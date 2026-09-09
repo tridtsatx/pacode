@@ -16,6 +16,7 @@ pub struct ServerControl {
     pub connections: Arc<std::sync::atomic::AtomicUsize>,
     pub app_version: String,
     pub pid: u32,
+    pub paths: codeapp_config::Paths,
     /// Set by `Shutdown{force:false}`: exit as soon as the core is idle.
     pub shutdown_when_idle: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -180,6 +181,19 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
             Request::Attach(attach) => {
                 if let Some(handle) = forwarder_handle.take() {
                     handle.abort();
+                }
+                // Pick up config edits (api keys, defaults) without a daemon restart.
+                match codeapp_config::load(&control.paths) {
+                    Ok(cfg) => {
+                        let mut api_keys = std::collections::BTreeMap::new();
+                        for (id, pcfg) in &cfg.providers {
+                            api_keys.insert(id.clone(), codeapp_config::resolve_api_key(pcfg));
+                        }
+                        if let Err(e) = core.reload_config(cfg, &api_keys) {
+                            log::warn!("config reload failed: {e}");
+                        }
+                    }
+                    Err(e) => log::warn!("config reload failed: {e}"),
                 }
                 match core.open_session(attach).await {
                     Err(err) => Reply::Error {

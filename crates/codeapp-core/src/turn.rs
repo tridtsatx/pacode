@@ -421,8 +421,16 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
     *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
 
     tokio::spawn(async move {
-        run_turn(session.clone(), agent.clone(), cancel).await;
+        let stop = run_turn(session.clone(), agent.clone(), cancel).await;
         *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
+        // An injection that landed between the last drain and the end of the turn
+        // would otherwise wait for the next user message: run another turn for it.
+        if agent.id.is_main() && matches!(stop, TurnStop::Completed) && !agent.injections.is_empty()
+        {
+            start_turn(session.clone(), agent.clone());
+            return;
+        }
 
         if !agent.id.is_main() {
             let last_assistant_text = {

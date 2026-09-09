@@ -34,6 +34,9 @@ pub struct CoreDeps {
 
 pub struct Core {
     pub(crate) deps: CoreDeps,
+    /// Live provider registry; replaced by `reload_config` (new sessions use it).
+    pub(crate) providers: RwLock<Arc<ProviderRegistry>>,
+    pub(crate) config: RwLock<Arc<Config>>,
     pub(crate) sessions: RwLock<BTreeMap<SessionId, Arc<Session>>>,
     /// Routes `TaskEvent`s to the owning session (injections + UI events).
     pub(crate) task_router: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -44,8 +47,12 @@ impl Core {
     /// Build the core and start the task-event router.
     pub async fn new(deps: CoreDeps) -> Arc<Core> {
         let rx = deps.tasks.subscribe();
+        let providers = RwLock::new(deps.providers.clone());
+        let config = RwLock::new(deps.config.clone());
         let core = Arc::new(Core {
             deps,
+            providers,
+            config,
             sessions: RwLock::new(BTreeMap::new()),
             task_router: std::sync::Mutex::new(None),
             cached_mcp_tools: std::sync::Mutex::new(None),
@@ -79,6 +86,45 @@ impl Core {
     /// resumes the most recently updated session for `cwd` or creates one.
     pub async fn open_session(&self, attach: Attach) -> Result<SessionId, CoreError> {
         open::open_session(self, attach).await
+    }
+
+    pub fn providers(&self) -> Arc<ProviderRegistry> {
+        self.providers
+            .read()
+            .map(|p| p.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+
+    pub fn config(&self) -> Arc<Config> {
+        self.config
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_else(|c| c.into_inner().clone())
+    }
+
+    /// Re-read config (api keys, providers, defaults) for NEW sessions. Existing
+    /// sessions keep their registry. Called by the daemon on every `Attach`.
+    pub fn reload_config(
+        &self,
+        config: Config,
+        api_keys: &std::collections::BTreeMap<String, Option<String>>,
+    ) -> Result<(), CoreError> {
+        let mut registry = ProviderRegistry::from_config(&config, api_keys)?;
+        // keep a mock provider inserted at startup (tests/smoke)
+        if let Some(mock) = self.providers().get("mock") {
+            registry.insert(mock);
+            if registry.default_route().is_none() {
+                registry
+                    .set_default_route(Some(codeapp_types::ModelRoute::new("mock", "mock-model")));
+            }
+        }
+        if let Ok(mut p) = self.providers.write() {
+            *p = Arc::new(registry);
+        }
+        if let Ok(mut c) = self.config.write() {
+            *c = Arc::new(config);
+        }
+        Ok(())
     }
 
     pub fn session(&self, id: &SessionId) -> Option<Arc<Session>> {
@@ -248,7 +294,7 @@ impl Core {
                 }
             }
             Request::ListModels => {
-                let models = self.deps.providers.list_all_models().await;
+                let models = self.providers().list_all_models().await;
                 Reply::Models { models }
             }
             Request::Compact => {
@@ -296,7 +342,7 @@ impl Core {
                 },
             ),
             Request::ListModels => Some(Reply::Models {
-                models: self.deps.providers.list_all_models().await,
+                models: self.providers().list_all_models().await,
             }),
             _ => None,
         }

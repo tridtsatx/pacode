@@ -32,6 +32,7 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
         connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         app_version: opts.app_version.clone(),
         pid,
+        paths: opts.paths.clone(),
         shutdown_when_idle: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 

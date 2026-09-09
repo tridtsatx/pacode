@@ -39,11 +39,11 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
             mode,
         } => {
             let model_route = model
-                .or_else(|| core.deps.providers.default_route().cloned())
-                .or_else(|| core.deps.config.default_route())
+                .or_else(|| core.providers().default_route().cloned())
+                .or_else(|| core.config().default_route())
                 .ok_or(CoreError::NoModel)?;
-            let effort = effort.unwrap_or(core.deps.config.provider.effort);
-            let mode = mode.unwrap_or(core.deps.config.permissions.default_mode);
+            let effort = effort.unwrap_or(core.config().provider.effort);
+            let mode = mode.unwrap_or(core.config().permissions.default_mode);
             let git_branch = crate::prompt::git_branch(&cwd);
             let id = SessionId::generate();
             let now = codeapp_types::now_ms();
@@ -114,8 +114,8 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 events: crate::transcript::EventSink::new(),
                 tasks: core.deps.tasks.clone(),
                 store: core.deps.store.clone(),
-                config: core.deps.config.clone(),
-                providers: core.deps.providers.clone(),
+                config: core.config(),
+                providers: core.providers(),
                 tools: session_tools,
                 mcp: core.deps.mcp.clone(),
                 app_version: core.deps.app_version.clone(),
@@ -306,8 +306,8 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 events: crate::transcript::EventSink::new(),
                 tasks: core.deps.tasks.clone(),
                 store: core.deps.store.clone(),
-                config: core.deps.config.clone(),
-                providers: core.deps.providers.clone(),
+                config: core.config(),
+                providers: core.providers(),
                 tools: session_tools,
                 mcp: core.deps.mcp.clone(),
                 app_version: core.deps.app_version.clone(),
