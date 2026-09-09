@@ -9,7 +9,7 @@ expression: view
 "with a persistent rail and separate   │                                                │[✓] Read codebase & analyze arc…"
 "dialog column.                        │Here is the diff for rail rendering.            │[•] Implement TUI layout & widg…"
 "                                      │                                                │    ▰▰▰▰▰▱▱▱ 60%                "
-"▣ read_file crates/codeapp-tui/src/lay│▣ edit_file crates/codeapp-tui/src/ui/rail.rs +6│[ ] Add key bindings & event lo…"
+"▣ Read_file crates/codeapp-tui/src/lay│▣ Edit_file crates/codeapp-tui/src/ui/rail.rs +6│[ ] Add key bindings & event lo…"
 "  │ pub fn compute(area: Rect) -> Scr…│  │ --- a/rail.rs                               │[ ] Write unit tests & snapshot…"
 "                                      │  │ +++ b/rail.rs                               │AGENTS                       5 ●"
 "                                      │  │ @@ -10,3 +10,5 @@                           │● main  думает · 0.4s           "

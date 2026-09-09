@@ -7,7 +7,7 @@ expression: view
 "I'll help you organize the TUI crate with a persistent rail "
 "and separate dialog column.                                 "
 "                                                            "
-"▣ read_file crates/codeapp-tui/src/layout.rs ok 0.1s        "
+"▣ Read_file crates/codeapp-tui/src/layout.rs ok 0.1s        "
 "  │ pub fn compute(area: Rect) -> ScreenLayout...           "
 "                                                            "
 "                                                            "

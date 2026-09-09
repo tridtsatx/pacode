@@ -187,9 +187,20 @@ fn render_item(kind: &TranscriptKind, width: u16, opts: &RenderOptions) -> Vec<L
         } => {
             let mut out = Vec::new();
             let sym = opts.glyphs.tool;
+            // The core builds titles as `<name> <arg>`; show `▣ Name arg` (mockup).
+            let rest = title
+                .strip_prefix(name.as_str())
+                .map(str::trim_start)
+                .unwrap_or(title.as_str());
+            let mut display_name = String::new();
+            let mut chars = name.chars();
+            if let Some(first) = chars.next() {
+                display_name.extend(first.to_uppercase());
+                display_name.push_str(chars.as_str());
+            }
             let mut spans = vec![
-                Span::styled(format!("{sym} {name} "), opts.theme.cyan),
-                Span::styled(title.clone(), opts.theme.dim),
+                Span::styled(format!("{sym} {display_name} "), opts.theme.cyan),
+                Span::styled(rest.to_string(), opts.theme.dim),
             ];
 
             match status {

@@ -6,7 +6,7 @@ expression: view
 "                                                                                       │ses_abcdef123                   "
 "I'll help ┌ Background Tasks ───────────────────────────────────────────────┐og column.│                                "
 "          │▸ ✓ cargo build --release 3m02s                                  │          │PLAN                   1/4 · 40%"
-"▣ read_fil│  ✗ npm run lint 0.1s                                            │          │[✓] Read codebase & analyze arc…"
+"▣ Read_fil│  ✗ npm run lint 0.1s                                            │          │[✓] Read codebase & analyze arc…"
 "  │ pub fn│  ✓ tsc --noEmit 12s                                             │          │[•] Implement TUI layout & widg…"
 "          │  ◍ cargo test --all 214/380                                     │          │    ▰▰▰▰▰▱▱▱ 60%                "
 "          │                                                                 │          │[ ] Add key bindings & event lo…"

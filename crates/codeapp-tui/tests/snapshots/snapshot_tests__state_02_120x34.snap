@@ -6,7 +6,7 @@ expression: view
 "                                                                                       │ses_abcdef123                   "
 "I'll help you organize the TUI crate with a persistent rail and separate dialog column.│                                "
 "                                                                                       │PLAN                 1/4 · 40% ▸"
-"▣ read_file crates/codeapp-tui/src/layout.rs ok 0.1s                                   │AGENTS                       5 ●"
+"▣ Read_file crates/codeapp-tui/src/layout.rs ok 0.1s                                   │AGENTS                       5 ●"
 "  │ pub fn compute(area: Rect) -> ScreenLayout...                                      │● main  думает · 0.4s           "
 "                                                                                       │  ○ codegen  1m47s              "
 "                                                                                       │  ○ tester  23s                 "
