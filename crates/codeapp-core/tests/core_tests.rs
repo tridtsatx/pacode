@@ -567,6 +567,8 @@ async fn test_05_subagent_spawn_and_finish() {
     mock.push(MockResponse::Text(
         "Acknowledged subagent completion".into(),
     ));
+    // The session-title request after the first reply consumes one script too.
+    mock.push(MockResponse::Text("Delegated subtask".into()));
 
     let mut rx = core.subscribe(&session_id).unwrap();
 
@@ -603,6 +605,19 @@ async fn test_05_subagent_spawn_and_finish() {
         }
     }
 
+    if !main_saw_agent_finished {
+        for (i, r) in mock.requests().iter().enumerate() {
+            let last = r.messages.last().map(|m| m.text()).unwrap_or_default();
+            eprintln!(
+                "request {i}: {} messages, last = {last:?}",
+                r.messages.len()
+            );
+        }
+        eprintln!("pending scripts: {}", mock.pending());
+        for a in core.session(&session_id).unwrap().agent_infos() {
+            eprintln!("agent {} {:?} {:?}", a.name, a.status, a.error);
+        }
+    }
     assert!(
         main_saw_agent_finished,
         "main agent requests should contain <agent_finished"
