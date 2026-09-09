@@ -85,7 +85,7 @@ pub async fn run_turn(
         agent: agent.id.clone(),
         turn: turn_id.clone(),
     });
-    agent.set_status(AgentStatus::Thinking, Some("думает".to_string()));
+    agent.set_status(AgentStatus::Thinking, Some("thinking".to_string()));
     session.events.emit(Event::AgentUpdated(agent.info()));
 
     let mut turn_usage = Usage::default();
