@@ -101,7 +101,9 @@ async fn run_reader(
                                 emit_event(events_tx, dropped_events, ClientEvent::Event { seq, event });
                             }
                             Err(e) => {
-                                log::warn!("failed to deserialize ServerMessage: {e}: {trimmed}");
+                                log::error!(
+                                    "protocol error: failed to deserialize ServerMessage: {e}: {trimmed}"
+                                );
                             }
                         }
                     }
@@ -262,6 +264,7 @@ pub(crate) async fn run_supervisor(mut ctx: SupervisorCtx) {
         }
 
         // Connection dropped
+        log::warn!("daemon connection lost: {reason}");
         ctx.connected.store(false, Ordering::Relaxed);
         if let Ok(mut w) = ctx.writer_tx_holder.lock() {
             *w = None;
@@ -282,6 +285,10 @@ pub(crate) async fn run_supervisor(mut ctx: SupervisorCtx) {
                 return;
             }
 
+            log::info!(
+                "attempting reconnect {attempt} to daemon at {}",
+                ctx.socket_path.display()
+            );
             emit_event(
                 &ctx.events_tx,
                 &ctx.dropped_events,
@@ -367,6 +374,7 @@ pub(crate) async fn run_supervisor(mut ctx: SupervisorCtx) {
             }
             spawn_writer(write_half, new_writer_rx, ctx.cancel_token.clone());
             ctx.connected.store(true, Ordering::Relaxed);
+            log::info!("reconnected to daemon: pid={pid}, daemon_version={daemon_version}");
 
             emit_event(
                 &ctx.events_tx,
@@ -379,6 +387,7 @@ pub(crate) async fn run_supervisor(mut ctx: SupervisorCtx) {
             );
 
             if let Some(snapshot) = snapshot_opt {
+                log::info!("reconnect attached to session {}", snapshot.meta.id);
                 emit_event(
                     &ctx.events_tx,
                     &ctx.dropped_events,

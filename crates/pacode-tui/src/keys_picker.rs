@@ -26,6 +26,20 @@ fn is_overlay_down(key: &KeyEvent) -> bool {
 }
 
 pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
+    let prev_overlay = match &state.focus {
+        Focus::Overlay(o) => Some(crate::nav::overlay_name(o)),
+        _ => None,
+    };
+    let actions = handle_picker_key_inner(state, key);
+    if let Some(name) = prev_overlay
+        && !matches!(state.focus, Focus::Overlay(_))
+    {
+        log::debug!("close overlay: {name}");
+    }
+    actions
+}
+
+fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     match &mut state.focus {
         Focus::Overlay(Overlay::EffortPicker { index }) => {
             match key.code {
@@ -329,6 +343,7 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     &dotted,
                     pacode_config::toml::Value::String(formatted),
                 ) {
+                    log::warn!("failed to update config value '{dotted}': {err}");
                     state.push_toast(
                         pacode_types::ToastLevel::Error,
                         "Failed to update config".to_string(),
@@ -360,6 +375,7 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                             if let Err(err) =
                                 pacode_config::remove_config_value(&state.paths, &dotted)
                             {
+                                log::warn!("failed to remove config value '{dotted}': {err}");
                                 state.push_toast(
                                     pacode_types::ToastLevel::Error,
                                     "Failed to update config".to_string(),
@@ -435,20 +451,24 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                             if *index < builtins.len() {
                                 let name = builtins[*index].name.clone();
                                 state.config.theme.name = name.clone();
-                                let _ = pacode_config::update_config_value(
+                                if let Err(e) = pacode_config::update_config_value(
                                     &state.paths,
                                     "theme.name",
                                     pacode_config::toml::Value::String(name),
-                                );
+                                ) {
+                                    log::warn!("failed to update config value 'theme.name': {e}");
+                                }
                                 state.focus = Focus::Normal;
                             } else if *index < builtins.len() + user_themes.len() {
                                 let name = user_themes[*index - builtins.len()].clone();
                                 state.config.theme.name = name.clone();
-                                let _ = pacode_config::update_config_value(
+                                if let Err(e) = pacode_config::update_config_value(
                                     &state.paths,
                                     "theme.name",
                                     pacode_config::toml::Value::String(name),
-                                );
+                                ) {
+                                    log::warn!("failed to update config value 'theme.name': {e}");
+                                }
                                 state.focus = Focus::Normal;
                             } else {
                                 *step = crate::state::ThemePickerStep::SelectBase;
@@ -495,11 +515,15 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                             match pacode_config::write_theme(&state.paths, &new_palette) {
                                 Ok(path) => {
                                     state.config.theme.name = custom_name.clone();
-                                    let _ = pacode_config::update_config_value(
+                                    if let Err(e) = pacode_config::update_config_value(
                                         &state.paths,
                                         "theme.name",
                                         pacode_config::toml::Value::String(custom_name.clone()),
-                                    );
+                                    ) {
+                                        log::warn!(
+                                            "failed to update config value 'theme.name': {e}"
+                                        );
+                                    }
                                     state.theme =
                                         pacode_render::Theme::from_palette(&new_palette, truecolor);
                                     state.focus = Focus::Normal;

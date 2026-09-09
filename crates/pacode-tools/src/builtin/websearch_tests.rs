@@ -81,6 +81,7 @@ impl ToolHost for DummyHost {
     }
     fn set_plan(&self, _plan: pacode_types::Plan) {}
     fn emit_preview(&self, _call_id: &CallId, _preview: String) {}
+    fn emit_notice(&self, _level: pacode_types::ToastLevel, _text: String) {}
 }
 
 fn dummy_ctx() -> ToolCtx {

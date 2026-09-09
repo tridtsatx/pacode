@@ -125,6 +125,7 @@ impl McpPool {
 
         let mut names = Vec::new();
         for (name, client) in to_reap {
+            log::info!("reaping idle MCP server '{name}'");
             client.shutdown().await;
             self.update_status_ready(&name);
             names.push(name);
@@ -159,6 +160,7 @@ impl McpPool {
         });
 
         for (name, client) in to_reap {
+            log::info!("reaping idle MCP server '{name}' (sync)");
             self.update_status_ready(&name);
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
@@ -366,11 +368,19 @@ impl McpPool {
     fn get_cached_schema(&self, server: &str, cfg: &McpServerConfig) -> Option<ServerSchemaCache> {
         let mut mem = self.schema_cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(cache) = mem.get(server) {
+            log::debug!("MCP schema cache memory hit for '{server}'");
             return Some(cache.clone());
         }
         if let Some(cache_dir) = &self.cache_dir {
-            load_disk_cache(cache_dir, server, cfg, &mut mem)
+            let disk_result = load_disk_cache(cache_dir, server, cfg, &mut mem);
+            if disk_result.is_some() {
+                log::debug!("MCP schema cache disk hit for '{server}'");
+            } else {
+                log::debug!("MCP schema cache miss for '{server}'");
+            }
+            disk_result
         } else {
+            log::debug!("MCP schema cache miss for '{server}' (no cache dir)");
             None
         }
     }
@@ -380,6 +390,7 @@ impl McpPool {
         server: &str,
         cfg: &McpServerConfig,
     ) -> Result<Arc<McpClient>, McpError> {
+        log::info!("starting MCP server '{server}'");
         let sampling_handler = self
             .sampling_handler
             .read()
@@ -397,14 +408,18 @@ impl McpPool {
             sampling_max_tokens,
         )
         .await
-        .map_err(|e| match e {
-            McpError::Spawn { server, source } => McpError::Spawn { server, source },
-            other => McpError::Spawn {
-                server: server.to_string(),
-                source: std::io::Error::other(other.to_string()),
-            },
+        .map_err(|e| {
+            log::warn!("failed to start MCP server '{server}': {e}");
+            match e {
+                McpError::Spawn { server, source } => McpError::Spawn { server, source },
+                other => McpError::Spawn {
+                    server: server.to_string(),
+                    source: std::io::Error::other(other.to_string()),
+                },
+            }
         })?;
 
+        log::info!("MCP server '{server}' started successfully");
         Ok(Arc::new(client))
     }
 

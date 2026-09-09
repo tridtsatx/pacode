@@ -370,6 +370,11 @@ pub fn main() -> anyhow::Result<()> {
             }
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;
+            log::info!(
+                "pacode run starting (version={}, pid={}, log_level={log_level:?})",
+                pacode_config::APP_VERSION,
+                std::process::id()
+            );
             let cwd = std::env::current_dir().context("failed to get current working directory")?;
             let model_route = parse_model_override(model.as_deref(), &config)?;
             let effort_level = parse_effort_override(effort.as_deref())?;
@@ -389,6 +394,10 @@ pub fn main() -> anyhow::Result<()> {
         Some(Command::Sessions { action }) => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;
+            log::info!(
+                "pacode sessions cli starting (pid={}, log_level={log_level:?})",
+                std::process::id()
+            );
             sessions::run(action, Some(socket), paths)
         }
         Some(Command::Mcp { action }) => mcp_cmd::run(action, &paths),
@@ -412,6 +421,10 @@ pub fn main() -> anyhow::Result<()> {
         Some(Command::Daemon { action }) => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;
+            log::info!(
+                "pacode daemon cli starting (pid={}, log_level={log_level:?})",
+                std::process::id()
+            );
             daemon::run(action, socket)
         }
         #[cfg(feature = "acp")]
@@ -425,6 +438,11 @@ pub fn main() -> anyhow::Result<()> {
         None => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;
+            log::info!(
+                "pacode client starting (version={}, pid={}, log_level={log_level:?})",
+                pacode_config::APP_VERSION,
+                std::process::id()
+            );
             let cwd = std::env::current_dir().context("failed to get current working directory")?;
             // Remembered choices (/model, /effort, /mode) win over config defaults;
             // explicit flags win over both.

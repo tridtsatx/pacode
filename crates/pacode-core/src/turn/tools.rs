@@ -60,6 +60,13 @@ async fn run_single_tool(
     cancel: CancellationToken,
     mut call: ToolCallInfo,
 ) -> ToolExecutionStatus {
+    log::debug!(
+        "tool call start: session={} agent={} tool={} call_id={}",
+        session.id,
+        agent.id(),
+        call.name,
+        call.call_id
+    );
     agent.set_status(AgentStatus::RunningTool, Some(call.title.clone()));
     session.events.emit(Event::AgentUpdated(agent.info()));
 
@@ -259,6 +266,15 @@ async fn run_single_tool(
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
+    log::debug!(
+        "tool call result: session={} agent={} tool={} call_id={} status={:?} duration={}ms is_error={is_error}",
+        session.id,
+        agent.id(),
+        call.name,
+        call.call_id,
+        status,
+        duration_ms
+    );
 
     let output_val = serde_json::json!({
         "content": content,

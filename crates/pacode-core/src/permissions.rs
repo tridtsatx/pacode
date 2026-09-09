@@ -33,7 +33,7 @@ pub fn gate(
     risk: Option<RiskLevel>,
     allow_catastrophic: bool,
 ) -> GateDecision {
-    match kind {
+    let decision = match kind {
         ToolKind::ReadOnly | ToolKind::Control | ToolKind::Network => GateDecision::Allow,
         ToolKind::Edit => match mode {
             Mode::Build => GateDecision::Ask,
@@ -74,7 +74,9 @@ pub fn gate(
                 },
             }
         }
-    }
+    };
+    log::debug!("permission gate: mode={mode:?} kind={kind:?} risk={risk:?} decision={decision:?}");
+    decision
 }
 
 #[cfg(test)]
@@ -209,6 +211,12 @@ impl PermissionState {
 
     /// Register a pending request; the returned receiver resolves on `resolve`.
     pub fn register(&self, req: PermissionRequest) -> oneshot::Receiver<PermissionDecision> {
+        log::info!(
+            "permission requested: id={} tool={} title={:?}",
+            req.id,
+            req.tool,
+            req.title
+        );
         let (tx, rx) = oneshot::channel();
         if let Ok(mut p) = self.pending.lock() {
             p.insert(req.id.clone(), (req, tx));
@@ -218,10 +226,14 @@ impl PermissionState {
 
     /// Resolve a pending request. Returns false when unknown.
     pub fn resolve(&self, id: &PermissionId, decision: PermissionDecision) -> bool {
+        log::info!("permission decision: id={id} decision={decision:?}");
         let entry = self.pending.lock().ok().and_then(|mut p| p.remove(id));
         match entry {
             Some((_, tx)) => tx.send(decision).is_ok(),
-            None => false,
+            None => {
+                log::warn!("permission decision for unknown id={id}");
+                false
+            }
         }
     }
 

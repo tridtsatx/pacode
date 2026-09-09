@@ -515,19 +515,25 @@ impl AppState {
     pub fn save_pref_model(&self, model: &str) {
         let mut prefs = pacode_config::load_prefs(&self.paths);
         prefs.model = Some(model.to_string());
-        let _ = pacode_config::save_prefs(&self.paths, &prefs);
+        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
+            log::warn!("failed to save prefs (model): {e}");
+        }
     }
 
     pub fn save_pref_effort(&self, effort: Effort) {
         let mut prefs = pacode_config::load_prefs(&self.paths);
         prefs.effort = Some(effort);
-        let _ = pacode_config::save_prefs(&self.paths, &prefs);
+        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
+            log::warn!("failed to save prefs (effort): {e}");
+        }
     }
 
     pub fn save_pref_mode(&self, mode: Mode) {
         let mut prefs = pacode_config::load_prefs(&self.paths);
         prefs.mode = Some(mode);
-        let _ = pacode_config::save_prefs(&self.paths, &prefs);
+        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
+            log::warn!("failed to save prefs (mode): {e}");
+        }
     }
 
     pub fn is_bottom_picker(&self) -> bool {

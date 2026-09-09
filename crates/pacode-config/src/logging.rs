@@ -13,11 +13,29 @@ use std::sync::Mutex;
 /// to capture detailed diagnostic information, and `log::LevelFilter::Warn` in release
 /// builds to minimize logging overhead and noise.
 pub fn default_level() -> log::LevelFilter {
-    if cfg!(debug_assertions) {
+    default_level_for(cfg!(debug_assertions))
+}
+
+/// Pure helper for `default_level` taking an explicit `debug_assertions` flag,
+/// allowing both profile defaults to be unit tested directly.
+pub fn default_level_for(debug_assertions: bool) -> log::LevelFilter {
+    if debug_assertions {
         log::LevelFilter::Trace
     } else {
         log::LevelFilter::Warn
     }
+}
+
+/// Level applied to records from crates that are not ours. `trace` in a debug
+/// build means tokio, mio, rustls and hyper each log on every event-loop turn,
+/// which buries our own records and writes far more than it is worth; their
+/// warnings and errors are still kept, because those are the ones worth seeing.
+const DEPENDENCY_LEVEL: log::LevelFilter = log::LevelFilter::Warn;
+
+/// Whether a record's target belongs to this workspace. Every crate here is
+/// named `pacode…`, and `log` targets default to the module path.
+fn is_own_target(target: &str) -> bool {
+    target.starts_with("pacode")
 }
 
 /// File logger backend implementing `log::Log`.
@@ -33,11 +51,22 @@ impl FileLogger {
             level,
         }
     }
+
+    /// The level a target is held to: the configured one for our own crates,
+    /// `DEPENDENCY_LEVEL` for everything else — but never above what was asked
+    /// for, so `PACODE_LOG=error` stays quiet across the board.
+    fn level_for(&self, target: &str) -> log::LevelFilter {
+        if is_own_target(target) {
+            self.level
+        } else {
+            self.level.min(DEPENDENCY_LEVEL)
+        }
+    }
 }
 
 impl log::Log for FileLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= self.level
+        metadata.level() <= self.level_for(metadata.target())
     }
 
     fn log(&self, record: &log::Record) {

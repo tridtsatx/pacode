@@ -182,6 +182,8 @@ impl ToolHost for StubHost {
     }
 
     fn emit_preview(&self, _call_id: &CallId, _preview: String) {}
+
+    fn emit_notice(&self, _level: pacode_types::ToastLevel, _text: String) {}
 }
 
 fn make_ctx(cwd: PathBuf, host: Arc<dyn ToolHost>) -> ToolCtx {

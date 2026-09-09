@@ -9,6 +9,7 @@ use pacode_tools::host::PermissionDraft;
 use pacode_tools::{AgentSpec, ToolError, ToolHost, WaitOutcome};
 use pacode_types::{
     AgentId, AgentInfo, CallId, PermissionDecision, Plan, TaskId, TaskInfo, TaskProgress,
+    ToastLevel,
 };
 
 use crate::session::Session;
@@ -408,6 +409,30 @@ impl ToolHost for SessionHost {
                     .events
                     .emit(pacode_types::Event::ItemUpdated(updated));
             }
+        }
+    }
+
+    fn emit_notice(&self, level: ToastLevel, text: String) {
+        if let Some(agent) = self.session.agent(&self.agent) {
+            let seq = agent
+                .transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .next_seq();
+            let item = pacode_types::TranscriptItem {
+                seq,
+                agent: self.agent.clone(),
+                ts_ms: pacode_types::now_ms(),
+                kind: pacode_types::TranscriptKind::Notice { level, text },
+            };
+            agent
+                .transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .upsert(item.clone());
+            self.session
+                .events
+                .emit(pacode_types::Event::ItemAdded(item));
         }
     }
 }

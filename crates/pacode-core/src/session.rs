@@ -340,6 +340,10 @@ impl Session {
 
     /// Detach a running turn on the main agent into a background subagent.
     pub async fn detach_main_turn(self: &Arc<Self>) -> Result<AgentId, CoreError> {
+        log::info!(
+            "detaching running turn on main agent in session {}",
+            self.id
+        );
         let live_count = self
             .agents
             .read()
@@ -350,6 +354,10 @@ impl Session {
             })
             .unwrap_or(0);
         if live_count >= self.config.agents.max_live {
+            log::warn!(
+                "failed to detach main turn: maximum live subagents ({}) reached",
+                self.config.agents.max_live
+            );
             return Err(CoreError::Invalid(format!(
                 "maximum live subagents ({}) reached",
                 self.config.agents.max_live
@@ -361,6 +369,7 @@ impl Session {
             .ok_or_else(|| CoreError::AgentNotFound(AgentId::main()))?;
 
         if !main.is_running() {
+            log::warn!("failed to detach main turn: no turn is running on the main agent");
             return Err(CoreError::Invalid(
                 "no turn is running on the main agent".to_string(),
             ));
@@ -525,6 +534,11 @@ impl Session {
             self.events
                 .emit(pacode_types::Event::AgentUpdated(fresh_main.info()));
         }
+
+        log::info!(
+            "detached running turn on main agent into background subagent {new_id} in session {}",
+            self.id
+        );
 
         Ok(new_id)
     }

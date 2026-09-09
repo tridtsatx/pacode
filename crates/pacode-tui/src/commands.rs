@@ -240,6 +240,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
     match cmd {
         "model" => {
             if arg.is_empty() {
+                log::debug!("open overlay: ModelPicker");
                 state.focus = Focus::Overlay(Overlay::ModelPicker {
                     query: String::new(),
                     index: 0,
@@ -258,6 +259,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
         }
         "effort" => {
             if arg.is_empty() {
+                log::debug!("open overlay: EffortPicker");
                 let cur_idx = Effort::ALL
                     .iter()
                     .position(|e| *e == state.effort())
@@ -279,6 +281,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
         }
         "mode" => {
             if arg.is_empty() {
+                log::debug!("open overlay: ModePicker");
                 let cur_idx = Mode::CYCLE
                     .iter()
                     .position(|m| *m == state.mode())
@@ -305,6 +308,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 _ => pacode_render::detect_truecolor(),
             };
             if arg.is_empty() {
+                log::debug!("open overlay: ThemePicker");
                 let user_themes = pacode_config::user_theme_names(&state.paths);
                 let builtins = pacode_render::builtin_palettes();
                 let current_name = state.config.theme.name.clone();
@@ -336,11 +340,13 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 let (palette, warnings) = pacode_config::load_theme(&state.paths, &theme_cfg);
                 state.theme = pacode_render::Theme::from_palette(&palette, truecolor);
                 state.config.theme.name = arg.clone();
-                let _ = pacode_config::update_config_value(
+                if let Err(e) = pacode_config::update_config_value(
                     &state.paths,
                     "theme.name",
                     pacode_config::toml::Value::String(arg.clone()),
-                );
+                ) {
+                    log::warn!("failed to update config value 'theme.name': {e}");
+                }
                 for w in warnings {
                     push_notice(state, ToastLevel::Warn, w);
                 }
@@ -349,12 +355,14 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             }
         }
         "config" => {
+            log::debug!("open overlay: ConfigPicker");
             state.config_view = crate::ui::config_view::ConfigViewState::new(&state.config);
             state.focus = Focus::Overlay(Overlay::ConfigPicker);
             state.dirty = true;
             vec![]
         }
         "sessions" => {
+            log::debug!("open overlay: SessionPicker");
             state.focus = Focus::Overlay(Overlay::SessionPicker {
                 query: String::new(),
                 index: 0,
@@ -363,6 +371,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![Action::Send(Request::ListSessions { limit: 50 })]
         }
         "mcp" => {
+            log::debug!("open overlay: McpPicker");
             state.focus = Focus::Overlay(Overlay::McpPicker {
                 index: 0,
                 servers: Vec::new(),
@@ -372,6 +381,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![Action::Send(Request::ListMcpServers)]
         }
         "plugins" => {
+            log::debug!("open overlay: PluginsPicker");
             state.focus = Focus::Overlay(Overlay::PluginsPicker {
                 index: 0,
                 plugins: state.plugins.clone(),
@@ -380,6 +390,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![Action::Send(Request::ListPlugins)]
         }
         "keys" => {
+            log::debug!("open overlay: KeysPicker");
             state.focus = Focus::Overlay(Overlay::KeysPicker {
                 index: 0,
                 capturing: false,
@@ -392,6 +403,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![]
         }
         "import" => {
+            log::debug!("open overlay: Import");
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -461,6 +473,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![]
         }
         "help" => {
+            log::debug!("open overlay: Help");
             state.focus = Focus::Overlay(Overlay::Help);
             state.dirty = true;
             vec![]

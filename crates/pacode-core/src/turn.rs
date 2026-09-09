@@ -59,6 +59,12 @@ pub async fn run_turn(
 
     let turn_id = TurnId::generate();
     let turn_start_instant = std::time::Instant::now();
+    log::info!(
+        "turn start: session={} agent={} turn={}",
+        session.id,
+        agent.id(),
+        turn_id
+    );
     let _ = session
         .plugins
         .run_hooks(&pacode_plugin::HookEvent::TurnStart)
@@ -79,6 +85,13 @@ pub async fn run_turn(
             session.events.emit(Event::AgentUpdated(agent.info()));
             let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
             let output_tokens = turn_usage.output_tokens;
+            log::info!(
+                "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
+                session.id,
+                agent.id(),
+                turn_id,
+                duration_ms
+            );
             let _ = session
                 .plugins
                 .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
@@ -157,6 +170,13 @@ pub async fn run_turn(
                 };
                 let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
                 let output_tokens = turn_usage.output_tokens;
+                log::warn!(
+                    "turn end: session={} agent={} turn={} stop=Failed duration={}ms error={e}",
+                    session.id,
+                    agent.id(),
+                    turn_id,
+                    duration_ms
+                );
                 let _ = session
                     .plugins
                     .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
@@ -183,6 +203,13 @@ pub async fn run_turn(
                 };
                 let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
                 let output_tokens = turn_usage.output_tokens;
+                log::warn!(
+                    "turn end: session={} agent={} turn={} stop=Failed duration={}ms error={e}",
+                    session.id,
+                    agent.id(),
+                    turn_id,
+                    duration_ms
+                );
                 let _ = session
                     .plugins
                     .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
@@ -232,6 +259,13 @@ pub async fn run_turn(
             session.events.emit(Event::AgentUpdated(agent.info()));
             let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
             let output_tokens = turn_usage.output_tokens;
+            log::info!(
+                "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
+                session.id,
+                agent.id(),
+                turn_id,
+                duration_ms
+            );
             let _ = session
                 .plugins
                 .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
@@ -352,6 +386,13 @@ pub async fn run_turn(
             session.events.emit(Event::AgentUpdated(agent.info()));
             let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
             let output_tokens = turn_usage.output_tokens;
+            log::info!(
+                "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
+                session.id,
+                agent.id(),
+                turn_id,
+                duration_ms
+            );
             let _ = session
                 .plugins
                 .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
@@ -373,6 +414,13 @@ pub async fn run_turn(
             session.events.emit(Event::AgentUpdated(agent.info()));
             let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
             let output_tokens = turn_usage.output_tokens;
+            log::info!(
+                "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
+                session.id,
+                agent.id(),
+                turn_id,
+                duration_ms
+            );
             let _ = session
                 .plugins
                 .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
@@ -465,6 +513,13 @@ pub async fn run_turn(
 
     let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
     let output_tokens = turn_usage.output_tokens;
+    log::info!(
+        "turn end: session={} agent={} turn={} stop=Completed duration={}ms output_tokens={output_tokens}",
+        session.id,
+        agent.id(),
+        turn_id,
+        duration_ms
+    );
     let _ = session
         .plugins
         .run_hooks(&pacode_plugin::HookEvent::TurnEnd {

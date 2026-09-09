@@ -127,6 +127,11 @@ pub fn copy(text: &str) -> Result<Method, ClipboardError> {
         (true, false) => Ok(Method::Osc52),
         (false, true) => Ok(Method::System),
         (false, false) => {
+            log::warn!(
+                "clipboard copy failed: OSC 52 err={:?}, system arboard err={:?}",
+                osc52_result.as_ref().err(),
+                arboard_result.as_ref().err(),
+            );
             if let Err(e) = osc52_result {
                 Err(ClipboardError::Io(e))
             } else if let Err(e) = arboard_result {

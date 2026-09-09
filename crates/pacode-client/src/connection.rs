@@ -36,6 +36,7 @@ impl Client {
     /// The returned receiver yields `ClientEvent`s (the first is `Connected`).
     pub async fn connect(opts: ClientOptions) -> Result<(Client, EventReceiver), ClientError> {
         let socket_path = opts.socket_path();
+        log::info!("connecting to daemon at {}", socket_path.display());
         let stream = match tokio::net::UnixStream::connect(&socket_path).await {
             Ok(s) => s,
             Err(connect_err) => {
@@ -111,18 +112,27 @@ impl Client {
                     },
             } => {
                 if protocol != PROTOCOL_VERSION {
+                    log::error!(
+                        "protocol version mismatch: daemon={protocol}, client={PROTOCOL_VERSION}"
+                    );
                     return Err(ClientError::Protocol {
                         daemon: protocol,
                         client: PROTOCOL_VERSION,
                     });
                 }
                 let version_mismatch = daemon_version != opts.app_version;
+                log::info!(
+                    "connected to daemon: pid={pid}, daemon_version={daemon_version}, client_id={client_id}"
+                );
                 (daemon_version, pid, version_mismatch)
             }
             ServerMessage::Reply {
                 id: 1,
                 reply: Reply::Error { message },
-            } => return Err(ClientError::Daemon(message)),
+            } => {
+                log::warn!("daemon rejected hello: {message}");
+                return Err(ClientError::Daemon(message));
+            }
             other => {
                 return Err(ClientError::UnexpectedReply {
                     request: "hello".into(),
@@ -189,14 +199,19 @@ impl Client {
 
     /// Attach to a session and return its snapshot; remembered for reconnects.
     pub async fn attach(&self, attach: Attach) -> Result<SessionSnapshot, ClientError> {
+        log::info!("attaching to session: {attach:?}");
         match self.request(Request::Attach(attach)).await? {
             Reply::Attached(snapshot) => {
+                log::info!("attached to session {}", snapshot.meta.id);
                 if let Ok(mut guard) = self.attached_session.lock() {
                     *guard = Some(snapshot.meta.id.clone());
                 }
                 Ok(snapshot)
             }
-            Reply::Error { message } => Err(ClientError::Daemon(message)),
+            Reply::Error { message } => {
+                log::warn!("failed to attach to session: {message}");
+                Err(ClientError::Daemon(message))
+            }
             other => Err(ClientError::UnexpectedReply {
                 request: "attach".into(),
                 reply: format!("{other:?}"),
@@ -401,6 +416,7 @@ impl Client {
 
     /// Stop the reader/reconnect loop and close the socket.
     pub async fn close(mut self) {
+        log::info!("closing client connection (client_id={})", self.client_id);
         self.cancel_token.cancel();
         self.connected.store(false, Ordering::Relaxed);
         if let Ok(mut w) = self.writer_tx.lock() {

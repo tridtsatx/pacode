@@ -120,6 +120,7 @@ fn paste_into_prompt(state: &mut AppState, text: String, now: Instant) {
     let total_chars = normalized.chars().count();
 
     let paste_content = if total_chars > PASTE_MAX_CHARS {
+        log::warn!("pasted text truncated from {total_chars} to {PASTE_MAX_CHARS} chars");
         state.push_toast(
             ToastLevel::Warn,
             format!("Pasted text truncated to {PASTE_MAX_CHARS} chars"),
@@ -214,6 +215,7 @@ pub fn handle_paste_image_with_runner(
 ) -> Vec<Action> {
     // If an overlay is active, pasting an image into it is invalid.
     if matches!(state.focus, Focus::Overlay(_)) {
+        log::warn!("paste image rejected: overlay active");
         if explicit {
             state.push_toast(
                 ToastLevel::Warn,
@@ -248,6 +250,7 @@ pub fn handle_paste_image_with_runner(
                 state.dirty = true;
             }
             Err(err) => {
+                log::warn!("clipboard image paste failed to save file: {err}");
                 state.push_toast(
                     ToastLevel::Error,
                     "Failed to save pasted image".to_string(),
@@ -257,6 +260,7 @@ pub fn handle_paste_image_with_runner(
             }
         },
         ClipboardImageResult::NoImage => {
+            log::debug!("clipboard image paste: no image found in clipboard");
             if explicit {
                 state.push_toast(
                     ToastLevel::Info,
@@ -267,6 +271,7 @@ pub fn handle_paste_image_with_runner(
             }
         }
         ClipboardImageResult::HelperMissing(msg) => {
+            log::warn!("clipboard image paste failed: helper missing: {msg}");
             if explicit {
                 state.push_toast(
                     ToastLevel::Warn,

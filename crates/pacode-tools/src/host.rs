@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use pacode_exec::TaskSpec;
 use pacode_types::{
     AgentId, AgentInfo, CallId, Effort, Mode, ModelRoute, PermissionDecision, Plan, RiskLevel,
-    SessionId, TaskId, TaskInfo, TaskProgress,
+    SessionId, TaskId, TaskInfo, TaskProgress, ToastLevel,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -145,4 +145,6 @@ pub trait ToolHost: Send + Sync {
     // --- UI ---
     /// Stream a bounded preview of in-progress output to the transcript row.
     fn emit_preview(&self, call_id: &CallId, preview: String);
+    /// Emit a user-visible notice in the session transcript.
+    fn emit_notice(&self, level: ToastLevel, text: String);
 }

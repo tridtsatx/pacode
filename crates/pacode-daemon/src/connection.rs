@@ -83,6 +83,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
     let env = match serde_json::from_str::<Envelope>(first_line.trim()) {
         Ok(env) => env,
         Err(err) => {
+            log::warn!("protocol error: invalid first line JSON envelope: {err}");
             let _ = send_reply(
                 &tx,
                 0,
@@ -100,6 +101,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
     let hello = match env.req {
         Request::Hello(hello) => hello,
         _ => {
+            log::warn!("protocol error: first request must be Hello");
             let _ = send_reply(
                 &tx,
                 env.id,
@@ -115,6 +117,10 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
     };
 
     if hello.protocol != PROTOCOL_VERSION {
+        log::warn!(
+            "protocol version mismatch: client protocol is {}, daemon requires {PROTOCOL_VERSION}",
+            hello.protocol
+        );
         let _ = send_reply(
             &tx,
             env.id,
@@ -147,6 +153,12 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
         return;
     }
 
+    log::info!(
+        "client connected: client_id={} app_version={}",
+        hello.client_id,
+        hello.app_version
+    );
+
     let mut attached_session: Option<SessionId> = None;
     let mut forwarder_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -159,6 +171,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
         let env = match serde_json::from_str::<Envelope>(trimmed) {
             Ok(env) => env,
             Err(err) => {
+                log::warn!("protocol error: invalid JSON envelope: {err}");
                 if !send_reply(
                     &tx,
                     0,
@@ -179,6 +192,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                 message: "already initialized".to_string(),
             },
             Request::Attach(attach) => {
+                log::info!("client {} attaching: attach={attach:?}", hello.client_id);
                 let _ = core.handle_global(&Request::ListMcpServers).await;
                 if let Some(handle) = forwarder_handle.take() {
                     handle.abort();
@@ -197,10 +211,17 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                     Err(e) => log::warn!("config reload failed: {e}"),
                 }
                 match core.open_session(attach).await {
-                    Err(err) => Reply::Error {
-                        message: err.to_string(),
-                    },
+                    Err(err) => {
+                        log::warn!("client {} attach failed: {err}", hello.client_id);
+                        Reply::Error {
+                            message: err.to_string(),
+                        }
+                    }
                     Ok(session_id) => {
+                        log::info!(
+                            "client {} attached to session {session_id}",
+                            hello.client_id
+                        );
                         attached_session = Some(session_id.clone());
                         if let Some(mut broadcast_rx) = core.subscribe(&session_id) {
                             let event_tx = tx.clone();
@@ -241,6 +262,10 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                 }
             }
             Request::Detach => {
+                log::info!(
+                    "client {} detaching from session {attached_session:?}",
+                    hello.client_id
+                );
                 let _ = core.handle_global(&Request::ListMcpServers).await;
                 if let Some(handle) = forwarder_handle.take() {
                     handle.abort();
@@ -292,6 +317,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
     if let Some(handle) = forwarder_handle.take() {
         handle.abort();
     }
+    log::info!("client {} disconnected", hello.client_id);
     drop(tx);
     let _ = writer_handle.await;
 }

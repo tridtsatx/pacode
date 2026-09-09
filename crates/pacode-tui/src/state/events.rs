@@ -16,7 +16,9 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             prefs.model = Some(meta.model.to_string());
             prefs.effort = Some(meta.effort);
             prefs.mode = Some(meta.mode);
-            let _ = pacode_config::save_prefs(&state.paths, &prefs);
+            if let Err(e) = pacode_config::save_prefs(&state.paths, &prefs) {
+                log::warn!("failed to save prefs on session update: {e}");
+            }
             let header = crate::state::transcript::HeaderInfo {
                 version: state.app_version.clone(),
                 mascot: state.mascot,

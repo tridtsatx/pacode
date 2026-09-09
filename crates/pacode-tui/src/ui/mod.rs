@@ -219,7 +219,9 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         let text = extract_selection_text(frame.buffer_mut(), &state.selection, dialog_area);
         if !text.is_empty() {
             let count = text.chars().count();
-            let _ = crate::clipboard::copy(&text);
+            if let Err(e) = crate::clipboard::copy(&text) {
+                log::warn!("clipboard copy failed ({count} chars): {e}");
+            }
             let detail = match copy_req {
                 crate::state::selection::CopyRequest::Auto => {
                     Some("disable autocopy in /config".to_string())

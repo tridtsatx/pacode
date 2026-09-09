@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use pacode_types::{Config, Effort, Mode, ProviderConfig};
 use tempfile::tempdir;
 
-use crate::logging::{FileLogger, default_level, init_file_logger, level_from_env};
+use crate::logging::{FileLogger, default_level, default_level_for, level_from_env};
 use crate::paths::Paths;
 use crate::{ConfigError, apply_env_overrides, load, parse, resolve_api_key};
 
@@ -257,7 +257,7 @@ fn ensure_dirs_creates_dirs_and_permissions() {
 }
 
 #[test]
-fn logger_writes_line_containing_message() {
+fn logger_writes_line_and_respects_level() {
     let dir = tempdir().expect("tempdir");
     let log_file_path = dir.path().join("logs").join("test.log");
 
@@ -270,81 +270,196 @@ fn logger_writes_line_containing_message() {
 
     let logger = FileLogger::new(file, log::LevelFilter::Info);
 
-    let target_name = "test_target";
-    let message_text = "test logging message 12345";
-    let args = format_args!("{message_text}");
-    let record = log::Record::builder()
-        .args(args)
-        .level(log::Level::Info)
-        .target(target_name)
-        .module_path(Some("pacode_config::tests"))
-        .file(Some("config_tests.rs"))
-        .line(Some(42))
-        .build();
-
     use log::Log;
-    logger.log(&record);
+
+    // 1. A Debug record must NOT be written because logger level is Info
+    let debug_record = log::Record::builder()
+        .args(format_args!("debug message that should be dropped"))
+        .level(log::Level::Debug)
+        .target("pacode_test::debug")
+        .build();
+    assert!(!logger.enabled(debug_record.metadata()));
+    logger.log(&debug_record);
     logger.flush();
 
-    let contents = fs::read_to_string(&log_file_path).expect("read log file");
+    let initial_contents = fs::read_to_string(&log_file_path).expect("read log file");
     assert!(
-        contents.contains(message_text),
-        "log file should contain message: {contents}"
+        initial_contents.is_empty(),
+        "debug record must not be written when filter is Info"
     );
+
+    // 2. A Trace record must NOT be written
+    let trace_record = log::Record::builder()
+        .args(format_args!("trace message that should be dropped"))
+        .level(log::Level::Trace)
+        .target("pacode_test::trace")
+        .build();
+    assert!(!logger.enabled(trace_record.metadata()));
+    logger.log(&trace_record);
+    logger.flush();
+
+    let trace_contents = fs::read_to_string(&log_file_path).expect("read log file");
     assert!(
-        contents.contains("INFO"),
-        "log file should contain level: {contents}"
+        trace_contents.is_empty(),
+        "trace record must not be written when filter is Info"
     );
+
+    // 3. An Info record MUST be written
+    let info_record = log::Record::builder()
+        .args(format_args!("info message 12345"))
+        .level(log::Level::Info)
+        .target("pacode_test::info")
+        .build();
+    assert!(logger.enabled(info_record.metadata()));
+    logger.log(&info_record);
+    logger.flush();
+
+    let info_contents = fs::read_to_string(&log_file_path).expect("read log file");
     assert!(
-        contents.contains(target_name),
-        "log file should contain target: {contents}"
+        info_contents.contains("info message 12345"),
+        "info record must be written"
     );
-    // Line format: 2026-09-09T12:34:56.789Z INFO  target: message
+    assert!(info_contents.contains("INFO  pacode_test::info: info message 12345"));
+
+    // 4. A Warn record MUST also be written
+    let warn_record = log::Record::builder()
+        .args(format_args!("warn message 67890"))
+        .level(log::Level::Warn)
+        .target("test_warn_target")
+        .build();
+    assert!(logger.enabled(warn_record.metadata()));
+    logger.log(&warn_record);
+    logger.flush();
+
+    let warn_contents = fs::read_to_string(&log_file_path).expect("read log file");
     assert!(
-        contents.contains("INFO  test_target: test logging message 12345"),
-        "log line must follow the exact format: {contents}"
+        warn_contents.contains("warn message 67890"),
+        "warn record must be written"
     );
+    assert!(warn_contents.contains("WARN  test_warn_target: warn message 67890"));
 }
 
 #[test]
-fn init_file_logger_integration_and_second_call() {
-    let dir = tempdir().expect("tempdir");
-    let log_path = dir.path().join("nested").join("daemon.log");
-
-    init_file_logger(&log_path, log::LevelFilter::Debug).expect("first init");
-    init_file_logger(&log_path, log::LevelFilter::Debug).expect("second init should succeed");
-
-    log::info!("integration test info line");
-
-    // Give IO a moment if needed
-    let _ = fs::read_to_string(&log_path);
-}
-
-#[test]
-fn level_from_env_parsing() {
-    assert_eq!(level_from_env(None), None);
-    assert_eq!(level_from_env(Some("")), None);
-    assert_eq!(level_from_env(Some("invalid")), None);
-
+fn level_from_env_all_accepted_and_junk() {
+    // Accepted values (case-insensitive and trimmed)
     assert_eq!(level_from_env(Some("error")), Some(log::LevelFilter::Error));
     assert_eq!(level_from_env(Some("ERROR")), Some(log::LevelFilter::Error));
+    assert_eq!(level_from_env(Some("Error")), Some(log::LevelFilter::Error));
+    assert_eq!(
+        level_from_env(Some("  error  ")),
+        Some(log::LevelFilter::Error)
+    );
+
     assert_eq!(level_from_env(Some("warn")), Some(log::LevelFilter::Warn));
+    assert_eq!(level_from_env(Some("WARN")), Some(log::LevelFilter::Warn));
     assert_eq!(level_from_env(Some("Warn")), Some(log::LevelFilter::Warn));
+    assert_eq!(
+        level_from_env(Some("  warn  ")),
+        Some(log::LevelFilter::Warn)
+    );
+
     assert_eq!(level_from_env(Some("info")), Some(log::LevelFilter::Info));
-    assert_eq!(level_from_env(Some(" INFO ")), Some(log::LevelFilter::Info));
+    assert_eq!(level_from_env(Some("INFO")), Some(log::LevelFilter::Info));
+    assert_eq!(level_from_env(Some("Info")), Some(log::LevelFilter::Info));
+    assert_eq!(
+        level_from_env(Some("  info  ")),
+        Some(log::LevelFilter::Info)
+    );
+
     assert_eq!(level_from_env(Some("debug")), Some(log::LevelFilter::Debug));
+    assert_eq!(level_from_env(Some("DEBUG")), Some(log::LevelFilter::Debug));
+    assert_eq!(level_from_env(Some("Debug")), Some(log::LevelFilter::Debug));
+    assert_eq!(
+        level_from_env(Some("  debug  ")),
+        Some(log::LevelFilter::Debug)
+    );
+
     assert_eq!(level_from_env(Some("trace")), Some(log::LevelFilter::Trace));
+    assert_eq!(level_from_env(Some("TRACE")), Some(log::LevelFilter::Trace));
+    assert_eq!(level_from_env(Some("Trace")), Some(log::LevelFilter::Trace));
+    assert_eq!(
+        level_from_env(Some("  trace  ")),
+        Some(log::LevelFilter::Trace)
+    );
+
     assert_eq!(level_from_env(Some("off")), Some(log::LevelFilter::Off));
+    assert_eq!(level_from_env(Some("OFF")), Some(log::LevelFilter::Off));
+    assert_eq!(level_from_env(Some("Off")), Some(log::LevelFilter::Off));
+    assert_eq!(level_from_env(Some("  off  ")), Some(log::LevelFilter::Off));
+
+    // Junk values
+    assert_eq!(level_from_env(None), None);
+    assert_eq!(level_from_env(Some("")), None);
+    assert_eq!(level_from_env(Some("   ")), None);
+    assert_eq!(level_from_env(Some("junk")), None);
+    assert_eq!(level_from_env(Some("invalid")), None);
+    assert_eq!(level_from_env(Some("123")), None);
+    assert_eq!(level_from_env(Some("warn!")), None);
+    assert_eq!(level_from_env(Some("not_a_level")), None);
+    assert_eq!(level_from_env(Some("info\0")), None);
 }
 
 #[test]
-fn default_level_matches_build_profile() {
+fn default_level_both_profiles() {
+    assert_eq!(
+        default_level_for(true),
+        log::LevelFilter::Trace,
+        "debug profile default must be Trace"
+    );
+    assert_eq!(
+        default_level_for(false),
+        log::LevelFilter::Warn,
+        "release profile default must be Warn"
+    );
+
     let expected = if cfg!(debug_assertions) {
         log::LevelFilter::Trace
     } else {
         log::LevelFilter::Warn
     };
     assert_eq!(default_level(), expected);
+}
+
+#[test]
+fn compile_time_cap_matches_current_profile() {
+    if cfg!(debug_assertions) {
+        assert_eq!(
+            log::STATIC_MAX_LEVEL,
+            log::LevelFilter::Trace,
+            "in debug profile, compile-time cap is Trace"
+        );
+    } else {
+        assert_eq!(
+            log::STATIC_MAX_LEVEL,
+            log::LevelFilter::Warn,
+            "in release profile with release_max_level_warn, compile-time cap is Warn"
+        );
+    }
+}
+
+#[test]
+#[cfg(not(debug_assertions))]
+fn compile_time_cap_in_force_in_release() {
+    // Under release builds with feature `release_max_level_warn`:
+    // 1. STATIC_MAX_LEVEL is Warn.
+    assert_eq!(log::STATIC_MAX_LEVEL, log::LevelFilter::Warn);
+
+    // 2. Macro arguments at Info, Debug, and Trace levels are eliminated at compile time
+    // and their expressions are never evaluated.
+    let mut side_effect_count = 0;
+    let mut side_effect = || {
+        side_effect_count += 1;
+        "evaluated"
+    };
+
+    log::info!("side effect test: {}", side_effect());
+    log::debug!("side effect test: {}", side_effect());
+    log::trace!("side effect test: {}", side_effect());
+
+    assert_eq!(
+        side_effect_count, 0,
+        "side effects inside info/debug/trace must not be evaluated in release builds"
+    );
 }
 
 #[test]
@@ -582,5 +697,60 @@ fn test_ups_frame_interval_clamping() {
     assert_eq!(
         pacode_types::Ups::Auto.frame_interval(Some(360)),
         Some(Duration::from_millis(4))
+    );
+}
+
+#[test]
+fn dependency_records_are_held_to_warn_even_at_trace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.log");
+    let file = std::fs::File::create(&path).expect("create");
+    let logger = FileLogger::new(file, log::LevelFilter::Trace);
+
+    // Our own crates get the configured level...
+    let ours = log::Metadata::builder()
+        .level(log::Level::Trace)
+        .target("pacode_tui::keys")
+        .build();
+    assert!(log::Log::enabled(&logger, &ours));
+
+    // ...while a dependency's trace and debug are dropped, so an event loop
+    // cannot bury the log in mio/tokio chatter.
+    for target in [
+        "mio::poll",
+        "tokio::runtime",
+        "rustls::client",
+        "hyper::proto",
+    ] {
+        for level in [log::Level::Trace, log::Level::Debug, log::Level::Info] {
+            let dep = log::Metadata::builder().level(level).target(target).build();
+            assert!(
+                !log::Log::enabled(&logger, &dep),
+                "{target} at {level} should be filtered"
+            );
+        }
+        // Their warnings and errors still matter.
+        let warn = log::Metadata::builder()
+            .level(log::Level::Warn)
+            .target(target)
+            .build();
+        assert!(log::Log::enabled(&logger, &warn), "{target} warn must pass");
+    }
+}
+
+#[test]
+fn a_quiet_setting_also_silences_dependencies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.log");
+    let file = std::fs::File::create(&path).expect("create");
+    let logger = FileLogger::new(file, log::LevelFilter::Error);
+
+    let dep = log::Metadata::builder()
+        .level(log::Level::Warn)
+        .target("mio::poll")
+        .build();
+    assert!(
+        !log::Log::enabled(&logger, &dep),
+        "PACODE_LOG=error must not be raised back to warn for dependencies"
     );
 }

@@ -64,7 +64,7 @@ toml_edit = "0.22"
 # errors / logging
 thiserror = "2"
 anyhow = "1"
-log = "0.4"
+log = { version = "0.4", features = ["release_max_level_warn"] }
 
 # http
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "rustls-tls-native-roots", "system-proxy"] }

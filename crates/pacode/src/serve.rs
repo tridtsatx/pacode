@@ -35,6 +35,11 @@ pub fn run(
 
     pacode_config::logging::init_file_logger(&paths.daemon_log(), log_level)
         .context("failed to initialize daemon logger")?;
+    log::info!(
+        "pacode daemon starting (version={}, pid={}, log_level={log_level:?})",
+        pacode_config::APP_VERSION,
+        std::process::id()
+    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

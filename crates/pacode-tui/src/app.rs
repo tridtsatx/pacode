@@ -44,12 +44,14 @@ enum BgResponse {
 }
 
 pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> {
+    log::info!("TUI starting up");
     let mut term_guard = TerminalGuard::enter(opts.config.ui.mouse)?;
 
     let client_paths = opts.client.paths.clone();
     let (client, mut events) = Client::connect(opts.client).await?;
     let snapshot = client.attach(opts.attach.clone()).await?;
     let session_id = snapshot.meta.id.clone();
+    log::info!("TUI attached to session {session_id}");
     let client = Arc::new(client);
 
     let size = term_guard.terminal.size()?;
@@ -306,6 +308,7 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         .as_ref()
         .map(|m| m.id.clone())
         .unwrap_or(session_id);
+    log::info!("TUI loop ended, quitting session {attached_session}");
     if let Some((area, _)) = active_escape.take() {
         let _ = term_guard.clear_image_area(area);
     }
@@ -336,6 +339,7 @@ fn dispatch_action(
             });
         }
         Action::RunBashInteractive { command } => {
+            log::info!("bash-mode interactive start: {command}");
             let shell = crate::bash::user_shell();
             let cwd = state.cwd();
             let mouse = state.config.ui.mouse;
@@ -347,8 +351,18 @@ fn dispatch_action(
                     .status()
             });
             let (exit_code, err_msg) = match status {
-                Ok(Ok(s)) => (s.code(), None),
-                Ok(Err(e)) | Err(e) => (Some(1), Some(e.to_string())),
+                Ok(Ok(s)) => {
+                    log::debug!("bash-mode interactive exited with code {:?}", s.code());
+                    (s.code(), None)
+                }
+                Ok(Err(e)) => {
+                    log::warn!("bash-mode interactive failed to execute: {e}");
+                    (Some(1), Some(e.to_string()))
+                }
+                Err(e) => {
+                    log::warn!("terminal error during interactive bash command: {e}");
+                    (Some(1), Some(e.to_string()))
+                }
             };
             let now = now_ms();
             let output = err_msg.unwrap_or_default();
@@ -368,6 +382,7 @@ fn dispatch_action(
             state.dirty = true;
         }
         Action::RunBashCaptured { command } => {
+            log::info!("bash-mode captured start: {command}");
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
             state.running_bash = Some(cancel_tx);
             state.dirty = true;
@@ -413,6 +428,7 @@ fn dispatch_action(
             let tx = bg_tx.clone();
             let first_cell_id = state.transcript.oldest_seq();
             let limit = state.config.session.history_page;
+            log::debug!("history page requested: before_seq={first_cell_id:?}, limit={limit}");
             state.transcript.loading_history = true;
             tokio::spawn(async move {
                 let res = cl
@@ -584,10 +600,15 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                 Ok(Reply::History {
                     items, has_more, ..
                 }) => {
+                    log::debug!(
+                        "history page loaded: {} items, has_more={has_more}",
+                        items.len()
+                    );
                     state.transcript.prepend(items, has_more);
                     state.dirty = true;
                 }
                 _ => {
+                    log::warn!("history page request failed or returned non-history reply");
                     state.transcript.loading_history = false;
                 }
             }
@@ -598,6 +619,11 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             state.dirty = true;
             match res {
                 Ok(out) => {
+                    log::debug!(
+                        "bash-mode captured completed: exit_code={:?}, truncated={}",
+                        out.exit_code,
+                        out.truncated
+                    );
                     let now = now_ms();
                     state.transcript.cells.push_back(Cell {
                         id: now,
@@ -614,6 +640,7 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                     state.transcript.scroll_to_bottom();
                 }
                 Err(err) => {
+                    log::warn!("bash-mode captured error: {err}");
                     let now = now_ms();
                     state.transcript.cells.push_back(Cell {
                         id: now,

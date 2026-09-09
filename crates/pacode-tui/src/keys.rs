@@ -125,6 +125,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     let action = state.keymap.action_for(key);
+    log::trace!("key event {key:?} resolved to action {action:?}");
 
     // Paste image from clipboard via ctrl+alt+v
     if action == Some(KeyAction::PasteImage) {
@@ -133,6 +134,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 2. Session picker via ctrl+p
     if action == Some(KeyAction::SessionPicker) {
+        log::debug!("open overlay: SessionPicker");
         state.focus = Focus::Overlay(Overlay::SessionPicker {
             query: String::new(),
             index: 0,
@@ -265,6 +267,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 5.5 Files overlay: alt+b
     if action == Some(KeyAction::FilesOverlay) {
+        log::debug!("open overlay: Files");
         state.focus = Focus::Overlay(Overlay::Files { index: 0 });
         return vec![];
     }
@@ -483,6 +486,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     .collect();
                 if let Some(model) = filtered.get(*index) {
                     let route = model.route.clone();
+                    log::debug!("close overlay: ModelPicker");
                     state.focus = Focus::Normal;
                     return vec![Action::Send(Request::SetModel(route))];
                 }
@@ -490,6 +494,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             Focus::Overlay(Overlay::EffortPicker { index }) => {
                 if let Some(effort) = pacode_types::model::Effort::ALL.get(*index) {
                     let eff = *effort;
+                    log::debug!("close overlay: EffortPicker");
                     state.focus = Focus::Normal;
                     return vec![Action::Send(Request::SetEffort(eff))];
                 }
@@ -507,6 +512,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     .collect();
                 if let Some(session) = filtered.get(*index) {
                     let id = session.id.clone();
+                    log::debug!("close overlay: SessionPicker");
                     state.focus = Focus::Normal;
                     return vec![Action::Send(Request::Attach(
                         pacode_types::Attach::Resume { session: id },

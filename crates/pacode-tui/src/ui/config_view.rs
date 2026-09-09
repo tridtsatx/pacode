@@ -280,6 +280,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
 
 fn save_and_apply(state: &mut AppState, key: &str, val: pacode_config::toml::Value, now: Instant) {
     if let Err(e) = pacode_config::update_config_value(&state.paths, key, val.clone()) {
+        log::warn!("failed to write config key '{key}': {e}");
         state.push_toast(
             ToastLevel::Error,
             "Failed to update config".to_string(),
@@ -409,6 +410,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(&entry) = matching.get(state.config_view.selected) {
                 if let Err(e) = pacode_config::remove_config_value(&state.paths, entry.dotted_key) {
+                    log::warn!("failed to remove config key '{}': {e}", entry.dotted_key);
                     state.push_toast(
                         ToastLevel::Error,
                         "Failed to remove config".to_string(),

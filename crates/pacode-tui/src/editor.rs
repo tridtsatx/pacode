@@ -93,15 +93,24 @@ pub fn edit_text_with(
     cmd.args(args);
     cmd.arg(&path);
 
-    let mut child = cmd.spawn().map_err(|e| EditorError::Spawn {
-        cmd: program.to_string(),
-        source: e,
+    log::debug!("spawning editor '{program}' with args {args:?}");
+    let mut child = cmd.spawn().map_err(|e| {
+        log::warn!("failed to spawn editor '{program}': {e}");
+        EditorError::Spawn {
+            cmd: program.to_string(),
+            source: e,
+        }
     })?;
 
-    let status = child.wait().map_err(|e| EditorError::Wait {
-        cmd: program.to_string(),
-        source: e,
+    let status = child.wait().map_err(|e| {
+        log::warn!("failed to wait for editor '{program}': {e}");
+        EditorError::Wait {
+            cmd: program.to_string(),
+            source: e,
+        }
     })?;
+
+    log::debug!("editor '{program}' exited with status {status}");
 
     if !status.success() {
         return Err(EditorError::NonZeroExit {

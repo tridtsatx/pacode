@@ -9,6 +9,12 @@ use serde_json::{Value, json};
 use super::helpers::{cap_output, parse_input};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WaitOutcome};
 
+#[path = "ssh_multiplex.rs"]
+mod ssh_multiplex;
+#[cfg(test)]
+#[path = "ssh_multiplex_tests.rs"]
+mod ssh_multiplex_tests;
+
 pub const NAME: &str = "bash";
 
 pub struct BashTool;
@@ -88,6 +94,8 @@ impl Tool for BashTool {
         };
         ctx.require_permission(perm_title, detail, Some(assessment.level))
             .await?;
+
+        ssh_multiplex::check_and_warn(&args.command, ctx.host.as_ref()).await;
 
         let label = args
             .label

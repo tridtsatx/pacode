@@ -72,10 +72,35 @@ pub fn switch_to_session_slot(state: &mut AppState, slot_idx: usize) -> Vec<Acti
         }
     };
 
+    let session_id_str = match &attach {
+        pacode_types::Attach::Resume { session } => session.as_str(),
+        pacode_types::Attach::New { .. } => "new",
+        pacode_types::Attach::Latest { .. } => "latest",
+    };
+    log::debug!("switch session slot to {slot_idx} (session: {session_id_str})");
+
     vec![
         Action::Send(Request::Detach),
         Action::Send(Request::Attach(attach)),
     ]
+}
+
+pub fn overlay_name(o: &Overlay) -> &'static str {
+    match o {
+        Overlay::EffortPicker { .. } => "EffortPicker",
+        Overlay::ModePicker { .. } => "ModePicker",
+        Overlay::ModelPicker { .. } => "ModelPicker",
+        Overlay::SessionPicker { .. } => "SessionPicker",
+        Overlay::Files { .. } => "Files",
+        Overlay::RailOverlay => "RailOverlay",
+        Overlay::Help => "Help",
+        Overlay::Import(_) => "Import",
+        Overlay::McpPicker { .. } => "McpPicker",
+        Overlay::PluginsPicker { .. } => "PluginsPicker",
+        Overlay::KeysPicker { .. } => "KeysPicker",
+        Overlay::ThemePicker { .. } => "ThemePicker",
+        Overlay::ConfigPicker => "ConfigPicker",
+    }
 }
 
 pub fn handle_esc(state: &mut AppState) -> Vec<Action> {
@@ -102,7 +127,8 @@ pub fn handle_esc(state: &mut AppState) -> Vec<Action> {
         Focus::BgList { .. } => {
             state.focus = Focus::Normal;
         }
-        Focus::Overlay(_) => {
+        Focus::Overlay(ref overlay) => {
+            log::debug!("close overlay: {}", overlay_name(overlay));
             state.focus = Focus::Normal;
         }
         Focus::Normal => {}
@@ -356,6 +382,7 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             && state.transcript.is_at_top()
             && state.can_load_history()
         {
+            log::debug!("requesting history page from scroll at top");
             state.transcript.loading_history = true;
             return vec![Action::LoadHistory];
         }

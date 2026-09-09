@@ -649,12 +649,16 @@ impl Keymap {
                         keymap.set_binding(action, binding);
                     }
                     Err(err) => {
+                        log::warn!(
+                            "rejected invalid key binding from config for '{action_name}': '{spec}' ({err})"
+                        );
                         warnings.push(format!(
                             "invalid binding for '{action_name}': '{spec}' ({err})"
                         ));
                     }
                 },
                 None => {
+                    log::warn!("rejected unknown key action from config: '{action_name}'");
                     warnings.push(format!("unknown key action: '{action_name}'"));
                 }
             }

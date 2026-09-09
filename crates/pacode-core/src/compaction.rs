@@ -82,6 +82,13 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
         (to_summarize, to_keep, hist.summary.clone(), upto_seq)
     };
 
+    log::info!(
+        "compaction starting: session={} agent={} upto_seq={upto_seq} messages_to_summarize={}",
+        session.id,
+        agent.id(),
+        to_summarize.len()
+    );
+
     let summary_messages = build_summary_request(prev_summary.as_deref(), &to_summarize);
     let agent_info = agent.info();
     let route = session
@@ -119,6 +126,13 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
     if summary.is_empty() {
         return Ok(false);
     }
+
+    log::info!(
+        "compaction finished: session={} agent={} upto_seq={upto_seq} summary_len={}",
+        session.id,
+        agent.id(),
+        summary.len()
+    );
 
     {
         let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
