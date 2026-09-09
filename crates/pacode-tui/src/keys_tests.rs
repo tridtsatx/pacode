@@ -316,24 +316,12 @@ fn test_overlay_config_picker_navigation_and_esc() {
     state.input.insert_str("/config");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     handle_key(&mut state, enter, now);
-    assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::ConfigPicker {
-            index: 0,
-            editing_number: None,
-        })
-    );
+    assert_eq!(state.focus, Focus::Overlay(Overlay::ConfigPicker));
 
     // Down key changes index to 1
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     handle_key(&mut state, down, now);
-    assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::ConfigPicker {
-            index: 1,
-            editing_number: None,
-        })
-    );
+    assert_eq!(state.focus, Focus::Overlay(Overlay::ConfigPicker));
 
     // Esc closes it
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -1415,6 +1403,7 @@ fn test_lazy_loader_scrolling() {
         })
         .collect();
     state.transcript.reset(items, true);
+    state.transcript.record_render(30, 10);
     assert!(state.transcript.has_more_history);
     assert!(!state.transcript.loading_history);
     assert_eq!(state.transcript.oldest_seq(), Some(10));
@@ -1439,4 +1428,121 @@ fn test_lazy_loader_scrolling() {
     // Once the daemon reports no older history, further scrolls request nothing
     let actions_after = handle_key(&mut state, home, now);
     assert!(actions_after.is_empty());
+}
+
+#[test]
+fn test_slash_command_enter_completion_and_execution() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+    // 1. `/cl` + Enter leaves `/clear ` in the prompt and sends nothing
+    state.input.insert_str("/cl");
+    let actions1 = handle_key(&mut state, enter, now);
+    assert!(actions1.is_empty(), "First enter must send nothing");
+    assert_eq!(
+        state.input.text, "/clear ",
+        "First enter must complete to '/clear '"
+    );
+    assert_eq!(state.input.cursor, "/clear ".chars().count());
+
+    // 2. A second Enter runs it
+    // Insert a dummy cell to verify /clear clears the transcript
+    state.transcript.cells.push_back(crate::state::Cell {
+        id: 1,
+        kind: crate::state::CellKind::Item(pacode_types::TranscriptKind::User {
+            text: "test".into(),
+        }),
+        version: 0,
+        ts_ms: 0,
+        stats: None,
+    });
+    assert!(!state.transcript.cells.is_empty());
+    let actions2 = handle_key(&mut state, enter, now);
+    assert!(actions2.is_empty());
+    assert!(
+        state.input.is_empty(),
+        "Second enter must submit and clear the prompt"
+    );
+    assert!(
+        state.transcript.cells.is_empty(),
+        "/clear must have executed and cleared cells"
+    );
+
+    // 3. `/clear` + Enter (already complete, one exact match) runs it immediately rather than requiring two presses
+    state.transcript.cells.push_back(crate::state::Cell {
+        id: 2,
+        kind: crate::state::CellKind::Item(pacode_types::TranscriptKind::User {
+            text: "test2".into(),
+        }),
+        version: 0,
+        ts_ms: 0,
+        stats: None,
+    });
+    state.input.insert_str("/clear");
+    let actions_exact = handle_key(&mut state, enter, now);
+    assert!(actions_exact.is_empty());
+    assert!(
+        state.input.is_empty(),
+        "Exact match must run immediately on single Enter"
+    );
+    assert!(
+        state.transcript.cells.is_empty(),
+        "/clear must have executed immediately"
+    );
+
+    // 4. `/x` matching nothing + Enter behaves as today (attempts execution, produces notice)
+    state.input.insert_str("/x");
+    let actions_unknown = handle_key(&mut state, enter, now);
+    assert!(actions_unknown.is_empty());
+    assert!(
+        state.input.is_empty(),
+        "Unknown command is submitted and input is cleared"
+    );
+    // Notice item for unknown command is added to transcript
+    let last_cell = state.transcript.cells.back().expect("cell exists");
+    match &last_cell.kind {
+        crate::state::CellKind::Item(pacode_types::TranscriptKind::Notice { text, .. }) => {
+            assert!(
+                text.contains("Unknown command: /x"),
+                "expected unknown command notice, got: '{text}'"
+            );
+        }
+        other => panic!("expected notice, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_keymap_delete_word_actions() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // 1. alt+delete deletes word forward
+    state.input.insert_str("foo   bar baz");
+    state.input.cursor = 0;
+    let alt_del = KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_del, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "bar baz");
+    assert_eq!(state.input.cursor, 0);
+
+    // 2. ctrl+w deletes word backward via keymap action DeleteWordBack
+    state.input.cursor = state.input.text.chars().count();
+    let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_w, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "bar ");
+    assert_eq!(state.input.cursor, 4);
+
+    // 3. Vim-mode path is unaffected
+    state.config.ui.vim = true;
+    state.vim.mode = crate::state::vim::VimMode::Normal;
+    state.input.text = "hello world".to_string();
+    state.input.cursor = 0;
+
+    // Normal mode 'w' motion moves cursor forward, vim handles it
+    let char_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
+    handle_key(&mut state, char_w, now);
+    assert_eq!(state.input.cursor, 6);
+    assert_eq!(state.input.text, "hello world");
 }

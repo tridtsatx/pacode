@@ -26,12 +26,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         Focus::Overlay(Overlay::ModelPicker { query, index }) => {
             draw_model(frame, area, state, query, *index, opts);
         }
-        Focus::Overlay(Overlay::ConfigPicker {
-            index,
-            editing_number,
-        }) => {
-            draw_config(frame, area, state, *index, editing_number.as_deref(), opts);
-        }
         Focus::Overlay(Overlay::ThemePicker { .. }) => {
             crate::ui::theme_picker::draw(frame, area, state, opts);
         }
@@ -341,115 +335,6 @@ fn draw_model(
     // Set cursor on query input
     let cursor_x = area.x + 2 + (query.len() as u16).min(area.width.saturating_sub(3));
     frame.set_cursor_position((cursor_x, area.y + 1));
-}
-
-fn draw_config(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    selected: usize,
-    editing_number: Option<&str>,
-    opts: &RenderOptions,
-) {
-    let mut lines = Vec::new();
-
-    // 0: Title
-    lines.push(Line::from(Span::styled(
-        "Quick Settings",
-        opts.theme.bold.patch(opts.theme.accent),
-    )));
-
-    let model_val = state
-        .model()
-        .map(|m| m.to_string())
-        .or_else(|| state.config.provider.default.clone())
-        .unwrap_or_else(|| "default".to_string());
-    let effort_val = state.effort().as_str().to_string();
-    let mode_val = state.mode().as_str().to_string();
-    let mouse_val = state.config.ui.mouse.to_string();
-    let ascii_val = state.config.ui.ascii_only.to_string();
-    let hints_effort_val = state.config.ui.hints.effort.to_string();
-    let color_val = state.config.ui.color.clone();
-    let yield_val = state.config.exec.yield_after_secs.to_string();
-    let agents_val = state.config.agents.max_live.to_string();
-    let idle_val = state.config.daemon.idle_timeout_secs.to_string();
-
-    let items = [
-        ("model", model_val),
-        ("effort", effort_val),
-        ("mode", mode_val),
-        ("ui.mouse", mouse_val),
-        ("ui.ascii_only", ascii_val),
-        ("ui.hints.effort", hints_effort_val),
-        ("ui.color", color_val),
-        ("exec.yield_after_secs", yield_val),
-        ("agents.max_live", agents_val),
-        ("daemon.idle_timeout_secs", idle_val),
-    ];
-
-    let mut edit_cursor: Option<(u16, u16)> = None;
-
-    for (i, (key, val)) in items.iter().enumerate() {
-        if lines.len() >= (area.height as usize).saturating_sub(1) {
-            break;
-        }
-
-        let is_sel = i == selected;
-        if is_sel {
-            if let Some(buf) = editing_number {
-                let line_y = area.y + lines.len() as u16;
-                let cursor_x = area.x + 6 + key.len() as u16 + buf.len() as u16;
-                edit_cursor = Some((cursor_x, line_y));
-                lines.push(Line::from(vec![
-                    Span::styled("▸ ", opts.theme.accent),
-                    Span::styled(*key, opts.theme.bold),
-                    Span::raw(": [ "),
-                    Span::styled(buf, opts.theme.accent.patch(opts.theme.bold)),
-                    Span::raw(" ]"),
-                ]));
-            } else {
-                let text = format!("▸ {key}: {val}");
-                let padded = format!(
-                    "{:<width$}",
-                    text,
-                    width = (area.width as usize).saturating_sub(1)
-                );
-                lines.push(Line::from(Span::styled(
-                    padded,
-                    opts.theme
-                        .selected_bg
-                        .patch(opts.theme.bold)
-                        .patch(opts.theme.accent),
-                )));
-            }
-        } else {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(*key, opts.theme.fg),
-                Span::raw(": "),
-                Span::styled(val, opts.theme.dim),
-            ]));
-        }
-    }
-
-    while lines.len() < (area.height as usize).saturating_sub(1) {
-        lines.push(Line::default());
-    }
-
-    let hint = if editing_number.is_some() {
-        "enter confirm · esc cancel"
-    } else if state.config.ui.ascii_only {
-        "^/v select . enter/<-/-> edit . esc close"
-    } else {
-        "↑/↓ select · enter/←/→ edit · esc close"
-    };
-    lines.push(Line::from(Span::styled(hint, opts.theme.faint)));
-
-    frame.render_widget(Paragraph::new(lines), area);
-
-    if let Some((cx, cy)) = edit_cursor {
-        frame.set_cursor_position((cx, cy));
-    }
 }
 
 #[cfg(test)]

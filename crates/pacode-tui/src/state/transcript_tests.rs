@@ -340,7 +340,8 @@ fn test_lazy_loader_prepend_keeps_anchored_cell_position() {
     t.reset(initial_items, true);
     let viewport = 10;
     // Scroll to the top (max_scroll = 20 - 10 = 10)
-    t.scroll_by(100, 20, viewport);
+    t.record_render(20, viewport);
+    t.scroll_by(100);
     assert_eq!(t.scroll_from_bottom, 10);
 
     // Anchor cell is cell id 10 at the top of the viewport
@@ -374,4 +375,111 @@ fn test_lazy_loader_prepend_keeps_anchored_cell_position() {
     let pos_mid_after = t.cell_screen_position(mid_id, viewport);
     assert_eq!(pos_mid_after, pos_mid_before);
     assert_eq!(pos_mid_after, Some(5));
+}
+
+#[test]
+fn test_scroll_fewer_lines_than_viewport_does_not_move() {
+    let mut t = Transcript::new(100);
+    t.record_render(10, 25);
+    assert_eq!(t.scroll_from_bottom, 0);
+
+    t.scroll_by(5);
+    assert_eq!(t.scroll_from_bottom, 0);
+
+    t.scroll_by(100);
+    assert_eq!(t.scroll_from_bottom, 0);
+
+    t.scroll_to_top();
+    assert_eq!(t.scroll_from_bottom, 0);
+}
+
+#[test]
+fn test_scroll_up_stops_exactly_at_first_line_and_repeated_presses_do_not_move() {
+    let mut t = Transcript::new(100);
+    // 50 total lines, 20 viewport -> max scroll is 30
+    t.record_render(50, 20);
+    assert_eq!(t.scroll_from_bottom, 0);
+
+    t.scroll_by(10);
+    assert_eq!(t.scroll_from_bottom, 10);
+
+    t.scroll_by(15);
+    assert_eq!(t.scroll_from_bottom, 25);
+
+    // Reaches exact ceiling (30)
+    t.scroll_by(10);
+    assert_eq!(t.scroll_from_bottom, 30);
+
+    // Repeated presses do not move further
+    t.scroll_by(5);
+    assert_eq!(t.scroll_from_bottom, 30);
+
+    t.scroll_by(1000);
+    assert_eq!(t.scroll_from_bottom, 30);
+
+    t.scroll_to_top();
+    assert_eq!(t.scroll_from_bottom, 30);
+}
+
+#[test]
+fn test_is_at_top_true_only_when_oldest_line_is_on_screen() {
+    let mut t = Transcript::new(100);
+
+    // Before first draw, rendered total is unknown: is_at_top must be false
+    assert!(!t.is_at_top());
+
+    // 50 total lines, 20 viewport -> max scroll is 30
+    t.record_render(50, 20);
+    assert!(!t.is_at_top());
+
+    t.scroll_by(15);
+    assert!(!t.is_at_top());
+
+    t.scroll_by(14);
+    // At scroll 29, line 1 is visible at top, but oldest line (line 0) is not yet
+    assert_eq!(t.scroll_from_bottom, 29);
+    assert!(!t.is_at_top());
+
+    // At scroll 30, line 0 is on screen
+    t.scroll_by(1);
+    assert_eq!(t.scroll_from_bottom, 30);
+    assert!(t.is_at_top());
+
+    // With fewer lines than viewport, all lines fit on screen so oldest line is on screen
+    let mut t_small = Transcript::new(100);
+    t_small.record_render(10, 25);
+    assert!(t_small.is_at_top());
+
+    // With 0 lines rendered, is_at_top is false
+    let mut t_empty = Transcript::new(100);
+    t_empty.record_render(0, 25);
+    assert!(!t_empty.is_at_top());
+}
+
+#[test]
+fn test_scroll_down_always_returns_to_bottom() {
+    let mut t = Transcript::new(100);
+    t.record_render(50, 20);
+    t.scroll_to_top();
+    assert_eq!(t.scroll_from_bottom, 30);
+
+    t.scroll_by(-10);
+    assert_eq!(t.scroll_from_bottom, 20);
+
+    t.scroll_by(-15);
+    assert_eq!(t.scroll_from_bottom, 5);
+
+    // Negative scroll past 0 clamps to 0
+    t.scroll_by(-10);
+    assert_eq!(t.scroll_from_bottom, 0);
+
+    // Repeated downward scrolls remain at 0
+    t.scroll_by(-5);
+    assert_eq!(t.scroll_from_bottom, 0);
+
+    // scroll_to_bottom returns to 0
+    t.scroll_by(20);
+    assert_eq!(t.scroll_from_bottom, 20);
+    t.scroll_to_bottom();
+    assert_eq!(t.scroll_from_bottom, 0);
 }

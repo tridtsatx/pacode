@@ -459,6 +459,14 @@ fn test_keymap_action_for() {
         Some(Action::SessionPicker)
     );
     assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT)),
+        Some(Action::DeleteWordForward)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+        Some(Action::DeleteWordBack)
+    );
+    assert_eq!(
         keymap.action_for(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
         None
     );

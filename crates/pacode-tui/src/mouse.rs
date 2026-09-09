@@ -42,9 +42,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
         MouseEventKind::ScrollDown => {
             let delta = -3;
             if layout.dialog.contains((col, row).into()) {
-                state
-                    .transcript
-                    .scroll_by(delta, 1000, layout.dialog.height as usize);
+                state.transcript.scroll_by(delta);
             } else if layout.input.contains((col, row).into()) {
                 let max_scroll = state
                     .input
@@ -54,10 +52,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
                 state.input.input_scroll = (state.input.input_scroll + 1).min(max_scroll);
             } else if let Some(panel) = layout.panel {
                 if panel.contains((col, row).into()) {
-                    state
-                        .panel
-                        .agent_transcript
-                        .scroll_by(delta, 1000, panel.height as usize);
+                    state.panel.agent_transcript.scroll_by(delta);
                 }
             } else if layout.rail.contains((col, row).into()) {
                 handle_navigate_down(state);
@@ -66,9 +61,8 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
         MouseEventKind::ScrollUp => {
             let delta = 3;
             if layout.dialog.contains((col, row).into()) {
-                let viewport = layout.dialog.height as usize;
-                state.transcript.scroll_by(delta, 1000, viewport);
-                if state.transcript.is_at_top(1000, viewport) && state.can_load_history() {
+                state.transcript.scroll_by(delta);
+                if state.transcript.is_at_top() && state.can_load_history() {
                     state.transcript.loading_history = true;
                     return vec![Action::LoadHistory];
                 }
@@ -76,10 +70,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
                 state.input.input_scroll = state.input.input_scroll.saturating_sub(1);
             } else if let Some(panel) = layout.panel {
                 if panel.contains((col, row).into()) {
-                    state
-                        .panel
-                        .agent_transcript
-                        .scroll_by(delta, 1000, panel.height as usize);
+                    state.panel.agent_transcript.scroll_by(delta);
                 }
             } else if layout.rail.contains((col, row).into()) {
                 handle_navigate_up(state);

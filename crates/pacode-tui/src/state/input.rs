@@ -9,6 +9,10 @@ use unicode_segmentation::UnicodeSegmentation;
 #[path = "input_tests.rs"]
 mod input_tests;
 
+#[cfg(test)]
+#[path = "input_delete_tests.rs"]
+mod input_delete_tests;
+
 #[derive(Default)]
 pub struct InputState {
     /// The text being edited (may contain newlines).
@@ -156,6 +160,37 @@ impl InputState {
             let end_byte = char_to_byte_index(&self.text, self.cursor);
             self.text.replace_range(start_byte..end_byte, "");
             self.cursor = i;
+            self.at_closed = false;
+            self.bash_complete_closed = false;
+        }
+    }
+
+    /// Delete the word after the cursor (alt+delete).
+    pub fn delete_word_forward(&mut self) {
+        let total_chars = self.text.chars().count();
+        if self.cursor < total_chars {
+            let chars: Vec<char> = self.text.chars().collect();
+            let mut i = self.cursor;
+            if !chars[i].is_whitespace() {
+                while i < chars.len() && !chars[i].is_whitespace() {
+                    i += 1;
+                }
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+            } else {
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                while i < chars.len() && !chars[i].is_whitespace() {
+                    i += 1;
+                }
+            }
+            let start_byte = char_to_byte_index(&self.text, self.cursor);
+            let end_byte = char_to_byte_index(&self.text, i);
+            self.text.replace_range(start_byte..end_byte, "");
+            self.at_closed = false;
+            self.bash_complete_closed = false;
         }
     }
 

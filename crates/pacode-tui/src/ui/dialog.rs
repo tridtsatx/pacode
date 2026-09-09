@@ -13,6 +13,10 @@ use pacode_types::{ToastLevel, TranscriptKind};
 
 use crate::state::transcript::{CellKind, Transcript};
 
+#[cfg(test)]
+#[path = "dialog_tests.rs"]
+mod dialog_tests;
+
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -59,11 +63,13 @@ pub fn draw(
     let total_lines: usize = cell_lines.iter().map(|l| l.len()).sum();
     let viewport = area.height as usize;
 
+    transcript.record_render(total_lines, viewport);
+
     let (start_line, is_scrolled_up) = if total_lines <= viewport {
         (0, false)
     } else {
         let max_scroll = total_lines.saturating_sub(viewport);
-        let scroll = transcript.scroll_from_bottom.min(max_scroll);
+        let scroll = transcript.scroll_from_bottom;
         let start = max_scroll.saturating_sub(scroll);
         (start, scroll > 0)
     };
@@ -281,6 +287,12 @@ pub(crate) fn render_item(
                 Span::styled(rest.to_string(), opts.theme.dim),
             ];
 
+            let exit_code = if *status == ToolStatus::Error {
+                parse_exit_code(preview)
+            } else {
+                None
+            };
+
             match status {
                 ToolStatus::Running => {
                     spans.push(Span::raw(" "));
@@ -306,14 +318,16 @@ pub(crate) fn render_item(
                 }
                 ToolStatus::Error => {
                     spans.push(Span::raw(" "));
-                    if let Some(ms) = duration_ms {
-                        spans.push(Span::styled(
-                            format!("fail {}", pacode_types::time::format_duration_ms(*ms)),
-                            opts.theme.red,
-                        ));
-                    } else {
-                        spans.push(Span::styled("fail", opts.theme.red));
+                    let mut label = match duration_ms {
+                        Some(ms) => {
+                            format!("fail {}", pacode_types::time::format_duration_ms(*ms))
+                        }
+                        None => "fail".to_string(),
+                    };
+                    if let Some(code) = exit_code {
+                        label.push_str(&format!(" · exit {code}"));
                     }
+                    spans.push(Span::styled(label, opts.theme.red));
                 }
                 ToolStatus::Backgrounded => {
                     spans.push(Span::raw(" "));
@@ -329,6 +343,11 @@ pub(crate) fn render_item(
             }
             out.push(Line::from(spans));
 
+            let is_exit_line = |l: &str| {
+                let t = l.trim();
+                t.starts_with("[exit code ") && t.ends_with(']')
+            };
+
             if !preview.is_empty() {
                 if preview.starts_with("--- ") || preview.contains("\n+++ ") {
                     let diff_lines = render_diff(preview, opts);
@@ -338,14 +357,21 @@ pub(crate) fn render_item(
                         out.push(Line::from(spans));
                     }
                 } else {
-                    for pl in preview.lines().take(6) {
-                        out.push(Line::from(vec![
-                            Span::styled("  │ ", opts.theme.dim),
-                            Span::styled(
-                                truncate_to_width(pl, (width as usize).saturating_sub(4), true),
-                                opts.theme.faint,
-                            ),
-                        ]));
+                    let content_lines: Vec<&str> = preview
+                        .lines()
+                        .filter(|l| !(*status == ToolStatus::Error && is_exit_line(l)))
+                        .collect();
+
+                    if content_lines.iter().any(|l| !l.trim().is_empty()) {
+                        for pl in content_lines.iter().take(6) {
+                            out.push(Line::from(vec![
+                                Span::styled("  │ ", opts.theme.dim),
+                                Span::styled(
+                                    truncate_to_width(pl, (width as usize).saturating_sub(4), true),
+                                    opts.theme.faint,
+                                ),
+                            ]));
+                        }
                     }
                 }
             }
@@ -433,6 +459,27 @@ pub(crate) fn render_item(
             out
         }
     }
+}
+
+pub(crate) fn parse_exit_code(preview: &str) -> Option<i32> {
+    for line in preview.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("[exit code ")
+            && let Some(num_str) = rest.strip_suffix(']')
+            && let Ok(code) = num_str.trim().parse::<i32>()
+        {
+            return Some(code);
+        }
+    }
+    if let Some(start) = preview.find("[exit code ") {
+        let rest = &preview[start + "[exit code ".len()..];
+        if let Some(end) = rest.find(']')
+            && let Ok(code) = rest[..end].trim().parse::<i32>()
+        {
+            return Some(code);
+        }
+    }
+    None
 }
 
 fn render_diff_stat(diff: &DiffStat, opts: &RenderOptions) -> Vec<Span<'static>> {

@@ -55,7 +55,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: Cow::Borrowed("config"),
         usage: Cow::Borrowed("/config"),
-        help: Cow::Borrowed("quick settings"),
+        help: Cow::Borrowed("settings"),
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
@@ -349,10 +349,8 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             }
         }
         "config" => {
-            state.focus = Focus::Overlay(Overlay::ConfigPicker {
-                index: 0,
-                editing_number: None,
-            });
+            state.config_view = crate::ui::config_view::ConfigViewState::new(&state.config);
+            state.focus = Focus::Overlay(Overlay::ConfigPicker);
             state.dirty = true;
             vec![]
         }

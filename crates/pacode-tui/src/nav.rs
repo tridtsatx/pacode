@@ -185,7 +185,7 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
         | Focus::Overlay(
             Overlay::Files { .. }
             | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker { .. }
+            | Overlay::ConfigPicker
             | Overlay::McpPicker { .. }
             | Overlay::PluginsPicker { .. }
             | Overlay::Import(_)
@@ -231,7 +231,7 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
             | Overlay::SessionPicker { .. }
             | Overlay::Files { .. }
             | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker { .. }
+            | Overlay::ConfigPicker
             | Overlay::McpPicker { .. }
             | Overlay::PluginsPicker { .. }
             | Overlay::Import(_)

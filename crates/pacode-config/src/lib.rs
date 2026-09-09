@@ -11,6 +11,7 @@ pub mod display;
 pub mod logging;
 pub mod paths;
 pub mod prefs;
+pub mod registry;
 pub mod theme;
 
 pub use display::detect_refresh_hz;

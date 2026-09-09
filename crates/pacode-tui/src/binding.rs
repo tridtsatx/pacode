@@ -26,6 +26,8 @@ pub enum Action {
     Submit,
     Newline,
     ClearInput,
+    DeleteWordForward,
+    DeleteWordBack,
     StopAgent,
     KillTask,
     CycleMode,
@@ -68,6 +70,8 @@ impl Action {
             Self::Submit => "submit",
             Self::Newline => "newline",
             Self::ClearInput => "clear_input",
+            Self::DeleteWordForward => "delete_word_forward",
+            Self::DeleteWordBack => "delete_word_back",
             Self::StopAgent => "stop_agent",
             Self::KillTask => "kill_task",
             Self::CycleMode => "cycle_mode",
@@ -110,6 +114,8 @@ impl Action {
             Self::Submit => "Submit prompt / open panel",
             Self::Newline => "Insert newline into prompt",
             Self::ClearInput => "Clear input prompt",
+            Self::DeleteWordForward => "Delete word forward",
+            Self::DeleteWordBack => "Delete word backward",
             Self::StopAgent => "Stop running agent",
             Self::KillTask => "Kill background task",
             Self::CycleMode => "Cycle permission mode",
@@ -332,6 +338,8 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("submit", Action::Submit),
     ("newline", Action::Newline),
     ("clear_input", Action::ClearInput),
+    ("delete_word_forward", Action::DeleteWordForward),
+    ("delete_word_back", Action::DeleteWordBack),
     ("stop_agent", Action::StopAgent),
     ("kill_task", Action::KillTask),
     ("cycle_mode", Action::CycleMode),
@@ -480,6 +488,20 @@ impl Keymap {
             Action::ClearInput,
             vec![Binding {
                 code: KeyCode::Char('u'),
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::DeleteWordForward,
+            vec![Binding {
+                code: KeyCode::Delete,
+                mods: KeyModifiers::ALT,
+            }],
+        );
+        bindings.insert(
+            Action::DeleteWordBack,
+            vec![Binding {
+                code: KeyCode::Char('w'),
                 mods: KeyModifiers::CONTROL,
             }],
         );

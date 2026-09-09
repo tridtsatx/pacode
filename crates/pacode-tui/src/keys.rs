@@ -188,17 +188,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         }
 
-        if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-            let query = &state.input.text[1..];
-            let matches = commands::matching(query);
-            if !matches.is_empty() {
-                let selected = state.input.slash_index % matches.len();
-                let cmd = &matches[selected];
-                let name = &cmd.name;
-                state.input.text = format!("/{name} ");
-                state.input.cursor = state.input.text.chars().count();
-                state.input.slash_index = 0;
-            }
+        if complete_slash_command(state) {
+            return vec![];
         }
         return vec![];
     }
@@ -382,6 +373,18 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         }
 
+        if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
+            let query = &state.input.text[1..];
+            let is_complete = commands::find_command(query).is_some();
+            if !is_complete {
+                let matches = commands::matching(query);
+                if !matches.is_empty() {
+                    complete_slash_command(state);
+                    return vec![];
+                }
+            }
+        }
+
         if !state.input.is_empty() {
             return submit_prompt(state);
         }
@@ -453,7 +456,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             | Focus::Overlay(
                 Overlay::Files { .. }
                 | Overlay::ModePicker { .. }
-                | Overlay::ConfigPicker { .. }
+                | Overlay::ConfigPicker
                 | Overlay::McpPicker { .. }
                 | Overlay::PluginsPicker { .. }
                 | Overlay::Import(_)
@@ -559,8 +562,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
+    if action == Some(KeyAction::DeleteWordBack) {
         state.input.delete_word();
+        return vec![];
+    }
+
+    if action == Some(KeyAction::DeleteWordForward) {
+        state.input.delete_word_forward();
         return vec![];
     }
 
@@ -580,6 +588,23 @@ pub use crate::nav::{
     handle_esc, handle_follow, handle_navigate_down, handle_navigate_up, select_agent_at_index,
     select_agent_by_id, selectable_agents, switch_to_session_slot,
 };
+
+fn complete_slash_command(state: &mut AppState) -> bool {
+    if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
+        let query = &state.input.text[1..];
+        let matches = commands::matching(query);
+        if !matches.is_empty() {
+            let selected = state.input.slash_index % matches.len();
+            let cmd = &matches[selected];
+            let name = &cmd.name;
+            state.input.text = format!("/{name} ");
+            state.input.cursor = state.input.text.chars().count();
+            state.input.slash_index = 0;
+            return true;
+        }
+    }
+    false
+}
 
 fn submit_prompt(state: &mut AppState) -> Vec<Action> {
     if !state.input.is_empty() {
@@ -622,9 +647,9 @@ fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             }
         }
         match action {
-            KeyAction::ScrollUp => state.panel.agent_transcript.scroll_by(10, 100, 20),
-            KeyAction::ScrollDown => state.panel.agent_transcript.scroll_by(-10, 100, 20),
-            KeyAction::ScrollTop => state.panel.agent_transcript.scroll_by(1000, 100, 20),
+            KeyAction::ScrollUp => state.panel.agent_transcript.scroll_by(10),
+            KeyAction::ScrollDown => state.panel.agent_transcript.scroll_by(-10),
+            KeyAction::ScrollTop => state.panel.agent_transcript.scroll_to_top(),
             KeyAction::ScrollBottom => state.panel.agent_transcript.scroll_to_bottom(),
             KeyAction::FollowAgent
             | KeyAction::FilesOverlay
@@ -636,6 +661,8 @@ fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::Submit
             | KeyAction::Newline
             | KeyAction::ClearInput
+            | KeyAction::DeleteWordForward
+            | KeyAction::DeleteWordBack
             | KeyAction::StopAgent
             | KeyAction::KillTask
             | KeyAction::CycleMode
@@ -661,9 +688,9 @@ fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
         }
     } else {
         match action {
-            KeyAction::ScrollUp => state.transcript.scroll_by(10, 1000, 25),
-            KeyAction::ScrollDown => state.transcript.scroll_by(-10, 1000, 25),
-            KeyAction::ScrollTop => state.transcript.scroll_by(10000, 1000, 25),
+            KeyAction::ScrollUp => state.transcript.scroll_by(10),
+            KeyAction::ScrollDown => state.transcript.scroll_by(-10),
+            KeyAction::ScrollTop => state.transcript.scroll_to_top(),
             KeyAction::ScrollBottom => state.transcript.scroll_to_bottom(),
             KeyAction::FollowAgent
             | KeyAction::FilesOverlay
@@ -675,6 +702,8 @@ fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::Submit
             | KeyAction::Newline
             | KeyAction::ClearInput
+            | KeyAction::DeleteWordForward
+            | KeyAction::DeleteWordBack
             | KeyAction::StopAgent
             | KeyAction::KillTask
             | KeyAction::CycleMode
@@ -699,7 +728,7 @@ fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::SelectSession9 => {}
         }
         if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
-            && state.transcript.is_at_top(1000, 25)
+            && state.transcript.is_at_top()
             && state.can_load_history()
         {
             state.transcript.loading_history = true;

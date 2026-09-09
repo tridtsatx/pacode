@@ -4,6 +4,7 @@
 //! Widgets may mutate render caches inside the state but nothing else.
 
 pub mod anim;
+pub mod config_view;
 pub mod dialog;
 pub mod files;
 pub mod footer;

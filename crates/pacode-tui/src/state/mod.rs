@@ -70,10 +70,9 @@ pub enum Overlay {
     ModePicker {
         index: usize,
     },
-    ConfigPicker {
-        index: usize,
-        editing_number: Option<String>,
-    },
+    /// The settings view. Its state lives in `AppState::config_view`; the
+    /// variant only says which overlay is open.
+    ConfigPicker,
     ThemePicker {
         index: usize,
         original_theme: Box<pacode_render::Theme>,
@@ -155,6 +154,7 @@ pub struct AppState {
     pub input: InputState,
     pub vim: VimState,
     pub focus: Focus,
+    pub config_view: crate::ui::config_view::ConfigViewState,
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
@@ -238,6 +238,7 @@ impl AppState {
             input: InputState::default(),
             vim: VimState::default(),
             focus: Focus::Normal,
+            config_view: crate::ui::config_view::ConfigViewState::default(),
             toasts: VecDeque::new(),
             models: Vec::new(),
             sessions: Vec::new(),
@@ -441,7 +442,6 @@ impl AppState {
             Focus::Overlay(Overlay::EffortPicker { .. })
                 | Focus::Overlay(Overlay::ModePicker { .. })
                 | Focus::Overlay(Overlay::ModelPicker { .. })
-                | Focus::Overlay(Overlay::ConfigPicker { .. })
                 | Focus::Overlay(Overlay::ThemePicker { .. })
         )
     }
@@ -451,7 +451,6 @@ impl AppState {
             Focus::Overlay(Overlay::EffortPicker { .. })
             | Focus::Overlay(Overlay::ModePicker { .. }) => 7,
             Focus::Overlay(Overlay::ModelPicker { .. })
-            | Focus::Overlay(Overlay::ConfigPicker { .. })
             | Focus::Overlay(Overlay::ThemePicker { .. }) => 12,
             _ => 0,
         }

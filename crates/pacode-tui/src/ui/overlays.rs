@@ -68,10 +68,12 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::KeysPicker { index, capturing } => {
                 crate::ui::keys_overlay::draw(frame, area, *index, *capturing, state, opts);
             }
+            Overlay::ConfigPicker => {
+                crate::ui::config_view::draw(frame, area, state, opts);
+            }
             Overlay::ModelPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker { .. }
             | Overlay::ThemePicker { .. } => {}
         },
         Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } => {}

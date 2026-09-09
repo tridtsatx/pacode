@@ -49,6 +49,10 @@ pub struct Transcript {
     pub max_cells: usize,
     /// Scroll offset in rendered lines from the bottom; 0 = follow the tail.
     pub scroll_from_bottom: usize,
+    /// Total rendered line count recorded by the most recent draw. `None` before first draw.
+    pub rendered_lines: Option<usize>,
+    /// Viewport height recorded by the most recent draw. `None` before first draw.
+    pub viewport_height: Option<usize>,
     pub cache: LineCache,
     /// Streaming reveal buffer for the live assistant cell (`live_cell`).
     pub stream: Option<StreamBuffer>,
@@ -70,6 +74,8 @@ impl Transcript {
             header_version: 0,
             max_cells,
             scroll_from_bottom: 0,
+            rendered_lines: None,
+            viewport_height: None,
             cache: LineCache::new(20_000),
             stream: None,
             live_cell: None,
@@ -88,6 +94,8 @@ impl Transcript {
         self.pending_final = None;
         self.scroll_from_bottom = 0;
         self.loading_history = false;
+        self.rendered_lines = None;
+        self.viewport_height = None;
 
         // The daemon already bounds what it sends to `session.history_page` items and
         // reports whether anything older exists, so the client keeps the page whole
@@ -375,11 +383,31 @@ impl Transcript {
         self.pending_final.is_some()
     }
 
-    pub fn scroll_by(&mut self, delta: i32, total_lines: usize, viewport: usize) {
+    /// Record the rendered line count and viewport height from the most recent draw,
+    /// clamping `scroll_from_bottom` so the view can never sit past the top.
+    pub fn record_render(&mut self, total_lines: usize, viewport: usize) {
+        self.rendered_lines = Some(total_lines);
+        self.viewport_height = Some(viewport);
         let max_scroll = total_lines.saturating_sub(viewport);
+        self.scroll_from_bottom = self.scroll_from_bottom.min(max_scroll);
+    }
+
+    pub fn scroll_by(&mut self, delta: i32) {
+        let max_scroll = match (self.rendered_lines, self.viewport_height) {
+            (Some(total), Some(vp)) => total.saturating_sub(vp),
+            _ => 0,
+        };
         let new_scroll =
             (self.scroll_from_bottom as i64 + delta as i64).clamp(0, max_scroll as i64);
         self.scroll_from_bottom = new_scroll as usize;
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        let max_scroll = match (self.rendered_lines, self.viewport_height) {
+            (Some(total), Some(vp)) => total.saturating_sub(vp),
+            _ => 0,
+        };
+        self.scroll_from_bottom = max_scroll;
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -390,9 +418,17 @@ impl Transcript {
         self.cells.front().map(|c| c.id)
     }
 
-    pub fn is_at_top(&self, total_lines: usize, viewport: usize) -> bool {
-        let max_scroll = total_lines.saturating_sub(viewport);
-        self.scroll_from_bottom >= max_scroll
+    pub fn is_at_top(&self) -> bool {
+        match (self.rendered_lines, self.viewport_height) {
+            (Some(total), Some(vp)) => {
+                if total == 0 {
+                    return false;
+                }
+                let max_scroll = total.saturating_sub(vp);
+                self.scroll_from_bottom >= max_scroll
+            }
+            _ => false,
+        }
     }
 
     /// Screen position (0-based line offset from the top of the viewport) for a cell.
