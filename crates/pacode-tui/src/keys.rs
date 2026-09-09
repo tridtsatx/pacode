@@ -126,7 +126,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 4. Escape: peel layers one by one
     if key.code == KeyCode::Esc {
-        return handle_esc(state);
+        if state.config.ui.vim && state.focus == Focus::Normal {
+            // Handled by vim::handle on the normal prompt
+        } else {
+            return handle_esc(state);
+        }
     }
 
     // 5. Follow shortcut: alt+f
@@ -181,8 +185,17 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
     }
 
+    // 8.5 Vim mode handling on normal prompt
+    if state.config.ui.vim && state.focus == Focus::Normal {
+        match crate::state::vim::handle(&mut state.vim, &mut state.input, key) {
+            crate::state::vim::VimEffect::Consumed => return vec![],
+            crate::state::vim::VimEffect::Submit => return submit_prompt(state),
+            crate::state::vim::VimEffect::PassThrough => {}
+        }
+    }
+
     // 9. Single keys in empty prompt: '.', 's', 'k'
-    if state.input.is_empty() {
+    if state.input.is_empty() && (!state.config.ui.vim || state.focus != Focus::Normal) {
         match key.code {
             KeyCode::Char('.') => {
                 state.focus = Focus::BgList { index: 0 };
@@ -224,11 +237,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
 
         if !state.input.is_empty() {
-            let text = state.input.take();
-            if text.starts_with('/') {
-                return commands::execute(state, &text);
-            }
-            return vec![Action::Send(Request::UserMessage { text })];
+            return submit_prompt(state);
         }
 
         // Enter with empty prompt: open selection in panel
@@ -314,7 +323,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | Overlay::PluginsPicker { .. }
                 | Overlay::Import(_)
                 | Overlay::RailOverlay
-                | Overlay::Help,
+                | Overlay::Help
+                | Overlay::ThemePicker { .. },
             ) => {}
         }
         return vec![];
@@ -388,6 +398,17 @@ pub fn selectable_agents(state: &AppState) -> Vec<AgentId> {
         }
     }
     list
+}
+
+fn submit_prompt(state: &mut AppState) -> Vec<Action> {
+    if !state.input.is_empty() {
+        let text = state.input.take();
+        if text.starts_with('/') {
+            return commands::execute(state, &text);
+        }
+        return vec![Action::Send(Request::UserMessage { text })];
+    }
+    vec![]
 }
 
 fn handle_esc(state: &mut AppState) -> Vec<Action> {
@@ -504,7 +525,8 @@ fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
             | Overlay::PluginsPicker { .. }
             | Overlay::Import(_)
             | Overlay::RailOverlay
-            | Overlay::Help,
+            | Overlay::Help
+            | Overlay::ThemePicker { .. },
         ) => {
             // Anywhere -> select first agent
             if !agents.is_empty() {

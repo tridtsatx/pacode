@@ -269,6 +269,161 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
+        Focus::Overlay(Overlay::ThemePicker {
+            index,
+            original_theme,
+            original_name,
+            step,
+            user_themes,
+        }) => {
+            let truecolor = match state.config.ui.color.as_str() {
+                "ansi" => false,
+                "truecolor" | "24bit" => true,
+                _ => pacode_render::detect_truecolor(),
+            };
+            let builtins = pacode_render::builtin_palettes();
+
+            match step {
+                crate::state::ThemePickerStep::SelectTheme => {
+                    let total_rows = builtins.len() + user_themes.len() + 1; // +1 for "Create new one…"
+
+                    let mut moved = false;
+                    if is_overlay_up(&key) && *index > 0 {
+                        *index -= 1;
+                        moved = true;
+                    }
+                    if is_overlay_down(&key) && *index + 1 < total_rows {
+                        *index += 1;
+                        moved = true;
+                    }
+
+                    if moved {
+                        if *index < builtins.len() {
+                            let p = &builtins[*index];
+                            let theme_cfg = pacode_types::ThemeConfig {
+                                name: p.name.clone(),
+                                overrides: state.config.theme.overrides.clone(),
+                            };
+                            let (pal, _) = pacode_config::load_theme(&state.paths, &theme_cfg);
+                            state.theme = pacode_render::Theme::from_palette(&pal, truecolor);
+                        } else if *index < builtins.len() + user_themes.len() {
+                            let u_name = &user_themes[*index - builtins.len()];
+                            let theme_cfg = pacode_types::ThemeConfig {
+                                name: u_name.clone(),
+                                overrides: state.config.theme.overrides.clone(),
+                            };
+                            let (pal, _) = pacode_config::load_theme(&state.paths, &theme_cfg);
+                            state.theme = pacode_render::Theme::from_palette(&pal, truecolor);
+                        } else {
+                            state.theme = (**original_theme).clone();
+                        }
+                        return vec![];
+                    }
+
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.theme = (**original_theme).clone();
+                            state.config.theme.name = original_name.clone();
+                            state.focus = Focus::Normal;
+                        }
+                        KeyCode::Enter => {
+                            if *index < builtins.len() {
+                                let name = builtins[*index].name.clone();
+                                state.config.theme.name = name.clone();
+                                let _ = pacode_config::update_config_value(
+                                    &state.paths,
+                                    "theme.name",
+                                    pacode_config::toml::Value::String(name),
+                                );
+                                state.focus = Focus::Normal;
+                            } else if *index < builtins.len() + user_themes.len() {
+                                let name = user_themes[*index - builtins.len()].clone();
+                                state.config.theme.name = name.clone();
+                                let _ = pacode_config::update_config_value(
+                                    &state.paths,
+                                    "theme.name",
+                                    pacode_config::toml::Value::String(name),
+                                );
+                                state.focus = Focus::Normal;
+                            } else {
+                                *step = crate::state::ThemePickerStep::SelectBase;
+                                *index = 0;
+                                let p = &builtins[0];
+                                state.theme = pacode_render::Theme::from_palette(p, truecolor);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                crate::state::ThemePickerStep::SelectBase => {
+                    let total_rows = builtins.len();
+
+                    let mut moved = false;
+                    if is_overlay_up(&key) && *index > 0 {
+                        *index -= 1;
+                        moved = true;
+                    }
+                    if is_overlay_down(&key) && *index + 1 < total_rows {
+                        *index += 1;
+                        moved = true;
+                    }
+
+                    if moved {
+                        let p = &builtins[*index];
+                        state.theme = pacode_render::Theme::from_palette(p, truecolor);
+                        return vec![];
+                    }
+
+                    match key.code {
+                        KeyCode::Esc => {
+                            *step = crate::state::ThemePickerStep::SelectTheme;
+                            *index = 0;
+                            state.theme = (**original_theme).clone();
+                        }
+                        KeyCode::Enter => {
+                            let base_palette = &builtins[*index % builtins.len()];
+                            let custom_name =
+                                pacode_config::theme::next_custom_theme_name(&state.paths);
+                            let mut new_palette = base_palette.clone();
+                            new_palette.name = custom_name.clone();
+
+                            match pacode_config::write_theme(&state.paths, &new_palette) {
+                                Ok(path) => {
+                                    state.config.theme.name = custom_name.clone();
+                                    let _ = pacode_config::update_config_value(
+                                        &state.paths,
+                                        "theme.name",
+                                        pacode_config::toml::Value::String(custom_name.clone()),
+                                    );
+                                    state.theme =
+                                        pacode_render::Theme::from_palette(&new_palette, truecolor);
+                                    state.focus = Focus::Normal;
+
+                                    let path_str = path.display().to_string();
+                                    state.push_toast(
+                                        pacode_types::ToastLevel::Success,
+                                        format!("Theme '{custom_name}' created"),
+                                        Some(format!("Edit {path_str}")),
+                                        std::time::Instant::now(),
+                                    );
+                                }
+                                Err(err) => {
+                                    state.focus = Focus::Normal;
+                                    state.push_toast(
+                                        pacode_types::ToastLevel::Error,
+                                        "Failed to create theme".to_string(),
+                                        Some(err.to_string()),
+                                        std::time::Instant::now(),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            vec![]
+        }
         Focus::Overlay(Overlay::ConfigPicker {
             index,
             editing_number,

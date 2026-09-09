@@ -880,3 +880,107 @@ fn test_overlay_plugins_picker_keys() {
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
 }
+
+#[test]
+fn test_vim_disabled_behavior_is_identical() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    assert!(!state.config.ui.vim);
+
+    // Typing 'w', 'b', 'd', 'x' enters them as text characters
+    for ch in ['w', 'b', 'd', 'x'] {
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        let actions = handle_key(&mut state, key, now);
+        assert!(actions.is_empty());
+    }
+    assert_eq!(state.input.text, "wbdx");
+    assert_eq!(state.input.cursor, 4);
+
+    // Esc clears selection and returns empty actions without altering text
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, esc, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "wbdx");
+
+    // Enter submits the prompt exactly as before
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::UserMessage {
+            text: "wbdx".into()
+        })]
+    );
+    assert!(state.input.is_empty());
+}
+
+#[test]
+fn test_overlay_intercepts_keys_before_vim_when_vim_enabled() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.config.ui.vim = true;
+
+    // Open Help overlay
+    state.focus = Focus::Overlay(Overlay::Help);
+
+    // Pressing 'j' or 'x' in overlay does not go to vim mode and does not modify input
+    let char_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, char_j, now);
+    assert!(actions.is_empty());
+    assert!(state.input.is_empty());
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Help));
+
+    let char_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, char_x, now);
+    assert!(actions.is_empty());
+    assert!(state.input.is_empty());
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Help));
+
+    // Esc closes overlay first, returning to Normal prompt
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, esc, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_vim_enabled_keys_routing() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.config.ui.vim = true;
+    state.input.text = "hello world".to_string();
+    state.input.cursor = 0;
+
+    // Normal mode motion 'w' moves cursor, does NOT insert 'w'
+    let char_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, char_w, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.cursor, 6);
+    assert_eq!(state.input.text, "hello world");
+
+    // 'i' enters insert mode
+    let char_i = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+    handle_key(&mut state, char_i, now);
+    assert_eq!(state.vim.mode, crate::state::vim::VimMode::Insert);
+
+    // In insert mode, characters are inserted into prompt
+    let char_excl = KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE);
+    handle_key(&mut state, char_excl, now);
+    assert_eq!(state.input.text, "hello !world");
+
+    // Esc exits insert mode to normal mode
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.vim.mode, crate::state::vim::VimMode::Normal);
+
+    // Enter in normal mode submits the prompt
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::UserMessage {
+            text: "hello !world".into()
+        })]
+    );
+    assert!(state.input.is_empty());
+}

@@ -1,7 +1,20 @@
 //! ANSI-16 palette and glyph table (spec §13, mockup CSS vars). Colour is never the
 //! only carrier of meaning: every status has a glyph too.
 
+use std::collections::BTreeMap;
+
 use ratatui::style::{Color, Modifier, Style};
+use serde::{Deserialize, Serialize};
+
+pub use crate::palettes::builtin_palettes;
+
+/// Serializable color palette. Role names match `Theme` fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Palette {
+    pub name: String,
+    pub light: bool,
+    pub colors: BTreeMap<String, String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Theme {
@@ -19,22 +32,24 @@ pub struct Theme {
     pub user_bar: Style,
 }
 
+/// Detects `COLORTERM` (`truecolor`/`24bit`) or `PACODE_COLOR=ansi|truecolor`.
+pub fn detect_truecolor() -> bool {
+    let forced = std::env::var("PACODE_COLOR").ok();
+    match forced.as_deref() {
+        Some("ansi") => false,
+        Some("truecolor") | Some("24bit") => true,
+        _ => std::env::var("COLORTERM")
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("truecolor") || v.contains("24bit")
+            })
+            .unwrap_or(false),
+    }
+}
+
 impl Default for Theme {
-    /// Detects `COLORTERM` (`truecolor`/`24bit`) → mockup RGB palette, else ANSI-16.
-    /// `PACODE_COLOR=ansi|truecolor` forces one.
     fn default() -> Self {
-        let forced = std::env::var("PACODE_COLOR").ok();
-        let truecolor = match forced.as_deref() {
-            Some("ansi") => false,
-            Some("truecolor") | Some("24bit") => true,
-            _ => std::env::var("COLORTERM")
-                .map(|v| {
-                    let v = v.to_ascii_lowercase();
-                    v.contains("truecolor") || v.contains("24bit")
-                })
-                .unwrap_or(false),
-        };
-        if truecolor {
+        if detect_truecolor() {
             Self::truecolor()
         } else {
             Self::ansi()
@@ -43,6 +58,90 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// Build a `Theme` from a `Palette`. Missing keys fall back to the defaults
+    /// for that role. When `truecolor` is false, RGB hex colors are mapped to
+    /// the nearest ANSI-16 color.
+    pub fn from_palette(p: &Palette, truecolor: bool) -> Self {
+        let base = if truecolor {
+            Self::truecolor()
+        } else {
+            Self::ansi()
+        };
+
+        let resolve = |key: &str| -> Option<Color> {
+            let raw = p.colors.get(key)?;
+            let parsed = parse_color(raw)?;
+            if !truecolor {
+                match parsed {
+                    Color::Rgb(r, g, b) => Some(rgb_to_ansi16(r, g, b)),
+                    other => Some(other),
+                }
+            } else {
+                Some(parsed)
+            }
+        };
+
+        let fg = resolve("fg")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.fg);
+        let dim = resolve("dim")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.dim);
+        let faint = resolve("faint")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.faint);
+        let accent = resolve("accent")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.accent);
+        let green = resolve("green")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.green);
+        let cyan = resolve("cyan")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.cyan);
+        let red = resolve("red")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.red);
+        let violet = resolve("violet")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.violet);
+        let yellow = resolve("yellow")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.yellow);
+        let bold = resolve("bold")
+            .map(|c| Style::default().fg(c).add_modifier(Modifier::BOLD))
+            .unwrap_or(base.bold);
+        let selected_bg = resolve("selected_bg")
+            .map(|c| {
+                if !truecolor && c == Color::Black {
+                    Style::default()
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default().bg(c)
+                }
+            })
+            .unwrap_or(base.selected_bg);
+        let user_bar = resolve("user_bar")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.user_bar);
+
+        Self {
+            fg,
+            dim,
+            faint,
+            accent,
+            green,
+            cyan,
+            red,
+            violet,
+            yellow,
+            bold,
+            selected_bg,
+            user_bar,
+        }
+    }
+
     /// The mockup palette (see the design artifact CSS variables). Terminals whose
     /// ANSI-16 palette is monochrome still get colour this way.
     pub fn truecolor() -> Self {
@@ -84,6 +183,93 @@ impl Theme {
             user_bar: Style::default().fg(Color::Cyan),
         }
     }
+}
+
+/// Parse a color string: `"#rrggbb"`, `"#rgb"`, a named ANSI colour, or an index `0-255`.
+pub fn parse_color(s: &str) -> Option<Color> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color::Rgb(r, g, b));
+        } else if hex.len() == 3 {
+            let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+            let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+            let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+            return Some(Color::Rgb(r * 17, g * 17, b * 17));
+        }
+        return None;
+    }
+
+    if let Ok(idx) = s.parse::<u8>() {
+        return Some(Color::Indexed(idx));
+    }
+
+    let lower = s.to_ascii_lowercase();
+    match lower.as_str() {
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" | "purple" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "gray" | "grey" => Some(Color::Gray),
+        "darkgray" | "dark_gray" | "dark-gray" | "darkgrey" => Some(Color::DarkGray),
+        "lightred" | "light_red" | "light-red" => Some(Color::LightRed),
+        "lightgreen" | "light_green" | "light-green" => Some(Color::LightGreen),
+        "lightyellow" | "light_yellow" | "light-yellow" => Some(Color::LightYellow),
+        "lightblue" | "light_blue" | "light-blue" => Some(Color::LightBlue),
+        "lightmagenta" | "light_magenta" | "light-magenta" => Some(Color::LightMagenta),
+        "lightcyan" | "light_cyan" | "light-cyan" => Some(Color::LightCyan),
+        "white" => Some(Color::White),
+        "reset" => Some(Color::Reset),
+        _ => None,
+    }
+}
+
+/// Map an RGB value to the nearest ANSI-16 colour using squared Euclidean distance.
+pub fn rgb_to_ansi16(r: u8, g: u8, b: u8) -> Color {
+    const ANSI_TABLE: [(Color, (u8, u8, u8)); 16] = [
+        (Color::Black, (0, 0, 0)),
+        (Color::Red, (128, 0, 0)),
+        (Color::Green, (0, 128, 0)),
+        (Color::Yellow, (128, 128, 0)),
+        (Color::Blue, (0, 0, 128)),
+        (Color::Magenta, (128, 0, 128)),
+        (Color::Cyan, (0, 128, 128)),
+        (Color::Gray, (192, 192, 192)),
+        (Color::DarkGray, (128, 128, 128)),
+        (Color::LightRed, (255, 0, 0)),
+        (Color::LightGreen, (0, 255, 0)),
+        (Color::LightYellow, (255, 255, 0)),
+        (Color::LightBlue, (0, 0, 255)),
+        (Color::LightMagenta, (255, 0, 255)),
+        (Color::LightCyan, (0, 255, 255)),
+        (Color::White, (255, 255, 255)),
+    ];
+
+    let mut best_color = Color::White;
+    let mut best_dist = u64::MAX;
+
+    for (color, (ar, ag, ab)) in ANSI_TABLE {
+        let dr = (r as i32) - (ar as i32);
+        let dg = (g as i32) - (ag as i32);
+        let db = (b as i32) - (ab as i32);
+        let dist = (dr * dr + dg * dg + db * db) as u64;
+        if dist < best_dist {
+            best_dist = dist;
+            best_color = color;
+        }
+    }
+
+    best_color
 }
 
 /// Glyphs with ASCII fallback (`ui.ascii_only`).
@@ -186,14 +372,5 @@ impl Glyphs {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn progress_bar_rounds_up() {
-        let g = Glyphs::new(true);
-        assert_eq!(g.progress_bar(60, 8), "#####---");
-        assert_eq!(g.progress_bar(0, 4), "----");
-        assert_eq!(g.progress_bar(100, 4), "####");
-    }
-}
+#[path = "theme_tests.rs"]
+mod theme_tests;

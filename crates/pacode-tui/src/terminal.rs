@@ -63,6 +63,12 @@ impl TerminalGuard {
         self.mouse
     }
 
+    /// Apply font configuration using the terminal backend writer.
+    pub fn apply_font(&mut self, cfg: &pacode_types::FontConfig) -> crate::font::FontOutcome {
+        let control = crate::font::detect();
+        crate::font::apply_with_writer(cfg, control, self.terminal.backend_mut())
+    }
+
     /// Emit an image escape sequence starting at the specified terminal cell position.
     pub fn draw_image_escape(
         &mut self,

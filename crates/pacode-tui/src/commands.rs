@@ -47,6 +47,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         arg_hint: Cow::Borrowed("[build|auto|plan|bypass]"),
     },
     SlashCommand {
+        name: Cow::Borrowed("theme"),
+        usage: Cow::Borrowed("/theme"),
+        help: Cow::Borrowed("switch color theme"),
+        arg_hint: Cow::Borrowed("[name]"),
+    },
+    SlashCommand {
         name: Cow::Borrowed("config"),
         usage: Cow::Borrowed("/config"),
         help: Cow::Borrowed("quick settings"),
@@ -280,6 +286,56 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 vec![]
             }
         }
+        "theme" => {
+            let truecolor = match state.config.ui.color.as_str() {
+                "ansi" => false,
+                "truecolor" | "24bit" => true,
+                _ => pacode_render::detect_truecolor(),
+            };
+            if arg.is_empty() {
+                let user_themes = pacode_config::user_theme_names(&state.paths);
+                let builtins = pacode_render::builtin_palettes();
+                let current_name = state.config.theme.name.clone();
+                let index = builtins
+                    .iter()
+                    .position(|p| p.name == current_name)
+                    .or_else(|| {
+                        user_themes
+                            .iter()
+                            .position(|u| u == &current_name)
+                            .map(|i| builtins.len() + i)
+                    })
+                    .unwrap_or(0);
+
+                state.focus = Focus::Overlay(Overlay::ThemePicker {
+                    index,
+                    original_theme: Box::new(state.theme.clone()),
+                    original_name: current_name,
+                    step: crate::state::ThemePickerStep::SelectTheme,
+                    user_themes,
+                });
+                state.dirty = true;
+                vec![]
+            } else {
+                let theme_cfg = pacode_types::ThemeConfig {
+                    name: arg.clone(),
+                    overrides: state.config.theme.overrides.clone(),
+                };
+                let (palette, warnings) = pacode_config::load_theme(&state.paths, &theme_cfg);
+                state.theme = pacode_render::Theme::from_palette(&palette, truecolor);
+                state.config.theme.name = arg.clone();
+                let _ = pacode_config::update_config_value(
+                    &state.paths,
+                    "theme.name",
+                    pacode_config::toml::Value::String(arg.clone()),
+                );
+                for w in warnings {
+                    push_notice(state, ToastLevel::Warn, w);
+                }
+                push_notice(state, ToastLevel::Success, format!("Theme set to {arg}"));
+                vec![]
+            }
+        }
         "config" => {
             state.focus = Focus::Overlay(Overlay::ConfigPicker {
                 index: 0,
@@ -458,5 +514,8 @@ mod tests {
 
         let import = COMMANDS.iter().find(|c| c.name == "import").unwrap();
         assert_eq!(import.arg_hint, "");
+
+        let theme = COMMANDS.iter().find(|c| c.name == "theme").unwrap();
+        assert_eq!(theme.arg_hint, "[name]");
     }
 }

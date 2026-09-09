@@ -149,3 +149,40 @@ fn test_footer_select_agent_shows_main_and_subagents() {
         "text was: {text}"
     );
 }
+
+#[test]
+fn test_footer_vim_mode_badges() {
+    let mut state = make_test_state();
+    let opts = RenderOptions::new(120, false);
+
+    // With vim = false, no badge is present
+    let row1 = render_row1(120, &state, &opts);
+    let row1_text: String = row1.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(!row1_text.contains("NOR"));
+    assert!(!row1_text.contains("INS"));
+    assert!(!row1_text.contains("VIS"));
+
+    // Enable vim mode
+    state.config.ui.vim = true;
+
+    // Normal mode badge
+    state.vim.mode = crate::state::vim::VimMode::Normal;
+    let row1 = render_row1(120, &state, &opts);
+    let row1_text: String = row1.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(row1_text.contains("NOR"), "row1_text was: {row1_text}");
+    assert!(!row1_text.contains("INS"));
+
+    // Insert mode badge
+    state.vim.mode = crate::state::vim::VimMode::Insert;
+    let row1 = render_row1(120, &state, &opts);
+    let row1_text: String = row1.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(row1_text.contains("INS"), "row1_text was: {row1_text}");
+    assert!(!row1_text.contains("NOR"));
+
+    // Visual mode badge
+    state.vim.mode = crate::state::vim::VimMode::Visual;
+    let row1 = render_row1(120, &state, &opts);
+    let row1_text: String = row1.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(row1_text.contains("VIS"), "row1_text was: {row1_text}");
+    assert!(!row1_text.contains("NOR"));
+}

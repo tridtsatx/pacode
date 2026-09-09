@@ -65,6 +65,16 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
 
     let mut left_spans = vec![Span::styled(mode.label(), mode_style)];
 
+    if state.config.ui.vim {
+        let (vim_badge, vim_style) = match state.vim.mode {
+            crate::state::vim::VimMode::Normal => ("NOR", opts.theme.cyan),
+            crate::state::vim::VimMode::Insert => ("INS", opts.theme.green),
+            crate::state::vim::VimMode::Visual => ("VIS", opts.theme.yellow),
+        };
+        left_spans.push(Span::styled(" · ", opts.theme.faint));
+        left_spans.push(Span::styled(vim_badge, vim_style));
+    }
+
     if let Some((_, text)) = &state.plugin_status {
         left_spans.push(Span::styled(format!(" · {text}"), opts.theme.dim));
     }
@@ -90,21 +100,22 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         }
         Line::from(left_spans)
     } else {
-        let plain = if let Some((_, text)) = &state.plugin_status {
-            format!(
-                "{} · {} · {} | {}",
-                mode.label(),
-                text,
-                state.model().map(|m| m.display_name()).unwrap_or_default(),
-                state.effort()
-            )
+        let vim_part = if state.config.ui.vim {
+            match state.vim.mode {
+                crate::state::vim::VimMode::Normal => " · NOR",
+                crate::state::vim::VimMode::Insert => " · INS",
+                crate::state::vim::VimMode::Visual => " · VIS",
+            }
         } else {
-            format!(
-                "{} · {} | {}",
-                mode.label(),
-                state.model().map(|m| m.display_name()).unwrap_or_default(),
-                state.effort()
-            )
+            ""
+        };
+        let mode_label = mode.label();
+        let display_name = state.model().map(|m| m.display_name()).unwrap_or_default();
+        let effort = state.effort();
+        let plain = if let Some((_, text)) = &state.plugin_status {
+            format!("{mode_label}{vim_part} · {text} · {display_name} | {effort}")
+        } else {
+            format!("{mode_label}{vim_part} · {display_name} | {effort}")
         };
         let trunc = truncate_to_width(&plain, width, true);
         Line::from(Span::styled(trunc, opts.theme.dim))

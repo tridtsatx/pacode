@@ -61,6 +61,17 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     state.paths = client_paths;
     state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
 
+    let font_outcome = term_guard.apply_font(&opts.config.font);
+    if !font_outcome.unsupported.is_empty() {
+        let items = font_outcome.unsupported.join(", ");
+        state.push_toast(
+            ToastLevel::Info,
+            format!("font: this terminal has no {items} control"),
+            None,
+            Instant::now(),
+        );
+    }
+
     if let Some(prompt) = opts.initial_prompt {
         let _ = client.ok(Request::UserMessage { text: prompt }).await;
     }
@@ -111,6 +122,7 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         if state.dirty && can_draw {
             term_guard.terminal.draw(|f| {
                 last_layout = ui::draw(f, &mut state);
+                crate::font::apply_weight_to_frame(f, &state.config.font);
             })?;
             state.dirty = false;
             last_draw = Instant::now();

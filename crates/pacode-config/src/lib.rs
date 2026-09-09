@@ -11,10 +11,12 @@ pub mod display;
 pub mod logging;
 pub mod paths;
 pub mod prefs;
+pub mod theme;
 
 pub use display::detect_refresh_hz;
 pub use paths::Paths;
 pub use prefs::{Prefs, load_prefs, save_prefs};
+pub use theme::{load_theme, user_theme_names, write_theme};
 pub use toml;
 
 use pacode_types::{Config, Effort, Mode, ProviderConfig};

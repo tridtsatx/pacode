@@ -68,7 +68,8 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::ModelPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker { .. } => {}
+            | Overlay::ConfigPicker { .. }
+            | Overlay::ThemePicker { .. } => {}
         },
         Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } => {}
     }

@@ -29,6 +29,9 @@ pub struct Config {
     pub session: SessionConfig,
     pub plugins: PluginsConfig,
     pub skills: SkillsConfig,
+    pub theme: ThemeConfig,
+    pub font: FontConfig,
+    pub keys: KeysConfig,
 }
 
 impl Config {
@@ -191,6 +194,9 @@ pub struct UiConfig {
     /// `auto` or `off`.
     #[serde(default = "default_images")]
     pub images: String,
+    /// Vim keybindings for prompt input (`[ui] vim = true`).
+    #[serde(default)]
+    pub vim: bool,
 }
 
 impl Default for UiConfig {
@@ -204,6 +210,7 @@ impl Default for UiConfig {
             color: "auto".to_string(),
             transcript_cells: 500,
             images: default_images(),
+            vim: false,
         }
     }
 }
@@ -468,6 +475,7 @@ mod tests {
         assert_eq!(cfg.ui.ups, Ups::Fixed(10));
         assert_eq!(cfg.ui.images, "auto");
         assert!(cfg.ui.images_enabled());
+        assert!(!cfg.ui.vim);
         assert!(cfg.skills.enabled);
         assert!(cfg.skills.dirs.is_empty());
         assert_eq!(cfg.skills.max_body_bytes, 16384);
@@ -538,4 +546,45 @@ mod tests {
         assert_eq!(serde_json::to_string(&Ups::Dynamic).unwrap(), "\"dynamic\"");
         assert_eq!(serde_json::to_string(&Ups::Auto).unwrap(), "\"auto\"");
     }
+}
+
+/// `[theme]`: which palette to use. `name` is a built-in id or the stem of a
+/// `<config dir>/themes/<name>.toml` file; `overrides` patches individual roles
+/// on top of it, so a user can tweak one colour without copying a whole theme.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub name: String,
+    /// Role name (`accent`, `green`, ...) to colour (`#rrggbb`, `red`, `9`).
+    pub overrides: BTreeMap<String, String>,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            name: "pacode-dark".to_string(),
+            overrides: BTreeMap::new(),
+        }
+    }
+}
+
+/// `[font]`: applied best effort. A terminal application does not own its font;
+/// only some emulators expose a control sequence for it, so every field here is
+/// a request that may be silently unavailable.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FontConfig {
+    pub family: Option<String>,
+    pub size: Option<u16>,
+    /// `normal` or `bold`; only affects what pacode draws itself.
+    pub weight: Option<String>,
+}
+
+/// `[keys]`: action name to key binding, e.g. `follow_agent = "alt+f"`.
+/// Unset actions keep their built-in binding.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeysConfig {
+    #[serde(flatten)]
+    pub bindings: BTreeMap<String, String>,
 }

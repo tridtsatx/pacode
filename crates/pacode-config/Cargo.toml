@@ -7,6 +7,7 @@ description = "XDG paths, TOML config loading, env overrides, file logger"
 
 [dependencies]
 pacode-types = { workspace = true }
+pacode-render = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }

@@ -13,6 +13,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod commands;
+pub mod font;
 pub mod keys;
 pub mod keys_picker;
 pub mod layout;

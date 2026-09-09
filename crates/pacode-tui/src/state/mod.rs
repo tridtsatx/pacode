@@ -7,6 +7,7 @@ pub mod rail;
 pub mod selection;
 pub mod stats;
 pub mod transcript;
+pub mod vim;
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -23,6 +24,7 @@ pub use input::InputState;
 pub use rail::RailState;
 pub use selection::Selection;
 pub use transcript::{Cell, CellKind, Transcript};
+pub use vim::{VimEffect, VimMode, VimState};
 
 /// Interaction modes (spec §5). Layers are removed one at a time by `esc`.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +70,13 @@ pub enum Overlay {
         index: usize,
         editing_number: Option<String>,
     },
+    ThemePicker {
+        index: usize,
+        original_theme: Box<pacode_render::Theme>,
+        original_name: String,
+        step: ThemePickerStep,
+        user_themes: Vec<String>,
+    },
     SessionPicker {
         query: String,
         index: usize,
@@ -88,6 +97,12 @@ pub enum Overlay {
     /// Plan + agents on the `Tiny` tier.
     RailOverlay,
     Help,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemePickerStep {
+    SelectTheme,
+    SelectBase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +128,7 @@ pub enum Connection {
 
 pub struct AppState {
     pub config: Config,
+    pub theme: pacode_render::Theme,
     /// Footer status text set by a plugin via `pacode.status` (plugin name, text).
     pub plugin_status: Option<(String, String)>,
     pub paths: pacode_config::Paths,
@@ -127,6 +143,7 @@ pub struct AppState {
     pub files: FilesState,
     pub rail: RailState,
     pub input: InputState,
+    pub vim: VimState,
     pub focus: Focus,
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
@@ -165,10 +182,19 @@ pub struct PanelState {
 impl AppState {
     pub fn new(config: Config, app_version: String, cols: u16, rows: u16) -> Self {
         let cells = config.ui.transcript_cells;
+        let paths = pacode_config::Paths::discover();
+        let truecolor = match config.ui.color.as_str() {
+            "ansi" => false,
+            "truecolor" | "24bit" => true,
+            _ => pacode_render::detect_truecolor(),
+        };
+        let (palette, _) = pacode_config::theme::load_theme(&paths, &config.theme);
+        let theme = pacode_render::Theme::from_palette(&palette, truecolor);
         Self {
             config,
+            theme,
             plugin_status: None,
-            paths: pacode_config::Paths::discover(),
+            paths,
             app_version,
             meta: None,
             connection: Connection::Connected,
@@ -184,6 +210,7 @@ impl AppState {
             files: FilesState::default(),
             rail: RailState::default(),
             input: InputState::default(),
+            vim: VimState::default(),
             focus: Focus::Normal,
             toasts: VecDeque::new(),
             models: Vec::new(),
@@ -659,6 +686,7 @@ impl AppState {
                 | Focus::Overlay(Overlay::ModePicker { .. })
                 | Focus::Overlay(Overlay::ModelPicker { .. })
                 | Focus::Overlay(Overlay::ConfigPicker { .. })
+                | Focus::Overlay(Overlay::ThemePicker { .. })
         )
     }
 
@@ -667,7 +695,8 @@ impl AppState {
             Focus::Overlay(Overlay::EffortPicker { .. })
             | Focus::Overlay(Overlay::ModePicker { .. }) => 7,
             Focus::Overlay(Overlay::ModelPicker { .. })
-            | Focus::Overlay(Overlay::ConfigPicker { .. }) => 12,
+            | Focus::Overlay(Overlay::ConfigPicker { .. })
+            | Focus::Overlay(Overlay::ThemePicker { .. }) => 12,
             _ => 0,
         }
     }

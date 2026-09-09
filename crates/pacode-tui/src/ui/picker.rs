@@ -32,6 +32,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         }) => {
             draw_config(frame, area, state, *index, editing_number.as_deref(), opts);
         }
+        Focus::Overlay(Overlay::ThemePicker { .. }) => {
+            crate::ui::theme_picker::draw(frame, area, state, opts);
+        }
         _ => {}
     }
 }

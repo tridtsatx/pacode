@@ -19,6 +19,7 @@ pub mod plugins;
 pub mod popup;
 pub mod rail;
 pub mod rail_session;
+pub mod theme_picker;
 pub mod toast;
 
 use ratatui::Frame;
@@ -41,7 +42,11 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     let input_lines = state.input.wrapped_lines(temp_layout.input.width);
     let layout = crate::layout::compute(frame.area(), input_lines, panel_open);
 
-    let opts = RenderOptions::new(frame.area().width, state.config.ui.ascii_only);
+    let opts = RenderOptions::with_theme(
+        frame.area().width,
+        state.config.ui.ascii_only,
+        state.theme.clone(),
+    );
 
     if layout.rail.width > 0 {
         if layout.rail_separator.width > 0 {
@@ -72,7 +77,11 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     };
 
     if dialog_area.width > 0 && dialog_area.height > 0 {
-        let dialog_opts = RenderOptions::new(dialog_area.width, state.config.ui.ascii_only);
+        let dialog_opts = RenderOptions::with_theme(
+            dialog_area.width,
+            state.config.ui.ascii_only,
+            state.theme.clone(),
+        );
         if state.turn_active && dialog_area.height > 1 {
             let trans_h = dialog_area.height - 1;
             let trans_area = Rect::new(dialog_area.x, dialog_area.y, dialog_area.width, trans_h);
@@ -148,7 +157,11 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 );
             }
         }
-        let panel_opts = RenderOptions::new(panel_rect.width, state.config.ui.ascii_only);
+        let panel_opts = RenderOptions::with_theme(
+            panel_rect.width,
+            state.config.ui.ascii_only,
+            state.theme.clone(),
+        );
         panel::draw(frame, panel_rect, state, &panel_opts);
     }
 

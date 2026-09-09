@@ -27,7 +27,7 @@ pub struct InputState {
     pub input_scroll: usize,
 }
 
-fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
+pub fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
     text.char_indices()
         .nth(char_idx)
         .map(|(idx, _)| idx)
