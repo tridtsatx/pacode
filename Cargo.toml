@@ -19,6 +19,7 @@ members = [
     "crates/pacode-import",
     "crates/pacode-image",
     "crates/pacode-skills",
+    "crates/pacode-acp",
 ]
 
 [workspace.package]
@@ -45,6 +46,7 @@ pacode-plugin = { path = "crates/pacode-plugin" }
 pacode-import = { path = "crates/pacode-import" }
 pacode-image = { path = "crates/pacode-image" }
 pacode-skills = { path = "crates/pacode-skills" }
+pacode-acp = { path = "crates/pacode-acp" }
 
 # async
 tokio = { version = "1", default-features = false }

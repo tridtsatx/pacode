@@ -178,6 +178,10 @@ pub enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+
+    /// Run as an ACP (Agent Client Protocol) agent over stdio.
+    #[cfg(feature = "acp")]
+    Acp,
 }
 
 #[derive(Subcommand, Debug)]
@@ -409,6 +413,14 @@ pub fn main() -> anyhow::Result<()> {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;
             daemon::run(action, socket)
+        }
+        #[cfg(feature = "acp")]
+        Some(Command::Acp) => {
+            pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
+                .context("failed to initialize client logger")?;
+            let mut client_opts = ClientOptions::new(paths.clone(), pacode_config::APP_VERSION);
+            client_opts.socket = Some(socket);
+            pacode_acp::run(client_opts, config).context("ACP agent failed")
         }
         None => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)

@@ -17,6 +17,7 @@ pacode-daemon = { workspace = true }
 pacode-tui = { workspace = true }
 pacode-plugin = { workspace = true }
 pacode-import = { workspace = true }
+pacode-acp = { workspace = true, optional = true }
 toml_edit = { workspace = true }
 clap = { workspace = true, features = ["color"] }
 anyhow = { workspace = true }
@@ -30,5 +31,6 @@ shlex = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = []
+default = ["acp"]
+acp = ["dep:pacode-acp"]
 mimalloc = []

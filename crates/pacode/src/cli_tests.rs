@@ -448,6 +448,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "acp")]
+    fn parse_acp_shape() {
+        let cli = Cli::try_parse_from(["pacode", "acp"]).expect("acp plain");
+        match cli.command {
+            Some(Command::Acp) => {}
+            other => panic!("expected Acp, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_invalid_flag() {
         assert!(Cli::try_parse_from(["pacode", "--unknown-flag"]).is_err());
     }
