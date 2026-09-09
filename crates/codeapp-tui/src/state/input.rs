@@ -2,7 +2,8 @@
 
 use std::collections::VecDeque;
 
-use codeapp_render::{display_width, wrap_text};
+use codeapp_render::display_width;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(test)]
 #[path = "input_tests.rs"]
@@ -22,6 +23,8 @@ pub struct InputState {
     pub draft: String,
     /// Slash popup: matching commands when `text` starts with `/`.
     pub slash_index: usize,
+    /// Vertical scroll offset for multi-line prompts (> 6 rows).
+    pub input_scroll: usize,
 }
 
 fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
@@ -29,6 +32,40 @@ fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(idx, _)| idx)
         .unwrap_or(text.len())
+}
+
+/// Wrap text into lines preserving all characters without trimming.
+/// Trailing whitespace (spaces, etc.) occupies terminal cells.
+pub fn wrap_text_non_trimming(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let width = width.max(1);
+    let mut lines = Vec::new();
+
+    for raw_line in text.split('\n') {
+        let raw_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        let mut cur_line = String::new();
+        let mut cur_w = 0usize;
+
+        for g in raw_line.graphemes(true) {
+            let gw = display_width(g);
+            if cur_w + gw > width && cur_w > 0 {
+                lines.push(std::mem::take(&mut cur_line));
+                cur_w = 0;
+            }
+            cur_line.push_str(g);
+            cur_w += gw;
+        }
+        lines.push(cur_line);
+    }
+
+    lines
 }
 
 impl InputState {
@@ -109,6 +146,7 @@ impl InputState {
         self.history_index = None;
         self.draft.clear();
         self.slash_index = 0;
+        self.input_scroll = 0;
         if !taken.trim().is_empty() {
             self.history.push_back(taken.clone());
             if self.history.len() > 100 {
@@ -161,8 +199,14 @@ impl InputState {
             return 1;
         }
         let text_w = (width as usize).saturating_sub(2).max(1);
-        let lines = wrap_text(&self.text, text_w);
+        let lines = wrap_text_non_trimming(&self.text, text_w);
         lines.len().clamp(1, 6) as u16
+    }
+
+    /// Wrapped lines without clamping, preserving all characters.
+    pub fn wrap_lines(&self, width: u16) -> Vec<String> {
+        let text_w = (width as usize).saturating_sub(2).max(1);
+        wrap_text_non_trimming(&self.text, text_w)
     }
 
     /// Cursor position as (line, column) after wrapping at `width`.
@@ -172,8 +216,8 @@ impl InputState {
         }
         let text_w = (width as usize).saturating_sub(2).max(1);
         let before_cursor: String = self.text.chars().take(self.cursor).collect();
-        let lines = wrap_text(&before_cursor, text_w);
-        let line_idx = (lines.len().saturating_sub(1)).min(5) as u16;
+        let lines = wrap_text_non_trimming(&before_cursor, text_w);
+        let line_idx = lines.len().saturating_sub(1) as u16;
         let last_line = lines.last().map(|s| s.as_str()).unwrap_or("");
         let col = 2 + display_width(last_line);
         (line_idx, (col as u16).min(width.saturating_sub(1)))

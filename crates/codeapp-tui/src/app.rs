@@ -102,6 +102,26 @@ pub async fn run(opts: TuiOptions) -> Result<(), TuiError> {
             }
         };
 
+        let anim_sleep = async {
+            if state.needs_anim_tick() {
+                tokio::time::sleep(Duration::from_millis(125)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+
+        let ctrl_c_expiry_sleep = async {
+            if let Some(t) = state.ctrl_c_at {
+                let dur = Duration::from_secs(2);
+                let elapsed = Instant::now().saturating_duration_since(t);
+                if elapsed < dur {
+                    tokio::time::sleep(dur - elapsed).await;
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+
         let toast_expiry_sleep = async {
             if let Some(oldest) = state.toasts.front() {
                 let dur = Duration::from_secs(TOAST_TTL_SECS);
@@ -165,6 +185,14 @@ pub async fn run(opts: TuiOptions) -> Result<(), TuiError> {
                 if state.rail.update_idle(state.turn_active, now) {
                     state.dirty = true;
                 }
+            }
+            _ = anim_sleep => {
+                state.anim_frame = state.anim_frame.wrapping_add(1);
+                state.dirty = true;
+            }
+            _ = ctrl_c_expiry_sleep => {
+                state.ctrl_c_at = None;
+                state.dirty = true;
             }
             _ = toast_expiry_sleep => {
                 state.expire_toasts(Instant::now());

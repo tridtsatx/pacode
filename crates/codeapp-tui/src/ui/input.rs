@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use codeapp_render::{RenderOptions, wrap_text};
+use codeapp_render::RenderOptions;
 
 use crate::commands;
 use crate::layout::ScreenLayout;
@@ -23,31 +23,44 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
     }
 
     if layout.input.height > 0 {
-        let avail = (layout.input.width as usize).saturating_sub(2).max(1);
-        let wrapped = wrap_text(&state.input.text, avail);
-        let mut lines = Vec::new();
+        let lines = state.input.wrap_lines(layout.input.width);
+        let total_lines = lines.len();
+        let height = layout.input.height as usize;
+        let (cur_line, cur_col) = state.input.cursor_position(layout.input.width);
 
-        for (i, wl) in wrapped
+        let max_scroll = total_lines.saturating_sub(height);
+        state.input.input_scroll = state.input.input_scroll.min(max_scroll);
+
+        let cur_line_idx = cur_line as usize;
+        if cur_line_idx < state.input.input_scroll {
+            state.input.input_scroll = cur_line_idx;
+        } else if cur_line_idx >= state.input.input_scroll + height {
+            state.input.input_scroll = cur_line_idx.saturating_sub(height.saturating_sub(1));
+        }
+
+        let mut rendered = Vec::new();
+        for (i, wl) in lines
             .iter()
             .enumerate()
-            .take(layout.input.height as usize)
+            .skip(state.input.input_scroll)
+            .take(height)
         {
             let prefix = if i == 0 {
                 Span::styled(format!("{} ", opts.glyphs.prompt), opts.theme.dim)
             } else {
                 Span::raw("  ")
             };
-            lines.push(Line::from(vec![
+            rendered.push(Line::from(vec![
                 prefix,
                 Span::styled(wl.clone(), opts.theme.fg),
             ]));
         }
 
-        frame.render_widget(Paragraph::new(lines), layout.input);
+        frame.render_widget(Paragraph::new(rendered), layout.input);
 
-        let (cur_line, cur_col) = state.input.cursor_position(layout.input.width);
-        if cur_line < layout.input.height {
-            frame.set_cursor_position((layout.input.x + cur_col, layout.input.y + cur_line));
+        let cur_screen_line = cur_line.saturating_sub(state.input.input_scroll as u16);
+        if cur_line >= state.input.input_scroll as u16 && (cur_screen_line as usize) < height {
+            frame.set_cursor_position((layout.input.x + cur_col, layout.input.y + cur_screen_line));
         }
     }
 

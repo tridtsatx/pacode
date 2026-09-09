@@ -3,6 +3,7 @@
 //! Each widget is a function `fn draw_x(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOptions)`.
 //! Widgets may mutate render caches inside the state but nothing else.
 
+pub mod anim;
 pub mod dialog;
 pub mod footer;
 pub mod input;
@@ -18,14 +19,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use codeapp_render::RenderOptions;
+use codeapp_types::TranscriptKind;
+use codeapp_types::transcript::ToolStatus;
 
 use crate::layout::ScreenLayout;
+use crate::state::transcript::CellKind;
 use crate::state::{AppState, Focus};
 
 /// Draw the whole screen; returns the layout used (for mouse hit-testing).
 pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     let panel_open = state.panel.target.is_some() || matches!(state.focus, Focus::Panel { .. });
-    let input_lines = state.input.wrapped_lines(frame.area().width);
+    let temp_layout = crate::layout::compute(frame.area(), 1, panel_open);
+    let input_lines = state.input.wrapped_lines(temp_layout.input.width);
     let layout = crate::layout::compute(frame.area(), input_lines, panel_open);
 
     let opts = RenderOptions::new(frame.area().width, state.config.ui.ascii_only);
@@ -46,7 +51,71 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
 
     if layout.dialog.width > 0 && layout.dialog.height > 0 {
         let dialog_opts = RenderOptions::new(layout.dialog.width, state.config.ui.ascii_only);
-        dialog::draw(frame, layout.dialog, &mut state.transcript, &dialog_opts);
+        if state.turn_active && layout.dialog.height > 1 {
+            let trans_h = layout.dialog.height - 1;
+            let trans_area = Rect::new(
+                layout.dialog.x,
+                layout.dialog.y,
+                layout.dialog.width,
+                trans_h,
+            );
+            let anim_area = Rect::new(
+                layout.dialog.x,
+                layout.dialog.bottom() - 1,
+                layout.dialog.width,
+                1,
+            );
+            dialog::draw(
+                frame,
+                trans_area,
+                &mut state.transcript,
+                &dialog_opts,
+                state.anim_frame,
+            );
+
+            let running_tool = state.transcript.cells.iter().rev().find_map(|c| {
+                if let CellKind::Item(TranscriptKind::ToolCall {
+                    status: ToolStatus::Running,
+                    title,
+                    ..
+                }) = &c.kind
+                {
+                    Some(title.clone())
+                } else {
+                    None
+                }
+            });
+            let activity = running_tool.unwrap_or_else(|| "думает…".to_string());
+            let elapsed_ms = state
+                .turn_started_at
+                .map(|t| {
+                    std::time::Instant::now()
+                        .saturating_duration_since(t)
+                        .as_millis() as u64
+                })
+                .or_else(|| {
+                    let main_agent = state.rail.agents.iter().find(|a| a.id.is_main());
+                    main_agent.map(|a| a.duration_ms(codeapp_types::time::now_ms()))
+                })
+                .unwrap_or(0);
+            let anim_line = anim::render_pacman_line(
+                state.anim_frame,
+                24,
+                &dialog_opts,
+                &activity,
+                elapsed_ms,
+                layout.dialog.width as usize,
+            );
+            frame.render_widget(Paragraph::new(anim_line), anim_area);
+        } else {
+            dialog::draw(
+                frame,
+                layout.dialog,
+                &mut state.transcript,
+                &dialog_opts,
+                state.anim_frame,
+            );
+        }
     }
 
     if let Some(panel_rect) = layout.panel {

@@ -71,7 +71,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                 if follow && !follow_paused {
                     state.panel.agent_transcript.scroll_to_bottom();
                 }
-                crate::ui::dialog::draw(frame, trans_area, &mut state.panel.agent_transcript, opts);
+                crate::ui::dialog::draw(
+                    frame,
+                    trans_area,
+                    &mut state.panel.agent_transcript,
+                    opts,
+                    state.anim_frame,
+                );
             }
         }
         PanelTarget::Task(ref task_id) => {

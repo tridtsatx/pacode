@@ -13,7 +13,13 @@ use codeapp_types::{ToastLevel, TranscriptKind};
 
 use crate::state::transcript::{CellKind, Transcript};
 
-pub fn draw(frame: &mut Frame, area: Rect, transcript: &mut Transcript, opts: &RenderOptions) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    transcript: &mut Transcript,
+    opts: &RenderOptions,
+    anim_frame: u64,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -31,7 +37,15 @@ pub fn draw(frame: &mut Frame, area: Rect, transcript: &mut Transcript, opts: &R
 
     for (id, version, kind) in cell_snapshots {
         let is_live = live_id == Some(id);
-        let lines = get_or_render_cell(id, version, &kind, is_live, width, opts, transcript);
+        let args = CellRenderArgs {
+            cell_id: id,
+            cell_version: version,
+            cell_kind: &kind,
+            is_live,
+            width,
+            anim_frame,
+        };
+        let lines = get_or_render_cell(args, opts, transcript);
         cell_lines.push(lines);
     }
 
@@ -68,34 +82,50 @@ pub fn draw(frame: &mut Frame, area: Rect, transcript: &mut Transcript, opts: &R
     frame.render_widget(Paragraph::new(visible_lines), area);
 }
 
-fn get_or_render_cell(
+const BRAILLE_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const ASCII_SPINNER: &[&str] = &["|", "/", "-", "\\"];
+
+struct CellRenderArgs<'a> {
     cell_id: u64,
     cell_version: u32,
-    cell_kind: &CellKind,
+    cell_kind: &'a CellKind,
     is_live: bool,
     width: u16,
+    anim_frame: u64,
+}
+
+fn get_or_render_cell(
+    args: CellRenderArgs<'_>,
     opts: &RenderOptions,
     transcript: &mut Transcript,
 ) -> Vec<Line<'static>> {
     let key = CacheKey {
-        cell: cell_id ^ ((cell_version as u64) << 48),
-        width,
+        cell: args.cell_id ^ ((args.cell_version as u64) << 48),
+        width: args.width,
     };
 
-    if !is_live {
+    let is_running_tool = matches!(
+        args.cell_kind,
+        CellKind::Item(TranscriptKind::ToolCall {
+            status: ToolStatus::Running,
+            ..
+        })
+    );
+
+    if !args.is_live && !is_running_tool {
         if let Some(cached) = transcript.cache.get(key) {
             return cached.to_vec();
         }
-        let rendered = render_cell(cell_kind, width, opts);
+        let rendered = render_cell(args.cell_kind, args.width, opts, args.anim_frame);
         let cached = transcript.cache.insert(key, rendered);
         return cached.to_vec();
     }
 
-    if let CellKind::Item(TranscriptKind::Assistant { text, .. }) = cell_kind {
+    if let CellKind::Item(TranscriptKind::Assistant { text, .. }) = args.cell_kind {
         let (stable, tail) = split_stable_tail(text);
         let stable_key = CacheKey {
-            cell: (cell_id << 1) ^ (stable.len() as u64) ^ 0x8000_0000_0000_0000,
-            width,
+            cell: (args.cell_id << 1) ^ (stable.len() as u64) ^ 0x8000_0000_0000_0000,
+            width: args.width,
         };
 
         let stable_lines = if let Some(cached) = transcript.cache.get(stable_key) {
@@ -113,19 +143,33 @@ fn get_or_render_cell(
         return combined;
     }
 
-    let rendered = render_cell(cell_kind, width, opts);
-    let cached = transcript.cache.insert(key, rendered);
-    cached.to_vec()
-}
-
-fn render_cell(cell_kind: &CellKind, width: u16, opts: &RenderOptions) -> Vec<Line<'static>> {
-    match cell_kind {
-        CellKind::Gap => vec![Line::default()],
-        CellKind::Item(kind) => render_item(kind, width, opts),
+    let rendered = render_cell(args.cell_kind, args.width, opts, args.anim_frame);
+    if !is_running_tool {
+        let cached = transcript.cache.insert(key, rendered);
+        cached.to_vec()
+    } else {
+        rendered
     }
 }
 
-fn render_item(kind: &TranscriptKind, width: u16, opts: &RenderOptions) -> Vec<Line<'static>> {
+fn render_cell(
+    cell_kind: &CellKind,
+    width: u16,
+    opts: &RenderOptions,
+    anim_frame: u64,
+) -> Vec<Line<'static>> {
+    match cell_kind {
+        CellKind::Gap => vec![Line::default()],
+        CellKind::Item(kind) => render_item(kind, width, opts, anim_frame),
+    }
+}
+
+fn render_item(
+    kind: &TranscriptKind,
+    width: u16,
+    opts: &RenderOptions,
+    anim_frame: u64,
+) -> Vec<Line<'static>> {
     match kind {
         TranscriptKind::User { text } => {
             let bar = if opts.glyphs.ascii { "|" } else { "▎" };
@@ -206,7 +250,12 @@ fn render_item(kind: &TranscriptKind, width: u16, opts: &RenderOptions) -> Vec<L
             match status {
                 ToolStatus::Running => {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled("…", opts.theme.accent));
+                    let spin = if opts.glyphs.ascii {
+                        ASCII_SPINNER[(anim_frame as usize) % ASCII_SPINNER.len()]
+                    } else {
+                        BRAILLE_SPINNER[(anim_frame as usize) % BRAILLE_SPINNER.len()]
+                    };
+                    spans.push(Span::styled(spin, opts.theme.accent));
                 }
                 ToolStatus::Ok => {
                     spans.push(Span::raw(" "));

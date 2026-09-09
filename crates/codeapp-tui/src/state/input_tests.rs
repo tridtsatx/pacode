@@ -89,3 +89,11 @@ fn test_wrapping_and_cursor() {
     assert_eq!(state.wrapped_lines(80), 3);
     assert_eq!(state.cursor_position(80), (2, 7));
 }
+
+#[test]
+fn test_trailing_space_cursor() {
+    let mut state = InputState::default();
+    state.insert_str("/model ");
+    assert_eq!(state.cursor_position(80), (0, 2 + 7));
+    assert_eq!(state.wrapped_lines(80), 1);
+}

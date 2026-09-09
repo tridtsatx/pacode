@@ -36,6 +36,18 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![Action::Quit];
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        if !state.input.is_empty() {
+            state.input.text.clear();
+            state.input.cursor = 0;
+            state.input.history_index = None;
+            state.input.draft.clear();
+            state.ctrl_c_at = None;
+            return vec![];
+        }
+        if state.turn_active {
+            state.ctrl_c_at = None;
+            return vec![Action::Send(Request::Interrupt)];
+        }
         if let Some(prev) = state.ctrl_c_at
             && now.saturating_duration_since(prev) <= Duration::from_secs(2)
         {
@@ -43,16 +55,6 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             return vec![Action::Quit];
         }
         state.ctrl_c_at = Some(now);
-        if !state.input.is_empty() {
-            state.input.text.clear();
-            state.input.cursor = 0;
-            state.input.history_index = None;
-            state.input.draft.clear();
-            return vec![];
-        }
-        if state.turn_active {
-            return vec![Action::Send(Request::Interrupt)];
-        }
         return vec![];
     }
 
@@ -65,12 +67,26 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![Action::Send(Request::ListSessions { limit: 50 })];
     }
 
-    // 3. Shift+Tab: cycle permission mode
+    // 3. Shift+Tab: cycle permission mode; plain Tab: autocomplete slash command
     if key.code == KeyCode::BackTab
         || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
     {
         let next_mode = state.mode().next();
         return vec![Action::Send(Request::SetMode(next_mode))];
+    }
+    if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
+            let query = &state.input.text[1..];
+            let matches = commands::matching(query);
+            if !matches.is_empty() {
+                let selected = state.input.slash_index % matches.len();
+                let cmd = matches[selected];
+                state.input.text = format!("/{} ", cmd.name);
+                state.input.cursor = state.input.text.chars().count();
+                state.input.slash_index = 0;
+            }
+        }
+        return vec![];
     }
 
     // 4. Escape: peel layers one by one
@@ -255,7 +271,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     // 11. Up / Down arrows for history / slash popup
     if key.code == KeyCode::Up {
         if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-            state.input.slash_index = state.input.slash_index.saturating_sub(1);
+            let matches = commands::matching(&state.input.text[1..]);
+            if !matches.is_empty() {
+                let n = matches.len();
+                state.input.slash_index = (state.input.slash_index + n - 1) % n;
+            }
         } else if state.input.is_empty() || state.input.history_index.is_some() {
             state.input.history_up();
         }
@@ -263,7 +283,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
     if key.code == KeyCode::Down {
         if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-            state.input.slash_index += 1;
+            let matches = commands::matching(&state.input.text[1..]);
+            if !matches.is_empty() {
+                let n = matches.len();
+                state.input.slash_index = (state.input.slash_index + 1) % n;
+            }
         } else if state.input.history_index.is_some() {
             state.input.history_down();
         }
@@ -484,6 +508,17 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
         state
             .transcript
             .scroll_by(delta, 1000, layout.dialog.height as usize);
+    } else if layout.input.contains((col, row).into()) {
+        let max_scroll = state
+            .input
+            .wrap_lines(layout.input.width)
+            .len()
+            .saturating_sub(layout.input.height as usize);
+        if delta < 0 {
+            state.input.input_scroll = (state.input.input_scroll + 1).min(max_scroll);
+        } else {
+            state.input.input_scroll = state.input.input_scroll.saturating_sub(1);
+        }
     } else if let Some(panel) = layout.panel {
         if panel.contains((col, row).into()) {
             state

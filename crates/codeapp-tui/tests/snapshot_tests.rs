@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use codeapp_client::ClientEvent;
+use codeapp_tui::layout::ScreenLayout;
 use codeapp_tui::state::{AppState, Focus, PanelTarget};
 use codeapp_tui::ui;
 use codeapp_types::ids::{AgentId, SessionId, TaskId};
@@ -107,7 +108,7 @@ fn make_base_snapshot() -> SessionSnapshot {
             status: AgentStatus::Thinking,
             activity: Some("thinking".into()),
             started_at_ms: now - 400,
-            finished_at_ms: None,
+            finished_at_ms: Some(now),
             tokens_in: 5400,
             tokens_out: 1200,
             model: ModelRoute::new("anthropic", "claude-3-7-sonnet"),
@@ -269,7 +270,9 @@ fn create_state(cols: u16, rows: u16, snapshot: SessionSnapshot) -> AppState {
     config.ui.hints.effort = true;
     config.ui.hints.model = true;
     let mut state = AppState::new(config, "0.1.0-dev".into(), cols, rows);
-    state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+    let now = Instant::now();
+    state.apply_client_event(ClientEvent::Snapshot(snapshot), now);
+    state.turn_started_at = None;
     state
 }
 
@@ -280,14 +283,59 @@ fn test_mockup_state_01_120x34() {
 
     let backend = TestBackend::new(120, 34);
     let mut terminal = Terminal::new(backend).unwrap();
+    let mut layout = ScreenLayout::default();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            layout = ui::draw(f, &mut state);
         })
         .unwrap();
 
+    // Assert that column rail_separator.x is │ on EVERY row
+    assert!(layout.rail_separator.width > 0);
+    let sep_x = layout.rail_separator.x;
+    for y in 0..34 {
+        let cell = terminal.backend().buffer().cell((sep_x, y)).unwrap();
+        assert_eq!(
+            cell.symbol(),
+            "│",
+            "Row {y} must have vertical separator '│' at column {sep_x}, but found '{}'",
+            cell.symbol()
+        );
+    }
+
     let view = format!("{}", terminal.backend());
     insta::assert_snapshot!("state_01_120x34", view);
+}
+
+#[test]
+fn test_mockup_state_01_100x30() {
+    let snapshot = make_base_snapshot();
+    let mut state = create_state(100, 30, snapshot);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut layout = ScreenLayout::default();
+    terminal
+        .draw(|f| {
+            layout = ui::draw(f, &mut state);
+        })
+        .unwrap();
+
+    // Assert that column rail_separator.x is │ on EVERY row
+    assert!(layout.rail_separator.width > 0);
+    let sep_x = layout.rail_separator.x;
+    for y in 0..30 {
+        let cell = terminal.backend().buffer().cell((sep_x, y)).unwrap();
+        assert_eq!(
+            cell.symbol(),
+            "│",
+            "Row {y} must have vertical separator '│' at column {sep_x}, but found '{}'",
+            cell.symbol()
+        );
+    }
+
+    let view = format!("{}", terminal.backend());
+    insta::assert_snapshot!("state_01_100x30", view);
 }
 
 #[test]
@@ -472,9 +520,13 @@ fn test_mockup_state_05_bglist() {
 #[test]
 fn test_mockup_state_06_idle() {
     let mut snapshot = make_base_snapshot();
+    let now = codeapp_types::time::now_ms();
     snapshot.turn_active = false;
     for a in &mut snapshot.agents {
         a.status = AgentStatus::Finished;
+        if a.id.is_main() {
+            a.finished_at_ms = Some(now);
+        }
     }
     snapshot.tasks.clear();
 
@@ -492,4 +544,25 @@ fn test_mockup_state_06_idle() {
 
     let view = format!("{}", terminal.backend());
     insta::assert_snapshot!("state_06_120x34", view);
+}
+
+#[test]
+fn test_no_subagents_hides_agents_zone() {
+    let mut snapshot = make_base_snapshot();
+    // Keep only main agent (no subagents)
+    snapshot.agents.retain(|a| a.id.is_main());
+    let mut state = create_state(120, 34, snapshot);
+    state.rail.show_session_stats = false;
+
+    let backend = TestBackend::new(120, 34);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            ui::draw(f, &mut state);
+        })
+        .unwrap();
+
+    let view = format!("{}", terminal.backend());
+    assert!(!view.contains("AGENTS"));
+    assert!(!view.contains("● main"));
 }

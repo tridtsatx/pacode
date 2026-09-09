@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use codeapp_render::{RenderOptions, truncate_to_width};
+use codeapp_render::{RenderOptions, display_width, truncate_to_width};
 use codeapp_types::state::{AgentStatus, TaskStatus};
 use codeapp_types::time::{format_duration_ms, format_tokens, now_ms};
 
@@ -147,7 +147,7 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
         ));
     }
 
-    let right_len: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+    let right_len: usize = right_spans.iter().map(|s| display_width(&s.content)).sum();
     let spaces = (area.width as usize).saturating_sub(title_text.len() + right_len);
 
     let mut header_spans = vec![
@@ -211,7 +211,7 @@ fn render_task_line(
         TaskStatus::Killed => "killed".to_string(),
     };
 
-    let label_avail = width.saturating_sub(sym.chars().count() + tail_str.chars().count() + 3);
+    let label_avail = width.saturating_sub(display_width(sym) + display_width(&tail_str) + 2);
     let trunc_label = truncate_to_width(&task.label, label_avail, true);
 
     Line::from(vec![
@@ -251,22 +251,19 @@ pub fn draw_anchor(frame: &mut Frame, area: Rect, state: &AppState, opts: &Rende
         .and_then(|m| m.git_branch.as_deref())
         .unwrap_or("master");
 
+    let branch_str = format!(":{branch}");
+    let branch_w = display_width(&branch_str);
+    let cwd_w = (area.width as usize).saturating_sub(branch_w);
+    let cwd_trunc = truncate_to_width(&cwd_str, cwd_w, true);
+
     let line1 = Line::from(vec![
-        Span::styled(
-            truncate_to_width(
-                &cwd_str,
-                (area.width as usize).saturating_sub(branch.len() + 1),
-                true,
-            ),
-            opts.theme.dim,
-        ),
-        Span::styled(format!(":{branch}"), opts.theme.accent),
+        Span::styled(cwd_trunc, opts.theme.dim),
+        Span::styled(branch_str, opts.theme.accent),
     ]);
 
-    let line2 = Line::from(Span::styled(
-        format!("• codeapp {}", state.app_version),
-        opts.theme.faint,
-    ));
+    let app_str = format!("• codeapp {}", state.app_version);
+    let app_trunc = truncate_to_width(&app_str, area.width as usize, true);
+    let line2 = Line::from(Span::styled(app_trunc, opts.theme.faint));
 
     frame.render_widget(Paragraph::new(vec![line1, line2]), area);
 }

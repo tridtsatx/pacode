@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use codeapp_render::{RenderOptions, truncate_to_width};
+use codeapp_render::{RenderOptions, display_width, truncate_to_width};
 use codeapp_types::TranscriptKind;
 use codeapp_types::state::Mode;
 use codeapp_types::time::{format_duration_ms, now_ms};
@@ -50,7 +50,7 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
     let show_effort_hint = state.config.ui.hints.effort;
 
     let right_hint = if show_model_hint { "/model" } else { "" };
-    let right_len = right_hint.len();
+    let right_len = display_width(right_hint);
 
     let mut left_spans = vec![
         Span::styled(mode.label(), opts.theme.cyan),
@@ -64,7 +64,7 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         left_spans.push(Span::styled(" /effort", opts.theme.cyan));
     }
 
-    let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let left_len: usize = left_spans.iter().map(|s| display_width(&s.content)).sum();
 
     if left_len + 2 + right_len <= width {
         let spaces = width - left_len - right_len;
@@ -91,8 +91,8 @@ fn render_row2_with_right(
     width: usize,
     opts: &RenderOptions,
 ) -> Line<'static> {
-    let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
-    let right_len = right_text.chars().count();
+    let left_len: usize = left_spans.iter().map(|s| display_width(&s.content)).sum();
+    let right_len = display_width(&right_text);
     let spaces = width.saturating_sub(left_len + right_len);
     let mut out = left_spans;
     out.push(Span::raw(" ".repeat(spaces)));
@@ -101,6 +101,15 @@ fn render_row2_with_right(
 }
 
 fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'static> {
+    if let Some(t) = state.ctrl_c_at
+        && std::time::Instant::now().saturating_duration_since(t)
+            <= std::time::Duration::from_secs(2)
+    {
+        let hint = "ctrl+c again to exit · ctrl+d exit";
+        let trunc = truncate_to_width(hint, width, true);
+        return Line::from(Span::styled(trunc, opts.theme.accent));
+    }
+
     let pending_perm = state.transcript.cells.iter().find_map(|c| {
         if let CellKind::Item(TranscriptKind::Permission(ref req)) = c.kind {
             Some(req.clone())
@@ -241,7 +250,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
 
                         let tok_str = format_tokens_upper(state.rail.usage.context_tokens as u64);
                         let right_text = format!("{tok_str} · ctrl+p");
-                        let right_len = right_text.chars().count();
+                        let right_len = display_width(&right_text);
 
                         let perm_base =
                             format!("{} {}", opts.glyphs.chevrons, mode.permission_line());
@@ -267,10 +276,13 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                             format!(" · ← {agents} agents · {bg} bg")
                         };
 
+                        let perm_base_len = display_width(&perm_base);
+                        let hint_len = display_width(hint);
+                        let counts_len = display_width(&counts_or_idle);
+
                         // Degradation steps:
                         // 1. Full with hint and counts and context
-                        let full_left_len =
-                            perm_base.chars().count() + hint.len() + counts_or_idle.chars().count();
+                        let full_left_len = perm_base_len + hint_len + counts_len;
                         if full_left_len + 2 + right_len <= width {
                             let spans = vec![
                                 Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
@@ -282,8 +294,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                         }
 
                         // 2. Drop hint
-                        let no_hint_len =
-                            perm_base.chars().count() + counts_or_idle.chars().count();
+                        let no_hint_len = perm_base_len + counts_len;
                         if no_hint_len + 2 + right_len <= width {
                             let spans = vec![
                                 Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
@@ -294,7 +305,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                         }
 
                         // 3. Drop counts
-                        if perm_base.chars().count() + 2 + right_len <= width {
+                        if perm_base_len + 2 + right_len <= width {
                             let spans = vec![
                                 Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
                                 Span::styled(mode.permission_line(), perm_style),
@@ -340,8 +351,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         Vec::new()
     };
 
-    let right_len: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
-    let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let right_len: usize = right_spans.iter().map(|s| display_width(&s.content)).sum();
+    let left_len: usize = left_spans.iter().map(|s| display_width(&s.content)).sum();
 
     if left_len + 2 + right_len <= width {
         let spaces = width - left_len - right_len;

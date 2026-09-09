@@ -47,11 +47,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
 
     let layout = compute_rail(area, demand);
 
+    let has_subagents = state.rail.agents.iter().any(|a| !a.id.is_main());
+
     draw_header(frame, layout.header, state, opts);
     draw_plan(frame, layout.plan, state, opts, select_mode);
     if state.rail.show_session_stats {
         crate::ui::rail_session::draw_session(frame, layout.agents, state, opts);
-    } else {
+    } else if has_subagents {
         draw_agents(frame, layout.agents, state, opts, select_mode);
     }
     if layout.background.height > 0 {
@@ -192,21 +194,30 @@ fn draw_agents(
 
     let now = now_ms();
     let main_agent = state.rail.agents.iter().find(|a| a.id.is_main());
-    let main_dur = main_agent.map(|a| a.duration_ms(now)).unwrap_or(0);
-    let main_dur_str = format_duration_ms(main_dur);
-
-    let main_status_str = if state.turn_active {
-        format!("думает · {main_dur_str}")
+    let main_line = if state.turn_active {
+        let dur_ms = state
+            .turn_started_at
+            .map(|t| {
+                std::time::Instant::now()
+                    .saturating_duration_since(t)
+                    .as_millis() as u64
+            })
+            .or_else(|| main_agent.map(|a| a.duration_ms(now)))
+            .unwrap_or(0);
+        let dur_str = format_duration_ms(dur_ms);
+        Line::from(vec![
+            Span::styled(opts.glyphs.main_dot, opts.theme.green),
+            Span::raw(" "),
+            Span::styled("main  ", opts.theme.bold),
+            Span::styled(format!("думает · {dur_str}"), opts.theme.faint),
+        ])
     } else {
-        main_dur_str
+        Line::from(vec![
+            Span::styled(opts.glyphs.main_dot, opts.theme.green),
+            Span::raw(" "),
+            Span::styled("main", opts.theme.bold),
+        ])
     };
-
-    let main_line = Line::from(vec![
-        Span::styled(opts.glyphs.main_dot, opts.theme.green),
-        Span::raw(" "),
-        Span::styled("main  ", opts.theme.bold),
-        Span::styled(main_status_str, opts.theme.faint),
-    ]);
     lines.push(main_line);
 
     let subagents: Vec<_> = state

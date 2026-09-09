@@ -111,6 +111,10 @@ pub struct AppState {
     /// `ctrl+c` pressed once (exit on second within 2 s).
     pub ctrl_c_at: Option<Instant>,
     pub quit: bool,
+    /// When the main agent turn started (for calculating thinking duration and animations).
+    pub turn_started_at: Option<Instant>,
+    /// Frame counter for activity animations and spinners (8 fps).
+    pub anim_frame: u64,
 }
 
 /// What the panel shows.
@@ -150,6 +154,8 @@ impl AppState {
             rows,
             ctrl_c_at: None,
             quit: false,
+            turn_started_at: None,
+            anim_frame: 0,
         }
     }
 
@@ -178,6 +184,13 @@ impl AppState {
                 self.transcript
                     .reset(snapshot.transcript, snapshot.has_more_history);
                 self.turn_active = snapshot.turn_active;
+                if snapshot.turn_active {
+                    if self.turn_started_at.is_none() {
+                        self.turn_started_at = Some(now);
+                    }
+                } else {
+                    self.turn_started_at = None;
+                }
                 self.rail.plan = snapshot.plan;
                 self.rail.agents = snapshot.agents;
                 self.rail.agents.sort_by_key(|a| a.started_at_ms);
@@ -214,6 +227,7 @@ impl AppState {
             Event::TurnStarted { agent, turn: _ } => {
                 if agent.is_main() {
                     self.turn_active = true;
+                    self.turn_started_at = Some(now);
                     self.rail.update_idle(true, now);
                 }
             }
@@ -225,6 +239,7 @@ impl AppState {
             } => {
                 if agent.is_main() {
                     self.turn_active = false;
+                    self.turn_started_at = None;
                     self.transcript.flush_stream();
                     self.rail.update_idle(false, now);
                 }
@@ -439,6 +454,28 @@ impl AppState {
     /// Whether a periodic 1 s tick is needed (live agents or tasks: durations change).
     pub fn needs_second_tick(&self) -> bool {
         self.turn_active || self.rail.has_live_agents() || self.rail.has_running_tasks()
+    }
+
+    /// Whether the 8 fps (125 ms) animation tick is needed (turn active or active panel agent).
+    pub fn needs_anim_tick(&self) -> bool {
+        if self.turn_active {
+            return true;
+        }
+        match &self.focus {
+            Focus::Panel {
+                target: PanelTarget::Agent(id),
+                ..
+            } => self.rail.agent(id).is_some_and(|a| a.status.is_active()),
+            _ => self
+                .panel
+                .target
+                .as_ref()
+                .and_then(|t| match t {
+                    PanelTarget::Agent(id) => self.rail.agent(id),
+                    _ => None,
+                })
+                .is_some_and(|a| a.status.is_active()),
+        }
     }
 
     /// Whether the paced stream needs its 33 ms tick.

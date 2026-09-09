@@ -89,3 +89,54 @@ fn test_dot_only_on_empty_prompt() {
     assert_eq!(state.focus, Focus::Normal);
     assert_eq!(state.input.text, "cat.");
 }
+
+#[test]
+fn test_slash_tab_completion() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // 1. Tab on empty prompt does nothing
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    handle_key(&mut state, tab, now);
+    assert_eq!(state.input.text, "");
+
+    // 2. Tab on slash prefix completes to matching command + trailing space
+    state.input.insert_str("/mo");
+    handle_key(&mut state, tab, now);
+    assert_eq!(state.input.text, "/model ");
+    assert_eq!(state.input.cursor, "/model ".chars().count());
+
+    // 3. Arrow down cycles selection
+    state.input.text.clear();
+    state.input.cursor = 0;
+    state.input.insert_str("/");
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    // Next command after model is effort
+    handle_key(&mut state, tab, now);
+    assert_eq!(state.input.text, "/effort ");
+}
+
+#[test]
+fn test_ctrl_c_hint_lifecycle() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    // 1. If text is non-empty, ctrl+c clears text and does not set hint
+    state.input.insert_str("some text");
+    handle_key(&mut state, ctrl_c, now);
+    assert!(state.input.is_empty());
+    assert_eq!(state.ctrl_c_at, None);
+
+    // 2. Empty prompt: first ctrl+c sets ctrl_c_at
+    handle_key(&mut state, ctrl_c, now);
+    assert_eq!(state.ctrl_c_at, Some(now));
+    assert!(!state.quit);
+
+    // 3. Second ctrl+c within 2s exits
+    let later = now + Duration::from_millis(500);
+    let actions = handle_key(&mut state, ctrl_c, later);
+    assert!(state.quit);
+    assert_eq!(actions, vec![Action::Quit]);
+}
