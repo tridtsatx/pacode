@@ -53,6 +53,7 @@ pub enum Action {
     SubmitNow,
     RemoveQueued,
     ClearQueue,
+    PasteImage,
 }
 
 impl Action {
@@ -100,6 +101,7 @@ impl Action {
             Self::SubmitNow => "submit_now",
             Self::RemoveQueued => "remove_queued",
             Self::ClearQueue => "clear_queue",
+            Self::PasteImage => "paste_image",
         }
     }
 
@@ -147,6 +149,7 @@ impl Action {
             Self::SubmitNow => "Submit immediately (run turn in background)",
             Self::RemoveQueued => "Remove last queued prompt",
             Self::ClearQueue => "Clear prompt queue",
+            Self::PasteImage => "Paste image from clipboard",
         }
     }
 }
@@ -374,6 +377,7 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("submit_now", Action::SubmitNow),
     ("remove_queued", Action::RemoveQueued),
     ("clear_queue", Action::ClearQueue),
+    ("paste_image", Action::PasteImage),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -612,6 +616,13 @@ impl Keymap {
             vec![Binding {
                 code: KeyCode::Char('q'),
                 mods: KeyModifiers::ALT | KeyModifiers::SHIFT,
+            }],
+        );
+        bindings.insert(
+            Action::PasteImage,
+            vec![Binding {
+                code: KeyCode::Char('v'),
+                mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
             }],
         );
 

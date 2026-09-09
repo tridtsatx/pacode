@@ -71,7 +71,7 @@ pub(crate) fn start_task_router(
                                     task: info.clone(),
                                     tail,
                                 });
-                            if agent.id.is_main() && !agent.is_running() {
+                            if agent.id().is_main() && !agent.is_running() {
                                 crate::turn::start_turn(session.clone(), agent);
                             }
                         }

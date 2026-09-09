@@ -52,7 +52,7 @@ pub async fn consume_stream(
                             && let Some(seq) = assistant_item_seq
                         {
                             session.events.emit(Event::TextDelta {
-                                agent: agent.id.clone(),
+                                agent: agent.id(),
                                 item_seq: seq,
                                 text: flush,
                             });
@@ -61,7 +61,7 @@ pub async fn consume_stream(
                             && let Some(seq) = reasoning_item_seq
                         {
                             session.events.emit(Event::ReasoningDelta {
-                                agent: agent.id.clone(),
+                                agent: agent.id(),
                                 item_seq: seq,
                                 text: flush,
                             });
@@ -82,7 +82,7 @@ pub async fn consume_stream(
                                     assistant_item_seq = Some(item_seq);
                                     let item = TranscriptItem {
                                         seq: item_seq,
-                                        agent: agent.id.clone(),
+                                        agent: agent.id(),
                                         ts_ms: pacode_types::now_ms(),
                                         kind: TranscriptKind::Assistant {
                                             text: String::new(),
@@ -101,7 +101,7 @@ pub async fn consume_stream(
                                     && let Some(seq) = assistant_item_seq
                                 {
                                     session.events.emit(Event::TextDelta {
-                                        agent: agent.id.clone(),
+                                        agent: agent.id(),
                                         item_seq: seq,
                                         text: flush,
                                     });
@@ -117,7 +117,7 @@ pub async fn consume_stream(
                                     reasoning_item_seq = Some(item_seq);
                                     let item = TranscriptItem {
                                         seq: item_seq,
-                                        agent: agent.id.clone(),
+                                        agent: agent.id(),
                                         ts_ms: pacode_types::now_ms(),
                                         kind: TranscriptKind::Reasoning {
                                             text: String::new(),
@@ -136,7 +136,7 @@ pub async fn consume_stream(
                                     && let Some(seq) = reasoning_item_seq
                                 {
                                     session.events.emit(Event::ReasoningDelta {
-                                        agent: agent.id.clone(),
+                                        agent: agent.id(),
                                         item_seq: seq,
                                         text: flush,
                                     });
@@ -174,7 +174,7 @@ pub async fn consume_stream(
         && let Some(seq) = assistant_item_seq
     {
         session.events.emit(Event::TextDelta {
-            agent: agent.id.clone(),
+            agent: agent.id(),
             item_seq: seq,
             text: flush,
         });
@@ -183,7 +183,7 @@ pub async fn consume_stream(
         && let Some(seq) = reasoning_item_seq
     {
         session.events.emit(Event::ReasoningDelta {
-            agent: agent.id.clone(),
+            agent: agent.id(),
             item_seq: seq,
             text: flush,
         });
@@ -192,7 +192,7 @@ pub async fn consume_stream(
     if let Some(seq) = reasoning_item_seq {
         let item = TranscriptItem {
             seq,
-            agent: agent.id.clone(),
+            agent: agent.id(),
             ts_ms: pacode_types::now_ms(),
             kind: TranscriptKind::Reasoning {
                 text: reasoning_acc.clone(),
@@ -210,7 +210,7 @@ pub async fn consume_stream(
     if let Some(seq) = assistant_item_seq {
         let item = TranscriptItem {
             seq,
-            agent: agent.id.clone(),
+            agent: agent.id(),
             ts_ms: pacode_types::now_ms(),
             kind: TranscriptKind::Assistant {
                 text: text_acc.clone(),
@@ -247,7 +247,7 @@ pub async fn consume_stream(
                 .push(msg);
             let _ = session
                 .store
-                .append_message(&session.id, &agent.id, seq, &arc_msg)
+                .append_message(&session.id, &agent.id(), seq, &arc_msg)
                 .await;
         }
         return Ok(StreamOutcome {

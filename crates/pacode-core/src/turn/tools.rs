@@ -72,11 +72,11 @@ async fn run_single_tool(
             .push(stub);
         let _ = session
             .store
-            .append_message(&session.id, &agent.id, seq, &arc_stub)
+            .append_message(&session.id, &agent.id(), seq, &arc_stub)
             .await;
         let item = TranscriptItem {
             seq: call.item_seq,
-            agent: agent.id.clone(),
+            agent: agent.id(),
             ts_ms: pacode_types::now_ms(),
             kind: TranscriptKind::ToolCall {
                 call_id: call.call_id,
@@ -124,11 +124,11 @@ async fn run_single_tool(
 
     let host = Arc::new(crate::host::SessionHost {
         session: session.clone(),
-        agent: agent.id.clone(),
+        agent: agent.id(),
     });
     let ctx = pacode_tools::ToolCtx {
         session: session.id.clone(),
-        agent: agent.id.clone(),
+        agent: agent.id(),
         agent_name: agent.info().name,
         call_id: call.call_id.clone(),
         cwd: session.meta().cwd.clone(),
@@ -203,11 +203,11 @@ async fn run_single_tool(
                             .push(stub);
                         let _ = session
                             .store
-                            .append_message(&session.id, &agent.id, seq, &arc_stub)
+                            .append_message(&session.id, &agent.id(), seq, &arc_stub)
                             .await;
                         let item = TranscriptItem {
                             seq: call.item_seq,
-                            agent: agent.id.clone(),
+                            agent: agent.id(),
                             ts_ms: pacode_types::now_ms(),
                             kind: TranscriptKind::ToolCall {
                                 call_id: call.call_id,
@@ -275,7 +275,7 @@ async fn run_single_tool(
 
     let item = TranscriptItem {
         seq: call.item_seq,
-        agent: agent.id.clone(),
+        agent: agent.id(),
         ts_ms: pacode_types::now_ms(),
         kind: TranscriptKind::ToolCall {
             call_id: call.call_id.clone(),
@@ -304,7 +304,7 @@ async fn run_single_tool(
         .push(res_msg);
     let _ = session
         .store
-        .append_message(&session.id, &agent.id, seq, &arc_msg)
+        .append_message(&session.id, &agent.id(), seq, &arc_msg)
         .await;
 
     ToolExecutionStatus::Ok
@@ -327,7 +327,7 @@ pub async fn execute_tool_calls(
             .next_seq();
         let item = TranscriptItem {
             seq: item_seq,
-            agent: agent.id.clone(),
+            agent: agent.id(),
             ts_ms: pacode_types::now_ms(),
             kind: TranscriptKind::ToolCall {
                 call_id: call_id.clone(),
@@ -427,11 +427,11 @@ pub async fn execute_tool_calls(
                 .push(stub);
             let _ = session
                 .store
-                .append_message(&session.id, &agent.id, seq, &arc_stub)
+                .append_message(&session.id, &agent.id(), seq, &arc_stub)
                 .await;
             let item = TranscriptItem {
                 seq: call.item_seq,
-                agent: agent.id.clone(),
+                agent: agent.id(),
                 ts_ms: pacode_types::now_ms(),
                 kind: TranscriptKind::ToolCall {
                     call_id: call.call_id,

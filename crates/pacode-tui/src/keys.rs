@@ -126,6 +126,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     let action = state.keymap.action_for(key);
 
+    // Paste image from clipboard via ctrl+alt+v
+    if action == Some(KeyAction::PasteImage) {
+        return crate::paste::handle_paste_image(state, true, now);
+    }
+
     // 2. Session picker via ctrl+p
     if action == Some(KeyAction::SessionPicker) {
         state.focus = Focus::Overlay(Overlay::SessionPicker {
@@ -360,11 +365,15 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         if !state.turn_active {
             return submit_prompt(state);
         }
-        // The daemon already injects a message that arrives mid-turn as a steer,
-        // so this reaches the model without waiting for the turn to end and
-        // without discarding what the turn has done so far.
+        // Push the running turn out to a background agent first, so it keeps
+        // working on its own transcript, then start the new message on the main
+        // agent that takes its place. Nothing in flight is discarded.
         let text = state.input.take();
-        return vec![Action::Send(Request::UserMessage { text })];
+        state.pasted_images.mark_submitted(&text);
+        return vec![
+            Action::Send(Request::DetachTurn),
+            Action::Send(Request::UserMessage { text }),
+        ];
     }
 
     // 10. Enter key
@@ -428,6 +437,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     return vec![];
                 }
                 let text = state.input.take();
+                state.pasted_images.mark_submitted(&text);
                 state.input.queue_push(text);
                 return vec![];
             }
@@ -633,6 +643,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         _ => {}
     }
 
+    crate::paste::cleanup_unreferenced_images(state);
+
     vec![]
 }
 
@@ -662,6 +674,7 @@ fn complete_slash_command(state: &mut AppState) -> bool {
 fn submit_prompt(state: &mut AppState) -> Vec<Action> {
     if !state.input.is_empty() {
         let text = state.input.take();
+        state.pasted_images.mark_submitted(&text);
         if text.starts_with('/') {
             return commands::execute(state, &text);
         }

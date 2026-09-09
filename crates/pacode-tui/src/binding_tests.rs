@@ -522,4 +522,13 @@ fn test_queue_actions_present_in_defaults() {
             mods: KeyModifiers::ALT | KeyModifiers::SHIFT,
         }]
     );
+
+    let paste_image_bindings = keymap.bindings_for(Action::PasteImage);
+    assert_eq!(
+        paste_image_bindings,
+        &[Binding {
+            code: KeyCode::Char('v'),
+            mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
+        }]
+    );
 }

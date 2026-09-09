@@ -38,6 +38,41 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
 
     let mut idle_since: Option<std::time::Instant> = Some(std::time::Instant::now());
 
+    let core_for_watcher = Arc::clone(&core);
+    let _watcher = pacode_config::ConfigWatcher::watch(
+        opts.paths.config_file(),
+        std::time::Duration::from_millis(150),
+        move |result| {
+            let core = Arc::clone(&core_for_watcher);
+            tokio::spawn(async move {
+                match result {
+                    Ok(new_cfg) => {
+                        let mut api_keys = std::collections::BTreeMap::new();
+                        for (id, pcfg) in &new_cfg.providers {
+                            api_keys.insert(id.clone(), pacode_config::resolve_api_key(pcfg));
+                        }
+                        if let Err(e) = core.reload_config(new_cfg.clone(), &api_keys) {
+                            log::warn!("config reload failed: {e}");
+                        }
+                        let _ = core
+                            .handle_global(&pacode_types::Request::ListMcpServers)
+                            .await;
+                        log::info!("reloaded configuration from disk");
+                    }
+                    Err(err) => {
+                        log::error!("failed to parse configuration file: {err}");
+                        core.broadcast_event(pacode_types::Event::Toast {
+                            level: pacode_types::ToastLevel::Error,
+                            title: "Configuration error".to_string(),
+                            detail: Some(err.to_string()),
+                        });
+                    }
+                }
+            });
+        },
+    )
+    .ok();
+
     loop {
         let conns = control
             .connections
@@ -88,6 +123,9 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
                 }
             }
             _ = idle_timer => {
+                let _ = core
+                    .handle_global(&pacode_types::Request::ListMcpServers)
+                    .await;
                 let current_conns = control.connections.load(std::sync::atomic::Ordering::Relaxed);
                 if current_conns == 0 && core.is_idle() {
                     let idle_start = idle_since.get_or_insert_with(std::time::Instant::now);
@@ -105,6 +143,9 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
                 }
             }
             accept_res = listener.accept() => {
+                let _ = core
+                    .handle_global(&pacode_types::Request::ListMcpServers)
+                    .await;
                 match accept_res {
                     Ok((stream, _addr)) => {
                         idle_since = None;

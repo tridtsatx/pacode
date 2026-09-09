@@ -310,3 +310,81 @@ fn test_web_config_settings() {
     reset_in_config(&mut cfg, "web.default_num_results");
     assert_eq!(cfg.web.default_num_results, 8);
 }
+
+#[test]
+fn test_live_restart_classification_present_for_every_entry() {
+    for entry in SETTINGS {
+        match entry.apply {
+            ApplyMode::Immediate => assert_eq!(entry.apply.as_str(), "immediate"),
+            ApplyMode::NextTurn => assert_eq!(entry.apply.as_str(), "next turn"),
+            ApplyMode::Restart => assert_eq!(entry.apply.as_str(), "restart"),
+        }
+    }
+}
+
+#[test]
+fn test_live_restart_classification_spot_checks() {
+    // Restart: read once at startup / process spawn
+    assert_eq!(
+        find_entry("daemon.socket").unwrap().apply,
+        ApplyMode::Restart
+    );
+    assert_eq!(
+        find_entry("daemon.idle_timeout_secs").unwrap().apply,
+        ApplyMode::Restart
+    );
+    assert_eq!(find_entry("mcp.servers").unwrap().apply, ApplyMode::Restart);
+    assert_eq!(
+        find_entry("plugins.enabled").unwrap().apply,
+        ApplyMode::Restart
+    );
+    assert_eq!(
+        find_entry("skills.enabled").unwrap().apply,
+        ApplyMode::Restart
+    );
+    assert_eq!(
+        find_entry("exec.stall_secs").unwrap().apply,
+        ApplyMode::Restart
+    );
+
+    // Immediate: read on render / keypress / atomic update live
+    assert_eq!(
+        find_entry("ui.hints.model").unwrap().apply,
+        ApplyMode::Immediate
+    );
+    assert_eq!(find_entry("ui.vim").unwrap().apply, ApplyMode::Immediate);
+    assert_eq!(
+        find_entry("theme.name").unwrap().apply,
+        ApplyMode::Immediate
+    );
+    assert_eq!(
+        find_entry("mcp.sampling").unwrap().apply,
+        ApplyMode::Immediate
+    );
+    assert_eq!(
+        find_entry("mcp.idle_timeout_secs").unwrap().apply,
+        ApplyMode::Immediate
+    );
+
+    // NextTurn: read during turn execution / prompt building / agent spawning
+    assert_eq!(
+        find_entry("provider.default").unwrap().apply,
+        ApplyMode::NextTurn
+    );
+    assert_eq!(
+        find_entry("context.compaction_threshold").unwrap().apply,
+        ApplyMode::NextTurn
+    );
+    assert_eq!(
+        find_entry("agents.max_live").unwrap().apply,
+        ApplyMode::NextTurn
+    );
+    assert_eq!(
+        find_entry("permissions.default_mode").unwrap().apply,
+        ApplyMode::NextTurn
+    );
+    assert_eq!(
+        find_entry("exec.yield_after_secs").unwrap().apply,
+        ApplyMode::NextTurn
+    );
+}

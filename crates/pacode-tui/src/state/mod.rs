@@ -191,6 +191,8 @@ pub struct AppState {
     pub cwd: PathBuf,
     /// Cancellation sender for currently running local bash command.
     pub running_bash: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Temporary files created for pasted images.
+    pub pasted_images: crate::clipboard_read::PastedImages,
 }
 
 /// What the panel shows.
@@ -259,11 +261,16 @@ impl AppState {
             active_slot: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             running_bash: None,
+            pasted_images: crate::clipboard_read::PastedImages::new(),
         }
     }
 
     pub fn is_running_bash(&self) -> bool {
         self.running_bash.is_some()
+    }
+
+    pub fn cleanup_pasted_images(&mut self) {
+        self.pasted_images.cleanup_unreferenced(&self.input.text);
     }
 
     /// Fold a client event into the state (spec §5 state table, §7 follow rules).

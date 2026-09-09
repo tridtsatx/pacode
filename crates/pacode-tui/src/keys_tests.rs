@@ -1757,16 +1757,20 @@ fn test_ctrl_enter_submit_now_behavior() {
     );
     assert!(state.input.is_empty());
 
-    // 2. While a turn runs it still sends immediately: the daemon takes a message
-    // arriving mid-turn as a steer injection, so nothing waits and nothing is lost.
+    // 2. While a turn runs, the running turn is detached to a background agent
+    // first and the new message then starts a fresh turn on main. Order matters:
+    // the message must not reach main before the running turn has left it.
     state.turn_active = true;
     state.input.insert_str("send now while busy");
     let actions = handle_key(&mut state, ctrl_enter, now);
     assert_eq!(
         actions,
-        vec![Action::Send(Request::UserMessage {
-            text: "send now while busy".into()
-        })]
+        vec![
+            Action::Send(Request::DetachTurn),
+            Action::Send(Request::UserMessage {
+                text: "send now while busy".into()
+            })
+        ]
     );
     assert!(state.input.is_empty());
     assert!(

@@ -2,6 +2,8 @@
 
 use std::io::Write;
 
+pub use crate::clipboard_read::*;
+
 #[cfg(test)]
 #[path = "clipboard_tests.rs"]
 mod clipboard_tests;

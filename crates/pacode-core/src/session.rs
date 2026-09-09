@@ -98,13 +98,25 @@ impl Session {
             self.config.context.tool_output_cap_chars,
         );
 
+        if !main.is_running() {
+            let hist_snapshot = main
+                .history
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            *main
+                .history_before_turn
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(hist_snapshot);
+        }
+
         let (seq, arc_msg) = main
             .history
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(pacode_types::Message::user(&expanded_text));
         self.store
-            .append_message(&self.id, &main.id, seq, &arc_msg)
+            .append_message(&self.id, &main.id(), seq, &arc_msg)
             .await?;
 
         let item_seq = main
@@ -114,7 +126,7 @@ impl Session {
             .next_seq();
         let item = pacode_types::TranscriptItem {
             seq: item_seq,
-            agent: main.id.clone(),
+            agent: main.id(),
             ts_ms: pacode_types::now_ms(),
             kind: pacode_types::TranscriptKind::User { text: text.clone() },
         };
@@ -204,7 +216,7 @@ impl Session {
             .read()
             .map(|a| {
                 a.values()
-                    .filter(|agent| agent.status().is_live() && !agent.id.is_main())
+                    .filter(|agent| agent.status().is_live() && !agent.id().is_main())
                     .count()
             })
             .unwrap_or(0);
@@ -285,20 +297,14 @@ impl Session {
             .upsert_agent(&self.id, &info, Some(&spec.prompt))
             .await?;
 
-        let agent = Arc::new(Agent {
-            id: id.clone(),
-            info: RwLock::new(info.clone()),
-            history: std::sync::Mutex::new(history),
-            injections: crate::inject::InjectionQueue::default(),
-            tools: RwLock::new(tools),
-            cancel: std::sync::Mutex::new(None),
-            turn_lock: tokio::sync::Mutex::new(()),
-            transcript: std::sync::Mutex::new(crate::transcript::TranscriptState::new(
-                self.config.session.history_page as usize * 2,
-            )),
-            prompt: Some(spec.prompt),
-            turns: std::sync::Mutex::new(0),
-        });
+        let agent = Arc::new(Agent::new(
+            id.clone(),
+            info.clone(),
+            history,
+            tools,
+            self.config.session.history_page,
+            Some(spec.prompt),
+        ));
 
         if let Ok(mut agents) = self.agents.write() {
             agents.insert(id.clone(), agent.clone());
@@ -326,10 +332,201 @@ impl Session {
         let info = agent.info();
         let _ = self
             .store
-            .upsert_agent(&self.id, &info, agent.prompt.as_deref())
+            .upsert_agent(&self.id, &info, agent.prompt().as_deref())
             .await;
         self.events.emit(pacode_types::Event::AgentUpdated(info));
         Ok(())
+    }
+
+    /// Detach a running turn on the main agent into a background subagent.
+    pub async fn detach_main_turn(self: &Arc<Self>) -> Result<AgentId, CoreError> {
+        let live_count = self
+            .agents
+            .read()
+            .map(|a| {
+                a.values()
+                    .filter(|agent| agent.status().is_live() && !agent.id().is_main())
+                    .count()
+            })
+            .unwrap_or(0);
+        if live_count >= self.config.agents.max_live {
+            return Err(CoreError::Invalid(format!(
+                "maximum live subagents ({}) reached",
+                self.config.agents.max_live
+            )));
+        }
+
+        let main = self
+            .main_agent()
+            .ok_or_else(|| CoreError::AgentNotFound(AgentId::main()))?;
+
+        if !main.is_running() {
+            return Err(CoreError::Invalid(
+                "no turn is running on the main agent".to_string(),
+            ));
+        }
+
+        let history_before = main
+            .history_before_turn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+
+        let prior_history = history_before.unwrap_or_else(|| {
+            let hist_guard = main.history.lock().unwrap_or_else(|p| p.into_inner());
+            let mut msgs = hist_guard.messages.clone();
+            if !msgs.is_empty() {
+                msgs.pop();
+            }
+            let est_tokens = msgs.iter().map(|m| m.estimate_tokens()).sum::<u32>()
+                + hist_guard
+                    .summary
+                    .as_deref()
+                    .map(pacode_types::estimate_tokens)
+                    .unwrap_or(0);
+            crate::agent::History {
+                messages: msgs,
+                next_seq: hist_guard.next_seq.saturating_sub(1),
+                summary: hist_guard.summary.clone(),
+                summary_upto: hist_guard.summary_upto,
+                estimated_tokens: est_tokens,
+            }
+        });
+
+        let turn_prompt = {
+            let hist = main.history.lock().unwrap_or_else(|p| p.into_inner());
+            hist.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == pacode_types::Role::User)
+                .map(|m| m.text())
+        };
+        main.set_prompt(turn_prompt.clone());
+
+        let new_id = AgentId::generate();
+        let name = {
+            let count = self.agents.read().map(|a| a.len()).unwrap_or(1);
+            format!("agent-{count}")
+        };
+
+        let detached_info = {
+            let mut agents_guard = self.agents.write().unwrap_or_else(|p| p.into_inner());
+
+            // Lock the running agent's transcript while swapping identity
+            let mut transcript = main.transcript.lock().unwrap_or_else(|p| p.into_inner());
+
+            // 1. Swap ID atomically
+            main.set_id(new_id.clone());
+
+            // 2. Restrict tools to subagent subset (exclude `agent` tool)
+            {
+                let g = self.tools.read().unwrap_or_else(|p| p.into_inner());
+                let default_names = pacode_tools::subagent_tool_names(&g);
+                let sub_tools = g.subset(default_names.iter().map(String::as_str));
+                if let Ok(mut t) = main.tools.write() {
+                    *t = sub_tools;
+                }
+            }
+
+            // 3. Update info to subagent
+            let detached_info = {
+                let mut info_guard = main.info.write().unwrap_or_else(|p| p.into_inner());
+                info_guard.id = new_id.clone();
+                info_guard.name = name;
+                info_guard.kind = pacode_types::AgentKind::Sub;
+                info_guard.parent = Some(AgentId::main());
+                info_guard.clone()
+            };
+
+            // 4. Retag all transcript items in the detached agent's transcript
+            for item in &mut transcript.tail {
+                item.agent = new_id.clone();
+            }
+            for item in transcript.tool_items.values_mut() {
+                item.agent = new_id.clone();
+            }
+            drop(transcript);
+
+            // 5. Re-register running agent under new_id
+            agents_guard.insert(new_id.clone(), main.clone());
+
+            // 6. Create FRESH main agent
+            let main_tools = self.tools.read().unwrap_or_else(|p| p.into_inner()).clone();
+            let now = pacode_types::now_ms();
+            let fresh_main_info = pacode_types::AgentInfo {
+                id: AgentId::main(),
+                name: "main".to_string(),
+                kind: pacode_types::AgentKind::Main,
+                status: pacode_types::AgentStatus::Idle,
+                activity: None,
+                started_at_ms: now,
+                finished_at_ms: None,
+                tokens_in: 0,
+                tokens_out: 0,
+                model: self.meta().model,
+                effort: self.meta().effort,
+                parent: None,
+                summary: None,
+                error: None,
+            };
+
+            let mut fresh_transcript = crate::transcript::TranscriptState::new(
+                self.config.session.history_page as usize * 2,
+            );
+            let prior_tuples: Vec<(u64, Arc<pacode_types::Message>)> = prior_history
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (i as u64, m.clone()))
+                .collect();
+            let items = crate::transcript::history_to_items(&AgentId::main(), &prior_tuples, 0);
+            for item in items {
+                fresh_transcript.upsert(item);
+            }
+
+            let fresh_main = Arc::new(Agent::new_with_transcript(
+                AgentId::main(),
+                fresh_main_info.clone(),
+                prior_history,
+                main_tools,
+                fresh_transcript,
+                None,
+            ));
+
+            agents_guard.insert(AgentId::main(), fresh_main);
+
+            detached_info
+        };
+
+        // 7. Store updates
+        self.store
+            .upsert_agent(&self.id, &detached_info, turn_prompt.as_deref())
+            .await?;
+
+        {
+            let msgs = main
+                .history
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .messages
+                .clone();
+            for (seq, msg) in msgs.iter().enumerate() {
+                let _ = self
+                    .store
+                    .append_message(&self.id, &new_id, seq as u64, msg)
+                    .await;
+            }
+        }
+
+        // 8. Emit events
+        self.events
+            .emit(pacode_types::Event::AgentAdded(detached_info));
+        if let Some(fresh_main) = self.main_agent() {
+            self.events
+                .emit(pacode_types::Event::AgentUpdated(fresh_main.info()));
+        }
+
+        Ok(new_id)
     }
 
     pub fn set_plan(&self, plan: Plan) {
@@ -428,3 +625,7 @@ impl Session {
         self.events.emit(pacode_types::Event::SessionUpdated(meta));
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;

@@ -179,6 +179,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                 message: "already initialized".to_string(),
             },
             Request::Attach(attach) => {
+                let _ = core.handle_global(&Request::ListMcpServers).await;
                 if let Some(handle) = forwarder_handle.take() {
                     handle.abort();
                 }
@@ -240,13 +241,17 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                 }
             }
             Request::Detach => {
+                let _ = core.handle_global(&Request::ListMcpServers).await;
                 if let Some(handle) = forwarder_handle.take() {
                     handle.abort();
                 }
                 attached_session = None;
                 Reply::Ok
             }
-            Request::Ping => Reply::Pong,
+            Request::Ping => {
+                let _ = core.handle_global(&Request::ListMcpServers).await;
+                Reply::Pong
+            }
             Request::Shutdown { force } => {
                 if force {
                     control.shutdown.cancel();

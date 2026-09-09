@@ -365,6 +365,7 @@ pub struct McpConfig {
     pub servers: BTreeMap<String, McpServerConfig>,
     pub sampling: bool,
     pub sampling_max_tokens: u32,
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for McpConfig {
@@ -373,6 +374,7 @@ impl Default for McpConfig {
             servers: BTreeMap::new(),
             sampling: true,
             sampling_max_tokens: 2048,
+            idle_timeout_secs: 300,
         }
     }
 }
@@ -506,6 +508,7 @@ mod tests {
         assert_eq!(cfg.skills.max_listed, 100);
         assert_eq!(cfg.web.default_num_results, 8);
         assert_eq!(cfg.web.request_timeout_secs, 15);
+        assert_eq!(cfg.mcp.idle_timeout_secs, 300);
         assert!(cfg.default_route().is_none());
     }
 

@@ -314,6 +314,12 @@ impl Core {
                     }
                 }
             }
+            Request::DetachTurn => match session.detach_main_turn().await {
+                Ok(agent) => Reply::TurnDetached { agent },
+                Err(e) => Reply::Error {
+                    message: e.to_string(),
+                },
+            },
             Request::Hello(_)
             | Request::Attach(_)
             | Request::Detach
@@ -390,7 +396,7 @@ impl Core {
                 let info = agent.info();
                 let _ = session
                     .store
-                    .upsert_agent(&session.id, &info, agent.prompt.as_deref())
+                    .upsert_agent(&session.id, &info, agent.prompt().as_deref())
                     .await;
             }
             session.tasks.kill_session(&session.id).await;

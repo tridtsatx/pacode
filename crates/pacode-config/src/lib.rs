@@ -13,12 +13,14 @@ pub mod paths;
 pub mod prefs;
 pub mod registry;
 pub mod theme;
+pub mod watcher;
 
 pub use display::detect_refresh_hz;
 pub use paths::Paths;
 pub use prefs::{Prefs, load_prefs, save_prefs};
 pub use theme::{load_theme, user_theme_names, write_theme};
 pub use toml;
+pub use watcher::ConfigWatcher;
 
 use pacode_types::{Config, Effort, Mode, ProviderConfig};
 
@@ -45,18 +47,17 @@ pub enum ConfigError {
     Env { var: String, value: String },
 }
 
-/// Load the config file (missing file = defaults) and apply environment overrides:
-/// `PACODE_MODEL` (`provider/model`), `PACODE_EFFORT`, `PACODE_MODE`.
-pub fn load(paths: &Paths) -> Result<Config, ConfigError> {
-    let mut cfg = match std::fs::read_to_string(&paths.config_file) {
+/// Load config from a specific file path and apply environment overrides.
+pub fn load_from_path(path: &std::path::Path) -> Result<Config, ConfigError> {
+    let mut cfg = match std::fs::read_to_string(path) {
         Ok(text) => parse(&text).map_err(|message| ConfigError::Parse {
-            path: paths.config_file.clone(),
+            path: path.to_path_buf(),
             message,
         })?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(err) => {
             return Err(ConfigError::Read {
-                path: paths.config_file.clone(),
+                path: path.to_path_buf(),
                 source: err,
             });
         }
@@ -68,6 +69,12 @@ pub fn load(paths: &Paths) -> Result<Config, ConfigError> {
         env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())),
     )?;
     Ok(cfg)
+}
+
+/// Load the config file (missing file = defaults) and apply environment overrides:
+/// `PACODE_MODEL` (`provider/model`), `PACODE_EFFORT`, `PACODE_MODE`.
+pub fn load(paths: &Paths) -> Result<Config, ConfigError> {
+    load_from_path(&paths.config_file)
 }
 
 /// Parse TOML text into a `Config` (used by `load` and by tests).

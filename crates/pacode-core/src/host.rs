@@ -366,7 +366,7 @@ impl ToolHost for SessionHost {
         parent
             .injections
             .push(crate::inject::Injection::AgentStatus { agent: info, text });
-        if parent.id.is_main() && !parent.is_running() {
+        if parent.id().is_main() && !parent.is_running() {
             crate::turn::start_turn(self.session.clone(), parent);
         }
         Ok(())

@@ -89,6 +89,8 @@ pub enum Request {
     },
     ListModels,
     Compact,
+    /// Detach a running turn on the main agent into a background subagent.
+    DetachTurn,
     /// Ask the daemon to exit. Without `force` it exits only when idle.
     Shutdown {
         force: bool,
@@ -197,6 +199,9 @@ pub enum Reply {
     },
     Attached(SessionSnapshot),
     Snapshot(SessionSnapshot),
+    TurnDetached {
+        agent: AgentId,
+    },
     History {
         agent: AgentId,
         items: Vec<TranscriptItem>,
@@ -341,5 +346,30 @@ mod tests {
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
         assert_eq!(back, reply);
+    }
+
+    #[test]
+    fn detach_turn_protocol_round_trip() {
+        let env = Envelope {
+            id: 42,
+            req: Request::DetachTurn,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"detach_turn\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, env);
+
+        let sub_id = AgentId::new("agt_test123");
+        let reply_msg = ServerMessage::Reply {
+            id: 42,
+            reply: Reply::TurnDetached {
+                agent: sub_id.clone(),
+            },
+        };
+        let line = serde_json::to_string(&reply_msg).unwrap();
+        assert!(line.contains("\"type\":\"turn_detached\""));
+        assert!(line.contains("\"agent\":\"agt_test123\""));
+        let back_reply: ServerMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(back_reply, reply_msg);
     }
 }

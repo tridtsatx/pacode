@@ -251,6 +251,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                     let actions = match ev {
                         Event::Key(key) => handle_key(&mut state, key, Instant::now()),
                         Event::Mouse(mouse) => handle_mouse(&mut state, mouse, &last_layout),
+                        Event::Paste(text) => {
+                            crate::paste::handle_paste(&mut state, text, Instant::now())
+                        }
                         Event::Resize(w, h) => {
                             state.cols = w;
                             state.rows = h;

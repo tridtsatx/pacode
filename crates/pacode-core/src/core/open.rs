@@ -86,20 +86,14 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
             };
             core.deps.store.upsert_agent(&id, &main_info, None).await?;
 
-            let main_agent = Arc::new(crate::agent::Agent {
-                id: pacode_types::AgentId::main(),
-                info: RwLock::new(main_info),
-                history: std::sync::Mutex::new(crate::agent::History::default()),
-                injections: crate::inject::InjectionQueue::default(),
-                tools: RwLock::new(session_tools.clone()),
-                cancel: std::sync::Mutex::new(None),
-                turn_lock: tokio::sync::Mutex::new(()),
-                transcript: std::sync::Mutex::new(crate::transcript::TranscriptState::new(
-                    core.deps.config.session.history_page as usize * 2,
-                )),
-                prompt: None,
-                turns: std::sync::Mutex::new(0),
-            });
+            let main_agent = Arc::new(crate::agent::Agent::new(
+                pacode_types::AgentId::main(),
+                main_info,
+                crate::agent::History::default(),
+                session_tools.clone(),
+                core.deps.config.session.history_page,
+                None,
+            ));
 
             let mut agents = BTreeMap::new();
             agents.insert(pacode_types::AgentId::main(), main_agent);
@@ -255,18 +249,14 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                     }
                 });
 
-            let main_agent = Arc::new(crate::agent::Agent {
-                id: pacode_types::AgentId::main(),
-                info: RwLock::new(main_info),
-                history: std::sync::Mutex::new(main_history),
-                injections: crate::inject::InjectionQueue::default(),
-                tools: RwLock::new(session_tools.clone()),
-                cancel: std::sync::Mutex::new(None),
-                turn_lock: tokio::sync::Mutex::new(()),
-                transcript: std::sync::Mutex::new(transcript_state),
-                prompt: None,
-                turns: std::sync::Mutex::new(0),
-            });
+            let main_agent = Arc::new(crate::agent::Agent::new_with_transcript(
+                pacode_types::AgentId::main(),
+                main_info,
+                main_history,
+                session_tools.clone(),
+                transcript_state,
+                None,
+            ));
             agents.insert(pacode_types::AgentId::main(), main_agent);
 
             for mut sub_info in stored_agents {
@@ -281,20 +271,14 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                         .upsert_agent(&session_id, &sub_info, None)
                         .await;
                 }
-                let sub_agent = Arc::new(crate::agent::Agent {
-                    id: sub_info.id.clone(),
-                    info: RwLock::new(sub_info.clone()),
-                    history: std::sync::Mutex::new(crate::agent::History::default()),
-                    injections: crate::inject::InjectionQueue::default(),
-                    tools: RwLock::new(session_tools.clone()),
-                    cancel: std::sync::Mutex::new(None),
-                    turn_lock: tokio::sync::Mutex::new(()),
-                    transcript: std::sync::Mutex::new(crate::transcript::TranscriptState::new(
-                        core.deps.config.session.history_page as usize * 2,
-                    )),
-                    prompt: None,
-                    turns: std::sync::Mutex::new(0),
-                });
+                let sub_agent = Arc::new(crate::agent::Agent::new(
+                    sub_info.id.clone(),
+                    sub_info.clone(),
+                    crate::agent::History::default(),
+                    session_tools.clone(),
+                    core.deps.config.session.history_page,
+                    None,
+                ));
                 agents.insert(sub_info.id, sub_agent);
             }
 

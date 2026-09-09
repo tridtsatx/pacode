@@ -12,7 +12,7 @@ use crate::transcript::TranscriptState;
 
 /// The model-visible history of one agent: a compaction summary (if any) plus the
 /// messages after it. Messages are `Arc` so a forked subagent shares them.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct History {
     pub messages: Vec<Arc<Message>>,
     /// Seq of the next message (per session+agent, persisted with the message).
@@ -52,7 +52,7 @@ impl History {
 }
 
 pub struct Agent {
-    pub id: AgentId,
+    id: RwLock<Arc<AgentId>>,
     pub info: RwLock<AgentInfo>,
     pub history: Mutex<History>,
     pub injections: InjectionQueue,
@@ -64,12 +64,99 @@ pub struct Agent {
     pub turn_lock: tokio::sync::Mutex<()>,
     pub transcript: Mutex<TranscriptState>,
     /// The prompt a subagent was spawned with (persisted).
-    pub prompt: Option<String>,
+    pub prompt: RwLock<Option<String>>,
     /// Turns run so far (subagent cap `agents.max_turns`).
     pub turns: Mutex<u32>,
+    /// History snapshot as it stood before the current turn began (for turn detach).
+    pub history_before_turn: Mutex<Option<History>>,
 }
 
 impl Agent {
+    pub fn new(
+        id: AgentId,
+        info: AgentInfo,
+        history: History,
+        tools: ToolRegistry,
+        history_page: u32,
+        prompt: Option<String>,
+    ) -> Self {
+        Self {
+            id: RwLock::new(Arc::new(id)),
+            info: RwLock::new(info),
+            history: Mutex::new(history),
+            injections: InjectionQueue::default(),
+            tools: RwLock::new(tools),
+            cancel: Mutex::new(None),
+            turn_lock: tokio::sync::Mutex::new(()),
+            transcript: Mutex::new(TranscriptState::new(history_page as usize * 2)),
+            prompt: RwLock::new(prompt),
+            turns: Mutex::new(0),
+            history_before_turn: Mutex::new(None),
+        }
+    }
+
+    pub fn new_with_transcript(
+        id: AgentId,
+        info: AgentInfo,
+        history: History,
+        tools: ToolRegistry,
+        transcript: TranscriptState,
+        prompt: Option<String>,
+    ) -> Self {
+        Self {
+            id: RwLock::new(Arc::new(id)),
+            info: RwLock::new(info),
+            history: Mutex::new(history),
+            injections: InjectionQueue::default(),
+            tools: RwLock::new(tools),
+            cancel: Mutex::new(None),
+            turn_lock: tokio::sync::Mutex::new(()),
+            transcript: Mutex::new(transcript),
+            prompt: RwLock::new(prompt),
+            turns: Mutex::new(0),
+            history_before_turn: Mutex::new(None),
+        }
+    }
+
+    pub fn id(&self) -> AgentId {
+        (*self.id_arc()).clone()
+    }
+
+    pub fn id_arc(&self) -> Arc<AgentId> {
+        self.id
+            .read()
+            .map(|id| id.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+
+    pub fn set_id(&self, new_id: AgentId) {
+        if let Ok(mut guard) = self.id.write() {
+            *guard = Arc::new(new_id);
+        } else if let Err(poisoned) = self.id.write() {
+            *poisoned.into_inner() = Arc::new(new_id);
+        }
+    }
+
+    pub fn with_id<R>(&self, f: impl FnOnce(&AgentId) -> R) -> R {
+        let guard = self.id.read().unwrap_or_else(|p| p.into_inner());
+        f(&guard)
+    }
+
+    pub fn prompt(&self) -> Option<String> {
+        self.prompt
+            .read()
+            .map(|p| p.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+
+    pub fn set_prompt(&self, prompt: Option<String>) {
+        if let Ok(mut guard) = self.prompt.write() {
+            *guard = prompt;
+        } else if let Err(p) = self.prompt.write() {
+            *p.into_inner() = prompt;
+        }
+    }
+
     pub fn info(&self) -> AgentInfo {
         self.info
             .read()
@@ -130,3 +217,7 @@ impl Agent {
         (items, has_more)
     }
 }
+
+#[cfg(test)]
+#[path = "agent_tests.rs"]
+mod agent_tests;

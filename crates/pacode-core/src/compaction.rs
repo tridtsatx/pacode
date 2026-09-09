@@ -132,7 +132,7 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
 
     session
         .store
-        .save_compaction(&session.id, &agent.id, &summary, upto_seq)
+        .save_compaction(&session.id, &agent.id(), &summary, upto_seq)
         .await?;
 
     let notice_item = pacode_types::TranscriptItem {
@@ -141,7 +141,7 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .next_seq(),
-        agent: agent.id.clone(),
+        agent: agent.id(),
         ts_ms: pacode_types::now_ms(),
         kind: pacode_types::TranscriptKind::Notice {
             level: pacode_types::ToastLevel::Info,

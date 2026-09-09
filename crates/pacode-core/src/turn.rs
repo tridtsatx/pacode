@@ -65,7 +65,7 @@ pub async fn run_turn(
         .await;
 
     session.events.emit(Event::TurnStarted {
-        agent: agent.id.clone(),
+        agent: agent.id(),
         turn: turn_id.clone(),
     });
     agent.set_status(AgentStatus::Thinking, Some("thinking".to_string()));
@@ -87,7 +87,7 @@ pub async fn run_turn(
                 })
                 .await;
             session.events.emit(Event::TurnEnded {
-                agent: agent.id.clone(),
+                agent: agent.id(),
                 turn: turn_id,
                 usage: Some(turn_usage),
                 stop: TurnStop::Interrupted,
@@ -117,7 +117,7 @@ pub async fn run_turn(
                 mode: meta.mode,
                 plan: &plan_guard,
                 instructions: instructions.as_deref(),
-                is_subagent: !agent.id.is_main(),
+                is_subagent: !agent.id().is_main(),
                 skills: session.skills.skills(),
                 skills_enabled: session.config.skills.enabled,
                 max_listed_skills: session.config.skills.max_listed,
@@ -165,7 +165,7 @@ pub async fn run_turn(
                     })
                     .await;
                 session.events.emit(Event::TurnEnded {
-                    agent: agent.id.clone(),
+                    agent: agent.id(),
                     turn: turn_id,
                     usage: Some(turn_usage),
                     stop: stop.clone(),
@@ -191,7 +191,7 @@ pub async fn run_turn(
                     })
                     .await;
                 session.events.emit(Event::TurnEnded {
-                    agent: agent.id.clone(),
+                    agent: agent.id(),
                     turn: turn_id,
                     usage: Some(turn_usage),
                     stop: stop.clone(),
@@ -216,7 +216,7 @@ pub async fn run_turn(
                     })
                     .await;
                 session.events.emit(Event::TurnEnded {
-                    agent: agent.id.clone(),
+                    agent: agent.id(),
                     turn: turn_id,
                     usage: Some(turn_usage),
                     stop: stop.clone(),
@@ -240,7 +240,7 @@ pub async fn run_turn(
                 })
                 .await;
             session.events.emit(Event::TurnEnded {
-                agent: agent.id.clone(),
+                agent: agent.id(),
                 turn: turn_id,
                 usage: Some(turn_usage),
                 stop: TurnStop::Interrupted,
@@ -277,7 +277,7 @@ pub async fn run_turn(
             .push(assistant_msg.clone());
         let _ = session
             .store
-            .append_message(&session.id, &agent.id, msg_seq, &arc_msg)
+            .append_message(&session.id, &agent.id(), msg_seq, &arc_msg)
             .await;
 
         let _ = session
@@ -288,7 +288,7 @@ pub async fn run_turn(
             })
             .await;
 
-        if agent.id.is_main()
+        if agent.id().is_main()
             && session.meta().name.is_none()
             && !outcome.text.is_empty()
             && let Some(first_prompt) = session.meta().first_prompt.clone()
@@ -339,7 +339,7 @@ pub async fn run_turn(
                     .push(injection_msg);
                 let _ = session
                     .store
-                    .append_message(&session.id, &agent.id, inj_seq, &arc_inj)
+                    .append_message(&session.id, &agent.id(), inj_seq, &arc_inj)
                     .await;
                 continue;
             }
@@ -360,7 +360,7 @@ pub async fn run_turn(
                 })
                 .await;
             session.events.emit(Event::TurnEnded {
-                agent: agent.id.clone(),
+                agent: agent.id(),
                 turn: turn_id,
                 usage: Some(turn_usage),
                 stop: TurnStop::Interrupted,
@@ -381,7 +381,7 @@ pub async fn run_turn(
                 })
                 .await;
             session.events.emit(Event::TurnEnded {
-                agent: agent.id.clone(),
+                agent: agent.id(),
                 turn: turn_id,
                 usage: Some(turn_usage),
                 stop: TurnStop::Interrupted,
@@ -402,7 +402,7 @@ pub async fn run_turn(
                 .push(injection_msg);
             let _ = session
                 .store
-                .append_message(&session.id, &agent.id, inj_seq, &arc_inj)
+                .append_message(&session.id, &agent.id(), inj_seq, &arc_inj)
                 .await;
         }
 
@@ -417,7 +417,7 @@ pub async fn run_turn(
             let _ = crate::compaction::compact(&session, &agent).await;
         }
 
-        if !agent.id.is_main() {
+        if !agent.id().is_main() {
             let mut turns_guard = agent.turns.lock().unwrap_or_else(|p| p.into_inner());
             *turns_guard += 1;
             if *turns_guard >= session.config.agents.max_turns {
@@ -427,7 +427,7 @@ pub async fn run_turn(
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .next_seq(),
-                    agent: agent.id.clone(),
+                    agent: agent.id(),
                     ts_ms: pacode_types::now_ms(),
                     kind: TranscriptKind::Notice {
                         level: pacode_types::ToastLevel::Warn,
@@ -448,7 +448,7 @@ pub async fn run_turn(
         }
     }
 
-    let final_status = if agent.id.is_main() {
+    let final_status = if agent.id().is_main() {
         AgentStatus::Idle
     } else {
         AgentStatus::Finished
@@ -461,7 +461,7 @@ pub async fn run_turn(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .estimated_tokens;
-    session.record_usage(&agent.id, turn_usage, context_tokens);
+    session.record_usage(&agent.id(), turn_usage, context_tokens);
 
     let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
     let output_tokens = turn_usage.output_tokens;
@@ -474,7 +474,7 @@ pub async fn run_turn(
         .await;
 
     session.events.emit(Event::TurnEnded {
-        agent: agent.id.clone(),
+        agent: agent.id(),
         turn: turn_id,
         usage: Some(turn_usage),
         stop: TurnStop::Completed,

@@ -121,6 +121,7 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
         Some(opts.paths.mcp_cache_dir()),
         None,
     );
+    mcp.set_idle_timeout_secs(opts.config.mcp.idle_timeout_secs);
     let store = Store::open(&opts.paths.db_file()).map_err(DaemonError::Store)?;
 
     let deps = CoreDeps {
