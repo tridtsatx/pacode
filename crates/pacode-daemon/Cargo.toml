@@ -1,0 +1,27 @@
+[package]
+name = "pacode-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unix socket server: hello/attach, request routing to core, event streaming, idle shutdown"
+
+[dependencies]
+pacode-types = { workspace = true }
+pacode-config = { workspace = true }
+pacode-core = { workspace = true }
+pacode-provider = { workspace = true }
+pacode-store = { workspace = true }
+pacode-tools = { workspace = true }
+pacode-exec = { workspace = true }
+pacode-mcp = { workspace = true }
+pacode-plugin = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros", "signal", "fs"] }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

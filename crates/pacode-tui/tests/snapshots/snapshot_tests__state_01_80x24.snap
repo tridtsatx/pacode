@@ -1,0 +1,28 @@
+---
+source: crates/pacode-tui/tests/snapshot_tests.rs
+expression: view
+---
+" ▄▄▄▄▄     pacode v0.1.0-dev                       │Refactor TUI layout         "
+"█ ▀ ██     claude-3-7-sonnet with high effort · an │ses_abcdef123               "
+"███▀       /home/someone/zed/pacode                │                            "
+" ▀▀▀▀▀                                             │PLAN               1/4 · 40%"
+"                                                   │[✓] Read codebase & analyze…"
+"Using claude-3-7-sonnet (from /home/someone/.confi │[•] Implement TUI layout & …"
+"                                                   │    ▰▰▰▰▰▱▱▱ 60%            "
+"▎ Refactor TUI layout and split into modules       │[ ] Add key bindings & even…"
+"                                                   │[ ] Write unit tests & snap…"
+"I'll help you organize the TUI crate with a        │AGENTS                   5 ●"
+"persistent rail and separate dialog column.        │● main  thinking · 400ms    "
+"                                                   │○ codegen  1m47s            "
+"▣ Read_file crates/pacode-tui/src/layout.rs ok 120 │○ tester  23s               "
+"  │ pub fn compute(area: Rect) -> ScreenLayout...  │✓ indexer  400ms            "
+"                                                   │✓ parser  400ms             "
+"                                                   │                            "
+"                                                   │                            "
+"                                                   │                            "
+"[  C • • • • • • • • • ] thinking… · 400ms         │                            "
+"────────────────────────────────────────────────── │BACKGROUND              1 ◍ "
+"❯                                                  │◍ cargo test --all 214/380  "
+"────────────────────────────────────────────────── │     ~/zed/pacode:master    "
+"Build · Claude 3 7 Sonnet | high /effort    /model │     • pacode 0.1.0-dev     "
+"» ask before edits and commands     10.7K · ctrl+p │                            "

@@ -1,0 +1,28 @@
+[package]
+name = "pacode-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ratatui client: dialog, rail (plan/agents/background/session), agent panel, input, footer"
+
+[dependencies]
+pacode-types = { workspace = true }
+pacode-config = { workspace = true }
+pacode-client = { workspace = true }
+pacode-render = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+futures = { workspace = true }
+unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+arboard = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+pretty_assertions = { workspace = true }

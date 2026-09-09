@@ -1,0 +1,5 @@
+name = "echo-lua"
+version = "0.1.0"
+kind = "lua"
+entry = "main.lua"
+description = "Echo lua test plugin"
