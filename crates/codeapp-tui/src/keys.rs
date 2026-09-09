@@ -58,6 +58,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
+    // 1.5 While an in-place picker is open, ALL keys go to it (fixes focus leak to input).
+    if state.is_bottom_picker() {
+        return crate::keys_picker::handle_picker_key(state, key);
+    }
+
     // 2. Session picker via ctrl+p
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('p')) {
         state.focus = Focus::Overlay(Overlay::SessionPicker {

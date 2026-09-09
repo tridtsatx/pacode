@@ -56,6 +56,13 @@ pub enum Overlay {
     EffortPicker {
         index: usize,
     },
+    ModePicker {
+        index: usize,
+    },
+    ConfigPicker {
+        index: usize,
+        editing_number: Option<String>,
+    },
     SessionPicker {
         query: String,
         index: usize,
@@ -88,6 +95,7 @@ pub enum Connection {
 
 pub struct AppState {
     pub config: Config,
+    pub paths: codeapp_config::Paths,
     pub app_version: String,
     pub meta: Option<SessionMeta>,
     pub connection: Connection,
@@ -131,6 +139,7 @@ impl AppState {
         let cells = config.ui.transcript_cells;
         Self {
             config,
+            paths: codeapp_config::Paths::discover(),
             app_version,
             meta: None,
             connection: Connection::Connected,
@@ -222,6 +231,11 @@ impl AppState {
     pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) {
         match event {
             Event::SessionUpdated(meta) => {
+                let mut prefs = codeapp_config::load_prefs(&self.paths);
+                prefs.model = Some(meta.model.to_string());
+                prefs.effort = Some(meta.effort);
+                prefs.mode = Some(meta.mode);
+                let _ = codeapp_config::save_prefs(&self.paths, &prefs);
                 self.meta = Some(meta);
             }
             Event::TurnStarted { agent, turn: _ } => {
@@ -457,6 +471,58 @@ impl AppState {
 
     pub fn model(&self) -> Option<&ModelRoute> {
         self.meta.as_ref().map(|m| &m.model)
+    }
+
+    pub fn push_notice(&mut self, text: String) {
+        let now = now_ms();
+        self.transcript.cells.push_back(Cell {
+            id: now,
+            kind: CellKind::Item(TranscriptKind::Notice {
+                level: ToastLevel::Info,
+                text,
+            }),
+            version: 0,
+            ts_ms: now,
+        });
+        self.dirty = true;
+    }
+
+    pub fn save_pref_model(&self, model: &str) {
+        let mut prefs = codeapp_config::load_prefs(&self.paths);
+        prefs.model = Some(model.to_string());
+        let _ = codeapp_config::save_prefs(&self.paths, &prefs);
+    }
+
+    pub fn save_pref_effort(&self, effort: Effort) {
+        let mut prefs = codeapp_config::load_prefs(&self.paths);
+        prefs.effort = Some(effort);
+        let _ = codeapp_config::save_prefs(&self.paths, &prefs);
+    }
+
+    pub fn save_pref_mode(&self, mode: Mode) {
+        let mut prefs = codeapp_config::load_prefs(&self.paths);
+        prefs.mode = Some(mode);
+        let _ = codeapp_config::save_prefs(&self.paths, &prefs);
+    }
+
+    pub fn is_bottom_picker(&self) -> bool {
+        matches!(
+            &self.focus,
+            Focus::Overlay(Overlay::EffortPicker { .. })
+                | Focus::Overlay(Overlay::ModePicker { .. })
+                | Focus::Overlay(Overlay::ModelPicker { .. })
+                | Focus::Overlay(Overlay::ConfigPicker { .. })
+        )
+    }
+
+    pub fn bottom_picker_height(&self) -> u16 {
+        match &self.focus {
+            Focus::Overlay(Overlay::EffortPicker { .. })
+            | Focus::Overlay(Overlay::ModePicker { .. }) => 7,
+            Focus::Overlay(Overlay::ModelPicker { .. })
+            | Focus::Overlay(Overlay::ConfigPicker { .. }) => 12,
+            _ => 0,
+        }
     }
 
     /// Whether a periodic 1 s tick is needed (live agents or tasks: durations change).

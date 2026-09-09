@@ -9,6 +9,7 @@ pub mod footer;
 pub mod input;
 pub mod overlays;
 pub mod panel;
+pub mod picker;
 pub mod rail;
 pub mod rail_session;
 pub mod toast;
@@ -49,20 +50,29 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         rail::draw(frame, layout.rail, state, &opts);
     }
 
-    if layout.dialog.width > 0 && layout.dialog.height > 0 {
-        let dialog_opts = RenderOptions::new(layout.dialog.width, state.config.ui.ascii_only);
-        if state.turn_active && layout.dialog.height > 1 {
-            let trans_h = layout.dialog.height - 1;
-            let trans_area = Rect::new(
-                layout.dialog.x,
-                layout.dialog.y,
-                layout.dialog.width,
-                trans_h,
-            );
+    let is_picker = state.is_bottom_picker();
+    let picker_h = if is_picker {
+        state.bottom_picker_height().min(frame.area().height)
+    } else {
+        0
+    };
+    let dialog_area = if is_picker {
+        let picker_y = frame.area().height.saturating_sub(picker_h);
+        let d_h = picker_y.saturating_sub(layout.dialog.y);
+        Rect::new(layout.dialog.x, layout.dialog.y, layout.dialog.width, d_h)
+    } else {
+        layout.dialog
+    };
+
+    if dialog_area.width > 0 && dialog_area.height > 0 {
+        let dialog_opts = RenderOptions::new(dialog_area.width, state.config.ui.ascii_only);
+        if state.turn_active && dialog_area.height > 1 {
+            let trans_h = dialog_area.height - 1;
+            let trans_area = Rect::new(dialog_area.x, dialog_area.y, dialog_area.width, trans_h);
             let anim_area = Rect::new(
-                layout.dialog.x,
-                layout.dialog.bottom() - 1,
-                layout.dialog.width,
+                dialog_area.x,
+                dialog_area.bottom() - 1,
+                dialog_area.width,
                 1,
             );
             dialog::draw(
@@ -104,13 +114,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 &dialog_opts,
                 &activity,
                 elapsed_ms,
-                layout.dialog.width as usize,
+                dialog_area.width as usize,
             );
             frame.render_widget(Paragraph::new(anim_line), anim_area);
         } else {
             dialog::draw(
                 frame,
-                layout.dialog,
+                dialog_area,
                 &mut state.transcript,
                 &dialog_opts,
                 state.anim_frame,
@@ -133,11 +143,34 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         panel::draw(frame, panel_rect, state, &panel_opts);
     }
 
-    input::draw(frame, &layout, state, &opts);
-    footer::draw(frame, layout.footer, state, &opts);
+    if is_picker {
+        let picker_y = frame.area().height.saturating_sub(picker_h);
+        let picker_w = if layout.dialog.width > 0 {
+            layout.dialog.width
+        } else {
+            frame.area().width
+        };
+        let picker_area = Rect::new(layout.dialog.x, picker_y, picker_w, picker_h);
+        picker::draw(frame, picker_area, state, &opts);
+    } else {
+        input::draw(frame, &layout, state, &opts);
+        footer::draw(frame, layout.footer, state, &opts);
+    }
 
     if layout.toast.width > 0 && layout.toast.height > 0 {
-        toast::draw(frame, layout.toast, state, &opts);
+        let toast_area = if is_picker {
+            let picker_y = frame.area().height.saturating_sub(picker_h);
+            let toast_y = picker_y.saturating_sub(layout.toast.height);
+            Rect::new(
+                layout.toast.x,
+                toast_y,
+                layout.toast.width,
+                layout.toast.height,
+            )
+        } else {
+            layout.toast
+        };
+        toast::draw(frame, toast_area, state, &opts);
     }
 
     let dialog_or_full = if layout.dialog.width > 0 {

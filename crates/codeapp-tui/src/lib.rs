@@ -13,6 +13,7 @@
 pub mod app;
 pub mod commands;
 pub mod keys;
+pub mod keys_picker;
 pub mod layout;
 pub mod state;
 pub mod terminal;

@@ -37,12 +37,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
     };
 
     let select_mode = matches!(state.focus, Focus::SelectAgent { .. });
+    let show_session = state.rail.show_session_stats && state.rail.usage.turns > 0;
     let demand = RailDemand {
         plan_lines,
         background_lines: bg_lines,
         session_lines: 8,
         agent_select_mode: select_mode,
-        idle: state.rail.show_session_stats,
+        idle: show_session,
+        anchor_y: None,
     };
 
     let layout = compute_rail(area, demand);
@@ -51,7 +53,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
 
     draw_header(frame, layout.header, state, opts);
     draw_plan(frame, layout.plan, state, opts, select_mode);
-    if state.rail.show_session_stats {
+    if show_session {
         crate::ui::rail_session::draw_session(frame, layout.agents, state, opts);
     } else if has_subagents {
         draw_agents(frame, layout.agents, state, opts, select_mode);

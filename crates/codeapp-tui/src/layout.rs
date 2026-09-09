@@ -129,12 +129,6 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
     let dialog_h = input_top_y.saturating_sub(left_area.y);
     let dialog_y = left_area.y;
 
-    let toast_h = 2.min(dialog_h);
-    let toast_y = input_top_y.saturating_sub(toast_h);
-    let toast_w = left_area.width.min(48);
-    let toast_x = left_area.x + left_area.width.saturating_sub(toast_w);
-    let toast = Rect::new(toast_x, toast_y, toast_w, toast_h);
-
     let (dialog, panel, panel_separator) = if panel_open {
         let share = tier.dialog_share_with_panel();
         if share == 0 {
@@ -166,6 +160,12 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
             None,
         )
     };
+
+    let toast_w = (dialog.width.saturating_sub(2)).min(60);
+    let toast_h = if toast_w > 0 { 2.min(dialog.height) } else { 0 };
+    let toast_y = input_top_y.saturating_sub(toast_h);
+    let toast_x = dialog.x + dialog.width.saturating_sub(1).saturating_sub(toast_w);
+    let toast = Rect::new(toast_x, toast_y, toast_w, toast_h);
 
     ScreenLayout {
         tier,
@@ -206,15 +206,16 @@ pub struct RailDemand {
     pub session_lines: u16,
     pub agent_select_mode: bool,
     pub idle: bool,
+    /// Static row where the anchor starts (defaults to `rail.y + rail.height - 3`).
+    pub anchor_y: Option<u16>,
 }
 
 #[cfg(test)]
 #[path = "layout_tests.rs"]
 mod layout_tests;
 
-/// Split the rail: header fixed, anchor fixed, plan as demanded (or 1 line), background
-/// as demanded (max 5), agents = remainder with a 4-line minimum; when the remainder
-/// is under 4 the agents zone collapses to 1 line (`5 agents ▾`).
+/// Split the rail: header fixed, anchor pinned statically at the input's bottom separator
+/// row (`anchor_y` and `anchor_y + 1`), zones above end one row above the anchor.
 pub fn compute_rail(rail: Rect, demand: RailDemand) -> RailLayout {
     if rail.width == 0 || rail.height == 0 {
         return RailLayout::default();
@@ -223,15 +224,17 @@ pub fn compute_rail(rail: Rect, demand: RailDemand) -> RailLayout {
     let x = rail.x;
     let w = rail.width;
 
-    let header_h = 3.min(rail.height);
-    let header = Rect::new(x, rail.y, w, header_h);
-
-    let rem_after_header = rail.height.saturating_sub(header_h);
-    let anchor_h = 2.min(rem_after_header);
-    let anchor_y = rail.y + rail.height - anchor_h;
+    let anchor_y = demand
+        .anchor_y
+        .unwrap_or_else(|| rail.y + rail.height.saturating_sub(3));
+    let anchor_h = 2.min(rail.bottom().saturating_sub(anchor_y));
     let anchor = Rect::new(x, anchor_y, w, anchor_h);
 
-    let avail = rail.height.saturating_sub(header_h + anchor_h);
+    let avail_end = anchor_y;
+    let header_h = 3.min(avail_end.saturating_sub(rail.y));
+    let header = Rect::new(x, rail.y, w, header_h);
+
+    let avail = avail_end.saturating_sub(header.bottom());
 
     let plan_h = if demand.agent_select_mode {
         1.min(avail)

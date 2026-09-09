@@ -24,18 +24,23 @@ pub struct SlashCommand {
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "model",
-        usage: "/model [provider/model]",
+        usage: "/model",
         help: "switch model",
     },
     SlashCommand {
         name: "effort",
-        usage: "/effort [low|medium|high|max]",
+        usage: "/effort",
         help: "reasoning effort",
     },
     SlashCommand {
         name: "mode",
-        usage: "/mode [build|auto|plan|bypass]",
+        usage: "/mode",
         help: "permission mode",
+    },
+    SlashCommand {
+        name: "config",
+        usage: "/config",
+        help: "quick settings",
     },
     SlashCommand {
         name: "sessions",
@@ -100,15 +105,21 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 } else {
                     ModelRoute::new("default", &arg)
                 };
+                state.save_pref_model(&route.to_string());
                 vec![Action::Send(Request::SetModel(route))]
             }
         }
         "effort" => {
             if arg.is_empty() {
-                state.focus = Focus::Overlay(Overlay::EffortPicker { index: 0 });
+                let cur_idx = Effort::ALL
+                    .iter()
+                    .position(|e| *e == state.effort())
+                    .unwrap_or(1);
+                state.focus = Focus::Overlay(Overlay::EffortPicker { index: cur_idx });
                 state.dirty = true;
                 vec![]
             } else if let Some(eff) = Effort::parse(&arg) {
+                state.save_pref_effort(eff);
                 vec![Action::Send(Request::SetEffort(eff))]
             } else {
                 push_notice(
@@ -121,9 +132,15 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
         }
         "mode" => {
             if arg.is_empty() {
-                let next = state.mode().next();
-                vec![Action::Send(Request::SetMode(next))]
+                let cur_idx = Mode::CYCLE
+                    .iter()
+                    .position(|m| *m == state.mode())
+                    .unwrap_or(0);
+                state.focus = Focus::Overlay(Overlay::ModePicker { index: cur_idx });
+                state.dirty = true;
+                vec![]
             } else if let Some(m) = Mode::parse(&arg) {
+                state.save_pref_mode(m);
                 vec![Action::Send(Request::SetMode(m))]
             } else {
                 push_notice(
@@ -133,6 +150,14 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 );
                 vec![]
             }
+        }
+        "config" => {
+            state.focus = Focus::Overlay(Overlay::ConfigPicker {
+                index: 0,
+                editing_number: None,
+            });
+            state.dirty = true;
+            vec![]
         }
         "sessions" => {
             state.focus = Focus::Overlay(Overlay::SessionPicker {

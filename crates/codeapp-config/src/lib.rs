@@ -9,8 +9,11 @@
 
 pub mod logging;
 pub mod paths;
+pub mod prefs;
 
 pub use paths::Paths;
+pub use prefs::{Prefs, load_prefs, save_prefs};
+pub use toml;
 
 use codeapp_types::{Config, Effort, Mode, ProviderConfig};
 
@@ -20,6 +23,11 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum ConfigError {
     #[error("cannot read {path}: {source}")]
     Read {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("cannot write {path}: {source}")]
+    Write {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
@@ -123,6 +131,68 @@ pub fn effective_effort(cfg: &Config, override_effort: Option<Effort>) -> Effort
 /// Effective mode: CLI/env override, else `[permissions].default_mode`.
 pub fn effective_mode(cfg: &Config, override_mode: Option<Mode>) -> Mode {
     override_mode.unwrap_or(cfg.permissions.default_mode)
+}
+
+/// Set a nested key in `paths.config_file` by parsing the existing file as a `toml::Table`,
+/// creating tables for intermediate keys as needed, setting `value` at the target key,
+/// and writing back. Comments in the file are lost.
+pub fn update_config_value(
+    paths: &Paths,
+    dotted_key: &str,
+    value: toml::Value,
+) -> Result<(), ConfigError> {
+    let mut table: toml::Table = match std::fs::read_to_string(&paths.config_file) {
+        Ok(text) => toml::from_str(&text).map_err(|e: toml::de::Error| ConfigError::Parse {
+            path: paths.config_file.clone(),
+            message: e.to_string(),
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(err) => {
+            return Err(ConfigError::Read {
+                path: paths.config_file.clone(),
+                source: err,
+            });
+        }
+    };
+
+    let parts: Vec<&str> = dotted_key.split('.').collect();
+    if parts.is_empty() || dotted_key.is_empty() {
+        return Ok(());
+    }
+
+    let (parents, last) = parts.split_at(parts.len() - 1);
+    let last_key = last[0];
+
+    let mut current = &mut table;
+    for &part in parents {
+        let entry = current
+            .entry(part)
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !entry.is_table() {
+            *entry = toml::Value::Table(toml::Table::new());
+        }
+        current = match entry {
+            toml::Value::Table(t) => t,
+            _ => unreachable!(),
+        };
+    }
+    current.insert(last_key.to_string(), value);
+
+    if let Some(parent) = paths.config_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let serialized = toml::to_string_pretty(&table).map_err(|e| ConfigError::Parse {
+        path: paths.config_file.clone(),
+        message: e.to_string(),
+    })?;
+
+    std::fs::write(&paths.config_file, serialized).map_err(|e| ConfigError::Write {
+        path: paths.config_file.clone(),
+        source: e,
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]

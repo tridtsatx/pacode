@@ -28,10 +28,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
     };
 
     let mut lines = Vec::new();
+    let sym_w = codeapp_render::display_width(sym) + 1;
     let title_line = Line::from(vec![
         Span::styled(format!("{sym} "), style),
         Span::styled(
-            truncate_to_width(&toast.title, (area.width as usize).saturating_sub(4), true),
+            truncate_to_width(
+                &toast.title,
+                (area.width as usize).saturating_sub(sym_w),
+                true,
+            ),
             opts.theme.bold,
         ),
     ]);
@@ -42,7 +47,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                truncate_to_width(detail_str, (area.width as usize).saturating_sub(4), true),
+                truncate_to_width(detail_str, (area.width as usize).saturating_sub(2), true),
                 opts.theme.faint,
             ),
         ]));

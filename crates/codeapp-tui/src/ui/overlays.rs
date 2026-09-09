@@ -9,7 +9,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use codeapp_render::{RenderOptions, truncate_to_width};
-use codeapp_types::model::Effort;
 use codeapp_types::state::TaskStatus;
 use codeapp_types::time::{format_duration_ms, now_ms};
 
@@ -40,12 +39,6 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             draw_bg_list(frame, area, *index, state, opts);
         }
         Focus::Overlay(overlay) => match overlay {
-            Overlay::ModelPicker { query, index } => {
-                draw_model_picker(frame, area, query, *index, state, opts);
-            }
-            Overlay::EffortPicker { index } => {
-                draw_effort_picker(frame, area, *index, opts);
-            }
             Overlay::SessionPicker { query, index } => {
                 draw_session_picker(frame, area, query, *index, state, opts);
             }
@@ -55,6 +48,7 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::Help => {
                 draw_help(frame, area, opts);
             }
+            _ => {}
         },
         _ => {}
     }
@@ -122,92 +116,6 @@ fn draw_bg_list(
             ),
             Span::raw(" "),
             Span::styled(tail_str, opts.theme.faint),
-        ]));
-    }
-
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn draw_model_picker(
-    frame: &mut Frame,
-    area: Rect,
-    query: &str,
-    selected: usize,
-    state: &AppState,
-    opts: &RenderOptions,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" Switch Model ", opts.theme.bold))
-        .title_bottom(Span::styled(" enter select · esc cancel ", opts.theme.dim))
-        .border_style(opts.theme.dim);
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let q_lower = query.to_lowercase();
-    let filtered: Vec<_> = state
-        .models
-        .iter()
-        .filter(|m| {
-            q_lower.is_empty()
-                || m.route.to_string().to_lowercase().contains(&q_lower)
-                || m.display_name.to_lowercase().contains(&q_lower)
-        })
-        .collect();
-
-    let mut lines = Vec::new();
-    let query_line = Line::from(vec![
-        Span::styled("> ", opts.theme.cyan),
-        Span::styled(query, opts.theme.bold),
-    ]);
-    lines.push(query_line);
-    lines.push(Line::default());
-
-    let max_rows = (inner.height as usize).saturating_sub(2);
-    for (i, m) in filtered.iter().enumerate().take(max_rows) {
-        let is_sel = i == selected;
-        let style = if is_sel {
-            opts.theme.selected_bg
-        } else {
-            opts.theme.fg
-        };
-        let p = if is_sel { opts.glyphs.pointer } else { " " };
-        lines.push(Line::from(vec![
-            Span::styled(p, opts.theme.accent),
-            Span::raw(" "),
-            Span::styled(m.route.to_string(), style),
-            Span::raw("  "),
-            Span::styled(m.display_name.clone(), opts.theme.dim),
-        ]));
-    }
-
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn draw_effort_picker(frame: &mut Frame, area: Rect, selected: usize, opts: &RenderOptions) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" Reasoning Effort ", opts.theme.bold))
-        .title_bottom(Span::styled(" enter select · esc cancel ", opts.theme.dim))
-        .border_style(opts.theme.dim);
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut lines = Vec::new();
-    for (i, effort) in Effort::ALL.iter().enumerate() {
-        let is_sel = i == selected;
-        let style = if is_sel {
-            opts.theme.selected_bg
-        } else {
-            opts.theme.fg
-        };
-        let p = if is_sel { opts.glyphs.pointer } else { " " };
-        lines.push(Line::from(vec![
-            Span::styled(p, opts.theme.accent),
-            Span::raw(" "),
-            Span::styled(effort.to_string(), style),
         ]));
     }
 

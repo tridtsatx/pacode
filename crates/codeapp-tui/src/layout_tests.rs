@@ -75,6 +75,7 @@ fn test_compute_rail_normal() {
         session_lines: 0,
         agent_select_mode: false,
         idle: false,
+        anchor_y: None,
     };
     let layout = compute_rail(rail, demand);
 
@@ -82,10 +83,10 @@ fn test_compute_rail_normal() {
     assert_eq!(layout.anchor.height, 2);
     assert_eq!(layout.plan.height, 5);
     assert_eq!(layout.background.height, 3);
-    // avail = 34 - 3 - 2 = 29
-    // after plan (5) = 24
-    // remainder = 24 - 3 = 21 >= 4
-    assert_eq!(layout.agents.height, 21);
+    // avail = 31 - 3 = 28
+    // after plan (5) = 23
+    // remainder = 23 - 3 = 20 >= 4
+    assert_eq!(layout.agents.height, 20);
     assert_eq!(layout.agents.y, layout.plan.bottom());
     assert_eq!(layout.background.y, layout.agents.bottom());
     assert_eq!(layout.anchor.y, layout.background.bottom());
@@ -100,12 +101,13 @@ fn test_compute_rail_select_mode() {
         session_lines: 0,
         agent_select_mode: true,
         idle: false,
+        anchor_y: None,
     };
     let layout = compute_rail(rail, demand);
 
     assert_eq!(layout.plan.height, 1);
-    // avail = 34 - 3 - 2 = 29; after plan (1) = 28
-    assert_eq!(layout.agents.height, 28);
+    // avail = 31 - 3 = 28; after plan (1) = 27
+    assert_eq!(layout.agents.height, 27);
 }
 
 #[test]
@@ -117,16 +119,71 @@ fn test_compute_rail_tight_space() {
         session_lines: 0,
         agent_select_mode: false,
         idle: false,
+        anchor_y: None,
     };
     let layout = compute_rail(rail, demand);
 
-    // avail = 10 - 3 - 2 = 5
-    // plan = 4, avail_after_plan = 1
-    // bg_lines = 1.min(5).min(1) = 1
-    // remainder = 0 < 4 -> agents_h = 0
     assert_eq!(layout.header.height, 3);
     assert_eq!(layout.plan.height, 4);
-    assert_eq!(layout.background.height, 1);
+    assert_eq!(layout.background.height, 0);
     assert_eq!(layout.agents.height, 0);
     assert_eq!(layout.anchor.height, 2);
+}
+
+#[test]
+fn test_toast_rect_inside_dialog() {
+    // 1. Without panel
+    let area = Rect::new(0, 0, 140, 40);
+    let layout = compute(area, 1, false);
+    // Dialog column: x = 0, width = 106, dialog_y = 0, input_top = y: 35
+    assert_eq!(layout.dialog.width, 106);
+    // Toast width = min(dialog.width - 2, 60) = 60
+    assert_eq!(layout.toast.width, 60);
+    assert_eq!(layout.toast.height, 2);
+    // Toast must be strictly inside dialog: x >= dialog.x and toast.right() <= dialog.right() - 1
+    assert!(layout.toast.x >= layout.dialog.x);
+    assert_eq!(
+        layout.toast.x + layout.toast.width,
+        layout.dialog.x + layout.dialog.width - 1
+    );
+    // Toast must be above input separator: toast.bottom() == layout.input_top.y
+    assert_eq!(layout.toast.y + layout.toast.height, layout.input_top.y);
+
+    // 2. With panel (dialog is narrower)
+    let layout_panel = compute(area, 1, true);
+    assert_eq!(layout_panel.dialog.width, 52);
+    // Toast width = min(52 - 2, 60) = 50
+    assert_eq!(layout_panel.toast.width, 50);
+    assert!(layout_panel.toast.x >= layout_panel.dialog.x);
+    assert_eq!(
+        layout_panel.toast.x + layout_panel.toast.width,
+        layout_panel.dialog.x + layout_panel.dialog.width - 1
+    );
+    assert_eq!(
+        layout_panel.toast.y + layout_panel.toast.height,
+        layout_panel.input_top.y
+    );
+}
+
+#[test]
+fn test_anchor_rows() {
+    let area = Rect::new(0, 0, 120, 34);
+    let layout = compute(area, 1, false);
+    // input_bottom.y is row 31
+    assert_eq!(layout.input_bottom.y, 31);
+    let demand = RailDemand {
+        plan_lines: 3,
+        background_lines: 1,
+        session_lines: 0,
+        agent_select_mode: false,
+        idle: false,
+        anchor_y: Some(layout.input_bottom.y),
+    };
+    let rail_layout = compute_rail(layout.rail, demand);
+    // Anchor pinned statically at input_bottom.y and + 1
+    assert_eq!(rail_layout.anchor.y, layout.input_bottom.y);
+    assert_eq!(rail_layout.anchor.height, 2);
+    assert_eq!(rail_layout.anchor.bottom(), layout.input_bottom.y + 2);
+    // The rail zones above end one row above the anchor
+    assert_eq!(rail_layout.background.bottom(), rail_layout.anchor.y);
 }

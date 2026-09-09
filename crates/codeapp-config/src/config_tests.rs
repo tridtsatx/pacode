@@ -410,3 +410,57 @@ fn load_valid_file_and_parse_error() {
         other => panic!("expected ConfigError::Parse, got: {other:?}"),
     }
 }
+
+#[test]
+fn prefs_round_trip() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    // Initially default (missing file)
+    let prefs = crate::load_prefs(&paths);
+    assert_eq!(prefs, crate::Prefs::default());
+
+    // Save prefs
+    let custom = crate::Prefs {
+        model: Some("anthropic/claude-3-7-sonnet".to_string()),
+        effort: Some(Effort::Max),
+        mode: Some(Mode::Bypass),
+    };
+    crate::save_prefs(&paths, &custom).expect("save_prefs must succeed");
+
+    // Load back and verify
+    let loaded = crate::load_prefs(&paths);
+    assert_eq!(loaded, custom);
+
+    // Verify written file contains expected keys
+    let text = fs::read_to_string(crate::prefs::prefs_file(&paths)).expect("read prefs.toml");
+    assert!(text.contains("model = \"anthropic/claude-3-7-sonnet\""));
+    assert!(text.contains("effort = \"max\""));
+    assert!(text.contains("mode = \"bypass\""));
+}
+
+#[test]
+fn update_config_value_nested_write() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    // 1. Write nested value to non-existent file
+    crate::update_config_value(&paths, "ui.mouse", toml::Value::Boolean(false))
+        .expect("update_config_value should succeed on missing file");
+
+    let cfg = load(&paths).expect("load updated config");
+    assert!(!cfg.ui.mouse);
+
+    // 2. Set deeper nested key
+    crate::update_config_value(&paths, "ui.hints.effort", toml::Value::Boolean(false))
+        .expect("update nested");
+    let cfg = load(&paths).expect("load updated config");
+    assert!(!cfg.ui.hints.effort);
+    assert!(!cfg.ui.mouse);
+
+    // 3. Set top-level / existing table key
+    crate::update_config_value(&paths, "exec.yield_after_secs", toml::Value::Integer(42))
+        .expect("update integer");
+    let cfg = load(&paths).expect("load updated config");
+    assert_eq!(cfg.exec.yield_after_secs, 42);
+}

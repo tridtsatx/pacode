@@ -45,6 +45,7 @@ enum BgResponse {
 pub async fn run(opts: TuiOptions) -> Result<(), TuiError> {
     let mut term_guard = TerminalGuard::enter(opts.config.ui.mouse)?;
 
+    let client_paths = opts.client.paths.clone();
     let (client, mut events) = Client::connect(opts.client).await?;
     let snapshot = client.attach(opts.attach.clone()).await?;
     let client = Arc::new(client);
@@ -56,6 +57,7 @@ pub async fn run(opts: TuiOptions) -> Result<(), TuiError> {
         size.width,
         size.height,
     );
+    state.paths = client_paths;
     state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
 
     if let Some(prompt) = opts.initial_prompt {

@@ -54,60 +54,65 @@ pub fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, opts: &Rend
         opts.theme.dim,
     )));
 
-    lines.push(Line::default());
-
-    let finished_agents: Vec<_> = state
+    let finished_subagents: Vec<_> = state
         .rail
         .agents
         .iter()
-        .filter(|a| a.status == AgentStatus::Finished || a.status == AgentStatus::Failed)
+        .filter(|a| {
+            !a.id.is_main()
+                && (a.status == AgentStatus::Finished || a.status == AgentStatus::Failed)
+        })
         .collect();
-    lines.push(Line::from(Span::styled(
-        format!("AGENTS  {} done", finished_agents.len()),
-        opts.theme.faint,
-    )));
 
-    let rem = (area.height as usize).saturating_sub(lines.len());
-    let now = now_ms();
-    if finished_agents.len() <= rem {
-        for a in finished_agents {
-            let dur = format_duration_ms(a.duration_ms(now));
-            let tok = format_tokens(a.tokens_in);
-            let dot = if a.status == AgentStatus::Failed {
-                opts.glyphs.fail
-            } else {
-                opts.glyphs.ok
-            };
-            let style = if a.status == AgentStatus::Failed {
-                opts.theme.red
-            } else {
-                opts.theme.green
-            };
-            lines.push(Line::from(vec![
-                Span::styled(dot, style),
-                Span::raw(" "),
-                Span::styled(&a.name, opts.theme.fg),
-                Span::raw(" "),
-                Span::styled(format!("{dur} · {tok}"), opts.theme.faint),
-            ]));
-        }
-    } else if rem > 1 {
-        for a in finished_agents.iter().take(rem - 1) {
-            let dur = format_duration_ms(a.duration_ms(now));
-            let dot = opts.glyphs.ok;
-            lines.push(Line::from(vec![
-                Span::styled(dot, opts.theme.green),
-                Span::raw(" "),
-                Span::styled(&a.name, opts.theme.fg),
-                Span::raw(" "),
-                Span::styled(dur, opts.theme.faint),
-            ]));
-        }
-        let more = finished_agents.len() - (rem - 1);
+    if !finished_subagents.is_empty() {
+        lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            format!("and {more} more"),
+            format!("AGENTS  {} done", finished_subagents.len()),
             opts.theme.faint,
         )));
+
+        let rem = (area.height as usize).saturating_sub(lines.len());
+        let now = now_ms();
+        if finished_subagents.len() <= rem {
+            for a in finished_subagents {
+                let dur = format_duration_ms(a.duration_ms(now));
+                let tok = format_tokens(a.tokens_in);
+                let dot = if a.status == AgentStatus::Failed {
+                    opts.glyphs.fail
+                } else {
+                    opts.glyphs.ok
+                };
+                let style = if a.status == AgentStatus::Failed {
+                    opts.theme.red
+                } else {
+                    opts.theme.green
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(dot, style),
+                    Span::raw(" "),
+                    Span::styled(&a.name, opts.theme.fg),
+                    Span::raw(" "),
+                    Span::styled(format!("{dur} · {tok}"), opts.theme.faint),
+                ]));
+            }
+        } else if rem > 1 {
+            for a in finished_subagents.iter().take(rem - 1) {
+                let dur = format_duration_ms(a.duration_ms(now));
+                let dot = opts.glyphs.ok;
+                lines.push(Line::from(vec![
+                    Span::styled(dot, opts.theme.green),
+                    Span::raw(" "),
+                    Span::styled(&a.name, opts.theme.fg),
+                    Span::raw(" "),
+                    Span::styled(dur, opts.theme.faint),
+                ]));
+            }
+            let more = finished_subagents.len() - (rem - 1);
+            lines.push(Line::from(Span::styled(
+                format!("and {more} more"),
+                opts.theme.faint,
+            )));
+        }
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -265,5 +270,5 @@ pub fn draw_anchor(frame: &mut Frame, area: Rect, state: &AppState, opts: &Rende
     let app_trunc = truncate_to_width(&app_str, area.width as usize, true);
     let line2 = Line::from(Span::styled(app_trunc, opts.theme.faint));
 
-    frame.render_widget(Paragraph::new(vec![line1, line2]), area);
+    frame.render_widget(Paragraph::new(vec![line1, line2]).centered(), area);
 }

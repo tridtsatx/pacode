@@ -140,3 +140,69 @@ fn test_ctrl_c_hint_lifecycle() {
     assert!(state.quit);
     assert_eq!(actions, vec![Action::Quit]);
 }
+
+#[test]
+fn test_effort_picker_focus_capture() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // 1. Submit `/effort` without arguments to open picker
+    state.input.insert_str("/effort");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert!(actions.is_empty());
+    // Initial index based on make_test_state() default effort (Effort::Medium -> index 1)
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::EffortPicker { .. })
+    ));
+
+    // Set to index 1 (medium) for controlled testing
+    state.focus = Focus::Overlay(Overlay::EffortPicker { index: 1 });
+
+    // 2. Left arrow moves index to 0 (low) and does NOT leak to input
+    let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, left, now);
+    assert!(actions.is_empty());
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::EffortPicker { index: 0 })
+    );
+    assert!(state.input.is_empty());
+
+    // 3. Typing letters does NOT leak into input
+    let char_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, char_x, now);
+    assert!(actions.is_empty());
+    assert!(state.input.is_empty());
+
+    // 4. 'l' key moves right (vim navigation)
+    let char_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+    handle_key(&mut state, char_l, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::EffortPicker { index: 1 })
+    );
+
+    let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+    handle_key(&mut state, right, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::EffortPicker { index: 2 })
+    ); // high
+
+    // 5. Enter sends SetEffort(High) and returns focus to Normal
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::SetEffort(Effort::High))]
+    );
+    assert_eq!(state.focus, Focus::Normal);
+
+    // 6. Esc cancels picker without sending
+    state.focus = Focus::Overlay(Overlay::EffortPicker { index: 3 });
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, esc, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, Focus::Normal);
+}

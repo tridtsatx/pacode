@@ -38,6 +38,23 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
             state.input.input_scroll = cur_line_idx.saturating_sub(height.saturating_sub(1));
         }
 
+        let matching_cmd_token = if state.input.text.starts_with('/') {
+            let token = state
+                .input
+                .text
+                .split_whitespace()
+                .next()
+                .unwrap_or(&state.input.text);
+            let name = token.strip_prefix('/').unwrap_or("");
+            if commands::COMMANDS.iter().any(|c| c.name == name) {
+                Some(token.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut rendered = Vec::new();
         for (i, wl) in lines
             .iter()
@@ -50,10 +67,22 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
             } else {
                 Span::raw("  ")
             };
-            rendered.push(Line::from(vec![
-                prefix,
-                Span::styled(wl.clone(), opts.theme.fg),
-            ]));
+
+            let mut line_spans = vec![prefix];
+            if i == 0 {
+                if let Some(ref token) = matching_cmd_token
+                    && wl.starts_with(token.as_str())
+                {
+                    line_spans.push(Span::styled(token.clone(), opts.theme.cyan));
+                    line_spans.push(Span::styled(wl[token.len()..].to_string(), opts.theme.fg));
+                } else {
+                    line_spans.push(Span::styled(wl.clone(), opts.theme.fg));
+                }
+            } else {
+                line_spans.push(Span::styled(wl.clone(), opts.theme.fg));
+            }
+
+            rendered.push(Line::from(line_spans));
         }
 
         frame.render_widget(Paragraph::new(rendered), layout.input);
@@ -76,7 +105,8 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
         let query = &state.input.text[1..];
         let matches = commands::matching(query);
         if !matches.is_empty() {
-            let count = matches.len().min(6);
+            let max_visible = 6;
+            let count = matches.len().min(max_visible);
             let popup_h = count as u16;
             let popup_y = layout.input_top.y.saturating_sub(popup_h);
             let popup_w = layout.input.width.min(50);
@@ -85,22 +115,47 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
             frame.render_widget(Clear, popup_area);
 
             let selected = state.input.slash_index % matches.len();
-            let mut popup_lines = Vec::new();
+            let start = if selected >= max_visible {
+                selected + 1 - max_visible
+            } else {
+                0
+            };
 
-            for (i, cmd) in matches.iter().enumerate().take(count) {
+            let mut popup_lines = Vec::new();
+            for (i, cmd) in matches.iter().enumerate().skip(start).take(count) {
                 let is_sel = i == selected;
-                let (usage_style, help_style) = if is_sel {
-                    (opts.theme.selected_bg, opts.theme.selected_bg)
+                let usage_style = if is_sel {
+                    opts.theme
+                        .selected_bg
+                        .patch(opts.theme.cyan)
+                        .patch(opts.theme.bold)
                 } else {
-                    (opts.theme.accent, opts.theme.dim)
+                    opts.theme.accent
+                };
+                let help_style = if is_sel {
+                    opts.theme.selected_bg.patch(opts.theme.fg)
+                } else {
+                    opts.theme.dim
                 };
 
-                let usage = format!("{:<16}", cmd.usage);
-                let line = Line::from(vec![
-                    Span::styled(usage, usage_style),
-                    Span::raw(" "),
-                    Span::styled(cmd.help, help_style),
-                ]);
+                let usage = format!("{:<12}", cmd.usage);
+                let line = if is_sel {
+                    let text = format!("{usage} {}", cmd.help);
+                    let padded = format!("{:<width$}", text, width = popup_w as usize);
+                    Line::from(Span::styled(
+                        padded,
+                        opts.theme
+                            .selected_bg
+                            .patch(opts.theme.cyan)
+                            .patch(opts.theme.bold),
+                    ))
+                } else {
+                    Line::from(vec![
+                        Span::styled(usage, usage_style),
+                        Span::raw(" "),
+                        Span::styled(cmd.help, help_style),
+                    ])
+                };
                 popup_lines.push(line);
             }
 

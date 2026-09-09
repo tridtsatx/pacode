@@ -234,9 +234,16 @@ pub fn main() -> anyhow::Result<()> {
             codeapp_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;
             let cwd = std::env::current_dir().context("failed to get current working directory")?;
-            let model_route = parse_model_override(cli.model.as_deref(), &config)?;
-            let effort_level = parse_effort_override(cli.effort.as_deref())?;
-            let mode_val = parse_mode_override(cli.mode.as_deref())?;
+            // Remembered choices (/model, /effort, /mode) win over config defaults;
+            // explicit flags win over both.
+            let prefs = codeapp_config::load_prefs(&paths);
+            let model_route = parse_model_override(cli.model.as_deref(), &config)?.or_else(|| {
+                parse_model_override(prefs.model.as_deref(), &config)
+                    .ok()
+                    .flatten()
+            });
+            let effort_level = parse_effort_override(cli.effort.as_deref())?.or(prefs.effort);
+            let mode_val = parse_mode_override(cli.mode.as_deref())?.or(prefs.mode);
             let attach = build_attach(cli.resume, cwd.clone(), model_route, effort_level, mode_val);
 
             let mut client_opts = ClientOptions::new(paths.clone(), codeapp_config::APP_VERSION);
