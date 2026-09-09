@@ -80,14 +80,111 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
     out
 }
 
+pub const DEFAULT_MEMORY_CAP_CHARS: usize = 8000;
+
+/// Load global (`~/.config/pacode/memory.md`) and project (`<cwd>/.pacode/memory.md`)
+/// memory files, formatted under `# Memory (global)` and `# Memory (project)`.
+/// Missing or empty files are skipped. Total text is capped at `memory_cap_chars`
+/// by truncating oldest lines first (i.e. keeping the tail).
+pub fn load_memory(
+    cwd: &Path,
+    home_config: Option<&Path>,
+    memory_cap_chars: usize,
+) -> Option<String> {
+    if memory_cap_chars == 0 {
+        return None;
+    }
+
+    let global_file = home_config
+        .map(|h| h.join("memory.md"))
+        .unwrap_or_else(|| pacode_config::Paths::discover().memory_file());
+
+    let global_content = std::fs::read_to_string(global_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let project_file = cwd.join(".pacode").join("memory.md");
+    let project_content = std::fs::read_to_string(project_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if global_content.is_none() && project_content.is_none() {
+        return None;
+    }
+
+    let g_lines: Vec<&str> = global_content
+        .as_deref()
+        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+
+    let p_lines: Vec<&str> = project_content
+        .as_deref()
+        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+
+    if g_lines.is_empty() && p_lines.is_empty() {
+        return None;
+    }
+
+    let render = |g: &[&str], p: &[&str]| -> String {
+        let mut parts = Vec::new();
+        if !g.is_empty() {
+            parts.push(format!("# Memory (global)\n\n{}", g.join("\n")));
+        }
+        if !p.is_empty() {
+            parts.push(format!("# Memory (project)\n\n{}", p.join("\n")));
+        }
+        parts.join("\n\n")
+    };
+
+    let mut g_start = 0;
+    let mut p_start = 0;
+
+    let mut rendered = render(&g_lines[g_start..], &p_lines[p_start..]);
+    while rendered.chars().count() > memory_cap_chars {
+        if g_start < g_lines.len() {
+            g_start += 1;
+        } else if p_start < p_lines.len() {
+            p_start += 1;
+        } else {
+            break;
+        }
+        rendered = render(&g_lines[g_start..], &p_lines[p_start..]);
+    }
+
+    if rendered.chars().count() > memory_cap_chars {
+        let skip = rendered.chars().count().saturating_sub(memory_cap_chars);
+        rendered = rendered.chars().skip(skip).collect();
+    }
+
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
 /// Collect `AGENTS.md`, `PACODE.md`, and `CLAUDE.md` from `cwd` up to the filesystem root
 /// (order per dir: `AGENTS.md`, `PACODE.md`, `CLAUDE.md`; nearest dir last so it wins),
 /// plus `~/.config/pacode/AGENTS.md` and `~/.config/pacode/PACODE.md` first. Each file is prefixed
 /// with `# <path>`; the total is capped to `cap_chars` (head+tail).
+/// Memory sections are loaded and appended after instructions using default memory cap.
 pub fn load_instructions(
     cwd: &Path,
     home_config: Option<&Path>,
     cap_chars: usize,
+) -> Option<String> {
+    load_instructions_with_memory(cwd, home_config, cap_chars, DEFAULT_MEMORY_CAP_CHARS)
+}
+
+/// Variant of `load_instructions` with explicit memory cap chars.
+pub fn load_instructions_with_memory(
+    cwd: &Path,
+    home_config: Option<&Path>,
+    instructions_cap_chars: usize,
+    memory_cap_chars: usize,
 ) -> Option<String> {
     let mut files = Vec::new();
 
@@ -122,10 +219,6 @@ pub fn load_instructions(
         }
     }
 
-    if files.is_empty() {
-        return None;
-    }
-
     let mut combined = String::new();
     for file in files {
         if let Ok(content) = std::fs::read_to_string(&file)
@@ -138,11 +231,23 @@ pub fn load_instructions(
         }
     }
 
-    if combined.is_empty() {
-        return None;
-    }
+    let instructions = if combined.is_empty() {
+        None
+    } else {
+        Some(pacode_types::truncate_head_tail(
+            &combined,
+            instructions_cap_chars,
+        ))
+    };
 
-    Some(pacode_types::truncate_head_tail(&combined, cap_chars))
+    let memory = load_memory(cwd, home_config, memory_cap_chars);
+
+    match (instructions, memory) {
+        (Some(i), Some(m)) => Some(format!("{i}\n\n{m}")),
+        (Some(i), None) => Some(i),
+        (None, Some(m)) => Some(m),
+        (None, None) => None,
+    }
 }
 
 /// `git rev-parse --abbrev-ref HEAD` equivalent by reading `.git/HEAD` (no process).
@@ -227,5 +332,103 @@ mod tests {
         assert!(pos_parent_claude < pos_child_agents);
         assert!(pos_child_agents < pos_child_pacode);
         assert!(pos_child_pacode < pos_child_claude);
+    }
+
+    #[test]
+    fn test_load_memory_skipping_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home_config");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // 1. Neither exists -> None
+        assert!(load_memory(&proj, Some(&home), 8000).is_none());
+
+        // 2. Only global exists
+        std::fs::write(home.join("memory.md"), "- global note 1\n- global note 2\n").unwrap();
+        let loaded_global = load_memory(&proj, Some(&home), 8000).unwrap();
+        assert!(loaded_global.starts_with("# Memory (global)"));
+        assert!(loaded_global.contains("- global note 1"));
+        assert!(loaded_global.contains("- global note 2"));
+        assert!(!loaded_global.contains("# Memory (project)"));
+
+        // 3. Only project exists
+        std::fs::remove_file(home.join("memory.md")).unwrap();
+        let proj_pacode = proj.join(".pacode");
+        std::fs::create_dir_all(&proj_pacode).unwrap();
+        std::fs::write(proj_pacode.join("memory.md"), "- proj note 1\n").unwrap();
+        let loaded_proj = load_memory(&proj, Some(&home), 8000).unwrap();
+        assert!(!loaded_proj.contains("# Memory (global)"));
+        assert!(loaded_proj.starts_with("# Memory (project)"));
+        assert!(loaded_proj.contains("- proj note 1"));
+    }
+
+    #[test]
+    fn test_load_memory_capping_keeps_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home_config");
+        let proj = tmp.path().join("proj");
+        let proj_pacode = proj.join(".pacode");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&proj_pacode).unwrap();
+
+        // Global has older notes; project has newer notes
+        std::fs::write(
+            home.join("memory.md"),
+            "- global line 1 (oldest)\n- global line 2\n- global line 3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj_pacode.join("memory.md"),
+            "- proj line 1\n- proj line 2 (newest)\n",
+        )
+        .unwrap();
+
+        let full = load_memory(&proj, Some(&home), 8000).unwrap();
+        assert!(full.contains("global line 1"));
+        assert!(full.contains("proj line 2"));
+
+        // Cap to length that drops oldest global line(s)
+        let capped = load_memory(&proj, Some(&home), 90).unwrap();
+        assert!(capped.chars().count() <= 90);
+        // Newest line must be kept
+        assert!(capped.contains("proj line 2 (newest)"));
+        // Oldest global line must be dropped
+        assert!(!capped.contains("global line 1 (oldest)"));
+
+        // Even tighter cap drops all global lines and keeps only project tail
+        let tight = load_memory(&proj, Some(&home), 50).unwrap();
+        assert!(tight.chars().count() <= 50);
+        assert!(!tight.contains("# Memory (global)"));
+        assert!(tight.contains("proj line 2 (newest)"));
+    }
+
+    #[test]
+    fn test_load_instructions_appends_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home_config");
+        let proj = tmp.path().join("proj");
+        let proj_pacode = proj.join(".pacode");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&proj_pacode).unwrap();
+
+        std::fs::write(proj.join("AGENTS.md"), "instruction content").unwrap();
+        std::fs::write(home.join("memory.md"), "- remember global").unwrap();
+        std::fs::write(proj_pacode.join("memory.md"), "- remember project").unwrap();
+
+        let loaded = load_instructions(&proj, Some(&home), 10_000).unwrap();
+        assert!(loaded.contains("instruction content"));
+        assert!(loaded.contains("# Memory (global)"));
+        assert!(loaded.contains("- remember global"));
+        assert!(loaded.contains("# Memory (project)"));
+        assert!(loaded.contains("- remember project"));
+
+        let pos_instr = loaded.find("instruction content").unwrap();
+        let pos_global = loaded.find("# Memory (global)").unwrap();
+        let pos_proj = loaded.find("# Memory (project)").unwrap();
+
+        assert!(pos_instr < pos_global);
+        assert!(pos_global < pos_proj);
     }
 }

@@ -1,8 +1,11 @@
 //! All mutable UI state. Widgets read it; `app` and `keys` mutate it; `apply_event`
 //! folds daemon events in. Nothing here touches the terminal.
 
+pub mod files;
 pub mod input;
 pub mod rail;
+pub mod selection;
+pub mod stats;
 pub mod transcript;
 
 use std::collections::VecDeque;
@@ -15,8 +18,10 @@ use pacode_types::{
     TaskId, TaskStatus, ToastLevel, TranscriptKind,
 };
 
+pub use files::FilesState;
 pub use input::InputState;
 pub use rail::RailState;
+pub use selection::Selection;
 pub use transcript::{Cell, CellKind, Transcript};
 
 /// Interaction modes (spec §5). Layers are removed one at a time by `esc`.
@@ -67,6 +72,9 @@ pub enum Overlay {
         query: String,
         index: usize,
     },
+    Files {
+        index: usize,
+    },
     /// Plan + agents on the `Tiny` tier.
     RailOverlay,
     Help,
@@ -104,6 +112,7 @@ pub struct AppState {
     pub transcript: Transcript,
     /// Panel transcript (agent) or task output lines.
     pub panel: PanelState,
+    pub files: FilesState,
     pub rail: RailState,
     pub input: InputState,
     pub focus: Focus,
@@ -116,6 +125,10 @@ pub struct AppState {
     /// Terminal size as last seen.
     pub cols: u16,
     pub rows: u16,
+    /// Mouse selection in dialog area.
+    pub selection: Selection,
+    /// Whether the OSC 52 remote clipboard hint popup has already been shown this session.
+    pub clipboard_warned: bool,
     /// `ctrl+c` pressed once (exit on second within 2 s).
     pub ctrl_c_at: Option<Instant>,
     pub quit: bool,
@@ -152,6 +165,7 @@ impl AppState {
                 task_total_lines: 0,
                 scroll: 0,
             },
+            files: FilesState::default(),
             rail: RailState::default(),
             input: InputState::default(),
             focus: Focus::Normal,
@@ -161,6 +175,8 @@ impl AppState {
             dirty: true,
             cols,
             rows,
+            selection: Selection::default(),
+            clipboard_warned: false,
             ctrl_c_at: None,
             quit: false,
             turn_started_at: None,
@@ -189,9 +205,33 @@ impl AppState {
             }
             ClientEvent::Snapshot(snapshot) => {
                 self.connection = Connection::Connected;
-                self.meta = Some(snapshot.meta);
+                self.meta = Some(snapshot.meta.clone());
                 self.transcript
-                    .reset(snapshot.transcript, snapshot.has_more_history);
+                    .reset(snapshot.transcript.clone(), snapshot.has_more_history);
+                let header = crate::state::transcript::HeaderInfo {
+                    model: snapshot.meta.model.model.clone(),
+                    effort: snapshot.meta.effort.as_str().to_string(),
+                    provider: snapshot.meta.model.provider.clone(),
+                    cwd: snapshot.meta.cwd.display().to_string(),
+                    config_path: self.paths.config_file.display().to_string(),
+                    version: self.app_version.clone(),
+                };
+                self.transcript.insert_header(header);
+                for item in &snapshot.transcript {
+                    if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
+                        let arg = title
+                            .strip_prefix(name.as_str())
+                            .map(str::trim_start)
+                            .unwrap_or_else(|| {
+                                title
+                                    .split_once(' ')
+                                    .map(|(_, r)| r.trim())
+                                    .unwrap_or(title.as_str())
+                            });
+                        let input = serde_json::json!({ "path": arg });
+                        self.files.observe_tool_item(name, &input, item.ts_ms);
+                    }
+                }
                 self.turn_active = snapshot.turn_active;
                 if snapshot.turn_active {
                     if self.turn_started_at.is_none() {
@@ -237,6 +277,15 @@ impl AppState {
                 prefs.effort = Some(meta.effort);
                 prefs.mode = Some(meta.mode);
                 let _ = pacode_config::save_prefs(&self.paths, &prefs);
+                let header = crate::state::transcript::HeaderInfo {
+                    model: meta.model.model.clone(),
+                    effort: meta.effort.as_str().to_string(),
+                    provider: meta.model.provider.clone(),
+                    cwd: meta.cwd.display().to_string(),
+                    config_path: self.paths.config_file.display().to_string(),
+                    version: self.app_version.clone(),
+                };
+                self.transcript.insert_header(header);
                 self.meta = Some(meta);
             }
             Event::TurnStarted { agent, turn: _ } => {
@@ -330,6 +379,19 @@ impl AppState {
                 }
             }
             Event::ItemAdded(item) => {
+                if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
+                    let arg = title
+                        .strip_prefix(name.as_str())
+                        .map(str::trim_start)
+                        .unwrap_or_else(|| {
+                            title
+                                .split_once(' ')
+                                .map(|(_, r)| r.trim())
+                                .unwrap_or(title.as_str())
+                        });
+                    let input = serde_json::json!({ "path": arg });
+                    self.files.observe_tool_item(name, &input, item.ts_ms);
+                }
                 if item.agent.is_main() {
                     self.transcript.upsert(item, now);
                 } else if let Focus::Panel {
@@ -638,18 +700,7 @@ fn compute_turn_stats(duration_ms: u64, usage: &pacode_types::stream::Usage) -> 
     if usage.output_tokens == 0 {
         return None;
     }
-    let duration_secs = (duration_ms as f64) / 1000.0;
-    let tok_per_sec = if duration_secs > 0.0 {
-        (usage.output_tokens as f64) / duration_secs
-    } else {
-        0.0
-    };
-    let dur_str = pacode_types::time::format_duration_ms(duration_ms);
-    let out_str = pacode_types::time::format_tokens(usage.output_tokens);
-    let in_str = pacode_types::time::format_tokens(usage.input_tokens);
-    Some(format!(
-        "{dur_str} · {tok_per_sec:.1} tok/s · ↑{out_str} ↓{in_str}"
-    ))
+    Some(stats::stats_line(duration_ms))
 }
 
 fn attach_turn_stats(transcript: &mut Transcript, stats_str: String) {

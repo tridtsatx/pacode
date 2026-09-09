@@ -43,6 +43,9 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::SessionPicker { query, index } => {
                 draw_session_picker(frame, area, query, *index, state, opts);
             }
+            Overlay::Files { index } => {
+                crate::ui::files::draw(frame, area, *index, state, opts);
+            }
             Overlay::RailOverlay => {
                 draw_rail_overlay(frame, area, state, opts);
             }
@@ -207,6 +210,7 @@ fn draw_help(frame: &mut Frame, area: Rect, opts: &RenderOptions) {
         Line::from("  alt+↓ / alt+↑     Select agents in rail (or ctrl+j/k)"),
         Line::from("  enter             Open panel on agent/task / submit"),
         Line::from("  alt+b             Follow agent (auto-scroll)"),
+        Line::from("  alt+f             Show touched files"),
         Line::from("  .                 Show background tasks (empty prompt)"),
         Line::from("  shift+tab         Cycle permission mode"),
         Line::from("  ctrl+p            Pick / resume session"),

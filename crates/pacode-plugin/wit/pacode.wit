@@ -1,0 +1,23 @@
+package pacode:plugin@0.1.0;
+
+world plugin {
+    record tool-def {
+        name: string,
+        description: string,
+        schema: string,
+    }
+
+    record command-def {
+        name: string,
+        description: string,
+    }
+
+    import toast: func(text: string);
+    import status: func(text: string);
+
+    export get-tools: func() -> list<tool-def>;
+    export get-commands: func() -> list<command-def>;
+    export call-tool: func(name: string, input-json: string) -> result<string, string>;
+    export run-command: func(name: string, args: string) -> result<string, string>;
+    export hook: func(event-json: string) -> result<string, string>;
+}

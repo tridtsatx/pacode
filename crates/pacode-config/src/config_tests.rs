@@ -113,6 +113,11 @@ fn parse_spec_example() {
         vec!["-y", "@modelcontextprotocol/server-filesystem", "."]
     );
     assert!(fs_server.lazy);
+    assert!(fs_server.enabled);
+    assert_eq!(fs_server.url, None);
+    assert!(fs_server.headers.is_empty());
+    assert!(cfg.mcp.sampling);
+    assert_eq!(cfg.mcp.sampling_max_tokens, 2048);
 }
 
 #[test]
@@ -225,6 +230,7 @@ fn paths_under_layout() {
     assert_eq!(paths.mcp_cache_dir(), root.join("cache/mcp"));
     assert_eq!(paths.socket_path(), root.join("run/daemon.sock"));
     assert_eq!(paths.pid_file(), root.join("run/daemon.pid"));
+    assert_eq!(paths.memory_file(), root.join("memory.md"));
 }
 
 #[test]

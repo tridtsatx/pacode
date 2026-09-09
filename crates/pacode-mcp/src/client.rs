@@ -1,181 +1,70 @@
-//! One MCP server process.
+//! One MCP server client over Stdio or HTTP transport.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pacode_types::McpServerConfig;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, oneshot};
-use tokio::task::JoinHandle;
 
-use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MCP_PROTOCOL_VERSION};
-use crate::{McpCallResult, McpError, McpToolInfo};
+use crate::protocol::{PROTOCOL_VERSION_2024_11_05, PROTOCOL_VERSION_2025_06_18};
+use crate::transport::{HttpTransport, StdioTransport, Transport};
+use crate::{
+    McpCallResult, McpError, McpPrompt, McpPromptArgument, McpResource, McpToolInfo,
+    SamplingHandler,
+};
 
 pub struct McpClient {
     name: String,
     timeout_secs: u64,
-    child: Mutex<Child>,
-    writer: Arc<Mutex<ChildStdin>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
-    next_id: AtomicU64,
-    reader_task: JoinHandle<()>,
-    stderr_task: JoinHandle<()>,
+    transport: Transport,
+    protocol_version: String,
+    capabilities: Value,
+    server_info: Value,
 }
 
 impl McpClient {
-    /// Spawn the server, run `initialize` + `notifications/initialized`.
     pub async fn start(
         name: &str,
         cfg: &McpServerConfig,
         cwd: Option<&std::path::Path>,
     ) -> Result<Self, McpError> {
-        let mut cmd = Command::new(&cfg.command);
-        cmd.args(&cfg.args);
+        Self::start_with_sampling(name, cfg, cwd, None, true, 2048).await
+    }
 
-        // cfg.env merged over the current env
-        for (k, v) in std::env::vars() {
-            cmd.env(k, v);
-        }
-        for (k, v) in &cfg.env {
-            cmd.env(k, v);
-        }
+    pub async fn start_with_sampling(
+        name: &str,
+        cfg: &McpServerConfig,
+        cwd: Option<&std::path::Path>,
+        sampling_handler: Option<Arc<dyn SamplingHandler>>,
+        sampling_enabled: bool,
+        sampling_max_tokens: u32,
+    ) -> Result<Self, McpError> {
+        let is_http = cfg.url.as_ref().is_some_and(|u| !u.trim().is_empty());
 
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        let mut child = cmd.spawn().map_err(|source| McpError::Spawn {
-            server: name.to_string(),
-            source,
-        })?;
-
-        let stdin = child.stdin.take().ok_or_else(|| McpError::Spawn {
-            server: name.to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin pipe unavailable"),
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| McpError::Spawn {
-            server: name.to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe unavailable"),
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| McpError::Spawn {
-            server: name.to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr pipe unavailable"),
-        })?;
-
-        let server_name = name.to_string();
-        let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                log::debug!("[MCP stderr {server_name}] {line}");
-            }
-        });
-
-        let writer = Arc::new(Mutex::new(stdin));
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        let reader_name = name.to_string();
-        let pending_reader = Arc::clone(&pending);
-        let writer_reader = Arc::clone(&writer);
-
-        let reader_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        let val: Value = match serde_json::from_str(trimmed) {
-                            Ok(v) => v,
-                            Err(err) => {
-                                log::debug!(
-                                    "[MCP {reader_name}] malformed json ({err}): {trimmed}"
-                                );
-                                continue;
-                            }
-                        };
-
-                        let has_method = val.get("method").and_then(|m| m.as_str()).is_some();
-                        let id_val = val.get("id");
-                        let has_id = id_val.is_some() && !id_val.is_some_and(|v| v.is_null());
-
-                        if has_method {
-                            if !has_id {
-                                log::debug!("[MCP {reader_name}] notification: {trimmed}");
-                            } else {
-                                log::debug!("[MCP {reader_name}] server request: {trimmed}");
-                                let req_id = id_val.cloned().unwrap_or(Value::Null);
-                                let err_reply = serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": req_id,
-                                    "error": {
-                                        "code": -32601,
-                                        "message": "Method not found"
-                                    }
-                                });
-                                let mut msg = err_reply.to_string();
-                                msg.push('\n');
-                                let mut w = writer_reader.lock().await;
-                                let _ = w.write_all(msg.as_bytes()).await;
-                                let _ = w.flush().await;
-                            }
-                        } else if has_id
-                            && (val.get("result").is_some() || val.get("error").is_some())
-                        {
-                            match serde_json::from_value::<JsonRpcResponse>(val) {
-                                Ok(resp) => {
-                                    let id_num = resp.id.as_u64().or_else(|| {
-                                        resp.id.as_str().and_then(|s| s.parse::<u64>().ok())
-                                    });
-                                    if let Some(id_num) = id_num {
-                                        let mut map = pending_reader.lock().await;
-                                        if let Some(tx) = map.remove(&id_num) {
-                                            let _ = tx.send(resp);
-                                        } else {
-                                            log::debug!(
-                                                "[MCP {reader_name}] unexpected response id {id_num}"
-                                            );
-                                        }
-                                    } else {
-                                        log::debug!(
-                                            "[MCP {reader_name}] response id not u64: {:?}",
-                                            resp.id
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    log::debug!(
-                                        "[MCP {reader_name}] failed to parse response ({err}): {trimmed}"
-                                    );
-                                }
-                            }
-                        } else {
-                            log::debug!("[MCP {reader_name}] ignored line: {trimmed}");
-                        }
-                    }
-                    Ok(None) => {
-                        log::debug!("[MCP {reader_name}] stdout EOF");
-                        break;
-                    }
-                    Err(err) => {
-                        log::debug!("[MCP {reader_name}] stdout read error: {err}");
-                        break;
-                    }
-                }
-            }
-            let mut map = pending_reader.lock().await;
-            map.clear();
-        });
+        let transport = if is_http {
+            Transport::Http(
+                HttpTransport::start(
+                    name,
+                    cfg,
+                    sampling_handler,
+                    sampling_enabled,
+                    sampling_max_tokens,
+                )
+                .await?,
+            )
+        } else {
+            Transport::Stdio(
+                StdioTransport::start(
+                    name,
+                    cfg,
+                    cwd,
+                    sampling_handler,
+                    sampling_enabled,
+                    sampling_max_tokens,
+                )
+                .await?,
+            )
+        };
 
         let timeout_secs = if cfg.timeout_secs == 0 {
             60
@@ -183,21 +72,12 @@ impl McpClient {
             cfg.timeout_secs
         };
 
-        let client = Self {
-            name: name.to_string(),
-            timeout_secs,
-            child: Mutex::new(child),
-            writer,
-            pending,
-            next_id: AtomicU64::new(1),
-            reader_task,
-            stderr_task,
-        };
-
-        // Handshake: request `initialize` then notification `notifications/initialized`
+        // Handshake: offer 2025-06-18, accept whatever server returns
         let init_params = serde_json::json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
+            "protocolVersion": PROTOCOL_VERSION_2025_06_18,
+            "capabilities": {
+                "sampling": {}
+            },
             "clientInfo": {
                 "name": "pacode",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -205,85 +85,75 @@ impl McpClient {
         });
 
         let handshake_timeout = Duration::from_secs(timeout_secs);
-        if let Err(err) = client
+        let resp = match transport
             .request("initialize", Some(init_params), handshake_timeout)
             .await
         {
-            client.shutdown().await;
+            Ok(r) => r,
+            Err(err) => {
+                transport.shutdown().await;
+                return Err(err);
+            }
+        };
+
+        let result = resp.result.unwrap_or_else(|| serde_json::json!({}));
+        let protocol_version = result
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or(PROTOCOL_VERSION_2024_11_05)
+            .to_string();
+
+        let capabilities = result
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let server_info = result
+            .get("serverInfo")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        if let Err(err) = transport.notify("notifications/initialized", None).await {
+            transport.shutdown().await;
             return Err(err);
         }
 
-        let notif = JsonRpcNotification::new("notifications/initialized", None);
-        let mut notif_str = serde_json::to_string(&notif)?;
-        notif_str.push('\n');
-        {
-            let mut w = client.writer.lock().await;
-            if let Err(e) = w.write_all(notif_str.as_bytes()).await {
-                client.shutdown().await;
-                return Err(McpError::Io(e));
-            }
-            if let Err(e) = w.flush().await {
-                client.shutdown().await;
-                return Err(McpError::Io(e));
-            }
-        }
-
-        Ok(client)
-    }
-
-    async fn request(
-        &self,
-        method: &str,
-        params: Option<Value>,
-        timeout: Duration,
-    ) -> Result<JsonRpcResponse, McpError> {
-        if !self.is_alive() {
-            return Err(McpError::Closed);
-        }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut map = self.pending.lock().await;
-            map.insert(id, tx);
-        }
-
-        let req = JsonRpcRequest::new(id, method, params);
-        let mut line = serde_json::to_string(&req)?;
-        line.push('\n');
-
-        {
-            let mut w = self.writer.lock().await;
-            if let Err(err) = w.write_all(line.as_bytes()).await {
-                self.pending.lock().await.remove(&id);
-                return Err(McpError::Io(err));
-            }
-            if let Err(err) = w.flush().await {
-                self.pending.lock().await.remove(&id);
-                return Err(McpError::Io(err));
-            }
-        }
-
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(resp)) => {
-                if let Some(err) = resp.error {
-                    Err(McpError::Server {
-                        code: err.code,
-                        message: err.message,
-                    })
-                } else {
-                    Ok(resp)
-                }
-            }
-            Ok(Err(_closed)) => Err(McpError::Closed),
-            Err(_elapsed) => {
-                self.pending.lock().await.remove(&id);
-                Err(McpError::Timeout(timeout.as_secs()))
-            }
-        }
+        Ok(Self {
+            name: name.to_string(),
+            timeout_secs,
+            transport,
+            protocol_version,
+            capabilities,
+            server_info,
+        })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn protocol_version(&self) -> &str {
+        &self.protocol_version
+    }
+
+    pub fn capabilities(&self) -> &Value {
+        &self.capabilities
+    }
+
+    pub fn server_info(&self) -> &Value {
+        &self.server_info
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.transport.is_alive()
+    }
+
+    pub fn set_sampling_handler(&self, handler: Arc<dyn SamplingHandler>) {
+        self.transport.set_sampling_handler(handler);
+    }
+
+    pub fn set_sampling_config(&self, enabled: bool, max_tokens: u32) {
+        self.transport.set_sampling_config(enabled, max_tokens);
     }
 
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>, McpError> {
@@ -293,12 +163,15 @@ impl McpClient {
 
         loop {
             let params = cursor.as_ref().map(|c| serde_json::json!({ "cursor": c }));
-            let response = self.request("tools/list", params, timeout).await?;
-            let result = response.result.ok_or_else(|| {
+            let resp = self
+                .transport
+                .request("tools/list", params, timeout)
+                .await?;
+            let res = resp.result.ok_or_else(|| {
                 McpError::Protocol("missing result in tools/list response".to_string())
             })?;
 
-            if let Some(items) = result.get("tools").and_then(|t| t.as_array()) {
+            if let Some(items) = res.get("tools").and_then(|t| t.as_array()) {
                 for item in items {
                     let name = item
                         .get("name")
@@ -323,18 +196,15 @@ impl McpClient {
                 }
             }
 
-            let next_cursor = result
+            match res
                 .get("nextCursor")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
-
-            match next_cursor {
-                Some(nc) => cursor = Some(nc),
+            {
+                Some(nc) => cursor = Some(nc.to_string()),
                 None => break,
             }
         }
-
         Ok(tools)
     }
 
@@ -349,60 +219,276 @@ impl McpClient {
         } else {
             args
         };
-        let params = serde_json::json!({
-            "name": tool,
-            "arguments": arguments,
-        });
-
-        let response = self.request("tools/call", Some(params), timeout).await?;
-        let result = response.result.ok_or_else(|| {
+        let params = serde_json::json!({ "name": tool, "arguments": arguments });
+        let resp = self
+            .transport
+            .request("tools/call", Some(params), timeout)
+            .await?;
+        let res = resp.result.ok_or_else(|| {
             McpError::Protocol("missing result in tools/call response".to_string())
         })?;
 
         let mut parts = Vec::new();
-        if let Some(content_array) = result.get("content").and_then(|c| c.as_array()) {
+        if let Some(content_array) = res.get("content").and_then(|c| c.as_array()) {
             for block in content_array {
-                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if block_type == "text" {
-                    let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    parts.push(text.to_string());
-                } else if !block_type.is_empty() {
-                    parts.push(format!("[{block_type}]"));
+                let typ = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if typ == "text" {
+                    parts.push(
+                        block
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                } else if !typ.is_empty() {
+                    parts.push(format!("[{typ}]"));
                 } else {
                     parts.push("[unknown]".to_string());
                 }
             }
-        } else if let Some(text) = result.get("content").and_then(|c| c.as_str()) {
+        } else if let Some(text) = res.get("content").and_then(|c| c.as_str()) {
             parts.push(text.to_string());
         }
 
-        let content = parts.join("\n");
-        let is_error = result
+        let is_error = res
             .get("isError")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-
-        Ok(McpCallResult { content, is_error })
+        Ok(McpCallResult {
+            content: parts.join("\n"),
+            is_error,
+        })
     }
 
-    pub fn is_alive(&self) -> bool {
-        !self.reader_task.is_finished()
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
+        let mut resources = Vec::new();
+        let mut cursor: Option<String> = None;
+        let timeout = Duration::from_secs(self.timeout_secs);
+
+        loop {
+            let params = cursor.as_ref().map(|c| serde_json::json!({ "cursor": c }));
+            let resp = match self
+                .transport
+                .request("resources/list", params, timeout)
+                .await
+            {
+                Ok(r) => r,
+                Err(McpError::Server { code: -32601, .. }) => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
+
+            let res = resp.result.ok_or_else(|| {
+                McpError::Protocol("missing result in resources/list response".to_string())
+            })?;
+
+            if let Some(items) = res.get("resources").and_then(|r| r.as_array()) {
+                for item in items {
+                    let uri = item
+                        .get("uri")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let description = item
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let mime_type = item
+                        .get("mimeType")
+                        .or_else(|| item.get("mime_type"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    resources.push(McpResource {
+                        uri,
+                        name,
+                        description,
+                        mime_type,
+                    });
+                }
+            }
+
+            match res
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                Some(nc) => cursor = Some(nc.to_string()),
+                None => break,
+            }
+        }
+        Ok(resources)
     }
 
-    /// Kill the process and stop the reader task.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let params = serde_json::json!({ "uri": uri });
+        let resp = self
+            .transport
+            .request("resources/read", Some(params), timeout)
+            .await?;
+        let res = resp.result.ok_or_else(|| {
+            McpError::Protocol("missing result in resources/read response".to_string())
+        })?;
+
+        let mut parts = Vec::new();
+        if let Some(contents) = res.get("contents").and_then(|c| c.as_array()) {
+            for item in contents {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    parts.push(text.to_string());
+                } else if item.get("blob").is_some() {
+                    let mime = item
+                        .get("mimeType")
+                        .or_else(|| item.get("mime_type"))
+                        .and_then(|v| v.as_str());
+                    match mime {
+                        Some(m) => parts.push(format!("[blob: {m}]")),
+                        None => parts.push("[blob]".to_string()),
+                    }
+                } else {
+                    parts.push("[unknown]".to_string());
+                }
+            }
+        } else if let Some(text) = res.get("text").and_then(|t| t.as_str()) {
+            parts.push(text.to_string());
+        }
+
+        Ok(parts.join("\n"))
+    }
+
+    pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, McpError> {
+        let mut prompts = Vec::new();
+        let mut cursor: Option<String> = None;
+        let timeout = Duration::from_secs(self.timeout_secs);
+
+        loop {
+            let params = cursor.as_ref().map(|c| serde_json::json!({ "cursor": c }));
+            let resp = match self
+                .transport
+                .request("prompts/list", params, timeout)
+                .await
+            {
+                Ok(r) => r,
+                Err(McpError::Server { code: -32601, .. }) => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
+
+            let res = resp.result.ok_or_else(|| {
+                McpError::Protocol("missing result in prompts/list response".to_string())
+            })?;
+
+            if let Some(items) = res.get("prompts").and_then(|p| p.as_array()) {
+                for item in items {
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let description = item
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let mut arguments = Vec::new();
+                    if let Some(args_arr) = item.get("arguments").and_then(|a| a.as_array()) {
+                        for arg in args_arr {
+                            let arg_name = arg
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let arg_desc = arg
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let required = arg
+                                .get("required")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            arguments.push(McpPromptArgument {
+                                name: arg_name,
+                                description: arg_desc,
+                                required,
+                            });
+                        }
+                    }
+                    prompts.push(McpPrompt {
+                        name,
+                        description,
+                        arguments,
+                    });
+                }
+            }
+
+            match res
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                Some(nc) => cursor = Some(nc.to_string()),
+                None => break,
+            }
+        }
+        Ok(prompts)
+    }
+
+    pub async fn get_prompt(&self, name: &str, args: Value) -> Result<String, McpError> {
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let params = serde_json::json!({ "name": name, "arguments": args });
+        let resp = self
+            .transport
+            .request("prompts/get", Some(params), timeout)
+            .await?;
+        let res = resp.result.ok_or_else(|| {
+            McpError::Protocol("missing result in prompts/get response".to_string())
+        })?;
+
+        let mut rendered_messages = Vec::new();
+        if let Some(messages) = res.get("messages").and_then(|m| m.as_array()) {
+            for msg in messages {
+                let text = match msg.get("content") {
+                    Some(Value::Object(obj)) => {
+                        let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if typ == "text" {
+                            obj.get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        } else if !typ.is_empty() {
+                            format!("[{typ}]")
+                        } else {
+                            String::new()
+                        }
+                    }
+                    Some(Value::Array(arr)) => {
+                        let mut block_texts = Vec::new();
+                        for block in arr {
+                            let typ = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if typ == "text" {
+                                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                                    block_texts.push(t.to_string());
+                                }
+                            } else if !typ.is_empty() {
+                                block_texts.push(format!("[{typ}]"));
+                            }
+                        }
+                        block_texts.join("\n")
+                    }
+                    Some(Value::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                if !text.is_empty() {
+                    rendered_messages.push(text);
+                }
+            }
+        }
+
+        Ok(rendered_messages.join("\n\n"))
+    }
+
     pub async fn shutdown(&self) {
-        self.reader_task.abort();
-        self.stderr_task.abort();
-        self.pending.lock().await.clear();
-        let mut child = self.child.lock().await;
-        let _ = child.kill().await;
-        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
-    }
-}
-
-impl Drop for McpClient {
-    fn drop(&mut self) {
-        self.reader_task.abort();
-        self.stderr_task.abort();
+        self.transport.shutdown().await;
     }
 }

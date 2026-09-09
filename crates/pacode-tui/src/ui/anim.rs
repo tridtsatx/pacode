@@ -90,12 +90,12 @@ pub fn render_pacman_line(
             if !buf.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut buf), opts.theme.dim));
             }
-            spans.push(Span::styled(ch.to_string(), opts.theme.accent));
+            spans.push(Span::styled(ch.to_string(), opts.theme.yellow));
         } else if ch == candy_sym {
             if !buf.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut buf), opts.theme.dim));
             }
-            spans.push(Span::styled(ch.to_string(), opts.theme.faint));
+            spans.push(Span::styled(ch.to_string(), opts.theme.fg));
         } else {
             buf.push(ch);
         }
@@ -115,9 +115,39 @@ pub fn render_pacman_line(
     Line::from(spans)
 }
 
+/// Dynamic animation frame interval based on stream backlog and draining phase.
+///
+/// - Idle thinking: 240 ms / frame.
+/// - Once stream arrives: clamp(240 - backlog_chars / 8, 60, 240) ms.
+/// - When draining final item: 60 ms.
+pub fn pacman_interval_ms(backlog_chars: usize, draining: bool) -> u64 {
+    if draining {
+        60
+    } else {
+        let reduction = (backlog_chars / 8) as u64;
+        240u64.saturating_sub(reduction).clamp(60, 240)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pacman_interval_ms() {
+        // Draining is always 60 ms
+        assert_eq!(pacman_interval_ms(0, true), 60);
+        assert_eq!(pacman_interval_ms(500, true), 60);
+        assert_eq!(pacman_interval_ms(5000, true), 60);
+
+        // Not draining: clamp(240 - backlog/8, 60, 240)
+        assert_eq!(pacman_interval_ms(0, false), 240);
+        assert_eq!(pacman_interval_ms(80, false), 230);
+        assert_eq!(pacman_interval_ms(800, false), 140);
+        assert_eq!(pacman_interval_ms(1440, false), 60);
+        assert_eq!(pacman_interval_ms(2000, false), 60);
+        assert_eq!(pacman_interval_ms(usize::MAX, false), 60);
+    }
 
     #[test]
     fn test_pacman_frame_ascii() {

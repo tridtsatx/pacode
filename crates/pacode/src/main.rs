@@ -1,7 +1,7 @@
 //! pacode binary.
 //!
 //! ```text
-//! pacode [PROMPT] [--resume ID] [--model M] [--effort E] [--mode M] [-C DIR] [--socket P]
+//! pacode [PROMPT] [-s ID] [--model M] [--effort E] [--mode M] [-C DIR] [--socket P]
 //! pacode serve [--detach] [--socket P]
 //! pacode run PROMPT [--json] [--model M] [--effort E] [--mode M] [-C DIR]
 //! pacode sessions [list [--limit N] | delete ID]
@@ -9,7 +9,7 @@
 //! ```
 //!
 //! - default: load config, `TuiOptions` with `Attach::New{cwd,..}` or `Resume`, run the TUI
-//!   on a `current_thread` runtime.
+//!   on a `current_thread` runtime, and print the resume banner on normal exit.
 //! - `serve`: `--detach` re-executes itself with `setsid` (via `pacode_client::spawn_daemon`)
 //!   and exits; otherwise builds the core and runs the daemon on a multi-thread runtime
 //!   with 2 workers; logs to `paths.daemon_log()` (level from `PACODE_LOG`).

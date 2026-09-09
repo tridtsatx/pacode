@@ -64,11 +64,55 @@ macro_rules! id_type {
     };
 }
 
-id_type!(
-    /// A session owned by the daemon.
-    SessionId,
-    "ses"
-);
+/// A session owned by the daemon.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub const PREFIX: &'static str = "pacode";
+
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    pub fn generate() -> Self {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let a: u32 = rng.random();
+        let b: u16 = rng.random();
+        Self(format!("pacode-{a:08x}-{b:04x}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for SessionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for SessionId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for SessionId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 id_type!(
     /// An agent inside a session. The main agent is always [`AgentId::main`].
     AgentId,
@@ -113,23 +157,5 @@ impl AgentId {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_ids_have_prefix_and_are_unique() {
-        let a = SessionId::generate();
-        let b = SessionId::generate();
-        assert!(a.as_str().starts_with("ses_"));
-        assert_eq!(a.as_str().len(), 4 + 12);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn main_agent() {
-        assert!(AgentId::main().is_main());
-        assert!(!AgentId::generate().is_main());
-        let json = serde_json::to_string(&AgentId::main()).unwrap();
-        assert_eq!(json, "\"main\"");
-    }
-}
+#[path = "ids_tests.rs"]
+mod ids_tests;

@@ -18,6 +18,7 @@ pub mod grep;
 pub(crate) mod helpers;
 pub mod ls;
 pub mod mcp;
+pub mod memory;
 pub mod multi_edit;
 pub mod plan;
 pub mod read;
@@ -45,6 +46,8 @@ pub fn builtin_tools() -> ToolRegistry {
         .with(Arc::new(agent::AgentTool))
         .with(Arc::new(webfetch::WebFetchTool))
         .with(Arc::new(report_status::ReportStatusTool))
+        .with(Arc::new(memory::MemoryWriteTool))
+        .with(Arc::new(memory::MemoryReadTool))
 }
 
 /// Tool names a subagent gets by default: everything except `agent` (depth 1).

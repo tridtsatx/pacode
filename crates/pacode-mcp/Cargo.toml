@@ -7,12 +7,15 @@ description = "MCP client over stdio JSON-RPC: server pool, lazy start, tool lis
 
 [dependencies]
 pacode-types = { workspace = true }
-tokio = { workspace = true, features = ["rt", "process", "io-util", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "process", "io-util", "sync", "time", "macros", "net"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 tempfile = { workspace = true }

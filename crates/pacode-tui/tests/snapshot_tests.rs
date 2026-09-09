@@ -600,12 +600,19 @@ fn test_turn_ended_response_stats_rendered() {
         .unwrap();
 
     let view = format!("{}", terminal.backend());
+    let has_verb = pacode_tui::state::stats::PACMAN_VERBS
+        .iter()
+        .any(|v| view.contains(v));
     assert!(
-        view.contains("tok/s"),
-        "Dialog view must render assistant response stats line with 'tok/s', but view was:\n{view}"
+        has_verb,
+        "Dialog view must contain a pacman verb, but view was:\n{view}"
     );
     assert!(
-        view.contains("↑1.2k ↓5.4k"),
-        "Dialog view must render '↑1.2k ↓5.4k', but view was:\n{view}"
+        view.contains("· done "),
+        "Dialog view must contain '· done ', but view was:\n{view}"
+    );
+    assert!(
+        !view.contains("tok/s"),
+        "Tokens must no longer be shown in the turn stats line"
     );
 }

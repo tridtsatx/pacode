@@ -799,6 +799,7 @@ async fn test_mcp_tools_proxy() {
         env: BTreeMap::new(),
         lazy: false,
         timeout_secs: 5,
+        ..Default::default()
     };
 
     let mut servers = BTreeMap::new();
@@ -827,6 +828,84 @@ async fn test_mcp_tools_proxy() {
 
     assert!(out.content.contains("hello from mcp"));
     assert_eq!(out.title, "fake__echo");
+
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_mcp_resource_proxy() {
+    use pacode_mcp::McpPool;
+    use pacode_types::McpServerConfig;
+    use std::collections::BTreeMap;
+
+    let python_ok = std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !python_ok {
+        return;
+    }
+
+    let fake_mcp_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("pacode-mcp/tests/fake_mcp.py");
+    if !fake_mcp_path.exists() {
+        return;
+    }
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_MCP_RESOURCES".to_string(), "1".to_string());
+
+    let cfg = McpServerConfig {
+        command: "python3".to_string(),
+        args: vec![fake_mcp_path.to_string_lossy().to_string()],
+        env,
+        lazy: false,
+        timeout_secs: 5,
+        ..Default::default()
+    };
+
+    let mut servers = BTreeMap::new();
+    servers.insert("fake".to_string(), cfg);
+    let pool = McpPool::new(servers, None, None);
+
+    let tools = pacode_tools::builtin::mcp::mcp_tools(pool.clone()).await;
+    // 3 tools (echo, fail, slow) + 1 resource proxy (fake__resource)
+    assert_eq!(tools.len(), 4);
+
+    let resource_tool = tools.iter().find(|t| t.name() == "fake__resource").unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let out = resource_tool
+        .call(
+            json!({
+                "uri": "fake://resource1",
+                "intent": "reading resource",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("content of resource1"));
+    assert_eq!(out.title, "fake__resource");
+
+    let out_blob = resource_tool
+        .call(
+            json!({
+                "uri": "fake://resource2",
+                "intent": "reading blob resource",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out_blob.content.contains("[blob: image/png]"));
 
     pool.shutdown().await;
 }

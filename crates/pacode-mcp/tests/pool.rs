@@ -47,6 +47,7 @@ async fn test_client_start_list_call() {
         env: BTreeMap::new(),
         lazy: false,
         timeout_secs: 5,
+        ..Default::default()
     };
 
     let client = McpClient::start("fake", &cfg, None)
@@ -95,6 +96,7 @@ async fn test_client_timeout_on_slow_tool() {
         env: BTreeMap::new(),
         lazy: false,
         timeout_secs: 1,
+        ..Default::default()
     };
 
     let client = McpClient::start("slow_server", &cfg, None)
@@ -131,6 +133,7 @@ async fn test_pool_lazy_start_and_disk_cache_reuse() {
         env: BTreeMap::new(),
         lazy: true,
         timeout_secs: 5,
+        ..Default::default()
     };
 
     // First pool instance: cold cache -> starts server and populates disk cache
@@ -166,6 +169,7 @@ async fn test_pool_lazy_start_and_disk_cache_reuse() {
         env: BTreeMap::new(),
         lazy: true,
         timeout_secs: 5,
+        ..Default::default()
     };
 
     // Update the disk cache entry for "fake" to match the bogus config fingerprint
@@ -210,6 +214,7 @@ async fn test_pool_restart_on_dead_client() {
         env: BTreeMap::new(),
         lazy: true,
         timeout_secs: 5,
+        ..Default::default()
     };
 
     let mut servers = BTreeMap::new();
@@ -245,6 +250,7 @@ async fn test_server_request_replies_method_not_found() {
         env: BTreeMap::new(),
         lazy: false,
         timeout_secs: 5,
+        ..Default::default()
     };
 
     let client = McpClient::start("server_req_test", &cfg, None)
@@ -259,4 +265,183 @@ async fn test_server_request_replies_method_not_found() {
     assert_eq!(res.content, "server request handled successfully");
 
     client.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_client_resources_and_prompts_stdio() {
+    if !has_python3() {
+        return;
+    }
+
+    let script = fake_mcp_path();
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_MCP_RESOURCES".to_string(), "1".to_string());
+    env.insert("FAKE_MCP_PROMPTS".to_string(), "1".to_string());
+
+    let cfg = McpServerConfig {
+        command: "python3".to_string(),
+        args: vec![script.to_str().unwrap().to_string()],
+        env,
+        lazy: false,
+        timeout_secs: 5,
+        ..Default::default()
+    };
+
+    let client = McpClient::start("res_prompt_test", &cfg, None)
+        .await
+        .expect("start client");
+
+    // Resources
+    let resources = client.list_resources().await.expect("list resources");
+    assert_eq!(resources.len(), 2);
+    assert_eq!(resources[0].uri, "fake://resource1");
+    assert_eq!(resources[0].name, "Resource 1");
+    assert_eq!(resources[1].uri, "fake://resource2");
+
+    let text1 = client
+        .read_resource("fake://resource1")
+        .await
+        .expect("read resource 1");
+    assert_eq!(text1, "content of resource1");
+
+    let text2 = client
+        .read_resource("fake://resource2")
+        .await
+        .expect("read resource 2");
+    assert_eq!(text2, "[blob: image/png]");
+
+    // Prompts
+    let prompts = client.list_prompts().await.expect("list prompts");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].name, "test_prompt");
+    assert_eq!(prompts[0].arguments.len(), 1);
+    assert_eq!(prompts[0].arguments[0].name, "topic");
+
+    let rendered = client
+        .get_prompt("test_prompt", json!({"topic": "Rust concurrency"}))
+        .await
+        .expect("get prompt");
+    assert_eq!(rendered, "Tell me about Rust concurrency");
+
+    client.shutdown().await;
+}
+
+struct FakeSamplingHandler;
+
+#[async_trait::async_trait]
+impl pacode_mcp::SamplingHandler for FakeSamplingHandler {
+    async fn create_message(
+        &self,
+        req: pacode_mcp::SamplingRequest,
+    ) -> Result<pacode_mcp::SamplingResponse, McpError> {
+        // Verify cap was applied from 4096 -> 2048
+        assert_eq!(req.max_tokens, Some(2048));
+        Ok(pacode_mcp::SamplingResponse::text(
+            "model-test",
+            "fake AI answer",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn test_sampling_roundtrip_stdio() {
+    if !has_python3() {
+        return;
+    }
+
+    let script = fake_mcp_path();
+    let cfg = McpServerConfig {
+        command: "python3".to_string(),
+        args: vec![script.to_str().unwrap().to_string()],
+        env: BTreeMap::new(),
+        lazy: false,
+        timeout_secs: 5,
+        ..Default::default()
+    };
+
+    let mut servers = BTreeMap::new();
+    servers.insert("fake".to_string(), cfg);
+    let pool = McpPool::new(servers, None, None);
+    pool.set_sampling_handler(std::sync::Arc::new(FakeSamplingHandler));
+
+    let res = pool
+        .call("fake", "test_sampling", json!({}))
+        .await
+        .expect("call test_sampling");
+
+    assert!(!res.is_error);
+    assert!(
+        res.content
+            .contains("sampling response received: fake AI answer")
+    );
+
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_pool_statuses_and_enabled_restart() {
+    if !has_python3() {
+        return;
+    }
+
+    let script = fake_mcp_path();
+    let cfg = McpServerConfig {
+        command: "python3".to_string(),
+        args: vec![script.to_str().unwrap().to_string()],
+        env: BTreeMap::new(),
+        lazy: true,
+        timeout_secs: 5,
+        ..Default::default()
+    };
+
+    let mut servers = BTreeMap::new();
+    servers.insert("fake".to_string(), cfg);
+    let pool = McpPool::new(servers, None, None);
+
+    // Initial status: Stopped
+    let statuses = pool.statuses();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].0, "fake");
+    assert_eq!(statuses[0].1, pacode_mcp::ServerStatus::Stopped);
+
+    // Trigger lazy start via list_all_tools
+    let tools = pool.list_all_tools().await;
+    assert_eq!(tools.len(), 3);
+
+    let statuses = pool.statuses();
+    match &statuses[0].1 {
+        pacode_mcp::ServerStatus::Ready {
+            tools,
+            resources,
+            prompts,
+        } => {
+            assert_eq!(*tools, 3);
+            assert_eq!(*resources, 0);
+            assert_eq!(*prompts, 0);
+        }
+        other => panic!("expected Ready, got: {other:?}"),
+    }
+
+    // Disable server
+    pool.set_enabled("fake", false).await.expect("disable");
+    let statuses = pool.statuses();
+    assert_eq!(statuses[0].1, pacode_mcp::ServerStatus::Stopped);
+
+    // Disabled servers advertise nothing
+    let tools = pool.list_all_tools().await;
+    assert!(tools.is_empty());
+
+    // Re-enable and restart
+    pool.set_enabled("fake", true).await.expect("enable");
+    pool.restart("fake").await.expect("restart");
+
+    let statuses = pool.statuses();
+    match &statuses[0].1 {
+        pacode_mcp::ServerStatus::Ready { tools, .. } => {
+            assert_eq!(*tools, 3);
+        }
+        other => panic!("expected Ready after restart, got: {other:?}"),
+    }
+
+    pool.shutdown().await;
 }

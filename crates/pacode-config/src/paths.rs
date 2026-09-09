@@ -128,4 +128,12 @@ impl Paths {
     pub fn pid_file(&self) -> PathBuf {
         self.runtime_dir.join("daemon.pid")
     }
+
+    /// Global memory file (`~/.config/pacode/memory.md` or next to `config.toml`).
+    pub fn memory_file(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .map(|p| p.join("memory.md"))
+            .unwrap_or_else(|| PathBuf::from("memory.md"))
+    }
 }

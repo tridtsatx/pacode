@@ -11,6 +11,7 @@
 //! - `terminal`: raw mode / alt screen / mouse capture / panic hook
 
 pub mod app;
+pub mod clipboard;
 pub mod commands;
 pub mod keys;
 pub mod keys_picker;

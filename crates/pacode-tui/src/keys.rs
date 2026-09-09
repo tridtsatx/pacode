@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use pacode_types::state::PermissionDecision;
 use pacode_types::{PermissionRequest, Request, TranscriptKind};
 
@@ -28,6 +28,22 @@ pub enum Action {
 
 pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Action> {
     state.dirty = true;
+
+    // Dismiss remote clipboard hint popup on any key.
+    state
+        .toasts
+        .retain(|t| t.title != crate::ui::popup::POPUP_TOAST_TITLE);
+
+    // ctrl+shift+c: copy current selection
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        if state.selection.is_active() && !state.selection.is_empty() {
+            state.selection.request_explicit_copy();
+        }
+        return vec![];
+    }
 
     // 1. ctrl+c / ctrl+d (Cyrillic layout letters are mapped to their Latin key).
     let key = normalize_cyrillic_ctrl(key);
@@ -58,8 +74,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
-    // 1.5 While an in-place picker is open, ALL keys go to it (fixes focus leak to input).
-    if state.is_bottom_picker() {
+    // 1.5 While an overlay is open, ALL keys go to it (fixes focus leak to input).
+    if let Focus::Overlay(_) = state.focus {
         return crate::keys_picker::handle_picker_key(state, key);
     }
 
@@ -99,11 +115,15 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return handle_esc(state);
     }
 
-    // 5. Follow shortcut: alt+b (alias alt+f)
-    if key.modifiers.contains(KeyModifiers::ALT)
-        && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('f'))
-    {
+    // 5. Follow shortcut: alt+b
+    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('b')) {
         return handle_follow(state);
+    }
+
+    // 5.5 Files overlay: alt+f
+    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('f')) {
+        state.focus = Focus::Overlay(Overlay::Files { index: 0 });
+        return vec![];
     }
 
     // 6. Navigation: alt+down/ctrl+j (next agent/task), alt+up/ctrl+k (prev agent/task)
@@ -330,6 +350,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 }
 
 fn handle_esc(state: &mut AppState) -> Vec<Action> {
+    state.selection.clear();
     match state.focus {
         Focus::Panel {
             follow: true,
@@ -505,40 +526,75 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
     let col = mouse.column;
     let row = mouse.row;
 
-    let delta = match mouse.kind {
-        MouseEventKind::ScrollDown => -3,
-        MouseEventKind::ScrollUp => 3,
-        _ => return vec![],
-    };
+    // Shift+drag is left to the terminal (mouse capture already grabs plain drag).
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        return vec![];
+    }
 
-    if layout.dialog.contains((col, row).into()) {
-        state
-            .transcript
-            .scroll_by(delta, 1000, layout.dialog.height as usize);
-    } else if layout.input.contains((col, row).into()) {
-        let max_scroll = state
-            .input
-            .wrap_lines(layout.input.width)
-            .len()
-            .saturating_sub(layout.input.height as usize);
-        if delta < 0 {
-            state.input.input_scroll = (state.input.input_scroll + 1).min(max_scroll);
-        } else {
-            state.input.input_scroll = state.input.input_scroll.saturating_sub(1);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            state.selection.clear();
+            if layout.dialog.contains((col, row).into()) {
+                state.selection.start(col, row, layout.dialog);
+            }
+            return vec![];
         }
-    } else if let Some(panel) = layout.panel {
-        if panel.contains((col, row).into()) {
-            state
-                .panel
-                .agent_transcript
-                .scroll_by(delta, 1000, panel.height as usize);
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if state.selection.dragging {
+                state.selection.drag(col, row, layout.dialog);
+            }
+            return vec![];
         }
-    } else if layout.rail.contains((col, row).into()) {
-        if delta < 0 {
-            handle_navigate_down(state);
-        } else {
-            handle_navigate_up(state);
+        MouseEventKind::Up(MouseButton::Left) => {
+            if state.selection.dragging {
+                state.selection.finish();
+            }
+            return vec![];
         }
+        MouseEventKind::ScrollDown => {
+            let delta = -3;
+            if layout.dialog.contains((col, row).into()) {
+                state
+                    .transcript
+                    .scroll_by(delta, 1000, layout.dialog.height as usize);
+            } else if layout.input.contains((col, row).into()) {
+                let max_scroll = state
+                    .input
+                    .wrap_lines(layout.input.width)
+                    .len()
+                    .saturating_sub(layout.input.height as usize);
+                state.input.input_scroll = (state.input.input_scroll + 1).min(max_scroll);
+            } else if let Some(panel) = layout.panel {
+                if panel.contains((col, row).into()) {
+                    state
+                        .panel
+                        .agent_transcript
+                        .scroll_by(delta, 1000, panel.height as usize);
+                }
+            } else if layout.rail.contains((col, row).into()) {
+                handle_navigate_down(state);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            let delta = 3;
+            if layout.dialog.contains((col, row).into()) {
+                state
+                    .transcript
+                    .scroll_by(delta, 1000, layout.dialog.height as usize);
+            } else if layout.input.contains((col, row).into()) {
+                state.input.input_scroll = state.input.input_scroll.saturating_sub(1);
+            } else if let Some(panel) = layout.panel {
+                if panel.contains((col, row).into()) {
+                    state
+                        .panel
+                        .agent_transcript
+                        .scroll_by(delta, 1000, panel.height as usize);
+                }
+            } else if layout.rail.contains((col, row).into()) {
+                handle_navigate_up(state);
+            }
+        }
+        _ => return vec![],
     }
 
     vec![]

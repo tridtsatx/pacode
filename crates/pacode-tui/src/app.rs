@@ -42,12 +42,13 @@ enum BgResponse {
     },
 }
 
-pub async fn run(opts: TuiOptions) -> Result<(), TuiError> {
+pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> {
     let mut term_guard = TerminalGuard::enter(opts.config.ui.mouse)?;
 
     let client_paths = opts.client.paths.clone();
     let (client, mut events) = Client::connect(opts.client).await?;
     let snapshot = client.attach(opts.attach.clone()).await?;
+    let session_id = snapshot.meta.id.clone();
     let client = Arc::new(client);
 
     let size = term_guard.terminal.size()?;
@@ -105,7 +106,13 @@ pub async fn run(opts: TuiOptions) -> Result<(), TuiError> {
         };
 
         let anim_sleep = async {
-            if state.needs_anim_tick() {
+            if state.turn_active || state.transcript.has_backlog() {
+                let interval_ms = crate::ui::anim::pacman_interval_ms(
+                    state.transcript.stream_backlog_chars(),
+                    state.transcript.has_pending_final(),
+                );
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            } else if state.needs_anim_tick() {
                 tokio::time::sleep(Duration::from_millis(125)).await;
             } else {
                 std::future::pending::<()>().await;
@@ -205,12 +212,17 @@ pub async fn run(opts: TuiOptions) -> Result<(), TuiError> {
         }
     }
 
+    let attached_session = state
+        .meta
+        .as_ref()
+        .map(|m| m.id.clone())
+        .unwrap_or(session_id);
     drop(events);
     drop(bg_rx);
     if let Ok(c) = Arc::try_unwrap(client) {
         c.close().await;
     }
-    Ok(())
+    Ok(attached_session)
 }
 
 fn dispatch_action(

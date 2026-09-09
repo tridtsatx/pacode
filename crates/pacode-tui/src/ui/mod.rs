@@ -5,11 +5,14 @@
 
 pub mod anim;
 pub mod dialog;
+pub mod files;
 pub mod footer;
+pub mod header;
 pub mod input;
 pub mod overlays;
 pub mod panel;
 pub mod picker;
+pub mod popup;
 pub mod rail;
 pub mod rail_session;
 pub mod toast;
@@ -126,6 +129,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 state.anim_frame,
             );
         }
+
+        apply_selection_highlight(frame, &state.selection, dialog_area, opts.theme.selected_bg);
     }
 
     if let Some(panel_rect) = layout.panel {
@@ -180,5 +185,99 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     };
     overlays::draw(frame, dialog_or_full, state, &opts);
 
+    let should_copy = match state.selection.copy_request {
+        crate::state::selection::CopyRequest::Explicit => true,
+        crate::state::selection::CopyRequest::Auto => state.config.ui.auto_copy,
+        crate::state::selection::CopyRequest::None => false,
+    };
+    state.selection.copy_request = crate::state::selection::CopyRequest::None;
+
+    if should_copy && state.selection.is_active() && !state.selection.is_empty() {
+        let text = extract_selection_text(frame.buffer_mut(), &state.selection, dialog_area);
+        if !text.is_empty() {
+            let count = text.chars().count();
+            let _ = crate::clipboard::copy(&text);
+            state.push_toast(
+                pacode_types::ToastLevel::Info,
+                format!("copied {count} chars"),
+                None,
+                std::time::Instant::now(),
+            );
+            if crate::clipboard::remote_hint().is_some() && !state.clipboard_warned {
+                state.clipboard_warned = true;
+                let now = std::time::Instant::now();
+                let shown_at = now
+                    .checked_sub(std::time::Duration::from_secs(
+                        crate::state::TOAST_TTL_SECS.saturating_sub(4),
+                    ))
+                    .unwrap_or(now);
+                state.toasts.push_back(crate::state::Toast {
+                    level: pacode_types::ToastLevel::Warn,
+                    title: popup::POPUP_TOAST_TITLE.to_string(),
+                    detail: Some(crate::clipboard::REMOTE_HINT_TEXT.to_string()),
+                    shown_at,
+                });
+            }
+        }
+    }
+
+    if let Some(popup_toast) = state
+        .toasts
+        .iter()
+        .find(|t| t.title == popup::POPUP_TOAST_TITLE)
+    {
+        let text = popup_toast
+            .detail
+            .as_deref()
+            .unwrap_or(crate::clipboard::REMOTE_HINT_TEXT);
+        popup::draw(frame, frame.area(), text, &opts);
+    }
+
     layout
+}
+
+pub(crate) fn apply_selection_highlight(
+    frame: &mut Frame,
+    selection: &crate::state::Selection,
+    dialog_area: Rect,
+    selected_bg: ratatui::style::Style,
+) {
+    if !selection.is_active() || selection.is_empty() {
+        return;
+    }
+    let Some(row_range) = selection.row_range(dialog_area) else {
+        return;
+    };
+    for row in row_range {
+        if let Some(col_range) = selection.col_range_for_row(row, dialog_area) {
+            for col in col_range {
+                if let Some(cell) = frame.buffer_mut().cell_mut((col, row)) {
+                    cell.set_style(cell.style().patch(selected_bg));
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn extract_selection_text(
+    buffer: &ratatui::buffer::Buffer,
+    selection: &crate::state::Selection,
+    dialog_area: Rect,
+) -> String {
+    let Some(row_range) = selection.row_range(dialog_area) else {
+        return String::new();
+    };
+    let mut rows = Vec::new();
+    for row in row_range {
+        if let Some(col_range) = selection.col_range_for_row(row, dialog_area) {
+            let mut row_str = String::new();
+            for col in col_range {
+                if let Some(cell) = buffer.cell((col, row)) {
+                    row_str.push_str(cell.symbol());
+                }
+            }
+            rows.push(row_str.trim_end().to_string());
+        }
+    }
+    rows.join("\n")
 }

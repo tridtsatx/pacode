@@ -25,6 +25,7 @@ pub struct Config {
     pub permissions: PermissionsConfig,
     pub mcp: McpConfig,
     pub session: SessionConfig,
+    pub plugins: PluginsConfig,
 }
 
 impl Config {
@@ -100,6 +101,7 @@ pub struct UiConfig {
     pub hints: UiHints,
     pub ascii_only: bool,
     pub mouse: bool,
+    pub auto_copy: bool,
     /// `auto` (COLORTERM detection), `truecolor`, or `ansi`.
     pub color: String,
     /// Max transcript cells kept in the client before older ones are evicted.
@@ -112,6 +114,7 @@ impl Default for UiConfig {
             hints: UiHints::default(),
             ascii_only: false,
             mouse: true,
+            auto_copy: true,
             color: "auto".to_string(),
             transcript_cells: 500,
         }
@@ -211,6 +214,7 @@ pub struct ContextConfig {
     pub injection_cap_chars: usize,
     /// Cap for AGENTS.md / CLAUDE.md content in the system prompt.
     pub instructions_cap_chars: usize,
+    pub memory_cap_chars: usize,
     pub compaction_model: Option<String>,
     /// Recent messages kept verbatim after compaction.
     pub keep_recent_messages: usize,
@@ -225,6 +229,7 @@ impl Default for ContextConfig {
             tool_output_cap_chars: 16_000,
             injection_cap_chars: 4_000,
             instructions_cap_chars: 32_000,
+            memory_cap_chars: 8_000,
             compaction_model: None,
             keep_recent_messages: 6,
             default_context_window: 128_000,
@@ -248,10 +253,22 @@ impl Default for PermissionsConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpConfig {
     pub servers: BTreeMap<String, McpServerConfig>,
+    pub sampling: bool,
+    pub sampling_max_tokens: u32,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            servers: BTreeMap::new(),
+            sampling: true,
+            sampling_max_tokens: 2048,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -260,6 +277,9 @@ pub struct McpServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub url: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub enabled: bool,
     /// Start on first tool call instead of at session start.
     pub lazy: bool,
     pub timeout_secs: u64,
@@ -271,6 +291,9 @@ impl Default for McpServerConfig {
             command: String::new(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            enabled: true,
             lazy: true,
             timeout_secs: 60,
         }
@@ -291,6 +314,29 @@ impl Default for SessionConfig {
         Self {
             title_model: None,
             history_page: 200,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginsConfig {
+    pub enabled: bool,
+    /// Empty means default `~/.config/pacode/plugins`.
+    pub dirs: Vec<PathBuf>,
+    pub wasm_memory_mb: u32,
+    pub lua_memory_mb: u32,
+    pub hook_timeout_ms: u64,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dirs: Vec::new(),
+            wasm_memory_mb: 64,
+            lua_memory_mb: 32,
+            hook_timeout_ms: 5000,
         }
     }
 }

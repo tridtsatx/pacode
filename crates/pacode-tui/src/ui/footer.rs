@@ -52,8 +52,14 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
     let right_hint = if show_model_hint { "/model" } else { "" };
     let right_len = display_width(right_hint);
 
+    let mode_style = match mode {
+        Mode::Bypass => opts.theme.red,
+        Mode::Plan => opts.theme.yellow,
+        Mode::Build | Mode::Auto => opts.theme.cyan,
+    };
+
     let mut left_spans = vec![
-        Span::styled(mode.label(), opts.theme.cyan),
+        Span::styled(mode.label(), mode_style),
         Span::styled(" · ", opts.theme.faint),
         Span::styled(model_name, opts.theme.dim),
         Span::styled(" | ", opts.theme.faint),
@@ -242,10 +248,10 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                     }
                     _ => {
                         let mode = state.mode();
-                        let perm_style = if mode == Mode::Bypass {
-                            opts.theme.red
-                        } else {
-                            opts.theme.cyan
+                        let perm_style = match mode {
+                            Mode::Bypass => opts.theme.red,
+                            Mode::Plan => opts.theme.yellow,
+                            Mode::Build | Mode::Auto => opts.theme.cyan,
                         };
 
                         let tok_str = format_tokens_upper(state.rail.usage.context_tokens as u64);

@@ -18,50 +18,43 @@ pub(crate) fn now_us() -> u64 {
         .unwrap_or(0)
 }
 
-/// Format a duration: `840ms` under a second, `12.3s` under a minute, `1m47s` under an
-/// hour, `1h02m` above.
+/// Format a duration: `342ms` under a second, `7.3s` under 10s, `42s` under a minute,
+/// `1m05s` under an hour, `1h02m` above.
 pub fn format_duration_ms(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs >= 3600 {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    } else if secs >= 60 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else if ms >= 1000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
+    if ms < 1000 {
         format!("{ms}ms")
+    } else if ms < 10_000 {
+        let val = ms as f64 / 1000.0;
+        format!("{val:.1}s")
+    } else if ms < 60_000 {
+        let secs = ms / 1000;
+        format!("{secs}s")
+    } else if ms < 3_600_000 {
+        let secs = ms / 1000;
+        let mins = secs / 60;
+        let rem_secs = secs % 60;
+        format!("{mins}m{rem_secs:02}s")
+    } else {
+        let secs = ms / 1000;
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        format!("{hours}h{mins:02}m")
     }
 }
 
 /// Format a token count as `9.1k` / `207.6k` / `1.2M` / `842`.
 pub fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        let val = n as f64 / 1_000_000.0;
+        format!("{val:.1}M")
     } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
+        let val = n as f64 / 1_000.0;
+        format!("{val:.1}k")
     } else {
         n.to_string()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durations() {
-        assert_eq!(format_duration_ms(0), "0ms");
-        assert_eq!(format_duration_ms(400), "400ms");
-        assert_eq!(format_duration_ms(41_000), "41.0s");
-        assert_eq!(format_duration_ms(107_000), "1m47s");
-        assert_eq!(format_duration_ms(3_720_000), "1h02m");
-    }
-
-    #[test]
-    fn tokens() {
-        assert_eq!(format_tokens(842), "842");
-        assert_eq!(format_tokens(9_100), "9.1k");
-        assert_eq!(format_tokens(207_600), "207.6k");
-        assert_eq!(format_tokens(1_200_000), "1.2M");
-    }
-}
+#[path = "time_tests.rs"]
+mod time_tests;

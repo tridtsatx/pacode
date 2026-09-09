@@ -9,13 +9,129 @@ def handle_request(req):
     params = req.get("params") or {}
 
     if method == "initialize":
+        caps = {"tools": {}}
+        import os
+        if os.environ.get("FAKE_MCP_RESOURCES") == "1":
+            caps["resources"] = {}
+        if os.environ.get("FAKE_MCP_PROMPTS") == "1":
+            caps["prompts"] = {}
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
+                "capabilities": caps,
                 "serverInfo": {"name": "fake_mcp", "version": "0.1.0"},
+            },
+        }
+
+    import os
+    if method == "resources/list" and os.environ.get("FAKE_MCP_RESOURCES") == "1":
+        cursor = params.get("cursor")
+        if not cursor:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "fake://resource1",
+                            "name": "Resource 1",
+                            "description": "First test resource",
+                            "mimeType": "text/plain",
+                        }
+                    ],
+                    "nextCursor": "res_page_2",
+                },
+            }
+        elif cursor == "res_page_2":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "fake://resource2",
+                            "name": "Resource 2",
+                            "description": "Second test resource",
+                            "mimeType": "image/png",
+                        }
+                    ],
+                },
+            }
+        else:
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": []}}
+
+    if method == "resources/read" and os.environ.get("FAKE_MCP_RESOURCES") == "1":
+        uri = params.get("uri")
+        if uri == "fake://resource1":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {
+                            "uri": "fake://resource1",
+                            "mimeType": "text/plain",
+                            "text": "content of resource1",
+                        }
+                    ]
+                },
+            }
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "image/png",
+                            "blob": "aW1hZ2VkYXRh",
+                        }
+                    ]
+                },
+            }
+
+    if method == "prompts/list" and os.environ.get("FAKE_MCP_PROMPTS") == "1":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "prompts": [
+                    {
+                        "name": "test_prompt",
+                        "description": "A test prompt",
+                        "arguments": [
+                            {
+                                "name": "topic",
+                                "description": "The prompt topic",
+                                "required": True,
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
+    if method == "prompts/get" and os.environ.get("FAKE_MCP_PROMPTS") == "1":
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        topic = args.get("topic", "default")
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "description": "Rendered test prompt",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": f"Tell me about {topic}",
+                        },
+                    }
+                ],
             },
         }
 
@@ -89,6 +205,60 @@ def handle_request(req):
                     "isError": False,
                 },
             }
+        elif tool_name == "test_sampling":
+            # Send sampling/createMessage request to client
+            sample_req = {
+                "jsonrpc": "2.0",
+                "id": 8888,
+                "method": "sampling/createMessage",
+                "params": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": "hello AI from fake_mcp",
+                            },
+                        }
+                    ],
+                    "maxTokens": 4096,
+                },
+            }
+            sys.stdout.write(json.dumps(sample_req) + "\n")
+            sys.stdout.flush()
+            reply_line = sys.stdin.readline()
+            try:
+                reply = json.loads(reply_line)
+                res = reply.get("result")
+                content = res.get("content", {})
+                text = content.get("text", "")
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"sampling response received: {text}",
+                            }
+                        ],
+                        "isError": False,
+                    },
+                }
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"sampling failed: {e}",
+                            }
+                        ],
+                        "isError": True,
+                    },
+                }
         elif tool_name == "fail":
             return {
                 "jsonrpc": "2.0",

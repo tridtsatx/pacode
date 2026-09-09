@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
 use pacode_client::ClientOptions;
 use pacode_config::Paths;
@@ -21,57 +22,117 @@ mod sessions;
 #[path = "cli_tests.rs"]
 mod cli_tests;
 
+pub const HELP_TEMPLATE: &str = "\
+ ▄▄▄▄▄
+█ ▀ ██
+███▀
+ ▀▀▀▀▀
+pacode v{version} — a coding agent that eats your backlog
+
+{usage-heading}
+  {usage}
+
+{all-args}{after-help}
+";
+
+pub fn cli_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .usage(Effects::BOLD.into())
+        .literal(AnsiColor::Cyan.on_default())
+        .placeholder(Effects::DIMMED.into())
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "pacode", version, about = "background-first coding agent")]
+#[command(
+    name = "pacode",
+    version,
+    about = "a coding agent that eats your backlog",
+    styles = cli_styles(),
+    help_template = HELP_TEMPLATE,
+)]
 pub struct Cli {
-    /// Prompt to send immediately.
+    /// Prompt to send immediately upon launch.
     pub prompt: Option<String>,
-    #[arg(long)]
-    pub resume: Option<String>,
-    #[arg(long)]
+
+    /// Resume an existing session by ID.
+    #[arg(short = 's', long = "session", alias = "resume", value_name = "ID")]
+    pub session: Option<String>,
+
+    /// Model override in provider/model format (e.g. bubna/gemini-3.8-flash).
+    #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
-    #[arg(long)]
+
+    /// Reasoning effort override (low, medium, high, max).
+    #[arg(long, value_name = "EFFORT")]
     pub effort: Option<String>,
-    #[arg(long)]
+
+    /// Permission mode override (build, auto, plan, bypass).
+    #[arg(long, value_name = "MODE")]
     pub mode: Option<String>,
-    #[arg(short = 'C', long)]
+
+    /// Working directory for the session.
+    #[arg(short = 'C', long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
-    #[arg(long)]
+
+    /// Path to the daemon Unix domain socket.
+    #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
+
+    /// Subcommand to execute instead of launching the interactive TUI.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run the daemon.
+    /// Start the background daemon server to manage sessions and agents.
     Serve {
+        /// Detach and run as a background daemon process.
         #[arg(long)]
         detach: bool,
-        #[arg(long)]
+
+        /// Path to listen on for client connections.
+        #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
     },
-    /// Headless prompt.
+
+    /// Execute a prompt in headless non-interactive mode without launching the TUI.
     Run {
+        /// Prompt string to execute.
         prompt: String,
+
+        /// Output stream events as newline-delimited JSON.
         #[arg(long)]
         json: bool,
-        #[arg(long)]
+
+        /// Model override in provider/model format.
+        #[arg(long, value_name = "MODEL")]
         model: Option<String>,
-        #[arg(long)]
+
+        /// Reasoning effort override (low, medium, high, max).
+        #[arg(long, value_name = "EFFORT")]
         effort: Option<String>,
-        #[arg(long)]
+
+        /// Permission mode override (build, auto, plan, bypass).
+        #[arg(long, value_name = "MODE")]
         mode: Option<String>,
-        #[arg(short = 'C', long)]
+
+        /// Working directory for execution.
+        #[arg(short = 'C', long, value_name = "DIR")]
         dir: Option<PathBuf>,
     },
-    /// List or delete sessions.
+
+    /// List or delete recorded sessions.
     Sessions {
+        /// Session action to perform (defaults to listing sessions).
         #[command(subcommand)]
         action: Option<SessionsAction>,
     },
-    /// Daemon status / stop.
+
+    /// Query status or request shutdown of the background daemon.
     Daemon {
+        /// Daemon action to perform.
         #[command(subcommand)]
         action: DaemonAction,
     },
@@ -79,32 +140,41 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum SessionsAction {
+    /// List recently active sessions.
     List {
+        /// Maximum number of sessions to display.
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+
+    /// Delete a session and its saved state by ID.
     Delete {
+        /// Identifier of the session to delete.
         id: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum DaemonAction {
+    /// Check if the daemon is currently running and responsive.
     Status,
+
+    /// Request the daemon to shut down cleanly.
     Stop {
+        /// Force immediate shutdown even if sessions are active.
         #[arg(long)]
         force: bool,
     },
 }
 
 pub fn build_attach(
-    resume: Option<String>,
+    session: Option<String>,
     cwd: PathBuf,
     model: Option<ModelRoute>,
     effort: Option<Effort>,
     mode: Option<Mode>,
 ) -> Attach {
-    match resume {
+    match session {
         Some(id) if !id.trim().is_empty() => Attach::Resume {
             session: SessionId::new(id.trim()),
         },
@@ -158,8 +228,9 @@ pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(ref dir) = cli.dir {
+        let dir_display = dir.display();
         std::env::set_current_dir(dir)
-            .with_context(|| format!("failed to change directory to {}", dir.display()))?;
+            .with_context(|| format!("failed to change directory to {dir_display}"))?;
     }
 
     let paths = Paths::discover();
@@ -199,8 +270,9 @@ pub fn main() -> anyhow::Result<()> {
             dir,
         }) => {
             if let Some(ref d) = dir {
+                let d_display = d.display();
                 std::env::set_current_dir(d)
-                    .with_context(|| format!("failed to change directory to {}", d.display()))?;
+                    .with_context(|| format!("failed to change directory to {d_display}"))?;
             }
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;
@@ -244,7 +316,13 @@ pub fn main() -> anyhow::Result<()> {
             });
             let effort_level = parse_effort_override(cli.effort.as_deref())?.or(prefs.effort);
             let mode_val = parse_mode_override(cli.mode.as_deref())?.or(prefs.mode);
-            let attach = build_attach(cli.resume, cwd.clone(), model_route, effort_level, mode_val);
+            let attach = build_attach(
+                cli.session,
+                cwd.clone(),
+                model_route,
+                effort_level,
+                mode_val,
+            );
 
             let mut client_opts = ClientOptions::new(paths.clone(), pacode_config::APP_VERSION);
             client_opts.socket = Some(socket);
@@ -269,8 +347,11 @@ pub fn main() -> anyhow::Result<()> {
                 .build()
                 .context("failed to create tokio current_thread runtime")?;
 
-            rt.block_on(async { pacode_tui::run(tui_opts).await })
+            let session_id = rt
+                .block_on(async { pacode_tui::run(tui_opts).await })
                 .context("tui error")?;
+
+            println!("Resume this session with:\n  pacode -s {session_id}");
 
             Ok(())
         }

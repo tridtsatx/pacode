@@ -83,9 +83,6 @@ pub fn draw(
     frame.render_widget(Paragraph::new(visible_lines), area);
 }
 
-const BRAILLE_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-const ASCII_SPINNER: &[&str] = &["|", "/", "-", "\\"];
-
 struct CellRenderArgs<'a> {
     cell_id: u64,
     cell_version: u32,
@@ -182,6 +179,7 @@ fn render_cell(
     match cell_kind {
         CellKind::Gap => vec![Line::default()],
         CellKind::Item(kind) => render_item(kind, stats, width, opts, anim_frame),
+        CellKind::Header(info) => crate::ui::header::render(info, width, opts),
     }
 }
 
@@ -190,7 +188,7 @@ fn render_item(
     stats: Option<&str>,
     width: u16,
     opts: &RenderOptions,
-    anim_frame: u64,
+    _anim_frame: u64,
 ) -> Vec<Line<'static>> {
     match kind {
         TranscriptKind::User { text } => {
@@ -278,12 +276,12 @@ fn render_item(
             match status {
                 ToolStatus::Running => {
                     spans.push(Span::raw(" "));
-                    let spin = if opts.glyphs.ascii {
-                        ASCII_SPINNER[(anim_frame as usize) % ASCII_SPINNER.len()]
+                    let label = if let Some(ms) = duration_ms {
+                        format!("running {}", pacode_types::time::format_duration_ms(*ms))
                     } else {
-                        BRAILLE_SPINNER[(anim_frame as usize) % BRAILLE_SPINNER.len()]
+                        "running".to_string()
                     };
-                    spans.push(Span::styled(spin, opts.theme.accent));
+                    spans.push(Span::styled(label, opts.theme.accent));
                 }
                 ToolStatus::Ok => {
                     spans.push(Span::raw(" "));
@@ -291,7 +289,7 @@ fn render_item(
                         spans.extend(render_diff_stat(diff, opts));
                     } else if let Some(ms) = duration_ms {
                         spans.push(Span::styled(
-                            format!("ok {:.1}s", *ms as f64 / 1000.0),
+                            format!("ok {}", pacode_types::time::format_duration_ms(*ms)),
                             opts.theme.green,
                         ));
                     } else {
@@ -300,7 +298,14 @@ fn render_item(
                 }
                 ToolStatus::Error => {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled("failed", opts.theme.red));
+                    if let Some(ms) = duration_ms {
+                        spans.push(Span::styled(
+                            format!("fail {}", pacode_types::time::format_duration_ms(*ms)),
+                            opts.theme.red,
+                        ));
+                    } else {
+                        spans.push(Span::styled("fail", opts.theme.red));
+                    }
                 }
                 ToolStatus::Backgrounded => {
                     spans.push(Span::raw(" "));

@@ -23,11 +23,23 @@ pub struct Cell {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct HeaderInfo {
+    pub model: String,
+    pub effort: String,
+    pub provider: String,
+    pub cwd: String,
+    pub config_path: String,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum CellKind {
     /// Wraps the daemon item; `Assistant`/`Reasoning` text is the *revealed* text.
     Item(TranscriptKind),
     /// Divider between turns (drawn as a blank line).
     Gap,
+    /// Header cell at the top of the transcript.
+    Header(HeaderInfo),
 }
 
 pub struct Transcript {
@@ -92,6 +104,12 @@ impl Transcript {
         self.has_more_history = has_more;
         self.loading_history = false;
 
+        let has_header = self
+            .cells
+            .front()
+            .is_some_and(|c| matches!(c.kind, CellKind::Header(..)));
+        let insert_idx = if has_header { 1 } else { 0 };
+
         for item in items.into_iter().rev() {
             let cell = Cell {
                 id: item.seq,
@@ -100,9 +118,27 @@ impl Transcript {
                 ts_ms: item.ts_ms,
                 stats: None,
             };
-            self.cells.push_front(cell);
+            self.cells.insert(insert_idx, cell);
         }
         self.enforce_cap();
+    }
+
+    /// Insert or update the non-persisted header cell at the very front.
+    pub fn insert_header(&mut self, info: HeaderInfo) {
+        if let Some(front) = self.cells.front_mut()
+            && matches!(front.kind, CellKind::Header(..))
+        {
+            front.kind = CellKind::Header(info);
+            front.version = front.version.wrapping_add(1);
+        } else {
+            self.cells.push_front(Cell {
+                id: 0,
+                kind: CellKind::Header(info),
+                version: 0,
+                ts_ms: 0,
+                stats: None,
+            });
+        }
     }
 
     /// `ItemAdded` / `ItemUpdated`: insert or replace by seq. Assistant/Reasoning items
@@ -338,6 +374,14 @@ impl Transcript {
         self.stream.as_ref().is_some_and(|s| !s.is_empty())
     }
 
+    pub fn stream_backlog_chars(&self) -> usize {
+        self.stream.as_ref().map(|s| s.backlog_chars()).unwrap_or(0)
+    }
+
+    pub fn has_pending_final(&self) -> bool {
+        self.pending_final.is_some()
+    }
+
     pub fn scroll_by(&mut self, delta: i32, total_lines: usize, viewport: usize) {
         let max_scroll = total_lines.saturating_sub(viewport);
         let new_scroll =
@@ -349,16 +393,29 @@ impl Transcript {
         self.scroll_from_bottom = 0;
     }
 
-    /// Evict oldest cells past `max_cells` (keeping the live cell), dropping their cache.
+    /// Evict oldest cells past `max_cells` (keeping the live cell and pinned header), dropping their cache.
     pub fn enforce_cap(&mut self) {
-        while self.cells.len() > self.max_cells {
-            if let Some(front) = self.cells.front()
-                && Some(front.id) == self.live_cell
-            {
-                break;
-            }
-            if let Some(evicted) = self.cells.pop_front() {
-                self.cache.invalidate_cell(evicted.id);
+        let has_header = self
+            .cells
+            .front()
+            .is_some_and(|c| matches!(c.kind, CellKind::Header(..)));
+        let limit = if has_header {
+            self.max_cells + 1
+        } else {
+            self.max_cells
+        };
+        let evict_idx = if has_header { 1 } else { 0 };
+
+        while self.cells.len() > limit {
+            if let Some(cell) = self.cells.get(evict_idx) {
+                if Some(cell.id) == self.live_cell {
+                    break;
+                }
+                if let Some(evicted) = self.cells.remove(evict_idx) {
+                    self.cache.invalidate_cell(evicted.id);
+                } else {
+                    break;
+                }
             } else {
                 break;
             }

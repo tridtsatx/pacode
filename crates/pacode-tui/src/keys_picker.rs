@@ -1,4 +1,4 @@
-//! Keyboard handling for bottom in-place pickers (effort, mode, model, config).
+//! Keyboard handling for overlays and pickers.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -67,16 +67,22 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 KeyCode::Esc => {
                     state.focus = Focus::Normal;
                 }
-                KeyCode::Up | KeyCode::Char('p')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Up => {
                     if *index > 0 {
                         *index -= 1;
                     }
                 }
-                KeyCode::Down | KeyCode::Char('n')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if *index > 0 {
+                        *index -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if filtered_count > 0 && *index + 1 < filtered_count {
+                        *index += 1;
+                    }
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if filtered_count > 0 && *index + 1 < filtered_count {
                         *index += 1;
                     }
@@ -111,6 +117,119 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     *index = 0;
                 }
                 _ => {}
+            }
+            vec![]
+        }
+        Focus::Overlay(Overlay::SessionPicker { query, index }) => {
+            let q_lower = query.to_lowercase();
+            let filtered_count = state
+                .sessions
+                .iter()
+                .filter(|s| {
+                    q_lower.is_empty()
+                        || s.title().to_lowercase().contains(&q_lower)
+                        || s.id.as_str().to_lowercase().contains(&q_lower)
+                })
+                .count();
+
+            match key.code {
+                KeyCode::Esc => {
+                    state.focus = Focus::Normal;
+                }
+                KeyCode::Up => {
+                    if *index > 0 {
+                        *index -= 1;
+                    }
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if *index > 0 {
+                        *index -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if filtered_count > 0 && *index + 1 < filtered_count {
+                        *index += 1;
+                    }
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if filtered_count > 0 && *index + 1 < filtered_count {
+                        *index += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let filtered: Vec<_> = state
+                        .sessions
+                        .iter()
+                        .filter(|s| {
+                            q_lower.is_empty()
+                                || s.title().to_lowercase().contains(&q_lower)
+                                || s.id.as_str().to_lowercase().contains(&q_lower)
+                        })
+                        .collect();
+                    if let Some(session) = filtered.get(*index) {
+                        let id = session.id.clone();
+                        state.focus = Focus::Normal;
+                        return vec![Action::Send(Request::Attach(
+                            pacode_types::Attach::Resume { session: id },
+                        ))];
+                    }
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *index = 0;
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    query.push(c);
+                    *index = 0;
+                }
+                _ => {}
+            }
+            vec![]
+        }
+        Focus::Overlay(Overlay::Files { index }) => {
+            let count = state.files.len();
+            match key.code {
+                KeyCode::Esc => {
+                    state.focus = Focus::Normal;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if *index > 0 {
+                        *index -= 1;
+                    }
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if *index > 0 {
+                        *index -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if count > 0 && *index + 1 < count {
+                        *index += 1;
+                    }
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if count > 0 && *index + 1 < count {
+                        *index += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let sorted = state.files.sorted_rows();
+                    if let Some(row) = sorted.get(*index) {
+                        state.input.insert_str(&row.path);
+                    }
+                    state.focus = Focus::Normal;
+                }
+                _ => {}
+            }
+            vec![]
+        }
+        Focus::Overlay(Overlay::RailOverlay) | Focus::Overlay(Overlay::Help) => {
+            if key.code == KeyCode::Esc {
+                state.focus = Focus::Normal;
             }
             vec![]
         }

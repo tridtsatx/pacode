@@ -13,6 +13,7 @@ pub struct Theme {
     pub cyan: Style,
     pub red: Style,
     pub violet: Style,
+    pub yellow: Style,
     pub bold: Style,
     pub selected_bg: Style,
     pub user_bar: Style,
@@ -55,6 +56,7 @@ impl Theme {
             cyan: rgb(0x6e, 0xa9, 0xbd),
             red: rgb(0xc8, 0x69, 0x5c),
             violet: rgb(0x9a, 0x8b, 0xc4),
+            yellow: rgb(0xf5, 0xc5, 0x42),
             bold: Style::default()
                 .fg(Color::Rgb(0xe7, 0xe5, 0xdd))
                 .add_modifier(Modifier::BOLD),
@@ -74,6 +76,7 @@ impl Theme {
             cyan: Style::default().fg(Color::Cyan),
             red: Style::default().fg(Color::Red),
             violet: Style::default().fg(Color::Magenta),
+            yellow: Style::default().fg(Color::Yellow),
             bold: Style::default().add_modifier(Modifier::BOLD),
             selected_bg: Style::default()
                 .bg(Color::Black)
@@ -160,7 +163,7 @@ impl Glyphs {
                 ellipsis: "…",
                 vline: "│",
                 hline: "─",
-                chevrons: "▸▸",
+                chevrons: "»",
             }
         }
     }

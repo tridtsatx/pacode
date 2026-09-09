@@ -16,7 +16,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         return;
     }
 
-    let Some(toast) = state.toasts.back() else {
+    let Some(toast) = state
+        .toasts
+        .iter()
+        .rev()
+        .find(|t| t.title != crate::ui::popup::POPUP_TOAST_TITLE)
+    else {
         return;
     };
 

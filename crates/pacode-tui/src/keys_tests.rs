@@ -206,3 +206,291 @@ fn test_effort_picker_focus_capture() {
     assert!(actions.is_empty());
     assert_eq!(state.focus, Focus::Normal);
 }
+
+#[test]
+fn test_overlay_model_picker_navigation_and_esc() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.models = vec![
+        pacode_types::ModelInfo {
+            route: ModelRoute::new("p", "m1"),
+            display_name: "Model 1".into(),
+            context_window: Some(1000),
+            supports_reasoning: true,
+            pricing: None,
+        },
+        pacode_types::ModelInfo {
+            route: ModelRoute::new("p", "m2"),
+            display_name: "Model 2".into(),
+            context_window: Some(1000),
+            supports_reasoning: true,
+            pricing: None,
+        },
+    ];
+
+    // Open via slash command `/model` + Enter
+    state.input.insert_str("/model");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    handle_key(&mut state, enter, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModelPicker {
+            query: String::new(),
+            index: 0,
+        })
+    );
+
+    // Down key changes index to 1 and keeps focus on overlay
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModelPicker {
+            query: String::new(),
+            index: 1,
+        })
+    );
+
+    // Esc closes it
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_overlay_mode_picker_navigation_and_esc() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Open via slash command `/mode` + Enter
+    state.input.insert_str("/mode");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    handle_key(&mut state, enter, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModePicker { index: 0 })
+    );
+
+    // Down key changes index to 1
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModePicker { index: 1 })
+    );
+
+    // Esc closes it
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_overlay_config_picker_navigation_and_esc() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Open via slash command `/config` + Enter
+    state.input.insert_str("/config");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    handle_key(&mut state, enter, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ConfigPicker {
+            index: 0,
+            editing_number: None,
+        })
+    );
+
+    // Down key changes index to 1
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ConfigPicker {
+            index: 1,
+            editing_number: None,
+        })
+    );
+
+    // Esc closes it
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_overlay_session_picker_navigation_focus_and_esc() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let meta1 = pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_1"),
+        cwd: std::path::PathBuf::from("/tmp"),
+        git_branch: None,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::Medium,
+        mode: pacode_types::Mode::Build,
+        created_at_ms: 1000,
+        updated_at_ms: 1000,
+        name: Some("Session 1".into()),
+        first_prompt: None,
+    };
+    let meta2 = pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_2"),
+        cwd: std::path::PathBuf::from("/tmp"),
+        git_branch: None,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::Medium,
+        mode: pacode_types::Mode::Build,
+        created_at_ms: 2000,
+        updated_at_ms: 2000,
+        name: Some("Session 2".into()),
+        first_prompt: None,
+    };
+    state.sessions = vec![meta1, meta2];
+
+    // Open via slash command `/sessions` + Enter
+    state.input.insert_str("/sessions");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    handle_key(&mut state, enter, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::SessionPicker {
+            query: String::new(),
+            index: 0,
+        })
+    );
+
+    // Keys do NOT leak to input!
+    let char_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+    handle_key(&mut state, char_a, now);
+    assert!(state.input.is_empty());
+    // 'a' went to query
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::SessionPicker {
+            query: "a".into(),
+            index: 0,
+        })
+    );
+
+    // Backspace clears query
+    let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+    handle_key(&mut state, backspace, now);
+
+    // Down key changes index to 1
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::SessionPicker {
+            query: String::new(),
+            index: 1,
+        })
+    );
+
+    // Esc closes it
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+
+    // Open via ctrl+p
+    let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+    handle_key(&mut state, ctrl_p, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::SessionPicker {
+            query: String::new(),
+            index: 0,
+        })
+    );
+    handle_key(&mut state, down, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::SessionPicker {
+            query: String::new(),
+            index: 1,
+        })
+    );
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_overlay_files_alt_f_navigation_enter_and_esc() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    state
+        .files
+        .observe_tool_item("read", &serde_json::json!({"path": "src/first.rs"}), 100);
+    state
+        .files
+        .observe_tool_item("write", &serde_json::json!({"path": "src/second.rs"}), 200);
+
+    // 1. alt+f opens Overlay::Files
+    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_f, now);
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+
+    // 2. Down key increments index
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 1 }));
+
+    // 3. Typing letters does NOT leak to input
+    let char_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+    handle_key(&mut state, char_z, now);
+    assert!(state.input.is_empty());
+
+    // 4. Up key decrements index
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    handle_key(&mut state, up, now);
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+
+    // 5. Enter copies selected path (second.rs has newer ts 200, so sorted index 0 is second.rs)
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    handle_key(&mut state, enter, now);
+    assert_eq!(state.focus, Focus::Normal);
+    assert_eq!(state.input.text, "src/second.rs");
+
+    // 6. Reopen with alt+f and press Esc to close
+    handle_key(&mut state, alt_f, now);
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+
+    // 7. Verify alt+b remains follow (does not open files)
+    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_b, now);
+    assert_ne!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+}
+
+#[test]
+fn test_overlay_rail_and_help_navigation_and_esc() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // RailOverlay
+    state.focus = Focus::Overlay(Overlay::RailOverlay);
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    // Still focused
+    assert_eq!(state.focus, Focus::Overlay(Overlay::RailOverlay));
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+
+    // Help via slash command `/help` + Enter
+    state.input.insert_str("/help");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    handle_key(&mut state, enter, now);
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Help));
+
+    handle_key(&mut state, down, now);
+    // Still focused
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Help));
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}

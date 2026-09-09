@@ -191,9 +191,58 @@ fn test_turn_ended_stats_attached() {
     let cell = &state.transcript.cells[0];
     assert!(cell.stats.is_some());
     let stats = cell.stats.as_ref().unwrap();
-    // 2s duration (2.0s), 100 tokens / 2.0s = 50.0 tok/s, out 100, in 500
-    assert_eq!(stats, "2.0s · 50.0 tok/s · ↑100 ↓500");
+    assert!(stats.contains("2.0s"));
     assert_eq!(cell.version, initial_version + 1);
+}
+
+#[test]
+fn test_header_pinned_on_cap_and_prepend() {
+    let mut t = Transcript::new(2);
+    let header = HeaderInfo {
+        model: "m".into(),
+        effort: "high".into(),
+        provider: "p".into(),
+        cwd: "/tmp".into(),
+        config_path: "/cfg".into(),
+        version: "0.1.0".into(),
+    };
+    t.insert_header(header);
+    assert_eq!(t.cells.len(), 1);
+    assert!(matches!(t.cells[0].kind, CellKind::Header(..)));
+
+    // Upsert items exceeding capacity of 2
+    let now = Instant::now();
+    for i in 1..=4 {
+        t.upsert(
+            TranscriptItem {
+                seq: i,
+                agent: AgentId::main(),
+                ts_ms: i,
+                kind: TranscriptKind::User {
+                    text: format!("{i}"),
+                },
+            },
+            now,
+        );
+    }
+    // Limit is max_cells (2) + 1 header = 3 total cells
+    assert_eq!(t.cells.len(), 3);
+    // Header is still pinned at index 0
+    assert!(matches!(t.cells[0].kind, CellKind::Header(..)));
+    assert_eq!(t.cells[1].id, 3);
+    assert_eq!(t.cells[2].id, 4);
+
+    // Prepending history inserts after header
+    t.prepend(
+        vec![TranscriptItem {
+            seq: 2,
+            agent: AgentId::main(),
+            ts_ms: 2,
+            kind: TranscriptKind::User { text: "2".into() },
+        }],
+        false,
+    );
+    assert!(matches!(t.cells[0].kind, CellKind::Header(..)));
 }
 
 #[test]

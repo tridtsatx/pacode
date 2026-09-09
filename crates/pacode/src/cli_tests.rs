@@ -14,7 +14,7 @@ mod tests {
     fn parse_default_empty() {
         let cli = Cli::try_parse_from(["pacode"]).expect("should parse empty args");
         assert!(cli.prompt.is_none());
-        assert!(cli.resume.is_none());
+        assert!(cli.session.is_none());
         assert!(cli.model.is_none());
         assert!(cli.effort.is_none());
         assert!(cli.mode.is_none());
@@ -56,11 +56,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_default_with_resume() {
-        let cli =
-            Cli::try_parse_from(["pacode", "--resume", "ses_12345"]).expect("should parse resume");
-        assert_eq!(cli.resume.as_deref(), Some("ses_12345"));
+    fn parse_default_with_session_short() {
+        let cli = Cli::try_parse_from(["pacode", "-s", "pacode-12345678-abcd"])
+            .expect("should parse session short");
+        assert_eq!(cli.session.as_deref(), Some("pacode-12345678-abcd"));
         assert!(cli.prompt.is_none());
+    }
+
+    #[test]
+    fn parse_default_with_session_long() {
+        let cli = Cli::try_parse_from(["pacode", "--session", "pacode-12345678-abcd"])
+            .expect("should parse session long");
+        assert_eq!(cli.session.as_deref(), Some("pacode-12345678-abcd"));
+        assert!(cli.prompt.is_none());
+    }
+
+    #[test]
+    fn parse_default_with_resume() {
+        let cli = Cli::try_parse_from(["pacode", "--resume", "pacode-12345678-abcd"])
+            .expect("should parse resume alias");
+        assert_eq!(cli.session.as_deref(), Some("pacode-12345678-abcd"));
+        assert!(cli.prompt.is_none());
+    }
+
+    #[test]
+    fn help_render_contains_tagline_and_mascot() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("pacode v"));
+        assert!(help.contains("a coding agent that eats your backlog"));
+        assert!(help.contains("▄▄▄▄▄"));
+        assert!(help.contains("-s, --session <ID>"));
+        assert!(!help.contains("--resume"));
+        assert!(help.contains("serve"));
+        assert!(help.contains("run"));
+        assert!(help.contains("sessions"));
+        assert!(help.contains("daemon"));
     }
 
     #[test]
@@ -245,7 +277,7 @@ mod tests {
     fn build_attach_resume() {
         let cwd = PathBuf::from("/workspace");
         let attach = build_attach(
-            Some("ses_9999".to_string()),
+            Some("pacode-99990000-1111".to_string()),
             cwd.clone(),
             Some(ModelRoute::new("p", "m")),
             Some(Effort::High),
@@ -254,7 +286,7 @@ mod tests {
         assert_eq!(
             attach,
             Attach::Resume {
-                session: SessionId::new("ses_9999"),
+                session: SessionId::new("pacode-99990000-1111"),
             }
         );
     }

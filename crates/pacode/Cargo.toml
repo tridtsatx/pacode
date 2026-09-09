@@ -15,7 +15,7 @@ pacode-config = { workspace = true }
 pacode-client = { workspace = true }
 pacode-daemon = { workspace = true }
 pacode-tui = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["color"] }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 serde_json = { workspace = true }
