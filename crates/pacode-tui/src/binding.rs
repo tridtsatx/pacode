@@ -50,6 +50,9 @@ pub enum Action {
     SelectSession7,
     SelectSession8,
     SelectSession9,
+    SubmitNow,
+    RemoveQueued,
+    ClearQueue,
 }
 
 impl Action {
@@ -94,6 +97,9 @@ impl Action {
             Self::SelectSession7 => "select_session_7",
             Self::SelectSession8 => "select_session_8",
             Self::SelectSession9 => "select_session_9",
+            Self::SubmitNow => "submit_now",
+            Self::RemoveQueued => "remove_queued",
+            Self::ClearQueue => "clear_queue",
         }
     }
 
@@ -138,6 +144,9 @@ impl Action {
             Self::SelectSession7 => "Select session slot 7",
             Self::SelectSession8 => "Select session slot 8",
             Self::SelectSession9 => "Select session slot 9",
+            Self::SubmitNow => "Submit immediately (run turn in background)",
+            Self::RemoveQueued => "Remove last queued prompt",
+            Self::ClearQueue => "Clear prompt queue",
         }
     }
 }
@@ -362,6 +371,9 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("select_session_7", Action::SelectSession7),
     ("select_session_8", Action::SelectSession8),
     ("select_session_9", Action::SelectSession9),
+    ("submit_now", Action::SubmitNow),
+    ("remove_queued", Action::RemoveQueued),
+    ("clear_queue", Action::ClearQueue),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -580,6 +592,28 @@ impl Keymap {
                 }],
             );
         }
+
+        bindings.insert(
+            Action::SubmitNow,
+            vec![Binding {
+                code: KeyCode::Enter,
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::RemoveQueued,
+            vec![Binding {
+                code: KeyCode::Char('q'),
+                mods: KeyModifiers::ALT,
+            }],
+        );
+        bindings.insert(
+            Action::ClearQueue,
+            vec![Binding {
+                code: KeyCode::Char('q'),
+                mods: KeyModifiers::ALT | KeyModifiers::SHIFT,
+            }],
+        );
 
         Self {
             bindings,

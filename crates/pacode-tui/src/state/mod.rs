@@ -347,6 +347,7 @@ impl AppState {
                 true
             }
             ClientEvent::Event { seq, event } => {
+                self.observe_background_completion(&event);
                 self.apply_event(seq, event, now);
                 self.dirty = true;
                 true
@@ -416,6 +417,92 @@ impl AppState {
             stats: None,
         });
         self.dirty = true;
+    }
+
+    pub fn push_notice_with_level(&mut self, level: ToastLevel, text: String) {
+        let now = now_ms();
+        self.transcript.cells.push_back(Cell {
+            id: now,
+            kind: CellKind::Item(TranscriptKind::Notice { level, text }),
+            version: 0,
+            ts_ms: now,
+            stats: None,
+        });
+        self.transcript.scroll_to_bottom();
+        self.dirty = true;
+    }
+
+    /// Drain the first prompt from the queue if the main agent is idle.
+    pub fn drain_prompt_queue(&mut self) -> Option<pacode_types::Request> {
+        if !self.turn_active && !self.input.prompt_queue.is_empty() {
+            let text = self.input.prompt_queue.pop_front()?;
+            self.turn_active = true;
+            self.dirty = true;
+            Some(pacode_types::Request::UserMessage { text })
+        } else {
+            None
+        }
+    }
+
+    /// Observe background tasks and subagents ending and record a notice in the transcript.
+    pub fn observe_background_completion(&mut self, event: &Event) {
+        match event {
+            Event::TaskUpdated(info) if info.status.is_terminal() => {
+                let was_terminal = self
+                    .rail
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == info.id)
+                    .is_some_and(|t| t.status.is_terminal());
+                if !was_terminal {
+                    let cmd = if info.command.is_empty() {
+                        &info.label
+                    } else {
+                        &info.command
+                    };
+                    let short_cmd = pacode_types::truncate_head_tail(cmd, 60);
+                    let exit_str = match info.exit_code {
+                        Some(c) => format!(" (exit code {c})"),
+                        None => String::new(),
+                    };
+                    let (status_word, level) = match info.status {
+                        pacode_types::TaskStatus::Completed => {
+                            let lvl = if info.exit_code.unwrap_or(0) == 0 {
+                                ToastLevel::Success
+                            } else {
+                                ToastLevel::Error
+                            };
+                            ("completed", lvl)
+                        }
+                        pacode_types::TaskStatus::Failed => ("failed", ToastLevel::Error),
+                        pacode_types::TaskStatus::Killed => ("killed", ToastLevel::Warn),
+                        pacode_types::TaskStatus::Running => return,
+                    };
+                    let text =
+                        format!("Background command \"{short_cmd}\" {status_word}{exit_str}");
+                    self.push_notice_with_level(level, text);
+                }
+            }
+            Event::AgentUpdated(info) if !info.id.is_main() && !info.status.is_live() => {
+                let was_finished = self
+                    .rail
+                    .agents
+                    .iter()
+                    .find(|a| a.id == info.id)
+                    .is_some_and(|a| !a.status.is_live());
+                if !was_finished {
+                    let (status_word, level) = match info.status {
+                        pacode_types::AgentStatus::Finished => ("completed", ToastLevel::Success),
+                        pacode_types::AgentStatus::Stopped => ("stopped", ToastLevel::Warn),
+                        pacode_types::AgentStatus::Failed => ("failed", ToastLevel::Error),
+                        _ => return,
+                    };
+                    let text = format!("Background agent \"{}\" {status_word}", info.name);
+                    self.push_notice_with_level(level, text);
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn save_pref_model(&self, model: &str) {

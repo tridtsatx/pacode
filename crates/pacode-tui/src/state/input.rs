@@ -13,6 +13,8 @@ mod input_tests;
 #[path = "input_delete_tests.rs"]
 mod input_delete_tests;
 
+pub const PROMPT_QUEUE_CAP: usize = 16;
+
 #[derive(Default)]
 pub struct InputState {
     /// The text being edited (may contain newlines).
@@ -43,6 +45,8 @@ pub struct InputState {
     pub bash_complete_index: usize,
     /// Whether user explicitly dismissed the bash completion popup with Esc.
     pub bash_complete_closed: bool,
+    /// Queued prompts submitted while a turn was running (cap `PROMPT_QUEUE_CAP`).
+    pub prompt_queue: VecDeque<String>,
 }
 
 pub fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
@@ -89,6 +93,27 @@ pub fn wrap_text_non_trimming(text: &str, width: usize) -> Vec<String> {
 impl InputState {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    pub fn queue_is_full(&self) -> bool {
+        self.prompt_queue.len() >= PROMPT_QUEUE_CAP
+    }
+
+    pub fn queue_push(&mut self, text: String) -> bool {
+        if self.prompt_queue.len() < PROMPT_QUEUE_CAP {
+            self.prompt_queue.push_back(text);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn queue_pop_back(&mut self) -> Option<String> {
+        self.prompt_queue.pop_back()
+    }
+
+    pub fn queue_clear(&mut self) {
+        self.prompt_queue.clear();
     }
 
     pub fn insert_str(&mut self, s: &str) {

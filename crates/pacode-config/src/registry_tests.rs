@@ -280,3 +280,33 @@ fn test_apply_and_reset_in_config() {
     reset_in_config(&mut cfg, "exec.yield_after_secs");
     assert_eq!(cfg.exec.yield_after_secs, 10);
 }
+
+#[test]
+fn test_web_config_settings() {
+    let mut cfg = Config::default();
+    assert_eq!(
+        read_value(&cfg, "web.default_num_results"),
+        Some("8".to_string())
+    );
+    assert_eq!(
+        read_value(&cfg, "web.request_timeout_secs"),
+        Some("15".to_string())
+    );
+
+    apply_to_config(
+        &mut cfg,
+        "web.default_num_results",
+        &toml::Value::Integer(12),
+    );
+    assert_eq!(cfg.web.default_num_results, 12);
+
+    apply_to_config(
+        &mut cfg,
+        "web.request_timeout_secs",
+        &toml::Value::Integer(30),
+    );
+    assert_eq!(cfg.web.request_timeout_secs, 30);
+
+    reset_in_config(&mut cfg, "web.default_num_results");
+    assert_eq!(cfg.web.default_num_results, 8);
+}

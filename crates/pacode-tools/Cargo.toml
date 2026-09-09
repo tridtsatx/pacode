@@ -28,7 +28,9 @@ grep-matcher = { workspace = true }
 similar = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
-html2text = { workspace = true }
+dom_smoothie = { workspace = true }
+htmd = { workspace = true }
+regex = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]

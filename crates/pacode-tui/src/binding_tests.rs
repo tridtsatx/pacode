@@ -492,3 +492,34 @@ fn test_rebind_select_agent_2_takes_effect() {
     let old_key = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT);
     assert_ne!(keymap.action_for(old_key), Some(Action::SelectAgent2));
 }
+
+#[test]
+fn test_queue_actions_present_in_defaults() {
+    let keymap = Keymap::defaults();
+    let submit_now_bindings = keymap.bindings_for(Action::SubmitNow);
+    assert_eq!(
+        submit_now_bindings,
+        &[Binding {
+            code: KeyCode::Enter,
+            mods: KeyModifiers::CONTROL,
+        }]
+    );
+
+    let remove_queued_bindings = keymap.bindings_for(Action::RemoveQueued);
+    assert_eq!(
+        remove_queued_bindings,
+        &[Binding {
+            code: KeyCode::Char('q'),
+            mods: KeyModifiers::ALT,
+        }]
+    );
+
+    let clear_queue_bindings = keymap.bindings_for(Action::ClearQueue);
+    assert_eq!(
+        clear_queue_bindings,
+        &[Binding {
+            code: KeyCode::Char('q'),
+            mods: KeyModifiers::ALT | KeyModifiers::SHIFT,
+        }]
+    );
+}

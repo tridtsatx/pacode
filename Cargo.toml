@@ -69,7 +69,8 @@ log = "0.4"
 # http
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "rustls-tls-native-roots", "system-proxy"] }
 url = "2"
-html2text = "0.13"
+dom_smoothie = "0.18.1"
+htmd = "0.5.5"
 
 # terminal
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }

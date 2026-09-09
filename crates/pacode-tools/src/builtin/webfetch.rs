@@ -28,7 +28,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch an http(s) URL and return its text (HTML converted to plain text). \
+        "Fetch an http(s) URL and return its text (HTML extracted to readable Markdown). \
          Output above the cap is cut head+tail."
     }
 
@@ -48,8 +48,9 @@ impl Tool for WebFetchTool {
     }
 
     /// reqwest GET with 20 s timeout, follows ≤ 5 redirects, refuses non-http(s)
-    /// schemes and bodies over 5 MiB; `text/html` → `html2text::from_read` at width 100;
-    /// other text types verbatim; binary → error. Title `Fetch <host>`.
+    /// schemes and bodies over 5 MiB; `text/html` → readability extraction (`dom_smoothie`)
+    /// and Markdown conversion (`htmd`); other text types verbatim; binary → error.
+    /// Title `Fetch <host>`.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<WebFetchInput>(input)?;
         if args.url.trim().is_empty() {
@@ -59,10 +60,10 @@ impl Tool for WebFetchTool {
         let parsed_url = url::Url::parse(&args.url)
             .map_err(|e| ToolError::invalid(format!("invalid URL: {e}")))?;
 
-        if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+        let scheme = parsed_url.scheme();
+        if scheme != "http" && scheme != "https" {
             return Err(ToolError::invalid(format!(
-                "unsupported scheme '{}': only http and https are supported",
-                parsed_url.scheme()
+                "unsupported scheme '{scheme}': only http and https are supported"
             )));
         }
 
@@ -76,7 +77,7 @@ impl Tool for WebFetchTool {
             .map_err(|e| ToolError::failed(format!("failed to build HTTP client: {e}")))?;
 
         let resp = client
-            .get(parsed_url)
+            .get(parsed_url.clone())
             .send()
             .await
             .map_err(|e| ToolError::failed(format!("HTTP request failed: {e}")))?;
@@ -115,8 +116,9 @@ impl Tool for WebFetchTool {
 
         let is_html = content_type.to_lowercase().contains("text/html");
         let text = if is_html {
-            html2text::from_read(bytes.as_slice(), 100)
-                .map_err(|e| ToolError::failed(format!("HTML conversion failed: {e}")))?
+            let html_str = String::from_utf8(bytes)
+                .map_err(|e| ToolError::failed(format!("response is not valid UTF-8: {e}")))?;
+            extract_html_to_markdown(&html_str, Some(parsed_url.as_str()))
         } else {
             String::from_utf8(bytes)
                 .map_err(|e| ToolError::failed(format!("response is not valid UTF-8: {e}")))?
@@ -124,10 +126,43 @@ impl Tool for WebFetchTool {
 
         let cap = args.max_chars.unwrap_or(ctx.output_cap_chars);
         let content = cap_output(&text, accept_large_output, cap);
-        let preview = format!("{} chars", content.chars().count());
+        let char_count = content.chars().count();
+        let preview = format!("{char_count} chars");
 
         Ok(ToolOutput::text(content)
             .with_title(title)
             .with_preview(preview))
+    }
+}
+
+/// Extract readable article content and convert to Markdown using `dom_smoothie` and `htmd`.
+/// If extraction yields nothing useful, falls back to converting the full document to Markdown
+/// and explicitly notes in the output that it fell back.
+pub fn extract_html_to_markdown(html: &str, url: Option<&str>) -> String {
+    // 1. Attempt readability extraction
+    let readability_result = dom_smoothie::Readability::new(html, url, None)
+        .or_else(|_| dom_smoothie::Readability::new(html, None, None))
+        .and_then(|mut r| r.parse());
+
+    if let Ok(article) = readability_result {
+        let content = article.content.to_string();
+        if !content.trim().is_empty()
+            && let Ok(md) = htmd::convert(&content)
+        {
+            let trimmed = md.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    // 2. Fallback: convert the entire document rather than returning an empty string
+    let full_md = htmd::convert(html).unwrap_or_else(|_| html.to_string());
+    let trimmed = full_md.trim();
+    if trimmed.is_empty() {
+        "[Extraction yielded no article content; fell back to full document]\n\n(empty document)"
+            .to_string()
+    } else {
+        format!("[Extraction yielded no article content; fell back to full document]\n\n{trimmed}")
     }
 }

@@ -32,6 +32,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub font: FontConfig,
     pub keys: KeysConfig,
+    pub web: WebConfig,
 }
 
 impl Config {
@@ -467,6 +468,24 @@ impl Default for SkillsConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Default number of results returned by websearch if unspecified.
+    pub default_num_results: usize,
+    /// Request timeout in seconds for web tools.
+    pub request_timeout_secs: u64,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            default_num_results: 8,
+            request_timeout_secs: 15,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +504,8 @@ mod tests {
         assert!(cfg.skills.dirs.is_empty());
         assert_eq!(cfg.skills.max_body_bytes, 16384);
         assert_eq!(cfg.skills.max_listed, 100);
+        assert_eq!(cfg.web.default_num_results, 8);
+        assert_eq!(cfg.web.request_timeout_secs, 15);
         assert!(cfg.default_route().is_none());
     }
 

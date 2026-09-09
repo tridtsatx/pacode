@@ -237,6 +237,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                 match client_ev {
                     Some(ev) => {
                         state.apply_client_event(ev, Instant::now());
+                        if let Some(req) = state.drain_prompt_queue() {
+                            dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                        }
                     }
                     None => {
                         break;

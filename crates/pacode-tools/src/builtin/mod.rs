@@ -26,6 +26,7 @@ pub mod read;
 pub mod report_status;
 pub mod skill;
 pub mod webfetch;
+pub mod websearch;
 pub mod write;
 
 pub use skill::SkillTool;
@@ -49,6 +50,7 @@ pub fn builtin_tools() -> ToolRegistry {
         .with(Arc::new(plan::PlanTool))
         .with(Arc::new(agent::AgentTool))
         .with(Arc::new(webfetch::WebFetchTool))
+        .with(Arc::new(websearch::WebSearchTool::default()))
         .with(Arc::new(report_status::ReportStatusTool))
         .with(Arc::new(memory::MemoryWriteTool))
         .with(Arc::new(memory::MemoryReadTool))

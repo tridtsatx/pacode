@@ -339,6 +339,34 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
     }
 
+    // 9.5 Prompt queue manipulation actions
+    if action == Some(KeyAction::RemoveQueued) {
+        if state.input.queue_pop_back().is_some() {
+            state.dirty = true;
+        }
+        return vec![];
+    }
+    if action == Some(KeyAction::ClearQueue) {
+        if !state.input.prompt_queue.is_empty() {
+            state.input.queue_clear();
+            state.dirty = true;
+        }
+        return vec![];
+    }
+    if action == Some(KeyAction::SubmitNow) {
+        if state.input.is_empty() {
+            return vec![];
+        }
+        if !state.turn_active {
+            return submit_prompt(state);
+        }
+        // The daemon already injects a message that arrives mid-turn as a steer,
+        // so this reaches the model without waiting for the turn to end and
+        // without discarding what the turn has done so far.
+        let text = state.input.take();
+        return vec![Action::Send(Request::UserMessage { text })];
+    }
+
     // 10. Enter key
     if action == Some(KeyAction::Newline) {
         state.input.insert_char('\n');
@@ -386,7 +414,31 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
 
         if !state.input.is_empty() {
+            if state.turn_active {
+                if state.input.queue_is_full() {
+                    state.push_toast(
+                        pacode_types::ToastLevel::Warn,
+                        "Prompt queue full".to_string(),
+                        Some(format!(
+                            "Maximum {} prompts queued",
+                            crate::state::input::PROMPT_QUEUE_CAP
+                        )),
+                        now,
+                    );
+                    return vec![];
+                }
+                let text = state.input.take();
+                state.input.queue_push(text);
+                return vec![];
+            }
             return submit_prompt(state);
+        }
+
+        if !state.turn_active
+            && !state.input.prompt_queue.is_empty()
+            && let Some(req) = state.drain_prompt_queue()
+        {
+            return vec![Action::Send(req)];
         }
 
         // Enter with empty prompt: open selection in panel
@@ -585,8 +637,9 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 }
 
 pub use crate::nav::{
-    handle_esc, handle_follow, handle_navigate_down, handle_navigate_up, select_agent_at_index,
-    select_agent_by_id, selectable_agents, switch_to_session_slot,
+    handle_esc, handle_follow, handle_navigate_down, handle_navigate_up, handle_scroll,
+    normalize_cyrillic_ctrl, select_agent_at_index, select_agent_by_id, selectable_agents,
+    switch_to_session_slot,
 };
 
 fn complete_slash_command(state: &mut AppState) -> bool {
@@ -629,115 +682,6 @@ fn submit_prompt(state: &mut AppState) -> Vec<Action> {
     vec![]
 }
 
-fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
-    let in_panel = matches!(state.focus, Focus::Panel { .. });
-    if in_panel {
-        if let Focus::Panel {
-            ref mut follow_paused,
-            follow: true,
-            ..
-        } = state.focus
-        {
-            if action == KeyAction::ScrollUp {
-                *follow_paused = true;
-            } else if action == KeyAction::ScrollBottom {
-                *follow_paused = false;
-                state.panel.agent_transcript.scroll_to_bottom();
-                return vec![];
-            }
-        }
-        match action {
-            KeyAction::ScrollUp => state.panel.agent_transcript.scroll_by(10),
-            KeyAction::ScrollDown => state.panel.agent_transcript.scroll_by(-10),
-            KeyAction::ScrollTop => state.panel.agent_transcript.scroll_to_top(),
-            KeyAction::ScrollBottom => state.panel.agent_transcript.scroll_to_bottom(),
-            KeyAction::FollowAgent
-            | KeyAction::FilesOverlay
-            | KeyAction::NextAgent
-            | KeyAction::PrevAgent
-            | KeyAction::SessionPicker
-            | KeyAction::BgList
-            | KeyAction::Cancel
-            | KeyAction::Submit
-            | KeyAction::Newline
-            | KeyAction::ClearInput
-            | KeyAction::DeleteWordForward
-            | KeyAction::DeleteWordBack
-            | KeyAction::StopAgent
-            | KeyAction::KillTask
-            | KeyAction::CycleMode
-            | KeyAction::CopySelection
-            | KeyAction::SelectAgent1
-            | KeyAction::SelectAgent2
-            | KeyAction::SelectAgent3
-            | KeyAction::SelectAgent4
-            | KeyAction::SelectAgent5
-            | KeyAction::SelectAgent6
-            | KeyAction::SelectAgent7
-            | KeyAction::SelectAgent8
-            | KeyAction::SelectAgent9
-            | KeyAction::SelectSession1
-            | KeyAction::SelectSession2
-            | KeyAction::SelectSession3
-            | KeyAction::SelectSession4
-            | KeyAction::SelectSession5
-            | KeyAction::SelectSession6
-            | KeyAction::SelectSession7
-            | KeyAction::SelectSession8
-            | KeyAction::SelectSession9 => {}
-        }
-    } else {
-        match action {
-            KeyAction::ScrollUp => state.transcript.scroll_by(10),
-            KeyAction::ScrollDown => state.transcript.scroll_by(-10),
-            KeyAction::ScrollTop => state.transcript.scroll_to_top(),
-            KeyAction::ScrollBottom => state.transcript.scroll_to_bottom(),
-            KeyAction::FollowAgent
-            | KeyAction::FilesOverlay
-            | KeyAction::NextAgent
-            | KeyAction::PrevAgent
-            | KeyAction::SessionPicker
-            | KeyAction::BgList
-            | KeyAction::Cancel
-            | KeyAction::Submit
-            | KeyAction::Newline
-            | KeyAction::ClearInput
-            | KeyAction::DeleteWordForward
-            | KeyAction::DeleteWordBack
-            | KeyAction::StopAgent
-            | KeyAction::KillTask
-            | KeyAction::CycleMode
-            | KeyAction::CopySelection
-            | KeyAction::SelectAgent1
-            | KeyAction::SelectAgent2
-            | KeyAction::SelectAgent3
-            | KeyAction::SelectAgent4
-            | KeyAction::SelectAgent5
-            | KeyAction::SelectAgent6
-            | KeyAction::SelectAgent7
-            | KeyAction::SelectAgent8
-            | KeyAction::SelectAgent9
-            | KeyAction::SelectSession1
-            | KeyAction::SelectSession2
-            | KeyAction::SelectSession3
-            | KeyAction::SelectSession4
-            | KeyAction::SelectSession5
-            | KeyAction::SelectSession6
-            | KeyAction::SelectSession7
-            | KeyAction::SelectSession8
-            | KeyAction::SelectSession9 => {}
-        }
-        if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
-            && state.transcript.is_at_top()
-            && state.can_load_history()
-        {
-            state.transcript.loading_history = true;
-            return vec![Action::LoadHistory];
-        }
-    }
-    vec![]
-}
-
 fn find_pending_permission(state: &AppState) -> Option<PermissionRequest> {
     state.transcript.cells.iter().find_map(|c| {
         if let CellKind::Item(TranscriptKind::Permission(ref req)) = c.kind {
@@ -749,51 +693,3 @@ fn find_pending_permission(state: &AppState) -> Option<PermissionRequest> {
 }
 
 pub use crate::mouse::handle_mouse;
-
-/// Map a Cyrillic (ЙЦУКЕН) letter pressed with CONTROL to the Latin letter on the same
-/// key, so `ctrl+в` acts as `ctrl+d`. Legacy terminals already send the control byte;
-/// this covers the kitty keyboard protocol where the Unicode letter arrives.
-pub fn normalize_cyrillic_ctrl(key: KeyEvent) -> KeyEvent {
-    if !key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        return key;
-    }
-    let KeyCode::Char(c) = key.code else {
-        return key;
-    };
-    let mapped = match c.to_lowercase().next().unwrap_or(c) {
-        'й' => 'q',
-        'ц' => 'w',
-        'у' => 'e',
-        'к' => 'r',
-        'е' => 't',
-        'н' => 'y',
-        'г' => 'u',
-        'ш' => 'i',
-        'щ' => 'o',
-        'з' => 'p',
-        'ф' => 'a',
-        'ы' => 's',
-        'в' => 'd',
-        'а' => 'f',
-        'п' => 'g',
-        'р' => 'h',
-        'о' => 'j',
-        'л' => 'k',
-        'д' => 'l',
-        'я' => 'z',
-        'ч' => 'x',
-        'с' => 'c',
-        'м' => 'v',
-        'и' => 'b',
-        'т' => 'n',
-        'ь' => 'm',
-        _ => return key,
-    };
-    KeyEvent {
-        code: KeyCode::Char(mapped),
-        ..key
-    }
-}

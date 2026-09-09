@@ -78,6 +78,7 @@ pub const SECTIONS: &[&str] = &[
     "theme",
     "font",
     "keys",
+    "web",
 ];
 
 const EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -172,6 +173,10 @@ pub static SETTINGS: &[SettingEntry] = &[
 
     // keys
     SettingEntry { dotted_key: "keys", label: "Keybindings", description: "Action keybindings (customize with /keys)", section: "keys", default_value: "/keys", kind: SettingKind::Action { command: "/keys" } },
+
+    // web
+    SettingEntry { dotted_key: "web.default_num_results", label: "Default Search Results", description: "Default number of search results to return", section: "web", default_value: "8", kind: SettingKind::Integer { min: 1, max: 50 } },
+    SettingEntry { dotted_key: "web.request_timeout_secs", label: "Web Request Timeout", description: "Request timeout in seconds for web tools", section: "web", default_value: "15", kind: SettingKind::Integer { min: 1, max: 300 } },
 ];
 
 pub fn all_settings() -> &'static [SettingEntry] {
@@ -267,6 +272,8 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             "{} custom bindings (/keys)",
             config.keys.bindings.len()
         )),
+        "web.default_num_results" => Some(config.web.default_num_results.to_string()),
+        "web.request_timeout_secs" => Some(config.web.request_timeout_secs.to_string()),
         _ => None,
     }
 }
@@ -651,6 +658,16 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "font.weight" => {
             if let toml::Value::String(s) = value {
                 config.font.weight = if s.is_empty() { None } else { Some(s.clone()) };
+            }
+        }
+        "web.default_num_results" => {
+            if let toml::Value::Integer(n) = value {
+                config.web.default_num_results = *n as usize;
+            }
+        }
+        "web.request_timeout_secs" => {
+            if let toml::Value::Integer(n) = value {
+                config.web.request_timeout_secs = *n as u64;
             }
         }
         _ => {}

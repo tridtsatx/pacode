@@ -1546,3 +1546,299 @@ fn test_keymap_delete_word_actions() {
     assert_eq!(state.input.cursor, 6);
     assert_eq!(state.input.text, "hello world");
 }
+
+#[test]
+fn test_enter_queues_when_turn_running_and_sends_when_idle() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+    // 1. Enter while idle sends as before
+    state.turn_active = false;
+    state.input.insert_str("idle prompt");
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::UserMessage {
+            text: "idle prompt".into()
+        })]
+    );
+    assert!(state.input.is_empty());
+    assert!(state.input.prompt_queue.is_empty());
+
+    // 2. Enter while a turn runs queues instead of sending, and the prompt clears
+    state.turn_active = true;
+    state.input.insert_str("queued prompt");
+    let actions = handle_key(&mut state, enter, now);
+    assert!(actions.is_empty());
+    assert!(state.input.is_empty());
+    assert_eq!(state.input.prompt_queue.len(), 1);
+    assert_eq!(
+        state.input.prompt_queue.front().map(String::as_str),
+        Some("queued prompt")
+    );
+}
+
+#[test]
+fn test_queue_drains_in_order_on_turn_finished() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+    // Queue two prompts while a turn is active
+    state.turn_active = true;
+    state.input.insert_str("first");
+    handle_key(&mut state, enter, now);
+    state.input.insert_str("second");
+    handle_key(&mut state, enter, now);
+    assert_eq!(state.input.prompt_queue.len(), 2);
+
+    // First turn finishes: TurnEnded event arrives for main agent
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 1,
+            event: pacode_types::Event::TurnEnded {
+                agent: AgentId::main(),
+                turn: pacode_types::TurnId::new("turn_1"),
+                usage: None,
+                stop: pacode_types::TurnStop::Completed,
+            },
+        },
+        now,
+    );
+
+    // The FIRST queued entry is drained
+    let req1 = state.drain_prompt_queue();
+    assert_eq!(
+        req1,
+        Some(Request::UserMessage {
+            text: "first".into()
+        })
+    );
+    assert_eq!(state.input.prompt_queue.len(), 1);
+    assert!(state.turn_active); // Marked active so another turn is not dispatched concurrently
+
+    // Second turn finishes
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 2,
+            event: pacode_types::Event::TurnEnded {
+                agent: AgentId::main(),
+                turn: pacode_types::TurnId::new("turn_2"),
+                usage: None,
+                stop: pacode_types::TurnStop::Completed,
+            },
+        },
+        now,
+    );
+
+    // The SECOND queued entry is drained
+    let req2 = state.drain_prompt_queue();
+    assert_eq!(
+        req2,
+        Some(Request::UserMessage {
+            text: "second".into()
+        })
+    );
+    assert_eq!(state.input.prompt_queue.len(), 0);
+
+    // Third turn finishes, queue is now empty
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 3,
+            event: pacode_types::Event::TurnEnded {
+                agent: AgentId::main(),
+                turn: pacode_types::TurnId::new("turn_3"),
+                usage: None,
+                stop: pacode_types::TurnStop::Completed,
+            },
+        },
+        now,
+    );
+    let req3 = state.drain_prompt_queue();
+    assert_eq!(req3, None);
+    assert!(!state.turn_active);
+}
+
+#[test]
+fn test_queue_cap_refuses_with_toast_and_preserves_entries() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    state.turn_active = true;
+
+    // Fill the queue up to PROMPT_QUEUE_CAP
+    for i in 0..crate::state::input::PROMPT_QUEUE_CAP {
+        state.input.insert_str(&format!("msg {i}"));
+        handle_key(&mut state, enter, now);
+    }
+    assert_eq!(
+        state.input.prompt_queue.len(),
+        crate::state::input::PROMPT_QUEUE_CAP
+    );
+
+    // Now try to queue one more
+    state.input.insert_str("overflow prompt");
+    let actions = handle_key(&mut state, enter, now);
+    assert!(actions.is_empty());
+    // Refused with a toast
+    assert!(
+        state
+            .toasts
+            .iter()
+            .any(|t| t.title.contains("Prompt queue full"))
+    );
+    // Existing entries not dropped
+    assert_eq!(
+        state.input.prompt_queue.len(),
+        crate::state::input::PROMPT_QUEUE_CAP
+    );
+    assert_eq!(
+        state.input.prompt_queue.front().map(String::as_str),
+        Some("msg 0")
+    );
+    // New text is not lost / dropped from the prompt
+    assert_eq!(state.input.text, "overflow prompt");
+}
+
+#[test]
+fn test_removing_and_clearing_queue() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    state.turn_active = true;
+
+    // Verify bindings exist in Keymap::defaults()
+    let keymap = crate::binding::Keymap::defaults();
+    assert!(!keymap.bindings_for(KeyAction::RemoveQueued).is_empty());
+    assert!(!keymap.bindings_for(KeyAction::ClearQueue).is_empty());
+
+    // Queue 3 entries
+    state.input.insert_str("p1");
+    handle_key(&mut state, enter, now);
+    state.input.insert_str("p2");
+    handle_key(&mut state, enter, now);
+    state.input.insert_str("p3");
+    handle_key(&mut state, enter, now);
+    assert_eq!(state.input.prompt_queue.len(), 3);
+
+    // alt+q removes the latest entry
+    let alt_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_q, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.prompt_queue.len(), 2);
+    assert_eq!(
+        state.input.prompt_queue.back().map(String::as_str),
+        Some("p2")
+    );
+
+    // alt+shift+q clears the entire queue
+    let alt_shift_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+    let actions = handle_key(&mut state, alt_shift_q, now);
+    assert!(actions.is_empty());
+    assert!(state.input.prompt_queue.is_empty());
+}
+
+#[test]
+fn test_ctrl_enter_submit_now_behavior() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+
+    // 1. When idle: ordinary submit
+    state.turn_active = false;
+    state.input.insert_str("send now when idle");
+    let actions = handle_key(&mut state, ctrl_enter, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::UserMessage {
+            text: "send now when idle".into()
+        })]
+    );
+    assert!(state.input.is_empty());
+
+    // 2. While a turn runs it still sends immediately: the daemon takes a message
+    // arriving mid-turn as a steer injection, so nothing waits and nothing is lost.
+    state.turn_active = true;
+    state.input.insert_str("send now while busy");
+    let actions = handle_key(&mut state, ctrl_enter, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::UserMessage {
+            text: "send now while busy".into()
+        })]
+    );
+    assert!(state.input.is_empty());
+    assert!(
+        state.input.prompt_queue.is_empty(),
+        "ctrl+enter must bypass the queue, not append to it"
+    );
+}
+
+#[test]
+fn test_background_completion_renders_notice_with_exit_code() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Background task completed with non-zero exit code
+    let failed_task = pacode_types::TaskInfo {
+        id: pacode_types::TaskId::new("task_f1"),
+        session: pacode_types::SessionId::new("ses_1"),
+        owner: AgentId::main(),
+        label: "test run".into(),
+        command: "cargo test".into(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        status: pacode_types::state::TaskStatus::Failed,
+        backgrounded: true,
+        exit_code: Some(101),
+        started_at_ms: 0,
+        ended_at_ms: Some(100),
+        progress: None,
+        warnings: 0,
+        errors: 1,
+        output_path: std::path::PathBuf::from("/tmp/out"),
+        output_bytes: 0,
+        acked: false,
+    };
+
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 1,
+            event: pacode_types::Event::TaskUpdated(failed_task),
+        },
+        now,
+    );
+
+    // Verify notice cell was added
+    let cell = state
+        .transcript
+        .cells
+        .back()
+        .expect("notice cell was added");
+    let (level, text) = match &cell.kind {
+        CellKind::Item(TranscriptKind::Notice { level, text }) => (*level, text.clone()),
+        _ => panic!("expected TranscriptKind::Notice item"),
+    };
+
+    assert_eq!(level, pacode_types::ToastLevel::Error);
+    assert!(
+        text.contains("101"),
+        "exit code 101 must be visible in notice: '{text}'"
+    );
+    assert!(text.contains("cargo test") || text.contains("test run"));
+
+    // Verify rendered output is exactly one notice line (+ blank spacing line)
+    let opts = pacode_render::RenderOptions::new(80, false);
+    let kind = match &cell.kind {
+        CellKind::Item(k) => k,
+        _ => panic!("expected CellKind::Item"),
+    };
+    let lines = crate::ui::dialog::render_item(kind, None, 80, &opts, 0);
+    let content_lines: Vec<_> = lines
+        .iter()
+        .filter(|l| !l.spans.is_empty() && !l.spans[0].content.is_empty())
+        .collect();
+    assert_eq!(content_lines.len(), 1);
+    let rendered_text = &content_lines[0].spans[0].content;
+    assert!(rendered_text.contains("101"));
+}

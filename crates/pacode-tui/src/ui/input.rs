@@ -289,6 +289,48 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
             frame.render_widget(Paragraph::new(popup_lines), popup_area);
         }
     }
+
+    // Prompt queue popup (drawn ABOVE the input box when no other popup is active)
+    let slash_popup_active = state.input.text.starts_with('/') && !state.input.text.contains(' ');
+    let bash_popup_active = state.input.text.starts_with('!') && !state.input.bash_complete_closed;
+    let at_popup_active = at_query.is_some();
+
+    if !slash_popup_active
+        && !bash_popup_active
+        && !at_popup_active
+        && !state.input.prompt_queue.is_empty()
+    {
+        let max_visible = 6;
+        let queue_len = state.input.prompt_queue.len();
+        let count = queue_len.min(max_visible);
+        let popup_h = count as u16;
+        let popup_y = layout.input_top.y.saturating_sub(popup_h);
+        let popup_w = layout.input.width.min(60);
+        let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
+
+        frame.render_widget(Clear, popup_area);
+
+        let mut popup_lines = Vec::new();
+        for (i, prompt) in state
+            .input
+            .prompt_queue
+            .iter()
+            .enumerate()
+            .take(max_visible)
+        {
+            let prefix = format!(" queued #{}: ", i + 1);
+            let avail = (popup_w as usize).saturating_sub(prefix.len()).max(1);
+            let single_line = prompt.lines().next().unwrap_or("");
+            let truncated = pacode_render::truncate_to_width(single_line, avail, true);
+            let line = Line::from(vec![
+                Span::styled(prefix, opts.theme.accent),
+                Span::styled(truncated, opts.theme.fg),
+            ]);
+            popup_lines.push(line);
+        }
+
+        frame.render_widget(Paragraph::new(popup_lines), popup_area);
+    }
 }
 
 pub fn command_inline_hint(text: &str) -> Option<String> {
