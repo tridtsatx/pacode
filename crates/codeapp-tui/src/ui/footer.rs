@@ -271,9 +271,21 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                             );
                             format!(" · {done_count} agents done · {dur}")
                         } else {
-                            let agents = state.rail.agents.len();
+                            let agents =
+                                state.rail.agents.iter().filter(|a| !a.id.is_main()).count();
                             let bg = state.rail.running_task_count();
-                            format!(" · ← {agents} agents · {bg} bg")
+                            let mut parts = Vec::new();
+                            if agents > 0 {
+                                parts.push(format!("← {agents} agents"));
+                            }
+                            if bg > 0 {
+                                parts.push(format!("{bg} bg"));
+                            }
+                            if parts.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {}", parts.join(" · "))
+                            }
                         };
 
                         let perm_base_len = display_width(&perm_base);
@@ -342,11 +354,16 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
     };
 
     let right_spans = if show_context {
-        let tok_str = format_tokens_upper(state.rail.usage.context_tokens as u64);
-        vec![
-            Span::styled(tok_str, opts.theme.faint),
-            Span::styled(" · ctrl+p", opts.theme.faint),
-        ]
+        let tokens = state.rail.usage.context_tokens as u64;
+        if tokens == 0 {
+            vec![Span::styled("ctrl+p", opts.theme.faint)]
+        } else {
+            let tok_str = format_tokens_upper(tokens);
+            vec![
+                Span::styled(tok_str, opts.theme.faint),
+                Span::styled(" · ctrl+p", opts.theme.faint),
+            ]
+        }
     } else {
         Vec::new()
     };

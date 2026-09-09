@@ -41,6 +41,31 @@ use crate::session::Session;
 
 /// Run one turn of `agent` inside `session`. Sets agent status and emits
 /// `TurnStarted`/`TurnEnded`. Never panics; every error becomes `TurnStop::Failed`.
+/// Surface a turn failure in the transcript (error notice item) so clients and
+/// `codeapp run` see why nothing happened.
+fn emit_failure_notice(session: &Session, agent: &Agent, message: &str) {
+    let seq = agent
+        .transcript
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_seq();
+    let item = codeapp_types::TranscriptItem {
+        seq,
+        agent: agent.id.clone(),
+        ts_ms: codeapp_types::now_ms(),
+        kind: codeapp_types::TranscriptKind::Notice {
+            level: codeapp_types::ToastLevel::Error,
+            text: format!("turn failed: {message}"),
+        },
+    };
+    agent
+        .transcript
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upsert(item.clone());
+    session.events.emit(Event::ItemAdded(item));
+}
+
 pub async fn run_turn(
     session: Arc<Session>,
     agent: Arc<Agent>,
@@ -127,6 +152,7 @@ pub async fn run_turn(
         let provider = match session.providers.resolve(&agent_info.model) {
             Ok(p) => p,
             Err(e) => {
+                emit_failure_notice(&session, &agent, &e.to_string());
                 let stop = TurnStop::Failed {
                     message: e.to_string(),
                 };
@@ -143,6 +169,7 @@ pub async fn run_turn(
         let stream = match provider.complete(req).await {
             Ok(s) => s,
             Err(e) => {
+                emit_failure_notice(&session, &agent, &e.to_string());
                 let stop = TurnStop::Failed {
                     message: e.to_string(),
                 };
@@ -159,6 +186,9 @@ pub async fn run_turn(
         let outcome = match stream::consume_stream(&session, &agent, &cancel, stream).await {
             Ok(out) => out,
             Err(stop) => {
+                if let TurnStop::Failed { message } = &stop {
+                    emit_failure_notice(&session, &agent, message);
+                }
                 session.events.emit(Event::TurnEnded {
                     agent: agent.id.clone(),
                     turn: turn_id,

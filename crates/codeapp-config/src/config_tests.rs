@@ -152,7 +152,7 @@ fn defaults_from_empty_text() {
     assert!(!cfg.ui.ascii_only);
     assert!(cfg.ui.mouse);
     assert_eq!(cfg.ui.transcript_cells, 500);
-    assert!(cfg.ui.hints.model);
+    assert!(!cfg.ui.hints.model);
     assert!(cfg.ui.hints.effort);
 }
 

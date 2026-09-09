@@ -28,7 +28,7 @@ fn test_layout_wide_no_panel() {
     assert_eq!(layout.rail.width, 32);
     assert_eq!(layout.rail_separator.width, 1);
     // left column = 140 - 32 - 1 = 107
-    assert_eq!(layout.dialog.width, 107);
+    assert_eq!(layout.dialog.width, 106);
     assert!(layout.panel.is_none());
     assert!(layout.panel_separator.is_none());
     assert_eq!(layout.footer.height, 2);
@@ -46,10 +46,10 @@ fn test_layout_wide_with_panel() {
     assert_eq!(layout.tier, WidthTier::Wide);
     assert!(layout.panel.is_some());
     assert!(layout.panel_separator.is_some());
-    let left_w = 140 - 32 - 1; // 107
-    let _avail_w = left_w - 1; // 106
-    let dialog_w = 106 * 50 / 100; // 53
-    let panel_w = 106 - 53; // 53
+    let left_w = 140 - 32 - 2; // 106 (one blank column before the separator)
+    let avail_w = left_w - 1; // 105
+    let dialog_w = avail_w * 50 / 100; // 52
+    let panel_w = avail_w - dialog_w; // 53
     assert_eq!(layout.dialog.width, dialog_w);
     assert_eq!(layout.panel.unwrap().width, panel_w);
     assert_eq!(layout.panel_separator.unwrap().width, 1);

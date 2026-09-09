@@ -128,7 +128,7 @@ pub struct UiHints {
 impl Default for UiHints {
     fn default() -> Self {
         Self {
-            model: true,
+            model: false,
             effort: true,
         }
     }
@@ -304,7 +304,7 @@ mod tests {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.exec.yield_after_secs, 10);
         assert_eq!(cfg.permissions.default_mode, Mode::Build);
-        assert!(cfg.ui.hints.model);
+        assert!(!cfg.ui.hints.model);
         assert!(cfg.default_route().is_none());
     }
 

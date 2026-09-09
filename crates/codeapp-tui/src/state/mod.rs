@@ -235,8 +235,16 @@ impl AppState {
                 agent,
                 turn: _,
                 usage: _,
-                stop: _,
+                stop,
             } => {
+                if let codeapp_types::TurnStop::Failed { message } = &stop {
+                    self.push_toast(
+                        ToastLevel::Error,
+                        "turn failed".to_string(),
+                        Some(message.clone()),
+                        now,
+                    );
+                }
                 if agent.is_main() {
                     self.turn_active = false;
                     self.turn_started_at = None;

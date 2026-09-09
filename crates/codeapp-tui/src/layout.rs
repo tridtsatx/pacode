@@ -90,9 +90,10 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
     let tier = WidthTier::for_width(area.width);
     let rail_w = tier.rail_width();
 
-    let (left_area, rail, rail_separator) = if rail_w > 0 && area.width > rail_w + 1 {
-        let left_w = area.width - rail_w - 1;
-        let rail_sep_x = area.x + left_w;
+    // One blank column between the dialog column and the separator line.
+    let (left_area, rail, rail_separator) = if rail_w > 0 && area.width > rail_w + 2 {
+        let left_w = area.width - rail_w - 2;
+        let rail_sep_x = area.x + left_w + 1;
         let rail_x = rail_sep_x + 1;
         (
             Rect::new(area.x, area.y, left_w, area.height),
