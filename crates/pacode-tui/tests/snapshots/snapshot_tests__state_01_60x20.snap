@@ -3,8 +3,8 @@ source: crates/pacode-tui/tests/snapshot_tests.rs
 expression: view
 ---
 "▄▀▀▀▀▀▀▀▀▀▀▄                                                "
-"▀▀▀▀▀▀▀▀       pacode v0.1.0-dev                            "
-"▀▀▀▀▀▀▄▄                                                    "
+"▀▀▀▀▀▀▀▀▀      pacode v0.1.0-dev                            "
+"▀▀▀▀▀▀▀▄▄                                                   "
 "▀▀▀▀▀▀▀▀▀▀▀▀                                                "
 "  ▀▀▀▀▀▀▀▀                                                  "
 "                                                            "

@@ -4,8 +4,8 @@ expression: view
 ---
 "  ▄▄▀▀▀▀▄▄                                                                             │Refactor TUI layout             "
 "▄▀▀▀▀▀▀▀▀▀▀▄                                                                           │ses_abcdef123                   "
-"▀▀▀▀▀▀▀▀ ┌ Background Tasks ───────────────────────────────────────────────┐           │                                "
-"▀▀▀▀▀▀▄▄ │▸ ✓ cargo build --release 3m02s                                  │           │PLAN                   1/4 · 40%"
+"▀▀▀▀▀▀▀▀▀┌ Background Tasks ───────────────────────────────────────────────┐           │                                "
+"▀▀▀▀▀▀▀▄▄│▸ ✓ cargo build --release 3m02s                                  │           │PLAN                   1/4 · 40%"
 "▀▀▀▀▀▀▀▀▀│  ✗ npm run lint 100ms                                           │           │[✓] Read codebase & analyze arc…"
 "  ▀▀▀▀▀▀▀│  ✓ tsc --noEmit 12s                                             │           │[•] Implement TUI layout & widg…"
 "         │  ◍ cargo test --all 214/380                                     │           │    ▰▰▰▰▰▱▱▱ 60%                "
