@@ -28,9 +28,9 @@ pub fn render(info: &HeaderInfo, width: u16, opts: &RenderOptions) -> Vec<Line<'
     }
 
     let mascot_lines = if opts.glyphs.ascii {
-        mascot::render_ascii()
+        mascot::render_ascii(info.truecolor)
     } else {
-        mascot::render(info.mascot)
+        mascot::render(info.mascot, info.truecolor)
     };
 
     // Vertically centre the single title line against the mascot block.

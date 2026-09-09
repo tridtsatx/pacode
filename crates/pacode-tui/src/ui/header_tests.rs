@@ -5,6 +5,7 @@ fn info() -> HeaderInfo {
     HeaderInfo {
         version: "0.1.0".to_string(),
         mascot: mascot::MascotKind::Pacman,
+        truecolor: true,
     }
 }
 

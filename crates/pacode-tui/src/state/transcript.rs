@@ -26,6 +26,9 @@ pub struct Cell {
 pub struct HeaderInfo {
     pub version: String,
     pub mascot: crate::ui::mascot::MascotKind,
+    /// Whether the terminal takes RGB, so the mascot can use the arcade palette
+    /// instead of folding it down to the nearest ANSI colour.
+    pub truecolor: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

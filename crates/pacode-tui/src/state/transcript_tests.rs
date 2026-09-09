@@ -201,6 +201,7 @@ fn test_header_is_not_a_cell_and_survives_a_seq_zero_item() {
     t.set_header(HeaderInfo {
         version: "0.1.0".into(),
         mascot: crate::ui::mascot::MascotKind::Pacman,
+        truecolor: true,
     });
     assert!(t.cells.is_empty(), "header must not occupy a cell");
 
@@ -228,6 +229,7 @@ fn test_header_is_not_a_cell_and_survives_a_seq_zero_item() {
         Some(HeaderInfo {
             version: "0.1.0".into(),
             mascot: crate::ui::mascot::MascotKind::Pacman,
+            truecolor: true,
         })
     );
 }
@@ -238,6 +240,7 @@ fn test_set_header_is_idempotent() {
     let info = HeaderInfo {
         version: "0.1.0".into(),
         mascot: crate::ui::mascot::MascotKind::Pacman,
+        truecolor: true,
     };
     t.set_header(info.clone());
     let v = t.header_version;
@@ -249,6 +252,7 @@ fn test_set_header_is_idempotent() {
     t.set_header(HeaderInfo {
         version: "0.2.0".into(),
         mascot: crate::ui::mascot::MascotKind::Pacman,
+        truecolor: true,
     });
     assert_ne!(t.header_version, v);
 }

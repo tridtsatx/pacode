@@ -8,13 +8,13 @@ fn every_sprite_is_rectangular_and_renders_to_half_height() {
         for row in sprite.pixels {
             assert_eq!(row.chars().count(), WIDTH, "ragged sprite row: {row}");
         }
-        assert_eq!(render(kind).len(), HEIGHT);
+        assert_eq!(render(kind, true).len(), HEIGHT);
     }
 }
 
 #[test]
 fn transparent_pixels_render_as_spaces() {
-    let lines = render(MascotKind::Pacman);
+    let lines = render(MascotKind::Pacman, true);
     let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
         first.starts_with("  "),
@@ -24,8 +24,8 @@ fn transparent_pixels_render_as_spaces() {
 
 #[test]
 fn ghosts_and_pacman_differ() {
-    let pac = render(MascotKind::Pacman);
-    let ghost = render(MascotKind::Blinky);
+    let pac = render(MascotKind::Pacman, true);
+    let ghost = render(MascotKind::Blinky, true);
     assert_ne!(
         pac.last().map(|l| l.spans.len()),
         None,

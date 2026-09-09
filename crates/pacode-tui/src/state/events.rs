@@ -20,6 +20,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             let header = crate::state::transcript::HeaderInfo {
                 version: state.app_version.clone(),
                 mascot: state.mascot,
+                truecolor: state.truecolor,
             };
             state.transcript.set_header(header);
             state.meta = Some(meta);

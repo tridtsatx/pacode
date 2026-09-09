@@ -178,6 +178,9 @@ pub struct AppState {
     pub anim_frame: u64,
     /// Mascot shown in the header banner; random per run, fixed for the session.
     pub mascot: crate::ui::mascot::MascotKind,
+    /// Whether the terminal takes RGB; decided once from `[ui] color` and the
+    /// environment, and reused by the theme and the mascot.
+    pub truecolor: bool,
     /// Pending readline key chord (e.g. `ctrl+x` waiting for `ctrl+e`).
     pub pending_chord: Option<crossterm::event::KeyEvent>,
     /// Session slot table (1..=9).
@@ -249,6 +252,7 @@ impl AppState {
             turn_started_at: None,
             anim_frame: 0,
             mascot: crate::ui::mascot::MascotKind::random(),
+            truecolor,
             pending_chord: None,
             slots: Default::default(),
             active_slot: 0,
@@ -295,6 +299,7 @@ impl AppState {
                 let header = crate::state::transcript::HeaderInfo {
                     version: self.app_version.clone(),
                     mascot: self.mascot,
+                    truecolor: self.truecolor,
                 };
                 self.transcript.set_header(header);
                 for item in &snapshot.transcript {
