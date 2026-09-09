@@ -27,13 +27,193 @@ impl ToolHost for SessionHost {
     /// `WaitingApproval`, awaits the decision (cancel → Deny), emits
     /// `PermissionResolved`, caches `AllowSession`.
     async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
-        let _ = draft;
-        todo!("SessionHost::request_permission")
+        let tool_name = {
+            let prefix = draft
+                .title
+                .split(|c: char| c == ':' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+            if self.session.tools.get(&prefix).is_some() {
+                prefix
+            } else if draft.risk.is_some() {
+                "bash".to_string()
+            } else {
+                prefix
+            }
+        };
+
+        let kind = if draft.risk.is_some() {
+            codeapp_tools::ToolKind::Exec
+        } else if let Some(t) = self.session.tools.get(&tool_name) {
+            t.kind()
+        } else if tool_name == "bash" {
+            codeapp_tools::ToolKind::Exec
+        } else if tool_name == "write" || tool_name == "edit" || tool_name == "multi_edit" {
+            codeapp_tools::ToolKind::Edit
+        } else {
+            codeapp_tools::ToolKind::ReadOnly
+        };
+
+        let mode = self.session.meta().mode;
+        let allow_catastrophic = self.session.config.permissions.allow_catastrophic;
+        let gate_decision = crate::permissions::gate(mode, kind, draft.risk, allow_catastrophic);
+
+        match gate_decision {
+            crate::permissions::GateDecision::Allow => PermissionDecision::AllowOnce,
+            crate::permissions::GateDecision::Deny(_) => PermissionDecision::Deny,
+            crate::permissions::GateDecision::Ask => {
+                let target = draft.detail.lines().next().unwrap_or("").trim();
+                let cache_key = crate::permissions::session_key(&tool_name, target);
+                if self.session.permissions.is_allowed_for_session(&cache_key) {
+                    return PermissionDecision::AllowSession;
+                }
+
+                let perm_id = codeapp_types::PermissionId::generate();
+                let perm_req = codeapp_types::PermissionRequest {
+                    id: perm_id.clone(),
+                    agent: draft.agent.clone(),
+                    agent_name: draft.agent_name.clone(),
+                    call_id: draft.call_id.clone(),
+                    tool: tool_name,
+                    title: draft.title.clone(),
+                    detail: draft.detail.clone(),
+                    risk: draft.risk,
+                    created_at_ms: codeapp_types::now_ms(),
+                };
+
+                let rx = self.session.permissions.register(perm_req.clone());
+                self.session
+                    .events
+                    .emit(codeapp_types::Event::PermissionRequested(perm_req.clone()));
+
+                let agent_opt = self.session.agent(&draft.agent);
+                let item_seq = agent_opt
+                    .as_ref()
+                    .map(|a| {
+                        a.transcript
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .next_seq()
+                    })
+                    .unwrap_or(0);
+
+                let perm_item = codeapp_types::TranscriptItem {
+                    seq: item_seq,
+                    agent: draft.agent.clone(),
+                    ts_ms: perm_req.created_at_ms,
+                    kind: codeapp_types::TranscriptKind::Permission(perm_req),
+                };
+
+                if let Some(agent) = &agent_opt {
+                    agent
+                        .transcript
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .upsert(perm_item.clone());
+                }
+                self.session
+                    .events
+                    .emit(codeapp_types::Event::ItemAdded(perm_item.clone()));
+
+                let prev_status = agent_opt
+                    .as_ref()
+                    .map(|a| a.status())
+                    .unwrap_or(codeapp_types::AgentStatus::Idle);
+                let prev_activity = agent_opt.as_ref().and_then(|a| a.info().activity);
+
+                if let Some(agent) = &agent_opt {
+                    agent.set_status(
+                        codeapp_types::AgentStatus::WaitingApproval,
+                        Some(draft.title.clone()),
+                    );
+                    self.session
+                        .events
+                        .emit(codeapp_types::Event::AgentUpdated(agent.info()));
+                }
+
+                let cancel_token = agent_opt
+                    .as_ref()
+                    .and_then(|a| a.cancel.lock().unwrap_or_else(|p| p.into_inner()).clone());
+
+                let decision = match cancel_token {
+                    Some(token) => {
+                        tokio::select! {
+                            _ = token.cancelled() => {
+                                self.session.permissions.cancel(&perm_id);
+                                PermissionDecision::Deny
+                            }
+                            res = rx => res.unwrap_or(PermissionDecision::Deny),
+                        }
+                    }
+                    None => rx.await.unwrap_or(PermissionDecision::Deny),
+                };
+
+                self.session
+                    .events
+                    .emit(codeapp_types::Event::PermissionResolved {
+                        permission: perm_id,
+                        decision,
+                    });
+
+                if decision == PermissionDecision::AllowSession {
+                    self.session.permissions.allow_for_session(cache_key);
+                }
+
+                let (level, notice_text) = match decision {
+                    PermissionDecision::AllowOnce => (
+                        codeapp_types::ToastLevel::Info,
+                        "Permission allowed".to_string(),
+                    ),
+                    PermissionDecision::AllowSession => (
+                        codeapp_types::ToastLevel::Info,
+                        "Permission allowed for session".to_string(),
+                    ),
+                    PermissionDecision::Deny => (
+                        codeapp_types::ToastLevel::Warn,
+                        "Permission denied".to_string(),
+                    ),
+                };
+                let notice_item = codeapp_types::TranscriptItem {
+                    seq: perm_item.seq,
+                    agent: draft.agent.clone(),
+                    ts_ms: codeapp_types::now_ms(),
+                    kind: codeapp_types::TranscriptKind::Notice {
+                        level,
+                        text: notice_text,
+                    },
+                };
+                if let Some(agent) = &agent_opt {
+                    agent
+                        .transcript
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .upsert(notice_item.clone());
+                }
+                self.session
+                    .events
+                    .emit(codeapp_types::Event::ItemUpdated(notice_item));
+
+                if let Some(agent) = &agent_opt {
+                    agent.set_status(prev_status, prev_activity);
+                    self.session
+                        .events
+                        .emit(codeapp_types::Event::AgentUpdated(agent.info()));
+                }
+
+                decision
+            }
+        }
     }
 
     async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError> {
-        let _ = spec;
-        todo!("SessionHost::spawn_task")
+        let info = self
+            .session
+            .tasks
+            .spawn(spec)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        Ok(info.id)
     }
 
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {
@@ -50,28 +230,47 @@ impl ToolHost for SessionHost {
         timeout: Duration,
         return_on_progress: bool,
     ) -> WaitOutcome {
-        let _ = (task, timeout, return_on_progress);
-        todo!("SessionHost::wait_task")
+        let res = self
+            .session
+            .tasks
+            .wait(task, timeout, return_on_progress)
+            .await;
+        match res {
+            codeapp_exec::WaitResult::Ended(_) => WaitOutcome::Finished,
+            codeapp_exec::WaitResult::Progress(_) => WaitOutcome::Progress,
+            codeapp_exec::WaitResult::Timeout(_) => WaitOutcome::Timeout,
+            codeapp_exec::WaitResult::NotFound => WaitOutcome::Finished,
+        }
     }
 
     async fn kill_task(&self, task: &TaskId) -> Result<(), ToolError> {
-        let _ = task;
-        todo!("SessionHost::kill_task")
+        self.session
+            .tasks
+            .kill(task)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
     async fn task_tail(&self, task: &TaskId, lines: usize) -> Result<Vec<String>, ToolError> {
-        let _ = (task, lines);
-        todo!("SessionHost::task_tail")
+        self.session
+            .tasks
+            .tail(task, lines)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
     fn report_task_progress(&self, task: &TaskId, progress: TaskProgress) -> Result<(), ToolError> {
-        let _ = (task, progress);
-        todo!("SessionHost::report_task_progress")
+        self.session
+            .tasks
+            .report_progress(task, progress)
+            .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
     async fn spawn_agent(&self, spec: AgentSpec) -> Result<AgentId, ToolError> {
-        let _ = spec;
-        todo!("SessionHost::spawn_agent")
+        self.session
+            .spawn_agent(spec)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
     fn agent_info(&self, agent: &AgentId) -> Option<AgentInfo> {
@@ -83,13 +282,57 @@ impl ToolHost for SessionHost {
     }
 
     async fn wait_agent(&self, agent: &AgentId, timeout: Duration) -> WaitOutcome {
-        let _ = (agent, timeout);
-        todo!("SessionHost::wait_agent")
+        if let Some(agent_obj) = self.session.agent(agent) {
+            if !agent_obj.status().is_live() {
+                return WaitOutcome::Finished;
+            }
+        } else {
+            return WaitOutcome::Finished;
+        }
+
+        if timeout.is_zero() {
+            return WaitOutcome::Timeout;
+        }
+
+        let mut events_rx = self.session.events.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return WaitOutcome::Timeout;
+            }
+
+            match tokio::time::timeout(remaining, events_rx.recv()).await {
+                Ok(Ok((_seq, event))) => match event {
+                    codeapp_types::Event::AgentUpdated(info) if info.id == *agent => {
+                        if !info.status.is_live() {
+                            return WaitOutcome::Finished;
+                        }
+                    }
+                    codeapp_types::Event::TurnEnded { agent: a, .. } if a == *agent => {
+                        return WaitOutcome::Finished;
+                    }
+                    _ => {}
+                },
+                Ok(Err(_)) => {
+                    if let Some(a) = self.session.agent(agent)
+                        && !a.status().is_live()
+                    {
+                        return WaitOutcome::Finished;
+                    }
+                    return WaitOutcome::Timeout;
+                }
+                Err(_) => return WaitOutcome::Timeout,
+            }
+        }
     }
 
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
-        let _ = agent;
-        todo!("SessionHost::stop_agent")
+        self.session
+            .stop_agent(agent)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
     fn plan(&self) -> Plan {
@@ -105,7 +348,22 @@ impl ToolHost for SessionHost {
     }
 
     fn emit_preview(&self, call_id: &CallId, preview: String) {
-        let _ = (call_id, preview);
-        todo!("SessionHost::emit_preview")
+        if let Some(agent) = self.session.agent(&self.agent) {
+            let mut transcript = agent.transcript.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(item) = transcript.tool_items.get_mut(call_id) {
+                if let codeapp_types::TranscriptKind::ToolCall {
+                    preview: ref mut p, ..
+                } = item.kind
+                {
+                    *p = preview;
+                }
+                let updated = item.clone();
+                transcript.upsert(updated.clone());
+                drop(transcript);
+                self.session
+                    .events
+                    .emit(codeapp_types::Event::ItemUpdated(updated));
+            }
+        }
     }
 }

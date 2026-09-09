@@ -37,7 +37,17 @@ impl History {
 
     /// Messages sent to the model: summary (as a user message) then the rest.
     pub fn for_model(&self) -> Vec<Message> {
-        todo!("History::for_model")
+        let mut out = Vec::new();
+        if let Some(summary) = &self.summary {
+            out.push(
+                Message::user(format!("[Previous conversation summary]\n{summary}"))
+                    .with_kind(codeapp_types::MessageKind::CompactionSummary),
+            );
+        }
+        for m in &self.messages {
+            out.push((**m).clone());
+        }
+        out
     }
 }
 
@@ -77,8 +87,13 @@ impl Agent {
 
     /// Update status/activity; the caller emits `AgentUpdated` through the session.
     pub fn set_status(&self, status: AgentStatus, activity: Option<String>) {
-        let _ = (status, activity);
-        todo!("Agent::set_status")
+        if let Ok(mut info) = self.info.write() {
+            info.status = status;
+            info.activity = activity;
+            if !status.is_live() && info.finished_at_ms.is_none() {
+                info.finished_at_ms = Some(codeapp_types::now_ms());
+            }
+        }
     }
 
     /// Last `limit` transcript items before `before_seq` from the in-memory tail;
@@ -88,7 +103,30 @@ impl Agent {
         before_seq: Option<u64>,
         limit: usize,
     ) -> (Vec<TranscriptItem>, bool) {
-        let _ = (before_seq, limit);
-        todo!("Agent::transcript_tail")
+        let transcript = match self.transcript.lock() {
+            Ok(t) => t,
+            Err(e) => e.into_inner(),
+        };
+        let filtered: Vec<TranscriptItem> = transcript
+            .tail
+            .iter()
+            .filter(|item| match before_seq {
+                Some(before) => item.seq < before,
+                None => true,
+            })
+            .cloned()
+            .collect();
+
+        let total = filtered.len();
+        let skip = total.saturating_sub(limit);
+        let items: Vec<TranscriptItem> = filtered.into_iter().skip(skip).collect();
+
+        let has_more = if let Some(first) = items.first() {
+            first.seq > 0 || skip > 0
+        } else {
+            before_seq.is_some_and(|b| b > 0)
+        };
+
+        (items, has_more)
     }
 }

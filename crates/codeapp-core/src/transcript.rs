@@ -77,9 +77,60 @@ impl TranscriptState {
 
     /// Insert or replace (same seq) in the tail, evicting the oldest past the cap.
     pub fn upsert(&mut self, item: TranscriptItem) {
-        let _ = item;
-        todo!("TranscriptState::upsert")
+        let mut replaced = false;
+        for existing in &mut self.tail {
+            if existing.seq == item.seq {
+                *existing = item.clone();
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            self.tail.push_back(item.clone());
+            while self.tail.len() > self.tail_cap {
+                self.tail.pop_front();
+            }
+        }
+
+        match &item.kind {
+            codeapp_types::TranscriptKind::Assistant { complete, .. } => {
+                if !*complete {
+                    self.live_assistant = Some(item.seq);
+                } else if self.live_assistant == Some(item.seq) {
+                    self.live_assistant = None;
+                }
+            }
+            codeapp_types::TranscriptKind::Reasoning { complete, .. } => {
+                if !*complete {
+                    self.live_reasoning = Some(item.seq);
+                } else if self.live_reasoning == Some(item.seq) {
+                    self.live_reasoning = None;
+                }
+            }
+            codeapp_types::TranscriptKind::ToolCall { call_id, .. } => {
+                self.tool_items.insert(call_id.clone(), item);
+            }
+            codeapp_types::TranscriptKind::User { .. }
+            | codeapp_types::TranscriptKind::Notice { .. }
+            | codeapp_types::TranscriptKind::Permission(_) => {}
+        }
     }
+}
+
+fn tool_title(name: &str, input: &serde_json::Value) -> String {
+    if let Some(obj) = input.as_object() {
+        for (k, v) in obj {
+            if k != "intent"
+                && k != "accept_large_output"
+                && let Some(s) = v.as_str()
+            {
+                let arg = s.trim();
+                let truncated: String = arg.chars().take(60).collect();
+                return format!("{name} {truncated}");
+            }
+        }
+    }
+    name.to_string()
 }
 
 /// Convert persisted history into transcript items (used for resume and
@@ -90,8 +141,114 @@ pub fn history_to_items(
     messages: &[(u64, Arc<Message>)],
     first_item_seq: u64,
 ) -> Vec<TranscriptItem> {
-    let _ = (agent, messages, first_item_seq);
-    todo!("transcript::history_to_items")
+    use codeapp_types::{ContentBlock, Role, ToolStatus, TranscriptKind};
+
+    let mut items = Vec::new();
+    let mut tool_indices: HashMap<CallId, usize> = HashMap::new();
+    let mut cur_seq = first_item_seq;
+
+    for (_msg_seq, msg) in messages {
+        if msg.meta.hidden {
+            continue;
+        }
+
+        match msg.role {
+            Role::User => {
+                let text = msg.text();
+                items.push(TranscriptItem {
+                    seq: cur_seq,
+                    agent: agent.clone(),
+                    ts_ms: msg.meta.timestamp_ms,
+                    kind: TranscriptKind::User { text },
+                });
+                cur_seq += 1;
+            }
+            Role::Assistant => {
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Reasoning { text, .. } => {
+                            if !text.is_empty() {
+                                items.push(TranscriptItem {
+                                    seq: cur_seq,
+                                    agent: agent.clone(),
+                                    ts_ms: msg.meta.timestamp_ms,
+                                    kind: TranscriptKind::Reasoning {
+                                        text: text.clone(),
+                                        complete: true,
+                                    },
+                                });
+                                cur_seq += 1;
+                            }
+                        }
+                        ContentBlock::Text { text } => {
+                            if !text.is_empty() {
+                                items.push(TranscriptItem {
+                                    seq: cur_seq,
+                                    agent: agent.clone(),
+                                    ts_ms: msg.meta.timestamp_ms,
+                                    kind: TranscriptKind::Assistant {
+                                        text: text.clone(),
+                                        complete: true,
+                                    },
+                                });
+                                cur_seq += 1;
+                            }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            let title = tool_title(name, input);
+                            let intent = codeapp_tools::intent_of(input);
+                            let item_idx = items.len();
+                            items.push(TranscriptItem {
+                                seq: cur_seq,
+                                agent: agent.clone(),
+                                ts_ms: msg.meta.timestamp_ms,
+                                kind: TranscriptKind::ToolCall {
+                                    call_id: id.clone(),
+                                    name: name.clone(),
+                                    title,
+                                    intent,
+                                    status: ToolStatus::Running,
+                                    preview: String::new(),
+                                    diff: None,
+                                    duration_ms: None,
+                                    task: None,
+                                },
+                            });
+                            tool_indices.insert(id.clone(), item_idx);
+                            cur_seq += 1;
+                        }
+                        ContentBlock::ToolResult { .. } => {}
+                    }
+                }
+            }
+            Role::Tool => {
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } = block
+                        && let Some(&idx) = tool_indices.get(call_id)
+                        && let TranscriptKind::ToolCall {
+                            ref mut status,
+                            ref mut preview,
+                            ..
+                        } = items[idx].kind
+                    {
+                        *status = if *is_error {
+                            ToolStatus::Error
+                        } else {
+                            ToolStatus::Ok
+                        };
+                        *preview = codeapp_types::truncate_head_tail(content, 256);
+                    }
+                }
+            }
+            Role::System => {}
+        }
+    }
+
+    items
 }
 
 /// Coalesces text deltas: flush when ≥ `max_bytes` or `max_age` since the first
@@ -145,5 +302,76 @@ impl DeltaCoalescer {
 impl Default for DeltaCoalescer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codeapp_types::{ContentBlock, Message, Role, ToolStatus, TranscriptKind};
+
+    #[test]
+    fn test_history_to_items_pairs_tool_use_and_result() {
+        let agent = AgentId::main();
+        let call_id = CallId::generate();
+
+        let msgs = vec![
+            (0, Arc::new(Message::user("run echo"))),
+            (
+                1,
+                Arc::new(Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Text {
+                            text: "Running echo...".into(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: call_id.clone(),
+                            name: "bash".into(),
+                            input: serde_json::json!({"command": "echo hi"}),
+                        },
+                    ],
+                )),
+            ),
+            (
+                2,
+                Arc::new(Message::tool_result(call_id.clone(), "hi\n", false)),
+            ),
+            (
+                3,
+                Arc::new({
+                    let mut m = Message::user("hidden debug");
+                    m.meta.hidden = true;
+                    m
+                }),
+            ),
+        ];
+
+        let items = history_to_items(&agent, &msgs, 10);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].seq, 10);
+        assert!(matches!(&items[0].kind, TranscriptKind::User { text } if text == "run echo"));
+
+        assert_eq!(items[1].seq, 11);
+        assert!(
+            matches!(&items[1].kind, TranscriptKind::Assistant { text, complete } if text == "Running echo..." && *complete)
+        );
+
+        assert_eq!(items[2].seq, 12);
+        match &items[2].kind {
+            TranscriptKind::ToolCall {
+                call_id: cid,
+                name,
+                status,
+                preview,
+                ..
+            } => {
+                assert_eq!(cid, &call_id);
+                assert_eq!(name, "bash");
+                assert_eq!(status, &ToolStatus::Ok);
+                assert_eq!(preview, "hi\n");
+            }
+            other => panic!("expected ToolCall, got {:?}", other),
+        }
     }
 }

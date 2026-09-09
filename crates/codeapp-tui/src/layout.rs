@@ -14,7 +14,7 @@
 use ratatui::layout::Rect;
 
 /// Width tiers from spec §8.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WidthTier {
     /// ≥ 130: rail 32, panel 50/50.
     Wide,
@@ -23,6 +23,7 @@ pub enum WidthTier {
     /// 80–99: rail 28, panel takes the whole dialog column.
     Narrow,
     /// < 80: no rail; plan/agents live in an overlay; footer compresses.
+    #[default]
     Tiny,
 }
 
@@ -83,17 +84,101 @@ pub struct ScreenLayout {
     pub toast: Rect,
 }
 
-impl Default for WidthTier {
-    fn default() -> Self {
-        WidthTier::Tiny
-    }
-}
-
 /// Compute the layout for a terminal of `area` with `input_lines` lines of input and
 /// `panel_open`.
 pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
-    let _ = (area, input_lines, panel_open);
-    todo!("layout::compute")
+    let tier = WidthTier::for_width(area.width);
+    let rail_w = tier.rail_width();
+
+    let (left_area, rail, rail_separator) = if rail_w > 0 && area.width > rail_w + 1 {
+        let left_w = area.width - rail_w - 1;
+        let rail_sep_x = area.x + left_w;
+        let rail_x = rail_sep_x + 1;
+        (
+            Rect::new(area.x, area.y, left_w, area.height),
+            Rect::new(rail_x, area.y, rail_w, area.height),
+            Rect::new(rail_sep_x, area.y, 1, area.height),
+        )
+    } else {
+        (
+            area,
+            Rect::new(area.x + area.width, area.y, 0, area.height),
+            Rect::new(area.x + area.width, area.y, 0, area.height),
+        )
+    };
+
+    let footer_h = FOOTER_LINES.min(left_area.height);
+    let footer_y = left_area.y + left_area.height.saturating_sub(footer_h);
+    let footer = Rect::new(left_area.x, footer_y, left_area.width, footer_h);
+
+    let input_bottom_h = if left_area.height > footer_h { 1 } else { 0 };
+    let input_bottom_y = footer_y.saturating_sub(input_bottom_h);
+    let input_bottom = Rect::new(left_area.x, input_bottom_y, left_area.width, input_bottom_h);
+
+    let rem_for_input = input_bottom_y.saturating_sub(left_area.y);
+    let clamped_input = input_lines.clamp(INPUT_MIN_LINES, INPUT_MAX_LINES);
+    let input_h = clamped_input.min(rem_for_input);
+    let input_y = input_bottom_y.saturating_sub(input_h);
+    let input = Rect::new(left_area.x, input_y, left_area.width, input_h);
+
+    let input_top_h = if input_y > left_area.y { 1 } else { 0 };
+    let input_top_y = input_y.saturating_sub(input_top_h);
+    let input_top = Rect::new(left_area.x, input_top_y, left_area.width, input_top_h);
+
+    let dialog_h = input_top_y.saturating_sub(left_area.y);
+    let dialog_y = left_area.y;
+
+    let toast_h = 2.min(dialog_h);
+    let toast_y = input_top_y.saturating_sub(toast_h);
+    let toast_w = left_area.width.min(48);
+    let toast_x = left_area.x + left_area.width.saturating_sub(toast_w);
+    let toast = Rect::new(toast_x, toast_y, toast_w, toast_h);
+
+    let (dialog, panel, panel_separator) = if panel_open {
+        let share = tier.dialog_share_with_panel();
+        if share == 0 {
+            (
+                Rect::new(left_area.x, dialog_y, 0, dialog_h),
+                Some(Rect::new(left_area.x, dialog_y, left_area.width, dialog_h)),
+                None,
+            )
+        } else {
+            let sep_w = 1;
+            let avail_w = left_area.width.saturating_sub(sep_w);
+            let dialog_w = (avail_w as u32 * share as u32 / 100) as u16;
+            let panel_w = avail_w.saturating_sub(dialog_w);
+            (
+                Rect::new(left_area.x, dialog_y, dialog_w, dialog_h),
+                Some(Rect::new(
+                    left_area.x + dialog_w + sep_w,
+                    dialog_y,
+                    panel_w,
+                    dialog_h,
+                )),
+                Some(Rect::new(left_area.x + dialog_w, dialog_y, sep_w, dialog_h)),
+            )
+        }
+    } else {
+        (
+            Rect::new(left_area.x, dialog_y, left_area.width, dialog_h),
+            None,
+            None,
+        )
+    };
+
+    ScreenLayout {
+        tier,
+        dialog,
+        panel,
+        panel_separator,
+        input_top,
+        input,
+        input_bottom,
+        footer,
+        rail,
+        rail_separator,
+        toast,
+    }
 }
 
 /// Rail zones (spec §4): header (2 lines + blank), PLAN (1 + items, active item may
@@ -122,10 +207,65 @@ pub struct RailDemand {
     pub idle: bool,
 }
 
+#[cfg(test)]
+#[path = "layout_tests.rs"]
+mod layout_tests;
+
 /// Split the rail: header fixed, anchor fixed, plan as demanded (or 1 line), background
 /// as demanded (max 5), agents = remainder with a 4-line minimum; when the remainder
 /// is under 4 the agents zone collapses to 1 line (`5 agents ▾`).
 pub fn compute_rail(rail: Rect, demand: RailDemand) -> RailLayout {
-    let _ = (rail, demand);
-    todo!("layout::compute_rail")
+    if rail.width == 0 || rail.height == 0 {
+        return RailLayout::default();
+    }
+
+    let x = rail.x;
+    let w = rail.width;
+
+    let header_h = 3.min(rail.height);
+    let header = Rect::new(x, rail.y, w, header_h);
+
+    let rem_after_header = rail.height.saturating_sub(header_h);
+    let anchor_h = 2.min(rem_after_header);
+    let anchor_y = rail.y + rail.height - anchor_h;
+    let anchor = Rect::new(x, anchor_y, w, anchor_h);
+
+    let avail = rail.height.saturating_sub(header_h + anchor_h);
+
+    let plan_h = if demand.agent_select_mode {
+        1.min(avail)
+    } else {
+        demand.plan_lines.min(avail)
+    };
+    let plan_y = header.bottom();
+    let plan = Rect::new(x, plan_y, w, plan_h);
+
+    let avail_after_plan = avail.saturating_sub(plan_h);
+    let bg_lines = if demand.background_lines > 0 {
+        demand.background_lines.min(5).min(avail_after_plan)
+    } else {
+        0
+    };
+
+    let remainder = avail_after_plan.saturating_sub(bg_lines);
+    let agents_h = if remainder >= 4 {
+        remainder
+    } else if remainder >= 1 {
+        1
+    } else {
+        0
+    };
+    let agents_y = plan.bottom();
+    let agents = Rect::new(x, agents_y, w, agents_h);
+
+    let bg_y = anchor.y.saturating_sub(bg_lines);
+    let background = Rect::new(x, bg_y, w, bg_lines);
+
+    RailLayout {
+        header,
+        plan,
+        agents,
+        background,
+        anchor,
+    }
 }

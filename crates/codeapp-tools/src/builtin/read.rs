@@ -1,13 +1,25 @@
 //! `read`: file contents with line numbers.
 
+use std::path::Path;
+
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::helpers::{cap_output, parse_input};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "read";
 
 pub struct ReadTool;
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ReadInput {
+    path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
 
 #[async_trait]
 impl Tool for ReadTool {
@@ -41,7 +53,39 @@ impl Tool for ReadTool {
     /// applies offset/limit, formats `{:>6}\t{line}`, caps to `ctx.output_cap_chars`
     /// (unless `accept_large_output`), title `Read <path>`, preview = line count.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let _ = (input, ctx);
-        todo!("ReadTool::call")
+        let (args, accept_large_output) = parse_input::<ReadInput>(input)?;
+        if args.path.is_empty() {
+            return Err(ToolError::invalid("path cannot be empty"));
+        }
+        let full_path = ctx.resolve(Path::new(&args.path));
+        let bytes = tokio::fs::read(&full_path).await?;
+        let check_len = bytes.len().min(8192);
+        if bytes[..check_len].contains(&0) {
+            return Err(ToolError::failed(format!(
+                "cannot read binary file: {}",
+                args.path
+            )));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|e| ToolError::failed(format!("file is not valid UTF-8: {e}")))?;
+
+        let offset = args.offset.unwrap_or(1).max(1);
+        let limit = args.limit.unwrap_or(2000);
+
+        let mut lines_out = Vec::new();
+        for (line_num, line) in (1..).zip(text.lines()) {
+            if line_num >= offset && lines_out.len() < limit {
+                lines_out.push(format!("{line_num:>6}\t{line}"));
+            }
+        }
+
+        let raw = lines_out.join("\n");
+        let content = cap_output(&raw, accept_large_output, ctx.output_cap_chars);
+        let preview = format!("{} lines", lines_out.len());
+        let title = format!("Read {}", args.path);
+
+        Ok(ToolOutput::text(content)
+            .with_title(title)
+            .with_preview(preview))
     }
 }

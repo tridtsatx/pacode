@@ -15,6 +15,7 @@ pub mod bg;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub(crate) mod helpers;
 pub mod ls;
 pub mod mcp;
 pub mod multi_edit;

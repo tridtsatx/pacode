@@ -9,6 +9,7 @@ description = "Daemon connection: autospawn, reconnect with backoff, typed reque
 codeapp-types = { workspace = true }
 codeapp-config = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros", "process", "fs"] }
+tokio-util = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

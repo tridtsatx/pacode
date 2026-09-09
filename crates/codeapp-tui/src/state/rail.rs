@@ -86,7 +86,39 @@ impl RailState {
     /// Update `idle_since` / `show_session_stats` (spec §5 debounce). Returns true when
     /// the displayed block changed.
     pub fn update_idle(&mut self, turn_active: bool, now: Instant) -> bool {
-        let _ = (turn_active, now);
-        todo!("RailState::update_idle")
+        let is_idle = !turn_active && !self.has_live_agents() && !self.has_running_tasks();
+        if !is_idle {
+            self.idle_since = None;
+            if self.show_session_stats {
+                self.show_session_stats = false;
+                return true;
+            }
+            return false;
+        }
+
+        if self.show_session_stats {
+            return false;
+        }
+
+        match self.idle_since {
+            Some(since) => {
+                if now.saturating_duration_since(since).as_millis() as u64
+                    >= crate::state::IDLE_DEBOUNCE_MS
+                {
+                    self.show_session_stats = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                self.idle_since = Some(now);
+                false
+            }
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "rail_tests.rs"]
+mod rail_tests;

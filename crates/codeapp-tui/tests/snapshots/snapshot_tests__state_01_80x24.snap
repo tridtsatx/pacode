@@ -1,0 +1,28 @@
+---
+source: crates/codeapp-tui/tests/snapshot_tests.rs
+expression: view
+---
+"▎ Refactor TUI layout and split into modules       │Refactor TUI layout         "
+"                                                   │ses_abcdef123               "
+"I'll help you organize the TUI crate with a        │                            "
+"persistent rail and separate dialog column.        │PLAN               1/4 · 40%"
+"                                                   │[✓] Read codebase & analyze…"
+"▣ read_file crates/codeapp-tui/src/layout.rs ok 0.1│[•] Implement TUI layout & …"
+"  │ pub fn compute(area: Rect) -> ScreenLayout...  │    ▰▰▰▰▰▱▱▱ 60%            "
+"                                                   │[ ] Add key bindings & even…"
+"                                                   │[ ] Write unit tests & snap…"
+"                                                   │AGENTS                   5 ●"
+"                                                   │● main  думает · 0.4s       "
+"                                                   │○ codegen  1m47s            "
+"                                                   │○ tester  23s               "
+"                                                   │✓ indexer  0.4s             "
+"                                                   │✓ parser  0.4s              "
+"                                                   │                            "
+"                                                   │                            "
+"                                                   │                            "
+"                                                   │                            "
+"───────────────────────────────────────────────────│                            "
+"❯                                                  │BACKGROUND              1 ◍ "
+"───────────────────────────────────────────────────│◍ cargo test --all 214/380  "
+"Build · Claude 3 7 Sonnet | high /effort     /model│~/zed/codeapp:master        "
+"▸▸ ask before edits and commands     10.7K · ctrl+p│• codeapp 0.1.0-dev         "

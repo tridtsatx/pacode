@@ -2,7 +2,24 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
+use codeapp_client::ClientOptions;
+use codeapp_config::Paths;
+use codeapp_types::{Attach, Config, Effort, Mode, ModelRoute, SessionId};
+
+#[path = "daemon.rs"]
+mod daemon;
+#[path = "run.rs"]
+mod run;
+#[path = "serve.rs"]
+mod serve;
+#[path = "sessions.rs"]
+mod sessions;
+
+#[cfg(test)]
+#[path = "cli_tests.rs"]
+mod cli_tests;
 
 #[derive(Parser, Debug)]
 #[command(name = "codeapp", version, about = "background-first coding agent")]
@@ -80,8 +97,169 @@ pub enum DaemonAction {
     },
 }
 
+pub fn build_attach(
+    resume: Option<String>,
+    cwd: PathBuf,
+    model: Option<ModelRoute>,
+    effort: Option<Effort>,
+    mode: Option<Mode>,
+) -> Attach {
+    match resume {
+        Some(id) if !id.trim().is_empty() => Attach::Resume {
+            session: SessionId::new(id.trim()),
+        },
+        _ => Attach::New {
+            cwd,
+            model,
+            effort,
+            mode,
+        },
+    }
+}
+
+pub fn parse_model_override(
+    raw: Option<&str>,
+    config: &Config,
+) -> anyhow::Result<Option<ModelRoute>> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let default_provider = config
+        .default_route()
+        .map(|r| r.provider)
+        .or_else(|| config.providers.keys().next().cloned());
+    let known = config.providers.keys().map(String::as_str);
+    let route = ModelRoute::parse(s, known, default_provider.as_deref())
+        .or_else(|| ModelRoute::parse_lossy(s))
+        .ok_or_else(|| anyhow::anyhow!("invalid model: {s}"))?;
+    Ok(Some(route))
+}
+
+pub fn parse_effort_override(raw: Option<&str>) -> anyhow::Result<Option<Effort>> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let effort = Effort::parse(s).ok_or_else(|| {
+        anyhow::anyhow!("invalid effort level: {s} (expected low, medium, high, max)")
+    })?;
+    Ok(Some(effort))
+}
+
+pub fn parse_mode_override(raw: Option<&str>) -> anyhow::Result<Option<Mode>> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let mode = Mode::parse(s)
+        .ok_or_else(|| anyhow::anyhow!("invalid mode: {s} (expected build, auto, plan, bypass)"))?;
+    Ok(Some(mode))
+}
+
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let _ = cli;
-    todo!("cli::main")
+
+    if let Some(ref dir) = cli.dir {
+        std::env::set_current_dir(dir)
+            .with_context(|| format!("failed to change directory to {}", dir.display()))?;
+    }
+
+    let paths = Paths::discover();
+    paths
+        .ensure_dirs()
+        .context("failed to create codeapp directories")?;
+
+    let config = codeapp_config::load(&paths).context("failed to load config")?;
+
+    let socket = cli
+        .socket
+        .clone()
+        .or_else(|| config.daemon.socket.clone())
+        .unwrap_or_else(|| paths.socket_path());
+
+    let log_level =
+        codeapp_config::logging::level_from_env(std::env::var("CODEAPP_LOG").ok().as_deref())
+            .unwrap_or(log::LevelFilter::Info);
+
+    match cli.command {
+        Some(Command::Serve {
+            detach,
+            socket: serve_socket,
+        }) => {
+            let socket = serve_socket
+                .or(cli.socket)
+                .or_else(|| config.daemon.socket.clone())
+                .unwrap_or_else(|| paths.socket_path());
+            serve::run(detach, socket, paths, config, log_level)
+        }
+        Some(Command::Run {
+            prompt,
+            json,
+            model,
+            effort,
+            mode,
+            dir,
+        }) => {
+            if let Some(ref d) = dir {
+                std::env::set_current_dir(d)
+                    .with_context(|| format!("failed to change directory to {}", d.display()))?;
+            }
+            codeapp_config::logging::init_file_logger(&paths.client_log(), log_level)
+                .context("failed to initialize client logger")?;
+            let cwd = std::env::current_dir().context("failed to get current working directory")?;
+            let model_route = parse_model_override(model.as_deref(), &config)?;
+            let effort_level = parse_effort_override(effort.as_deref())?;
+            let mode_val = parse_mode_override(mode.as_deref())?;
+            let run_opts = run::RunOptions {
+                prompt,
+                json,
+                model: model_route,
+                effort: effort_level,
+                mode: mode_val,
+                cwd,
+                socket: Some(socket),
+                paths,
+            };
+            run::run(run_opts)
+        }
+        Some(Command::Sessions { action }) => {
+            codeapp_config::logging::init_file_logger(&paths.client_log(), log_level)
+                .context("failed to initialize client logger")?;
+            sessions::run(action, Some(socket), paths)
+        }
+        Some(Command::Daemon { action }) => {
+            codeapp_config::logging::init_file_logger(&paths.client_log(), log_level)
+                .context("failed to initialize client logger")?;
+            daemon::run(action, socket)
+        }
+        None => {
+            codeapp_config::logging::init_file_logger(&paths.client_log(), log_level)
+                .context("failed to initialize client logger")?;
+            let cwd = std::env::current_dir().context("failed to get current working directory")?;
+            let model_route = parse_model_override(cli.model.as_deref(), &config)?;
+            let effort_level = parse_effort_override(cli.effort.as_deref())?;
+            let mode_val = parse_mode_override(cli.mode.as_deref())?;
+            let attach = build_attach(cli.resume, cwd.clone(), model_route, effort_level, mode_val);
+
+            let mut client_opts = ClientOptions::new(paths.clone(), codeapp_config::APP_VERSION);
+            client_opts.socket = Some(socket);
+
+            let tui_opts = codeapp_tui::TuiOptions {
+                client: client_opts,
+                config,
+                attach,
+                initial_prompt: cli.prompt,
+                cwd,
+                app_version: codeapp_config::APP_VERSION.to_string(),
+            };
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to create tokio current_thread runtime")?;
+
+            rt.block_on(async { codeapp_tui::run(tui_opts).await })
+                .context("tui error")?;
+
+            Ok(())
+        }
+    }
 }

@@ -33,8 +33,152 @@ pub fn gate(
     risk: Option<RiskLevel>,
     allow_catastrophic: bool,
 ) -> GateDecision {
-    let _ = (mode, kind, risk, allow_catastrophic);
-    todo!("permissions::gate")
+    match kind {
+        ToolKind::ReadOnly | ToolKind::Control | ToolKind::Network => GateDecision::Allow,
+        ToolKind::Edit => match mode {
+            Mode::Build => GateDecision::Ask,
+            Mode::Auto => GateDecision::Allow,
+            Mode::Plan => {
+                GateDecision::Deny("file edits are not permitted in plan mode".to_string())
+            }
+            Mode::Bypass => GateDecision::Allow,
+        },
+        ToolKind::Exec => {
+            let exec_risk = risk.unwrap_or(RiskLevel::Confirm);
+            match exec_risk {
+                RiskLevel::Catastrophic => {
+                    if allow_catastrophic {
+                        GateDecision::Allow
+                    } else {
+                        GateDecision::Deny(
+                            "catastrophic operations are denied by policy".to_string(),
+                        )
+                    }
+                }
+                RiskLevel::Safe => GateDecision::Allow,
+                RiskLevel::Low => match mode {
+                    Mode::Build => GateDecision::Ask,
+                    Mode::Auto => GateDecision::Allow,
+                    Mode::Plan => GateDecision::Deny(
+                        "exec operations are not permitted in plan mode".to_string(),
+                    ),
+                    Mode::Bypass => GateDecision::Allow,
+                },
+                RiskLevel::Confirm => match mode {
+                    Mode::Build => GateDecision::Ask,
+                    Mode::Auto => GateDecision::Ask,
+                    Mode::Plan => GateDecision::Deny(
+                        "exec operations are not permitted in plan mode".to_string(),
+                    ),
+                    Mode::Bypass => GateDecision::Allow,
+                },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codeapp_types::RiskLevel;
+
+    #[test]
+    fn test_gate_table_all_modes() {
+        // ReadOnly & Network: Allow in all modes
+        for mode in [Mode::Build, Mode::Auto, Mode::Plan, Mode::Bypass] {
+            assert_eq!(
+                gate(mode, ToolKind::ReadOnly, None, false),
+                GateDecision::Allow
+            );
+            assert_eq!(
+                gate(mode, ToolKind::Network, None, false),
+                GateDecision::Allow
+            );
+        }
+
+        // Edit
+        assert_eq!(
+            gate(Mode::Build, ToolKind::Edit, None, false),
+            GateDecision::Ask
+        );
+        assert_eq!(
+            gate(Mode::Auto, ToolKind::Edit, None, false),
+            GateDecision::Allow
+        );
+        assert!(matches!(
+            gate(Mode::Plan, ToolKind::Edit, None, false),
+            GateDecision::Deny(_)
+        ));
+        assert_eq!(
+            gate(Mode::Bypass, ToolKind::Edit, None, false),
+            GateDecision::Allow
+        );
+
+        // Exec Safe
+        for mode in [Mode::Build, Mode::Auto, Mode::Plan, Mode::Bypass] {
+            assert_eq!(
+                gate(mode, ToolKind::Exec, Some(RiskLevel::Safe), false),
+                GateDecision::Allow
+            );
+        }
+
+        // Exec Low
+        assert_eq!(
+            gate(Mode::Build, ToolKind::Exec, Some(RiskLevel::Low), false),
+            GateDecision::Ask
+        );
+        assert_eq!(
+            gate(Mode::Auto, ToolKind::Exec, Some(RiskLevel::Low), false),
+            GateDecision::Allow
+        );
+        assert!(matches!(
+            gate(Mode::Plan, ToolKind::Exec, Some(RiskLevel::Low), false),
+            GateDecision::Deny(_)
+        ));
+        assert_eq!(
+            gate(Mode::Bypass, ToolKind::Exec, Some(RiskLevel::Low), false),
+            GateDecision::Allow
+        );
+
+        // Exec Confirm
+        assert_eq!(
+            gate(Mode::Build, ToolKind::Exec, Some(RiskLevel::Confirm), false),
+            GateDecision::Ask
+        );
+        assert_eq!(
+            gate(Mode::Auto, ToolKind::Exec, Some(RiskLevel::Confirm), false),
+            GateDecision::Ask
+        );
+        assert!(matches!(
+            gate(Mode::Plan, ToolKind::Exec, Some(RiskLevel::Confirm), false),
+            GateDecision::Deny(_)
+        ));
+        assert_eq!(
+            gate(
+                Mode::Bypass,
+                ToolKind::Exec,
+                Some(RiskLevel::Confirm),
+                false
+            ),
+            GateDecision::Allow
+        );
+
+        // Exec Catastrophic without allow_catastrophic
+        for mode in [Mode::Build, Mode::Auto, Mode::Plan, Mode::Bypass] {
+            assert!(matches!(
+                gate(mode, ToolKind::Exec, Some(RiskLevel::Catastrophic), false),
+                GateDecision::Deny(_)
+            ));
+        }
+
+        // Exec Catastrophic with allow_catastrophic
+        for mode in [Mode::Build, Mode::Auto, Mode::Plan, Mode::Bypass] {
+            assert_eq!(
+                gate(mode, ToolKind::Exec, Some(RiskLevel::Catastrophic), true),
+                GateDecision::Allow
+            );
+        }
+    }
 }
 
 /// Key for the AllowSession cache: `"<tool>:<target>"` where target is the file path

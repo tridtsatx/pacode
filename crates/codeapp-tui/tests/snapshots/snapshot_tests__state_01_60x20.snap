@@ -1,0 +1,24 @@
+---
+source: crates/codeapp-tui/tests/snapshot_tests.rs
+expression: view
+---
+"▎ Refactor TUI layout and split into modules                "
+"                                                            "
+"I'll help you organize the TUI crate with a persistent rail "
+"and separate dialog column.                                 "
+"                                                            "
+"▣ read_file crates/codeapp-tui/src/layout.rs ok 0.1s        "
+"  │ pub fn compute(area: Rect) -> ScreenLayout...           "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"────────────────────────────────────────────────────────────"
+"❯                                                           "
+"────────────────────────────────────────────────────────────"
+"Build · Claude 3 7 Sonnet | high /effort              /model"
+"▸▸ ask before edits and commands              10.7K · ctrl+p"

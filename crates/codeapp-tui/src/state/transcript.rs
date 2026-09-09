@@ -3,11 +3,16 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use codeapp_render::{LineCache, StreamBuffer};
+use codeapp_render::{LineCache, StreamBuffer, StreamKind, StreamOp};
 use codeapp_types::{TranscriptItem, TranscriptKind};
+
+#[cfg(test)]
+#[path = "transcript_tests.rs"]
+mod transcript_tests;
 
 /// One transcript row group. `id` is the item seq from the daemon (stable across
 /// updates), `cache_id` keys the render cache.
+#[derive(Clone, Debug)]
 pub struct Cell {
     pub id: u64,
     pub kind: CellKind,
@@ -16,6 +21,7 @@ pub struct Cell {
     pub ts_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum CellKind {
     /// Wraps the daemon item; `Assistant`/`Reasoning` text is the *revealed* text.
     Item(TranscriptKind),
@@ -54,38 +60,229 @@ impl Transcript {
 
     /// Replace everything (snapshot).
     pub fn reset(&mut self, items: Vec<TranscriptItem>, has_more: bool) {
-        let _ = (items, has_more);
-        todo!("Transcript::reset")
+        self.cells.clear();
+        self.cache.clear();
+        self.stream = None;
+        self.live_cell = None;
+        self.scroll_from_bottom = 0;
+        self.has_more_history = has_more;
+        self.loading_history = false;
+
+        for item in items {
+            let cell = Cell {
+                id: item.seq,
+                kind: CellKind::Item(item.kind),
+                version: 0,
+                ts_ms: item.ts_ms,
+            };
+            self.cells.push_back(cell);
+        }
+        self.enforce_cap();
     }
 
     /// Prepend older items (history page).
     pub fn prepend(&mut self, items: Vec<TranscriptItem>, has_more: bool) {
-        let _ = (items, has_more);
-        todo!("Transcript::prepend")
+        self.has_more_history = has_more;
+        self.loading_history = false;
+
+        for item in items.into_iter().rev() {
+            let cell = Cell {
+                id: item.seq,
+                kind: CellKind::Item(item.kind),
+                version: 0,
+                ts_ms: item.ts_ms,
+            };
+            self.cells.push_front(cell);
+        }
+        self.enforce_cap();
     }
 
     /// `ItemAdded` / `ItemUpdated`: insert or replace by seq. Assistant/Reasoning items
     /// that are not complete become the live cell with an empty revealed text.
     pub fn upsert(&mut self, item: TranscriptItem, now: Instant) {
-        let _ = (item, now);
-        todo!("Transcript::upsert")
+        let seq = item.seq;
+        match item.kind {
+            TranscriptKind::Assistant { text, complete } => {
+                if !complete {
+                    self.live_cell = Some(seq);
+                    let mut sb = self.stream.take().unwrap_or_else(|| StreamBuffer::new(now));
+                    if !text.is_empty() {
+                        sb.push(StreamKind::Text, &text);
+                    }
+                    self.stream = Some(sb);
+                    let kind = TranscriptKind::Assistant {
+                        text: String::new(),
+                        complete: false,
+                    };
+                    self.insert_or_replace(seq, kind, item.ts_ms);
+                } else {
+                    if self.live_cell == Some(seq) {
+                        self.flush_stream();
+                        self.live_cell = None;
+                        self.stream = None;
+                    }
+                    let kind = TranscriptKind::Assistant {
+                        text,
+                        complete: true,
+                    };
+                    self.insert_or_replace(seq, kind, item.ts_ms);
+                }
+            }
+            TranscriptKind::Reasoning { text, complete } => {
+                if !complete {
+                    self.live_cell = Some(seq);
+                    let mut sb = self.stream.take().unwrap_or_else(|| StreamBuffer::new(now));
+                    if !text.is_empty() {
+                        sb.push(StreamKind::Reasoning, &text);
+                    }
+                    self.stream = Some(sb);
+                    let kind = TranscriptKind::Reasoning {
+                        text: String::new(),
+                        complete: false,
+                    };
+                    self.insert_or_replace(seq, kind, item.ts_ms);
+                } else {
+                    if self.live_cell == Some(seq) {
+                        self.flush_stream();
+                        self.live_cell = None;
+                        self.stream = None;
+                    }
+                    let kind = TranscriptKind::Reasoning {
+                        text,
+                        complete: true,
+                    };
+                    self.insert_or_replace(seq, kind, item.ts_ms);
+                }
+            }
+            other => {
+                self.insert_or_replace(seq, other, item.ts_ms);
+            }
+        }
+        self.enforce_cap();
+    }
+
+    fn insert_or_replace(&mut self, seq: u64, kind: TranscriptKind, ts_ms: u64) {
+        if let Some(existing) = self.cells.iter_mut().find(|c| c.id == seq) {
+            existing.kind = CellKind::Item(kind);
+            existing.version = existing.version.wrapping_add(1);
+            existing.ts_ms = ts_ms;
+        } else {
+            self.cells.push_back(Cell {
+                id: seq,
+                kind: CellKind::Item(kind),
+                version: 0,
+                ts_ms,
+            });
+        }
     }
 
     /// `TextDelta`/`ReasoningDelta` for `item_seq`: queue into the stream buffer.
     pub fn push_delta(&mut self, item_seq: u64, text: &str, reasoning: bool, now: Instant) {
-        let _ = (item_seq, text, reasoning, now);
-        todo!("Transcript::push_delta")
+        if text.is_empty() {
+            return;
+        }
+        if self.live_cell == Some(item_seq) {
+            let sb = self.stream.get_or_insert_with(|| StreamBuffer::new(now));
+            let kind = if reasoning {
+                StreamKind::Reasoning
+            } else {
+                StreamKind::Text
+            };
+            sb.push(kind, text);
+        } else if let Some(cell) = self.cells.iter_mut().find(|c| c.id == item_seq) {
+            self.live_cell = Some(item_seq);
+            let sb = self.stream.get_or_insert_with(|| StreamBuffer::new(now));
+            let kind = if reasoning {
+                StreamKind::Reasoning
+            } else {
+                StreamKind::Text
+            };
+            sb.push(kind, text);
+            cell.version = cell.version.wrapping_add(1);
+        }
     }
 
     /// Reveal paced text into the live cell. Returns true when something was revealed.
     pub fn tick_stream(&mut self, now: Instant) -> bool {
-        let _ = now;
-        todo!("Transcript::tick_stream")
+        let Some(live_id) = self.live_cell else {
+            return false;
+        };
+        let Some(ref mut sb) = self.stream else {
+            return false;
+        };
+        let ops = sb.reveal(now);
+        if ops.is_empty() {
+            return false;
+        }
+
+        if let Some(cell) = self.cells.iter_mut().find(|c| c.id == live_id) {
+            for op in ops {
+                match op {
+                    StreamOp::Text(s) => match &mut cell.kind {
+                        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+                            text.push_str(&s);
+                        }
+                        CellKind::Item(TranscriptKind::Reasoning { .. }) => {
+                            cell.kind = CellKind::Item(TranscriptKind::Assistant {
+                                text: s,
+                                complete: false,
+                            });
+                        }
+                        _ => {}
+                    },
+                    StreamOp::Reasoning(s) => {
+                        if let CellKind::Item(TranscriptKind::Reasoning { text, .. }) =
+                            &mut cell.kind
+                        {
+                            text.push_str(&s);
+                        }
+                    }
+                    StreamOp::CloseReasoning => {}
+                }
+            }
+            cell.version = cell.version.wrapping_add(1);
+            true
+        } else {
+            false
+        }
     }
 
     /// Flush the stream (item complete or interrupted).
     pub fn flush_stream(&mut self) {
-        todo!("Transcript::flush_stream")
+        let Some(live_id) = self.live_cell else {
+            return;
+        };
+        let Some(ref mut sb) = self.stream else {
+            return;
+        };
+        let ops = sb.flush();
+        if let Some(cell) = self.cells.iter_mut().find(|c| c.id == live_id) {
+            for op in ops {
+                match op {
+                    StreamOp::Text(s) => match &mut cell.kind {
+                        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+                            text.push_str(&s);
+                        }
+                        CellKind::Item(TranscriptKind::Reasoning { .. }) => {
+                            cell.kind = CellKind::Item(TranscriptKind::Assistant {
+                                text: s,
+                                complete: false,
+                            });
+                        }
+                        _ => {}
+                    },
+                    StreamOp::Reasoning(s) => {
+                        if let CellKind::Item(TranscriptKind::Reasoning { text, .. }) =
+                            &mut cell.kind
+                        {
+                            text.push_str(&s);
+                        }
+                    }
+                    StreamOp::CloseReasoning => {}
+                }
+            }
+            cell.version = cell.version.wrapping_add(1);
+        }
     }
 
     pub fn has_backlog(&self) -> bool {
@@ -93,8 +290,10 @@ impl Transcript {
     }
 
     pub fn scroll_by(&mut self, delta: i32, total_lines: usize, viewport: usize) {
-        let _ = (delta, total_lines, viewport);
-        todo!("Transcript::scroll_by")
+        let max_scroll = total_lines.saturating_sub(viewport);
+        let new_scroll =
+            (self.scroll_from_bottom as i64 + delta as i64).clamp(0, max_scroll as i64);
+        self.scroll_from_bottom = new_scroll as usize;
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -103,6 +302,17 @@ impl Transcript {
 
     /// Evict oldest cells past `max_cells` (keeping the live cell), dropping their cache.
     pub fn enforce_cap(&mut self) {
-        todo!("Transcript::enforce_cap")
+        while self.cells.len() > self.max_cells {
+            if let Some(front) = self.cells.front()
+                && Some(front.id) == self.live_cell
+            {
+                break;
+            }
+            if let Some(evicted) = self.cells.pop_front() {
+                self.cache.invalidate_cell(evicted.id);
+            } else {
+                break;
+            }
+        }
     }
 }

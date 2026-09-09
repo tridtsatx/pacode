@@ -12,8 +12,35 @@ pub async fn generate_title(
     first_prompt: &str,
     first_answer: &str,
 ) -> Option<String> {
-    let _ = (provider, model, first_prompt, first_answer);
-    todo!("naming::generate_title")
+    use codeapp_provider::CompletionRequest;
+    use codeapp_types::{Message, StreamEvent};
+    use futures::StreamExt;
+
+    let system_static = "Generate a concise 3-6 word title summarizing the conversation in the language of the user's prompt. Reply with ONLY the title, no quotation marks, no punctuation at the end, no extra words.".to_string();
+    let prompt_user = format!("User: {first_prompt}\n\nAssistant: {first_answer}");
+    let req = CompletionRequest {
+        model: model.to_string(),
+        system_static,
+        system_dynamic: String::new(),
+        messages: vec![Message::user(prompt_user)],
+        tools: Vec::new(),
+        effort: None,
+        max_output_tokens: Some(40),
+    };
+
+    let mut stream = provider.complete(req).await.ok()?;
+    let mut title_acc = String::new();
+    while let Some(event_res) = stream.next().await {
+        match event_res {
+            Ok(StreamEvent::TextDelta { text }) => {
+                title_acc.push_str(&text);
+            }
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+
+    clean_title(&title_acc)
 }
 
 /// Trim quotes/periods, collapse whitespace, cap at 48 chars.

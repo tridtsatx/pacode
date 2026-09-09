@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use codeapp_mcp::{McpPool, McpToolInfo};
 use serde_json::Value;
 
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use super::helpers::cap_output;
+use crate::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub struct McpTool {
     pool: Arc<McpPool>,
@@ -31,8 +32,10 @@ impl McpTool {
 /// Build proxies for every tool of every configured server (lazy servers answer from
 /// the schema cache).
 pub async fn mcp_tools(pool: Arc<McpPool>) -> Vec<Arc<dyn Tool>> {
-    let _ = pool;
-    todo!("mcp::mcp_tools")
+    let all = pool.list_all_tools().await;
+    all.into_iter()
+        .map(|(server, info)| Arc::new(McpTool::new(pool.clone(), server, info)) as Arc<dyn Tool>)
+        .collect()
 }
 
 #[async_trait]
@@ -58,7 +61,39 @@ impl Tool for McpTool {
     /// Strips `intent`/`accept_large_output` from the input, calls
     /// `pool.call(server, tool, args)`, maps `is_error`, caps output.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let _ = (input, ctx, &self.server);
-        todo!("McpTool::call")
+        let accept_large_output = input
+            .get(ACCEPT_LARGE_OUTPUT_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let mut args = input;
+        if let Value::Object(ref mut map) = args {
+            map.remove(INTENT_KEY);
+            map.remove(ACCEPT_LARGE_OUTPUT_KEY);
+        }
+
+        let result = self
+            .pool
+            .call(&self.server, &self.info.name, args)
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))?;
+
+        let capped = cap_output(&result.content, accept_large_output, ctx.output_cap_chars);
+
+        let preview = capped
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default()
+            .to_string();
+
+        let mut output = if result.is_error {
+            ToolOutput::error(capped)
+        } else {
+            ToolOutput::text(capped)
+        };
+
+        output = output.with_title(&self.name).with_preview(preview);
+        Ok(output)
     }
 }

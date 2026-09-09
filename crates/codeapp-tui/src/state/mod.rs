@@ -9,8 +9,10 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use codeapp_client::ClientEvent;
+use codeapp_types::time::now_ms;
 use codeapp_types::{
-    AgentId, Config, Effort, Event, Mode, ModelInfo, ModelRoute, SessionMeta, TaskId, ToastLevel,
+    AgentId, Config, Effort, Event, Mode, ModelInfo, ModelRoute, PermissionDecision, SessionMeta,
+    TaskId, TaskStatus, ToastLevel, TranscriptKind,
 };
 
 pub use input::InputState;
@@ -154,14 +156,240 @@ impl AppState {
     /// Fold a client event into the state (spec §5 state table, §7 follow rules).
     /// Returns true when a redraw is needed (almost always).
     pub fn apply_client_event(&mut self, event: ClientEvent, now: Instant) -> bool {
-        let _ = (event, now);
-        todo!("AppState::apply_client_event")
+        match event {
+            ClientEvent::Connected { .. } => {
+                self.connection = Connection::Connected;
+                self.dirty = true;
+                true
+            }
+            ClientEvent::Disconnected { reason } => {
+                self.connection = Connection::Disconnected { reason };
+                self.dirty = true;
+                true
+            }
+            ClientEvent::Reconnecting { attempt } => {
+                self.connection = Connection::Reconnecting { attempt };
+                self.dirty = true;
+                true
+            }
+            ClientEvent::Snapshot(snapshot) => {
+                self.connection = Connection::Connected;
+                self.meta = Some(snapshot.meta);
+                self.transcript
+                    .reset(snapshot.transcript, snapshot.has_more_history);
+                self.turn_active = snapshot.turn_active;
+                self.rail.plan = snapshot.plan;
+                self.rail.agents = snapshot.agents;
+                self.rail.agents.sort_by_key(|a| a.started_at_ms);
+                self.rail.tasks = snapshot.tasks;
+                self.rail.tasks.sort_by_key(|t| t.started_at_ms);
+                self.rail.usage = snapshot.usage;
+                self.rail.update_idle(self.turn_active, now);
+                for (i, perm) in snapshot.pending_permissions.into_iter().enumerate() {
+                    let ts_ms = perm.created_at_ms;
+                    self.transcript.cells.push_back(Cell {
+                        id: snapshot.seq.wrapping_add(1).wrapping_add(i as u64),
+                        kind: CellKind::Item(TranscriptKind::Permission(perm)),
+                        version: 0,
+                        ts_ms,
+                    });
+                }
+                self.dirty = true;
+                true
+            }
+            ClientEvent::Event { seq, event } => {
+                self.apply_event(seq, event, now);
+                self.dirty = true;
+                true
+            }
+        }
     }
 
     /// Fold a daemon event (`ClientEvent::Event`) into transcript/rail/panel/toasts.
     pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) {
-        let _ = (seq, event, now);
-        todo!("AppState::apply_event")
+        match event {
+            Event::SessionUpdated(meta) => {
+                self.meta = Some(meta);
+            }
+            Event::TurnStarted { agent, turn: _ } => {
+                if agent.is_main() {
+                    self.turn_active = true;
+                    self.rail.update_idle(true, now);
+                }
+            }
+            Event::TurnEnded {
+                agent,
+                turn: _,
+                usage: _,
+                stop: _,
+            } => {
+                if agent.is_main() {
+                    self.turn_active = false;
+                    self.transcript.flush_stream();
+                    self.rail.update_idle(false, now);
+                }
+            }
+            Event::ItemAdded(item) => {
+                if item.agent.is_main() {
+                    self.transcript.upsert(item, now);
+                } else if let Focus::Panel {
+                    target: PanelTarget::Agent(ref id),
+                    ..
+                } = self.focus
+                    && *id == item.agent
+                {
+                    self.panel.agent_transcript.upsert(item, now);
+                }
+            }
+            Event::ItemUpdated(item) => {
+                if item.agent.is_main() {
+                    self.transcript.upsert(item, now);
+                } else if let Focus::Panel {
+                    target: PanelTarget::Agent(ref id),
+                    ..
+                } = self.focus
+                    && *id == item.agent
+                {
+                    self.panel.agent_transcript.upsert(item, now);
+                }
+            }
+            Event::TextDelta {
+                agent,
+                item_seq,
+                text,
+            } => {
+                if agent.is_main() {
+                    self.transcript.push_delta(item_seq, &text, false, now);
+                } else if let Focus::Panel {
+                    target: PanelTarget::Agent(ref id),
+                    ..
+                } = self.focus
+                    && *id == agent
+                {
+                    self.panel
+                        .agent_transcript
+                        .push_delta(item_seq, &text, false, now);
+                }
+            }
+            Event::ReasoningDelta {
+                agent,
+                item_seq,
+                text,
+            } => {
+                if agent.is_main() {
+                    self.transcript.push_delta(item_seq, &text, true, now);
+                } else if let Focus::Panel {
+                    target: PanelTarget::Agent(ref id),
+                    ..
+                } = self.focus
+                    && *id == agent
+                {
+                    self.panel
+                        .agent_transcript
+                        .push_delta(item_seq, &text, true, now);
+                }
+            }
+            Event::PermissionRequested(req) => {
+                let ts_ms = req.created_at_ms;
+                self.transcript.cells.push_back(Cell {
+                    id: seq,
+                    kind: CellKind::Item(TranscriptKind::Permission(req)),
+                    version: 0,
+                    ts_ms,
+                });
+            }
+            Event::PermissionResolved {
+                permission,
+                decision,
+            } => {
+                for cell in &mut self.transcript.cells {
+                    if let CellKind::Item(TranscriptKind::Permission(ref req)) = cell.kind
+                        && req.id == permission
+                    {
+                        let (level, text) = match decision {
+                            PermissionDecision::AllowOnce => {
+                                (ToastLevel::Success, format!("Allowed: {}", req.title))
+                            }
+                            PermissionDecision::AllowSession => (
+                                ToastLevel::Success,
+                                format!("Allowed for session: {}", req.title),
+                            ),
+                            PermissionDecision::Deny => {
+                                (ToastLevel::Warn, format!("Denied: {}", req.title))
+                            }
+                        };
+                        cell.kind = CellKind::Item(TranscriptKind::Notice { level, text });
+                        cell.version = cell.version.wrapping_add(1);
+                        break;
+                    }
+                }
+            }
+            Event::PlanUpdated(plan) => {
+                self.rail.plan = plan;
+            }
+            Event::AgentAdded(info) => {
+                self.rail.upsert_agent(info);
+            }
+            Event::AgentUpdated(info) => {
+                if !info.status.is_live()
+                    && let Focus::Panel {
+                        target: PanelTarget::Agent(ref id),
+                        ref mut follow,
+                        ..
+                    } = self.focus
+                {
+                    if *id == info.id {
+                        *follow = false;
+                    } else if *follow {
+                        let title = format!("{} finished", info.name);
+                        self.push_toast(ToastLevel::Info, title, info.summary.clone(), now);
+                    }
+                }
+                self.rail.upsert_agent(info);
+            }
+            Event::TaskAdded(info) => {
+                self.rail.upsert_task(info);
+            }
+            Event::TaskUpdated(info) => {
+                if info.status.is_terminal()
+                    && let Focus::Panel { follow: true, .. } = self.focus
+                {
+                    let level = match info.status {
+                        TaskStatus::Failed => ToastLevel::Error,
+                        _ => ToastLevel::Success,
+                    };
+                    let duration =
+                        codeapp_types::time::format_duration_ms(info.duration_ms(now_ms()));
+                    let title = format!(
+                        "{} {}",
+                        info.label,
+                        if info.status == TaskStatus::Failed {
+                            "failed"
+                        } else {
+                            "completed"
+                        }
+                    );
+                    self.push_toast(level, title, Some(duration), now);
+                }
+                self.rail.upsert_task(info);
+            }
+            Event::UsageUpdated(usage) => {
+                self.rail.usage = usage;
+            }
+            Event::Toast {
+                level,
+                title,
+                detail,
+            } => {
+                self.push_toast(level, title, detail, now);
+            }
+            Event::DaemonShuttingDown => {
+                self.connection = Connection::Disconnected {
+                    reason: "Daemon shutting down".into(),
+                };
+            }
+        }
+        self.rail.update_idle(self.turn_active, now);
     }
 
     pub fn push_toast(
@@ -171,14 +399,29 @@ impl AppState {
         detail: Option<String>,
         now: Instant,
     ) {
-        let _ = (level, title, detail, now);
-        todo!("AppState::push_toast")
+        let toast = Toast {
+            level,
+            title,
+            detail,
+            shown_at: now,
+        };
+        self.toasts.push_back(toast);
+        while self.toasts.len() > TOAST_MAX {
+            self.toasts.pop_front();
+        }
+        self.dirty = true;
     }
 
     /// Drop expired toasts; returns true when something changed.
     pub fn expire_toasts(&mut self, now: Instant) -> bool {
-        let _ = now;
-        todo!("AppState::expire_toasts")
+        let before = self.toasts.len();
+        self.toasts
+            .retain(|t| now.saturating_duration_since(t.shown_at).as_secs() < TOAST_TTL_SECS);
+        let changed = self.toasts.len() != before;
+        if changed {
+            self.dirty = true;
+        }
+        changed
     }
 
     pub fn mode(&self) -> Mode {
@@ -201,5 +444,16 @@ impl AppState {
     /// Whether the paced stream needs its 33 ms tick.
     pub fn needs_stream_tick(&self) -> bool {
         self.transcript.has_backlog() || self.panel.agent_transcript.has_backlog()
+    }
+
+    pub fn tick_stream(&mut self, now: Instant) -> bool {
+        let r1 = self.transcript.tick_stream(now);
+        let r2 = self.panel.agent_transcript.tick_stream(now);
+        if r1 || r2 {
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
     }
 }
