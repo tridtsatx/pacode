@@ -328,6 +328,43 @@ impl ToolHost for SessionHost {
         }
     }
 
+    fn request_agent_status(&self, agent: &AgentId) -> Result<(), ToolError> {
+        let target = self
+            .session
+            .agent(agent)
+            .ok_or_else(|| ToolError::failed(format!("agent not found: {agent}")))?;
+        if !target.info().status.is_live() {
+            return Err(ToolError::failed(format!("agent {agent} is not running")));
+        }
+        target
+            .injections
+            .push(crate::inject::Injection::StatusRequest);
+        Ok(())
+    }
+
+    fn report_status(&self, text: String) -> Result<(), ToolError> {
+        let me = self
+            .session
+            .agent(&self.agent)
+            .ok_or_else(|| ToolError::failed("agent not found"))?;
+        let info = me.info();
+        let parent_id = info
+            .parent
+            .clone()
+            .ok_or_else(|| ToolError::invalid("only subagents can report status"))?;
+        let parent = self
+            .session
+            .agent(&parent_id)
+            .ok_or_else(|| ToolError::failed("parent agent is gone"))?;
+        parent
+            .injections
+            .push(crate::inject::Injection::AgentStatus { agent: info, text });
+        if parent.id.is_main() && !parent.is_running() {
+            crate::turn::start_turn(self.session.clone(), parent);
+        }
+        Ok(())
+    }
+
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         self.session
             .stop_agent(agent)

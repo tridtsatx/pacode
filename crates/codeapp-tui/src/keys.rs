@@ -29,11 +29,13 @@ pub enum Action {
 pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Action> {
     state.dirty = true;
 
-    // 1. Interrupt / Quit via ctrl+c
+    // 1. ctrl+c / ctrl+d (Cyrillic layout letters are mapped to their Latin key).
+    let key = normalize_cyrillic_ctrl(key);
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('d')) {
+        state.quit = true;
+        return vec![Action::Quit];
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-        if state.turn_active {
-            return vec![Action::Send(Request::Interrupt)];
-        }
         if let Some(prev) = state.ctrl_c_at
             && now.saturating_duration_since(prev) <= Duration::from_secs(2)
         {
@@ -41,6 +43,16 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             return vec![Action::Quit];
         }
         state.ctrl_c_at = Some(now);
+        if !state.input.is_empty() {
+            state.input.text.clear();
+            state.input.cursor = 0;
+            state.input.history_index = None;
+            state.input.draft.clear();
+            return vec![];
+        }
+        if state.turn_active {
+            return vec![Action::Send(Request::Interrupt)];
+        }
         return vec![];
     }
 
@@ -488,4 +500,49 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
     }
 
     vec![]
+}
+
+/// Map a Cyrillic (ЙЦУКЕН) letter pressed with CONTROL to the Latin letter on the same
+/// key, so `ctrl+в` acts as `ctrl+d`. Legacy terminals already send the control byte;
+/// this covers the kitty keyboard protocol where the Unicode letter arrives.
+pub fn normalize_cyrillic_ctrl(key: KeyEvent) -> KeyEvent {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return key;
+    }
+    let KeyCode::Char(c) = key.code else {
+        return key;
+    };
+    let mapped = match c.to_lowercase().next().unwrap_or(c) {
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        'ф' => 'a',
+        'ы' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        'ь' => 'm',
+        _ => return key,
+    };
+    KeyEvent {
+        code: KeyCode::Char(mapped),
+        ..key
+    }
 }

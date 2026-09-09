@@ -152,6 +152,14 @@ impl ToolHost for StubHost {
         WaitOutcome::Finished
     }
 
+    fn request_agent_status(&self, _agent: &AgentId) -> Result<(), ToolError> {
+        Ok(())
+    }
+
+    fn report_status(&self, _text: String) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         if let Some(a) = self
             .agents

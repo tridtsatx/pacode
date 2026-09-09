@@ -39,6 +39,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
             mode,
         } => {
             let model_route = model
+                .or_else(|| core.deps.providers.default_route().cloned())
                 .or_else(|| core.deps.config.default_route())
                 .ok_or(CoreError::NoModel)?;
             let effort = effort.unwrap_or(core.deps.config.provider.effort);

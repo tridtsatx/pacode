@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod multi_edit;
 pub mod plan;
 pub mod read;
+pub mod report_status;
 pub mod webfetch;
 pub mod write;
 
@@ -43,6 +44,7 @@ pub fn builtin_tools() -> ToolRegistry {
         .with(Arc::new(plan::PlanTool))
         .with(Arc::new(agent::AgentTool))
         .with(Arc::new(webfetch::WebFetchTool))
+        .with(Arc::new(report_status::ReportStatusTool))
 }
 
 /// Tool names a subagent gets by default: everything except `agent` (depth 1).

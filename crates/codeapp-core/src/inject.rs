@@ -26,6 +26,13 @@ pub enum Injection {
         answer: String,
     },
     SystemNotice(String),
+    /// Orchestrator asked a subagent for its status.
+    StatusRequest,
+    /// A subagent reported its status to the parent.
+    AgentStatus {
+        agent: AgentInfo,
+        text: String,
+    },
 }
 
 #[derive(Default)]
@@ -130,6 +137,19 @@ pub fn render_injections(items: &[Injection], cap_chars: usize) -> Message {
                         agent.id, agent.name
                     ));
                 }
+            }
+            Injection::StatusRequest => {
+                parts.push(
+                    "<status_request>Report your current status briefly with the `report_status` tool (done / in progress / blockers), then continue.</status_request>"
+                        .to_string(),
+                );
+            }
+            Injection::AgentStatus { agent, text } => {
+                let capped = codeapp_types::truncate_head_tail(text, cap_chars);
+                parts.push(format!(
+                    "<agent_status id=\"{}\" name=\"{}\">\n{capped}\n</agent_status>",
+                    agent.id, agent.name
+                ));
             }
             Injection::SystemNotice(text) => {
                 let capped = codeapp_types::truncate_head_tail(text, cap_chars);

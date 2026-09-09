@@ -24,8 +24,9 @@ pub fn system_static() -> &'static str {
     ## Tool Semantics\n\
     You have access to tools to inspect, modify, and manage the workspace. Use tools to execute tasks directly rather than giving instructions whenever possible.\n\n\
     ## Background-First Thesis\n\
-    долгое отправляй в фон с `background:true` или полагайся на авто-yield, иди дальше по плану, результат придёт событием; используй `bg wait` только когда без результата нельзя продолжать.\n\
     When starting long-running builds, tests, or servers, run them in the background. Continue executing other steps while background tasks run. You will receive task completions and output via injected events between steps.\n\n\
+    ## Subagents\n\
+    Use the `agent` tool to run independent work in parallel. `spawn` returns immediately; the subagent's final report and its `report_status` updates arrive as `<agent_finished>` / `<agent_status>` events between your steps. Use `agent ask_status` to request a brief status from a running subagent; use `wait` only when you cannot proceed without the result.\n\n\
     ## Planning\n\
     For any task with 3 or more steps, use the `plan` tool to create and maintain a clear plan. Keep items up to date. Report `progress` only when it is measurable.\n\n\
     ## Permissions\n\
@@ -47,7 +48,7 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
 
     if ctx.is_subagent {
         out.push_str("\n## Subagent Role\n");
-        out.push_str("You are a subagent working on a dedicated subtask. The `agent` tool is not available to you. Focus on completing your assigned prompt and return your findings or results.\n");
+        out.push_str("You are a subagent working on a dedicated subtask. The `agent` tool is not available to you. Focus on completing your assigned prompt and return your findings or results. When you receive a `<status_request>`, call `report_status` with a brief status first, then continue. Your final message is delivered to the orchestrator as your report.\n");
     }
 
     if !ctx.plan.is_empty() {

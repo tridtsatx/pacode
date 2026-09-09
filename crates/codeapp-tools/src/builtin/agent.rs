@@ -40,7 +40,8 @@ impl Tool for AgentTool {
          and returns immediately with an agent id; its final report is delivered to you \
          automatically when it finishes, so continue with other work. `wait` blocks \
          (bounded) only when you cannot proceed without the result. `stop` cancels, \
-         `list` shows all agents. Subagents cannot spawn agents."
+         `list` shows all agents, `ask_status` asks a running subagent for a brief \
+         status that arrives at your next step. Subagents cannot spawn agents."
     }
 
     fn schema(&self) -> Value {
@@ -48,7 +49,7 @@ impl Tool for AgentTool {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "wait", "stop", "list"]},
+                "action": {"type": "string", "enum": ["spawn", "wait", "stop", "list", "ask_status"]},
                 "prompt": {"type": "string", "description": "Full task description for the subagent (spawn)."},
                 "name": {"type": "string", "description": "Short name shown in the UI, e.g. `tests`."},
                 "model": {"type": "string", "description": "`provider/model` override."},
@@ -135,6 +136,18 @@ impl Tool for AgentTool {
                     }
                     WaitOutcome::Cancelled => Err(ToolError::Cancelled),
                 }
+            }
+            "ask_status" => {
+                let agent_id_str = args
+                    .agent_id
+                    .ok_or_else(|| ToolError::invalid("agent_id is required for ask_status"))?;
+                let id = AgentId::new(agent_id_str);
+                ctx.host.request_agent_status(&id)?;
+                Ok(ToolOutput::text(format!(
+                    "Status requested from agent {id}; the answer arrives at your next step."
+                ))
+                .with_title(format!("Agent status {id}"))
+                .with_preview("requested"))
             }
             "stop" => {
                 let agent_id_str = args
