@@ -1,20 +1,20 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/codeapp-types",
-    "crates/codeapp-config",
-    "crates/codeapp-risk",
-    "crates/codeapp-render",
-    "crates/codeapp-exec",
-    "crates/codeapp-provider",
-    "crates/codeapp-mcp",
-    "crates/codeapp-store",
-    "crates/codeapp-tools",
-    "crates/codeapp-core",
-    "crates/codeapp-daemon",
-    "crates/codeapp-client",
-    "crates/codeapp-tui",
-    "crates/codeapp",
+    "crates/pacode-types",
+    "crates/pacode-config",
+    "crates/pacode-risk",
+    "crates/pacode-render",
+    "crates/pacode-exec",
+    "crates/pacode-provider",
+    "crates/pacode-mcp",
+    "crates/pacode-store",
+    "crates/pacode-tools",
+    "crates/pacode-core",
+    "crates/pacode-daemon",
+    "crates/pacode-client",
+    "crates/pacode-tui",
+    "crates/pacode",
 ]
 
 [workspace.package]
@@ -24,19 +24,19 @@ license = "MIT"
 rust-version = "1.90"
 
 [workspace.dependencies]
-codeapp-types = { path = "crates/codeapp-types" }
-codeapp-config = { path = "crates/codeapp-config" }
-codeapp-risk = { path = "crates/codeapp-risk" }
-codeapp-render = { path = "crates/codeapp-render" }
-codeapp-exec = { path = "crates/codeapp-exec" }
-codeapp-provider = { path = "crates/codeapp-provider" }
-codeapp-mcp = { path = "crates/codeapp-mcp" }
-codeapp-store = { path = "crates/codeapp-store" }
-codeapp-tools = { path = "crates/codeapp-tools" }
-codeapp-core = { path = "crates/codeapp-core" }
-codeapp-daemon = { path = "crates/codeapp-daemon" }
-codeapp-client = { path = "crates/codeapp-client" }
-codeapp-tui = { path = "crates/codeapp-tui" }
+pacode-types = { path = "crates/pacode-types" }
+pacode-config = { path = "crates/pacode-config" }
+pacode-risk = { path = "crates/pacode-risk" }
+pacode-render = { path = "crates/pacode-render" }
+pacode-exec = { path = "crates/pacode-exec" }
+pacode-provider = { path = "crates/pacode-provider" }
+pacode-mcp = { path = "crates/pacode-mcp" }
+pacode-store = { path = "crates/pacode-store" }
+pacode-tools = { path = "crates/pacode-tools" }
+pacode-core = { path = "crates/pacode-core" }
+pacode-daemon = { path = "crates/pacode-daemon" }
+pacode-client = { path = "crates/pacode-client" }
+pacode-tui = { path = "crates/pacode-tui" }
 
 # async
 tokio = { version = "1", default-features = false }

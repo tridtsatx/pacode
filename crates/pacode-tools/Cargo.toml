@@ -1,0 +1,35 @@
+[package]
+name = "pacode-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tool trait, ToolHost, and the built-in tool set (read/write/edit/bash/grep/glob/ls/plan/agent/bg/webfetch/mcp)"
+
+[dependencies]
+pacode-types = { workspace = true }
+pacode-exec = { workspace = true }
+pacode-risk = { workspace = true }
+pacode-render = { workspace = true }
+pacode-mcp = { workspace = true }
+tokio = { workspace = true, features = ["rt", "fs", "io-util", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+grep-searcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
+similar = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+html2text = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+pretty_assertions = { workspace = true }

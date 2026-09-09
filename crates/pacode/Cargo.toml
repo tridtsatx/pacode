@@ -1,0 +1,27 @@
+[package]
+name = "pacode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pacode: background-first TUI coding agent (client + daemon)"
+
+[[bin]]
+name = "pacode"
+path = "src/main.rs"
+
+[dependencies]
+pacode-types = { workspace = true }
+pacode-config = { workspace = true }
+pacode-client = { workspace = true }
+pacode-daemon = { workspace = true }
+pacode-tui = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+libc = { workspace = true }
+
+[features]
+default = []
+mimalloc = []

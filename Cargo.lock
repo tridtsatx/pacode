@@ -261,239 +261,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "codeapp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "codeapp-client",
- "codeapp-config",
- "codeapp-daemon",
- "codeapp-tui",
- "codeapp-types",
- "libc",
- "log",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "codeapp-client"
-version = "0.1.0"
-dependencies = [
- "codeapp-config",
- "codeapp-types",
- "libc",
- "log",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "codeapp-config"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "codeapp-types",
- "dirs",
- "libc",
- "log",
- "serde",
- "tempfile",
- "thiserror 2.0.20",
- "toml",
-]
-
-[[package]]
-name = "codeapp-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "codeapp-config",
- "codeapp-exec",
- "codeapp-mcp",
- "codeapp-provider",
- "codeapp-store",
- "codeapp-tools",
- "codeapp-types",
- "futures",
- "log",
- "pretty_assertions",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "codeapp-daemon"
-version = "0.1.0"
-dependencies = [
- "codeapp-config",
- "codeapp-core",
- "codeapp-exec",
- "codeapp-mcp",
- "codeapp-provider",
- "codeapp-store",
- "codeapp-tools",
- "codeapp-types",
- "libc",
- "log",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "codeapp-exec"
-version = "0.1.0"
-dependencies = [
- "codeapp-types",
- "libc",
- "log",
- "regex",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "codeapp-mcp"
-version = "0.1.0"
-dependencies = [
- "codeapp-types",
- "log",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
-name = "codeapp-provider"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "codeapp-types",
- "futures",
- "log",
- "pretty_assertions",
- "rand 0.9.5",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "codeapp-render"
-version = "0.1.0"
-dependencies = [
- "codeapp-types",
- "insta",
- "pretty_assertions",
- "pulldown-cmark",
- "ratatui",
- "similar",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
-name = "codeapp-risk"
-version = "0.1.0"
-dependencies = [
- "codeapp-types",
- "pretty_assertions",
-]
-
-[[package]]
-name = "codeapp-store"
-version = "0.1.0"
-dependencies = [
- "codeapp-types",
- "log",
- "pretty_assertions",
- "rusqlite",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
-name = "codeapp-tools"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "codeapp-exec",
- "codeapp-mcp",
- "codeapp-render",
- "codeapp-risk",
- "codeapp-types",
- "futures",
- "globset",
- "grep-matcher",
- "grep-regex",
- "grep-searcher",
- "html2text",
- "ignore",
- "log",
- "pretty_assertions",
- "reqwest",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "url",
-]
-
-[[package]]
-name = "codeapp-tui"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "codeapp-client",
- "codeapp-config",
- "codeapp-render",
- "codeapp-types",
- "crossterm",
- "futures",
- "insta",
- "log",
- "pretty_assertions",
- "ratatui",
- "thiserror 2.0.20",
- "tokio",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
-name = "codeapp-types"
-version = "0.1.0"
-dependencies = [
- "pretty_assertions",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1668,6 +1435,239 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "pacode"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "log",
+ "pacode-client",
+ "pacode-config",
+ "pacode-daemon",
+ "pacode-tui",
+ "pacode-types",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pacode-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "pacode-config",
+ "pacode-types",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "pacode-config"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "libc",
+ "log",
+ "pacode-types",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml",
+]
+
+[[package]]
+name = "pacode-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "log",
+ "pacode-config",
+ "pacode-exec",
+ "pacode-mcp",
+ "pacode-provider",
+ "pacode-store",
+ "pacode-tools",
+ "pacode-types",
+ "pretty_assertions",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "pacode-daemon"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "pacode-config",
+ "pacode-core",
+ "pacode-exec",
+ "pacode-mcp",
+ "pacode-provider",
+ "pacode-store",
+ "pacode-tools",
+ "pacode-types",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "pacode-exec"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "pacode-types",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "pacode-mcp"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "pacode-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "pacode-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "log",
+ "pacode-types",
+ "pretty_assertions",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "pacode-render"
+version = "0.1.0"
+dependencies = [
+ "insta",
+ "pacode-types",
+ "pretty_assertions",
+ "pulldown-cmark",
+ "ratatui",
+ "similar",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "pacode-risk"
+version = "0.1.0"
+dependencies = [
+ "pacode-types",
+ "pretty_assertions",
+]
+
+[[package]]
+name = "pacode-store"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "pacode-types",
+ "pretty_assertions",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "pacode-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "globset",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "html2text",
+ "ignore",
+ "log",
+ "pacode-exec",
+ "pacode-mcp",
+ "pacode-render",
+ "pacode-risk",
+ "pacode-types",
+ "pretty_assertions",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "pacode-tui"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "crossterm",
+ "futures",
+ "insta",
+ "log",
+ "pacode-client",
+ "pacode-config",
+ "pacode-render",
+ "pacode-types",
+ "pretty_assertions",
+ "ratatui",
+ "thiserror 2.0.20",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "pacode-types"
+version = "0.1.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "palette"

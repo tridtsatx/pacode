@@ -1,0 +1,20 @@
+[package]
+name = "pacode-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Background task manager: processes, output spool, head/tail buffer, progress parsers, stall watchdog"
+
+[dependencies]
+pacode-types = { workspace = true }
+tokio = { workspace = true, features = ["rt", "process", "io-util", "sync", "time", "fs", "macros"] }
+tokio-util = { workspace = true, features = ["rt"] }
+libc = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

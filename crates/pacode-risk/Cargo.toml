@@ -1,0 +1,12 @@
+[package]
+name = "pacode-risk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic shell command risk classification (blast radius tiers)"
+
+[dependencies]
+pacode-types = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
