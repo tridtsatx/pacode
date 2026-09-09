@@ -255,38 +255,39 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                         let perm_base =
                             format!("{} {}", opts.glyphs.chevrons, mode.permission_line());
                         let hint = " (shift+tab to cycle)";
-                        let counts_or_idle = if state.rail.show_session_stats {
-                            let done_count = state
-                                .rail
-                                .agents
-                                .iter()
-                                .filter(|a| !a.status.is_live())
-                                .count();
-                            let dur = format_duration_ms(
-                                state
+                        let counts_or_idle =
+                            if state.rail.show_session_stats && state.rail.usage.turns > 0 {
+                                let done_count = state
                                     .rail
-                                    .usage
-                                    .last_activity_ms
-                                    .saturating_sub(state.rail.usage.started_at_ms),
-                            );
-                            format!(" · {done_count} agents done · {dur}")
-                        } else {
-                            let agents =
-                                state.rail.agents.iter().filter(|a| !a.id.is_main()).count();
-                            let bg = state.rail.running_task_count();
-                            let mut parts = Vec::new();
-                            if agents > 0 {
-                                parts.push(format!("← {agents} agents"));
-                            }
-                            if bg > 0 {
-                                parts.push(format!("{bg} bg"));
-                            }
-                            if parts.is_empty() {
-                                String::new()
+                                    .agents
+                                    .iter()
+                                    .filter(|a| !a.status.is_live())
+                                    .count();
+                                let dur = format_duration_ms(
+                                    state
+                                        .rail
+                                        .usage
+                                        .last_activity_ms
+                                        .saturating_sub(state.rail.usage.started_at_ms),
+                                );
+                                format!(" · {done_count} agents done · {dur}")
                             } else {
-                                format!(" · {}", parts.join(" · "))
-                            }
-                        };
+                                let agents =
+                                    state.rail.agents.iter().filter(|a| !a.id.is_main()).count();
+                                let bg = state.rail.running_task_count();
+                                let mut parts = Vec::new();
+                                if agents > 0 {
+                                    parts.push(format!("← {agents} agents"));
+                                }
+                                if bg > 0 {
+                                    parts.push(format!("{bg} bg"));
+                                }
+                                if parts.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", parts.join(" · "))
+                                }
+                            };
 
                         let perm_base_len = display_width(&perm_base);
                         let hint_len = display_width(hint);

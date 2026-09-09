@@ -22,7 +22,8 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
 
     let is_bg_list = matches!(state.focus, Focus::BgList { .. });
     let is_overlay = matches!(state.focus, Focus::Overlay(_));
-    if !is_bg_list && !is_overlay {
+    // Bottom pickers (effort/mode/model/config) are drawn by `picker`, not here.
+    if (!is_bg_list && !is_overlay) || state.is_bottom_picker() {
         return;
     }
 
