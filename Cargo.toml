@@ -16,6 +16,7 @@ members = [
     "crates/pacode-tui",
     "crates/pacode",
     "crates/pacode-plugin",
+    "crates/pacode-import",
 ]
 
 [workspace.package]

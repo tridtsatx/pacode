@@ -33,7 +33,13 @@ pub fn draw(
         .map(|c| (c.id, c.version, c.kind.clone(), c.stats.clone()))
         .collect();
 
-    let mut cell_lines: Vec<Vec<Line<'static>>> = Vec::with_capacity(cell_snapshots.len());
+    let mut cell_lines: Vec<Vec<Line<'static>>> = Vec::with_capacity(cell_snapshots.len() + 1);
+
+    // The header banner lives outside `cells` so a transcript seq can never
+    // collide with it; it is always the first block of lines.
+    if let Some(info) = transcript.header.clone() {
+        cell_lines.push(crate::ui::header::render(&info, width, opts));
+    }
 
     for (id, version, kind, stats) in &cell_snapshots {
         let is_live = live_id == Some(*id);
@@ -179,7 +185,6 @@ fn render_cell(
     match cell_kind {
         CellKind::Gap => vec![Line::default()],
         CellKind::Item(kind) => render_item(kind, stats, width, opts, anim_frame),
-        CellKind::Header(info) => crate::ui::header::render(info, width, opts),
     }
 }
 

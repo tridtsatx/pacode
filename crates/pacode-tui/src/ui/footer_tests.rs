@@ -1,5 +1,8 @@
 use pacode_render::RenderOptions;
 use pacode_types::Config;
+use pacode_types::model::{Effort, ModelRoute};
+use pacode_types::state::{AgentKind, AgentStatus};
+use pacode_types::{AgentId, AgentInfo};
 
 use super::*;
 use crate::state::AppState;
@@ -42,4 +45,107 @@ fn test_footer_render_plugin_status() {
         "row2_text was: {row2_text}"
     );
     assert!(row2_text.contains("ask before edits and commands"));
+}
+
+#[test]
+fn test_footer_select_agent_shows_main_and_subagents() {
+    let mut state = make_test_state();
+    let opts = RenderOptions::new(120, false);
+    let main_agent = AgentInfo {
+        id: AgentId::main(),
+        name: "main".into(),
+        kind: AgentKind::Main,
+        status: AgentStatus::Thinking,
+        activity: None,
+        started_at_ms: 0,
+        finished_at_ms: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: None,
+        summary: None,
+        error: None,
+    };
+    let sub1 = AgentInfo {
+        id: AgentId::new("sub_1"),
+        name: "waiter-1".into(),
+        kind: AgentKind::Sub,
+        status: AgentStatus::RunningTool,
+        activity: None,
+        started_at_ms: 1000,
+        finished_at_ms: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: Some(AgentId::main()),
+        summary: None,
+        error: None,
+    };
+    let sub2 = AgentInfo {
+        id: AgentId::new("sub_2"),
+        name: "waiter-2".into(),
+        kind: AgentKind::Sub,
+        status: AgentStatus::RunningTool,
+        activity: None,
+        started_at_ms: 2000,
+        finished_at_ms: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: Some(AgentId::main()),
+        summary: None,
+        error: None,
+    };
+    state.rail.upsert_agent(main_agent);
+    state.rail.upsert_agent(sub1);
+    state.rail.upsert_agent(sub2);
+
+    // 1. Select main (index 0)
+    state.focus = Focus::SelectAgent { index: 0 };
+    let row2 = render_row2(120, &state, &opts);
+    let text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("main 1/3"), "text was: {text}");
+    assert!(
+        text.contains("enter open · alt+f follow · esc clear"),
+        "text was: {text}"
+    );
+
+    // 2. Select waiter-1 (index 1)
+    state.focus = Focus::SelectAgent { index: 1 };
+    let row2 = render_row2(120, &state, &opts);
+    let text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("waiter-1 2/3"), "text was: {text}");
+    assert!(
+        text.contains("enter open · alt+f follow · esc clear"),
+        "text was: {text}"
+    );
+
+    // 3. Panel with follow = true: hint shows alt+f release
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(AgentId::new("sub_1")),
+        follow: true,
+        follow_paused: false,
+    };
+    let row2 = render_row2(120, &state, &opts);
+    let text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        text.contains("pgup pause · alt+f release"),
+        "text was: {text}"
+    );
+
+    // 4. Panel with follow = false: hint shows alt+f follow
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(AgentId::new("sub_1")),
+        follow: false,
+        follow_paused: false,
+    };
+    let row2 = render_row2(120, &state, &opts);
+    let text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        text.contains("esc back · alt+f follow · s stop"),
+        "text was: {text}"
+    );
 }

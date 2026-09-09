@@ -2,12 +2,12 @@
 source: crates/pacode-tui/tests/snapshot_tests.rs
 expression: view
 ---
-" ▄▄▄▄▄     pacode v0.1.0-dev                                       │Refactor TUI layout             "
-"█ ▀ ██     claude-3-7-sonnet with high effort · anthropic          │ses_abcdef123                   "
-"███▀       /home/someone/zed/pacode                                │                                "
-" ▀▀▀▀▀                                                             │PLAN                   1/4 · 40%"
-"                                                                   │[✓] Read codebase & analyze arc…"
-"Using claude-3-7-sonnet (from /home/someone/.config/pacode/config. │[•] Implement TUI layout & widg…"
+"  ▄▄▀▀▀▀▄▄                                                         │Refactor TUI layout             "
+" ▀▀▀▀▀▀▀▀▀▀                                                        │ses_abcdef123                   "
+"▀▀▀▀▀▀▀▀▀▀     pacode v0.1.0-dev                                   │                                "
+"▀▀▀▀▀▀▀▄▄▄                                                         │PLAN                   1/4 · 40%"
+" ▀▀▀▀▀▀▀▀▀▀                                                        │[✓] Read codebase & analyze arc…"
+"  ▀▀▀▀▀▀▀▀                                                         │[•] Implement TUI layout & widg…"
 "                                                                   │    ▰▰▰▰▰▱▱▱ 60%                "
 "▎ Refactor TUI layout and split into modules                       │[ ] Add key bindings & event lo…"
 "                                                                   │[ ] Write unit tests & snapshot…"
@@ -30,5 +30,5 @@ expression: view
 "────────────────────────────────────────────────────────────────── │BACKGROUND                  1 ◍ "
 "❯                                                                  │◍ cargo test --all 214/380      "
 "────────────────────────────────────────────────────────────────── │       ~/zed/pacode:master      "
-"Build · Claude 3 7 Sonnet | high /effort                    /model │       • pacode 0.1.0-dev       "
+"Build · Claude 3 7 Sonnet | high /effort                    /model │                                "
 "» ask before edits and commands                     10.7K · ctrl+p │                                "

@@ -2,11 +2,11 @@
 source: crates/pacode-tui/tests/snapshot_tests.rs
 expression: view
 ---
-"█ ▀ ██     claude-3-7-sonnet with high effort · anthropic   "
-"███▀       /home/someone/zed/pacode                         "
-" ▀▀▀▀▀                                                      "
-"                                                            "
-"Using claude-3-7-sonnet (from /home/someone/.config/pacode/c"
+" ▀▀▀▀▀▀▀▀▀▀                                                 "
+"▀▀▀▀▀▀▀▀▀▀     pacode v0.1.0-dev                            "
+"▀▀▀▀▀▀▀▄▄▄                                                  "
+" ▀▀▀▀▀▀▀▀▀▀                                                 "
+"  ▀▀▀▀▀▀▀▀                                                  "
 "                                                            "
 "▎ Refactor TUI layout and split into modules                "
 "                                                            "

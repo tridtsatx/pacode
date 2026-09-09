@@ -80,7 +80,7 @@ pub struct ScreenLayout {
     pub rail: Rect,
     /// Vertical line between dialog column and rail.
     pub rail_separator: Rect,
-    /// Toast area: 2 lines above `input_top`, right-aligned inside the dialog column.
+    /// Toast area: 4 lines above `input_top`, right-aligned inside the dialog column.
     pub toast: Rect,
 }
 
@@ -161,8 +161,8 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
         )
     };
 
-    let toast_w = (dialog.width.saturating_sub(2)).min(60);
-    let toast_h = if toast_w > 0 { 2.min(dialog.height) } else { 0 };
+    let toast_w = (dialog.width.saturating_sub(2)).min(62);
+    let toast_h = if toast_w > 0 { 4.min(dialog.height) } else { 0 };
     let toast_y = input_top_y.saturating_sub(toast_h);
     let toast_x = dialog.x + dialog.width.saturating_sub(1).saturating_sub(toast_w);
     let toast = Rect::new(toast_x, toast_y, toast_w, toast_h);

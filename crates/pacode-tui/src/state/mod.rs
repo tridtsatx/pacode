@@ -148,6 +148,8 @@ pub struct AppState {
     pub turn_started_at: Option<Instant>,
     /// Frame counter for activity animations and spinners (8 fps).
     pub anim_frame: u64,
+    /// Mascot shown in the header banner; random per run, fixed for the session.
+    pub mascot: crate::ui::mascot::MascotKind,
 }
 
 /// What the panel shows.
@@ -195,6 +197,7 @@ impl AppState {
             quit: false,
             turn_started_at: None,
             anim_frame: 0,
+            mascot: crate::ui::mascot::MascotKind::random(),
         }
     }
 
@@ -223,14 +226,10 @@ impl AppState {
                 self.transcript
                     .reset(snapshot.transcript.clone(), snapshot.has_more_history);
                 let header = crate::state::transcript::HeaderInfo {
-                    model: snapshot.meta.model.model.clone(),
-                    effort: snapshot.meta.effort.as_str().to_string(),
-                    provider: snapshot.meta.model.provider.clone(),
-                    cwd: snapshot.meta.cwd.display().to_string(),
-                    config_path: self.paths.config_file.display().to_string(),
                     version: self.app_version.clone(),
+                    mascot: self.mascot,
                 };
-                self.transcript.insert_header(header);
+                self.transcript.set_header(header);
                 for item in &snapshot.transcript {
                     if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
                         let arg = title
@@ -292,14 +291,10 @@ impl AppState {
                 prefs.mode = Some(meta.mode);
                 let _ = pacode_config::save_prefs(&self.paths, &prefs);
                 let header = crate::state::transcript::HeaderInfo {
-                    model: meta.model.model.clone(),
-                    effort: meta.effort.as_str().to_string(),
-                    provider: meta.model.provider.clone(),
-                    cwd: meta.cwd.display().to_string(),
-                    config_path: self.paths.config_file.display().to_string(),
                     version: self.app_version.clone(),
+                    mascot: self.mascot,
                 };
-                self.transcript.insert_header(header);
+                self.transcript.set_header(header);
                 self.meta = Some(meta);
             }
             Event::TurnStarted { agent, turn: _ } => {

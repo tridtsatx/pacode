@@ -21,7 +21,7 @@ use futures::Stream;
 use pacode_types::{Effort, Message, ModelInfo, StreamEvent, ToolDefinition};
 
 pub use mock::MockProvider;
-pub use openai_compat::OpenAiCompat;
+pub use openai_compat::{OpenAiCompat, redact};
 pub use registry::ProviderRegistry;
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;

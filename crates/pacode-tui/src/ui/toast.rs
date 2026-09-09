@@ -1,10 +1,10 @@
 //! Toasts (spec §7): up to 2 lines, right-aligned above the input, 6 s TTL:
-//! `✓ cargo build finished 3m02s` + `warnings 2 · . to open`.
+//! `✓ cargo build finished 3m02s` + `warnings 2`.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use pacode_render::{RenderOptions, truncate_to_width};
 use pacode_types::state::ToastLevel;
@@ -32,6 +32,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         ToastLevel::Info => (opts.glyphs.main_dot, opts.theme.cyan),
     };
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(opts.theme.cyan);
+    let inner = block.inner(area);
+
     let mut lines = Vec::new();
     let sym_w = pacode_render::display_width(sym) + 1;
     let title_line = Line::from(vec![
@@ -39,7 +45,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         Span::styled(
             truncate_to_width(
                 &toast.title,
-                (area.width as usize).saturating_sub(sym_w),
+                (inner.width as usize).saturating_sub(sym_w),
                 true,
             ),
             opts.theme.bold,
@@ -47,17 +53,23 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
     ]);
     lines.push(title_line);
 
-    if area.height > 1 {
-        let detail_str = toast.detail.as_deref().unwrap_or(". to open");
+    if inner.height > 1
+        && let Some(detail_str) = toast.detail.as_deref()
+    {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                truncate_to_width(detail_str, (area.width as usize).saturating_sub(2), true),
+                truncate_to_width(detail_str, (inner.width as usize).saturating_sub(2), true),
                 opts.theme.faint,
             ),
         ]));
     }
 
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
+
+#[cfg(test)]
+#[path = "toast_tests.rs"]
+mod toast_tests;

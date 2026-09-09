@@ -1,11 +1,11 @@
 //! Event loop and redraw scheduling.
 //!
 //! One `tokio::select!` over: client events (`ClientEvent`), terminal events
-//! (`crossterm::event::EventStream`), the stream tick (33 ms, only while
-//! `state.needs_stream_tick()`), the second tick (1 s, only while
+//! (`crossterm::event::EventStream`), the stream tick (paced by `config.ui.ups`,
+//! only while `state.needs_stream_tick()`), the second tick (1 s, only while
 //! `state.needs_second_tick()`), and toast expiry (armed only while toasts exist).
-//! A frame is drawn when `state.dirty` and at least 16 ms passed since the last frame
-//! (otherwise a deferred draw is scheduled). Nothing ticks in the idle state.
+//! A frame is drawn when `state.dirty` and the frame interval has passed since the
+//! last frame (otherwise a deferred draw is scheduled). Nothing ticks in the idle state.
 //!
 //! Startup: connect (spawning the daemon), attach, apply the snapshot, send
 //! `initial_prompt` if any, then loop. On `quit`: leave the alt screen and close the
@@ -78,13 +78,23 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         });
     }
 
-    let mut last_draw = Instant::now() - Duration::from_millis(20);
+    let detected_hz = match opts.config.ui.ups {
+        pacode_types::Ups::Auto => pacode_config::display::detect_refresh_hz(),
+        pacode_types::Ups::Fixed(_) | pacode_types::Ups::Dynamic => None,
+    };
+    let frame_interval = opts.config.ui.ups.frame_interval(detected_hz);
+
+    let mut last_draw = Instant::now() - frame_interval.unwrap_or(Duration::from_millis(33));
     let mut last_layout = ScreenLayout::default();
 
     loop {
-        // Redraw if dirty and >= 16 ms since last draw
+        // Redraw if dirty and frame interval elapsed
         let now = Instant::now();
-        if state.dirty && now.saturating_duration_since(last_draw) >= Duration::from_millis(16) {
+        let can_draw = match frame_interval {
+            Some(interval) => now.saturating_duration_since(last_draw) >= interval,
+            None => true,
+        };
+        if state.dirty && can_draw {
             term_guard.terminal.draw(|f| {
                 last_layout = ui::draw(f, &mut state);
             })?;
@@ -98,9 +108,10 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
 
         // Compute timers dynamically
         let needs_stream = state.needs_stream_tick();
+        let stream_tick_dur = frame_interval.unwrap_or(Duration::from_millis(33));
         let stream_sleep = async {
             if needs_stream {
-                tokio::time::sleep(Duration::from_millis(33)).await;
+                tokio::time::sleep(stream_tick_dur).await;
             } else {
                 std::future::pending::<()>().await;
             }
@@ -154,9 +165,13 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
 
         let deferred_draw_sleep = async {
             if state.dirty {
-                let elapsed = Instant::now().saturating_duration_since(last_draw);
-                let remaining = Duration::from_millis(16).saturating_sub(elapsed);
-                tokio::time::sleep(remaining).await;
+                if let Some(interval) = frame_interval {
+                    let elapsed = Instant::now().saturating_duration_since(last_draw);
+                    let remaining = interval.saturating_sub(elapsed);
+                    tokio::time::sleep(remaining).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
             } else {
                 std::future::pending::<()>().await;
             }

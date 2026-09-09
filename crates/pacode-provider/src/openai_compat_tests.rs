@@ -6,7 +6,7 @@ use pacode_types::{
 };
 use serde_json::json;
 
-use crate::{CompletionRequest, OpenAiCompat, Provider};
+use crate::{CompletionRequest, OpenAiCompat, Provider, ProviderError, redact};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn make_provider(
@@ -484,4 +484,143 @@ async fn test_list_models_catalog_fetch_and_merge() {
     // Second call tests cache (server already closed)
     let cached = provider.list_models().await.expect("cached ok");
     assert_eq!(cached.len(), 3);
+}
+
+#[test]
+fn test_redact_bearer_token() {
+    assert_eq!(redact("Bearer sk-test12345"), "Bearer [REDACTED]");
+    assert_eq!(redact("bearer abcdef"), "bearer [REDACTED]");
+    assert_eq!(redact("BEARER XYZ"), "BEARER [REDACTED]");
+    assert_eq!(redact("Bearer: my-token"), "Bearer: [REDACTED]");
+    assert_eq!(redact("\"Bearer sk-12345\""), "\"Bearer [REDACTED]\"");
+    assert_eq!(
+        redact("Bearer token1 and Bearer token2"),
+        "Bearer [REDACTED] and Bearer [REDACTED]"
+    );
+}
+
+#[test]
+fn test_redact_api_key() {
+    assert_eq!(redact("api_key=mysecret"), "api_key=[REDACTED]");
+    assert_eq!(
+        redact("api_key=mysecret&model=gpt-4"),
+        "api_key=[REDACTED]&model=gpt-4"
+    );
+    assert_eq!(
+        redact("{\"api_key\": \"mysecret\"}"),
+        "{\"api_key\": \"[REDACTED]\"}"
+    );
+    assert_eq!(
+        redact("{\"api_key\":\"mysecret\"}"),
+        "{\"api_key\":\"[REDACTED]\"}"
+    );
+    assert_eq!(redact("api_key: mysecret"), "api_key: [REDACTED]");
+    assert_eq!(redact("apikey=mysecret"), "apikey=[REDACTED]");
+    assert_eq!(redact("api-key: mysecret"), "api-key: [REDACTED]");
+}
+
+#[test]
+fn test_redact_authorization() {
+    assert_eq!(
+        redact("Authorization: Bearer secret123"),
+        "Authorization: Bearer [REDACTED]"
+    );
+    assert_eq!(
+        redact("{\"authorization\": \"Bearer secret123\"}"),
+        "{\"authorization\": \"Bearer [REDACTED]\"}"
+    );
+    assert_eq!(
+        redact("Authorization: secret123"),
+        "Authorization: [REDACTED]"
+    );
+    assert_eq!(
+        redact("authorization=secret123"),
+        "authorization=[REDACTED]"
+    );
+}
+
+#[test]
+fn test_redact_no_sensitive_data() {
+    let safe = "POST https://api.openai.com/v1/chat/completions model=gpt-4o keys=[\"messages\", \"model\"]";
+    assert_eq!(redact(safe), safe);
+}
+
+#[tokio::test]
+async fn test_complete_non_2xx_carries_full_error_body() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let error_body = json!({
+            "error": {
+                "code": "invalid_request_error",
+                "message": "Invalid model specified: foo"
+            }
+        })
+        .to_string();
+        let resp = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            error_body.len(),
+            error_body
+        );
+        socket.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let cfg = ProviderConfig {
+        base_url: format!("http://127.0.0.1:{port}"),
+        api_key: Some("test-key".to_string()),
+        api_key_env: None,
+        models: vec![],
+        catalog: false,
+        context_window: None,
+        reasoning: None,
+        effort_map: BTreeMap::new(),
+        extra_body: None,
+        headers: BTreeMap::new(),
+    };
+
+    let provider = OpenAiCompat::new(
+        "test-prov",
+        cfg,
+        ProviderDefaults::default(),
+        Some("test-key".to_string()),
+        BTreeMap::new(),
+    )
+    .expect("ok");
+
+    let req = CompletionRequest {
+        model: "invalid-model".to_string(),
+        system_static: "".to_string(),
+        system_dynamic: "".to_string(),
+        messages: vec![],
+        tools: vec![],
+        effort: None,
+        max_output_tokens: None,
+    };
+
+    let result = provider.complete(req).await;
+    server.await.unwrap();
+
+    let expected_body = "{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Invalid model specified: foo\"}}";
+    match result {
+        Err(ProviderError::Http { status, message }) => {
+            assert_eq!(status, 400);
+            assert_eq!(message, expected_body);
+        }
+        Err(other) => panic!("expected ProviderError::Http, got: {other}"),
+        Ok(_) => panic!("expected ProviderError::Http, got a successful stream"),
+    }
+
+    let err: ProviderError = ProviderError::Http {
+        status: 400,
+        message: expected_body.to_string(),
+    };
+    let err_str = format!("{err}");
+    assert_eq!(
+        err_str,
+        "request failed (400): {\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Invalid model specified: foo\"}}"
+    );
 }

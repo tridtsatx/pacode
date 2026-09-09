@@ -11,6 +11,23 @@ use crate::state::AppState;
 fn make_test_state() -> AppState {
     let config = Config::default();
     let mut state = AppState::new(config, "0.1.0".into(), 120, 34);
+    let main_agent = AgentInfo {
+        id: AgentId::main(),
+        name: "main".into(),
+        kind: AgentKind::Main,
+        status: AgentStatus::Thinking,
+        activity: None,
+        started_at_ms: 500,
+        finished_at_ms: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: None,
+        summary: None,
+        error: None,
+    };
+    state.rail.upsert_agent(main_agent);
     let subagent = AgentInfo {
         id: AgentId::new("agt_1"),
         name: "worker".into(),
@@ -39,21 +56,26 @@ fn test_focus_machine_transitions() {
     // 1. Initially Normal
     assert_eq!(state.focus, Focus::Normal);
 
-    // 2. Alt+Down -> SelectAgent
+    // 2. Alt+Down -> SelectAgent (index 0 is main)
     let alt_down = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT);
     let actions = handle_key(&mut state, alt_down, now);
     assert!(actions.is_empty());
     assert_eq!(state.focus, Focus::SelectAgent { index: 0 });
 
-    // 3. Enter on empty prompt -> Panel
+    // 2b. Alt+Down again -> SelectAgent (index 1 is worker subagent)
+    let actions = handle_key(&mut state, alt_down, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, Focus::SelectAgent { index: 1 });
+
+    // 3. Enter on empty prompt while on subagent -> Panel
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let actions = handle_key(&mut state, enter, now);
     assert_eq!(actions, vec![Action::LoadPanel]);
     assert!(matches!(state.focus, Focus::Panel { follow: false, .. }));
 
-    // 4. Alt+B -> Follow
-    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
-    let actions = handle_key(&mut state, alt_b, now);
+    // 4. Alt+F -> Follow
+    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_f, now);
     assert!(actions.is_empty());
     assert!(matches!(state.focus, Focus::Panel { follow: true, .. }));
 
@@ -417,7 +439,7 @@ fn test_overlay_session_picker_navigation_focus_and_esc() {
 }
 
 #[test]
-fn test_overlay_files_alt_f_navigation_enter_and_esc() {
+fn test_overlay_files_alt_b_navigation_enter_and_esc() {
     let mut state = make_test_state();
     let now = Instant::now();
 
@@ -428,9 +450,9 @@ fn test_overlay_files_alt_f_navigation_enter_and_esc() {
         .files
         .observe_tool_item("write", &serde_json::json!({"path": "src/second.rs"}), 200);
 
-    // 1. alt+f opens Overlay::Files
-    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
-    handle_key(&mut state, alt_f, now);
+    // 1. alt+b opens Overlay::Files
+    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_b, now);
     assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
 
     // 2. Down key increments index
@@ -454,17 +476,196 @@ fn test_overlay_files_alt_f_navigation_enter_and_esc() {
     assert_eq!(state.focus, Focus::Normal);
     assert_eq!(state.input.text, "src/second.rs");
 
-    // 6. Reopen with alt+f and press Esc to close
-    handle_key(&mut state, alt_f, now);
+    // 6. Reopen with alt+b and press Esc to close
+    handle_key(&mut state, alt_b, now);
     assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
 
-    // 7. Verify alt+b remains follow (does not open files)
-    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
-    handle_key(&mut state, alt_b, now);
+    // 7. Verify alt+f is follow (does not open files)
+    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_f, now);
     assert_ne!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+}
+
+#[test]
+fn test_alt_f_toggles_follow() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let subagent_id = AgentId::new("agt_1");
+
+    // Panel open on subagent with follow = false
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(subagent_id.clone()),
+        follow: false,
+        follow_paused: false,
+    };
+    state.panel.target = Some(PanelTarget::Agent(subagent_id.clone()));
+
+    // 1. alt+f toggles follow to true
+    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_f, now);
+    assert!(actions.is_empty());
+    assert_eq!(
+        state.focus,
+        Focus::Panel {
+            target: PanelTarget::Agent(subagent_id.clone()),
+            follow: true,
+            follow_paused: false,
+        }
+    );
+
+    // 2. alt+f toggles follow back to false
+    let actions = handle_key(&mut state, alt_f, now);
+    assert!(actions.is_empty());
+    assert_eq!(
+        state.focus,
+        Focus::Panel {
+            target: PanelTarget::Agent(subagent_id.clone()),
+            follow: false,
+            follow_paused: false,
+        }
+    );
+
+    // 3. alt+f on SelectAgent for a subagent opens panel with follow = true
+    state.focus = Focus::SelectAgent { index: 1 };
+    let actions = handle_key(&mut state, alt_f, now);
+    assert_eq!(actions, vec![Action::LoadPanel]);
+    assert_eq!(
+        state.focus,
+        Focus::Panel {
+            target: PanelTarget::Agent(subagent_id),
+            follow: true,
+            follow_paused: false,
+        }
+    );
+
+    // 4. alt+f on SelectAgent for main returns to Focus::Normal without opening panel
+    state.focus = Focus::SelectAgent { index: 0 };
+    let actions = handle_key(&mut state, alt_f, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, Focus::Normal);
+    assert_eq!(state.panel.target, None);
+}
+
+#[test]
+fn test_alt_b_opens_files_overlay() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    assert_eq!(state.focus, Focus::Normal);
+    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_b, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+}
+
+#[test]
+fn test_alt_down_cycle_selects_main_first_then_subagents_and_wraps() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Add a second subagent so we have main (0), agt_1 (1), agt_2 (2)
+    let subagent2 = AgentInfo {
+        id: AgentId::new("agt_2"),
+        name: "tester".into(),
+        kind: AgentKind::Sub,
+        status: AgentStatus::RunningTool,
+        activity: Some("testing".into()),
+        started_at_ms: 2000,
+        finished_at_ms: None,
+        tokens_in: 50,
+        tokens_out: 25,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: Some(AgentId::main()),
+        summary: None,
+        error: None,
+    };
+    state.rail.upsert_agent(subagent2);
+
+    assert_eq!(state.focus, Focus::Normal);
+    let alt_down = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT);
+    let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+
+    // 1. alt+Down from Focus::Normal selects main first (index 0)
+    handle_key(&mut state, alt_down, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 0 });
+
+    // 2. Next alt+Down selects first subagent (index 1: agt_1)
+    handle_key(&mut state, alt_down, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 1 });
+
+    // 3. Next alt+Down selects second subagent (index 2: agt_2)
+    handle_key(&mut state, alt_down, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 2 });
+
+    // 4. Next alt+Down wraps back to main (index 0)
+    handle_key(&mut state, alt_down, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 0 });
+
+    // 5. alt+Up from index 0 wraps to the last subagent (index 2: agt_2)
+    handle_key(&mut state, alt_up, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 2 });
+
+    // 6. alt+Up moves back to index 1
+    handle_key(&mut state, alt_up, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 1 });
+
+    // 7. alt+Up moves back to main (index 0)
+    handle_key(&mut state, alt_up, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 0 });
+
+    // 8. ctrl+j and ctrl+k cycle identically
+    let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+    let ctrl_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+    handle_key(&mut state, ctrl_j, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 1 });
+    handle_key(&mut state, ctrl_k, now);
+    assert_eq!(state.focus, Focus::SelectAgent { index: 0 });
+}
+
+#[test]
+fn test_enter_on_main_returns_to_normal() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Select main
+    state.focus = Focus::SelectAgent { index: 0 };
+    state.panel.target = Some(PanelTarget::Agent(AgentId::new("agt_1")));
+
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+
+    assert!(actions.is_empty(), "Enter on main must not emit LoadPanel");
+    assert_eq!(state.focus, Focus::Normal);
+    assert_eq!(state.panel.target, None);
+}
+
+#[test]
+fn test_enter_on_subagent_opens_panel() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let subagent_id = AgentId::new("agt_1");
+
+    // Select subagent (index 1)
+    state.focus = Focus::SelectAgent { index: 1 };
+    state.panel.target = None;
+
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+
+    assert_eq!(actions, vec![Action::LoadPanel]);
+    assert_eq!(
+        state.focus,
+        Focus::Panel {
+            target: PanelTarget::Agent(subagent_id.clone()),
+            follow: false,
+            follow_paused: false,
+        }
+    );
+    assert_eq!(state.panel.target, Some(PanelTarget::Agent(subagent_id)));
 }
 
 #[test]

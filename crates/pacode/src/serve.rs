@@ -23,6 +23,16 @@ pub fn run(
         return Ok(());
     }
 
+    let log_level =
+        pacode_config::logging::level_from_env(std::env::var("PACODE_LOG").ok().as_deref())
+            .unwrap_or_else(|| {
+                if log_level == log::LevelFilter::Info {
+                    pacode_config::logging::default_level()
+                } else {
+                    log_level
+                }
+            });
+
     pacode_config::logging::init_file_logger(&paths.daemon_log(), log_level)
         .context("failed to initialize daemon logger")?;
 

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use pacode_types::state::PermissionDecision;
-use pacode_types::{PermissionRequest, Request, TranscriptKind};
+use pacode_types::{AgentId, PermissionRequest, Request, TranscriptKind};
 
 use crate::commands;
 use crate::layout::ScreenLayout;
@@ -102,7 +102,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             if !matches.is_empty() {
                 let selected = state.input.slash_index % matches.len();
                 let cmd = &matches[selected];
-                state.input.text = format!("/{} ", cmd.name);
+                let name = &cmd.name;
+                state.input.text = format!("/{name} ");
                 state.input.cursor = state.input.text.chars().count();
                 state.input.slash_index = 0;
             }
@@ -115,13 +116,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return handle_esc(state);
     }
 
-    // 5. Follow shortcut: alt+b
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('b')) {
+    // 5. Follow shortcut: alt+f
+    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('f')) {
         return handle_follow(state);
     }
 
-    // 5.5 Files overlay: alt+f
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('f')) {
+    // 5.5 Files overlay: alt+b
+    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('b')) {
         state.focus = Focus::Overlay(Overlay::Files { index: 0 });
         return vec![];
     }
@@ -220,19 +221,19 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         // Enter with empty prompt: open selection in panel
         match &state.focus {
             Focus::SelectAgent { index } => {
-                let subagents: Vec<_> = state
-                    .rail
-                    .agents
-                    .iter()
-                    .filter(|a| !a.id.is_main())
-                    .collect();
-                if let Some(agent) = subagents.get(*index) {
+                let agents = selectable_agents(state);
+                if let Some(id) = agents.get(*index) {
+                    if id.is_main() {
+                        state.focus = Focus::Normal;
+                        state.panel.target = None;
+                        return vec![];
+                    }
                     state.focus = Focus::Panel {
-                        target: PanelTarget::Agent(agent.id.clone()),
+                        target: PanelTarget::Agent(id.clone()),
                         follow: false,
                         follow_paused: false,
                     };
-                    state.panel.target = Some(PanelTarget::Agent(agent.id.clone()));
+                    state.panel.target = Some(PanelTarget::Agent(id.clone()));
                     return vec![Action::LoadPanel];
                 }
             }
@@ -290,7 +291,17 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     ))];
                 }
             }
-            _ => {}
+            Focus::Normal
+            | Focus::Panel { .. }
+            | Focus::Overlay(
+                Overlay::Files { .. }
+                | Overlay::ModePicker { .. }
+                | Overlay::ConfigPicker { .. }
+                | Overlay::McpPicker { .. }
+                | Overlay::PluginsPicker { .. }
+                | Overlay::RailOverlay
+                | Overlay::Help,
+            ) => {}
         }
         return vec![];
     }
@@ -349,6 +360,22 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     vec![]
 }
 
+/// Returns all rail agents including main, in the order the rail displays them (main first).
+pub fn selectable_agents(state: &AppState) -> Vec<AgentId> {
+    let mut list = Vec::new();
+    if let Some(main) = state.rail.agents.iter().find(|a| a.id.is_main()) {
+        list.push(main.id.clone());
+    } else if !state.rail.agents.is_empty() {
+        list.push(AgentId::main());
+    }
+    for agent in &state.rail.agents {
+        if !agent.id.is_main() {
+            list.push(agent.id.clone());
+        }
+    }
+    list
+}
+
 fn handle_esc(state: &mut AppState) -> Vec<Action> {
     state.selection.clear();
     match state.focus {
@@ -384,21 +411,28 @@ fn handle_esc(state: &mut AppState) -> Vec<Action> {
 fn handle_follow(state: &mut AppState) -> Vec<Action> {
     match &state.focus {
         Focus::SelectAgent { index } => {
-            let subagents: Vec<_> = state
-                .rail
-                .agents
-                .iter()
-                .filter(|a| !a.id.is_main())
-                .collect();
-            if let Some(agent) = subagents.get(*index) {
+            let agents = selectable_agents(state);
+            if let Some(id) = agents.get(*index) {
+                if id.is_main() {
+                    state.focus = Focus::Normal;
+                    state.panel.target = None;
+                    return vec![];
+                }
                 state.focus = Focus::Panel {
-                    target: PanelTarget::Agent(agent.id.clone()),
+                    target: PanelTarget::Agent(id.clone()),
                     follow: true,
                     follow_paused: false,
                 };
-                state.panel.target = Some(PanelTarget::Agent(agent.id.clone()));
+                state.panel.target = Some(PanelTarget::Agent(id.clone()));
                 return vec![Action::LoadPanel];
             }
+        }
+        Focus::Panel {
+            target: PanelTarget::Agent(id),
+            ..
+        } if id.is_main() => {
+            state.focus = Focus::Normal;
+            state.panel.target = None;
         }
         Focus::Panel {
             target: PanelTarget::Agent(id),
@@ -416,17 +450,23 @@ fn handle_follow(state: &mut AppState) -> Vec<Action> {
                 follow_paused: false,
             };
         }
-        _ => {}
+        Focus::Panel {
+            target: PanelTarget::Task(_),
+            ..
+        }
+        | Focus::Normal
+        | Focus::BgList { .. }
+        | Focus::Overlay(_) => {}
     }
     vec![]
 }
 
 fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
+    let agents = selectable_agents(state);
     match &mut state.focus {
         Focus::SelectAgent { index } => {
-            let count = state.rail.agents.iter().filter(|a| !a.id.is_main()).count();
-            if count > 0 && *index + 1 < count {
-                *index += 1;
+            if !agents.is_empty() {
+                *index = (*index + 1) % agents.len();
             }
         }
         Focus::BgList { index } => {
@@ -440,10 +480,19 @@ fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
         | Focus::Overlay(Overlay::SessionPicker { index, .. }) => {
             *index += 1;
         }
-        _ => {
+        Focus::Normal
+        | Focus::Panel { .. }
+        | Focus::Overlay(
+            Overlay::Files { .. }
+            | Overlay::ModePicker { .. }
+            | Overlay::ConfigPicker { .. }
+            | Overlay::McpPicker { .. }
+            | Overlay::PluginsPicker { .. }
+            | Overlay::RailOverlay
+            | Overlay::Help,
+        ) => {
             // Anywhere -> select first agent
-            let count = state.rail.agents.iter().filter(|a| !a.id.is_main()).count();
-            if count > 0 {
+            if !agents.is_empty() {
                 state.focus = Focus::SelectAgent { index: 0 };
             }
         }
@@ -452,10 +501,11 @@ fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
 }
 
 fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
+    let agents = selectable_agents(state);
     match &mut state.focus {
         Focus::SelectAgent { index } => {
-            if *index > 0 {
-                *index -= 1;
+            if !agents.is_empty() {
+                *index = (*index + agents.len() - 1) % agents.len();
             }
         }
         Focus::BgList { index } => {
@@ -470,7 +520,7 @@ fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
         {
             *index -= 1;
         }
-        _ => {}
+        Focus::Normal | Focus::Panel { .. } | Focus::Overlay(_) => {}
     }
     vec![]
 }

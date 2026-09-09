@@ -284,6 +284,257 @@ async fn sleep_backoff(attempt: u32) {
     tokio::time::sleep(Duration::from_secs_f64(delay_secs)).await;
 }
 
+/// Redact sensitive information (`api_key`, `authorization`, `Bearer ...`) from log messages.
+pub fn redact(input: &str) -> String {
+    let mut result = redact_bearer(input);
+    result = redact_keys(&result, &["api_key", "api-key", "apikey", "authorization"]);
+    result
+}
+
+fn redact_bearer(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(pos) = find_case_insensitive(remaining, "bearer") {
+        let is_word_boundary = if pos == 0 {
+            true
+        } else {
+            let prev_char = remaining[..pos].chars().next_back().unwrap_or(' ');
+            !prev_char.is_alphanumeric() && prev_char != '_'
+        };
+
+        if !is_word_boundary {
+            out.push_str(&remaining[..pos + 6]);
+            remaining = &remaining[pos + 6..];
+            continue;
+        }
+
+        let after_bearer = &remaining[pos + 6..];
+        let trimmed_colon = after_bearer.strip_prefix(':').unwrap_or(after_bearer);
+        let ws_len = trimmed_colon.len() - trimmed_colon.trim_start_matches([' ', '\t']).len();
+        if ws_len == 0 {
+            out.push_str(&remaining[..pos + 6]);
+            remaining = &remaining[pos + 6..];
+            continue;
+        }
+
+        let prefix_len = pos + 6 + (after_bearer.len() - trimmed_colon.len()) + ws_len;
+        out.push_str(&remaining[..prefix_len]);
+        let token_start = &remaining[prefix_len..];
+
+        if let Some(q) = token_start
+            .chars()
+            .next()
+            .filter(|&c| c == '"' || c == '\'')
+        {
+            out.push(q);
+            let val_content = &token_start[q.len_utf8()..];
+            let val_len = find_closing_quote(val_content, q).unwrap_or(val_content.len());
+            let val = &val_content[..val_len];
+            if val.trim().is_empty() || val == "[REDACTED]" {
+                out.push_str(val);
+            } else {
+                out.push_str("[REDACTED]");
+            }
+            if val_len < val_content.len() {
+                out.push(q);
+                remaining = &val_content[val_len + q.len_utf8()..];
+            } else {
+                remaining = "";
+            }
+        } else {
+            let token_len = token_start
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || c == '"'
+                        || c == '\''
+                        || c == ','
+                        || c == ';'
+                        || c == '&'
+                        || c == '}'
+                        || c == ']'
+                        || c == '\\'
+                })
+                .unwrap_or(token_start.len());
+
+            let token = &token_start[..token_len];
+            if !token.is_empty() && token != "[REDACTED]" {
+                out.push_str("[REDACTED]");
+            } else {
+                out.push_str(token);
+            }
+
+            remaining = &token_start[token_len..];
+        }
+    }
+
+    out.push_str(remaining);
+    out
+}
+
+fn redact_keys(input: &str, keys: &[&str]) -> String {
+    let mut current = input.to_string();
+    for key in keys {
+        current = redact_single_key(&current, key);
+    }
+    current
+}
+
+fn redact_single_key(input: &str, key: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(pos) = find_case_insensitive(remaining, key) {
+        let is_boundary = if pos == 0 {
+            true
+        } else {
+            let prev = remaining[..pos].chars().next_back().unwrap_or(' ');
+            !prev.is_alphanumeric() && prev != '_' && prev != '-'
+        };
+
+        if !is_boundary {
+            out.push_str(&remaining[..pos + key.len()]);
+            remaining = &remaining[pos + key.len()..];
+            continue;
+        }
+
+        let after_key = &remaining[pos + key.len()..];
+
+        let quote_len = if after_key.starts_with('"') || after_key.starts_with('\'') {
+            1
+        } else {
+            0
+        };
+        let after_key_quote = &after_key[quote_len..];
+
+        let ws1_len = after_key_quote.len() - after_key_quote.trim_start().len();
+        let after_ws1 = &after_key_quote[ws1_len..];
+
+        if !after_ws1.starts_with(':') && !after_ws1.starts_with('=') {
+            out.push_str(&remaining[..pos + key.len()]);
+            remaining = &remaining[pos + key.len()..];
+            continue;
+        }
+
+        let after_sep = &after_ws1[1..];
+        let ws2_len = after_sep.len() - after_sep.trim_start().len();
+        let after_ws2 = &after_sep[ws2_len..];
+
+        let prefix_len = pos + key.len() + quote_len + ws1_len + 1 + ws2_len;
+        out.push_str(&remaining[..prefix_len]);
+
+        if let Some(q) = after_ws2.chars().next().filter(|&c| c == '"' || c == '\'') {
+            out.push(q);
+            let val_content = &after_ws2[q.len_utf8()..];
+            let val_len = find_closing_quote(val_content, q).unwrap_or(val_content.len());
+            let val = &val_content[..val_len];
+            if val.trim().is_empty()
+                || val == "[REDACTED]"
+                || val.to_ascii_lowercase().starts_with("bearer [redacted]")
+            {
+                out.push_str(val);
+            } else if val.to_ascii_lowercase().starts_with("bearer ") {
+                let bearer_prefix = &val[..7];
+                out.push_str(bearer_prefix);
+                out.push_str("[REDACTED]");
+            } else {
+                out.push_str("[REDACTED]");
+            }
+            if val_len < val_content.len() {
+                out.push(q);
+                remaining = &val_content[val_len + q.len_utf8()..];
+            } else {
+                remaining = "";
+            }
+        } else {
+            let lower = after_ws2.to_ascii_lowercase();
+            if lower.starts_with("bearer [redacted]") {
+                out.push_str(&after_ws2[..17]);
+                remaining = &after_ws2[17..];
+                continue;
+            } else if lower.starts_with("bearer ") {
+                let ws_bearer = 7 + (after_ws2[7..].len() - after_ws2[7..].trim_start().len());
+                out.push_str(&after_ws2[..ws_bearer]);
+                let rest = &after_ws2[ws_bearer..];
+                let token_len = rest
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || c == '&'
+                            || c == ';'
+                            || c == ','
+                            || c == '}'
+                            || c == ']'
+                            || c == '"'
+                            || c == '\''
+                    })
+                    .unwrap_or(rest.len());
+                let token = &rest[..token_len];
+                if token != "[REDACTED]" && !token.is_empty() {
+                    out.push_str("[REDACTED]");
+                } else {
+                    out.push_str(token);
+                }
+                remaining = &rest[token_len..];
+            } else {
+                let val_len = after_ws2
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || c == '&'
+                            || c == ';'
+                            || c == ','
+                            || c == '}'
+                            || c == ']'
+                            || c == '"'
+                            || c == '\''
+                    })
+                    .unwrap_or(after_ws2.len());
+
+                let val = &after_ws2[..val_len];
+                if val.trim().is_empty() || val == "[REDACTED]" {
+                    out.push_str(val);
+                } else {
+                    out.push_str("[REDACTED]");
+                }
+                remaining = &after_ws2[val_len..];
+            }
+        }
+    }
+
+    out.push_str(remaining);
+    out
+}
+
+fn find_closing_quote(s: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .char_indices()
+        .find(|&(i, _)| {
+            haystack[i..]
+                .get(..needle.len())
+                .is_some_and(|slice| slice.eq_ignore_ascii_case(needle))
+        })
+        .map(|(i, _)| i)
+}
+
 #[async_trait]
 impl Provider for OpenAiCompat {
     fn id(&self) -> &str {
@@ -297,6 +548,18 @@ impl Provider for OpenAiCompat {
         );
         let body = self.build_body(&req);
         let max_retries = self.defaults.max_retries;
+
+        let body_keys: Vec<&str> = body
+            .as_object()
+            .map(|obj| obj.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let url_redacted = redact(&url);
+        let model = &req.model;
+        log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
+
+        let serialized_body = serde_json::to_string(&body).unwrap_or_default();
+        let body_redacted = redact(&serialized_body);
+        log::trace!("request body: {body_redacted}");
 
         let mut attempt = 0;
         let response = loop {
@@ -324,20 +587,22 @@ impl Provider for OpenAiCompat {
                     }
 
                     let status_u16 = status.as_u16();
+                    let text = resp.text().await.unwrap_or_default();
+                    let redacted_body = redact(&text);
+                    log::trace!("response body: {redacted_body}");
+                    log::warn!("request failed ({status_u16}): {redacted_body}");
+
                     if status_u16 == 401 || status_u16 == 403 {
-                        let text = resp.text().await.unwrap_or_default();
                         return Err(ProviderError::Auth(format!("{status_u16}: {text}")));
                     }
 
                     let is_retryable = status_u16 == 429 || status_u16 >= 500;
                     if is_retryable && attempt < max_retries {
-                        let _ = resp.text().await;
                         sleep_backoff(attempt).await;
                         attempt += 1;
                         continue;
                     }
 
-                    let text = resp.text().await.unwrap_or_default();
                     if status_u16 == 429 {
                         return Err(ProviderError::RateLimited(text));
                     }
@@ -347,6 +612,9 @@ impl Provider for OpenAiCompat {
                     });
                 }
                 Err(err) => {
+                    let err_str = err.to_string();
+                    let redacted_err = redact(&err_str);
+                    log::warn!("request transport error: {redacted_err}");
                     if attempt < max_retries {
                         sleep_backoff(attempt).await;
                         attempt += 1;
@@ -403,7 +671,8 @@ impl Provider for OpenAiCompat {
             Ok(resp) => resp,
             Err(err) => {
                 if !configured_models.is_empty() {
-                    log::warn!("failed to fetch models from {url}: {err}");
+                    let url_redacted = redact(&url);
+                    log::warn!("failed to fetch models from {url_redacted}: {err}");
                     if let Ok(mut guard) = self.catalog_cache.lock() {
                         *guard = Some(configured_models.clone());
                     }
@@ -414,29 +683,36 @@ impl Provider for OpenAiCompat {
         };
 
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            let redacted_text = redact(&text);
+            log::trace!("models response body: {redacted_text}");
             if !configured_models.is_empty() {
+                let url_redacted = redact(&url);
                 log::warn!(
-                    "models endpoint {url} returned status {}",
-                    response.status()
+                    "models endpoint {url_redacted} returned status {status}: {redacted_text}"
                 );
                 if let Ok(mut guard) = self.catalog_cache.lock() {
                     *guard = Some(configured_models.clone());
                 }
                 return Ok(configured_models);
             }
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            log::warn!("request failed ({status}): {redacted_text}");
             return Err(ProviderError::Http {
                 status,
                 message: text,
             });
         }
 
-        let json_val = match response.json::<Value>().await {
+        let json_text = response.text().await.unwrap_or_default();
+        let redacted_json = redact(&json_text);
+        log::trace!("models response body: {redacted_json}");
+        let json_val = match serde_json::from_str::<Value>(&json_text) {
             Ok(j) => j,
             Err(err) => {
                 if !configured_models.is_empty() {
-                    log::warn!("failed to parse JSON from {url}: {err}");
+                    let url_redacted = redact(&url);
+                    log::warn!("failed to parse JSON from {url_redacted}: {err}");
                     if let Ok(mut guard) = self.catalog_cache.lock() {
                         *guard = Some(configured_models.clone());
                     }

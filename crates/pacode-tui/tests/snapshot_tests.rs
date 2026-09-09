@@ -270,6 +270,8 @@ fn create_state(cols: u16, rows: u16, snapshot: SessionSnapshot) -> AppState {
     config.ui.hints.effort = true;
     config.ui.hints.model = true;
     let mut state = AppState::new(config, "0.1.0-dev".into(), cols, rows);
+    // The mascot is random per run; pin it so snapshots stay deterministic.
+    state.mascot = pacode_tui::ui::mascot::MascotKind::Pacman;
     let now = Instant::now();
     state.apply_client_event(ClientEvent::Snapshot(snapshot), now);
     state.turn_started_at = None;

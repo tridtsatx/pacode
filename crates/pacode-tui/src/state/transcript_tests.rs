@@ -196,23 +196,16 @@ fn test_turn_ended_stats_attached() {
 }
 
 #[test]
-fn test_header_pinned_on_cap_and_prepend() {
+fn test_header_is_not_a_cell_and_survives_a_seq_zero_item() {
     let mut t = Transcript::new(2);
-    let header = HeaderInfo {
-        model: "m".into(),
-        effort: "high".into(),
-        provider: "p".into(),
-        cwd: "/tmp".into(),
-        config_path: "/cfg".into(),
+    t.set_header(HeaderInfo {
         version: "0.1.0".into(),
-    };
-    t.insert_header(header);
-    assert_eq!(t.cells.len(), 1);
-    assert!(matches!(t.cells[0].kind, CellKind::Header(..)));
+        mascot: crate::ui::mascot::MascotKind::Pacman,
+    });
+    assert!(t.cells.is_empty(), "header must not occupy a cell");
 
-    // Upsert items exceeding capacity of 2
     let now = Instant::now();
-    for i in 1..=4 {
+    for i in 0..=3 {
         t.upsert(
             TranscriptItem {
                 seq: i,
@@ -225,24 +218,39 @@ fn test_header_pinned_on_cap_and_prepend() {
             now,
         );
     }
-    // Limit is max_cells (2) + 1 header = 3 total cells
-    assert_eq!(t.cells.len(), 3);
-    // Header is still pinned at index 0
-    assert!(matches!(t.cells[0].kind, CellKind::Header(..)));
-    assert_eq!(t.cells[1].id, 3);
-    assert_eq!(t.cells[2].id, 4);
 
-    // Prepending history inserts after header
-    t.prepend(
-        vec![TranscriptItem {
-            seq: 2,
-            agent: AgentId::main(),
-            ts_ms: 2,
-            kind: TranscriptKind::User { text: "2".into() },
-        }],
-        false,
+    // Item seq 0 no longer collides with the header, and the cap counts items only.
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 2);
+    assert_eq!(t.cells[1].id, 3);
+    assert_eq!(
+        t.header,
+        Some(HeaderInfo {
+            version: "0.1.0".into(),
+            mascot: crate::ui::mascot::MascotKind::Pacman,
+        })
     );
-    assert!(matches!(t.cells[0].kind, CellKind::Header(..)));
+}
+
+#[test]
+fn test_set_header_is_idempotent() {
+    let mut t = Transcript::new(4);
+    let info = HeaderInfo {
+        version: "0.1.0".into(),
+        mascot: crate::ui::mascot::MascotKind::Pacman,
+    };
+    t.set_header(info.clone());
+    let v = t.header_version;
+    t.set_header(info);
+    assert_eq!(
+        t.header_version, v,
+        "identical header must not bump version"
+    );
+    t.set_header(HeaderInfo {
+        version: "0.2.0".into(),
+        mascot: crate::ui::mascot::MascotKind::Pacman,
+    });
+    assert_ne!(t.header_version, v);
 }
 
 #[test]

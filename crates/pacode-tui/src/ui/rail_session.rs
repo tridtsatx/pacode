@@ -266,9 +266,5 @@ pub fn draw_anchor(frame: &mut Frame, area: Rect, state: &AppState, opts: &Rende
         Span::styled(branch_str, opts.theme.accent),
     ]);
 
-    let app_str = format!("• pacode {}", state.app_version);
-    let app_trunc = truncate_to_width(&app_str, area.width as usize, true);
-    let line2 = Line::from(Span::styled(app_trunc, opts.theme.faint));
-
-    frame.render_widget(Paragraph::new(vec![line1, line2]).centered(), area);
+    frame.render_widget(Paragraph::new(vec![line1]).centered(), area);
 }

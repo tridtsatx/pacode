@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use pacode_types::{Config, Effort, Mode, ProviderConfig};
 use tempfile::tempdir;
 
-use crate::logging::{FileLogger, init_file_logger, level_from_env};
+use crate::logging::{FileLogger, default_level, init_file_logger, level_from_env};
 use crate::paths::Paths;
 use crate::{ConfigError, apply_env_overrides, load, parse, resolve_api_key};
 
@@ -86,6 +86,7 @@ fn parse_spec_example() {
 
     assert!(!cfg.ui.ascii_only);
     assert!(cfg.ui.mouse);
+    assert_eq!(cfg.ui.ups, pacode_types::Ups::Fixed(10));
     assert!(cfg.ui.hints.model);
     assert!(cfg.ui.hints.effort);
 
@@ -156,6 +157,7 @@ fn defaults_from_empty_text() {
 
     assert!(!cfg.ui.ascii_only);
     assert!(cfg.ui.mouse);
+    assert_eq!(cfg.ui.ups, pacode_types::Ups::Fixed(10));
     assert_eq!(cfg.ui.transcript_cells, 500);
     assert!(!cfg.ui.hints.model);
     assert!(cfg.ui.hints.effort);
@@ -335,6 +337,16 @@ fn level_from_env_parsing() {
 }
 
 #[test]
+fn default_level_matches_build_profile() {
+    let expected = if cfg!(debug_assertions) {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Warn
+    };
+    assert_eq!(default_level(), expected);
+}
+
+#[test]
 fn resolve_api_key_precedence() {
     // 1. cfg.api_key trimmed non-empty wins
     let mut cfg = ProviderConfig {
@@ -469,4 +481,79 @@ fn update_config_value_nested_write() {
         .expect("update integer");
     let cfg = load(&paths).expect("load updated config");
     assert_eq!(cfg.exec.yield_after_secs, 42);
+}
+
+#[test]
+fn test_ups_toml_parsing() {
+    // 1. Integer form
+    let cfg1 = parse("[ui]\nups = 10\n").expect("parse ups = 10");
+    assert_eq!(cfg1.ui.ups, pacode_types::Ups::Fixed(10));
+
+    let cfg2 = parse("[ui]\nups = 60\n").expect("parse ups = 60");
+    assert_eq!(cfg2.ui.ups, pacode_types::Ups::Fixed(60));
+
+    // 2. String form: dynamic
+    let cfg3 = parse("[ui]\nups = \"dynamic\"\n").expect("parse ups = dynamic");
+    assert_eq!(cfg3.ui.ups, pacode_types::Ups::Dynamic);
+
+    // 3. String form: auto
+    let cfg4 = parse("[ui]\nups = \"auto\"\n").expect("parse ups = auto");
+    assert_eq!(cfg4.ui.ups, pacode_types::Ups::Auto);
+
+    // 4. Default when omitted
+    let cfg5 = parse("[ui]\nmouse = false\n").expect("parse without ups");
+    assert_eq!(cfg5.ui.ups, pacode_types::Ups::Fixed(10));
+
+    // 5. Invalid values must fail
+    assert!(parse("[ui]\nups = \"invalid\"\n").is_err());
+    assert!(parse("[ui]\nups = -1\n").is_err());
+}
+
+#[test]
+fn test_ups_frame_interval_clamping() {
+    use std::time::Duration;
+
+    // Fixed values and clamping
+    assert_eq!(
+        pacode_types::Ups::Fixed(0).frame_interval(None),
+        Some(Duration::from_millis(1000))
+    );
+    assert_eq!(
+        pacode_types::Ups::Fixed(10).frame_interval(None),
+        Some(Duration::from_millis(100))
+    );
+    assert_eq!(
+        pacode_types::Ups::Fixed(60).frame_interval(None),
+        Some(Duration::from_millis(16))
+    );
+    assert_eq!(
+        pacode_types::Ups::Fixed(300).frame_interval(None),
+        Some(Duration::from_millis(4))
+    );
+
+    // Dynamic always returns None
+    assert_eq!(pacode_types::Ups::Dynamic.frame_interval(None), None);
+    assert_eq!(pacode_types::Ups::Dynamic.frame_interval(Some(60)), None);
+
+    // Auto with detected Hz vs fallback
+    assert_eq!(
+        pacode_types::Ups::Auto.frame_interval(None),
+        Some(Duration::from_millis(100))
+    );
+    assert_eq!(
+        pacode_types::Ups::Auto.frame_interval(Some(60)),
+        Some(Duration::from_millis(16))
+    );
+    assert_eq!(
+        pacode_types::Ups::Auto.frame_interval(Some(144)),
+        Some(Duration::from_millis(6))
+    );
+    assert_eq!(
+        pacode_types::Ups::Auto.frame_interval(Some(0)),
+        Some(Duration::from_millis(1000))
+    );
+    assert_eq!(
+        pacode_types::Ups::Auto.frame_interval(Some(360)),
+        Some(Duration::from_millis(4))
+    );
 }

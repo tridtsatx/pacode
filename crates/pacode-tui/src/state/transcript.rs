@@ -24,12 +24,8 @@ pub struct Cell {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeaderInfo {
-    pub model: String,
-    pub effort: String,
-    pub provider: String,
-    pub cwd: String,
-    pub config_path: String,
     pub version: String,
+    pub mascot: crate::ui::mascot::MascotKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,12 +34,15 @@ pub enum CellKind {
     Item(TranscriptKind),
     /// Divider between turns (drawn as a blank line).
     Gap,
-    /// Header cell at the top of the transcript.
-    Header(HeaderInfo),
 }
 
 pub struct Transcript {
     pub cells: VecDeque<Cell>,
+    /// Non-persisted banner drawn above the first cell. Kept out of `cells` so a
+    /// transcript item can never collide with it by seq.
+    pub header: Option<HeaderInfo>,
+    /// Bumped on every header change so the render cache can key on it.
+    pub header_version: u32,
     pub max_cells: usize,
     /// Scroll offset in rendered lines from the bottom; 0 = follow the tail.
     pub scroll_from_bottom: usize,
@@ -64,6 +63,8 @@ impl Transcript {
     pub fn new(max_cells: usize) -> Self {
         Self {
             cells: VecDeque::new(),
+            header: None,
+            header_version: 0,
             max_cells,
             scroll_from_bottom: 0,
             cache: LineCache::new(20_000),
@@ -104,11 +105,7 @@ impl Transcript {
         self.has_more_history = has_more;
         self.loading_history = false;
 
-        let has_header = self
-            .cells
-            .front()
-            .is_some_and(|c| matches!(c.kind, CellKind::Header(..)));
-        let insert_idx = if has_header { 1 } else { 0 };
+        let insert_idx = 0;
 
         for item in items.into_iter().rev() {
             let cell = Cell {
@@ -123,22 +120,13 @@ impl Transcript {
         self.enforce_cap();
     }
 
-    /// Insert or update the non-persisted header cell at the very front.
-    pub fn insert_header(&mut self, info: HeaderInfo) {
-        if let Some(front) = self.cells.front_mut()
-            && matches!(front.kind, CellKind::Header(..))
-        {
-            front.kind = CellKind::Header(info);
-            front.version = front.version.wrapping_add(1);
-        } else {
-            self.cells.push_front(Cell {
-                id: 0,
-                kind: CellKind::Header(info),
-                version: 0,
-                ts_ms: 0,
-                stats: None,
-            });
+    /// Set or update the non-persisted header banner.
+    pub fn set_header(&mut self, info: HeaderInfo) {
+        if self.header.as_ref() == Some(&info) {
+            return;
         }
+        self.header = Some(info);
+        self.header_version = self.header_version.wrapping_add(1);
     }
 
     /// `ItemAdded` / `ItemUpdated`: insert or replace by seq. Assistant/Reasoning items
@@ -395,16 +383,8 @@ impl Transcript {
 
     /// Evict oldest cells past `max_cells` (keeping the live cell and pinned header), dropping their cache.
     pub fn enforce_cap(&mut self) {
-        let has_header = self
-            .cells
-            .front()
-            .is_some_and(|c| matches!(c.kind, CellKind::Header(..)));
-        let limit = if has_header {
-            self.max_cells + 1
-        } else {
-            self.max_cells
-        };
-        let evict_idx = if has_header { 1 } else { 0 };
+        let limit = self.max_cells;
+        let evict_idx = 0;
 
         while self.cells.len() > limit {
             if let Some(cell) = self.cells.get(evict_idx) {

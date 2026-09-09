@@ -1,11 +1,24 @@
 //! Tiny file logger for the `log` facade. No timers, no background thread: each
 //! record is formatted and appended under a mutex. Level from `PACODE_LOG`
-//! (`error|warn|info|debug|trace`, default `info`).
+//! (`error|warn|info|debug|trace`, default `trace` in debug builds, `warn` in release).
 
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
+
+/// Default logging filter level depending on the build profile.
+///
+/// Returns `log::LevelFilter::Trace` in debug builds (`cfg!(debug_assertions)` is true)
+/// to capture detailed diagnostic information, and `log::LevelFilter::Warn` in release
+/// builds to minimize logging overhead and noise.
+pub fn default_level() -> log::LevelFilter {
+    if cfg!(debug_assertions) {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Warn
+    }
+}
 
 /// File logger backend implementing `log::Log`.
 pub struct FileLogger {

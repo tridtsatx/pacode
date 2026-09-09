@@ -7,10 +7,12 @@
 //! - cache:   `~/.cache/pacode/`        → `mcp/<server>.json`
 //! - runtime: `$XDG_RUNTIME_DIR/pacode/` → `daemon.sock` (fallback `/tmp/pacode-<uid>/`)
 
+pub mod display;
 pub mod logging;
 pub mod paths;
 pub mod prefs;
 
+pub use display::detect_refresh_hz;
 pub use paths::Paths;
 pub use prefs::{Prefs, load_prefs, save_prefs};
 pub use toml;

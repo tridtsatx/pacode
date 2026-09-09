@@ -137,9 +137,9 @@ fn test_toast_rect_inside_dialog() {
     let layout = compute(area, 1, false);
     // Dialog column: x = 0, width = 106, dialog_y = 0, input_top = y: 35
     assert_eq!(layout.dialog.width, 106);
-    // Toast width = min(dialog.width - 2, 60) = 60
-    assert_eq!(layout.toast.width, 60);
-    assert_eq!(layout.toast.height, 2);
+    // Toast width = min(dialog.width - 2, 62) = 62
+    assert_eq!(layout.toast.width, 62);
+    assert_eq!(layout.toast.height, 4);
     // Toast must be strictly inside dialog: x >= dialog.x and toast.right() <= dialog.right() - 1
     assert!(layout.toast.x >= layout.dialog.x);
     assert_eq!(
@@ -152,8 +152,9 @@ fn test_toast_rect_inside_dialog() {
     // 2. With panel (dialog is narrower)
     let layout_panel = compute(area, 1, true);
     assert_eq!(layout_panel.dialog.width, 52);
-    // Toast width = min(52 - 2, 60) = 50
+    // Toast width = min(52 - 2, 62) = 50
     assert_eq!(layout_panel.toast.width, 50);
+    assert_eq!(layout_panel.toast.height, 4);
     assert!(layout_panel.toast.x >= layout_panel.dialog.x);
     assert_eq!(
         layout_panel.toast.x + layout_panel.toast.width,

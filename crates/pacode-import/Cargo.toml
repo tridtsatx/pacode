@@ -1,0 +1,13 @@
+[package]
+name = "pacode-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Discovery and normalization of MCP servers and skills from other coding agents"
+
+[dependencies]
+pacode-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }

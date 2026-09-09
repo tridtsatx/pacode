@@ -10,6 +10,7 @@ use pacode_types::TranscriptKind;
 use pacode_types::state::Mode;
 use pacode_types::time::{format_duration_ms, now_ms};
 
+use crate::keys::selectable_agents;
 use crate::state::transcript::CellKind;
 use crate::state::{AppState, Connection, Focus, PanelTarget};
 
@@ -174,26 +175,28 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
             } else {
                 match &state.focus {
                     Focus::SelectAgent { index } => {
-                        let total = state.rail.agents.len();
-                        let subagents: Vec<_> = state
-                            .rail
-                            .agents
-                            .iter()
-                            .filter(|a| !a.id.is_main())
-                            .collect();
-                        let name = subagents
+                        let agents = selectable_agents(state);
+                        let total = agents.len();
+                        let display_idx = index + 1;
+                        let name = agents
                             .get(*index)
-                            .map(|a| a.name.as_str())
+                            .and_then(|id| {
+                                if id.is_main() {
+                                    Some("main")
+                                } else {
+                                    state.rail.agent(id).map(|a| a.name.as_str())
+                                }
+                            })
                             .unwrap_or("agent");
                         (
                             vec![
                                 Span::styled(format!("{} ", opts.glyphs.chevrons), opts.theme.cyan),
                                 Span::styled(
-                                    format!("{name} {}/{} · ", index + 1, total),
+                                    format!("{name} {display_idx}/{total} · "),
                                     opts.theme.bold,
                                 ),
                                 Span::styled(
-                                    "enter open · alt+b follow · esc clear",
+                                    "enter open · alt+f follow · esc clear",
                                     opts.theme.dim,
                                 ),
                             ],
@@ -229,7 +232,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     Span::styled("FOLLOW", opts.theme.selected_bg),
                                     Span::raw(" "),
                                     Span::styled(format!("{name} {dur} · "), opts.theme.bold),
-                                    Span::styled("pgup pause · alt+b release", opts.theme.dim),
+                                    Span::styled("pgup pause · alt+f release", opts.theme.dim),
                                 ],
                                 false,
                             )
@@ -242,7 +245,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     ),
                                     Span::styled(format!("{name} · "), opts.theme.bold),
                                     Span::styled(
-                                        "esc back · alt+b follow · s stop",
+                                        "esc back · alt+f follow · s stop",
                                         opts.theme.dim,
                                     ),
                                 ],
@@ -315,7 +318,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                 if parts.is_empty() {
                                     String::new()
                                 } else {
-                                    format!(" · {}", parts.join(" · "))
+                                    let joined = parts.join(" · ");
+                                    format!(" · {joined}")
                                 }
                             };
 

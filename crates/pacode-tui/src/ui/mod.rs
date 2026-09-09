@@ -9,6 +9,7 @@ pub mod files;
 pub mod footer;
 pub mod header;
 pub mod input;
+pub mod mascot;
 pub mod mcp;
 pub mod overlays;
 pub mod panel;
@@ -187,7 +188,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     };
     overlays::draw(frame, dialog_or_full, state, &opts);
 
-    let should_copy = match state.selection.copy_request {
+    let copy_req = state.selection.copy_request;
+    let should_copy = match copy_req {
         crate::state::selection::CopyRequest::Explicit => true,
         crate::state::selection::CopyRequest::Auto => state.config.ui.auto_copy,
         crate::state::selection::CopyRequest::None => false,
@@ -199,10 +201,17 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         if !text.is_empty() {
             let count = text.chars().count();
             let _ = crate::clipboard::copy(&text);
+            let detail = match copy_req {
+                crate::state::selection::CopyRequest::Auto => {
+                    Some("disable autocopy in /config".to_string())
+                }
+                crate::state::selection::CopyRequest::Explicit
+                | crate::state::selection::CopyRequest::None => None,
+            };
             state.push_toast(
                 pacode_types::ToastLevel::Info,
                 format!("copied {count} chars"),
-                None,
+                detail,
                 std::time::Instant::now(),
             );
             if crate::clipboard::remote_hint().is_some() && !state.clipboard_warned {

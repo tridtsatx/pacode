@@ -313,7 +313,7 @@ pub fn main() -> anyhow::Result<()> {
 
     let log_level =
         pacode_config::logging::level_from_env(std::env::var("PACODE_LOG").ok().as_deref())
-            .unwrap_or(log::LevelFilter::Info);
+            .unwrap_or_else(pacode_config::logging::default_level);
 
     match cli.command {
         Some(Command::Serve {

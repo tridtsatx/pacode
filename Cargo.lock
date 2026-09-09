@@ -2197,6 +2197,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pacode-import"
+version = "0.1.0"
+dependencies = [
+ "pacode-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "toml",
+]
+
+[[package]]
 name = "pacode-mcp"
 version = "0.1.0"
 dependencies = [

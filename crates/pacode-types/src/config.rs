@@ -3,8 +3,10 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+pub use serde_json;
 use serde_json::Value;
 
 use crate::model::{Effort, ModelRoute, Pricing};
@@ -95,6 +97,79 @@ pub struct ModelConfig {
     pub reasoning: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ups {
+    Fixed(u16),
+    Dynamic,
+    Auto,
+}
+
+impl Default for Ups {
+    fn default() -> Self {
+        Self::Fixed(10)
+    }
+}
+
+impl Ups {
+    pub fn frame_interval(&self, detected_hz: Option<u16>) -> Option<Duration> {
+        match *self {
+            Self::Dynamic => None,
+            Self::Fixed(n) => {
+                let clamped = n.clamp(1, 240);
+                Some(Duration::from_millis(1000 / clamped as u64))
+            }
+            Self::Auto => {
+                let hz = detected_hz.unwrap_or(10);
+                let clamped = hz.clamp(1, 240);
+                Some(Duration::from_millis(1000 / clamped as u64))
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum UpsHelper {
+    Fixed(u16),
+    Named(UpsNamed),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum UpsNamed {
+    Dynamic,
+    Auto,
+}
+
+impl Serialize for Ups {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let helper = match *self {
+            Self::Fixed(n) => UpsHelper::Fixed(n),
+            Self::Dynamic => UpsHelper::Named(UpsNamed::Dynamic),
+            Self::Auto => UpsHelper::Named(UpsNamed::Auto),
+        };
+        helper.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ups {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let helper = UpsHelper::deserialize(deserializer)?;
+        let ups = match helper {
+            UpsHelper::Fixed(n) => Self::Fixed(n),
+            UpsHelper::Named(UpsNamed::Dynamic) => Self::Dynamic,
+            UpsHelper::Named(UpsNamed::Auto) => Self::Auto,
+        };
+        Ok(ups)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -102,6 +177,8 @@ pub struct UiConfig {
     pub ascii_only: bool,
     pub mouse: bool,
     pub auto_copy: bool,
+    #[serde(default)]
+    pub ups: Ups,
     /// `auto` (COLORTERM detection), `truecolor`, or `ansi`.
     pub color: String,
     /// Max transcript cells kept in the client before older ones are evicted.
@@ -115,6 +192,7 @@ impl Default for UiConfig {
             ascii_only: false,
             mouse: true,
             auto_copy: true,
+            ups: Ups::default(),
             color: "auto".to_string(),
             transcript_cells: 500,
         }
@@ -351,6 +429,7 @@ mod tests {
         assert_eq!(cfg.exec.yield_after_secs, 10);
         assert_eq!(cfg.permissions.default_mode, Mode::Build);
         assert!(!cfg.ui.hints.model);
+        assert_eq!(cfg.ui.ups, Ups::Fixed(10));
         assert!(cfg.default_route().is_none());
     }
 
@@ -364,5 +443,50 @@ mod tests {
         let route = cfg.default_route().unwrap();
         assert_eq!(route.provider, "bubna");
         assert_eq!(route.model, "gemini-3.8-flash");
+    }
+
+    #[test]
+    fn ups_serde_and_clamping() {
+        let fixed: Ups = serde_json::from_str("10").unwrap();
+        assert_eq!(fixed, Ups::Fixed(10));
+        assert_eq!(fixed.frame_interval(None), Some(Duration::from_millis(100)));
+
+        let dyn_val: Ups = serde_json::from_str("\"dynamic\"").unwrap();
+        assert_eq!(dyn_val, Ups::Dynamic);
+        assert_eq!(dyn_val.frame_interval(Some(60)), None);
+
+        let auto_val: Ups = serde_json::from_str("\"auto\"").unwrap();
+        assert_eq!(auto_val, Ups::Auto);
+        assert_eq!(
+            auto_val.frame_interval(None),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            auto_val.frame_interval(Some(60)),
+            Some(Duration::from_millis(16))
+        );
+
+        // Clamping tests
+        assert_eq!(
+            Ups::Fixed(0).frame_interval(None),
+            Some(Duration::from_millis(1000))
+        );
+        assert_eq!(
+            Ups::Fixed(300).frame_interval(None),
+            Some(Duration::from_millis(4))
+        );
+        assert_eq!(
+            Ups::Auto.frame_interval(Some(0)),
+            Some(Duration::from_millis(1000))
+        );
+        assert_eq!(
+            Ups::Auto.frame_interval(Some(300)),
+            Some(Duration::from_millis(4))
+        );
+
+        // Symmetric serialization
+        assert_eq!(serde_json::to_string(&Ups::Fixed(10)).unwrap(), "10");
+        assert_eq!(serde_json::to_string(&Ups::Dynamic).unwrap(), "\"dynamic\"");
+        assert_eq!(serde_json::to_string(&Ups::Auto).unwrap(), "\"auto\"");
     }
 }
