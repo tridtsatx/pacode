@@ -18,6 +18,7 @@ unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 chrono = { workspace = true }
 log = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

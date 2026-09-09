@@ -2,10 +2,12 @@
 //! tool set. Tools never see `Session`; everything they need arrives through
 //! [`ToolCtx`].
 
+pub mod builtin;
 pub mod host;
 pub mod output;
 pub mod registry;
 
+pub use builtin::{builtin_tools, subagent_tool_names};
 pub use host::{AgentSpec, ToolCtx, ToolHost, WaitOutcome};
 pub use output::{ToolError, ToolOutput};
 pub use registry::ToolRegistry;

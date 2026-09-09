@@ -28,6 +28,10 @@ pub struct ToolCtx {
     pub cancel: CancellationToken,
     /// From `[context].tool_output_cap_chars`.
     pub output_cap_chars: usize,
+    /// From `[exec].yield_after_secs`: foreground wait before a command is backgrounded.
+    pub exec_yield_after: Duration,
+    /// From `[exec].default_timeout_secs`.
+    pub exec_default_timeout: Duration,
 }
 
 impl ToolCtx {
