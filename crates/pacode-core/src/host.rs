@@ -34,7 +34,8 @@ impl ToolHost for SessionHost {
                 .next()
                 .unwrap_or("")
                 .to_lowercase();
-            if self.session.tools.get(&prefix).is_some() {
+            let session_tools = self.session.tools.read().unwrap_or_else(|p| p.into_inner());
+            if session_tools.get(&prefix).is_some() {
                 prefix
             } else if draft.risk.is_some() {
                 "bash".to_string()
@@ -45,7 +46,13 @@ impl ToolHost for SessionHost {
 
         let kind = if draft.risk.is_some() {
             pacode_tools::ToolKind::Exec
-        } else if let Some(t) = self.session.tools.get(&tool_name) {
+        } else if let Some(t) = self
+            .session
+            .tools
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&tool_name)
+        {
             t.kind()
         } else if tool_name == "bash" {
             pacode_tools::ToolKind::Exec

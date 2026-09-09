@@ -686,3 +686,296 @@ async fn test_event_queue_drop_on_lagging_receiver() {
 
     client.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_and_plugin_helpers() {
+    let dir = tempdir().unwrap();
+    let socket = dir.path().join("mcp_plugin.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+
+            // Hello
+            let _ = reader.read_line(&mut line).await;
+            let hello_reply = ServerMessage::Reply {
+                id: 1,
+                reply: Reply::Hello {
+                    daemon_version: "t".to_string(),
+                    protocol: PROTOCOL_VERSION,
+                    pid: 1,
+                },
+            };
+            let mut out = serde_json::to_string(&hello_reply).unwrap();
+            out.push('\n');
+            let _ = write_half.write_all(out.as_bytes()).await;
+
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let env: Envelope = serde_json::from_str(trimmed).unwrap();
+                let reply = match env.req {
+                    Request::ListMcpServers => Reply::McpServers {
+                        servers: vec![pacode_types::McpServerInfo {
+                            name: "github".into(),
+                            status: "ready".into(),
+                            error: None,
+                            tools: 5,
+                            resources: 2,
+                            prompts: 1,
+                            prompt_names: vec!["review".into()],
+                        }],
+                    },
+                    Request::RestartMcpServer { server } => {
+                        assert_eq!(server, "github");
+                        Reply::Ok
+                    }
+                    Request::SetMcpServerEnabled { server, enabled } => {
+                        assert_eq!(server, "github");
+                        assert!(!enabled);
+                        Reply::Ok
+                    }
+                    Request::GetMcpPrompt { server, name, args } => {
+                        assert_eq!(server, "github");
+                        assert_eq!(name, "review");
+                        assert_eq!(args.get("pr"), Some(&"123".to_string()));
+                        Reply::McpPrompt {
+                            text: "Review prompt content".into(),
+                        }
+                    }
+                    Request::ListPlugins => Reply::Plugins {
+                        plugins: vec![pacode_types::PluginInfo {
+                            name: "test-plugin".into(),
+                            version: "0.1.0".into(),
+                            kind: "lua".into(),
+                            tools: vec!["tool1".into()],
+                            commands: vec!["hello".into()],
+                            error: None,
+                        }],
+                    },
+                    Request::RunPluginCommand { name, args } => {
+                        assert_eq!(name, "hello");
+                        assert_eq!(args, "world");
+                        Reply::PluginCommand(pacode_types::PluginCommandOutcome::InsertText {
+                            text: "Hello, world!".into(),
+                        })
+                    }
+                    Request::ListSessions { limit } => {
+                        assert_eq!(limit, 10);
+                        Reply::Sessions {
+                            sessions: vec![dummy_snapshot().meta],
+                        }
+                    }
+                    Request::ListModels => Reply::Models {
+                        models: vec![pacode_types::model::ModelInfo {
+                            route: ModelRoute::new("dummy", "model"),
+                            display_name: "Dummy Model".into(),
+                            context_window: Some(32000),
+                            supports_reasoning: false,
+                            pricing: None,
+                        }],
+                    },
+                    _ => Reply::Ok,
+                };
+
+                let msg = ServerMessage::Reply { id: env.id, reply };
+                let mut out = serde_json::to_string(&msg).unwrap();
+                out.push('\n');
+                let _ = write_half.write_all(out.as_bytes()).await;
+                let _ = write_half.flush().await;
+            }
+        }
+    });
+
+    let mut opts = ClientOptions::new(Paths::under(dir.path()), "t");
+    opts.socket = Some(socket);
+    opts.spawn_daemon = false;
+
+    let (client, _rx) = Client::connect(opts).await.unwrap();
+
+    // 1. list_mcp_servers
+    let servers = client.list_mcp_servers().await.unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, "github");
+    assert_eq!(servers[0].prompt_names, vec!["review"]);
+
+    // 2. restart_mcp_server
+    client.restart_mcp_server("github").await.unwrap();
+
+    // 3. set_mcp_server_enabled
+    client
+        .set_mcp_server_enabled("github", false)
+        .await
+        .unwrap();
+
+    // 4. get_mcp_prompt
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("pr".to_string(), "123".to_string());
+    let prompt_text = client
+        .get_mcp_prompt("github", "review", args)
+        .await
+        .unwrap();
+    assert_eq!(prompt_text, "Review prompt content");
+
+    // 5. list_plugins
+    let plugins = client.list_plugins().await.unwrap();
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name, "test-plugin");
+    assert_eq!(plugins[0].commands, vec!["hello"]);
+
+    // 6. run_plugin_command
+    let outcome = client.run_plugin_command("hello", "world").await.unwrap();
+    assert_eq!(
+        outcome,
+        pacode_types::PluginCommandOutcome::InsertText {
+            text: "Hello, world!".into(),
+        }
+    );
+
+    // 7. list_sessions
+    let sessions = client.list_sessions(10).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+
+    // 8. list_models
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.len(), 1);
+
+    client.close().await;
+    let _ = server_task.await;
+}
+
+#[test]
+fn test_mcp_and_plugin_wire_serialization_round_trip() {
+    // 1. ListMcpServers
+    let env = Envelope {
+        id: 10,
+        req: Request::ListMcpServers,
+    };
+    let json = serde_json::to_string(&env).unwrap();
+    let parsed: Envelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, env);
+
+    // 2. RestartMcpServer
+    let env = Envelope {
+        id: 11,
+        req: Request::RestartMcpServer {
+            server: "server1".into(),
+        },
+    };
+    let json = serde_json::to_string(&env).unwrap();
+    let parsed: Envelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, env);
+
+    // 3. SetMcpServerEnabled
+    let env = Envelope {
+        id: 12,
+        req: Request::SetMcpServerEnabled {
+            server: "server1".into(),
+            enabled: true,
+        },
+    };
+    let json = serde_json::to_string(&env).unwrap();
+    let parsed: Envelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, env);
+
+    // 4. GetMcpPrompt
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("key".into(), "val".into());
+    let env = Envelope {
+        id: 13,
+        req: Request::GetMcpPrompt {
+            server: "server1".into(),
+            name: "prompt1".into(),
+            args,
+        },
+    };
+    let json = serde_json::to_string(&env).unwrap();
+    let parsed: Envelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, env);
+
+    // 5. ListPlugins
+    let env = Envelope {
+        id: 14,
+        req: Request::ListPlugins,
+    };
+    let json = serde_json::to_string(&env).unwrap();
+    let parsed: Envelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, env);
+
+    // 6. RunPluginCommand
+    let env = Envelope {
+        id: 15,
+        req: Request::RunPluginCommand {
+            name: "cmd1".into(),
+            args: "arg1 arg2".into(),
+        },
+    };
+    let json = serde_json::to_string(&env).unwrap();
+    let parsed: Envelope = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, env);
+
+    // Replies
+    let reply_mcp = ServerMessage::Reply {
+        id: 10,
+        reply: Reply::McpServers {
+            servers: vec![pacode_types::McpServerInfo {
+                name: "srv".into(),
+                status: "ready".into(),
+                error: Some("err".into()),
+                tools: 3,
+                resources: 1,
+                prompts: 2,
+                prompt_names: vec!["p1".into()],
+            }],
+        },
+    };
+    let json = serde_json::to_string(&reply_mcp).unwrap();
+    let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, reply_mcp);
+
+    let reply_prompt = ServerMessage::Reply {
+        id: 13,
+        reply: Reply::McpPrompt {
+            text: "rendered prompt".into(),
+        },
+    };
+    let json = serde_json::to_string(&reply_prompt).unwrap();
+    let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, reply_prompt);
+
+    let reply_plugins = ServerMessage::Reply {
+        id: 14,
+        reply: Reply::Plugins {
+            plugins: vec![pacode_types::PluginInfo {
+                name: "p".into(),
+                version: "1.0".into(),
+                kind: "wasm".into(),
+                tools: vec![],
+                commands: vec!["run".into()],
+                error: None,
+            }],
+        },
+    };
+    let json = serde_json::to_string(&reply_plugins).unwrap();
+    let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, reply_plugins);
+
+    let reply_cmd = ServerMessage::Reply {
+        id: 15,
+        reply: Reply::PluginCommand(pacode_types::PluginCommandOutcome::SendPrompt {
+            text: "do this".into(),
+        }),
+    };
+    let json = serde_json::to_string(&reply_cmd).unwrap();
+    let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, reply_cmd);
+}

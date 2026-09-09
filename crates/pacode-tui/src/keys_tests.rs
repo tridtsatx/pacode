@@ -494,3 +494,188 @@ fn test_overlay_rail_and_help_navigation_and_esc() {
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
 }
+
+#[test]
+fn test_overlay_mcp_picker_keys() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // 1. Open via slash command `/mcp` + Enter
+    state.input.insert_str("/mcp");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(actions, vec![Action::Send(Request::ListMcpServers)]);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::McpPicker {
+            index: 0,
+            servers: Vec::new(),
+            loading: true,
+        })
+    );
+
+    // 2. Populate servers
+    let server1 = pacode_types::McpServerInfo {
+        name: "srv1".into(),
+        status: "ready".into(),
+        error: None,
+        tools: 3,
+        resources: 1,
+        prompts: 2,
+        prompt_names: vec!["p1".into(), "p2".into()],
+    };
+    let server2 = pacode_types::McpServerInfo {
+        name: "srv2".into(),
+        status: "disabled".into(),
+        error: None,
+        tools: 0,
+        resources: 0,
+        prompts: 0,
+        prompt_names: vec![],
+    };
+    state.focus = Focus::Overlay(Overlay::McpPicker {
+        index: 0,
+        servers: vec![server1, server2],
+        loading: false,
+    });
+
+    // 3. Down moves index to 1
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, down, now);
+    assert!(actions.is_empty());
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::McpPicker { index: 1, .. })
+    ));
+
+    // Typing letters doesn't leak into input
+    let char_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+    handle_key(&mut state, char_z, now);
+    assert!(state.input.is_empty());
+
+    // 4. Up moves index back to 0
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    handle_key(&mut state, up, now);
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::McpPicker { index: 0, .. })
+    ));
+
+    // 5. 'r' on index 0 (srv1) sends RestartMcpServer + ListMcpServers
+    let char_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, char_r, now);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Send(Request::RestartMcpServer {
+                server: "srv1".into()
+            }),
+            Action::Send(Request::ListMcpServers),
+        ]
+    );
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::McpPicker { loading: true, .. })
+    ));
+
+    // 6. Enter on index 0 (srv1, status "ready") toggles to disabled (enabled = false)
+    if let Focus::Overlay(Overlay::McpPicker {
+        ref mut loading, ..
+    }) = state.focus
+    {
+        *loading = false;
+    }
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Send(Request::SetMcpServerEnabled {
+                server: "srv1".into(),
+                enabled: false,
+            }),
+            Action::Send(Request::ListMcpServers),
+        ]
+    );
+
+    // 7. Enter on index 1 (srv2, status "disabled") toggles to enabled (enabled = true)
+    handle_key(&mut state, down, now);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Send(Request::SetMcpServerEnabled {
+                server: "srv2".into(),
+                enabled: true,
+            }),
+            Action::Send(Request::ListMcpServers),
+        ]
+    );
+
+    // 8. Esc closes picker
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, esc, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_overlay_plugins_picker_keys() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // 1. Open via slash command `/plugins` + Enter
+    state.input.insert_str("/plugins");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(actions, vec![Action::Send(Request::ListPlugins)]);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::PluginsPicker {
+            index: 0,
+            plugins: Vec::new(),
+        })
+    );
+
+    // 2. Populate plugins
+    let p1 = pacode_types::PluginInfo {
+        name: "plug1".into(),
+        version: "1.0.0".into(),
+        kind: "lua".into(),
+        tools: vec![],
+        commands: vec!["c1".into()],
+        error: None,
+    };
+    let p2 = pacode_types::PluginInfo {
+        name: "plug2".into(),
+        version: "2.0.0".into(),
+        kind: "wasm".into(),
+        tools: vec![],
+        commands: vec![],
+        error: None,
+    };
+    state.focus = Focus::Overlay(Overlay::PluginsPicker {
+        index: 0,
+        plugins: vec![p1.clone(), p2.clone()],
+    });
+
+    // 3. Down moves index to 1
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::PluginsPicker {
+            index: 1,
+            plugins: vec![p1, p2],
+        })
+    );
+
+    // Letters do not leak to input
+    let char_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+    handle_key(&mut state, char_a, now);
+    assert!(state.input.is_empty());
+
+    // 4. Esc closes picker
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}

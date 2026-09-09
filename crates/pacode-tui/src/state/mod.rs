@@ -14,8 +14,8 @@ use std::time::Instant;
 use pacode_client::ClientEvent;
 use pacode_types::time::now_ms;
 use pacode_types::{
-    AgentId, Config, Effort, Event, Mode, ModelInfo, ModelRoute, PermissionDecision, SessionMeta,
-    TaskId, TaskStatus, ToastLevel, TranscriptKind,
+    AgentId, Config, Effort, Event, McpServerInfo, Mode, ModelInfo, ModelRoute, PermissionDecision,
+    PluginInfo, SessionMeta, TaskId, TaskStatus, ToastLevel, TranscriptKind,
 };
 
 pub use files::FilesState;
@@ -25,7 +25,7 @@ pub use selection::Selection;
 pub use transcript::{Cell, CellKind, Transcript};
 
 /// Interaction modes (spec §5). Layers are removed one at a time by `esc`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Focus {
     Normal,
     /// `alt+↓` pressed: the rail lists agents, one is highlighted.
@@ -52,7 +52,7 @@ pub enum PanelTarget {
     Task(TaskId),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Overlay {
     ModelPicker {
         query: String,
@@ -74,6 +74,15 @@ pub enum Overlay {
     },
     Files {
         index: usize,
+    },
+    McpPicker {
+        index: usize,
+        servers: Vec<McpServerInfo>,
+        loading: bool,
+    },
+    PluginsPicker {
+        index: usize,
+        plugins: Vec<PluginInfo>,
     },
     /// Plan + agents on the `Tiny` tier.
     RailOverlay,
@@ -122,6 +131,7 @@ pub struct AppState {
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
     pub sessions: Vec<SessionMeta>,
+    pub plugins: Vec<PluginInfo>,
     /// Set by any mutation; cleared after a frame is drawn.
     pub dirty: bool,
     /// Terminal size as last seen.
@@ -175,6 +185,7 @@ impl AppState {
             toasts: VecDeque::new(),
             models: Vec::new(),
             sessions: Vec::new(),
+            plugins: Vec::new(),
             dirty: true,
             cols,
             rows,

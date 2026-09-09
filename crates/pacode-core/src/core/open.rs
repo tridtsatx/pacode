@@ -91,7 +91,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 info: RwLock::new(main_info),
                 history: std::sync::Mutex::new(crate::agent::History::default()),
                 injections: crate::inject::InjectionQueue::default(),
-                tools: session_tools.clone(),
+                tools: RwLock::new(session_tools.clone()),
                 cancel: std::sync::Mutex::new(None),
                 turn_lock: tokio::sync::Mutex::new(()),
                 transcript: std::sync::Mutex::new(crate::transcript::TranscriptState::new(
@@ -116,8 +116,9 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 store: core.deps.store.clone(),
                 config: core.config(),
                 providers: core.providers(),
-                tools: session_tools,
+                tools: RwLock::new(session_tools),
                 mcp: core.deps.mcp.clone(),
+                plugins: core.deps.plugins.clone(),
                 app_version: core.deps.app_version.clone(),
             });
 
@@ -258,7 +259,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 info: RwLock::new(main_info),
                 history: std::sync::Mutex::new(main_history),
                 injections: crate::inject::InjectionQueue::default(),
-                tools: session_tools.clone(),
+                tools: RwLock::new(session_tools.clone()),
                 cancel: std::sync::Mutex::new(None),
                 turn_lock: tokio::sync::Mutex::new(()),
                 transcript: std::sync::Mutex::new(transcript_state),
@@ -284,7 +285,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                     info: RwLock::new(sub_info.clone()),
                     history: std::sync::Mutex::new(crate::agent::History::default()),
                     injections: crate::inject::InjectionQueue::default(),
-                    tools: session_tools.clone(),
+                    tools: RwLock::new(session_tools.clone()),
                     cancel: std::sync::Mutex::new(None),
                     turn_lock: tokio::sync::Mutex::new(()),
                     transcript: std::sync::Mutex::new(crate::transcript::TranscriptState::new(
@@ -308,8 +309,9 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 store: core.deps.store.clone(),
                 config: core.config(),
                 providers: core.providers(),
-                tools: session_tools,
+                tools: RwLock::new(session_tools),
                 mcp: core.deps.mcp.clone(),
+                plugins: core.deps.plugins.clone(),
                 app_version: core.deps.app_version.clone(),
             });
 

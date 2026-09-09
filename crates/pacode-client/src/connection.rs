@@ -2,14 +2,16 @@
 
 mod reconnect;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use pacode_types::ids::ClientId;
+use pacode_types::model::ModelInfo;
+use pacode_types::state::SessionMeta;
 use pacode_types::{
-    Attach, ClientHello, Envelope, PROTOCOL_VERSION, Reply, Request, ServerMessage, SessionId,
-    SessionSnapshot,
+    Attach, ClientHello, Envelope, McpServerInfo, PROTOCOL_VERSION, PluginCommandOutcome,
+    PluginInfo, Reply, Request, ServerMessage, SessionId, SessionSnapshot,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -273,6 +275,121 @@ impl Client {
             Reply::Error { message } => Err(ClientError::Daemon(message)),
             other => Err(ClientError::UnexpectedReply {
                 request: "ok".into(),
+                reply: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// List MCP servers and their status.
+    pub async fn list_mcp_servers(&self) -> Result<Vec<McpServerInfo>, ClientError> {
+        match self.request(Request::ListMcpServers).await? {
+            Reply::McpServers { servers } => Ok(servers),
+            Reply::Error { message } => Err(ClientError::Daemon(message)),
+            other => Err(ClientError::UnexpectedReply {
+                request: "list_mcp_servers".into(),
+                reply: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// Restart one MCP server.
+    pub async fn restart_mcp_server(&self, server: impl Into<String>) -> Result<(), ClientError> {
+        self.ok(Request::RestartMcpServer {
+            server: server.into(),
+        })
+        .await
+    }
+
+    /// Enable or disable one MCP server.
+    pub async fn set_mcp_server_enabled(
+        &self,
+        server: impl Into<String>,
+        enabled: bool,
+    ) -> Result<(), ClientError> {
+        self.ok(Request::SetMcpServerEnabled {
+            server: server.into(),
+            enabled,
+        })
+        .await
+    }
+
+    /// Render an MCP prompt.
+    pub async fn get_mcp_prompt(
+        &self,
+        server: impl Into<String>,
+        name: impl Into<String>,
+        args: BTreeMap<String, String>,
+    ) -> Result<String, ClientError> {
+        match self
+            .request(Request::GetMcpPrompt {
+                server: server.into(),
+                name: name.into(),
+                args,
+            })
+            .await?
+        {
+            Reply::McpPrompt { text } => Ok(text),
+            Reply::Error { message } => Err(ClientError::Daemon(message)),
+            other => Err(ClientError::UnexpectedReply {
+                request: "get_mcp_prompt".into(),
+                reply: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// List loaded plugins.
+    pub async fn list_plugins(&self) -> Result<Vec<PluginInfo>, ClientError> {
+        match self.request(Request::ListPlugins).await? {
+            Reply::Plugins { plugins } => Ok(plugins),
+            Reply::Error { message } => Err(ClientError::Daemon(message)),
+            other => Err(ClientError::UnexpectedReply {
+                request: "list_plugins".into(),
+                reply: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// Run a plugin slash command.
+    pub async fn run_plugin_command(
+        &self,
+        name: impl Into<String>,
+        args: impl Into<String>,
+    ) -> Result<PluginCommandOutcome, ClientError> {
+        match self
+            .request(Request::RunPluginCommand {
+                name: name.into(),
+                args: args.into(),
+            })
+            .await?
+        {
+            Reply::PluginCommand(outcome) => Ok(outcome),
+            Reply::Error { message } => Err(ClientError::Daemon(message)),
+            other => Err(ClientError::UnexpectedReply {
+                request: "run_plugin_command".into(),
+                reply: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// List recent sessions.
+    pub async fn list_sessions(&self, limit: u32) -> Result<Vec<SessionMeta>, ClientError> {
+        match self.request(Request::ListSessions { limit }).await? {
+            Reply::Sessions { sessions } => Ok(sessions),
+            Reply::Error { message } => Err(ClientError::Daemon(message)),
+            other => Err(ClientError::UnexpectedReply {
+                request: "list_sessions".into(),
+                reply: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// List available models.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>, ClientError> {
+        match self.request(Request::ListModels).await? {
+            Reply::Models { models } => Ok(models),
+            Reply::Error { message } => Err(ClientError::Daemon(message)),
+            other => Err(ClientError::UnexpectedReply {
+                request: "list_models".into(),
                 reply: format!("{other:?}"),
             }),
         }

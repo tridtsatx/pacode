@@ -6,6 +6,7 @@ use std::sync::Arc;
 use pacode_core::{Core, CoreDeps};
 use pacode_exec::TaskManager;
 use pacode_mcp::McpPool;
+use pacode_plugin::{PluginHost, UiSink};
 use pacode_provider::mock::MockResponse;
 use pacode_provider::{MockProvider, ProviderRegistry};
 use pacode_store::Store;
@@ -14,10 +15,40 @@ use pacode_types::ModelRoute;
 
 use crate::{DaemonError, DaemonOptions};
 
+struct DaemonUiSink {
+    core: Arc<std::sync::RwLock<Option<std::sync::Weak<Core>>>>,
+}
+
+impl UiSink for DaemonUiSink {
+    fn toast(&self, text: &str) {
+        if let Ok(guard) = self.core.read()
+            && let Some(weak) = guard.as_ref()
+            && let Some(core) = weak.upgrade()
+        {
+            core.broadcast_event(pacode_types::Event::PluginToast {
+                plugin: String::new(),
+                text: text.to_string(),
+            });
+        }
+    }
+
+    fn status(&self, text: &str) {
+        if let Ok(guard) = self.core.read()
+            && let Some(weak) = guard.as_ref()
+            && let Some(core) = weak.upgrade()
+        {
+            core.broadcast_event(pacode_types::Event::PluginStatus {
+                plugin: String::new(),
+                text: text.to_string(),
+            });
+        }
+    }
+}
+
 /// providers = `ProviderRegistry::from_config` with keys from
-/// `pacode_config::resolve_api_key`; tools = `pacode_tools::builtin_tools()` (MCP
-/// tools are added per session by the core from the pool); tasks =
-/// `TaskManager::new(paths.spool_dir(), config.exec.clone())`; mcp =
+/// `pacode_config::resolve_api_key`; tools = `pacode_tools::builtin_tools()` +
+/// plugin tools (MCP tools are added per session by the core from the pool);
+/// tasks = `TaskManager::new(paths.spool_dir(), config.exec.clone())`; mcp =
 /// `McpPool::new(config.mcp.servers.clone(), Some(paths.mcp_cache_dir()), None)`;
 /// store = `Store::open(paths.db_file())`.
 ///
@@ -47,7 +78,19 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
         providers.set_default_route(Some(ModelRoute::new("mock", "mock-model")));
     }
 
-    let tools = builtin_tools();
+    let core_slot: Arc<std::sync::RwLock<Option<std::sync::Weak<Core>>>> =
+        Arc::new(std::sync::RwLock::new(None));
+    let ui_sink = Arc::new(DaemonUiSink {
+        core: core_slot.clone(),
+    });
+
+    let plugin_host = Arc::new(PluginHost::load(&opts.config.plugins, ui_sink).await);
+
+    let mut tools = builtin_tools();
+    for tool in pacode_tools::builtin::plugin::plugin_tools(plugin_host.clone()) {
+        tools.register(tool);
+    }
+
     let tasks = TaskManager::new(opts.paths.spool_dir(), opts.config.exec.clone());
     let mcp = McpPool::new(
         opts.config.mcp.servers.clone(),
@@ -62,11 +105,25 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
         providers: Arc::new(providers),
         tools,
         tasks,
-        mcp,
+        mcp: mcp.clone(),
+        plugins: plugin_host,
         store,
         app_version: opts.app_version.clone(),
     };
 
     let core = Core::new(deps).await;
+    if let Ok(mut slot) = core_slot.write() {
+        *slot = Some(Arc::downgrade(&core));
+    }
+
+    let sampling_handler = Arc::new(pacode_core::sampling::CoreSamplingHandler::new(
+        Arc::downgrade(&core),
+    ));
+    mcp.set_sampling_handler(sampling_handler);
+    mcp.set_sampling_config(
+        opts.config.mcp.sampling,
+        opts.config.mcp.sampling_max_tokens,
+    );
+
     Ok(core)
 }

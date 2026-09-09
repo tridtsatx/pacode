@@ -2,13 +2,18 @@
 //!
 //! `/model [name]` (picker without argument), `/effort <low|medium|high|xhigh|max>` (picker
 //! without argument), `/mode <build|auto|plan|bypass>`, `/sessions` (picker),
-//! `/compact`, `/clear` (transcript view only), `/export [path]` (write the visible
-//! transcript as markdown to `path` or `~/pacode-<session>.md`), `/help`, `/quit`.
+//! `/mcp`, `/plugins`, `/compact`, `/clear` (transcript view only),
+//! `/export [path]` (write the visible transcript as markdown to `path` or `~/pacode-<session>.md`),
+//! `/help`, `/quit`.
+
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::RwLock;
 
 use pacode_types::model::{Effort, ModelRoute};
 use pacode_types::state::{Mode, ToastLevel};
 use pacode_types::time::now_ms;
-use pacode_types::{Request, TranscriptKind};
+use pacode_types::{McpServerInfo, PluginInfo, Request, TranscriptKind};
 
 use crate::keys::Action;
 use crate::state::transcript::{Cell, CellKind};
@@ -16,81 +21,188 @@ use crate::state::{AppState, Focus, Overlay};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommand {
-    pub name: &'static str,
-    pub usage: &'static str,
-    pub help: &'static str,
-    pub arg_hint: &'static str,
+    pub name: Cow<'static, str>,
+    pub usage: Cow<'static, str>,
+    pub help: Cow<'static, str>,
+    pub arg_hint: Cow<'static, str>,
 }
 
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
-        name: "model",
-        usage: "/model",
-        help: "switch model",
-        arg_hint: "[provider/model]",
+        name: Cow::Borrowed("model"),
+        usage: Cow::Borrowed("/model"),
+        help: Cow::Borrowed("switch model"),
+        arg_hint: Cow::Borrowed("[provider/model]"),
     },
     SlashCommand {
-        name: "effort",
-        usage: "/effort",
-        help: "reasoning effort",
-        arg_hint: "[low|medium|high|xhigh|max]",
+        name: Cow::Borrowed("effort"),
+        usage: Cow::Borrowed("/effort"),
+        help: Cow::Borrowed("reasoning effort"),
+        arg_hint: Cow::Borrowed("[low|medium|high|xhigh|max]"),
     },
     SlashCommand {
-        name: "mode",
-        usage: "/mode",
-        help: "permission mode",
-        arg_hint: "[build|auto|plan|bypass]",
+        name: Cow::Borrowed("mode"),
+        usage: Cow::Borrowed("/mode"),
+        help: Cow::Borrowed("permission mode"),
+        arg_hint: Cow::Borrowed("[build|auto|plan|bypass]"),
     },
     SlashCommand {
-        name: "config",
-        usage: "/config",
-        help: "quick settings",
-        arg_hint: "",
+        name: Cow::Borrowed("config"),
+        usage: Cow::Borrowed("/config"),
+        help: Cow::Borrowed("quick settings"),
+        arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
-        name: "sessions",
-        usage: "/sessions",
-        help: "pick a session",
-        arg_hint: "",
+        name: Cow::Borrowed("sessions"),
+        usage: Cow::Borrowed("/sessions"),
+        help: Cow::Borrowed("pick a session"),
+        arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
-        name: "compact",
-        usage: "/compact",
-        help: "compact the context now",
-        arg_hint: "",
+        name: Cow::Borrowed("mcp"),
+        usage: Cow::Borrowed("/mcp"),
+        help: Cow::Borrowed("manage MCP servers"),
+        arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
-        name: "clear",
-        usage: "/clear",
-        help: "clear the transcript view",
-        arg_hint: "",
+        name: Cow::Borrowed("plugins"),
+        usage: Cow::Borrowed("/plugins"),
+        help: Cow::Borrowed("manage plugins"),
+        arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
-        name: "export",
-        usage: "/export [path]",
-        help: "save transcript as markdown",
-        arg_hint: "[path]",
+        name: Cow::Borrowed("compact"),
+        usage: Cow::Borrowed("/compact"),
+        help: Cow::Borrowed("compact the context now"),
+        arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
-        name: "help",
-        usage: "/help",
-        help: "show keys and commands",
-        arg_hint: "",
+        name: Cow::Borrowed("clear"),
+        usage: Cow::Borrowed("/clear"),
+        help: Cow::Borrowed("clear the transcript view"),
+        arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
-        name: "quit",
-        usage: "/quit",
-        help: "exit the client",
-        arg_hint: "",
+        name: Cow::Borrowed("export"),
+        usage: Cow::Borrowed("/export [path]"),
+        help: Cow::Borrowed("save transcript as markdown"),
+        arg_hint: Cow::Borrowed("[path]"),
+    },
+    SlashCommand {
+        name: Cow::Borrowed("help"),
+        usage: Cow::Borrowed("/help"),
+        help: Cow::Borrowed("show keys and commands"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
+        name: Cow::Borrowed("quit"),
+        usage: Cow::Borrowed("/quit"),
+        help: Cow::Borrowed("exit the client"),
+        arg_hint: Cow::Borrowed(""),
     },
 ];
 
+static DYNAMIC_COMMANDS: RwLock<Vec<SlashCommand>> = RwLock::new(Vec::new());
+
+/// Returns all static and dynamically registered commands.
+pub fn all_commands() -> Vec<SlashCommand> {
+    let mut list = COMMANDS.to_vec();
+    if let Ok(guard) = DYNAMIC_COMMANDS.read() {
+        list.extend(guard.iter().cloned());
+    }
+    list
+}
+
 /// Commands whose name starts with `prefix` (for the popup).
-pub fn matching(prefix: &str) -> Vec<&'static SlashCommand> {
-    COMMANDS
-        .iter()
+pub fn matching(prefix: &str) -> Vec<SlashCommand> {
+    all_commands()
+        .into_iter()
         .filter(|c| c.name.starts_with(prefix))
         .collect()
+}
+
+/// Find a command by exact name.
+pub fn find_command(name: &str) -> Option<SlashCommand> {
+    all_commands().into_iter().find(|c| c.name == name)
+}
+
+/// Register an MCP prompt slash command `/mcp:<server>:<prompt>`.
+pub fn register_mcp_prompt(server: &str, prompt: &str) {
+    let name = format!("mcp:{server}:{prompt}");
+    let usage = format!("/mcp:{server}:{prompt}");
+    let help = format!("MCP prompt '{prompt}' from {server}");
+    let cmd = SlashCommand {
+        name: Cow::Owned(name),
+        usage: Cow::Owned(usage),
+        help: Cow::Owned(help),
+        arg_hint: Cow::Borrowed("[key=value ...]"),
+    };
+    if let Ok(mut guard) = DYNAMIC_COMMANDS.write() {
+        if let Some(pos) = guard.iter().position(|c| c.name == cmd.name) {
+            guard[pos] = cmd;
+        } else {
+            guard.push(cmd);
+        }
+    }
+}
+
+/// Register all MCP prompts from a list of MCP server info structs.
+pub fn register_mcp_servers(servers: &[McpServerInfo]) {
+    for s in servers {
+        for prompt in &s.prompt_names {
+            register_mcp_prompt(&s.name, prompt);
+        }
+    }
+}
+
+/// Register a plugin slash command `/<name>`.
+pub fn register_plugin_command(name: &str) {
+    let usage = format!("/{name}");
+    let help = format!("run plugin command '{name}'");
+    let cmd = SlashCommand {
+        name: Cow::Owned(name.to_string()),
+        usage: Cow::Owned(usage),
+        help: Cow::Owned(help),
+        arg_hint: Cow::Borrowed("[args]"),
+    };
+    if let Ok(mut guard) = DYNAMIC_COMMANDS.write() {
+        if let Some(pos) = guard.iter().position(|c| c.name == cmd.name) {
+            guard[pos] = cmd;
+        } else {
+            guard.push(cmd);
+        }
+    }
+}
+
+/// Register all commands from a list of plugins.
+pub fn register_plugins(plugins: &[PluginInfo]) {
+    for p in plugins {
+        for cmd in &p.commands {
+            register_plugin_command(cmd);
+        }
+    }
+}
+
+/// Clear dynamic commands (primarily for tests).
+pub fn clear_dynamic_commands() {
+    if let Ok(mut guard) = DYNAMIC_COMMANDS.write() {
+        guard.clear();
+    }
+}
+
+/// Check if a command name is a registered plugin command.
+pub fn is_plugin_command(state: &AppState, name: &str) -> bool {
+    state
+        .plugins
+        .iter()
+        .any(|p| p.commands.iter().any(|c| c == name))
+        || DYNAMIC_COMMANDS
+            .read()
+            .map(|g| {
+                g.iter()
+                    .any(|c| c.name == name && !c.name.starts_with("mcp:"))
+            })
+            .unwrap_or(false)
 }
 
 /// Execute a submitted `/command args` line. Unknown commands become a Notice.
@@ -178,6 +290,23 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             state.dirty = true;
             vec![Action::Send(Request::ListSessions { limit: 50 })]
         }
+        "mcp" => {
+            state.focus = Focus::Overlay(Overlay::McpPicker {
+                index: 0,
+                servers: Vec::new(),
+                loading: true,
+            });
+            state.dirty = true;
+            vec![Action::Send(Request::ListMcpServers)]
+        }
+        "plugins" => {
+            state.focus = Focus::Overlay(Overlay::PluginsPicker {
+                index: 0,
+                plugins: state.plugins.clone(),
+            });
+            state.dirty = true;
+            vec![Action::Send(Request::ListPlugins)]
+        }
         "compact" => vec![Action::Send(Request::Compact)],
         "clear" => {
             state.transcript.cells.clear();
@@ -229,6 +358,37 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![]
         }
         "quit" => vec![Action::Quit],
+        other if other.starts_with("mcp:") => {
+            let parts: Vec<&str> = other.splitn(3, ':').collect();
+            if parts.len() == 3 {
+                let server = parts[1].to_string();
+                let prompt = parts[2].to_string();
+                let mut args = BTreeMap::new();
+                for token in arg.split_whitespace() {
+                    if let Some((k, v)) = token.split_once('=') {
+                        args.insert(k.to_string(), v.to_string());
+                    }
+                }
+                vec![Action::Send(Request::GetMcpPrompt {
+                    server,
+                    name: prompt,
+                    args,
+                })]
+            } else {
+                push_notice(
+                    state,
+                    ToastLevel::Warn,
+                    format!("Invalid MCP prompt format: /{other}. Expected /mcp:<server>:<prompt>"),
+                );
+                vec![]
+            }
+        }
+        other if is_plugin_command(state, other) => {
+            vec![Action::Send(Request::RunPluginCommand {
+                name: other.to_string(),
+                args: arg,
+            })]
+        }
         _ => {
             push_notice(
                 state,
@@ -272,5 +432,11 @@ mod tests {
 
         let config = COMMANDS.iter().find(|c| c.name == "config").unwrap();
         assert_eq!(config.arg_hint, "");
+
+        let mcp = COMMANDS.iter().find(|c| c.name == "mcp").unwrap();
+        assert_eq!(mcp.arg_hint, "");
+
+        let plugins = COMMANDS.iter().find(|c| c.name == "plugins").unwrap();
+        assert_eq!(plugins.arg_hint, "");
     }
 }

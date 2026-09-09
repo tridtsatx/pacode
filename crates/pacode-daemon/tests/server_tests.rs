@@ -68,6 +68,7 @@ async fn build_test_core(tmp: &tempfile::TempDir, config: Arc<Config>) -> Arc<Co
         tools,
         tasks,
         mcp,
+        plugins: Arc::new(pacode_plugin::PluginHost::new()),
         store,
         app_version: "0.1.0".to_string(),
     };
@@ -487,4 +488,94 @@ async fn unattached_requests_behavior() {
         .expect("server shutdown timeout")
         .expect("join error");
     assert!(server_res.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_requests_in_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock_path = tmp.path().join("daemon_mcp.sock");
+
+    let paths = pacode_config::Paths::under(tmp.path());
+    let mut config = Config::default();
+    config.daemon.idle_timeout_secs = 3600;
+    let config = Arc::new(config);
+    let core = build_test_core(&tmp, Arc::clone(&config)).await;
+
+    let opts = DaemonOptions {
+        paths,
+        config: Arc::clone(&config),
+        socket: sock_path.clone(),
+        app_version: "0.1.0".to_string(),
+    };
+
+    let server_task = tokio::spawn(run(opts, core));
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    // 1. Hello
+    let hello_req = Envelope {
+        id: 1,
+        req: Request::Hello(ClientHello {
+            client_id: ClientId::generate(),
+            app_version: "0.1.0".to_string(),
+            protocol: PROTOCOL_VERSION,
+        }),
+    };
+    send_env(&mut writer, &hello_req).await;
+    let reply = read_reply(&mut lines, 1).await;
+    assert!(matches!(reply, Reply::Hello { .. }));
+
+    // 2. ListMcpServers with no servers configured -> Reply::McpServers with empty vec
+    let list_req = Envelope {
+        id: 2,
+        req: Request::ListMcpServers,
+    };
+    send_env(&mut writer, &list_req).await;
+    let reply = read_reply(&mut lines, 2).await;
+    match reply {
+        Reply::McpServers { servers } => {
+            assert!(servers.is_empty(), "expected 0 servers configured");
+        }
+        other => panic!("expected Reply::McpServers, got {other:?}"),
+    }
+
+    // 3. SetMcpServerEnabled on an unknown server -> Reply::Error
+    let set_req = Envelope {
+        id: 3,
+        req: Request::SetMcpServerEnabled {
+            server: "unknown_server".to_string(),
+            enabled: true,
+        },
+    };
+    send_env(&mut writer, &set_req).await;
+    let reply = read_reply(&mut lines, 3).await;
+    match reply {
+        Reply::Error { message } => {
+            assert!(
+                !message.is_empty(),
+                "expected error message for unknown server"
+            );
+        }
+        other => panic!("expected Reply::Error, got {other:?}"),
+    }
+
+    // 4. Shutdown
+    let shut_req = Envelope {
+        id: 4,
+        req: Request::Shutdown { force: true },
+    };
+    send_env(&mut writer, &shut_req).await;
+    let reply = read_reply(&mut lines, 4).await;
+    assert_eq!(reply, Reply::Ok);
+
+    let _ = server_task.await;
 }

@@ -11,6 +11,10 @@ use pacode_types::{Attach, Config, Effort, Mode, ModelRoute, SessionId};
 
 #[path = "daemon.rs"]
 mod daemon;
+#[path = "mcp_cmd.rs"]
+mod mcp_cmd;
+#[path = "plugins_cmd.rs"]
+mod plugins_cmd;
 #[path = "run.rs"]
 mod run;
 #[path = "serve.rs"]
@@ -22,8 +26,7 @@ mod sessions;
 #[path = "cli_tests.rs"]
 mod cli_tests;
 
-pub const HELP_TEMPLATE: &str = "\
- ▄▄▄▄▄
+pub const HELP_TEMPLATE: &str = "\x20▄▄▄▄▄
 █ ▀ ██
 ███▀
  ▀▀▀▀▀
@@ -130,6 +133,20 @@ pub enum Command {
         action: Option<SessionsAction>,
     },
 
+    /// Manage Model Context Protocol (MCP) servers.
+    Mcp {
+        /// MCP action to perform (defaults to listing servers).
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
+
+    /// Manage plugins.
+    Plugins {
+        /// Plugin action to perform (defaults to listing plugins).
+        #[command(subcommand)]
+        action: Option<PluginsAction>,
+    },
+
     /// Query status or request shutdown of the background daemon.
     Daemon {
         /// Daemon action to perform.
@@ -165,6 +182,54 @@ pub enum DaemonAction {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand, Debug, PartialEq)]
+pub enum McpAction {
+    /// List configured MCP servers.
+    List,
+
+    /// Add or update an MCP server configuration.
+    Add {
+        /// Name of the MCP server.
+        name: String,
+
+        /// Command and arguments to run (for stdio transport).
+        #[arg(long, conflicts_with = "url")]
+        cmd: Option<String>,
+
+        /// SSE / HTTP endpoint URL (for http transport).
+        #[arg(long, conflicts_with = "cmd")]
+        url: Option<String>,
+
+        /// HTTP header in K=V format (repeatable, for http transport).
+        #[arg(long = "header", value_name = "K=V")]
+        headers: Vec<String>,
+
+        /// Environment variable in K=V format (repeatable, for stdio transport).
+        #[arg(long = "env", value_name = "K=V")]
+        env: Vec<String>,
+
+        /// Start server on first tool call instead of session start.
+        #[arg(long, overrides_with = "no_lazy")]
+        lazy: bool,
+
+        /// Start server immediately at session start.
+        #[arg(long = "no-lazy", overrides_with = "lazy")]
+        no_lazy: bool,
+    },
+
+    /// Remove an MCP server configuration.
+    Remove {
+        /// Name of the MCP server to remove.
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq)]
+pub enum PluginsAction {
+    /// List loaded plugins.
+    List,
 }
 
 pub fn build_attach(
@@ -297,6 +362,8 @@ pub fn main() -> anyhow::Result<()> {
                 .context("failed to initialize client logger")?;
             sessions::run(action, Some(socket), paths)
         }
+        Some(Command::Mcp { action }) => mcp_cmd::run(action, &paths),
+        Some(Command::Plugins { action }) => plugins_cmd::run(action, &config),
         Some(Command::Daemon { action }) => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;

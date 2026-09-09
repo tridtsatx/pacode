@@ -12,6 +12,7 @@ pacode-provider = { workspace = true }
 pacode-tools = { workspace = true }
 pacode-exec = { workspace = true }
 pacode-mcp = { workspace = true }
+pacode-plugin = { workspace = true }
 pacode-store = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "fs", "process"] }
 tokio-util = { workspace = true }

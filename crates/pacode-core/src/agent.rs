@@ -57,7 +57,7 @@ pub struct Agent {
     pub history: Mutex<History>,
     pub injections: InjectionQueue,
     /// Tools this agent may call (main: all; subagent: subset without `agent`).
-    pub tools: ToolRegistry,
+    pub tools: RwLock<ToolRegistry>,
     /// Cancellation token of the running turn, if any.
     pub cancel: Mutex<Option<CancellationToken>>,
     /// One turn at a time.

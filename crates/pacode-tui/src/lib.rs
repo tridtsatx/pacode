@@ -21,6 +21,8 @@ pub mod terminal;
 pub mod ui;
 
 #[cfg(test)]
+mod commands_tests;
+#[cfg(test)]
 mod no_cyrillic_tests;
 
 use std::path::PathBuf;

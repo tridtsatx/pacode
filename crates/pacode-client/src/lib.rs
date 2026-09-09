@@ -113,7 +113,10 @@ pub trait ClientExt {
 pub type EventReceiver = mpsc::Receiver<ClientEvent>;
 
 // Re-exports for frontends that only need the wire types.
-pub use pacode_types::{Attach as AttachRequest, Reply as WireReply, Request as WireRequest};
+pub use pacode_types::{
+    Attach as AttachRequest, McpServerInfo, PluginCommandOutcome, PluginInfo, Reply as WireReply,
+    Request as WireRequest,
+};
 
 #[allow(dead_code)]
 fn _assert_types(_: Attach, _: Request, _: Reply) {}

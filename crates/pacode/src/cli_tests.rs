@@ -6,8 +6,8 @@ mod tests {
     use pacode_types::{Attach, Effort, Mode, ModelRoute, SessionId};
 
     use crate::cli::{
-        Cli, Command, DaemonAction, SessionsAction, build_attach, parse_effort_override,
-        parse_mode_override, parse_model_override,
+        Cli, Command, DaemonAction, McpAction, PluginsAction, SessionsAction, build_attach,
+        parse_effort_override, parse_mode_override, parse_model_override,
     };
 
     #[test]
@@ -92,7 +92,143 @@ mod tests {
         assert!(help.contains("serve"));
         assert!(help.contains("run"));
         assert!(help.contains("sessions"));
+        assert!(help.contains("mcp"));
+        assert!(help.contains("plugins"));
         assert!(help.contains("daemon"));
+    }
+
+    #[test]
+    fn parse_mcp_shapes() {
+        let cli = Cli::try_parse_from(["pacode", "mcp"]).expect("mcp plain");
+        match cli.command {
+            Some(Command::Mcp { action }) => {
+                assert!(action.is_none());
+            }
+            other => panic!("expected Mcp empty, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["pacode", "mcp", "list"]).expect("mcp list");
+        match cli.command {
+            Some(Command::Mcp {
+                action: Some(McpAction::List),
+            }) => {}
+            other => panic!("expected Mcp List, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "pacode",
+            "mcp",
+            "add",
+            "my-server",
+            "--cmd",
+            "echo hello",
+            "--lazy",
+        ])
+        .expect("mcp add stdio");
+        match cli.command {
+            Some(Command::Mcp {
+                action:
+                    Some(McpAction::Add {
+                        name,
+                        cmd,
+                        url,
+                        headers,
+                        env,
+                        lazy,
+                        no_lazy,
+                    }),
+            }) => {
+                assert_eq!(name, "my-server");
+                assert_eq!(cmd.as_deref(), Some("echo hello"));
+                assert!(url.is_none());
+                assert!(headers.is_empty());
+                assert!(env.is_empty());
+                assert!(lazy);
+                assert!(!no_lazy);
+            }
+            other => panic!("expected Mcp Add, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "pacode",
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "http://example.com/sse",
+            "--header",
+            "Auth=token",
+            "--no-lazy",
+        ])
+        .expect("mcp add http");
+        match cli.command {
+            Some(Command::Mcp {
+                action:
+                    Some(McpAction::Add {
+                        name,
+                        cmd,
+                        url,
+                        headers,
+                        env,
+                        lazy,
+                        no_lazy,
+                    }),
+            }) => {
+                assert_eq!(name, "remote");
+                assert!(cmd.is_none());
+                assert_eq!(url.as_deref(), Some("http://example.com/sse"));
+                assert_eq!(headers, vec!["Auth=token"]);
+                assert!(env.is_empty());
+                assert!(!lazy);
+                assert!(no_lazy);
+            }
+            other => panic!("expected Mcp Add, got {other:?}"),
+        }
+
+        // Mutual exclusion of --cmd and --url
+        assert!(
+            Cli::try_parse_from([
+                "pacode",
+                "mcp",
+                "add",
+                "bad",
+                "--cmd",
+                "foo",
+                "--url",
+                "http://bar"
+            ])
+            .is_err()
+        );
+
+        let cli =
+            Cli::try_parse_from(["pacode", "mcp", "remove", "my-server"]).expect("mcp remove");
+        match cli.command {
+            Some(Command::Mcp {
+                action: Some(McpAction::Remove { name }),
+            }) => {
+                assert_eq!(name, "my-server");
+            }
+            other => panic!("expected Mcp Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plugins_shapes() {
+        let cli = Cli::try_parse_from(["pacode", "plugins"]).expect("plugins plain");
+        match cli.command {
+            Some(Command::Plugins { action }) => {
+                assert!(action.is_none());
+            }
+            other => panic!("expected Plugins empty, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["pacode", "plugins", "list"]).expect("plugins list");
+        match cli.command {
+            Some(Command::Plugins {
+                action: Some(PluginsAction::List),
+            }) => {}
+            other => panic!("expected Plugins List, got {other:?}"),
+        }
     }
 
     #[test]

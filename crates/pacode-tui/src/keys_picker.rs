@@ -7,13 +7,29 @@ use pacode_types::Request;
 use crate::keys::Action;
 use crate::state::{AppState, Focus, Overlay};
 
+fn is_prev(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Up
+        || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn is_next(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Down
+        || (key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn is_overlay_up(key: &KeyEvent) -> bool {
+    is_prev(key) || key.code == KeyCode::Char('k')
+}
+
+fn is_overlay_down(key: &KeyEvent) -> bool {
+    is_next(key) || key.code == KeyCode::Char('j')
+}
+
 pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     match &mut state.focus {
         Focus::Overlay(Overlay::EffortPicker { index }) => {
             match key.code {
-                KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                }
+                KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
                     *index = index.saturating_sub(1);
                 }
@@ -32,9 +48,7 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
         }
         Focus::Overlay(Overlay::ModePicker { index }) => {
             match key.code {
-                KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                }
+                KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
                     *index = index.saturating_sub(1);
                 }
@@ -63,30 +77,17 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 })
                 .count();
 
+            if is_prev(&key) && *index > 0 {
+                *index -= 1;
+                return vec![];
+            }
+            if is_next(&key) && filtered_count > 0 && *index + 1 < filtered_count {
+                *index += 1;
+                return vec![];
+            }
+
             match key.code {
-                KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                }
-                KeyCode::Up => {
-                    if *index > 0 {
-                        *index -= 1;
-                    }
-                }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if *index > 0 {
-                        *index -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    if filtered_count > 0 && *index + 1 < filtered_count {
-                        *index += 1;
-                    }
-                }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if filtered_count > 0 && *index + 1 < filtered_count {
-                        *index += 1;
-                    }
-                }
+                KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Enter => {
                     let filtered: Vec<_> = state
                         .models
@@ -132,30 +133,17 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 })
                 .count();
 
+            if is_prev(&key) && *index > 0 {
+                *index -= 1;
+                return vec![];
+            }
+            if is_next(&key) && filtered_count > 0 && *index + 1 < filtered_count {
+                *index += 1;
+                return vec![];
+            }
+
             match key.code {
-                KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                }
-                KeyCode::Up => {
-                    if *index > 0 {
-                        *index -= 1;
-                    }
-                }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if *index > 0 {
-                        *index -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    if filtered_count > 0 && *index + 1 < filtered_count {
-                        *index += 1;
-                    }
-                }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if filtered_count > 0 && *index + 1 < filtered_count {
-                        *index += 1;
-                    }
-                }
+                KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Enter => {
                     let filtered: Vec<_> = state
                         .sessions
@@ -192,30 +180,16 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
         }
         Focus::Overlay(Overlay::Files { index }) => {
             let count = state.files.len();
+            if is_overlay_up(&key) && *index > 0 {
+                *index -= 1;
+                return vec![];
+            }
+            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
+                *index += 1;
+                return vec![];
+            }
             match key.code {
-                KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if *index > 0 {
-                        *index -= 1;
-                    }
-                }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if *index > 0 {
-                        *index -= 1;
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if count > 0 && *index + 1 < count {
-                        *index += 1;
-                    }
-                }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if count > 0 && *index + 1 < count {
-                        *index += 1;
-                    }
-                }
+                KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Enter => {
                     let sorted = state.files.sorted_rows();
                     if let Some(row) = sorted.get(*index) {
@@ -233,21 +207,78 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
+        Focus::Overlay(Overlay::McpPicker {
+            index,
+            servers,
+            loading,
+        }) => {
+            let count = servers.len();
+            if is_overlay_up(&key) && *index > 0 {
+                *index -= 1;
+                return vec![];
+            }
+            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
+                *index += 1;
+                return vec![];
+            }
+            match key.code {
+                KeyCode::Esc => state.focus = Focus::Normal,
+                KeyCode::Char('r') => {
+                    if let Some(s) = servers.get(*index) {
+                        let server_name = s.name.clone();
+                        *loading = true;
+                        return vec![
+                            Action::Send(Request::RestartMcpServer {
+                                server: server_name,
+                            }),
+                            Action::Send(Request::ListMcpServers),
+                        ];
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(s) = servers.get(*index) {
+                        let server_name = s.name.clone();
+                        let enabled = s.status == "disabled";
+                        *loading = true;
+                        return vec![
+                            Action::Send(Request::SetMcpServerEnabled {
+                                server: server_name,
+                                enabled,
+                            }),
+                            Action::Send(Request::ListMcpServers),
+                        ];
+                    }
+                }
+                _ => {}
+            }
+            vec![]
+        }
+        Focus::Overlay(Overlay::PluginsPicker { index, plugins }) => {
+            let count = plugins.len();
+            if is_overlay_up(&key) && *index > 0 {
+                *index -= 1;
+                return vec![];
+            }
+            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
+                *index += 1;
+                return vec![];
+            }
+            if key.code == KeyCode::Esc {
+                state.focus = Focus::Normal;
+            }
+            vec![]
+        }
         Focus::Overlay(Overlay::ConfigPicker {
             index,
             editing_number,
         }) => {
             if let Some(buf) = editing_number {
                 match key.code {
-                    KeyCode::Esc => {
-                        *editing_number = None;
-                    }
+                    KeyCode::Esc => *editing_number = None,
                     KeyCode::Backspace => {
                         buf.pop();
                     }
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        buf.push(c);
-                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() => buf.push(c),
                     KeyCode::Enter => {
                         let text = buf.clone();
                         let idx = *index;
@@ -300,20 +331,17 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 return vec![];
             }
 
+            if is_overlay_up(&key) && *index > 0 {
+                *index -= 1;
+                return vec![];
+            }
+            if is_overlay_down(&key) && *index + 1 < 10 {
+                *index += 1;
+                return vec![];
+            }
+
             match key.code {
-                KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if *index > 0 {
-                        *index -= 1;
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if *index + 1 < 10 {
-                        *index += 1;
-                    }
-                }
+                KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Enter | KeyCode::Left | KeyCode::Right => {
                     let is_enter = key.code == KeyCode::Enter;
                     match *index {
@@ -430,12 +458,8 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                                 "saved ui.color = \"{new_val}\" (restart the daemon for daemon/exec settings)"
                             ));
                         }
-                        7 => {
-                            *editing_number = Some(state.config.exec.yield_after_secs.to_string());
-                        }
-                        8 => {
-                            *editing_number = Some(state.config.agents.max_live.to_string());
-                        }
+                        7 => *editing_number = Some(state.config.exec.yield_after_secs.to_string()),
+                        8 => *editing_number = Some(state.config.agents.max_live.to_string()),
                         9 => {
                             *editing_number =
                                 Some(state.config.daemon.idle_timeout_secs.to_string());
@@ -447,6 +471,8 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
-        _ => vec![],
+        Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } | Focus::BgList { .. } => {
+            vec![]
+        }
     }
 }

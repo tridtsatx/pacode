@@ -32,8 +32,9 @@ pub struct Session {
     pub config: Arc<Config>,
     pub providers: Arc<ProviderRegistry>,
     /// Built-in + MCP tools available in this session (subagents get subsets).
-    pub tools: ToolRegistry,
+    pub tools: RwLock<ToolRegistry>,
     pub mcp: Arc<McpPool>,
+    pub plugins: Arc<pacode_plugin::PluginHost>,
     pub app_version: String,
 }
 
@@ -128,6 +129,14 @@ impl Session {
             self.touch();
         }
 
+        let _ = self
+            .plugins
+            .run_hooks(&pacode_plugin::HookEvent::OnMessage {
+                role: "user".to_string(),
+                text: text.clone(),
+            })
+            .await;
+
         if main.is_running() {
             main.injections
                 .push(crate::inject::Injection::UserSteer(text));
@@ -210,10 +219,12 @@ impl Session {
                 .map(String::as_str)
                 .filter(|n| *n != "agent")
                 .collect();
-            self.tools.subset(filtered)
+            let g = self.tools.read().unwrap_or_else(|p| p.into_inner());
+            g.subset(filtered)
         } else {
-            let default_names = pacode_tools::subagent_tool_names(&self.tools);
-            self.tools.subset(default_names.iter().map(String::as_str))
+            let g = self.tools.read().unwrap_or_else(|p| p.into_inner());
+            let default_names = pacode_tools::subagent_tool_names(&g);
+            g.subset(default_names.iter().map(String::as_str))
         };
 
         let model = spec
@@ -271,7 +282,7 @@ impl Session {
             info: RwLock::new(info.clone()),
             history: std::sync::Mutex::new(history),
             injections: crate::inject::InjectionQueue::default(),
-            tools,
+            tools: RwLock::new(tools),
             cancel: std::sync::Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
             transcript: std::sync::Mutex::new(crate::transcript::TranscriptState::new(

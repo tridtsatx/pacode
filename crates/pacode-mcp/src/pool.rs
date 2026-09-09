@@ -55,6 +55,14 @@ impl McpPool {
             .collect()
     }
 
+    pub fn is_enabled(&self, server: &str) -> bool {
+        self.servers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(server)
+            .is_some_and(|c| c.enabled)
+    }
+
     pub fn set_sampling_handler(&self, handler: Arc<dyn SamplingHandler>) {
         {
             let mut guard = self

@@ -101,7 +101,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             let matches = commands::matching(query);
             if !matches.is_empty() {
                 let selected = state.input.slash_index % matches.len();
-                let cmd = matches[selected];
+                let cmd = &matches[selected];
                 state.input.text = format!("/{} ", cmd.name);
                 state.input.cursor = state.input.text.chars().count();
                 state.input.slash_index = 0;

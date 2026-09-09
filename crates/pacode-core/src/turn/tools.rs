@@ -58,7 +58,7 @@ async fn run_single_tool(
     session: Arc<Session>,
     agent: Arc<Agent>,
     cancel: CancellationToken,
-    call: ToolCallInfo,
+    mut call: ToolCallInfo,
 ) -> ToolExecutionStatus {
     agent.set_status(AgentStatus::RunningTool, Some(call.title.clone()));
     session.events.emit(Event::AgentUpdated(agent.info()));
@@ -99,6 +99,29 @@ async fn run_single_tool(
         return ToolExecutionStatus::Cancelled;
     }
 
+    let mut hook_denied = None;
+    if call.parse_err.is_none() {
+        match session
+            .plugins
+            .run_hooks(&pacode_plugin::HookEvent::PreToolCall {
+                name: call.name.clone(),
+                input: call.input.clone(),
+            })
+            .await
+        {
+            Ok(pacode_plugin::HookResult::Deny { reason }) => {
+                hook_denied = Some(reason);
+            }
+            Ok(pacode_plugin::HookResult::ModifyInput(new_input)) => {
+                call.input = new_input;
+            }
+            Ok(pacode_plugin::HookResult::Continue) => {}
+            Err(e) => {
+                hook_denied = Some(format!("plugin hook error: {e}"));
+            }
+        }
+    }
+
     let host = Arc::new(crate::host::SessionHost {
         session: session.clone(),
         agent: agent.id.clone(),
@@ -118,7 +141,16 @@ async fn run_single_tool(
     };
 
     let start = Instant::now();
-    let (content, is_error, preview, diff, task, status) = if let Some(err) = call.parse_err {
+    let (content, is_error, preview, diff, task, status) = if let Some(reason) = hook_denied {
+        (
+            format!("Permission denied: {reason}"),
+            true,
+            "Denied".to_string(),
+            None,
+            None,
+            ToolStatus::Denied,
+        )
+    } else if let Some(err) = call.parse_err {
         (
             format!("Invalid JSON arguments: {err}"),
             true,
@@ -128,9 +160,14 @@ async fn run_single_tool(
             ToolStatus::Error,
         )
     } else {
-        match agent.tools.get(&call.name) {
+        let tool_opt = agent
+            .tools
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&call.name);
+        match tool_opt {
             Some(tool) => {
-                let call_fut = tool.call(call.input, &ctx);
+                let call_fut = tool.call(call.input.clone(), &ctx);
                 let tool_res = tokio::select! {
                     _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
                     res = call_fut => res,
@@ -223,6 +260,19 @@ async fn run_single_tool(
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    let output_val = serde_json::json!({
+        "content": content,
+        "is_error": is_error,
+    });
+    let _ = session
+        .plugins
+        .run_hooks(&pacode_plugin::HookEvent::PostToolCall {
+            name: call.name.clone(),
+            input: call.input.clone(),
+            output: output_val,
+        })
+        .await;
+
     let item = TranscriptItem {
         seq: call.item_seq,
         agent: agent.id.clone(),
@@ -313,6 +363,8 @@ pub async fn execute_tool_calls(
     for call in prepared_calls {
         let is_concurrent = agent
             .tools
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
             .get(&call.name)
             .map(|t| matches!(t.kind(), ToolKind::ReadOnly | ToolKind::Network))
             .unwrap_or(false);

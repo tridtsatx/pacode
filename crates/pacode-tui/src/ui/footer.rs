@@ -13,6 +13,10 @@ use pacode_types::time::{format_duration_ms, now_ms};
 use crate::state::transcript::CellKind;
 use crate::state::{AppState, Connection, Focus, PanelTarget};
 
+#[cfg(test)]
+#[path = "footer_tests.rs"]
+mod footer_tests;
+
 pub fn format_tokens_upper(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -58,13 +62,18 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         Mode::Build | Mode::Auto => opts.theme.cyan,
     };
 
-    let mut left_spans = vec![
-        Span::styled(mode.label(), mode_style),
+    let mut left_spans = vec![Span::styled(mode.label(), mode_style)];
+
+    if let Some((_, text)) = &state.plugin_status {
+        left_spans.push(Span::styled(format!(" · {text}"), opts.theme.dim));
+    }
+
+    left_spans.extend([
         Span::styled(" · ", opts.theme.faint),
         Span::styled(model_name, opts.theme.dim),
         Span::styled(" | ", opts.theme.faint),
         Span::styled(effort_str, opts.theme.accent),
-    ];
+    ]);
 
     if show_effort_hint {
         left_spans.push(Span::styled(" /effort", opts.theme.cyan));
@@ -80,12 +89,22 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         }
         Line::from(left_spans)
     } else {
-        let plain = format!(
-            "{} · {} | {}",
-            mode.label(),
-            state.model().map(|m| m.display_name()).unwrap_or_default(),
-            state.effort()
-        );
+        let plain = if let Some((_, text)) = &state.plugin_status {
+            format!(
+                "{} · {} · {} | {}",
+                mode.label(),
+                text,
+                state.model().map(|m| m.display_name()).unwrap_or_default(),
+                state.effort()
+            )
+        } else {
+            format!(
+                "{} · {} | {}",
+                mode.label(),
+                state.model().map(|m| m.display_name()).unwrap_or_default(),
+                state.effort()
+            )
+        };
         let trunc = truncate_to_width(&plain, width, true);
         Line::from(Span::styled(trunc, opts.theme.dim))
     }
@@ -260,6 +279,11 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
 
                         let perm_base =
                             format!("{} {}", opts.glyphs.chevrons, mode.permission_line());
+                        let plugin_status_str = state
+                            .plugin_status
+                            .as_ref()
+                            .map(|(_, t)| format!(" · {t}"))
+                            .unwrap_or_default();
                         let hint = " (shift+tab to cycle)";
                         let counts_or_idle =
                             if state.rail.show_session_stats && state.rail.usage.turns > 0 {
@@ -296,63 +320,76 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                             };
 
                         let perm_base_len = display_width(&perm_base);
+                        let status_len = display_width(&plugin_status_str);
                         let hint_len = display_width(hint);
                         let counts_len = display_width(&counts_or_idle);
 
+                        let make_spans = |with_status: bool, with_hint: bool, with_counts: bool| {
+                            let mut spans = vec![
+                                Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
+                                Span::styled(mode.permission_line(), perm_style),
+                            ];
+                            if with_status && !plugin_status_str.is_empty() {
+                                spans.push(Span::styled(plugin_status_str.clone(), opts.theme.dim));
+                            }
+                            if with_hint {
+                                spans.push(Span::styled(hint, opts.theme.faint));
+                            }
+                            if with_counts {
+                                spans.push(Span::styled(counts_or_idle.clone(), opts.theme.faint));
+                            }
+                            spans
+                        };
+
                         // Degradation steps:
-                        // 1. Full with hint and counts and context
-                        let full_left_len = perm_base_len + hint_len + counts_len;
+                        // 1. Full with status + hint + counts + context
+                        let full_left_len = perm_base_len + status_len + hint_len + counts_len;
                         if full_left_len + 2 + right_len <= width {
-                            let spans = vec![
-                                Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
-                                Span::styled(mode.permission_line(), perm_style),
-                                Span::styled(hint, opts.theme.faint),
-                                Span::styled(counts_or_idle, opts.theme.faint),
-                            ];
-                            return render_row2_with_right(spans, right_text, width, opts);
+                            return render_row2_with_right(
+                                make_spans(true, true, true),
+                                right_text,
+                                width,
+                                opts,
+                            );
                         }
 
-                        // 2. Drop hint
-                        let no_hint_len = perm_base_len + counts_len;
+                        // 2. Drop hint (keep status)
+                        let no_hint_len = perm_base_len + status_len + counts_len;
                         if no_hint_len + 2 + right_len <= width {
-                            let spans = vec![
-                                Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
-                                Span::styled(mode.permission_line(), perm_style),
-                                Span::styled(counts_or_idle, opts.theme.faint),
-                            ];
-                            return render_row2_with_right(spans, right_text, width, opts);
+                            return render_row2_with_right(
+                                make_spans(true, false, true),
+                                right_text,
+                                width,
+                                opts,
+                            );
                         }
 
-                        // 3. Drop counts
-                        if perm_base_len + 2 + right_len <= width {
-                            let spans = vec![
-                                Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
-                                Span::styled(mode.permission_line(), perm_style),
-                            ];
-                            return render_row2_with_right(spans, right_text, width, opts);
+                        // 3. Drop counts (keep status)
+                        let base_status_len = perm_base_len + status_len;
+                        if base_status_len + 2 + right_len <= width {
+                            return render_row2_with_right(
+                                make_spans(true, false, false),
+                                right_text,
+                                width,
+                                opts,
+                            );
                         }
 
                         // 4. Drop context (right)
                         if full_left_len <= width {
-                            let spans = vec![
-                                Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
-                                Span::styled(mode.permission_line(), perm_style),
-                                Span::styled(hint, opts.theme.faint),
-                                Span::styled(counts_or_idle, opts.theme.faint),
-                            ];
-                            return Line::from(spans);
+                            return Line::from(make_spans(true, true, true));
                         }
 
                         if no_hint_len <= width {
-                            let spans = vec![
-                                Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
-                                Span::styled(mode.permission_line(), perm_style),
-                                Span::styled(counts_or_idle, opts.theme.faint),
-                            ];
-                            return Line::from(spans);
+                            return Line::from(make_spans(true, false, true));
                         }
 
-                        let trunc = truncate_to_width(&perm_base, width, true);
+                        if base_status_len <= width {
+                            return Line::from(make_spans(true, false, false));
+                        }
+
+                        let plain = format!("{perm_base}{plugin_status_str}");
+                        let trunc = truncate_to_width(&plain, width, true);
                         return Line::from(Span::styled(trunc, perm_style));
                     }
                 }

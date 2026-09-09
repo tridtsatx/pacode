@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use pacode_client::{Client, ClientEvent};
 use pacode_types::state::ToastLevel;
 use pacode_types::time::now_ms;
-use pacode_types::{AgentId, Reply, Request, TranscriptKind};
+use pacode_types::{AgentId, PluginCommandOutcome, Reply, Request, TranscriptKind};
 
 use crate::keys::{Action, handle_key, handle_mouse};
 use crate::layout::ScreenLayout;
@@ -67,6 +67,16 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
 
     let mut term_events = EventStream::new();
     let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgResponse>();
+
+    // On start (after attach), send ListPlugins and register commands
+    {
+        let cl = Arc::clone(&client);
+        let tx = bg_tx.clone();
+        tokio::spawn(async move {
+            let res = cl.request(Request::ListPlugins).await;
+            let _ = tx.send(BgResponse::Reply(res));
+        });
+    }
 
     let mut last_draw = Instant::now() - Duration::from_millis(20);
     let mut last_layout = ScreenLayout::default();
@@ -183,7 +193,10 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
             bg_res = bg_rx.recv() => {
                 if let Some(res) = bg_res {
-                    handle_bg_response(res, &mut state);
+                    let actions = handle_bg_response(res, &mut state);
+                    for act in actions {
+                        dispatch_action(act, &mut state, &client, &bg_tx);
+                    }
                 }
             }
             _ = stream_sleep => {
@@ -292,7 +305,7 @@ fn dispatch_action(
     }
 }
 
-fn handle_bg_response(res: BgResponse, state: &mut AppState) {
+fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
     match res {
         BgResponse::Reply(Ok(Reply::Error { message })) => {
             let now = now_ms();
@@ -307,16 +320,62 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) {
                 stats: None,
             });
             state.dirty = true;
+            vec![]
         }
         BgResponse::Reply(Ok(Reply::Models { models })) => {
             state.models = models;
             state.dirty = true;
+            vec![]
         }
         BgResponse::Reply(Ok(Reply::Sessions { sessions })) => {
             state.sessions = sessions;
             state.dirty = true;
+            vec![]
         }
-        BgResponse::Reply(Ok(_)) => {}
+        BgResponse::Reply(Ok(Reply::McpServers { servers })) => {
+            crate::commands::register_mcp_servers(&servers);
+            if let crate::state::Focus::Overlay(crate::state::Overlay::McpPicker {
+                servers: ref mut s,
+                loading: ref mut l,
+                ..
+            }) = state.focus
+            {
+                *s = servers;
+                *l = false;
+                state.dirty = true;
+            }
+            vec![]
+        }
+        BgResponse::Reply(Ok(Reply::McpPrompt { text })) => {
+            state.input.insert_str(&text);
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::Reply(Ok(Reply::Plugins { plugins })) => {
+            crate::commands::register_plugins(&plugins);
+            state.plugins = plugins.clone();
+            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
+                plugins: ref mut p,
+                ..
+            }) = state.focus
+            {
+                *p = plugins;
+                state.dirty = true;
+            }
+            vec![]
+        }
+        BgResponse::Reply(Ok(Reply::PluginCommand(outcome))) => match outcome {
+            PluginCommandOutcome::InsertText { text } => {
+                state.input.insert_str(&text);
+                state.dirty = true;
+                vec![]
+            }
+            PluginCommandOutcome::SendPrompt { text } => {
+                vec![Action::Send(Request::UserMessage { text })]
+            }
+            PluginCommandOutcome::Nothing => vec![],
+        },
+        BgResponse::Reply(Ok(_)) => vec![],
         BgResponse::Reply(Err(err)) => {
             let now = now_ms();
             state.transcript.cells.push_back(Cell {
@@ -330,53 +389,60 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) {
                 stats: None,
             });
             state.dirty = true;
+            vec![]
         }
-        BgResponse::LoadPanelReply { target, result } => match result {
-            Ok(Reply::History {
-                items, has_more, ..
-            }) => {
-                if state.panel.target == Some(target) {
-                    state.panel.agent_transcript.reset(items, has_more);
+        BgResponse::LoadPanelReply { target, result } => {
+            match result {
+                Ok(Reply::History {
+                    items, has_more, ..
+                }) => {
+                    if state.panel.target == Some(target) {
+                        state.panel.agent_transcript.reset(items, has_more);
+                        state.dirty = true;
+                    }
+                }
+                Ok(Reply::TaskOutput {
+                    lines, total_lines, ..
+                }) => {
+                    if state.panel.target == Some(target) {
+                        state.panel.task_lines = lines;
+                        state.panel.task_total_lines = total_lines;
+                        state.dirty = true;
+                    }
+                }
+                Ok(Reply::Error { message }) => {
+                    state.push_toast(
+                        ToastLevel::Error,
+                        "Panel load error".into(),
+                        Some(message),
+                        Instant::now(),
+                    );
+                }
+                Err(e) => {
+                    state.push_toast(
+                        ToastLevel::Error,
+                        "Panel load error".into(),
+                        Some(e.to_string()),
+                        Instant::now(),
+                    );
+                }
+                _ => {}
+            }
+            vec![]
+        }
+        BgResponse::LoadHistoryReply { result } => {
+            match result {
+                Ok(Reply::History {
+                    items, has_more, ..
+                }) => {
+                    state.transcript.prepend(items, has_more);
                     state.dirty = true;
                 }
-            }
-            Ok(Reply::TaskOutput {
-                lines, total_lines, ..
-            }) => {
-                if state.panel.target == Some(target) {
-                    state.panel.task_lines = lines;
-                    state.panel.task_total_lines = total_lines;
-                    state.dirty = true;
+                _ => {
+                    state.transcript.loading_history = false;
                 }
             }
-            Ok(Reply::Error { message }) => {
-                state.push_toast(
-                    ToastLevel::Error,
-                    "Panel load error".into(),
-                    Some(message),
-                    Instant::now(),
-                );
-            }
-            Err(e) => {
-                state.push_toast(
-                    ToastLevel::Error,
-                    "Panel load error".into(),
-                    Some(e.to_string()),
-                    Instant::now(),
-                );
-            }
-            _ => {}
-        },
-        BgResponse::LoadHistoryReply { result } => match result {
-            Ok(Reply::History {
-                items, has_more, ..
-            }) => {
-                state.transcript.prepend(items, has_more);
-                state.dirty = true;
-            }
-            _ => {
-                state.transcript.loading_history = false;
-            }
-        },
+            vec![]
+        }
     }
 }

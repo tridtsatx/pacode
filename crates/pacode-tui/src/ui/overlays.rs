@@ -12,7 +12,7 @@ use pacode_render::{RenderOptions, truncate_to_width};
 use pacode_types::state::TaskStatus;
 use pacode_types::time::{format_duration_ms, now_ms};
 
-use crate::commands::COMMANDS;
+use crate::commands;
 use crate::state::{AppState, Focus, Overlay};
 
 pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &RenderOptions) {
@@ -46,15 +46,28 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::Files { index } => {
                 crate::ui::files::draw(frame, area, *index, state, opts);
             }
+            Overlay::McpPicker {
+                index,
+                servers,
+                loading,
+            } => {
+                crate::ui::mcp::draw(frame, area, *index, servers, *loading, opts);
+            }
+            Overlay::PluginsPicker { index, plugins } => {
+                crate::ui::plugins::draw(frame, area, *index, plugins, opts);
+            }
             Overlay::RailOverlay => {
                 draw_rail_overlay(frame, area, state, opts);
             }
             Overlay::Help => {
                 draw_help(frame, area, opts);
             }
-            _ => {}
+            Overlay::ModelPicker { .. }
+            | Overlay::EffortPicker { .. }
+            | Overlay::ModePicker { .. }
+            | Overlay::ConfigPicker { .. } => {}
         },
-        _ => {}
+        Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } => {}
     }
 }
 
@@ -215,14 +228,16 @@ fn draw_help(frame: &mut Frame, area: Rect, opts: &RenderOptions) {
         Line::from("  shift+tab         Cycle permission mode"),
         Line::from("  ctrl+p            Pick / resume session"),
         Line::from("  ctrl+c            Interrupt turn (twice: exit)"),
+        Line::from("  r                 Restart MCP server (in /mcp)"),
+        Line::from("  enter             Toggle MCP server enabled (in /mcp)"),
         Line::from("  esc               Peel focus layer"),
         Line::default(),
         Line::from(Span::styled("Commands:", opts.theme.accent)),
     ];
-    for cmd in COMMANDS {
+    for cmd in commands::all_commands() {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<16}", cmd.usage), opts.theme.cyan),
-            Span::styled(cmd.help, opts.theme.dim),
+            Span::styled(format!("  {:<18}", cmd.usage), opts.theme.cyan),
+            Span::styled(cmd.help.to_string(), opts.theme.dim),
         ]));
     }
 

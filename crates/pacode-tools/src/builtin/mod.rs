@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod memory;
 pub mod multi_edit;
 pub mod plan;
+pub mod plugin;
 pub mod read;
 pub mod report_status;
 pub mod webfetch;

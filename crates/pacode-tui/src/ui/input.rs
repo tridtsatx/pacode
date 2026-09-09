@@ -46,7 +46,7 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
                 .next()
                 .unwrap_or(&state.input.text);
             let name = token.strip_prefix('/').unwrap_or("");
-            if commands::COMMANDS.iter().any(|c| c.name == name) {
+            if commands::all_commands().iter().any(|c| c.name == name) {
                 Some(token.to_string())
             } else {
                 None
@@ -158,7 +158,7 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
                     Line::from(vec![
                         Span::styled(usage, usage_style),
                         Span::raw(" "),
-                        Span::styled(cmd.help, help_style),
+                        Span::styled(cmd.help.to_string(), help_style),
                     ])
                 };
                 popup_lines.push(line);
@@ -174,7 +174,7 @@ pub fn command_inline_hint(text: &str) -> Option<String> {
         let parts: Vec<&str> = rest.split_whitespace().collect();
         if parts.len() == 1 {
             let cmd_name = parts[0];
-            if let Some(cmd) = commands::COMMANDS.iter().find(|c| c.name == cmd_name)
+            if let Some(cmd) = commands::find_command(cmd_name)
                 && !cmd.arg_hint.is_empty()
             {
                 if text.ends_with(' ') {

@@ -1,5 +1,6 @@
 //! `Core`: the daemon-facing API.
 
+pub(crate) mod global;
 pub(crate) mod open;
 pub(crate) mod router;
 
@@ -27,6 +28,7 @@ pub struct CoreDeps {
     pub tools: ToolRegistry,
     pub tasks: Arc<TaskManager>,
     pub mcp: Arc<McpPool>,
+    pub plugins: Arc<pacode_plugin::PluginHost>,
     pub store: Store,
     /// Shown in the rail anchor and in `SessionMeta` logs.
     pub app_version: String,
@@ -318,33 +320,26 @@ impl Core {
             | Request::Ping => Reply::Error {
                 message: "connection-level request handled by daemon".to_string(),
             },
+            Request::ListMcpServers
+            | Request::RestartMcpServer { .. }
+            | Request::SetMcpServerEnabled { .. }
+            | Request::GetMcpPrompt { .. }
+            | Request::ListPlugins
+            | Request::RunPluginCommand { .. } => {
+                self.handle_global(&req)
+                    .await
+                    .unwrap_or_else(|| Reply::Error {
+                        message: "unhandled request".to_string(),
+                    })
+            }
         }
     }
 
-    /// Requests that need no session: `ListSessions`, `ListModels`. Used by the daemon
-    /// for unattached connections too.
-    pub async fn handle_global(&self, req: &Request) -> Option<Reply> {
-        match req {
-            Request::ListSessions { limit } => Some(
-                match self
-                    .deps
-                    .store
-                    .list_sessions(pacode_store::SessionFilter {
-                        cwd: None,
-                        limit: *limit,
-                    })
-                    .await
-                {
-                    Ok(sessions) => Reply::Sessions { sessions },
-                    Err(e) => Reply::Error {
-                        message: e.to_string(),
-                    },
-                },
-            ),
-            Request::ListModels => Some(Reply::Models {
-                models: self.providers().list_all_models().await,
-            }),
-            _ => None,
+    pub fn broadcast_event(&self, event: Event) {
+        if let Ok(guard) = self.sessions.read() {
+            for session in guard.values() {
+                session.events.emit(event.clone());
+            }
         }
     }
 

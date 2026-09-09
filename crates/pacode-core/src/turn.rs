@@ -24,8 +24,12 @@
 //! }
 //! ```
 
+pub(crate) mod lifecycle;
 pub(crate) mod stream;
 pub(crate) mod tools;
+
+pub(crate) use lifecycle::emit_failure_notice;
+pub use lifecycle::start_turn;
 
 use std::sync::Arc;
 
@@ -38,33 +42,6 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::Agent;
 use crate::prompt::DynamicContext;
 use crate::session::Session;
-
-/// Run one turn of `agent` inside `session`. Sets agent status and emits
-/// `TurnStarted`/`TurnEnded`. Never panics; every error becomes `TurnStop::Failed`.
-/// Surface a turn failure in the transcript (error notice item) so clients and
-/// `pacode run` see why nothing happened.
-fn emit_failure_notice(session: &Session, agent: &Agent, message: &str) {
-    let seq = agent
-        .transcript
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .next_seq();
-    let item = pacode_types::TranscriptItem {
-        seq,
-        agent: agent.id.clone(),
-        ts_ms: pacode_types::now_ms(),
-        kind: pacode_types::TranscriptKind::Notice {
-            level: pacode_types::ToastLevel::Error,
-            text: format!("turn failed: {message}"),
-        },
-    };
-    agent
-        .transcript
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .upsert(item.clone());
-    session.events.emit(Event::ItemAdded(item));
-}
 
 pub async fn run_turn(
     session: Arc<Session>,
@@ -81,6 +58,12 @@ pub async fn run_turn(
     };
 
     let turn_id = TurnId::generate();
+    let turn_start_instant = std::time::Instant::now();
+    let _ = session
+        .plugins
+        .run_hooks(&pacode_plugin::HookEvent::TurnStart)
+        .await;
+
     session.events.emit(Event::TurnStarted {
         agent: agent.id.clone(),
         turn: turn_id.clone(),
@@ -94,6 +77,15 @@ pub async fn run_turn(
         if cancel.is_cancelled() {
             agent.set_status(AgentStatus::Idle, None);
             session.events.emit(Event::AgentUpdated(agent.info()));
+            let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
+            let output_tokens = turn_usage.output_tokens;
+            let _ = session
+                .plugins
+                .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+                    duration_ms,
+                    output_tokens,
+                })
+                .await;
             session.events.emit(Event::TurnEnded {
                 agent: agent.id.clone(),
                 turn: turn_id,
@@ -137,7 +129,11 @@ pub async fn run_turn(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .for_model();
-        let tools_def = agent.tools.definitions();
+        let tools_def = agent
+            .tools
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .definitions();
 
         let req = pacode_provider::CompletionRequest {
             model: agent_info.model.model.clone(),
@@ -156,6 +152,15 @@ pub async fn run_turn(
                 let stop = TurnStop::Failed {
                     message: e.to_string(),
                 };
+                let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
+                let output_tokens = turn_usage.output_tokens;
+                let _ = session
+                    .plugins
+                    .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+                        duration_ms,
+                        output_tokens,
+                    })
+                    .await;
                 session.events.emit(Event::TurnEnded {
                     agent: agent.id.clone(),
                     turn: turn_id,
@@ -173,6 +178,15 @@ pub async fn run_turn(
                 let stop = TurnStop::Failed {
                     message: e.to_string(),
                 };
+                let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
+                let output_tokens = turn_usage.output_tokens;
+                let _ = session
+                    .plugins
+                    .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+                        duration_ms,
+                        output_tokens,
+                    })
+                    .await;
                 session.events.emit(Event::TurnEnded {
                     agent: agent.id.clone(),
                     turn: turn_id,
@@ -189,6 +203,15 @@ pub async fn run_turn(
                 if let TurnStop::Failed { message } = &stop {
                     emit_failure_notice(&session, &agent, message);
                 }
+                let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
+                let output_tokens = turn_usage.output_tokens;
+                let _ = session
+                    .plugins
+                    .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+                        duration_ms,
+                        output_tokens,
+                    })
+                    .await;
                 session.events.emit(Event::TurnEnded {
                     agent: agent.id.clone(),
                     turn: turn_id,
@@ -204,6 +227,15 @@ pub async fn run_turn(
         if outcome.interrupted {
             agent.set_status(AgentStatus::Idle, None);
             session.events.emit(Event::AgentUpdated(agent.info()));
+            let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
+            let output_tokens = turn_usage.output_tokens;
+            let _ = session
+                .plugins
+                .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+                    duration_ms,
+                    output_tokens,
+                })
+                .await;
             session.events.emit(Event::TurnEnded {
                 agent: agent.id.clone(),
                 turn: turn_id,
@@ -243,6 +275,14 @@ pub async fn run_turn(
         let _ = session
             .store
             .append_message(&session.id, &agent.id, msg_seq, &arc_msg)
+            .await;
+
+        let _ = session
+            .plugins
+            .run_hooks(&pacode_plugin::HookEvent::OnMessage {
+                role: "assistant".to_string(),
+                text: outcome.text.clone(),
+            })
             .await;
 
         if agent.id.is_main()
@@ -307,6 +347,15 @@ pub async fn run_turn(
         if tool_interrupted {
             agent.set_status(AgentStatus::Idle, None);
             session.events.emit(Event::AgentUpdated(agent.info()));
+            let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
+            let output_tokens = turn_usage.output_tokens;
+            let _ = session
+                .plugins
+                .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+                    duration_ms,
+                    output_tokens,
+                })
+                .await;
             session.events.emit(Event::TurnEnded {
                 agent: agent.id.clone(),
                 turn: turn_id,
@@ -319,6 +368,15 @@ pub async fn run_turn(
         if cancel.is_cancelled() {
             agent.set_status(AgentStatus::Idle, None);
             session.events.emit(Event::AgentUpdated(agent.info()));
+            let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
+            let output_tokens = turn_usage.output_tokens;
+            let _ = session
+                .plugins
+                .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+                    duration_ms,
+                    output_tokens,
+                })
+                .await;
             session.events.emit(Event::TurnEnded {
                 agent: agent.id.clone(),
                 turn: turn_id,
@@ -402,6 +460,16 @@ pub async fn run_turn(
         .estimated_tokens;
     session.record_usage(&agent.id, turn_usage, context_tokens);
 
+    let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
+    let output_tokens = turn_usage.output_tokens;
+    let _ = session
+        .plugins
+        .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+            duration_ms,
+            output_tokens,
+        })
+        .await;
+
     session.events.emit(Event::TurnEnded {
         agent: agent.id.clone(),
         turn: turn_id,
@@ -410,80 +478,4 @@ pub async fn run_turn(
     });
 
     TurnStop::Completed
-}
-
-/// Spawn `run_turn` as a tokio task, storing the cancel token on the agent. Returns
-/// immediately. When the turn ends, the token is cleared and, for subagents, the
-/// parent gets an `Injection::AgentFinished` and the agent's history is persisted
-/// and dropped from memory (info + summary stay).
-pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
-    let cancel = CancellationToken::new();
-    *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
-
-    tokio::spawn(async move {
-        let stop = run_turn(session.clone(), agent.clone(), cancel).await;
-        *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
-
-        // An injection that landed between the last drain and the end of the turn
-        // would otherwise wait for the next user message: run another turn for it.
-        if agent.id.is_main() && matches!(stop, TurnStop::Completed) && !agent.injections.is_empty()
-        {
-            start_turn(session.clone(), agent.clone());
-            return;
-        }
-
-        if !agent.id.is_main() {
-            let last_assistant_text = {
-                let hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
-                hist.messages
-                    .iter()
-                    .rev()
-                    .find_map(|m| {
-                        if m.role == Role::Assistant {
-                            Some(m.text())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
-            };
-            let capped_answer = pacode_types::truncate_head_tail(
-                &last_assistant_text,
-                session.config.context.injection_cap_chars,
-            );
-
-            {
-                if let Ok(mut info) = agent.info.write() {
-                    info.summary = Some(capped_answer.clone());
-                    info.status = AgentStatus::Finished;
-                    info.finished_at_ms = Some(pacode_types::now_ms());
-                }
-            }
-            let info = agent.info();
-            let _ = session
-                .store
-                .upsert_agent(&session.id, &info, agent.prompt.as_deref())
-                .await;
-            session.events.emit(Event::AgentUpdated(info.clone()));
-
-            if let Some(parent_id) = &info.parent
-                && let Some(parent) = session.agent(parent_id)
-            {
-                parent
-                    .injections
-                    .push(crate::inject::Injection::AgentFinished {
-                        agent: info,
-                        answer: capped_answer,
-                    });
-                if parent.id.is_main() && !parent.is_running() {
-                    start_turn(session.clone(), parent);
-                }
-            }
-
-            {
-                let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
-                hist.messages.clear();
-            }
-        }
-    });
 }

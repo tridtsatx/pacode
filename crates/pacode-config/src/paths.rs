@@ -96,6 +96,10 @@ impl Paths {
         Ok(())
     }
 
+    pub fn config_file(&self) -> PathBuf {
+        self.config_file.clone()
+    }
+
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("pacode.db")
     }
