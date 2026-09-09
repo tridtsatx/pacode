@@ -19,7 +19,52 @@ pub struct Theme {
 }
 
 impl Default for Theme {
+    /// Detects `COLORTERM` (`truecolor`/`24bit`) → mockup RGB palette, else ANSI-16.
+    /// `CODEAPP_COLOR=ansi|truecolor` forces one.
     fn default() -> Self {
+        let forced = std::env::var("CODEAPP_COLOR").ok();
+        let truecolor = match forced.as_deref() {
+            Some("ansi") => false,
+            Some("truecolor") | Some("24bit") => true,
+            _ => std::env::var("COLORTERM")
+                .map(|v| {
+                    let v = v.to_ascii_lowercase();
+                    v.contains("truecolor") || v.contains("24bit")
+                })
+                .unwrap_or(false),
+        };
+        if truecolor {
+            Self::truecolor()
+        } else {
+            Self::ansi()
+        }
+    }
+}
+
+impl Theme {
+    /// The mockup palette (see the design artifact CSS variables). Terminals whose
+    /// ANSI-16 palette is monochrome still get colour this way.
+    pub fn truecolor() -> Self {
+        let rgb = |r: u8, g: u8, b: u8| Style::default().fg(Color::Rgb(r, g, b));
+        Self {
+            fg: rgb(0xc9, 0xc7, 0xc0),
+            dim: rgb(0x75, 0x77, 0x6f),
+            faint: rgb(0x43, 0x46, 0x3f),
+            accent: rgb(0xd9, 0x9b, 0x4e),
+            green: rgb(0x96, 0xb3, 0x5d),
+            cyan: rgb(0x6e, 0xa9, 0xbd),
+            red: rgb(0xc8, 0x69, 0x5c),
+            violet: rgb(0x9a, 0x8b, 0xc4),
+            bold: Style::default()
+                .fg(Color::Rgb(0xe7, 0xe5, 0xdd))
+                .add_modifier(Modifier::BOLD),
+            selected_bg: Style::default().bg(Color::Rgb(0x1e, 0x24, 0x1c)),
+            user_bar: rgb(0x6e, 0xa9, 0xbd),
+        }
+    }
+
+    /// Plain ANSI-16 palette.
+    pub fn ansi() -> Self {
         Self {
             fg: Style::default(),
             dim: Style::default().fg(Color::Gray),

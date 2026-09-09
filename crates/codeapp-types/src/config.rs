@@ -100,6 +100,8 @@ pub struct UiConfig {
     pub hints: UiHints,
     pub ascii_only: bool,
     pub mouse: bool,
+    /// `auto` (COLORTERM detection), `truecolor`, or `ansi`.
+    pub color: String,
     /// Max transcript cells kept in the client before older ones are evicted.
     pub transcript_cells: usize,
 }
@@ -110,6 +112,7 @@ impl Default for UiConfig {
             hints: UiHints::default(),
             ascii_only: false,
             mouse: true,
+            color: "auto".to_string(),
             transcript_cells: 500,
         }
     }

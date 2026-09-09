@@ -18,17 +18,18 @@ pub(crate) fn now_us() -> u64 {
         .unwrap_or(0)
 }
 
-/// Format a millisecond duration as the compact `1m47s` / `41s` / `0.4s` used by the rail.
+/// Format a duration: `840ms` under a second, `12.3s` under a minute, `1m47s` under an
+/// hour, `1h02m` above.
 pub fn format_duration_ms(ms: u64) -> String {
     let secs = ms / 1000;
     if secs >= 3600 {
         format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     } else if secs >= 60 {
         format!("{}m{:02}s", secs / 60, secs % 60)
-    } else if secs >= 10 {
-        format!("{secs}s")
-    } else {
+    } else if ms >= 1000 {
         format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
     }
 }
 
@@ -49,8 +50,9 @@ mod tests {
 
     #[test]
     fn durations() {
-        assert_eq!(format_duration_ms(400), "0.4s");
-        assert_eq!(format_duration_ms(41_000), "41s");
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(400), "400ms");
+        assert_eq!(format_duration_ms(41_000), "41.0s");
         assert_eq!(format_duration_ms(107_000), "1m47s");
         assert_eq!(format_duration_ms(3_720_000), "1h02m");
     }

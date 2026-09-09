@@ -242,6 +242,12 @@ pub fn main() -> anyhow::Result<()> {
             let mut client_opts = ClientOptions::new(paths.clone(), codeapp_config::APP_VERSION);
             client_opts.socket = Some(socket);
 
+            // `[ui].color` overrides COLORTERM detection in codeapp-render.
+            if config.ui.color != "auto" && std::env::var_os("CODEAPP_COLOR").is_none() {
+                // SAFETY: single-threaded at this point, before the runtime starts.
+                unsafe { std::env::set_var("CODEAPP_COLOR", &config.ui.color) };
+            }
+
             let tui_opts = codeapp_tui::TuiOptions {
                 client: client_opts,
                 config,
