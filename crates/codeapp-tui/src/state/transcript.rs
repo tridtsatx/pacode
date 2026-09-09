@@ -38,6 +38,9 @@ pub struct Transcript {
     /// Streaming reveal buffer for the live assistant cell (`live_cell`).
     pub stream: Option<StreamBuffer>,
     pub live_cell: Option<u64>,
+    /// Final item received while the paced reveal still has backlog: applied when the
+    /// backlog drains so the tail of an answer does not pop in at once.
+    pub pending_final: Option<TranscriptItem>,
     /// Hidden text that arrived but is not revealed yet is inside `stream`.
     pub has_more_history: bool,
     /// Set while a `GetHistory` request is in flight.
@@ -53,6 +56,7 @@ impl Transcript {
             cache: LineCache::new(20_000),
             stream: None,
             live_cell: None,
+            pending_final: None,
             has_more_history: false,
             loading_history: false,
         }
@@ -64,6 +68,7 @@ impl Transcript {
         self.cache.clear();
         self.stream = None;
         self.live_cell = None;
+        self.pending_final = None;
         self.scroll_from_bottom = 0;
         self.has_more_history = has_more;
         self.loading_history = false;
@@ -116,8 +121,19 @@ impl Transcript {
                     };
                     self.insert_or_replace(seq, kind, item.ts_ms);
                 } else {
+                    if self.live_cell == Some(seq) && self.has_backlog() {
+                        self.pending_final = Some(TranscriptItem {
+                            seq,
+                            agent: item.agent,
+                            ts_ms: item.ts_ms,
+                            kind: TranscriptKind::Assistant {
+                                text,
+                                complete: true,
+                            },
+                        });
+                        return;
+                    }
                     if self.live_cell == Some(seq) {
-                        self.flush_stream();
                         self.live_cell = None;
                         self.stream = None;
                     }
@@ -142,8 +158,19 @@ impl Transcript {
                     };
                     self.insert_or_replace(seq, kind, item.ts_ms);
                 } else {
+                    if self.live_cell == Some(seq) && self.has_backlog() {
+                        self.pending_final = Some(TranscriptItem {
+                            seq,
+                            agent: item.agent,
+                            ts_ms: item.ts_ms,
+                            kind: TranscriptKind::Reasoning {
+                                text,
+                                complete: true,
+                            },
+                        });
+                        return;
+                    }
                     if self.live_cell == Some(seq) {
-                        self.flush_stream();
                         self.live_cell = None;
                         self.stream = None;
                     }
@@ -241,9 +268,22 @@ impl Transcript {
                 }
             }
             cell.version = cell.version.wrapping_add(1);
+            self.apply_pending_final();
             true
         } else {
             false
+        }
+    }
+
+    /// When the backlog is drained and a final item is waiting, install it.
+    fn apply_pending_final(&mut self) {
+        if self.has_backlog() {
+            return;
+        }
+        if let Some(item) = self.pending_final.take() {
+            self.live_cell = None;
+            self.stream = None;
+            self.insert_or_replace(item.seq, item.kind, item.ts_ms);
         }
     }
 
@@ -282,6 +322,11 @@ impl Transcript {
                 }
             }
             cell.version = cell.version.wrapping_add(1);
+        }
+        if let Some(item) = self.pending_final.take() {
+            self.live_cell = None;
+            self.stream = None;
+            self.insert_or_replace(item.seq, item.kind, item.ts_ms);
         }
     }
 

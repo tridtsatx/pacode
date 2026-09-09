@@ -94,8 +94,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return handle_esc(state);
     }
 
-    // 5. Follow shortcut: alt+b
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('b')) {
+    // 5. Follow shortcut: alt+b (alias alt+f)
+    if key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('f'))
+    {
         return handle_follow(state);
     }
 
@@ -541,7 +543,10 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
 /// key, so `ctrl+в` acts as `ctrl+d`. Legacy terminals already send the control byte;
 /// this covers the kitty keyboard protocol where the Unicode letter arrives.
 pub fn normalize_cyrillic_ctrl(key: KeyEvent) -> KeyEvent {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+    if !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
         return key;
     }
     let KeyCode::Char(c) = key.code else {
