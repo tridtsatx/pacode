@@ -2,12 +2,12 @@
 source: crates/pacode-tui/tests/snapshot_tests.rs
 expression: view
 ---
-"  ▄▄▀▀▀▀▄▄                                         │Refactor TUI layout         "
-"▄▀▀▀▀▀▀▀▀▀▀▄                                       │ses_abcdef123               "
-"▀▀▀▀▀▀▀▀▀      pacode v0.1.0-dev                   │                            "
-"▀▀▀▀▀▀▀▀▄                                          │PLAN               1/4 · 40%"
-"▀▀▀▀▀▀▀▀▀▀▀▀                                       │[✓] Read codebase & analyze…"
-"  ▀▀▀▀▀▀▀▀                                         │[•] Implement TUI layout & …"
+"  ▄▄▀▀▀▀▀▀▄▄                                       │Refactor TUI layout         "
+"▄▀▀▀▀▀▀▀▀▀▀▀▀▄                                     │ses_abcdef123               "
+"▀▀▀▀▀▀▀▀▀▀▀      pacode v0.1.0-dev                 │                            "
+"▀▀▀▀▀▀▀▀▀▀▄                                        │PLAN               1/4 · 40%"
+"▀▀▀▀▀▀▀▀▀▀▀▀▀▀                                     │[✓] Read codebase & analyze…"
+"  ▀▀▀▀▀▀▀▀▀▀                                       │[•] Implement TUI layout & …"
 "                                                   │    ▰▰▰▰▰▱▱▱ 60%            "
 "▎ Refactor TUI layout and split into modules       │[ ] Add key bindings & even…"
 "                                                   │[ ] Write unit tests & snap…"

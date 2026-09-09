@@ -39,33 +39,33 @@ struct Sprite {
 /// and left to right outside the mouth; breaking that symmetry is what makes the
 /// sprite read as an egg instead of a ball.
 const PACMAN: &[&str] = &[
-    "    ####    ",
-    "  ########  ",
-    " #####kk### ",
-    "######kk####",
-    "#########   ",
-    "########    ",
-    "########    ",
-    "#########   ",
-    "############",
-    " ########## ",
-    "  ########  ",
-    "    ####    ",
+    "    ######    ",
+    "  ##########  ",
+    " #######kk### ",
+    "########kk####",
+    "###########   ",
+    "##########    ",
+    "##########    ",
+    "###########   ",
+    "##############",
+    " ############ ",
+    "  ##########  ",
+    "    ######    ",
 ];
 
 const GHOST: &[&str] = &[
-    "    ####    ",
-    "  ########  ",
-    " ########## ",
-    "#wwww##wwww#",
-    "#wbbw##wbbw#",
-    "#wbbw##wbbw#",
-    "#wwww##wwww#",
-    "############",
-    "############",
-    "############",
-    "############",
-    "##.##..##.##",
+    "    ######    ",
+    "  ##########  ",
+    " ############ ",
+    "##wwww##wwww##",
+    "##wbbw##wbbw##",
+    "##wbbw##wbbw##",
+    "##wwww##wwww##",
+    "##############",
+    "##############",
+    "##############",
+    "##############",
+    "##..##..##..##",
 ];
 
 /// Which mascot the session shows. Picked once per run so the banner is stable
@@ -121,7 +121,7 @@ impl MascotKind {
 /// Rendered height in terminal rows (two pixel rows per row).
 pub const HEIGHT: usize = 6;
 /// Rendered width in terminal columns.
-pub const WIDTH: usize = 12;
+pub const WIDTH: usize = 14;
 
 fn color(rgb: (u8, u8, u8), truecolor: bool) -> Color {
     let (r, g, b) = rgb;
