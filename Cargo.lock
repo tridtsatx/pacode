@@ -271,6 +271,7 @@ dependencies = [
  "codeapp-daemon",
  "codeapp-tui",
  "codeapp-types",
+ "libc",
  "log",
  "serde_json",
  "tokio",

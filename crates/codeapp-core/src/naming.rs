@@ -24,11 +24,19 @@ pub async fn generate_title(
         system_dynamic: String::new(),
         messages: vec![Message::user(prompt_user)],
         tools: Vec::new(),
-        effort: None,
-        max_output_tokens: Some(40),
+        // Low effort and no output cap: a reasoning model spends a small cap on
+        // thinking and returns nothing.
+        effort: Some(codeapp_types::Effort::Low),
+        max_output_tokens: None,
     };
 
-    let mut stream = provider.complete(req).await.ok()?;
+    let mut stream = match provider.complete(req).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("title generation failed: {e}");
+            return None;
+        }
+    };
     let mut title_acc = String::new();
     while let Some(event_res) = stream.next().await {
         match event_res {
@@ -36,7 +44,10 @@ pub async fn generate_title(
                 title_acc.push_str(&text);
             }
             Ok(_) => {}
-            Err(_) => return None,
+            Err(e) => {
+                log::warn!("title generation stream failed: {e}");
+                return None;
+            }
         }
     }
 

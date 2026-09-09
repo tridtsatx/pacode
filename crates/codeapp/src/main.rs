@@ -21,6 +21,12 @@
 mod cli;
 
 fn main() {
+    // Let `codeapp sessions list | head` end quietly instead of panicking on EPIPE.
+    #[cfg(unix)]
+    // SAFETY: resetting the SIGPIPE disposition before any thread exists is sound.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     if let Err(err) = cli::main() {
         eprintln!("codeapp: {err:#}");
         std::process::exit(1);
