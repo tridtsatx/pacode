@@ -103,6 +103,8 @@ pub enum Connection {
 
 pub struct AppState {
     pub config: Config,
+    /// Footer status text set by a plugin via `pacode.status` (plugin name, text).
+    pub plugin_status: Option<(String, String)>,
     pub paths: pacode_config::Paths,
     pub app_version: String,
     pub meta: Option<SessionMeta>,
@@ -152,6 +154,7 @@ impl AppState {
         let cells = config.ui.transcript_cells;
         Self {
             config,
+            plugin_status: None,
             paths: pacode_config::Paths::discover(),
             app_version,
             meta: None,
@@ -550,6 +553,16 @@ impl AppState {
                 self.connection = Connection::Disconnected {
                     reason: "Daemon shutting down".into(),
                 };
+            }
+            Event::PluginToast { plugin, text } => {
+                self.push_toast(pacode_types::ToastLevel::Info, text, Some(plugin), now);
+            }
+            Event::PluginStatus { plugin, text } => {
+                if text.is_empty() {
+                    self.plugin_status = None;
+                } else {
+                    self.plugin_status = Some((plugin, text));
+                }
             }
         }
         self.rail.update_idle(self.turn_active, now);

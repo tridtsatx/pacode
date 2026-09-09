@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentId, ClientId, PermissionId, SessionId, TaskId, TurnId};
@@ -92,6 +94,69 @@ pub enum Request {
         force: bool,
     },
     Ping,
+    /// MCP servers with their status (`Reply::McpServers`).
+    ListMcpServers,
+    /// Restart one MCP server.
+    RestartMcpServer {
+        server: String,
+    },
+    /// Enable/disable one MCP server for the daemon lifetime.
+    SetMcpServerEnabled {
+        server: String,
+        enabled: bool,
+    },
+    /// Render an MCP prompt (`Reply::McpPrompt`).
+    GetMcpPrompt {
+        server: String,
+        name: String,
+        #[serde(default)]
+        args: BTreeMap<String, String>,
+    },
+    /// Loaded plugins (`Reply::Plugins`).
+    ListPlugins,
+    /// Run a plugin slash command (`Reply::PluginCommand`).
+    RunPluginCommand {
+        name: String,
+        args: String,
+    },
+}
+
+/// One MCP server as shown in the `/mcp` picker.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// `stopped` | `starting` | `ready` | `failed` | `disabled`
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub tools: u32,
+    pub resources: u32,
+    pub prompts: u32,
+    /// Prompt names exposed as `/mcp:<server>:<prompt>`.
+    #[serde(default)]
+    pub prompt_names: Vec<String>,
+}
+
+/// One loaded plugin as shown in the `/plugins` picker.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    pub name: String,
+    pub version: String,
+    /// `lua` | `wasm`
+    pub kind: String,
+    pub tools: Vec<String>,
+    pub commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Result of a plugin slash command.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginCommandOutcome {
+    InsertText { text: String },
+    SendPrompt { text: String },
+    Nothing,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -149,6 +214,16 @@ pub enum Reply {
         models: Vec<ModelInfo>,
     },
     Pong,
+    McpServers {
+        servers: Vec<McpServerInfo>,
+    },
+    McpPrompt {
+        text: String,
+    },
+    Plugins {
+        plugins: Vec<PluginInfo>,
+    },
+    PluginCommand(PluginCommandOutcome),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -206,6 +281,16 @@ pub enum Event {
         detail: Option<String>,
     },
     DaemonShuttingDown,
+    /// Plugin asked for a toast (`pacode.toast`).
+    PluginToast {
+        plugin: String,
+        text: String,
+    },
+    /// Plugin status text shown in the footer (`pacode.status`); empty clears it.
+    PluginStatus {
+        plugin: String,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
