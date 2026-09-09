@@ -1,28 +1,32 @@
 //! All mutable UI state. Widgets read it; `app` and `keys` mutate it; `apply_event`
 //! folds daemon events in. Nothing here touches the terminal.
 
+pub mod events;
 pub mod files;
 pub mod input;
 pub mod rail;
 pub mod selection;
+pub mod slots;
 pub mod stats;
 pub mod transcript;
 pub mod vim;
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use pacode_client::ClientEvent;
 use pacode_types::time::now_ms;
 use pacode_types::{
-    AgentId, Config, Effort, Event, McpServerInfo, Mode, ModelInfo, ModelRoute, PermissionDecision,
-    PluginInfo, SessionMeta, TaskId, TaskStatus, ToastLevel, TranscriptKind,
+    AgentId, Config, Effort, Event, McpServerInfo, Mode, ModelInfo, ModelRoute, PluginInfo,
+    SessionMeta, TaskId, ToastLevel, TranscriptKind,
 };
 
 pub use files::FilesState;
 pub use input::InputState;
 pub use rail::RailState;
 pub use selection::Selection;
+pub use slots::{NUM_SLOTS, SessionSlot};
 pub use transcript::{Cell, CellKind, Transcript};
 pub use vim::{VimEffect, VimMode, VimState};
 
@@ -176,6 +180,12 @@ pub struct AppState {
     pub mascot: crate::ui::mascot::MascotKind,
     /// Pending readline key chord (e.g. `ctrl+x` waiting for `ctrl+e`).
     pub pending_chord: Option<crossterm::event::KeyEvent>,
+    /// Session slot table (1..=9).
+    pub slots: [Option<SessionSlot>; NUM_SLOTS],
+    /// Currently active slot index (0..8).
+    pub active_slot: usize,
+    /// Working directory for the session.
+    pub cwd: PathBuf,
 }
 
 /// What the panel shows.
@@ -238,6 +248,9 @@ impl AppState {
             anim_frame: 0,
             mascot: crate::ui::mascot::MascotKind::random(),
             pending_chord: None,
+            slots: Default::default(),
+            active_slot: 0,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -263,6 +276,13 @@ impl AppState {
             ClientEvent::Snapshot(snapshot) => {
                 self.connection = Connection::Connected;
                 self.meta = Some(snapshot.meta.clone());
+                self.record_slot(
+                    self.active_slot,
+                    &snapshot.meta,
+                    &snapshot.usage,
+                    snapshot.agents.len(),
+                    snapshot.tasks.len(),
+                );
                 self.transcript
                     .reset(snapshot.transcript.clone(), snapshot.has_more_history);
                 let header = crate::state::transcript::HeaderInfo {
@@ -323,295 +343,7 @@ impl AppState {
 
     /// Fold a daemon event (`ClientEvent::Event`) into transcript/rail/panel/toasts.
     pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) {
-        match event {
-            Event::SessionUpdated(meta) => {
-                let mut prefs = pacode_config::load_prefs(&self.paths);
-                prefs.model = Some(meta.model.to_string());
-                prefs.effort = Some(meta.effort);
-                prefs.mode = Some(meta.mode);
-                let _ = pacode_config::save_prefs(&self.paths, &prefs);
-                let header = crate::state::transcript::HeaderInfo {
-                    version: self.app_version.clone(),
-                    mascot: self.mascot,
-                };
-                self.transcript.set_header(header);
-                self.meta = Some(meta);
-            }
-            Event::TurnStarted { agent, turn: _ } => {
-                if agent.is_main() {
-                    self.turn_active = true;
-                    self.turn_started_at = Some(now);
-                    self.rail.update_idle(true, now);
-                }
-            }
-            Event::TurnEnded {
-                agent,
-                turn: _,
-                usage,
-                stop,
-            } => {
-                if let pacode_types::TurnStop::Failed { message } = &stop {
-                    self.push_toast(
-                        ToastLevel::Error,
-                        "turn failed".to_string(),
-                        Some(message.clone()),
-                        now,
-                    );
-                }
-                if agent.is_main() {
-                    self.transcript.flush_stream();
-                    if let Some(ref u) = usage
-                        && u.output_tokens > 0
-                    {
-                        let duration_ms = self
-                            .turn_started_at
-                            .map(|t| now.saturating_duration_since(t).as_millis() as u64)
-                            .unwrap_or_else(|| {
-                                let last_ts = self
-                                    .transcript
-                                    .cells
-                                    .iter()
-                                    .rev()
-                                    .find_map(|c| {
-                                        if matches!(
-                                            c.kind,
-                                            CellKind::Item(TranscriptKind::Assistant { .. })
-                                        ) {
-                                            Some(c.ts_ms)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(0);
-                                pacode_types::time::now_ms().saturating_sub(last_ts)
-                            });
-                        if let Some(stats) = compute_turn_stats(duration_ms, u) {
-                            attach_turn_stats(&mut self.transcript, stats);
-                        }
-                    }
-                    self.turn_active = false;
-                    self.turn_started_at = None;
-                    self.rail.update_idle(false, now);
-                } else {
-                    let is_panel_target = self.panel.target.as_ref().is_some_and(|t| match t {
-                        PanelTarget::Agent(id) => *id == agent,
-                        _ => false,
-                    });
-                    if is_panel_target {
-                        self.panel.agent_transcript.flush_stream();
-                        if let Some(ref u) = usage
-                            && u.output_tokens > 0
-                        {
-                            let last_ts = self
-                                .panel
-                                .agent_transcript
-                                .cells
-                                .iter()
-                                .rev()
-                                .find_map(|c| {
-                                    if matches!(
-                                        c.kind,
-                                        CellKind::Item(TranscriptKind::Assistant { .. })
-                                    ) {
-                                        Some(c.ts_ms)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(0);
-                            let duration_ms = pacode_types::time::now_ms().saturating_sub(last_ts);
-                            if let Some(stats) = compute_turn_stats(duration_ms, u) {
-                                attach_turn_stats(&mut self.panel.agent_transcript, stats);
-                            }
-                        }
-                    }
-                }
-            }
-            Event::ItemAdded(item) => {
-                if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
-                    let arg = title
-                        .strip_prefix(name.as_str())
-                        .map(str::trim_start)
-                        .unwrap_or_else(|| {
-                            title
-                                .split_once(' ')
-                                .map(|(_, r)| r.trim())
-                                .unwrap_or(title.as_str())
-                        });
-                    let input = serde_json::json!({ "path": arg });
-                    self.files.observe_tool_item(name, &input, item.ts_ms);
-                }
-                if item.agent.is_main() {
-                    self.transcript.upsert(item, now);
-                } else if let Focus::Panel {
-                    target: PanelTarget::Agent(ref id),
-                    ..
-                } = self.focus
-                    && *id == item.agent
-                {
-                    self.panel.agent_transcript.upsert(item, now);
-                }
-            }
-            Event::ItemUpdated(item) => {
-                if item.agent.is_main() {
-                    self.transcript.upsert(item, now);
-                } else if let Focus::Panel {
-                    target: PanelTarget::Agent(ref id),
-                    ..
-                } = self.focus
-                    && *id == item.agent
-                {
-                    self.panel.agent_transcript.upsert(item, now);
-                }
-            }
-            Event::TextDelta {
-                agent,
-                item_seq,
-                text,
-            } => {
-                if agent.is_main() {
-                    self.transcript.push_delta(item_seq, &text, false, now);
-                } else if let Focus::Panel {
-                    target: PanelTarget::Agent(ref id),
-                    ..
-                } = self.focus
-                    && *id == agent
-                {
-                    self.panel
-                        .agent_transcript
-                        .push_delta(item_seq, &text, false, now);
-                }
-            }
-            Event::ReasoningDelta {
-                agent,
-                item_seq,
-                text,
-            } => {
-                if agent.is_main() {
-                    self.transcript.push_delta(item_seq, &text, true, now);
-                } else if let Focus::Panel {
-                    target: PanelTarget::Agent(ref id),
-                    ..
-                } = self.focus
-                    && *id == agent
-                {
-                    self.panel
-                        .agent_transcript
-                        .push_delta(item_seq, &text, true, now);
-                }
-            }
-            Event::PermissionRequested(req) => {
-                let ts_ms = req.created_at_ms;
-                self.transcript.cells.push_back(Cell {
-                    id: seq,
-                    kind: CellKind::Item(TranscriptKind::Permission(req)),
-                    version: 0,
-                    ts_ms,
-                    stats: None,
-                });
-            }
-            Event::PermissionResolved {
-                permission,
-                decision,
-            } => {
-                for cell in &mut self.transcript.cells {
-                    if let CellKind::Item(TranscriptKind::Permission(ref req)) = cell.kind
-                        && req.id == permission
-                    {
-                        let (level, text) = match decision {
-                            PermissionDecision::AllowOnce => {
-                                (ToastLevel::Success, format!("Allowed: {}", req.title))
-                            }
-                            PermissionDecision::AllowSession => (
-                                ToastLevel::Success,
-                                format!("Allowed for session: {}", req.title),
-                            ),
-                            PermissionDecision::Deny => {
-                                (ToastLevel::Warn, format!("Denied: {}", req.title))
-                            }
-                        };
-                        cell.kind = CellKind::Item(TranscriptKind::Notice { level, text });
-                        cell.version = cell.version.wrapping_add(1);
-                        break;
-                    }
-                }
-            }
-            Event::PlanUpdated(plan) => {
-                self.rail.plan = plan;
-            }
-            Event::AgentAdded(info) => {
-                self.rail.upsert_agent(info);
-            }
-            Event::AgentUpdated(info) => {
-                if !info.status.is_live()
-                    && let Focus::Panel {
-                        target: PanelTarget::Agent(ref id),
-                        ref mut follow,
-                        ..
-                    } = self.focus
-                {
-                    if *id == info.id {
-                        *follow = false;
-                    } else if *follow {
-                        let title = format!("{} finished", info.name);
-                        self.push_toast(ToastLevel::Info, title, info.summary.clone(), now);
-                    }
-                }
-                self.rail.upsert_agent(info);
-            }
-            Event::TaskAdded(info) => {
-                self.rail.upsert_task(info);
-            }
-            Event::TaskUpdated(info) => {
-                if info.status.is_terminal()
-                    && let Focus::Panel { follow: true, .. } = self.focus
-                {
-                    let level = match info.status {
-                        TaskStatus::Failed => ToastLevel::Error,
-                        _ => ToastLevel::Success,
-                    };
-                    let duration =
-                        pacode_types::time::format_duration_ms(info.duration_ms(now_ms()));
-                    let title = format!(
-                        "{} {}",
-                        info.label,
-                        if info.status == TaskStatus::Failed {
-                            "failed"
-                        } else {
-                            "completed"
-                        }
-                    );
-                    self.push_toast(level, title, Some(duration), now);
-                }
-                self.rail.upsert_task(info);
-            }
-            Event::UsageUpdated(usage) => {
-                self.rail.usage = usage;
-            }
-            Event::Toast {
-                level,
-                title,
-                detail,
-            } => {
-                self.push_toast(level, title, detail, now);
-            }
-            Event::DaemonShuttingDown => {
-                self.connection = Connection::Disconnected {
-                    reason: "Daemon shutting down".into(),
-                };
-            }
-            Event::PluginToast { plugin, text } => {
-                self.push_toast(pacode_types::ToastLevel::Info, text, Some(plugin), now);
-            }
-            Event::PluginStatus { plugin, text } => {
-                if text.is_empty() {
-                    self.plugin_status = None;
-                } else {
-                    self.plugin_status = Some((plugin, text));
-                }
-            }
-        }
-        self.rail.update_idle(self.turn_active, now);
+        events::apply_event(self, seq, event, now);
     }
 
     pub fn push_toast(
@@ -755,23 +487,70 @@ impl AppState {
             false
         }
     }
-}
 
-fn compute_turn_stats(duration_ms: u64, usage: &pacode_types::stream::Usage) -> Option<String> {
-    if usage.output_tokens == 0 {
-        return None;
+    pub fn cwd(&self) -> PathBuf {
+        self.meta
+            .as_ref()
+            .map(|m| m.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone())
     }
-    Some(stats::stats_line(duration_ms))
-}
 
-fn attach_turn_stats(transcript: &mut Transcript, stats_str: String) {
-    if let Some(cell) = transcript
-        .cells
-        .iter_mut()
-        .rev()
-        .find(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Assistant { .. })))
-    {
-        cell.stats = Some(stats_str);
-        cell.version = cell.version.wrapping_add(1);
+    pub fn can_load_history(&self) -> bool {
+        self.transcript.has_more_history && !self.transcript.loading_history
+    }
+
+    pub fn record_slot(
+        &mut self,
+        index: usize,
+        meta: &SessionMeta,
+        usage: &pacode_types::state::UsageTotals,
+        agents_count: usize,
+        tasks_count: usize,
+    ) {
+        if index < NUM_SLOTS {
+            self.slots[index] = Some(SessionSlot {
+                id: meta.id.clone(),
+                title: meta.title(),
+                turns: usage.turns,
+                context_tokens: usage.context_tokens,
+                agents_count,
+                tasks_count,
+            });
+        }
+    }
+
+    pub fn leave_active_slot(&mut self) {
+        let current = self.active_slot;
+        if let Some(meta) = &self.meta {
+            self.slots[current] = Some(SessionSlot {
+                id: meta.id.clone(),
+                title: meta.title(),
+                turns: self.rail.usage.turns,
+                context_tokens: self.rail.usage.context_tokens,
+                agents_count: self.rail.agents.len(),
+                tasks_count: self.rail.tasks.len(),
+            });
+        }
+        self.transcript.cells.clear();
+        self.transcript.cache.clear();
+        self.transcript.stream = None;
+        self.transcript.live_cell = None;
+        self.transcript.pending_final = None;
+        self.transcript.scroll_from_bottom = 0;
+        self.transcript.has_more_history = false;
+        self.transcript.loading_history = false;
+
+        self.panel.agent_transcript.cells.clear();
+        self.panel.agent_transcript.cache.clear();
+        self.panel.task_lines.clear();
+        self.panel.task_total_lines = 0;
+        self.panel.target = None;
+
+        self.focus = Focus::Normal;
+        self.meta = None;
+        self.rail.agents.clear();
+        self.rail.tasks.clear();
+        self.rail.plan = pacode_types::state::Plan::default();
+        self.rail.usage = pacode_types::state::UsageTotals::default();
     }
 }

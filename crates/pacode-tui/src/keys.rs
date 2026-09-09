@@ -2,13 +2,12 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pacode_types::state::PermissionDecision;
-use pacode_types::{AgentId, PermissionRequest, Request, TranscriptKind};
+use pacode_types::{PermissionRequest, Request, TranscriptKind};
 
 use crate::binding::Action as KeyAction;
 use crate::commands;
-use crate::layout::ScreenLayout;
 use crate::state::transcript::CellKind;
 use crate::state::{AppState, Focus, Overlay, PanelTarget};
 
@@ -28,6 +27,7 @@ pub enum Action {
 }
 
 pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Action> {
+    let was_dirty = state.dirty;
     state.dirty = true;
 
     // Dismiss remote clipboard hint popup on any key.
@@ -158,6 +158,44 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return handle_follow(state);
     }
 
+    // 5.1 Direct agent selection: alt+1..9
+    if let Some(agent_idx) = match action {
+        Some(KeyAction::SelectAgent1) => Some(0),
+        Some(KeyAction::SelectAgent2) => Some(1),
+        Some(KeyAction::SelectAgent3) => Some(2),
+        Some(KeyAction::SelectAgent4) => Some(3),
+        Some(KeyAction::SelectAgent5) => Some(4),
+        Some(KeyAction::SelectAgent6) => Some(5),
+        Some(KeyAction::SelectAgent7) => Some(6),
+        Some(KeyAction::SelectAgent8) => Some(7),
+        Some(KeyAction::SelectAgent9) => Some(8),
+        _ => None,
+    } {
+        let agents = selectable_agents(state);
+        if let Some(id) = agents.get(agent_idx).cloned() {
+            return select_agent_by_id(state, &id);
+        } else {
+            state.dirty = was_dirty;
+            return vec![];
+        }
+    }
+
+    // 5.2 Direct session slot switching: ctrl+alt+1..9
+    if let Some(slot_idx) = match action {
+        Some(KeyAction::SelectSession1) => Some(0),
+        Some(KeyAction::SelectSession2) => Some(1),
+        Some(KeyAction::SelectSession3) => Some(2),
+        Some(KeyAction::SelectSession4) => Some(3),
+        Some(KeyAction::SelectSession5) => Some(4),
+        Some(KeyAction::SelectSession6) => Some(5),
+        Some(KeyAction::SelectSession7) => Some(6),
+        Some(KeyAction::SelectSession8) => Some(7),
+        Some(KeyAction::SelectSession9) => Some(8),
+        _ => None,
+    } {
+        return switch_to_session_slot(state, slot_idx);
+    }
+
     // 5.5 Files overlay: alt+b
     if action == Some(KeyAction::FilesOverlay) {
         state.focus = Focus::Overlay(Overlay::Files { index: 0 });
@@ -254,19 +292,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         match &state.focus {
             Focus::SelectAgent { index } => {
                 let agents = selectable_agents(state);
-                if let Some(id) = agents.get(*index) {
-                    if id.is_main() {
-                        state.focus = Focus::Normal;
-                        state.panel.target = None;
-                        return vec![];
-                    }
-                    state.focus = Focus::Panel {
-                        target: PanelTarget::Agent(id.clone()),
-                        follow: false,
-                        follow_paused: false,
-                    };
-                    state.panel.target = Some(PanelTarget::Agent(id.clone()));
-                    return vec![Action::LoadPanel];
+                if let Some(id) = agents.get(*index).cloned() {
+                    return select_agent_by_id(state, &id);
                 }
             }
             Focus::BgList { index } => {
@@ -391,21 +418,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     vec![]
 }
 
-/// Returns all rail agents including main, in the order the rail displays them (main first).
-pub fn selectable_agents(state: &AppState) -> Vec<AgentId> {
-    let mut list = Vec::new();
-    if let Some(main) = state.rail.agents.iter().find(|a| a.id.is_main()) {
-        list.push(main.id.clone());
-    } else if !state.rail.agents.is_empty() {
-        list.push(AgentId::main());
-    }
-    for agent in &state.rail.agents {
-        if !agent.id.is_main() {
-            list.push(agent.id.clone());
-        }
-    }
-    list
-}
+pub use crate::nav::{
+    handle_esc, handle_follow, handle_navigate_down, handle_navigate_up, select_agent_at_index,
+    select_agent_by_id, selectable_agents, switch_to_session_slot,
+};
 
 fn submit_prompt(state: &mut AppState) -> Vec<Action> {
     if !state.input.is_empty() {
@@ -414,174 +430,6 @@ fn submit_prompt(state: &mut AppState) -> Vec<Action> {
             return commands::execute(state, &text);
         }
         return vec![Action::Send(Request::UserMessage { text })];
-    }
-    vec![]
-}
-
-fn handle_esc(state: &mut AppState) -> Vec<Action> {
-    state.selection.clear();
-    match state.focus {
-        Focus::Panel {
-            follow: true,
-            ref target,
-            ..
-        } => {
-            state.focus = Focus::Panel {
-                target: target.clone(),
-                follow: false,
-                follow_paused: false,
-            };
-        }
-        Focus::Panel { .. } => {
-            state.focus = Focus::Normal;
-            state.panel.target = None;
-        }
-        Focus::SelectAgent { .. } => {
-            state.focus = Focus::Normal;
-        }
-        Focus::BgList { .. } => {
-            state.focus = Focus::Normal;
-        }
-        Focus::Overlay(_) => {
-            state.focus = Focus::Normal;
-        }
-        Focus::Normal => {}
-    }
-    vec![]
-}
-
-fn handle_follow(state: &mut AppState) -> Vec<Action> {
-    match &state.focus {
-        Focus::SelectAgent { index } => {
-            let agents = selectable_agents(state);
-            if let Some(id) = agents.get(*index) {
-                if id.is_main() {
-                    state.focus = Focus::Normal;
-                    state.panel.target = None;
-                    return vec![];
-                }
-                state.focus = Focus::Panel {
-                    target: PanelTarget::Agent(id.clone()),
-                    follow: true,
-                    follow_paused: false,
-                };
-                state.panel.target = Some(PanelTarget::Agent(id.clone()));
-                return vec![Action::LoadPanel];
-            }
-        }
-        Focus::Panel {
-            target: PanelTarget::Agent(id),
-            ..
-        } if id.is_main() => {
-            state.focus = Focus::Normal;
-            state.panel.target = None;
-        }
-        Focus::Panel {
-            target: PanelTarget::Agent(id),
-            follow,
-            follow_paused,
-        } => {
-            let new_follow = if *follow && *follow_paused {
-                true // unpause
-            } else {
-                !follow
-            };
-            state.focus = Focus::Panel {
-                target: PanelTarget::Agent(id.clone()),
-                follow: new_follow,
-                follow_paused: false,
-            };
-        }
-        Focus::Panel {
-            target: PanelTarget::Task(_),
-            ..
-        }
-        | Focus::Normal
-        | Focus::BgList { .. }
-        | Focus::Overlay(_) => {}
-    }
-    vec![]
-}
-
-fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
-    let agents = selectable_agents(state);
-    match &mut state.focus {
-        Focus::SelectAgent { index } => {
-            if !agents.is_empty() {
-                *index = (*index + 1) % agents.len();
-            }
-        }
-        Focus::BgList { index } => {
-            let count = state.rail.tasks.len();
-            if count > 0 && *index + 1 < count {
-                *index += 1;
-            }
-        }
-        Focus::Overlay(Overlay::ModelPicker { index, .. })
-        | Focus::Overlay(Overlay::EffortPicker { index })
-        | Focus::Overlay(Overlay::SessionPicker { index, .. }) => {
-            *index += 1;
-        }
-        Focus::Normal
-        | Focus::Panel { .. }
-        | Focus::Overlay(
-            Overlay::Files { .. }
-            | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker { .. }
-            | Overlay::McpPicker { .. }
-            | Overlay::PluginsPicker { .. }
-            | Overlay::Import(_)
-            | Overlay::RailOverlay
-            | Overlay::Help
-            | Overlay::ThemePicker { .. }
-            | Overlay::KeysPicker { .. },
-        ) => {
-            // Anywhere -> select first agent
-            if !agents.is_empty() {
-                state.focus = Focus::SelectAgent { index: 0 };
-            }
-        }
-    }
-    vec![]
-}
-
-fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
-    let agents = selectable_agents(state);
-    match &mut state.focus {
-        Focus::SelectAgent { index } => {
-            if !agents.is_empty() {
-                *index = (*index + agents.len() - 1) % agents.len();
-            }
-        }
-        Focus::BgList { index } => {
-            if *index > 0 {
-                *index -= 1;
-            }
-        }
-        Focus::Overlay(Overlay::ModelPicker { index, .. })
-        | Focus::Overlay(Overlay::EffortPicker { index })
-        | Focus::Overlay(Overlay::SessionPicker { index, .. })
-            if *index > 0 =>
-        {
-            *index -= 1;
-        }
-        Focus::Normal
-        | Focus::Panel { .. }
-        | Focus::Overlay(
-            Overlay::ModelPicker { .. }
-            | Overlay::EffortPicker { .. }
-            | Overlay::SessionPicker { .. }
-            | Overlay::Files { .. }
-            | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker { .. }
-            | Overlay::McpPicker { .. }
-            | Overlay::PluginsPicker { .. }
-            | Overlay::Import(_)
-            | Overlay::RailOverlay
-            | Overlay::Help
-            | Overlay::ThemePicker { .. }
-            | Overlay::KeysPicker { .. },
-        ) => {}
     }
     vec![]
 }
@@ -621,7 +469,25 @@ fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::StopAgent
             | KeyAction::KillTask
             | KeyAction::CycleMode
-            | KeyAction::CopySelection => {}
+            | KeyAction::CopySelection
+            | KeyAction::SelectAgent1
+            | KeyAction::SelectAgent2
+            | KeyAction::SelectAgent3
+            | KeyAction::SelectAgent4
+            | KeyAction::SelectAgent5
+            | KeyAction::SelectAgent6
+            | KeyAction::SelectAgent7
+            | KeyAction::SelectAgent8
+            | KeyAction::SelectAgent9
+            | KeyAction::SelectSession1
+            | KeyAction::SelectSession2
+            | KeyAction::SelectSession3
+            | KeyAction::SelectSession4
+            | KeyAction::SelectSession5
+            | KeyAction::SelectSession6
+            | KeyAction::SelectSession7
+            | KeyAction::SelectSession8
+            | KeyAction::SelectSession9 => {}
         }
     } else {
         match action {
@@ -642,7 +508,32 @@ fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::StopAgent
             | KeyAction::KillTask
             | KeyAction::CycleMode
-            | KeyAction::CopySelection => {}
+            | KeyAction::CopySelection
+            | KeyAction::SelectAgent1
+            | KeyAction::SelectAgent2
+            | KeyAction::SelectAgent3
+            | KeyAction::SelectAgent4
+            | KeyAction::SelectAgent5
+            | KeyAction::SelectAgent6
+            | KeyAction::SelectAgent7
+            | KeyAction::SelectAgent8
+            | KeyAction::SelectAgent9
+            | KeyAction::SelectSession1
+            | KeyAction::SelectSession2
+            | KeyAction::SelectSession3
+            | KeyAction::SelectSession4
+            | KeyAction::SelectSession5
+            | KeyAction::SelectSession6
+            | KeyAction::SelectSession7
+            | KeyAction::SelectSession8
+            | KeyAction::SelectSession9 => {}
+        }
+        if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
+            && state.transcript.is_at_top(1000, 25)
+            && state.can_load_history()
+        {
+            state.transcript.loading_history = true;
+            return vec![Action::LoadHistory];
         }
     }
     vec![]
@@ -658,84 +549,7 @@ fn find_pending_permission(state: &AppState) -> Option<PermissionRequest> {
     })
 }
 
-pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayout) -> Vec<Action> {
-    state.dirty = true;
-    let col = mouse.column;
-    let row = mouse.row;
-
-    // Shift+drag is left to the terminal (mouse capture already grabs plain drag).
-    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-        return vec![];
-    }
-
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            state.selection.clear();
-            if layout.dialog.contains((col, row).into()) {
-                state.selection.start(col, row, layout.dialog);
-            }
-            return vec![];
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if state.selection.dragging {
-                state.selection.drag(col, row, layout.dialog);
-            }
-            return vec![];
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            if state.selection.dragging {
-                state.selection.finish();
-            }
-            return vec![];
-        }
-        MouseEventKind::ScrollDown => {
-            let delta = -3;
-            if layout.dialog.contains((col, row).into()) {
-                state
-                    .transcript
-                    .scroll_by(delta, 1000, layout.dialog.height as usize);
-            } else if layout.input.contains((col, row).into()) {
-                let max_scroll = state
-                    .input
-                    .wrap_lines(layout.input.width)
-                    .len()
-                    .saturating_sub(layout.input.height as usize);
-                state.input.input_scroll = (state.input.input_scroll + 1).min(max_scroll);
-            } else if let Some(panel) = layout.panel {
-                if panel.contains((col, row).into()) {
-                    state
-                        .panel
-                        .agent_transcript
-                        .scroll_by(delta, 1000, panel.height as usize);
-                }
-            } else if layout.rail.contains((col, row).into()) {
-                handle_navigate_down(state);
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            let delta = 3;
-            if layout.dialog.contains((col, row).into()) {
-                state
-                    .transcript
-                    .scroll_by(delta, 1000, layout.dialog.height as usize);
-            } else if layout.input.contains((col, row).into()) {
-                state.input.input_scroll = state.input.input_scroll.saturating_sub(1);
-            } else if let Some(panel) = layout.panel {
-                if panel.contains((col, row).into()) {
-                    state
-                        .panel
-                        .agent_transcript
-                        .scroll_by(delta, 1000, panel.height as usize);
-                }
-            } else if layout.rail.contains((col, row).into()) {
-                handle_navigate_up(state);
-            }
-        }
-        _ => return vec![],
-    }
-
-    vec![]
-}
+pub use crate::mouse::handle_mouse;
 
 /// Map a Cyrillic (ЙЦУКЕН) letter pressed with CONTROL to the Latin letter on the same
 /// key, so `ctrl+в` acts as `ctrl+d`. Legacy terminals already send the control byte;

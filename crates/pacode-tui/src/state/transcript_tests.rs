@@ -295,3 +295,79 @@ fn test_turn_ended_zero_tokens_no_stats() {
 
     assert_eq!(state.transcript.cells[0].stats, None);
 }
+
+#[test]
+fn test_reset_keeps_the_daemon_page_whole() {
+    let mut t = Transcript::new(500);
+    let items: Vec<TranscriptItem> = (0..150)
+        .map(|i| TranscriptItem {
+            seq: i,
+            agent: AgentId::main(),
+            ts_ms: i * 10,
+            kind: TranscriptKind::User {
+                text: format!("msg {i}"),
+            },
+        })
+        .collect();
+
+    // The daemon bounds the page it sends and says whether anything older exists;
+    // the client keeps that page whole rather than capping it again.
+    t.reset(items, false);
+    assert_eq!(t.cells.len(), 150);
+    assert!(!t.has_more_history);
+    assert_eq!(t.cells.front().map(|c| c.id), Some(0));
+    assert_eq!(t.cells.back().map(|c| c.id), Some(149));
+}
+
+#[test]
+fn test_lazy_loader_prepend_keeps_anchored_cell_position() {
+    let mut t = Transcript::new(500);
+    let initial_items: Vec<TranscriptItem> = (10..30)
+        .map(|i| TranscriptItem {
+            seq: i,
+            agent: AgentId::main(),
+            ts_ms: i * 10,
+            kind: TranscriptKind::User {
+                text: format!("msg {i}"),
+            },
+        })
+        .collect();
+
+    t.reset(initial_items, true);
+    let viewport = 10;
+    // Scroll to the top (max_scroll = 20 - 10 = 10)
+    t.scroll_by(100, 20, viewport);
+    assert_eq!(t.scroll_from_bottom, 10);
+
+    // Anchor cell is cell id 10 at the top of the viewport
+    let anchor_id = 10;
+    let pos_before = t.cell_screen_position(anchor_id, viewport);
+    assert_eq!(pos_before, Some(0));
+
+    // Also check another cell in the viewport (cell 15 at screen line 5)
+    let mid_id = 15;
+    let pos_mid_before = t.cell_screen_position(mid_id, viewport);
+    assert_eq!(pos_mid_before, Some(5));
+
+    // Prepend 10 older items (ids 0..10)
+    let older: Vec<TranscriptItem> = (0..10)
+        .map(|i| TranscriptItem {
+            seq: i,
+            agent: AgentId::main(),
+            ts_ms: i * 10,
+            kind: TranscriptKind::User {
+                text: format!("msg {i}"),
+            },
+        })
+        .collect();
+    t.prepend(older, false);
+
+    // The anchored cells must remain at the exact same screen position
+    let pos_after = t.cell_screen_position(anchor_id, viewport);
+    assert_eq!(pos_after, pos_before);
+    assert_eq!(pos_after, Some(0));
+
+    let pos_mid_after = t.cell_screen_position(mid_id, viewport);
+    assert_eq!(pos_mid_after, pos_mid_before);
+    assert_eq!(pos_mid_after, Some(5));
+}

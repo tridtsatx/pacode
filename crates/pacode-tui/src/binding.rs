@@ -30,6 +30,24 @@ pub enum Action {
     KillTask,
     CycleMode,
     CopySelection,
+    SelectAgent1,
+    SelectAgent2,
+    SelectAgent3,
+    SelectAgent4,
+    SelectAgent5,
+    SelectAgent6,
+    SelectAgent7,
+    SelectAgent8,
+    SelectAgent9,
+    SelectSession1,
+    SelectSession2,
+    SelectSession3,
+    SelectSession4,
+    SelectSession5,
+    SelectSession6,
+    SelectSession7,
+    SelectSession8,
+    SelectSession9,
 }
 
 impl Action {
@@ -54,6 +72,24 @@ impl Action {
             Self::KillTask => "kill_task",
             Self::CycleMode => "cycle_mode",
             Self::CopySelection => "copy_selection",
+            Self::SelectAgent1 => "select_agent_1",
+            Self::SelectAgent2 => "select_agent_2",
+            Self::SelectAgent3 => "select_agent_3",
+            Self::SelectAgent4 => "select_agent_4",
+            Self::SelectAgent5 => "select_agent_5",
+            Self::SelectAgent6 => "select_agent_6",
+            Self::SelectAgent7 => "select_agent_7",
+            Self::SelectAgent8 => "select_agent_8",
+            Self::SelectAgent9 => "select_agent_9",
+            Self::SelectSession1 => "select_session_1",
+            Self::SelectSession2 => "select_session_2",
+            Self::SelectSession3 => "select_session_3",
+            Self::SelectSession4 => "select_session_4",
+            Self::SelectSession5 => "select_session_5",
+            Self::SelectSession6 => "select_session_6",
+            Self::SelectSession7 => "select_session_7",
+            Self::SelectSession8 => "select_session_8",
+            Self::SelectSession9 => "select_session_9",
         }
     }
 
@@ -78,6 +114,24 @@ impl Action {
             Self::KillTask => "Kill background task",
             Self::CycleMode => "Cycle permission mode",
             Self::CopySelection => "Copy selected text",
+            Self::SelectAgent1 => "Select agent 1 (main)",
+            Self::SelectAgent2 => "Select agent 2",
+            Self::SelectAgent3 => "Select agent 3",
+            Self::SelectAgent4 => "Select agent 4",
+            Self::SelectAgent5 => "Select agent 5",
+            Self::SelectAgent6 => "Select agent 6",
+            Self::SelectAgent7 => "Select agent 7",
+            Self::SelectAgent8 => "Select agent 8",
+            Self::SelectAgent9 => "Select agent 9",
+            Self::SelectSession1 => "Select session slot 1",
+            Self::SelectSession2 => "Select session slot 2",
+            Self::SelectSession3 => "Select session slot 3",
+            Self::SelectSession4 => "Select session slot 4",
+            Self::SelectSession5 => "Select session slot 5",
+            Self::SelectSession6 => "Select session slot 6",
+            Self::SelectSession7 => "Select session slot 7",
+            Self::SelectSession8 => "Select session slot 8",
+            Self::SelectSession9 => "Select session slot 9",
         }
     }
 }
@@ -282,6 +336,24 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("kill_task", Action::KillTask),
     ("cycle_mode", Action::CycleMode),
     ("copy_selection", Action::CopySelection),
+    ("select_agent_1", Action::SelectAgent1),
+    ("select_agent_2", Action::SelectAgent2),
+    ("select_agent_3", Action::SelectAgent3),
+    ("select_agent_4", Action::SelectAgent4),
+    ("select_agent_5", Action::SelectAgent5),
+    ("select_agent_6", Action::SelectAgent6),
+    ("select_agent_7", Action::SelectAgent7),
+    ("select_agent_8", Action::SelectAgent8),
+    ("select_agent_9", Action::SelectAgent9),
+    ("select_session_1", Action::SelectSession1),
+    ("select_session_2", Action::SelectSession2),
+    ("select_session_3", Action::SelectSession3),
+    ("select_session_4", Action::SelectSession4),
+    ("select_session_5", Action::SelectSession5),
+    ("select_session_6", Action::SelectSession6),
+    ("select_session_7", Action::SelectSession7),
+    ("select_session_8", Action::SelectSession8),
+    ("select_session_9", Action::SelectSession9),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -445,6 +517,47 @@ impl Keymap {
                 mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             }],
         );
+        let digits = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
+        let agent_actions = [
+            Action::SelectAgent1,
+            Action::SelectAgent2,
+            Action::SelectAgent3,
+            Action::SelectAgent4,
+            Action::SelectAgent5,
+            Action::SelectAgent6,
+            Action::SelectAgent7,
+            Action::SelectAgent8,
+            Action::SelectAgent9,
+        ];
+        for (ch, act) in digits.iter().zip(agent_actions.iter()) {
+            bindings.insert(
+                *act,
+                vec![Binding {
+                    code: KeyCode::Char(*ch),
+                    mods: KeyModifiers::ALT,
+                }],
+            );
+        }
+        let session_actions = [
+            Action::SelectSession1,
+            Action::SelectSession2,
+            Action::SelectSession3,
+            Action::SelectSession4,
+            Action::SelectSession5,
+            Action::SelectSession6,
+            Action::SelectSession7,
+            Action::SelectSession8,
+            Action::SelectSession9,
+        ];
+        for (ch, act) in digits.iter().zip(session_actions.iter()) {
+            bindings.insert(
+                *act,
+                vec![Binding {
+                    code: KeyCode::Char(*ch),
+                    mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
+                }],
+            );
+        }
 
         Self {
             bindings,

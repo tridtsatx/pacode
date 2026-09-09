@@ -420,3 +420,36 @@ fn test_unrepresentable_key_rejected() {
     let toast = state.toasts.back().unwrap();
     assert_eq!(toast.level, ToastLevel::Warn);
 }
+
+#[test]
+fn test_keys_overlay_scrolling_keeps_selected_visible() {
+    let (state, _tmp) = setup_state_with_keys_picker();
+    // Use a small terminal height so the action list (36 items) is much taller than the overlay
+    let backend = TestBackend::new(80, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let opts = RenderOptions::new(80, false);
+
+    // Select an item near the bottom, e.g. index 30 (SelectSession5)
+    let selected_idx = 30;
+    terminal
+        .draw(|f| {
+            super::draw(f, f.area(), selected_idx, false, &state, &opts);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let text: String = buffer
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Selected item's description must be rendered and visible
+    let selected_action = Keymap::action_names()[selected_idx].1;
+    assert!(text.contains(selected_action.description()));
+
+    // The first item (follow_agent) should have scrolled off screen
+    let first_action = Keymap::action_names()[0].1;
+    assert!(!text.contains(first_action.description()));
+}

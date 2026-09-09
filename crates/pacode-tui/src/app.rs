@@ -59,6 +59,15 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         size.height,
     );
     state.paths = client_paths;
+    state.cwd = opts.cwd.clone();
+    state.slots[0] = Some(crate::state::SessionSlot {
+        id: snapshot.meta.id.clone(),
+        title: snapshot.meta.title(),
+        turns: snapshot.usage.turns,
+        context_tokens: snapshot.usage.context_tokens,
+        agents_count: snapshot.agents.len(),
+        tasks_count: snapshot.tasks.len(),
+    });
     state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
 
     let font_outcome = term_guard.apply_font(&opts.config.font);
@@ -352,14 +361,15 @@ fn dispatch_action(
         Action::LoadHistory => {
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
-            let first_cell_id = state.transcript.cells.front().map(|c| c.id);
+            let first_cell_id = state.transcript.oldest_seq();
+            let limit = state.config.session.history_page;
             state.transcript.loading_history = true;
             tokio::spawn(async move {
                 let res = cl
                     .request(Request::GetHistory {
                         agent: AgentId::main(),
                         before_seq: first_cell_id,
-                        limit: 100,
+                        limit,
                     })
                     .await;
                 let _ = tx.send(BgResponse::LoadHistoryReply { result: res });
@@ -438,6 +448,32 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             }
             PluginCommandOutcome::Nothing => vec![],
         },
+        BgResponse::Reply(Ok(Reply::Attached(snapshot))) => {
+            let slot_idx = state.active_slot;
+            state.record_slot(
+                slot_idx,
+                &snapshot.meta,
+                &snapshot.usage,
+                snapshot.agents.len(),
+                snapshot.tasks.len(),
+            );
+            state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::Reply(Ok(Reply::Snapshot(snapshot))) => {
+            let slot_idx = state.active_slot;
+            state.record_slot(
+                slot_idx,
+                &snapshot.meta,
+                &snapshot.usage,
+                snapshot.agents.len(),
+                snapshot.tasks.len(),
+            );
+            state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+            state.dirty = true;
+            vec![]
+        }
         BgResponse::Reply(Ok(_)) => vec![],
         BgResponse::Reply(Err(err)) => {
             let now = now_ms();

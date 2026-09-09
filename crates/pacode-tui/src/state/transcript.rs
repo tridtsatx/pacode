@@ -84,13 +84,17 @@ impl Transcript {
         self.live_cell = None;
         self.pending_final = None;
         self.scroll_from_bottom = 0;
-        self.has_more_history = has_more;
         self.loading_history = false;
 
-        for item in items {
+        // The daemon already bounds what it sends to `session.history_page` items and
+        // reports whether anything older exists, so the client keeps the page whole
+        // instead of capping it a second time with a number of its own.
+        self.has_more_history = has_more;
+
+        for item in &items {
             let cell = Cell {
                 id: item.seq,
-                kind: CellKind::Item(item.kind),
+                kind: CellKind::Item(item.kind.clone()),
                 version: 0,
                 ts_ms: item.ts_ms,
                 stats: None,
@@ -105,8 +109,6 @@ impl Transcript {
         self.has_more_history = has_more;
         self.loading_history = false;
 
-        let insert_idx = 0;
-
         for item in items.into_iter().rev() {
             let cell = Cell {
                 id: item.seq,
@@ -115,7 +117,7 @@ impl Transcript {
                 ts_ms: item.ts_ms,
                 stats: None,
             };
-            self.cells.insert(insert_idx, cell);
+            self.cells.push_front(cell);
         }
         self.enforce_cap();
     }
@@ -379,6 +381,33 @@ impl Transcript {
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_from_bottom = 0;
+    }
+
+    pub fn oldest_seq(&self) -> Option<u64> {
+        self.cells.front().map(|c| c.id)
+    }
+
+    pub fn is_at_top(&self, total_lines: usize, viewport: usize) -> bool {
+        let max_scroll = total_lines.saturating_sub(viewport);
+        self.scroll_from_bottom >= max_scroll
+    }
+
+    /// Screen position (0-based line offset from the top of the viewport) for a cell.
+    /// Returns `None` if the cell is not currently within the visible viewport.
+    pub fn cell_screen_position(&self, cell_id: u64, viewport: usize) -> Option<usize> {
+        let cell_idx = self.cells.iter().position(|c| c.id == cell_id)?;
+        let total = self.cells.len();
+        if total == 0 || viewport == 0 {
+            return None;
+        }
+        let max_scroll = total.saturating_sub(viewport);
+        let scroll = self.scroll_from_bottom.min(max_scroll);
+        let start = max_scroll.saturating_sub(scroll);
+        if cell_idx >= start && cell_idx < start + viewport {
+            Some(cell_idx - start)
+        } else {
+            None
+        }
     }
 
     /// Evict oldest cells past `max_cells` (keeping the live cell and pinned header), dropping their cache.

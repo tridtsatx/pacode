@@ -93,6 +93,35 @@ fn test_parse_binding_valid() {
             mods: KeyModifiers::SUPER,
         }
     );
+    // Digits: alt+1..9 and ctrl+alt+1..9
+    assert_eq!(
+        parse_binding("alt+1").unwrap(),
+        Binding {
+            code: KeyCode::Char('1'),
+            mods: KeyModifiers::ALT,
+        }
+    );
+    assert_eq!(
+        parse_binding("alt+9").unwrap(),
+        Binding {
+            code: KeyCode::Char('9'),
+            mods: KeyModifiers::ALT,
+        }
+    );
+    assert_eq!(
+        parse_binding("ctrl+alt+1").unwrap(),
+        Binding {
+            code: KeyCode::Char('1'),
+            mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
+        }
+    );
+    assert_eq!(
+        parse_binding("ctrl+alt+9").unwrap(),
+        Binding {
+            code: KeyCode::Char('9'),
+            mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
+        }
+    );
 }
 
 #[test]
@@ -433,4 +462,25 @@ fn test_keymap_action_for() {
         keymap.action_for(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
         None
     );
+}
+
+#[test]
+fn test_rebind_select_agent_2_takes_effect() {
+    let mut cfg = KeysConfig::default();
+    cfg.bindings
+        .insert("select_agent_2".to_string(), "ctrl+shift+2".to_string());
+    let (keymap, warnings) = Keymap::from_config(&cfg);
+    assert!(warnings.is_empty());
+    assert!(keymap.is_overridden(Action::SelectAgent2));
+
+    // New binding resolves to SelectAgent2
+    let new_key = KeyEvent::new(
+        KeyCode::Char('2'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert_eq!(keymap.action_for(new_key), Some(Action::SelectAgent2));
+
+    // Old default binding (alt+2) no longer resolves to SelectAgent2
+    let old_key = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT);
+    assert_ne!(keymap.action_for(old_key), Some(Action::SelectAgent2));
 }

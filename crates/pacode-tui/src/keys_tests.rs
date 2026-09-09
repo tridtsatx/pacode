@@ -1231,3 +1231,212 @@ fn test_ctrl_x_chord_discarded() {
     assert_eq!(state.input.cursor, 6);
     assert!(state.pending_chord.is_none());
 }
+
+#[test]
+fn test_select_agent_shortcuts() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Add a third agent so selectable_agents has 3 entries: main, agt_1, agt_2
+    let third_agent = AgentInfo {
+        id: AgentId::new("agt_2"),
+        name: "reviewer".into(),
+        kind: AgentKind::Sub,
+        status: AgentStatus::Thinking,
+        activity: None,
+        started_at_ms: 1500,
+        finished_at_ms: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: Some(AgentId::main()),
+        summary: None,
+        error: None,
+    };
+    state.rail.upsert_agent(third_agent);
+    let agents = selectable_agents(&state);
+    assert_eq!(agents.len(), 3);
+    assert_eq!(agents[0], AgentId::main());
+    assert_eq!(agents[2], AgentId::new("agt_2"));
+
+    // alt+3 selects the third entry of selectable_agents
+    let alt_3 = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_3, now);
+    assert_eq!(actions, vec![Action::LoadPanel]);
+    assert_eq!(
+        state.focus,
+        Focus::Panel {
+            target: PanelTarget::Agent(AgentId::new("agt_2")),
+            follow: false,
+            follow_paused: false,
+        }
+    );
+    assert_eq!(
+        state.panel.target,
+        Some(PanelTarget::Agent(AgentId::new("agt_2")))
+    );
+
+    // alt+1 selects main (back to Focus::Normal, panel target cleared)
+    let alt_1 = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_1, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, Focus::Normal);
+    assert_eq!(state.panel.target, None);
+
+    // alt+9 with only 2 agents does nothing at all (state unchanged, no toast pushed)
+    // Remove the 3rd agent so there are only 2 agents
+    state.rail.agents.retain(|a| a.id != AgentId::new("agt_2"));
+    assert_eq!(selectable_agents(&state).len(), 2);
+
+    state.dirty = false;
+    let focus_before = state.focus.clone();
+    let panel_before = state.panel.target.clone();
+    let toasts_len_before = state.toasts.len();
+
+    let alt_9 = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_9, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, focus_before);
+    assert_eq!(state.panel.target, panel_before);
+    assert_eq!(state.toasts.len(), toasts_len_before);
+    assert!(!state.dirty);
+}
+
+#[test]
+fn test_session_slot_switching() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.cwd = std::path::PathBuf::from("/test/cwd");
+
+    // Initially slot 1 is active (active_slot = 0)
+    assert_eq!(state.active_slot, 0);
+
+    // Switching to the already-active slot (ctrl+alt+1) emits nothing
+    let ctrl_alt_1 = KeyEvent::new(
+        KeyCode::Char('1'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let actions = handle_key(&mut state, ctrl_alt_1, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.active_slot, 0);
+
+    // Switching to an empty slot (ctrl+alt+2) emits Detach then a new-session attach, in that order
+    let ctrl_alt_2 = KeyEvent::new(
+        KeyCode::Char('2'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let actions = handle_key(&mut state, ctrl_alt_2, now);
+    assert_eq!(state.active_slot, 1);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Send(Request::Detach),
+            Action::Send(Request::Attach(pacode_types::Attach::New {
+                cwd: std::path::PathBuf::from("/test/cwd"),
+                model: None,
+                effort: None,
+                mode: None,
+            })),
+        ]
+    );
+
+    // Populate slot 3 with an occupied SessionSlot
+    let slot_3_session = pacode_types::SessionId::new("sess_occupied_3");
+    state.slots[2] = Some(crate::state::SessionSlot {
+        id: slot_3_session.clone(),
+        title: "Session 3".to_string(),
+        turns: 5,
+        context_tokens: 1200,
+        agents_count: 1,
+        tasks_count: 0,
+    });
+
+    // Switching to an occupied slot (ctrl+alt+3) emits Detach then Resume with the right id
+    let ctrl_alt_3 = KeyEvent::new(
+        KeyCode::Char('3'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let actions = handle_key(&mut state, ctrl_alt_3, now);
+    assert_eq!(state.active_slot, 2);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Send(Request::Detach),
+            Action::Send(Request::Attach(pacode_types::Attach::Resume {
+                session: slot_3_session,
+            })),
+        ]
+    );
+}
+
+#[test]
+fn test_leaving_slot_clears_transcript_cells() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Populate transcript with some cells
+    state.transcript.cells.push_back(crate::state::Cell {
+        id: 1,
+        kind: crate::state::CellKind::Item(pacode_types::TranscriptKind::User {
+            text: "test".into(),
+        }),
+        version: 0,
+        ts_ms: 100,
+        stats: None,
+    });
+    assert!(!state.transcript.cells.is_empty());
+
+    // Switch to slot 2
+    let ctrl_alt_2 = KeyEvent::new(
+        KeyCode::Char('2'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    handle_key(&mut state, ctrl_alt_2, now);
+
+    // Transcript cells must be cleared
+    assert!(state.transcript.cells.is_empty());
+}
+
+#[test]
+fn test_lazy_loader_scrolling() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Populate transcript with items
+    let items: Vec<pacode_types::TranscriptItem> = (10..30)
+        .map(|i| pacode_types::TranscriptItem {
+            seq: i,
+            agent: AgentId::main(),
+            ts_ms: i * 10,
+            kind: pacode_types::TranscriptKind::User {
+                text: format!("msg {i}"),
+            },
+        })
+        .collect();
+    state.transcript.reset(items, true);
+    assert!(state.transcript.has_more_history);
+    assert!(!state.transcript.loading_history);
+    assert_eq!(state.transcript.oldest_seq(), Some(10));
+
+    // Scroll to the top using ScrollTop (Home or key)
+    let home = KeyEvent::new(KeyCode::Home, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, home, now);
+
+    // Scrolling to the top requests the next page with the right before_seq
+    assert_eq!(actions, vec![Action::LoadHistory]);
+    assert!(state.transcript.loading_history);
+
+    // A second scroll while one is pending requests nothing
+    let actions_second = handle_key(&mut state, home, now);
+    assert!(actions_second.is_empty());
+
+    // Daemon reports no older history
+    state.transcript.prepend(vec![], false);
+    assert!(!state.transcript.loading_history);
+    assert!(!state.transcript.has_more_history);
+
+    // Once the daemon reports no older history, further scrolls request nothing
+    let actions_after = handle_key(&mut state, home, now);
+    assert!(actions_after.is_empty());
+}

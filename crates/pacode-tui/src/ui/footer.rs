@@ -28,6 +28,36 @@ pub fn format_tokens_upper(n: u64) -> String {
     }
 }
 
+pub fn format_slots_summary(state: &AppState) -> String {
+    let mut s = String::new();
+    for i in 0..9 {
+        let num = i + 1;
+        if i == state.active_slot {
+            s.push_str(&format!("[{num}]"));
+        } else if state.slots[i].is_some() {
+            s.push_str(&format!("{num}"));
+        } else {
+            s.push('·');
+        }
+    }
+    s
+}
+
+pub fn render_slots_spans(state: &AppState, opts: &RenderOptions) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(9);
+    for i in 0..9 {
+        let num = i + 1;
+        if i == state.active_slot {
+            spans.push(Span::styled(format!("[{num}]"), opts.theme.accent));
+        } else if state.slots[i].is_some() {
+            spans.push(Span::styled(format!("{num}"), opts.theme.fg));
+        } else {
+            spans.push(Span::styled("·", opts.theme.faint));
+        }
+    }
+    spans
+}
+
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOptions) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -288,7 +318,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                         };
 
                         let tok_str = format_tokens_upper(state.rail.usage.context_tokens as u64);
-                        let right_text = format!("{tok_str} · ctrl+p");
+                        let slots_str = format_slots_summary(state);
+                        let right_text = format!("{slots_str} · {tok_str} · ctrl+p");
                         let right_len = display_width(&right_text);
 
                         let perm_base =
@@ -414,15 +445,15 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
 
     let right_spans = if show_context {
         let tokens = state.rail.usage.context_tokens as u64;
-        if tokens == 0 {
-            vec![Span::styled("ctrl+p", opts.theme.faint)]
-        } else {
+        let mut spans = render_slots_spans(state, opts);
+        spans.push(Span::styled(" · ", opts.theme.faint));
+        if tokens > 0 {
             let tok_str = format_tokens_upper(tokens);
-            vec![
-                Span::styled(tok_str, opts.theme.faint),
-                Span::styled(" · ctrl+p", opts.theme.faint),
-            ]
+            spans.push(Span::styled(tok_str, opts.theme.faint));
+            spans.push(Span::styled(" · ", opts.theme.faint));
         }
+        spans.push(Span::styled("ctrl+p", opts.theme.faint));
+        spans
     } else {
         Vec::new()
     };

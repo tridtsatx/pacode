@@ -19,6 +19,8 @@ pub mod font;
 pub mod keys;
 pub mod keys_picker;
 pub mod layout;
+pub mod mouse;
+pub mod nav;
 pub mod state;
 pub mod terminal;
 pub mod ui;
