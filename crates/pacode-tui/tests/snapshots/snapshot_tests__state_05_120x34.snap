@@ -3,7 +3,7 @@ source: crates/pacode-tui/tests/snapshot_tests.rs
 expression: view
 ---
 "  ▄▄▀▀▀▀▀▀▄▄                                                                           │Refactor TUI layout             "
-"▄▀▀▀▀▀▀▀▀▀▀▀▀▄                                                                         │ses_abcdef123                   "
+"▄▀▀▀▀▀▀▀▀▀▀▀                                                                           │ses_abcdef123                   "
 "▀▀▀▀▀▀▀▀▀┌ Background Tasks ───────────────────────────────────────────────┐           │                                "
 "▀▀▀▀▀▀▀▀▀│▸ ✓ cargo build --release 3m02s                                  │           │PLAN                   1/4 · 40%"
 "▀▀▀▀▀▀▀▀▀│  ✗ npm run lint 100ms                                           │           │[✓] Read codebase & analyze arc…"
