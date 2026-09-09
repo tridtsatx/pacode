@@ -65,6 +65,9 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::Help => {
                 draw_help(frame, area, opts);
             }
+            Overlay::KeysPicker { index, capturing } => {
+                crate::ui::keys_overlay::draw(frame, area, *index, *capturing, state, opts);
+            }
             Overlay::ModelPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }

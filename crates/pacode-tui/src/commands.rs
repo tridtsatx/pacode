@@ -77,6 +77,18 @@ pub const COMMANDS: &[SlashCommand] = &[
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
+        name: Cow::Borrowed("keys"),
+        usage: Cow::Borrowed("/keys"),
+        help: Cow::Borrowed("customize keybindings"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
+        name: Cow::Borrowed("editor"),
+        usage: Cow::Borrowed("/editor"),
+        help: Cow::Borrowed("edit prompt in $EDITOR"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
         name: Cow::Borrowed("import"),
         usage: Cow::Borrowed("/import"),
         help: Cow::Borrowed("import MCP servers and skills"),
@@ -369,6 +381,18 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             state.dirty = true;
             vec![Action::Send(Request::ListPlugins)]
         }
+        "keys" => {
+            state.focus = Focus::Overlay(Overlay::KeysPicker {
+                index: 0,
+                capturing: false,
+            });
+            state.dirty = true;
+            vec![]
+        }
+        "editor" => {
+            crate::editor::open_editor(state);
+            vec![]
+        }
         "import" => {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
@@ -511,6 +535,12 @@ mod tests {
 
         let plugins = COMMANDS.iter().find(|c| c.name == "plugins").unwrap();
         assert_eq!(plugins.arg_hint, "");
+
+        let keys = COMMANDS.iter().find(|c| c.name == "keys").unwrap();
+        assert_eq!(keys.arg_hint, "");
+
+        let editor = COMMANDS.iter().find(|c| c.name == "editor").unwrap();
+        assert_eq!(editor.arg_hint, "");
 
         let import = COMMANDS.iter().find(|c| c.name == "import").unwrap();
         assert_eq!(import.arg_hint, "");

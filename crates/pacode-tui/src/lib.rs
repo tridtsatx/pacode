@@ -14,6 +14,7 @@ pub mod app;
 pub mod binding;
 pub mod clipboard;
 pub mod commands;
+pub mod editor;
 pub mod font;
 pub mod keys;
 pub mod keys_picker;

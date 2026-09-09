@@ -1208,3 +1208,26 @@ fn test_user_override_in_keys_config() {
     handle_key(&mut state, ctrl_g, now);
     assert!(matches!(state.focus, Focus::Panel { follow: true, .. }));
 }
+
+#[test]
+fn test_ctrl_x_chord_discarded() {
+    let mut state = make_test_state();
+    state.input.text = "hello".to_string();
+    state.input.cursor = 5;
+    let now = Instant::now();
+
+    // 1. Press ctrl+x: enters pending chord state, returns empty actions, prompt unchanged
+    let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_x, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "hello");
+    assert!(state.pending_chord.is_some());
+
+    // 2. Press 'z' (not ctrl+e): chord discarded, 'z' processed normally (inserted into prompt)
+    let char_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, char_z, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "helloz");
+    assert_eq!(state.input.cursor, 6);
+    assert!(state.pending_chord.is_none());
+}

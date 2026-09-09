@@ -10,6 +10,7 @@ pub mod footer;
 pub mod header;
 pub mod import;
 pub mod input;
+pub mod keys_overlay;
 pub mod mascot;
 pub mod mcp;
 pub mod overlays;

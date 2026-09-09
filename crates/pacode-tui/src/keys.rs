@@ -35,6 +35,22 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         .toasts
         .retain(|t| t.title != crate::ui::popup::POPUP_TOAST_TITLE);
 
+    // 1. ctrl+c / ctrl+d (Cyrillic layout letters are mapped to their Latin key).
+    let key = normalize_cyrillic_ctrl(key);
+
+    // Any key clears pending chord.
+    let pending = state.pending_chord.take();
+    if let Some(prev) = pending
+        && prev.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(prev.code, KeyCode::Char('x'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('e'))
+        && state.focus == Focus::Normal
+    {
+        crate::editor::open_editor(state);
+        return vec![];
+    }
+
     // ctrl+shift+c: copy current selection
     if state.keymap.action_for(key) == Some(KeyAction::CopySelection) {
         if state.selection.is_active() && !state.selection.is_empty() {
@@ -42,9 +58,6 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
         return vec![];
     }
-
-    // 1. ctrl+c / ctrl+d (Cyrillic layout letters are mapped to their Latin key).
-    let key = normalize_cyrillic_ctrl(key);
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('d')) {
         state.quit = true;
         return vec![Action::Quit];
@@ -88,6 +101,15 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
     if let Focus::Overlay(_) = state.focus {
         return crate::keys_picker::handle_picker_key(state, key);
+    }
+
+    // Readline chord ctrl+x ctrl+e: start chord when ctrl+x arrives with prompt focused.
+    if state.focus == Focus::Normal
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('x'))
+    {
+        state.pending_chord = Some(key);
+        return vec![];
     }
 
     let action = state.keymap.action_for(key);
@@ -312,7 +334,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | Overlay::Import(_)
                 | Overlay::RailOverlay
                 | Overlay::Help
-                | Overlay::ThemePicker { .. },
+                | Overlay::ThemePicker { .. }
+                | Overlay::KeysPicker { .. },
             ) => {}
         }
         return vec![];
@@ -510,7 +533,8 @@ fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
             | Overlay::Import(_)
             | Overlay::RailOverlay
             | Overlay::Help
-            | Overlay::ThemePicker { .. },
+            | Overlay::ThemePicker { .. }
+            | Overlay::KeysPicker { .. },
         ) => {
             // Anywhere -> select first agent
             if !agents.is_empty() {
@@ -541,7 +565,23 @@ fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
         {
             *index -= 1;
         }
-        Focus::Normal | Focus::Panel { .. } | Focus::Overlay(_) => {}
+        Focus::Normal
+        | Focus::Panel { .. }
+        | Focus::Overlay(
+            Overlay::ModelPicker { .. }
+            | Overlay::EffortPicker { .. }
+            | Overlay::SessionPicker { .. }
+            | Overlay::Files { .. }
+            | Overlay::ModePicker { .. }
+            | Overlay::ConfigPicker { .. }
+            | Overlay::McpPicker { .. }
+            | Overlay::PluginsPicker { .. }
+            | Overlay::Import(_)
+            | Overlay::RailOverlay
+            | Overlay::Help
+            | Overlay::ThemePicker { .. }
+            | Overlay::KeysPicker { .. },
+        ) => {}
     }
     vec![]
 }

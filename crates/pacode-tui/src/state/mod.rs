@@ -93,6 +93,10 @@ pub enum Overlay {
         index: usize,
         plugins: Vec<PluginInfo>,
     },
+    KeysPicker {
+        index: usize,
+        capturing: bool,
+    },
     Import(crate::ui::import::ImportOverlayState),
     /// Plan + agents on the `Tiny` tier.
     RailOverlay,
@@ -170,6 +174,8 @@ pub struct AppState {
     pub anim_frame: u64,
     /// Mascot shown in the header banner; random per run, fixed for the session.
     pub mascot: crate::ui::mascot::MascotKind,
+    /// Pending readline key chord (e.g. `ctrl+x` waiting for `ctrl+e`).
+    pub pending_chord: Option<crossterm::event::KeyEvent>,
 }
 
 /// What the panel shows.
@@ -231,6 +237,7 @@ impl AppState {
             turn_started_at: None,
             anim_frame: 0,
             mascot: crate::ui::mascot::MascotKind::random(),
+            pending_chord: None,
         }
     }
 

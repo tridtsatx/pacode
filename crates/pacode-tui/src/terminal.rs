@@ -159,13 +159,31 @@ pub fn resume(mouse: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+struct SuspendGuard {
+    mouse: bool,
+    active: bool,
+}
+
+impl Drop for SuspendGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = resume(self.mouse);
+        }
+    }
+}
+
 /// Run a closure with the TUI suspended, restoring the terminal state afterwards.
 pub fn run_suspended<F, R>(mouse: bool, f: F) -> std::io::Result<R>
 where
     F: FnOnce() -> R,
 {
     suspend(mouse)?;
+    let mut guard = SuspendGuard {
+        mouse,
+        active: true,
+    };
     let result = f();
+    guard.active = false;
     resume(mouse)?;
     Ok(result)
 }

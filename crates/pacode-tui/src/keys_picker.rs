@@ -269,6 +269,111 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
+        Focus::Overlay(Overlay::KeysPicker { index, capturing }) => {
+            let count = crate::binding::Keymap::action_names().len();
+            if *capturing {
+                if key.code == KeyCode::Esc {
+                    *capturing = false;
+                    return vec![];
+                }
+
+                let mut mods = key.modifiers
+                    & (KeyModifiers::CONTROL
+                        | KeyModifiers::ALT
+                        | KeyModifiers::SHIFT
+                        | KeyModifiers::SUPER);
+                let code = match key.code {
+                    KeyCode::Char(c) if c.is_ascii_uppercase() => {
+                        mods.insert(KeyModifiers::SHIFT);
+                        KeyCode::Char(c.to_ascii_lowercase())
+                    }
+                    KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
+                    other => other,
+                };
+                let binding = crate::binding::Binding { code, mods };
+                let formatted = crate::binding::format_binding(&binding);
+                if formatted.ends_with("unknown") {
+                    *capturing = false;
+                    state.push_toast(
+                        pacode_types::ToastLevel::Warn,
+                        "Cannot bind key".to_string(),
+                        Some("Key cannot be represented".to_string()),
+                        std::time::Instant::now(),
+                    );
+                    return vec![];
+                }
+
+                let Some(&(_, action)) = crate::binding::Keymap::action_names().get(*index) else {
+                    *capturing = false;
+                    return vec![];
+                };
+
+                if let Some((_, conflict_action)) = state.keymap.find_conflict(&binding, action) {
+                    *capturing = false;
+                    state.push_toast(
+                        pacode_types::ToastLevel::Warn,
+                        "Keybinding conflict".to_string(),
+                        Some(conflict_action.description().to_string()),
+                        std::time::Instant::now(),
+                    );
+                    return vec![];
+                }
+
+                state.keymap.set_binding(action, binding);
+                *capturing = false;
+
+                let act_name = action.name();
+                let dotted = format!("keys.{act_name}");
+                if let Err(err) = pacode_config::update_config_value(
+                    &state.paths,
+                    &dotted,
+                    pacode_config::toml::Value::String(formatted),
+                ) {
+                    state.push_toast(
+                        pacode_types::ToastLevel::Error,
+                        "Failed to update config".to_string(),
+                        Some(err.to_string()),
+                        std::time::Instant::now(),
+                    );
+                }
+            } else {
+                if is_overlay_up(&key) && *index > 0 {
+                    *index -= 1;
+                    return vec![];
+                }
+                if is_overlay_down(&key) && count > 0 && *index + 1 < count {
+                    *index += 1;
+                    return vec![];
+                }
+                match key.code {
+                    KeyCode::Esc => state.focus = Focus::Normal,
+                    KeyCode::Enter => {
+                        *capturing = true;
+                    }
+                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(&(_, action)) =
+                            crate::binding::Keymap::action_names().get(*index)
+                        {
+                            state.keymap.reset_default(action);
+                            let act_name = action.name();
+                            let dotted = format!("keys.{act_name}");
+                            if let Err(err) =
+                                pacode_config::remove_config_value(&state.paths, &dotted)
+                            {
+                                state.push_toast(
+                                    pacode_types::ToastLevel::Error,
+                                    "Failed to update config".to_string(),
+                                    Some(err.to_string()),
+                                    std::time::Instant::now(),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            vec![]
+        }
         Focus::Overlay(Overlay::ThemePicker {
             index,
             original_theme,

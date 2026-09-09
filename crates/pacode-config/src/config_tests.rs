@@ -485,6 +485,32 @@ fn update_config_value_nested_write() {
 }
 
 #[test]
+fn update_and_remove_config_value_keys_round_trip() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    // 1. Update keys.follow_agent
+    crate::update_config_value(
+        &paths,
+        "keys.follow_agent",
+        toml::Value::String("ctrl+a".to_string()),
+    )
+    .expect("update keys.follow_agent");
+
+    let cfg = load(&paths).expect("load updated config");
+    assert_eq!(
+        cfg.keys.bindings.get("follow_agent").map(|s| s.as_str()),
+        Some("ctrl+a")
+    );
+
+    // 2. Remove keys.follow_agent
+    crate::remove_config_value(&paths, "keys.follow_agent").expect("remove keys.follow_agent");
+
+    let cfg2 = load(&paths).expect("load updated config");
+    assert_eq!(cfg2.keys.bindings.get("follow_agent"), None);
+}
+
+#[test]
 fn test_ups_toml_parsing() {
     // 1. Integer form
     let cfg1 = parse("[ui]\nups = 10\n").expect("parse ups = 10");

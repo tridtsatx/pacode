@@ -24,8 +24,8 @@ serde_json = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 arboard = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
