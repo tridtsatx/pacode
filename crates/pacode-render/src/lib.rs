@@ -24,12 +24,15 @@ pub struct RenderOptions {
     pub width: u16,
     pub theme: Theme,
     pub glyphs: Glyphs,
+    /// Draw the model's reasoning line (`[ui] thinking`). Off by default.
+    pub thinking: bool,
 }
 
 impl RenderOptions {
     pub fn new(width: u16, ascii_only: bool) -> Self {
         Self {
             width,
+            thinking: false,
             theme: Theme::default(),
             glyphs: Glyphs::new(ascii_only),
         }
@@ -40,6 +43,13 @@ impl RenderOptions {
             width,
             theme,
             glyphs: Glyphs::new(ascii_only),
+            thinking: false,
         }
+    }
+
+    /// Draw the model's reasoning line, per `[ui] thinking`.
+    pub fn thinking(mut self, thinking: bool) -> Self {
+        self.thinking = thinking;
+        self
     }
 }

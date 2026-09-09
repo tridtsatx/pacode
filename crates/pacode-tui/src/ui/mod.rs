@@ -47,7 +47,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         frame.area().width,
         state.config.ui.ascii_only,
         state.theme.clone(),
-    );
+    )
+    .thinking(state.config.ui.thinking);
 
     if layout.rail.width > 0 {
         if layout.rail_separator.width > 0 {
@@ -82,7 +83,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             dialog_area.width,
             state.config.ui.ascii_only,
             state.theme.clone(),
-        );
+        )
+        .thinking(state.config.ui.thinking);
         if state.turn_active && dialog_area.height > 1 {
             let trans_h = dialog_area.height - 1;
             let trans_area = Rect::new(dialog_area.x, dialog_area.y, dialog_area.width, trans_h);
@@ -162,7 +164,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             panel_rect.width,
             state.config.ui.ascii_only,
             state.theme.clone(),
-        );
+        )
+        .thinking(state.config.ui.thinking);
         panel::draw(frame, panel_rect, state, &panel_opts);
     }
 

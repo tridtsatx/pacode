@@ -66,5 +66,8 @@ fn a_touched_session_is_no_longer_the_eviction_candidate() {
     touch_order(&mut order, &PacodeSessionId::new("a"));
     // `a` was the oldest by creation; after use, `b` is the one to drop.
     assert_eq!(evict_candidate(&order, |_| false), Some(0));
-    assert_eq!(order.front().map(|id| id.to_string()), Some("b".to_string()));
+    assert_eq!(
+        order.front().map(|id| id.to_string()),
+        Some("b".to_string())
+    );
 }

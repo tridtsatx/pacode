@@ -234,6 +234,9 @@ pub(crate) fn render_item(
             lines
         }
         TranscriptKind::Reasoning { text, complete } => {
+            if !opts.thinking {
+                return Vec::new();
+            }
             let line = if *complete {
                 Line::from(Span::styled("thought for a moment", opts.theme.faint))
             } else if text.is_empty() {

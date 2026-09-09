@@ -197,6 +197,10 @@ pub struct UiConfig {
     /// Vim keybindings for prompt input (`[ui] vim = true`).
     #[serde(default)]
     pub vim: bool,
+    /// Show the model's reasoning line in the transcript. Off by default: the
+    /// reasoning is still recorded, it is just not drawn.
+    #[serde(default)]
+    pub thinking: bool,
 }
 
 impl Default for UiConfig {
@@ -211,6 +215,7 @@ impl Default for UiConfig {
             transcript_cells: 500,
             images: default_images(),
             vim: false,
+            thinking: false,
         }
     }
 }
