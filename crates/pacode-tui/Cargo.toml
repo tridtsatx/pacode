@@ -10,6 +10,8 @@ pacode-types = { workspace = true }
 pacode-config = { workspace = true }
 pacode-client = { workspace = true }
 pacode-render = { workspace = true }
+pacode-import = { workspace = true }
+pacode-image = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }

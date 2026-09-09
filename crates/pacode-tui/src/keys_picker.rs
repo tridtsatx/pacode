@@ -207,6 +207,7 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
+        Focus::Overlay(Overlay::Import(_)) => vec![],
         Focus::Overlay(Overlay::McpPicker {
             index,
             servers,

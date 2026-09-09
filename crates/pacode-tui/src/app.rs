@@ -86,8 +86,22 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
 
     let mut last_draw = Instant::now() - frame_interval.unwrap_or(Duration::from_millis(33));
     let mut last_layout = ScreenLayout::default();
+    let mut active_escape: Option<(ratatui::layout::Rect, std::path::PathBuf)> = None;
 
     loop {
+        let is_files_overlay = matches!(
+            state.focus,
+            crate::state::Focus::Overlay(crate::state::Overlay::Files { .. })
+        );
+        if !is_files_overlay {
+            if state.files.cached_preview.is_some() {
+                state.files.clear_preview();
+            }
+            if let Some((area, _path)) = active_escape.take() {
+                let _ = term_guard.clear_image_area(area);
+            }
+        }
+
         // Redraw if dirty and frame interval elapsed
         let now = Instant::now();
         let can_draw = match frame_interval {
@@ -100,6 +114,22 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             })?;
             state.dirty = false;
             last_draw = Instant::now();
+
+            if is_files_overlay {
+                if let Some((area, esc, path)) = state.files.pending_escape.take() {
+                    if let Some((old_area, ref old_path)) = active_escape
+                        && (*old_path != path || old_area != area)
+                    {
+                        let _ = term_guard.clear_image_area(old_area);
+                    }
+                    let _ = term_guard.draw_image_escape(area, &esc);
+                    active_escape = Some((area, path));
+                } else if let Some((old_area, _)) = active_escape.take() {
+                    let _ = term_guard.clear_image_area(old_area);
+                }
+            } else if let Some((old_area, _)) = active_escape.take() {
+                let _ = term_guard.clear_image_area(old_area);
+            }
         }
 
         if state.quit {
@@ -245,6 +275,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         .as_ref()
         .map(|m| m.id.clone())
         .unwrap_or(session_id);
+    if let Some((area, _)) = active_escape.take() {
+        let _ = term_guard.clear_image_area(area);
+    }
     drop(events);
     drop(bg_rx);
     if let Ok(c) = Arc::try_unwrap(client) {

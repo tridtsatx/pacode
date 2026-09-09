@@ -17,6 +17,8 @@ members = [
     "crates/pacode",
     "crates/pacode-plugin",
     "crates/pacode-import",
+    "crates/pacode-image",
+    "crates/pacode-skills",
 ]
 
 [workspace.package]
@@ -40,6 +42,9 @@ pacode-daemon = { path = "crates/pacode-daemon" }
 pacode-client = { path = "crates/pacode-client" }
 pacode-tui = { path = "crates/pacode-tui" }
 pacode-plugin = { path = "crates/pacode-plugin" }
+pacode-import = { path = "crates/pacode-import" }
+pacode-image = { path = "crates/pacode-image" }
+pacode-skills = { path = "crates/pacode-skills" }
 
 # async
 tokio = { version = "1", default-features = false }
@@ -91,6 +96,8 @@ rand = "0.9"
 libc = "0.2"
 regex = "1"
 shlex = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 # dev
 tempfile = "3"

@@ -87,3 +87,26 @@ fn test_sorted_rows_desc() {
     assert_eq!(sorted[1].path, "mid.rs");
     assert_eq!(sorted[2].path, "old.rs");
 }
+
+#[test]
+fn test_clear_preview() {
+    let mut files = FilesState::new();
+    assert!(files.cached_preview.is_none());
+    assert!(files.pending_escape.is_none());
+
+    let key = ImageCacheKey {
+        path: std::path::PathBuf::from("test.png"),
+        cell_w: 10,
+        cell_h: 10,
+    };
+    files.cached_preview = Some(CachedImagePreview { key, preview: None });
+    files.pending_escape = Some((
+        ratatui::layout::Rect::new(0, 0, 10, 10),
+        "esc".to_string(),
+        std::path::PathBuf::from("test.png"),
+    ));
+
+    files.clear_preview();
+    assert!(files.cached_preview.is_none());
+    assert!(files.pending_escape.is_none());
+}

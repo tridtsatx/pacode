@@ -245,6 +245,7 @@ async fn setup_test_core() -> (Arc<Core>, Arc<MockProvider>, tempfile::TempDir) 
         plugins: Arc::new(pacode_plugin::PluginHost::new()),
         store,
         app_version: "0.1.0-test".into(),
+        skills: Arc::new(pacode_skills::SkillRegistry::default()),
     };
 
     let core = Core::new(deps).await;

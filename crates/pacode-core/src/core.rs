@@ -32,6 +32,7 @@ pub struct CoreDeps {
     pub store: Store,
     /// Shown in the rail anchor and in `SessionMeta` logs.
     pub app_version: String,
+    pub skills: Arc<pacode_skills::SkillRegistry>,
 }
 
 pub struct Core {

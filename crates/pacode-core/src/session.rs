@@ -36,6 +36,7 @@ pub struct Session {
     pub mcp: Arc<McpPool>,
     pub plugins: Arc<pacode_plugin::PluginHost>,
     pub app_version: String,
+    pub skills: Arc<pacode_skills::SkillRegistry>,
 }
 
 impl Session {

@@ -51,6 +51,7 @@ async fn create_test_core(
         plugins,
         store,
         app_version: "0.1.0-test".into(),
+        skills: Arc::new(pacode_skills::SkillRegistry::default()),
     };
 
     let core = Core::new(deps).await;

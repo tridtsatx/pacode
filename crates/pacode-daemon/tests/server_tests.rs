@@ -71,6 +71,7 @@ async fn build_test_core(tmp: &tempfile::TempDir, config: Arc<Config>) -> Arc<Co
         plugins: Arc::new(pacode_plugin::PluginHost::new()),
         store,
         app_version: "0.1.0".to_string(),
+        skills: Arc::new(pacode_skills::SkillRegistry::default()),
     };
 
     Core::new(deps).await

@@ -16,6 +16,7 @@ pacode-client = { workspace = true }
 pacode-daemon = { workspace = true }
 pacode-tui = { workspace = true }
 pacode-plugin = { workspace = true }
+pacode-import = { workspace = true }
 toml_edit = { workspace = true }
 clap = { workspace = true, features = ["color"] }
 anyhow = { workspace = true }

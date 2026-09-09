@@ -24,8 +24,11 @@ pub mod plan;
 pub mod plugin;
 pub mod read;
 pub mod report_status;
+pub mod skill;
 pub mod webfetch;
 pub mod write;
+
+pub use skill::SkillTool;
 
 use std::sync::Arc;
 

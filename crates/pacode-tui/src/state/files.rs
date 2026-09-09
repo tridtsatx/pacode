@@ -1,10 +1,30 @@
 //! Touched files tracking for the files overlay (spec §11).
 
+use std::path::PathBuf;
+
 #[cfg(test)]
 #[path = "files_tests.rs"]
 mod files_tests;
 
 pub const MAX_FILES: usize = 500;
+
+/// Key identifying a cached image preview by path and cell dimensions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageCacheKey {
+    pub path: PathBuf,
+    pub cell_w: u16,
+    pub cell_h: u16,
+}
+
+/// Cache entry for at most one rendered image preview.
+/// Owner: `FilesState`.
+/// Cap: exactly 1 entry.
+/// Invalidation rule: dropped when the files overlay closes or highlighted entry changes.
+#[derive(Clone, Debug)]
+pub struct CachedImagePreview {
+    pub key: ImageCacheKey,
+    pub preview: Option<pacode_image::Preview>,
+}
 
 /// Bitflags for operations performed on a file: Read, Write, Edit, Search.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,11 +78,25 @@ pub struct FileRow {
 #[derive(Clone, Debug, Default)]
 pub struct FilesState {
     pub rows: Vec<FileRow>,
+    /// At most one cached image preview.
+    pub cached_preview: Option<CachedImagePreview>,
+    /// Pending escape sequence to write after frame flush: (area, escape_seq, path).
+    pub pending_escape: Option<(ratatui::layout::Rect, String, PathBuf)>,
 }
 
 impl FilesState {
     pub fn new() -> Self {
-        Self { rows: Vec::new() }
+        Self {
+            rows: Vec::new(),
+            cached_preview: None,
+            pending_escape: None,
+        }
+    }
+
+    /// Clear cached preview and pending escape sequence (e.g. on overlay close).
+    pub fn clear_preview(&mut self) {
+        self.cached_preview = None;
+        self.pending_escape = None;
     }
 
     pub fn len(&self) -> usize {

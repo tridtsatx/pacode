@@ -86,9 +86,33 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
 
     let plugin_host = Arc::new(PluginHost::load(&opts.config.plugins, ui_sink).await);
 
+    let (skill_registry, _warnings) = if opts.config.skills.enabled {
+        let dirs = if opts.config.skills.dirs.is_empty() {
+            vec![opts.paths.skills_dir()]
+        } else {
+            opts.config.skills.dirs.clone()
+        };
+        let (reg, warnings) = pacode_skills::SkillRegistry::load(&dirs);
+        for warning in &warnings {
+            log::warn!("{warning}");
+        }
+        (Arc::new(reg), warnings)
+    } else {
+        (
+            Arc::new(pacode_skills::SkillRegistry::default()),
+            Vec::new(),
+        )
+    };
+
     let mut tools = builtin_tools();
     for tool in pacode_tools::builtin::plugin::plugin_tools(plugin_host.clone()) {
         tools.register(tool);
+    }
+    if opts.config.skills.enabled {
+        tools.register(Arc::new(pacode_tools::builtin::skill::SkillTool::new(
+            skill_registry.clone(),
+            opts.config.skills.max_body_bytes,
+        )));
     }
 
     let tasks = TaskManager::new(opts.paths.spool_dir(), opts.config.exec.clone());
@@ -109,6 +133,7 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
         plugins: plugin_host,
         store,
         app_version: opts.app_version.clone(),
+        skills: skill_registry,
     };
 
     let core = Core::new(deps).await;

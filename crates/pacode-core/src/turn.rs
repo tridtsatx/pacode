@@ -118,6 +118,9 @@ pub async fn run_turn(
                 plan: &plan_guard,
                 instructions: instructions.as_deref(),
                 is_subagent: !agent.id.is_main(),
+                skills: session.skills.skills(),
+                skills_enabled: session.config.skills.enabled,
+                max_listed_skills: session.config.skills.max_listed,
             };
             crate::prompt::system_dynamic(&dyn_ctx)
         };

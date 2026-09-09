@@ -140,4 +140,12 @@ impl Paths {
             .map(|p| p.join("memory.md"))
             .unwrap_or_else(|| PathBuf::from("memory.md"))
     }
+
+    /// Skills directory (`~/.config/pacode/skills` or next to `config.toml`).
+    pub fn skills_dir(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .map(|p| p.join("skills"))
+            .unwrap_or_else(|| PathBuf::from("skills"))
+    }
 }

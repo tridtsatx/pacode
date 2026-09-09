@@ -2,8 +2,9 @@
 //! (`ui.mouse`), keyboard enhancement flags when supported (so `shift+enter` and
 //! `alt+arrows` arrive), a panic hook that restores the terminal.
 
-use std::io::Stdout;
+use std::io::{Stdout, Write};
 
+use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -61,11 +62,42 @@ impl TerminalGuard {
     pub fn mouse_enabled(&self) -> bool {
         self.mouse
     }
+
+    /// Emit an image escape sequence starting at the specified terminal cell position.
+    pub fn draw_image_escape(
+        &mut self,
+        area: ratatui::layout::Rect,
+        escape: &str,
+    ) -> std::io::Result<()> {
+        let mut stdout = std::io::stdout();
+        execute!(stdout, SavePosition, MoveTo(area.x, area.y))?;
+        stdout.write_all(escape.as_bytes())?;
+        execute!(stdout, RestorePosition)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    /// Clear an image preview area by sending kitty delete command and overwriting cells with spaces.
+    pub fn clear_image_area(&mut self, area: ratatui::layout::Rect) -> std::io::Result<()> {
+        let mut stdout = std::io::stdout();
+        execute!(stdout, SavePosition)?;
+        let _ = stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\");
+        let spaces = " ".repeat(area.width as usize);
+        for row in 0..area.height {
+            let _ = execute!(stdout, MoveTo(area.x, area.y + row));
+            let _ = stdout.write_all(spaces.as_bytes());
+        }
+        execute!(stdout, RestorePosition)?;
+        stdout.flush()?;
+        Ok(())
+    }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\");
+        let _ = stdout.flush();
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         if self.mouse {
             let _ = execute!(stdout, DisableMouseCapture);
@@ -79,6 +111,8 @@ impl Drop for TerminalGuard {
 /// Restore the terminal from a panic hook (best effort, never panics).
 pub fn restore_on_panic() {
     let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\");
+    let _ = stdout.flush();
     let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);

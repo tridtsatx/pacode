@@ -1,7 +1,9 @@
-//! Touched files overlay list (spec §11).
+//! Touched files overlay list with inline image previews (spec §11).
+
+use std::path::Path;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -9,13 +11,30 @@ use pacode_render::RenderOptions;
 use pacode_types::time::{format_duration_ms, now_ms};
 
 use crate::state::AppState;
+use crate::state::files::{CachedImagePreview, FileRow, ImageCacheKey};
+
+#[cfg(test)]
+#[path = "files_tests.rs"]
+mod files_tests;
+
+/// Check if a path has a supported image extension (case-insensitive).
+pub fn is_image_file(path_str: &str) -> bool {
+    let p = Path::new(path_str);
+    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    )
+}
 
 /// Draw the touched files overlay.
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
     selected: usize,
-    state: &AppState,
+    state: &mut AppState,
     opts: &RenderOptions,
 ) {
     let block = Block::default()
@@ -31,20 +50,56 @@ pub fn draw(
     frame.render_widget(block, area);
 
     if state.files.is_empty() {
+        state.files.clear_preview();
         let msg = Line::from(Span::styled("No files touched yet", opts.theme.faint));
         frame.render_widget(Paragraph::new(vec![msg]), inner);
         return;
     }
 
-    let sorted = state.files.sorted_rows();
-    let max_rows = inner.height as usize;
-    let now = now_ms();
+    // `sorted` borrows `state.files`, so decide the layout and draw the list
+    // first, then release the borrow before the preview needs `&mut state`.
+    let preview_path = {
+        let sorted = state.files.sorted_rows();
+        let sel_idx = if sorted.is_empty() {
+            0
+        } else {
+            selected.min(sorted.len() - 1)
+        };
 
-    let sel_idx = if sorted.is_empty() {
-        0
-    } else {
-        selected.min(sorted.len() - 1)
+        let is_img = state.config.ui.images_enabled()
+            && !sorted.is_empty()
+            && is_image_file(&sorted[sel_idx].path);
+
+        if is_img && inner.width >= 40 {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(inner);
+            render_file_list(frame, chunks[0], &sorted, sel_idx, opts);
+            Some((chunks[1], sorted[sel_idx].path.clone()))
+        } else {
+            render_file_list(frame, inner, &sorted, sel_idx, opts);
+            None
+        }
     };
+
+    match preview_path {
+        Some((preview_area, path)) => {
+            render_image_preview(frame, preview_area, &path, state, opts);
+        }
+        None => state.files.clear_preview(),
+    }
+}
+
+fn render_file_list(
+    frame: &mut Frame,
+    area: Rect,
+    sorted: &[&FileRow],
+    sel_idx: usize,
+    opts: &RenderOptions,
+) {
+    let max_rows = area.height as usize;
+    let now = now_ms();
 
     let start = if sel_idx >= max_rows {
         sel_idx + 1 - max_rows
@@ -53,7 +108,7 @@ pub fn draw(
     };
 
     let mut lines = Vec::new();
-    let avail_path_width = (inner.width as usize).saturating_sub(24).max(10);
+    let avail_path_width = (area.width as usize).saturating_sub(24).max(10);
 
     for (i, row) in sorted.iter().enumerate().skip(start).take(max_rows) {
         let is_sel = i == sel_idx;
@@ -113,7 +168,102 @@ pub fn draw(
         ]));
     }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_image_preview(
+    frame: &mut Frame,
+    area: Rect,
+    path_str: &str,
+    state: &mut AppState,
+    opts: &RenderOptions,
+) {
+    let preview_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(opts.theme.dim);
+    let p_inner = preview_block.inner(area);
+    frame.render_widget(preview_block, area);
+
+    if p_inner.width == 0 || p_inner.height == 0 {
+        return;
+    }
+
+    let p = Path::new(path_str);
+    // Files are listed relative to the session cwd reported by the daemon.
+    let cwd = state
+        .meta
+        .as_ref()
+        .map(|m| m.cwd.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let resolved_path = if p.is_absolute() {
+        p.to_path_buf()
+    } else if cwd.join(p).exists() {
+        cwd.join(p)
+    } else {
+        p.to_path_buf()
+    };
+
+    let key = ImageCacheKey {
+        path: resolved_path.clone(),
+        cell_w: p_inner.width,
+        cell_h: p_inner.height,
+    };
+
+    let cached_hit = state.files.cached_preview.as_ref().filter(|c| c.key == key);
+
+    let preview_result = if let Some(cached) = cached_hit {
+        cached.preview.clone()
+    } else {
+        let proto = pacode_image::detect();
+        let req = pacode_image::PreviewRequest {
+            path: resolved_path.clone(),
+            cell_w: p_inner.width,
+            cell_h: p_inner.height,
+        };
+        let val = pacode_image::render(&req, proto).ok();
+        state.files.cached_preview = Some(CachedImagePreview {
+            key,
+            preview: val.clone(),
+        });
+        val
+    };
+
+    match preview_result {
+        Some(pacode_image::Preview::Cells(grid)) => {
+            state.files.pending_escape = None;
+            let mut lines = Vec::new();
+            for row in grid.iter().take(p_inner.height as usize) {
+                let mut spans = Vec::new();
+                for cell in row.iter().take(p_inner.width as usize) {
+                    let style = ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::Rgb(
+                            cell.top.0, cell.top.1, cell.top.2,
+                        ))
+                        .bg(ratatui::style::Color::Rgb(
+                            cell.bottom.0,
+                            cell.bottom.1,
+                            cell.bottom.2,
+                        ));
+                    spans.push(Span::styled("▀", style));
+                }
+                lines.push(Line::from(spans));
+            }
+            frame.render_widget(Paragraph::new(lines), p_inner);
+        }
+        Some(pacode_image::Preview::Escape(esc)) => {
+            frame.render_widget(ratatui::widgets::Clear, p_inner);
+            state.files.pending_escape = Some((p_inner, esc, resolved_path));
+        }
+        None => {
+            state.files.pending_escape = None;
+            let filename = p.file_name().and_then(|f| f.to_str()).unwrap_or(path_str);
+            let placeholder = vec![
+                Line::from(Span::styled("Image preview unavailable", opts.theme.dim)),
+                Line::from(Span::styled(filename.to_string(), opts.theme.faint)),
+            ];
+            frame.render_widget(Paragraph::new(placeholder), p_inner);
+        }
+    }
 }
 
 /// Truncate string on the left, prepending an ellipsis if it exceeds `max_width`.

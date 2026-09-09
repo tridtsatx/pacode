@@ -7,6 +7,7 @@ description = "Tool trait, ToolHost, and the built-in tool set (read/write/edit/
 
 [dependencies]
 pacode-types = { workspace = true }
+pacode-skills = { workspace = true }
 pacode-exec = { workspace = true }
 pacode-risk = { workspace = true }
 pacode-render = { workspace = true }

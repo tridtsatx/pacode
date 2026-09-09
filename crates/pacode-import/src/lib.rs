@@ -1,6 +1,7 @@
 //! Pure, IO-light library that discovers MCP servers and skills configured
 //! for other coding agents and normalizes them into pacode's shapes.
 
+pub mod apply;
 pub mod error;
 pub mod mcp;
 pub mod skills;
@@ -8,6 +9,10 @@ pub mod skills;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+pub use apply::{
+    AppliedEntry, ApplyOutcome, ApplyReport, ApplyTarget, EntryStatus, PlanEntry, PlanItem, apply,
+    check_status,
+};
 pub use error::ParseImportSourceError;
 pub use pacode_types::config::McpServerConfig;
 
@@ -146,5 +151,18 @@ pub fn discover(home: &Path, cwd: &Path, sources: &[ImportSource]) -> Discovery 
         skills::discover_skills(home, cwd, source, &mut discovery);
     }
 
+    // A name is the identity of an imported server or skill, and the same skill
+    // ships in several plugin bundles, so keep the first one found and drop the
+    // rest instead of offering the user a list full of duplicates.
+    dedup_by_name(&mut discovery);
     discovery
+}
+
+fn dedup_by_name(discovery: &mut Discovery) {
+    let mut seen_mcp: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    discovery.mcp.retain(|m| seen_mcp.insert(m.name.clone()));
+    let mut seen_skill: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    discovery
+        .skills
+        .retain(|s| seen_skill.insert(s.name.clone()));
 }

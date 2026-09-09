@@ -15,6 +15,9 @@ pub struct DynamicContext<'a> {
     pub instructions: Option<&'a str>,
     /// `true` for subagents (no `agent` tool, report back at the end).
     pub is_subagent: bool,
+    pub skills: &'a [pacode_skills::Skill],
+    pub skills_enabled: bool,
+    pub max_listed_skills: usize,
 }
 
 /// Identity, tool rules, the background-first thesis, plan rules, permission notes.
@@ -75,6 +78,20 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
         out.push_str("\n## Project Instructions\n");
         out.push_str(instructions);
         out.push('\n');
+    }
+
+    if ctx.skills_enabled && !ctx.skills.is_empty() {
+        out.push_str("\n## Skills\n");
+        for skill in ctx.skills.iter().take(ctx.max_listed_skills) {
+            let desc = skill.description.replace("\r\n", " ").replace('\n', " ");
+            let desc = desc.trim();
+            let desc_capped: String = if desc.chars().count() > 200 {
+                desc.chars().take(200).collect()
+            } else {
+                desc.to_string()
+            };
+            out.push_str(&format!("- {}: {desc_capped}\n", skill.name));
+        }
     }
 
     out
@@ -430,5 +447,88 @@ mod tests {
 
         assert!(pos_instr < pos_global);
         assert!(pos_global < pos_proj);
+    }
+
+    #[test]
+    fn test_system_dynamic_skills_section() {
+        let cwd = std::path::PathBuf::from("/test/cwd");
+        let plan = pacode_types::Plan::default();
+
+        let long_desc = "x".repeat(300);
+        let skills = vec![
+            pacode_skills::Skill {
+                name: "skill-a".to_string(),
+                description: "Description for skill A".to_string(),
+                dir: cwd.join("skills/skill-a"),
+                path: cwd.join("skills/skill-a/SKILL.md"),
+            },
+            pacode_skills::Skill {
+                name: "skill-b".to_string(),
+                description: long_desc,
+                dir: cwd.join("skills/skill-b"),
+                path: cwd.join("skills/skill-b/SKILL.md"),
+            },
+            pacode_skills::Skill {
+                name: "skill-c".to_string(),
+                description: "Skill C should be omitted if max_listed is 2".to_string(),
+                dir: cwd.join("skills/skill-c"),
+                path: cwd.join("skills/skill-c/SKILL.md"),
+            },
+        ];
+
+        // 1. Skills enabled and present
+        let ctx = DynamicContext {
+            cwd: &cwd,
+            git_branch: None,
+            date: "2026-09-09",
+            mode: Mode::Build,
+            plan: &plan,
+            instructions: None,
+            is_subagent: false,
+            skills: &skills,
+            skills_enabled: true,
+            max_listed_skills: 2,
+        };
+        let out = system_dynamic(&ctx);
+        assert!(out.contains("## Skills\n"));
+        assert!(out.contains("- skill-a: Description for skill A\n"));
+        // skill-b description must be capped at 200 chars
+        assert!(out.contains(&format!("- skill-b: {}\n", "x".repeat(200))));
+        assert!(!out.contains(&"x".repeat(201)));
+        // skill-c should not be present because max_listed_skills is 2
+        assert!(!out.contains("- skill-c"));
+
+        // 2. Skills disabled -> emits NOTHING about skills
+        let ctx_disabled = DynamicContext {
+            cwd: &cwd,
+            git_branch: None,
+            date: "2026-09-09",
+            mode: Mode::Build,
+            plan: &plan,
+            instructions: None,
+            is_subagent: false,
+            skills: &skills,
+            skills_enabled: false,
+            max_listed_skills: 10,
+        };
+        let out_disabled = system_dynamic(&ctx_disabled);
+        assert!(!out_disabled.contains("## Skills"));
+        assert!(!out_disabled.contains("skill-a"));
+
+        // 3. Skills empty -> emits NOTHING about skills
+        let ctx_empty = DynamicContext {
+            cwd: &cwd,
+            git_branch: None,
+            date: "2026-09-09",
+            mode: Mode::Build,
+            plan: &plan,
+            instructions: None,
+            is_subagent: false,
+            skills: &[],
+            skills_enabled: true,
+            max_listed_skills: 10,
+        };
+        let out_empty = system_dynamic(&ctx_empty);
+        assert!(!out_empty.contains("## Skills"));
     }
 }

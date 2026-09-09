@@ -120,6 +120,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 mcp: core.deps.mcp.clone(),
                 plugins: core.deps.plugins.clone(),
                 app_version: core.deps.app_version.clone(),
+                skills: core.deps.skills.clone(),
             });
 
             if let Ok(mut sessions) = core.sessions.write() {
@@ -313,6 +314,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 mcp: core.deps.mcp.clone(),
                 plugins: core.deps.plugins.clone(),
                 app_version: core.deps.app_version.clone(),
+                skills: core.deps.skills.clone(),
             });
 
             if let Ok(mut sessions) = core.sessions.write() {

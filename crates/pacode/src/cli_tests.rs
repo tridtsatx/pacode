@@ -232,6 +232,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_import_shapes() {
+        let cli = Cli::try_parse_from(["pacode", "import"]).expect("import plain");
+        match cli.command {
+            Some(Command::Import {
+                from,
+                mcp,
+                skills,
+                apply,
+                force,
+            }) => {
+                assert!(from.is_empty());
+                assert!(!mcp);
+                assert!(!skills);
+                assert!(!apply);
+                assert!(!force);
+            }
+            other => panic!("expected Import empty, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "pacode", "import", "--from", "claude", "--from", "cursor", "--mcp", "--apply",
+            "--force",
+        ])
+        .expect("import with flags");
+        match cli.command {
+            Some(Command::Import {
+                from,
+                mcp,
+                skills,
+                apply,
+                force,
+            }) => {
+                assert_eq!(from, vec!["claude", "cursor"]);
+                assert!(mcp);
+                assert!(!skills);
+                assert!(apply);
+                assert!(force);
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_serve_shapes() {
         let cli = Cli::try_parse_from(["pacode", "serve"]).expect("serve plain");
         match cli.command {

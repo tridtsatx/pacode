@@ -75,6 +75,19 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     // 1.5 While an overlay is open, ALL keys go to it (fixes focus leak to input).
+    if matches!(state.focus, Focus::Overlay(Overlay::Import(_))) {
+        // The handler needs `&mut AppState` too, so take the overlay out and put
+        // it back unless it asked to close.
+        let taken = std::mem::replace(&mut state.focus, Focus::Normal);
+        let Focus::Overlay(Overlay::Import(mut overlay)) = taken else {
+            return vec![];
+        };
+        let actions = crate::ui::import::handle_key(state, &mut overlay, key, now);
+        if !overlay.closed {
+            state.focus = Focus::Overlay(Overlay::Import(overlay));
+        }
+        return actions;
+    }
     if let Focus::Overlay(_) = state.focus {
         return crate::keys_picker::handle_picker_key(state, key);
     }
@@ -299,6 +312,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | Overlay::ConfigPicker { .. }
                 | Overlay::McpPicker { .. }
                 | Overlay::PluginsPicker { .. }
+                | Overlay::Import(_)
                 | Overlay::RailOverlay
                 | Overlay::Help,
             ) => {}
@@ -488,6 +502,7 @@ fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
             | Overlay::ConfigPicker { .. }
             | Overlay::McpPicker { .. }
             | Overlay::PluginsPicker { .. }
+            | Overlay::Import(_)
             | Overlay::RailOverlay
             | Overlay::Help,
         ) => {

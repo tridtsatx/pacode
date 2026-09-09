@@ -84,6 +84,7 @@ pub enum Overlay {
         index: usize,
         plugins: Vec<PluginInfo>,
     },
+    Import(crate::ui::import::ImportOverlayState),
     /// Plan + agents on the `Tiny` tier.
     RailOverlay,
     Help,

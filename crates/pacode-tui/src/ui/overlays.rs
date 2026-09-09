@@ -56,6 +56,9 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::PluginsPicker { index, plugins } => {
                 crate::ui::plugins::draw(frame, area, *index, plugins, opts);
             }
+            Overlay::Import(import_state) => {
+                crate::ui::import::draw(frame, area, import_state, opts);
+            }
             Overlay::RailOverlay => {
                 draw_rail_overlay(frame, area, state, opts);
             }

@@ -55,6 +55,7 @@ async fn test_lua_plugin_full_flow() {
         plugins: plugin_host.clone(),
         store,
         app_version: "0.1.0-test".into(),
+        skills: Arc::new(pacode_skills::SkillRegistry::default()),
     };
 
     let core = Core::new(deps).await;

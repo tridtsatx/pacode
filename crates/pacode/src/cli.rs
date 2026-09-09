@@ -11,6 +11,8 @@ use pacode_types::{Attach, Config, Effort, Mode, ModelRoute, SessionId};
 
 #[path = "daemon.rs"]
 mod daemon;
+#[path = "import_cmd.rs"]
+mod import_cmd;
 #[path = "mcp_cmd.rs"]
 mod mcp_cmd;
 #[path = "plugins_cmd.rs"]
@@ -145,6 +147,29 @@ pub enum Command {
         /// Plugin action to perform (defaults to listing plugins).
         #[command(subcommand)]
         action: Option<PluginsAction>,
+    },
+
+    /// Import MCP servers and skills from other coding agents.
+    Import {
+        /// Sources to import from (claude, codex, opencode, cursor, gemini, vscode, all).
+        #[arg(long = "from", value_name = "SOURCE")]
+        from: Vec<String>,
+
+        /// Import MCP servers only.
+        #[arg(long)]
+        mcp: bool,
+
+        /// Import skills only.
+        #[arg(long)]
+        skills: bool,
+
+        /// Apply changes (default is dry-run).
+        #[arg(long)]
+        apply: bool,
+
+        /// Overwrite existing servers or skill directories on conflict.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Query status or request shutdown of the background daemon.
@@ -364,6 +389,22 @@ pub fn main() -> anyhow::Result<()> {
         }
         Some(Command::Mcp { action }) => mcp_cmd::run(action, &paths),
         Some(Command::Plugins { action }) => plugins_cmd::run(action, &config),
+        Some(Command::Import {
+            from,
+            mcp,
+            skills,
+            apply,
+            force,
+        }) => {
+            let args = import_cmd::ImportArgs {
+                from,
+                mcp,
+                skills,
+                apply,
+                force,
+            };
+            import_cmd::run(args, &paths)
+        }
         Some(Command::Daemon { action }) => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;

@@ -28,6 +28,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub session: SessionConfig,
     pub plugins: PluginsConfig,
+    pub skills: SkillsConfig,
 }
 
 impl Config {
@@ -170,6 +171,10 @@ impl<'de> Deserialize<'de> for Ups {
     }
 }
 
+fn default_images() -> String {
+    "auto".to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -183,6 +188,9 @@ pub struct UiConfig {
     pub color: String,
     /// Max transcript cells kept in the client before older ones are evicted.
     pub transcript_cells: usize,
+    /// `auto` or `off`.
+    #[serde(default = "default_images")]
+    pub images: String,
 }
 
 impl Default for UiConfig {
@@ -195,7 +203,14 @@ impl Default for UiConfig {
             ups: Ups::default(),
             color: "auto".to_string(),
             transcript_cells: 500,
+            images: default_images(),
         }
+    }
+}
+
+impl UiConfig {
+    pub fn images_enabled(&self) -> bool {
+        self.images != "off"
     }
 }
 
@@ -419,6 +434,27 @@ impl Default for PluginsConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    pub enabled: bool,
+    /// Empty means default `<config dir>/skills`.
+    pub dirs: Vec<PathBuf>,
+    pub max_body_bytes: usize,
+    pub max_listed: usize,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dirs: Vec::new(),
+            max_body_bytes: 16384,
+            max_listed: 100,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,7 +466,20 @@ mod tests {
         assert_eq!(cfg.permissions.default_mode, Mode::Build);
         assert!(!cfg.ui.hints.model);
         assert_eq!(cfg.ui.ups, Ups::Fixed(10));
+        assert_eq!(cfg.ui.images, "auto");
+        assert!(cfg.ui.images_enabled());
+        assert!(cfg.skills.enabled);
+        assert!(cfg.skills.dirs.is_empty());
+        assert_eq!(cfg.skills.max_body_bytes, 16384);
+        assert_eq!(cfg.skills.max_listed, 100);
         assert!(cfg.default_route().is_none());
+    }
+
+    #[test]
+    fn ui_images_off() {
+        let cfg: Config = serde_json::from_str(r#"{"ui": {"images": "off"}}"#).unwrap();
+        assert_eq!(cfg.ui.images, "off");
+        assert!(!cfg.ui.images_enabled());
     }
 
     #[test]

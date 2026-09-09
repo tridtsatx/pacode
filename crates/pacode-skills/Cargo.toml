@@ -1,0 +1,9 @@
+[package]
+name = "pacode-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Markdown skills loader and registry for pacode"
+
+[dependencies]
+thiserror = { workspace = true }
