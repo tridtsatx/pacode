@@ -25,6 +25,20 @@ pub struct InputState {
     pub slash_index: usize,
     /// Vertical scroll offset for multi-line prompts (> 6 rows).
     pub input_scroll: usize,
+    /// Bounded history of executed bash commands (`BASH_HISTORY_CAP` = 500).
+    pub bash_history: VecDeque<String>,
+    /// Index into bash history while browsing with ↑/↓ in bash mode.
+    pub bash_history_index: Option<usize>,
+    /// Draft saved while browsing bash history.
+    pub bash_draft: String,
+    /// Selected index in `@` reference popup.
+    pub at_index: usize,
+    /// Whether user explicitly dismissed the `@` reference popup with Esc.
+    pub at_closed: bool,
+    /// Selected index in bash completion popup.
+    pub bash_complete_index: usize,
+    /// Whether user explicitly dismissed the bash completion popup with Esc.
+    pub bash_complete_closed: bool,
 }
 
 pub fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
@@ -77,6 +91,8 @@ impl InputState {
         let byte_idx = char_to_byte_index(&self.text, self.cursor);
         self.text.insert_str(byte_idx, s);
         self.cursor += s.chars().count();
+        self.at_closed = false;
+        self.bash_complete_closed = false;
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -90,6 +106,8 @@ impl InputState {
             let end_byte = char_to_byte_index(&self.text, self.cursor);
             self.text.replace_range(start_byte..end_byte, "");
             self.cursor -= 1;
+            self.at_closed = false;
+            self.bash_complete_closed = false;
         }
     }
 
@@ -99,6 +117,8 @@ impl InputState {
             let start_byte = char_to_byte_index(&self.text, self.cursor);
             let end_byte = char_to_byte_index(&self.text, self.cursor + 1);
             self.text.replace_range(start_byte..end_byte, "");
+            self.at_closed = false;
+            self.bash_complete_closed = false;
         }
     }
 
@@ -147,6 +167,12 @@ impl InputState {
         self.draft.clear();
         self.slash_index = 0;
         self.input_scroll = 0;
+        self.bash_history_index = None;
+        self.bash_draft.clear();
+        self.at_index = 0;
+        self.at_closed = false;
+        self.bash_complete_index = 0;
+        self.bash_complete_closed = false;
         if !taken.trim().is_empty() {
             self.history.push_back(taken.clone());
             if self.history.len() > 100 {
@@ -154,6 +180,43 @@ impl InputState {
             }
         }
         taken
+    }
+
+    pub fn bash_history_up(&mut self) {
+        if self.bash_history.is_empty() {
+            return;
+        }
+        match self.bash_history_index {
+            None => {
+                self.bash_draft = self.text.clone();
+                let idx = self.bash_history.len() - 1;
+                self.bash_history_index = Some(idx);
+                self.text = format!("!{}", self.bash_history[idx]);
+                self.cursor = self.text.chars().count();
+            }
+            Some(idx) if idx > 0 => {
+                let new_idx = idx - 1;
+                self.bash_history_index = Some(new_idx);
+                self.text = format!("!{}", self.bash_history[new_idx]);
+                self.cursor = self.text.chars().count();
+            }
+            Some(_) => {}
+        }
+    }
+
+    pub fn bash_history_down(&mut self) {
+        if let Some(idx) = self.bash_history_index {
+            if idx + 1 < self.bash_history.len() {
+                let new_idx = idx + 1;
+                self.bash_history_index = Some(new_idx);
+                self.text = format!("!{}", self.bash_history[new_idx]);
+                self.cursor = self.text.chars().count();
+            } else {
+                self.bash_history_index = None;
+                self.text = std::mem::take(&mut self.bash_draft);
+                self.cursor = self.text.chars().count();
+            }
+        }
     }
 
     pub fn history_up(&mut self) {

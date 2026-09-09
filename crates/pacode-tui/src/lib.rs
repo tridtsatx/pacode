@@ -11,6 +11,8 @@
 //! - `terminal`: raw mode / alt screen / mouse capture / panic hook
 
 pub mod app;
+pub mod at_complete;
+pub mod bash;
 pub mod binding;
 pub mod clipboard;
 pub mod commands;

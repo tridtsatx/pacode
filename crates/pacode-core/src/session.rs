@@ -91,11 +91,18 @@ impl Session {
             .main_agent()
             .ok_or_else(|| CoreError::AgentNotFound(AgentId::main()))?;
 
+        let cwd = self.meta().cwd;
+        let expanded_text = crate::expand::expand_user_message(
+            &text,
+            &cwd,
+            self.config.context.tool_output_cap_chars,
+        );
+
         let (seq, arc_msg) = main
             .history
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push(pacode_types::Message::user(&text));
+            .push(pacode_types::Message::user(&expanded_text));
         self.store
             .append_message(&self.id, &main.id, seq, &arc_msg)
             .await?;

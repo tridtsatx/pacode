@@ -112,7 +112,8 @@ impl TranscriptState {
             }
             pacode_types::TranscriptKind::User { .. }
             | pacode_types::TranscriptKind::Notice { .. }
-            | pacode_types::TranscriptKind::Permission(_) => {}
+            | pacode_types::TranscriptKind::Permission(_)
+            | pacode_types::TranscriptKind::BashCommand { .. } => {}
         }
     }
 }

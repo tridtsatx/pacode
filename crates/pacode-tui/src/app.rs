@@ -40,6 +40,7 @@ enum BgResponse {
     LoadHistoryReply {
         result: Result<Reply, pacode_client::ClientError>,
     },
+    BashCompleted(Result<crate::bash::BashOutput, String>),
 }
 
 pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> {
@@ -328,6 +329,49 @@ fn dispatch_action(
                 let _ = tx.send(BgResponse::Reply(res));
             });
         }
+        Action::RunBashInteractive { command } => {
+            let shell = crate::bash::user_shell();
+            let cwd = state.cwd();
+            let mouse = state.config.ui.mouse;
+            let status = crate::terminal::run_suspended(mouse, || {
+                std::process::Command::new(&shell)
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(&cwd)
+                    .status()
+            });
+            let (exit_code, err_msg) = match status {
+                Ok(Ok(s)) => (s.code(), None),
+                Ok(Err(e)) | Err(e) => (Some(1), Some(e.to_string())),
+            };
+            let now = now_ms();
+            let output = err_msg.unwrap_or_default();
+            state.transcript.cells.push_back(Cell {
+                id: now,
+                kind: CellKind::Item(TranscriptKind::BashCommand {
+                    command,
+                    output,
+                    exit_code,
+                    truncated: false,
+                }),
+                version: 0,
+                ts_ms: now,
+                stats: None,
+            });
+            state.transcript.scroll_to_bottom();
+            state.dirty = true;
+        }
+        Action::RunBashCaptured { command } => {
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            state.running_bash = Some(cancel_tx);
+            state.dirty = true;
+            let tx = bg_tx.clone();
+            let cwd = state.cwd();
+            tokio::spawn(async move {
+                let res = crate::bash::run_captured(&command, &cwd, cancel_rx).await;
+                let _ = tx.send(BgResponse::BashCompleted(res));
+            });
+        }
         Action::LoadPanel => {
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
@@ -539,6 +583,43 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                 }
                 _ => {
                     state.transcript.loading_history = false;
+                }
+            }
+            vec![]
+        }
+        BgResponse::BashCompleted(res) => {
+            state.running_bash = None;
+            state.dirty = true;
+            match res {
+                Ok(out) => {
+                    let now = now_ms();
+                    state.transcript.cells.push_back(Cell {
+                        id: now,
+                        kind: CellKind::Item(TranscriptKind::BashCommand {
+                            command: out.command,
+                            output: out.output,
+                            exit_code: out.exit_code,
+                            truncated: out.truncated,
+                        }),
+                        version: 0,
+                        ts_ms: now,
+                        stats: None,
+                    });
+                    state.transcript.scroll_to_bottom();
+                }
+                Err(err) => {
+                    let now = now_ms();
+                    state.transcript.cells.push_back(Cell {
+                        id: now,
+                        kind: CellKind::Item(TranscriptKind::Notice {
+                            level: ToastLevel::Error,
+                            text: err,
+                        }),
+                        version: 0,
+                        ts_ms: now,
+                        stats: None,
+                    });
+                    state.transcript.scroll_to_bottom();
                 }
             }
             vec![]

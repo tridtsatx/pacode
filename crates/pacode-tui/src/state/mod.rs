@@ -186,6 +186,8 @@ pub struct AppState {
     pub active_slot: usize,
     /// Working directory for the session.
     pub cwd: PathBuf,
+    /// Cancellation sender for currently running local bash command.
+    pub running_bash: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// What the panel shows.
@@ -251,7 +253,12 @@ impl AppState {
             slots: Default::default(),
             active_slot: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            running_bash: None,
         }
+    }
+
+    pub fn is_running_bash(&self) -> bool {
+        self.running_bash.is_some()
     }
 
     /// Fold a client event into the state (spec §5 state table, §7 follow rules).

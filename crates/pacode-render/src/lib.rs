@@ -15,7 +15,7 @@ pub use diff::{diff_stat, render_diff, unified_diff};
 pub use markdown::render_markdown;
 pub use palettes::builtin_palettes;
 pub use stream::{StreamBuffer, StreamKind, StreamOp};
-pub use theme::{Glyphs, Palette, Theme, detect_truecolor, parse_color, rgb_to_ansi16};
+pub use theme::{BashRole, Glyphs, Palette, Theme, detect_truecolor, parse_color, rgb_to_ansi16};
 pub use wrap::{display_width, truncate_to_width, wrap_line, wrap_text};
 
 /// Rendering parameters shared by all renderers.

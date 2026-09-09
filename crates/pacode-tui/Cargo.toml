@@ -14,8 +14,9 @@ pacode-import = { workspace = true }
 pacode-image = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "process"] }
 futures = { workspace = true }
+ignore = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 chrono = { workspace = true }

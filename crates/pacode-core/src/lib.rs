@@ -18,6 +18,7 @@
 pub mod agent;
 pub mod compaction;
 pub mod core;
+pub mod expand;
 pub mod host;
 pub mod inject;
 pub mod naming;

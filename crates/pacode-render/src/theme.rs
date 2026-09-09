@@ -16,6 +16,18 @@ pub struct Palette {
     pub colors: BTreeMap<String, String>,
 }
 
+/// Semantic roles for syntax highlighting in bash mode (spec prompt-input feature 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashRole {
+    Command,
+    Flag,
+    String,
+    Operator,
+    Variable,
+    Argument,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Theme {
     pub fg: Style,
@@ -30,6 +42,12 @@ pub struct Theme {
     pub bold: Style,
     pub selected_bg: Style,
     pub user_bar: Style,
+    pub bash_command: Style,
+    pub bash_flag: Style,
+    pub bash_string: Style,
+    pub bash_operator: Style,
+    pub bash_variable: Style,
+    pub bash_arg: Style,
 }
 
 /// Detects `COLORTERM` (`truecolor`/`24bit`) or `PACODE_COLOR=ansi|truecolor`.
@@ -125,6 +143,30 @@ impl Theme {
         let user_bar = resolve("user_bar")
             .map(|c| Style::default().fg(c))
             .unwrap_or(base.user_bar);
+        let bash_command = resolve("bash_command")
+            .or_else(|| resolve("command"))
+            .map(|c| Style::default().fg(c).add_modifier(Modifier::BOLD))
+            .unwrap_or(base.bash_command);
+        let bash_flag = resolve("bash_flag")
+            .or_else(|| resolve("flag"))
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.bash_flag);
+        let bash_string = resolve("bash_string")
+            .or_else(|| resolve("string"))
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.bash_string);
+        let bash_operator = resolve("bash_operator")
+            .or_else(|| resolve("operator"))
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.bash_operator);
+        let bash_variable = resolve("bash_variable")
+            .or_else(|| resolve("variable"))
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.bash_variable);
+        let bash_arg = resolve("bash_arg")
+            .or_else(|| resolve("argument"))
+            .map(|c| Style::default().fg(c))
+            .unwrap_or(base.bash_arg);
 
         Self {
             fg,
@@ -139,6 +181,24 @@ impl Theme {
             bold,
             selected_bg,
             user_bar,
+            bash_command,
+            bash_flag,
+            bash_string,
+            bash_operator,
+            bash_variable,
+            bash_arg,
+        }
+    }
+
+    /// Style for a semantic bash role.
+    pub fn bash_style(&self, role: BashRole) -> Style {
+        match role {
+            BashRole::Command => self.bash_command,
+            BashRole::Flag => self.bash_flag,
+            BashRole::String => self.bash_string,
+            BashRole::Operator => self.bash_operator,
+            BashRole::Variable => self.bash_variable,
+            BashRole::Argument => self.bash_arg,
         }
     }
 
@@ -161,6 +221,12 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             selected_bg: Style::default().bg(Color::Rgb(0x1e, 0x24, 0x1c)),
             user_bar: rgb(0x6e, 0xa9, 0xbd),
+            bash_command: rgb(0x6e, 0xa9, 0xbd).add_modifier(Modifier::BOLD),
+            bash_flag: rgb(0x9a, 0x8b, 0xc4),
+            bash_string: rgb(0x96, 0xb3, 0x5d),
+            bash_operator: rgb(0xd9, 0x9b, 0x4e),
+            bash_variable: rgb(0xf5, 0xc5, 0x42),
+            bash_arg: rgb(0xc9, 0xc7, 0xc0),
         }
     }
 
@@ -181,6 +247,14 @@ impl Theme {
                 .bg(Color::Black)
                 .add_modifier(Modifier::REVERSED),
             user_bar: Style::default().fg(Color::Cyan),
+            bash_command: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            bash_flag: Style::default().fg(Color::Magenta),
+            bash_string: Style::default().fg(Color::Green),
+            bash_operator: Style::default().fg(Color::Yellow),
+            bash_variable: Style::default().fg(Color::Yellow),
+            bash_arg: Style::default(),
         }
     }
 }

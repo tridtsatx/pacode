@@ -188,7 +188,7 @@ fn render_cell(
     }
 }
 
-fn render_item(
+pub(crate) fn render_item(
     kind: &TranscriptKind,
     stats: Option<&str>,
     width: u16,
@@ -388,6 +388,46 @@ fn render_item(
             )));
             lines.push(Line::default());
             lines
+        }
+        TranscriptKind::BashCommand {
+            command,
+            output,
+            exit_code,
+            truncated: _,
+        } => {
+            let mut out = Vec::new();
+            let mut header_spans = vec![
+                Span::styled(
+                    "! ",
+                    opts.theme
+                        .accent
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                Span::styled(command.clone(), opts.theme.bold),
+            ];
+
+            if let Some(code) = exit_code
+                && *code != 0
+            {
+                header_spans.push(Span::raw(" "));
+                header_spans.push(Span::styled(format!("(exit {code})"), opts.theme.red));
+            }
+            out.push(Line::from(header_spans));
+
+            if !output.is_empty() {
+                for line in output.lines() {
+                    out.push(Line::from(vec![
+                        Span::styled("  │ ", opts.theme.dim),
+                        Span::styled(
+                            truncate_to_width(line, (width as usize).saturating_sub(4), true),
+                            opts.theme.fg,
+                        ),
+                    ]));
+                }
+            }
+
+            out.push(Line::default());
+            out
         }
     }
 }

@@ -59,6 +59,13 @@ pub enum TranscriptKind {
         text: String,
     },
     Permission(PermissionRequest),
+    BashCommand {
+        command: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        truncated: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -87,6 +94,27 @@ mod tests {
         assert_eq!(json["kind"], "user");
         assert_eq!(json["text"], "hi");
         assert_eq!(json["seq"], 3);
+        let back: TranscriptItem = serde_json::from_value(json).unwrap();
+        assert_eq!(back, item);
+    }
+
+    #[test]
+    fn bash_command_kind_tag() {
+        let item = TranscriptItem {
+            seq: 4,
+            agent: AgentId::main(),
+            ts_ms: 2,
+            kind: TranscriptKind::BashCommand {
+                command: "cargo test".into(),
+                output: "ok\n".into(),
+                exit_code: Some(0),
+                truncated: false,
+            },
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["kind"], "bash_command");
+        assert_eq!(json["command"], "cargo test");
+        assert_eq!(json["exit_code"], 0);
         let back: TranscriptItem = serde_json::from_value(json).unwrap();
         assert_eq!(back, item);
     }

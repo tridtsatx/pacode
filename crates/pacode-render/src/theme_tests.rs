@@ -74,6 +74,12 @@ fn test_pacode_dark_equals_theme_default_field_for_field() {
     assert_eq!(from_pal.bold, previous.bold);
     assert_eq!(from_pal.selected_bg, previous.selected_bg);
     assert_eq!(from_pal.user_bar, previous.user_bar);
+    assert_eq!(from_pal.bash_command, previous.bash_command);
+    assert_eq!(from_pal.bash_flag, previous.bash_flag);
+    assert_eq!(from_pal.bash_string, previous.bash_string);
+    assert_eq!(from_pal.bash_operator, previous.bash_operator);
+    assert_eq!(from_pal.bash_variable, previous.bash_variable);
+    assert_eq!(from_pal.bash_arg, previous.bash_arg);
     assert_eq!(from_pal, previous);
 }
 

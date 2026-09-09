@@ -23,6 +23,14 @@ pub enum Action {
     LoadPanel,
     /// Ask for an older history page for the dialog.
     LoadHistory,
+    /// Run bash command captured asynchronously.
+    RunBashCaptured {
+        command: String,
+    },
+    /// Run interactive full-screen bash command suspended.
+    RunBashInteractive {
+        command: String,
+    },
     Quit,
 }
 
@@ -63,6 +71,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![Action::Quit];
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        if let Some(cancel_tx) = state.running_bash.take() {
+            let _ = cancel_tx.send(());
+            return vec![];
+        }
         if !state.input.is_empty() {
             state.input.text.clear();
             state.input.cursor = 0;
@@ -123,12 +135,59 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![Action::Send(Request::ListSessions { limit: 50 })];
     }
 
-    // 3. Shift+Tab: cycle permission mode; plain Tab: autocomplete slash command
+    // 3. Shift+Tab: cycle permission mode; plain Tab: autocomplete slash command / @ / bash
     if action == Some(KeyAction::CycleMode) {
         let next_mode = state.mode().next();
         return vec![Action::Send(Request::SetMode(next_mode))];
     }
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        // First check @ completion
+        let byte_cursor =
+            crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
+        if !state.input.at_closed
+            && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
+        {
+            let cwd = state.cwd();
+            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            if !candidates.is_empty() {
+                let sel = state.input.at_index % candidates.len();
+                let cand = candidates[sel].clone();
+                let prefix = state.input.text[..q.at_byte_index].to_string();
+                let suffix = state.input.text[byte_cursor..].to_string();
+                let insert = format!("@{}", cand.path);
+                let new_cursor = prefix.chars().count() + insert.chars().count();
+                state.input.text = format!("{prefix}{insert}{suffix}");
+                state.input.cursor = new_cursor;
+                if cand.is_dir {
+                    state.input.at_closed = false;
+                    state.input.at_index = 0;
+                } else {
+                    state.input.insert_char(' ');
+                    state.input.at_closed = true;
+                }
+                return vec![];
+            }
+        }
+
+        // Second check bash mode Tab completion
+        if state.input.text.starts_with('!') {
+            let cwd = state.cwd();
+            let char_cursor = state.input.cursor.saturating_sub(1);
+            let candidates = crate::bash::complete::complete(
+                &state.input.text[1..],
+                char_cursor,
+                &state.input.bash_history,
+                &cwd,
+            );
+            if !candidates.is_empty() {
+                let sel = state.input.bash_complete_index % candidates.len();
+                let cand = &candidates[sel];
+                state.input.text = format!("!{}", cand.replacement);
+                state.input.cursor = state.input.text.chars().count();
+                return vec![];
+            }
+        }
+
         if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
             let query = &state.input.text[1..];
             let matches = commands::matching(query);
@@ -146,6 +205,18 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 4. Escape: peel layers one by one
     if action == Some(KeyAction::Cancel) {
+        if !state.input.at_closed {
+            let byte_cursor =
+                crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
+            if pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor).is_some() {
+                state.input.at_closed = true;
+                return vec![];
+            }
+        }
+        if state.input.text.starts_with('!') && !state.input.bash_complete_closed {
+            state.input.bash_complete_closed = true;
+            return vec![];
+        }
         if state.config.ui.vim && state.focus == Focus::Normal {
             // Handled by vim::handle on the normal prompt
         } else {
@@ -284,6 +355,33 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     if action == Some(KeyAction::Submit) {
+        let byte_cursor =
+            crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
+        if !state.input.at_closed
+            && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
+        {
+            let cwd = state.cwd();
+            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            if !candidates.is_empty() {
+                let sel = state.input.at_index % candidates.len();
+                let cand = candidates[sel].clone();
+                let prefix = state.input.text[..q.at_byte_index].to_string();
+                let suffix = state.input.text[byte_cursor..].to_string();
+                let insert = format!("@{}", cand.path);
+                let new_cursor = prefix.chars().count() + insert.chars().count();
+                state.input.text = format!("{prefix}{insert}{suffix}");
+                state.input.cursor = new_cursor;
+                if cand.is_dir {
+                    state.input.at_closed = false;
+                    state.input.at_index = 0;
+                } else {
+                    state.input.insert_char(' ');
+                    state.input.at_closed = true;
+                }
+                return vec![];
+            }
+        }
+
         if !state.input.is_empty() {
             return submit_prompt(state);
         }
@@ -368,8 +466,38 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
-    // 11. Up / Down arrows for history / slash popup
+    // 11. Up / Down arrows for history / slash popup / @ popup / bash completion
     if key.code == KeyCode::Up {
+        let byte_cursor =
+            crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
+        if !state.input.at_closed
+            && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
+        {
+            let cwd = state.cwd();
+            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            if !candidates.is_empty() {
+                let n = candidates.len();
+                state.input.at_index = (state.input.at_index + n - 1) % n;
+                return vec![];
+            }
+        }
+        if state.input.text.starts_with('!') {
+            let cwd = state.cwd();
+            let char_cursor = state.input.cursor.saturating_sub(1);
+            let candidates = crate::bash::complete::complete(
+                &state.input.text[1..],
+                char_cursor,
+                &state.input.bash_history,
+                &cwd,
+            );
+            if !state.input.bash_complete_closed && !candidates.is_empty() {
+                let n = candidates.len();
+                state.input.bash_complete_index = (state.input.bash_complete_index + n - 1) % n;
+                return vec![];
+            }
+            state.input.bash_history_up();
+            return vec![];
+        }
         if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
             let matches = commands::matching(&state.input.text[1..]);
             if !matches.is_empty() {
@@ -382,6 +510,36 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
     if key.code == KeyCode::Down {
+        let byte_cursor =
+            crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
+        if !state.input.at_closed
+            && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
+        {
+            let cwd = state.cwd();
+            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            if !candidates.is_empty() {
+                let n = candidates.len();
+                state.input.at_index = (state.input.at_index + 1) % n;
+                return vec![];
+            }
+        }
+        if state.input.text.starts_with('!') {
+            let cwd = state.cwd();
+            let char_cursor = state.input.cursor.saturating_sub(1);
+            let candidates = crate::bash::complete::complete(
+                &state.input.text[1..],
+                char_cursor,
+                &state.input.bash_history,
+                &cwd,
+            );
+            if !state.input.bash_complete_closed && !candidates.is_empty() {
+                let n = candidates.len();
+                state.input.bash_complete_index = (state.input.bash_complete_index + 1) % n;
+                return vec![];
+            }
+            state.input.bash_history_down();
+            return vec![];
+        }
         if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
             let matches = commands::matching(&state.input.text[1..]);
             if !matches.is_empty() {
@@ -428,6 +586,18 @@ fn submit_prompt(state: &mut AppState) -> Vec<Action> {
         let text = state.input.take();
         if text.starts_with('/') {
             return commands::execute(state, &text);
+        }
+        if let Some(rest) = text.strip_prefix('!') {
+            let cmd = rest.trim().to_string();
+            if cmd.is_empty() {
+                return vec![];
+            }
+            crate::bash::record_history(&mut state.input.bash_history, &cmd);
+            if crate::bash::is_interactive(&cmd) {
+                return vec![Action::RunBashInteractive { command: cmd }];
+            } else {
+                return vec![Action::RunBashCaptured { command: cmd }];
+            }
         }
         return vec![Action::Send(Request::UserMessage { text })];
     }

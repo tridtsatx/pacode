@@ -2471,6 +2471,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "ignore",
  "insta",
  "log",
  "pacode-client",

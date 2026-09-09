@@ -435,6 +435,19 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                     CellKind::Item(TranscriptKind::ToolCall { name, title, .. }) => {
                         md.push_str(&format!("*Tool: {name} - {title}*\n\n"));
                     }
+                    CellKind::Item(TranscriptKind::BashCommand {
+                        command,
+                        output,
+                        exit_code,
+                        ..
+                    }) => {
+                        let code = exit_code
+                            .map(|c| format!(" (exit {c})"))
+                            .unwrap_or_default();
+                        md.push_str(&format!(
+                            "### Bash: {command}{code}\n\n```\n{output}\n```\n\n"
+                        ));
+                    }
                     _ => {}
                 }
             }
