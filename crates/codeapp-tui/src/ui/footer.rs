@@ -168,7 +168,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     opts.theme.bold,
                                 ),
                                 Span::styled(
-                                    "enter открыть · alt+b follow · esc снять",
+                                    "enter open · alt+b follow · esc clear",
                                     opts.theme.dim,
                                 ),
                             ],
@@ -204,7 +204,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     Span::styled("FOLLOW", opts.theme.selected_bg),
                                     Span::raw(" "),
                                     Span::styled(format!("{name} {dur} · "), opts.theme.bold),
-                                    Span::styled("pgup пауза · alt+b отпустить", opts.theme.dim),
+                                    Span::styled("pgup pause · alt+b release", opts.theme.dim),
                                 ],
                                 false,
                             )
@@ -217,7 +217,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     ),
                                     Span::styled(format!("{name} · "), opts.theme.bold),
                                     Span::styled(
-                                        "esc назад · alt+b follow · s стоп",
+                                        "esc back · alt+b follow · s stop",
                                         opts.theme.dim,
                                     ),
                                 ],
@@ -235,7 +235,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     format!("{running} bg running · {failed} failed · "),
                                     opts.theme.bold,
                                 ),
-                                Span::styled("enter вывод · k убить · esc", opts.theme.dim),
+                                Span::styled("enter output · k kill · esc", opts.theme.dim),
                             ],
                             false,
                         )

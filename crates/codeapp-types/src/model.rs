@@ -16,17 +16,26 @@ pub enum Effort {
     #[default]
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
     Max,
 }
 
 impl Effort {
-    pub const ALL: [Effort; 4] = [Effort::Low, Effort::Medium, Effort::High, Effort::Max];
+    pub const ALL: [Effort; 5] = [
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::XHigh,
+        Effort::Max,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
+            Effort::XHigh => "xhigh",
             Effort::Max => "max",
         }
     }
@@ -36,7 +45,8 @@ impl Effort {
             "low" => Some(Effort::Low),
             "medium" | "med" => Some(Effort::Medium),
             "high" => Some(Effort::High),
-            "max" | "xhigh" => Some(Effort::Max),
+            "xhigh" | "x-high" | "extra-high" => Some(Effort::XHigh),
+            "max" => Some(Effort::Max),
             _ => None,
         }
     }
@@ -46,7 +56,8 @@ impl Effort {
         match self {
             Effort::Low | Effort::Medium => 1,
             Effort::High => 2,
-            Effort::Max => 3,
+            Effort::XHigh => 3,
+            Effort::Max => 4,
         }
     }
 }

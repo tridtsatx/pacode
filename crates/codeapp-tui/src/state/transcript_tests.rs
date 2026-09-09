@@ -131,3 +131,110 @@ fn test_enforce_cap_retains_live_cell() {
     assert_eq!(t.cells[1].id, 3);
     assert_eq!(t.live_cell, Some(3));
 }
+
+#[test]
+fn test_turn_ended_stats_attached() {
+    use crate::state::AppState;
+    use codeapp_types::stream::Usage;
+    use codeapp_types::{Config, Event, TurnStop};
+
+    let mut state = AppState::new(Config::default(), "0.1.0".into(), 80, 24);
+    let now = Instant::now();
+
+    // Start turn
+    state.apply_event(
+        1,
+        Event::TurnStarted {
+            agent: AgentId::main(),
+            turn: codeapp_types::TurnId::new("trn_1"),
+        },
+        now,
+    );
+
+    // Assistant item added
+    state.apply_event(
+        2,
+        Event::ItemAdded(TranscriptItem {
+            seq: 2,
+            agent: AgentId::main(),
+            ts_ms: 1000,
+            kind: TranscriptKind::Assistant {
+                text: "Hello world".into(),
+                complete: true,
+            },
+        }),
+        now,
+    );
+
+    let initial_version = state.transcript.cells[0].version;
+    assert_eq!(state.transcript.cells[0].stats, None);
+
+    // Turn ended 2 seconds later with usage
+    let later = now + Duration::from_secs(2);
+    state.apply_event(
+        3,
+        Event::TurnEnded {
+            agent: AgentId::main(),
+            turn: codeapp_types::TurnId::new("trn_1"),
+            usage: Some(Usage {
+                input_tokens: 500,
+                output_tokens: 100,
+                reasoning_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            stop: TurnStop::Completed,
+        },
+        later,
+    );
+
+    let cell = &state.transcript.cells[0];
+    assert!(cell.stats.is_some());
+    let stats = cell.stats.as_ref().unwrap();
+    // 2s duration (2.0s), 100 tokens / 2.0s = 50.0 tok/s, out 100, in 500
+    assert_eq!(stats, "2.0s · 50.0 tok/s · ↑100 ↓500");
+    assert_eq!(cell.version, initial_version + 1);
+}
+
+#[test]
+fn test_turn_ended_zero_tokens_no_stats() {
+    use crate::state::AppState;
+    use codeapp_types::stream::Usage;
+    use codeapp_types::{Config, Event, TurnStop};
+
+    let mut state = AppState::new(Config::default(), "0.1.0".into(), 80, 24);
+    let now = Instant::now();
+
+    state.apply_event(
+        1,
+        Event::ItemAdded(TranscriptItem {
+            seq: 1,
+            agent: AgentId::main(),
+            ts_ms: 1000,
+            kind: TranscriptKind::Assistant {
+                text: "Hello".into(),
+                complete: true,
+            },
+        }),
+        now,
+    );
+
+    state.apply_event(
+        2,
+        Event::TurnEnded {
+            agent: AgentId::main(),
+            turn: codeapp_types::TurnId::new("trn_1"),
+            usage: Some(Usage {
+                input_tokens: 500,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            stop: TurnStop::Completed,
+        },
+        now,
+    );
+
+    assert_eq!(state.transcript.cells[0].stats, None);
+}

@@ -292,6 +292,7 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) {
                 }),
                 version: 0,
                 ts_ms: now,
+                stats: None,
             });
             state.dirty = true;
         }
@@ -314,6 +315,7 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) {
                 }),
                 version: 0,
                 ts_ms: now,
+                stats: None,
             });
             state.dirty = true;
         }

@@ -18,7 +18,7 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     *index = index.saturating_sub(1);
                 }
                 KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
-                    *index = (*index + 1).min(3);
+                    *index = (*index + 1).min(codeapp_types::Effort::ALL.len() - 1);
                 }
                 KeyCode::Enter => {
                     let effort = codeapp_types::Effort::ALL[*index];
@@ -213,12 +213,10 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                                     .unwrap_or(1);
                                 state.focus = Focus::Overlay(Overlay::EffortPicker { index: cur });
                             } else {
-                                let next = match state.effort() {
-                                    codeapp_types::Effort::Low => codeapp_types::Effort::Medium,
-                                    codeapp_types::Effort::Medium => codeapp_types::Effort::High,
-                                    codeapp_types::Effort::High => codeapp_types::Effort::Max,
-                                    codeapp_types::Effort::Max => codeapp_types::Effort::Low,
-                                };
+                                let all = codeapp_types::Effort::ALL;
+                                let cur =
+                                    all.iter().position(|e| *e == state.effort()).unwrap_or(0);
+                                let next = all[(cur + 1) % all.len()];
                                 state.config.provider.effort = next;
                                 let _ = codeapp_config::update_config_value(
                                     &state.paths,

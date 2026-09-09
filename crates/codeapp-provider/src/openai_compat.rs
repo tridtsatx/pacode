@@ -218,7 +218,7 @@ impl OpenAiCompat {
                 None => match effort {
                     Effort::Low => "low".to_string(),
                     Effort::Medium => "medium".to_string(),
-                    Effort::High | Effort::Max => "high".to_string(),
+                    Effort::High | Effort::XHigh | Effort::Max => "high".to_string(),
                 },
             };
             body.insert(

@@ -27,20 +27,21 @@ pub fn draw(
     let width = area.width;
     let live_id = transcript.live_cell;
 
-    let cell_snapshots: Vec<(u64, u32, CellKind)> = transcript
+    let cell_snapshots: Vec<(u64, u32, CellKind, Option<String>)> = transcript
         .cells
         .iter()
-        .map(|c| (c.id, c.version, c.kind.clone()))
+        .map(|c| (c.id, c.version, c.kind.clone(), c.stats.clone()))
         .collect();
 
     let mut cell_lines: Vec<Vec<Line<'static>>> = Vec::with_capacity(cell_snapshots.len());
 
-    for (id, version, kind) in cell_snapshots {
-        let is_live = live_id == Some(id);
+    for (id, version, kind, stats) in &cell_snapshots {
+        let is_live = live_id == Some(*id);
         let args = CellRenderArgs {
-            cell_id: id,
-            cell_version: version,
-            cell_kind: &kind,
+            cell_id: *id,
+            cell_version: *version,
+            cell_kind: kind,
+            cell_stats: stats.as_deref(),
             is_live,
             width,
             anim_frame,
@@ -89,6 +90,7 @@ struct CellRenderArgs<'a> {
     cell_id: u64,
     cell_version: u32,
     cell_kind: &'a CellKind,
+    cell_stats: Option<&'a str>,
     is_live: bool,
     width: u16,
     anim_frame: u64,
@@ -116,7 +118,13 @@ fn get_or_render_cell(
         if let Some(cached) = transcript.cache.get(key) {
             return cached.to_vec();
         }
-        let rendered = render_cell(args.cell_kind, args.width, opts, args.anim_frame);
+        let rendered = render_cell(
+            args.cell_kind,
+            args.cell_stats,
+            args.width,
+            opts,
+            args.anim_frame,
+        );
         let cached = transcript.cache.insert(key, rendered);
         return cached.to_vec();
     }
@@ -139,11 +147,23 @@ fn get_or_render_cell(
         let mut tail_lines = render_markdown(tail, opts);
         let mut combined = stable_lines;
         combined.append(&mut tail_lines);
+        if let Some(stats) = args.cell_stats {
+            combined.push(Line::from(Span::styled(
+                stats.to_string(),
+                opts.theme.faint,
+            )));
+        }
         combined.push(Line::default());
         return combined;
     }
 
-    let rendered = render_cell(args.cell_kind, args.width, opts, args.anim_frame);
+    let rendered = render_cell(
+        args.cell_kind,
+        args.cell_stats,
+        args.width,
+        opts,
+        args.anim_frame,
+    );
     if !is_running_tool {
         let cached = transcript.cache.insert(key, rendered);
         cached.to_vec()
@@ -154,18 +174,20 @@ fn get_or_render_cell(
 
 fn render_cell(
     cell_kind: &CellKind,
+    stats: Option<&str>,
     width: u16,
     opts: &RenderOptions,
     anim_frame: u64,
 ) -> Vec<Line<'static>> {
     match cell_kind {
         CellKind::Gap => vec![Line::default()],
-        CellKind::Item(kind) => render_item(kind, width, opts, anim_frame),
+        CellKind::Item(kind) => render_item(kind, stats, width, opts, anim_frame),
     }
 }
 
 fn render_item(
     kind: &TranscriptKind,
+    stats: Option<&str>,
     width: u16,
     opts: &RenderOptions,
     anim_frame: u64,
@@ -199,6 +221,12 @@ fn render_item(
                 ];
             }
             let mut lines = render_markdown(text, opts);
+            if let Some(stats) = stats {
+                lines.push(Line::from(Span::styled(
+                    stats.to_string(),
+                    opts.theme.faint,
+                )));
+            }
             lines.push(Line::default());
             lines
         }

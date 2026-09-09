@@ -19,6 +19,7 @@ pub struct Cell {
     /// Bumped whenever the content changes (invalidates the cache).
     pub version: u32,
     pub ts_ms: u64,
+    pub stats: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +80,7 @@ impl Transcript {
                 kind: CellKind::Item(item.kind),
                 version: 0,
                 ts_ms: item.ts_ms,
+                stats: None,
             };
             self.cells.push_back(cell);
         }
@@ -96,6 +98,7 @@ impl Transcript {
                 kind: CellKind::Item(item.kind),
                 version: 0,
                 ts_ms: item.ts_ms,
+                stats: None,
             };
             self.cells.push_front(cell);
         }
@@ -199,6 +202,7 @@ impl Transcript {
                 kind: CellKind::Item(kind),
                 version: 0,
                 ts_ms,
+                stats: None,
             });
         }
     }

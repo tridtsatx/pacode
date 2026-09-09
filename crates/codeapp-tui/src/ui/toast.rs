@@ -1,5 +1,5 @@
 //! Toasts (spec §7): up to 2 lines, right-aligned above the input, 6 s TTL:
-//! `✓ cargo build завершилась 3m02s` + `warnings 2 · точка — открыть`.
+//! `✓ cargo build finished 3m02s` + `warnings 2 · . to open`.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -43,7 +43,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
     lines.push(title_line);
 
     if area.height > 1 {
-        let detail_str = toast.detail.as_deref().unwrap_or(". — открыть");
+        let detail_str = toast.detail.as_deref().unwrap_or(". to open");
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(

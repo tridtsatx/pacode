@@ -211,7 +211,7 @@ fn draw_agents(
             Span::styled(opts.glyphs.main_dot, opts.theme.green),
             Span::raw(" "),
             Span::styled("main  ", opts.theme.bold),
-            Span::styled(format!("думает · {dur_str}"), opts.theme.faint),
+            Span::styled(format!("thinking · {dur_str}"), opts.theme.faint),
         ])
     } else {
         Line::from(vec![

@@ -566,3 +566,46 @@ fn test_no_subagents_hides_agents_zone() {
     assert!(!view.contains("AGENTS"));
     assert!(!view.contains("● main"));
 }
+
+#[test]
+fn test_turn_ended_response_stats_rendered() {
+    let snapshot = make_base_snapshot();
+    let mut state = create_state(120, 34, snapshot);
+
+    let now = Instant::now();
+    // Simulate TurnEnded with usage
+    state.apply_event(
+        100,
+        codeapp_types::Event::TurnEnded {
+            agent: AgentId::main(),
+            turn: codeapp_types::TurnId::new("trn_test"),
+            usage: Some(codeapp_types::stream::Usage {
+                input_tokens: 5400,
+                output_tokens: 1200,
+                reasoning_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            stop: codeapp_types::TurnStop::Completed,
+        },
+        now + std::time::Duration::from_millis(2400),
+    );
+
+    let backend = TestBackend::new(120, 34);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            ui::draw(f, &mut state);
+        })
+        .unwrap();
+
+    let view = format!("{}", terminal.backend());
+    assert!(
+        view.contains("tok/s"),
+        "Dialog view must render assistant response stats line with 'tok/s', but view was:\n{view}"
+    );
+    assert!(
+        view.contains("↑1.2k ↓5.4k"),
+        "Dialog view must render '↑1.2k ↓5.4k', but view was:\n{view}"
+    );
+}

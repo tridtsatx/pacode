@@ -214,6 +214,7 @@ impl AppState {
                         kind: CellKind::Item(TranscriptKind::Permission(perm)),
                         version: 0,
                         ts_ms,
+                        stats: None,
                     });
                 }
                 self.dirty = true;
@@ -248,7 +249,7 @@ impl AppState {
             Event::TurnEnded {
                 agent,
                 turn: _,
-                usage: _,
+                usage,
                 stop,
             } => {
                 if let codeapp_types::TurnStop::Failed { message } = &stop {
@@ -260,10 +261,72 @@ impl AppState {
                     );
                 }
                 if agent.is_main() {
+                    self.transcript.flush_stream();
+                    if let Some(ref u) = usage
+                        && u.output_tokens > 0
+                    {
+                        let duration_ms = self
+                            .turn_started_at
+                            .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+                            .unwrap_or_else(|| {
+                                let last_ts = self
+                                    .transcript
+                                    .cells
+                                    .iter()
+                                    .rev()
+                                    .find_map(|c| {
+                                        if matches!(
+                                            c.kind,
+                                            CellKind::Item(TranscriptKind::Assistant { .. })
+                                        ) {
+                                            Some(c.ts_ms)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                codeapp_types::time::now_ms().saturating_sub(last_ts)
+                            });
+                        if let Some(stats) = compute_turn_stats(duration_ms, u) {
+                            attach_turn_stats(&mut self.transcript, stats);
+                        }
+                    }
                     self.turn_active = false;
                     self.turn_started_at = None;
-                    self.transcript.flush_stream();
                     self.rail.update_idle(false, now);
+                } else {
+                    let is_panel_target = self.panel.target.as_ref().is_some_and(|t| match t {
+                        PanelTarget::Agent(id) => *id == agent,
+                        _ => false,
+                    });
+                    if is_panel_target {
+                        self.panel.agent_transcript.flush_stream();
+                        if let Some(ref u) = usage
+                            && u.output_tokens > 0
+                        {
+                            let last_ts = self
+                                .panel
+                                .agent_transcript
+                                .cells
+                                .iter()
+                                .rev()
+                                .find_map(|c| {
+                                    if matches!(
+                                        c.kind,
+                                        CellKind::Item(TranscriptKind::Assistant { .. })
+                                    ) {
+                                        Some(c.ts_ms)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            let duration_ms = codeapp_types::time::now_ms().saturating_sub(last_ts);
+                            if let Some(stats) = compute_turn_stats(duration_ms, u) {
+                                attach_turn_stats(&mut self.panel.agent_transcript, stats);
+                            }
+                        }
+                    }
                 }
             }
             Event::ItemAdded(item) => {
@@ -333,6 +396,7 @@ impl AppState {
                     kind: CellKind::Item(TranscriptKind::Permission(req)),
                     version: 0,
                     ts_ms,
+                    stats: None,
                 });
             }
             Event::PermissionResolved {
@@ -483,6 +547,7 @@ impl AppState {
             }),
             version: 0,
             ts_ms: now,
+            stats: None,
         });
         self.dirty = true;
     }
@@ -566,5 +631,35 @@ impl AppState {
         } else {
             false
         }
+    }
+}
+
+fn compute_turn_stats(duration_ms: u64, usage: &codeapp_types::stream::Usage) -> Option<String> {
+    if usage.output_tokens == 0 {
+        return None;
+    }
+    let duration_secs = (duration_ms as f64) / 1000.0;
+    let tok_per_sec = if duration_secs > 0.0 {
+        (usage.output_tokens as f64) / duration_secs
+    } else {
+        0.0
+    };
+    let dur_str = codeapp_types::time::format_duration_ms(duration_ms);
+    let out_str = codeapp_types::time::format_tokens(usage.output_tokens);
+    let in_str = codeapp_types::time::format_tokens(usage.input_tokens);
+    Some(format!(
+        "{dur_str} · {tok_per_sec:.1} tok/s · ↑{out_str} ↓{in_str}"
+    ))
+}
+
+fn attach_turn_stats(transcript: &mut Transcript, stats_str: String) {
+    if let Some(cell) = transcript
+        .cells
+        .iter_mut()
+        .rev()
+        .find(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Assistant { .. })))
+    {
+        cell.stats = Some(stats_str);
+        cell.version = cell.version.wrapping_add(1);
     }
 }

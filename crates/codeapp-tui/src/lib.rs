@@ -19,6 +19,9 @@ pub mod state;
 pub mod terminal;
 pub mod ui;
 
+#[cfg(test)]
+mod no_cyrillic_tests;
+
 use std::path::PathBuf;
 
 use codeapp_client::ClientOptions;

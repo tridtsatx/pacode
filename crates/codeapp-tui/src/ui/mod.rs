@@ -95,7 +95,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                     None
                 }
             });
-            let activity = running_tool.unwrap_or_else(|| "думает…".to_string());
+            let activity = running_tool.unwrap_or_else(|| "thinking…".to_string());
             let elapsed_ms = state
                 .turn_started_at
                 .map(|t| {

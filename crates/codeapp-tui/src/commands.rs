@@ -1,6 +1,6 @@
 //! Slash commands typed in the prompt.
 //!
-//! `/model [name]` (picker without argument), `/effort <low|medium|high|max>` (picker
+//! `/model [name]` (picker without argument), `/effort <low|medium|high|xhigh|max>` (picker
 //! without argument), `/mode <build|auto|plan|bypass>`, `/sessions` (picker),
 //! `/compact`, `/clear` (transcript view only), `/export [path]` (write the visible
 //! transcript as markdown to `path` or `~/codeapp-<session>.md`), `/help`, `/quit`.
@@ -19,6 +19,7 @@ pub struct SlashCommand {
     pub name: &'static str,
     pub usage: &'static str,
     pub help: &'static str,
+    pub arg_hint: &'static str,
 }
 
 pub const COMMANDS: &[SlashCommand] = &[
@@ -26,51 +27,61 @@ pub const COMMANDS: &[SlashCommand] = &[
         name: "model",
         usage: "/model",
         help: "switch model",
+        arg_hint: "[provider/model]",
     },
     SlashCommand {
         name: "effort",
         usage: "/effort",
         help: "reasoning effort",
+        arg_hint: "[low|medium|high|xhigh|max]",
     },
     SlashCommand {
         name: "mode",
         usage: "/mode",
         help: "permission mode",
+        arg_hint: "[build|auto|plan|bypass]",
     },
     SlashCommand {
         name: "config",
         usage: "/config",
         help: "quick settings",
+        arg_hint: "",
     },
     SlashCommand {
         name: "sessions",
         usage: "/sessions",
         help: "pick a session",
+        arg_hint: "",
     },
     SlashCommand {
         name: "compact",
         usage: "/compact",
         help: "compact the context now",
+        arg_hint: "",
     },
     SlashCommand {
         name: "clear",
         usage: "/clear",
         help: "clear the transcript view",
+        arg_hint: "",
     },
     SlashCommand {
         name: "export",
         usage: "/export [path]",
         help: "save transcript as markdown",
+        arg_hint: "[path]",
     },
     SlashCommand {
         name: "help",
         usage: "/help",
         help: "show keys and commands",
+        arg_hint: "",
     },
     SlashCommand {
         name: "quit",
         usage: "/quit",
         help: "exit the client",
+        arg_hint: "",
     },
 ];
 
@@ -236,6 +247,30 @@ fn push_notice(state: &mut AppState, level: ToastLevel, text: String) {
         kind: CellKind::Item(TranscriptKind::Notice { level, text }),
         version: 0,
         ts_ms: now,
+        stats: None,
     });
     state.dirty = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_commands_arg_hints() {
+        let effort = COMMANDS.iter().find(|c| c.name == "effort").unwrap();
+        assert_eq!(effort.arg_hint, "[low|medium|high|xhigh|max]");
+
+        let mode = COMMANDS.iter().find(|c| c.name == "mode").unwrap();
+        assert_eq!(mode.arg_hint, "[build|auto|plan|bypass]");
+
+        let model = COMMANDS.iter().find(|c| c.name == "model").unwrap();
+        assert_eq!(model.arg_hint, "[provider/model]");
+
+        let export = COMMANDS.iter().find(|c| c.name == "export").unwrap();
+        assert_eq!(export.arg_hint, "[path]");
+
+        let config = COMMANDS.iter().find(|c| c.name == "config").unwrap();
+        assert_eq!(config.arg_hint, "");
+    }
 }

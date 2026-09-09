@@ -11,7 +11,7 @@ use codeapp_types::time::format_duration_ms;
 
 /// Pure function generating the pacman progress bar frame.
 ///
-/// Format: `[- C o o o o]` -> `[--- c o o o]`.
+/// Format: `[  C • • • • ]` -> `[    c • • • ]`.
 /// Width is the total display width including `[` and `]`.
 pub fn pacman_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
     if width < 3 {
@@ -19,12 +19,12 @@ pub fn pacman_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
     }
 
     let inner_w = width - 2;
-    let candy_str = if glyphs.ascii { "o" } else { "●" };
+    let candy_str = if glyphs.ascii { "o" } else { "•" };
     let mouth = if frame.is_multiple_of(2) { 'C' } else { 'c' };
 
-    // Pacman advances by 2 cells per step (eating one candy slot: "- " or "--- ").
-    // Step 0: 1 dash, 1 space ("- "), then C, then candies.
-    // Step 1: 3 dashes, 1 space ("--- "), then c, then candies.
+    // Pacman advances by 2 cells per step (eating one candy slot: "  " or "    ").
+    // Step 0: 2 spaces, then C, then candies.
+    // Step 1: 4 spaces, then c, then candies.
     let num_steps = inner_w / 2;
     let step = if num_steps > 0 {
         (frame as usize) % num_steps
@@ -32,22 +32,22 @@ pub fn pacman_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
         0
     };
 
-    let dashes_count = 2 * step + 1;
+    let spaces_count = 2 * step + 1;
     let mut out = String::with_capacity(width + 8);
     out.push('[');
 
-    // Behind pacman: dashes, then a space if space permits
-    if dashes_count + 1 < inner_w {
-        for _ in 0..dashes_count {
-            out.push('-');
+    // Behind pacman: eaten cells are spaces, then pacman mouth if space permits
+    if spaces_count + 1 < inner_w {
+        for _ in 0..spaces_count {
+            out.push(' ');
         }
         out.push(' ');
         out.push(mouth);
     } else {
-        // Near the end: fill with dashes and place pacman
-        let dashes = (inner_w.saturating_sub(1)).min(dashes_count);
-        for _ in 0..dashes {
-            out.push('-');
+        // Near the end: fill with spaces and place pacman
+        let spaces = (inner_w.saturating_sub(1)).min(spaces_count);
+        for _ in 0..spaces {
+            out.push(' ');
         }
         if out.len() < width - 1 {
             out.push(mouth);
@@ -80,7 +80,7 @@ pub fn render_pacman_line(
     max_line_width: usize,
 ) -> Line<'static> {
     let raw = pacman_frame(frame, width, &opts.glyphs);
-    let candy_sym = if opts.glyphs.ascii { 'o' } else { '●' };
+    let candy_sym = if opts.glyphs.ascii { 'o' } else { '•' };
 
     let mut spans = Vec::new();
     let mut buf = String::new();
@@ -123,23 +123,23 @@ mod tests {
     fn test_pacman_frame_ascii() {
         let glyphs = Glyphs::new(true);
         let f0 = pacman_frame(0, 14, &glyphs);
-        assert_eq!(f0, "[- C o o o o ]");
+        assert_eq!(f0, "[  C o o o o ]");
 
         let f1 = pacman_frame(1, 14, &glyphs);
-        assert_eq!(f1, "[--- c o o o ]");
+        assert_eq!(f1, "[    c o o o ]");
 
         let f2 = pacman_frame(2, 14, &glyphs);
-        assert_eq!(f2, "[----- C o o ]");
+        assert_eq!(f2, "[      C o o ]");
     }
 
     #[test]
     fn test_pacman_frame_unicode() {
         let glyphs = Glyphs::new(false);
         let f0 = pacman_frame(0, 14, &glyphs);
-        assert_eq!(f0, "[- C ● ● ● ● ]");
+        assert_eq!(f0, "[  C • • • • ]");
 
         let f1 = pacman_frame(1, 14, &glyphs);
-        assert_eq!(f1, "[--- c ● ● ● ]");
+        assert_eq!(f1, "[    c • • • ]");
     }
 
     #[test]

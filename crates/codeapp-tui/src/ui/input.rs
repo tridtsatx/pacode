@@ -55,6 +55,8 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
             None
         };
 
+        let inline_hint = command_inline_hint(&state.input.text);
+
         let mut rendered = Vec::new();
         for (i, wl) in lines
             .iter()
@@ -77,6 +79,9 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
                     line_spans.push(Span::styled(wl[token.len()..].to_string(), opts.theme.fg));
                 } else {
                     line_spans.push(Span::styled(wl.clone(), opts.theme.fg));
+                }
+                if let Some(ref hint) = inline_hint {
+                    line_spans.push(Span::styled(hint.clone(), opts.theme.dim));
                 }
             } else {
                 line_spans.push(Span::styled(wl.clone(), opts.theme.fg));
@@ -161,5 +166,72 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
 
             frame.render_widget(Paragraph::new(popup_lines), popup_area);
         }
+    }
+}
+
+pub fn command_inline_hint(text: &str) -> Option<String> {
+    if let Some(rest) = text.strip_prefix('/') {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() == 1 {
+            let cmd_name = parts[0];
+            if let Some(cmd) = commands::COMMANDS.iter().find(|c| c.name == cmd_name)
+                && !cmd.arg_hint.is_empty()
+            {
+                if text.ends_with(' ') {
+                    return Some(cmd.arg_hint.to_string());
+                } else {
+                    return Some(format!(" {}", cmd.arg_hint));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_command_inline_hints() {
+        assert_eq!(
+            command_inline_hint("/effort"),
+            Some(" [low|medium|high|xhigh|max]".into())
+        );
+        assert_eq!(
+            command_inline_hint("/effort "),
+            Some("[low|medium|high|xhigh|max]".into())
+        );
+        assert_eq!(
+            command_inline_hint("/mode"),
+            Some(" [build|auto|plan|bypass]".into())
+        );
+        assert_eq!(
+            command_inline_hint("/mode "),
+            Some("[build|auto|plan|bypass]".into())
+        );
+        assert_eq!(
+            command_inline_hint("/model"),
+            Some(" [provider/model]".into())
+        );
+        assert_eq!(
+            command_inline_hint("/model "),
+            Some("[provider/model]".into())
+        );
+        assert_eq!(command_inline_hint("/export"), Some(" [path]".into()));
+        assert_eq!(command_inline_hint("/export "), Some("[path]".into()));
+
+        // Commands with no argument hint
+        assert_eq!(command_inline_hint("/config"), None);
+        assert_eq!(command_inline_hint("/config "), None);
+
+        // Commands with arguments already typed
+        assert_eq!(command_inline_hint("/effort hi"), None);
+        assert_eq!(command_inline_hint("/mode plan"), None);
+
+        // Unknown or non-slash inputs
+        assert_eq!(command_inline_hint("/unknown"), None);
+        assert_eq!(command_inline_hint("hello"), None);
+        assert_eq!(command_inline_hint(""), None);
     }
 }
