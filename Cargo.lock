@@ -294,6 +294,7 @@ dependencies = [
 name = "codeapp-config"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "codeapp-types",
  "dirs",
  "libc",
@@ -333,6 +334,11 @@ version = "0.1.0"
 dependencies = [
  "codeapp-config",
  "codeapp-core",
+ "codeapp-exec",
+ "codeapp-mcp",
+ "codeapp-provider",
+ "codeapp-store",
+ "codeapp-tools",
  "codeapp-types",
  "libc",
  "log",
@@ -469,6 +475,7 @@ dependencies = [
  "log",
  "pretty_assertions",
  "ratatui",
+ "thiserror 2.0.20",
  "tokio",
  "unicode-segmentation",
  "unicode-width",

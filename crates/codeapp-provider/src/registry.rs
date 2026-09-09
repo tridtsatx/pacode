@@ -5,7 +5,12 @@ use std::sync::Arc;
 
 use codeapp_types::{Config, ModelInfo, ModelRoute};
 
+use crate::openai_compat::OpenAiCompat;
 use crate::{Provider, ProviderError};
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod registry_tests;
 
 #[derive(Clone)]
 pub struct ProviderRegistry {
@@ -28,8 +33,25 @@ impl ProviderRegistry {
         cfg: &Config,
         api_keys: &BTreeMap<String, Option<String>>,
     ) -> Result<Self, ProviderError> {
-        let _ = (cfg, api_keys);
-        todo!("ProviderRegistry::from_config")
+        let mut registry = Self::empty();
+        for (id, pcfg) in &cfg.providers {
+            if pcfg.base_url.trim().is_empty() {
+                return Err(ProviderError::Config(format!(
+                    "provider '{id}' has empty base_url"
+                )));
+            }
+            let api_key = api_keys.get(id).cloned().flatten();
+            let provider = OpenAiCompat::new(
+                id.clone(),
+                pcfg.clone(),
+                cfg.provider.clone(),
+                api_key,
+                cfg.pricing.clone(),
+            )?;
+            registry.insert(Arc::new(provider));
+        }
+        registry.set_default_route(cfg.default_route());
+        Ok(registry)
     }
 
     pub fn insert(&mut self, provider: Arc<dyn Provider>) {
@@ -69,6 +91,15 @@ impl ProviderRegistry {
 
     /// Catalog of every provider (errors of one provider are logged and skipped).
     pub async fn list_all_models(&self) -> Vec<ModelInfo> {
-        todo!("ProviderRegistry::list_all_models")
+        let mut all_models = Vec::new();
+        for (id, provider) in &self.providers {
+            match provider.list_models().await {
+                Ok(models) => all_models.extend(models),
+                Err(err) => {
+                    log::warn!("failed to list models for provider '{id}': {err}");
+                }
+            }
+        }
+        all_models
     }
 }

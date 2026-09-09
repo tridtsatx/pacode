@@ -6,39 +6,139 @@
 //! runs `schema::migrate`, then loops. `Store` is `Clone` (cheap); dropping the last
 //! clone stops the thread.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
 
 use codeapp_types::{
     AgentId, AgentInfo, Message, Plan, SessionId, SessionMeta, TaskInfo, Usage, UsageTotals,
 };
+use rusqlite::Connection;
 
-use crate::StoreError;
 use crate::queries::{MessageRow, SearchHit, SessionFilter};
+use crate::{StoreError, queries, schema};
+
+type Task = Box<dyn FnOnce(&mut Connection) + Send>;
+
+enum Command {
+    Execute(Task),
+    Stop,
+}
 
 #[derive(Clone)]
 pub struct Store {
-    _private: (),
+    sender: mpsc::Sender<Command>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store, StoreError> {
-        let _ = path;
-        todo!("Store::open")
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let is_memory = path.to_str() == Some(":memory:");
+        Self::start_worker(path.to_path_buf(), is_memory)
     }
 
     pub fn open_in_memory() -> Result<Store, StoreError> {
-        todo!("Store::open_in_memory")
+        Self::start_worker(PathBuf::from(":memory:"), true)
+    }
+
+    fn start_worker(path: PathBuf, is_memory: bool) -> Result<Store, StoreError> {
+        let (init_tx, init_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel::<Command>();
+
+        let builder = std::thread::Builder::new().name("codeapp-store".to_string());
+        let handle = builder
+            .spawn(move || {
+                let conn_res = if is_memory {
+                    Connection::open_in_memory()
+                } else {
+                    Connection::open(&path)
+                };
+
+                let mut conn = match conn_res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(StoreError::Sqlite(e)));
+                        return;
+                    }
+                };
+
+                if let Err(e) = Self::init_db(&mut conn, is_memory) {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+
+                if init_tx.send(Ok(())).is_err() {
+                    return;
+                }
+
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        Command::Execute(f) => f(&mut conn),
+                        Command::Stop => break,
+                    }
+                }
+            })
+            .map_err(StoreError::Io)?;
+
+        init_rx.recv().map_err(|_| StoreError::Closed)??;
+
+        Ok(Store {
+            sender: tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+        })
+    }
+
+    fn init_db(conn: &mut Connection, is_memory: bool) -> Result<(), StoreError> {
+        if !is_memory {
+            conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        }
+        conn.execute_batch(
+            r#"
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -2000;
+            PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
+            "#,
+        )?;
+        schema::migrate(conn)?;
+        Ok(())
+    }
+
+    fn call<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
+    ) -> impl std::future::Future<Output = Result<T, StoreError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = Command::Execute(Box::new(move |conn| {
+            let res = f(conn);
+            let _ = tx.send(res);
+        }));
+
+        let send_res = self.sender.send(cmd);
+
+        async move {
+            if send_res.is_err() {
+                return Err(StoreError::Closed);
+            }
+            rx.await.map_err(|_| StoreError::Closed)?
+        }
     }
 
     // --- sessions ---
     pub async fn upsert_session(&self, meta: &SessionMeta) -> Result<(), StoreError> {
-        let _ = meta;
-        todo!("Store::upsert_session")
+        let meta = meta.clone();
+        self.call(move |conn| queries::upsert_session(conn, &meta))
+            .await
     }
 
     pub async fn get_session(&self, id: &SessionId) -> Result<Option<SessionMeta>, StoreError> {
-        let _ = id;
-        todo!("Store::get_session")
+        let id = id.clone();
+        self.call(move |conn| queries::get_session(conn, &id)).await
     }
 
     /// Most recently updated first.
@@ -46,14 +146,15 @@ impl Store {
         &self,
         filter: SessionFilter,
     ) -> Result<Vec<SessionMeta>, StoreError> {
-        let _ = filter;
-        todo!("Store::list_sessions")
+        self.call(move |conn| queries::list_sessions(conn, filter))
+            .await
     }
 
     /// Deletes the session and everything owned by it.
     pub async fn delete_session(&self, id: &SessionId) -> Result<(), StoreError> {
-        let _ = id;
-        todo!("Store::delete_session")
+        let id = id.clone();
+        self.call(move |conn| queries::delete_session(conn, &id))
+            .await
     }
 
     // --- messages ---
@@ -65,8 +166,11 @@ impl Store {
         seq: u64,
         msg: &Message,
     ) -> Result<(), StoreError> {
-        let _ = (session, agent, seq, msg);
-        todo!("Store::append_message")
+        let session = session.clone();
+        let agent = agent.clone();
+        let msg = msg.clone();
+        self.call(move |conn| queries::append_message(conn, &session, &agent, seq, &msg))
+            .await
     }
 
     /// All messages of an agent in seq order.
@@ -75,8 +179,10 @@ impl Store {
         session: &SessionId,
         agent: &AgentId,
     ) -> Result<Vec<MessageRow>, StoreError> {
-        let _ = (session, agent);
-        todo!("Store::load_messages")
+        let session = session.clone();
+        let agent = agent.clone();
+        self.call(move |conn| queries::load_messages(conn, &session, &agent))
+            .await
     }
 
     /// Up to `limit` messages with `seq < before` (or the last ones), ascending.
@@ -87,8 +193,10 @@ impl Store {
         before: Option<u64>,
         limit: u32,
     ) -> Result<Vec<MessageRow>, StoreError> {
-        let _ = (session, agent, before, limit);
-        todo!("Store::load_messages_before")
+        let session = session.clone();
+        let agent = agent.clone();
+        self.call(move |conn| queries::load_messages_before(conn, &session, &agent, before, limit))
+            .await
     }
 
     // --- agents ---
@@ -98,35 +206,44 @@ impl Store {
         info: &AgentInfo,
         prompt: Option<&str>,
     ) -> Result<(), StoreError> {
-        let _ = (session, info, prompt);
-        todo!("Store::upsert_agent")
+        let session = session.clone();
+        let info = info.clone();
+        let prompt = prompt.map(str::to_string);
+        self.call(move |conn| queries::upsert_agent(conn, &session, &info, prompt.as_deref()))
+            .await
     }
 
     pub async fn list_agents(&self, session: &SessionId) -> Result<Vec<AgentInfo>, StoreError> {
-        let _ = session;
-        todo!("Store::list_agents")
+        let session = session.clone();
+        self.call(move |conn| queries::list_agents(conn, &session))
+            .await
     }
 
     // --- tasks ---
     pub async fn upsert_task(&self, info: &TaskInfo) -> Result<(), StoreError> {
-        let _ = info;
-        todo!("Store::upsert_task")
+        let info = info.clone();
+        self.call(move |conn| queries::upsert_task(conn, &info))
+            .await
     }
 
     pub async fn list_tasks(&self, session: &SessionId) -> Result<Vec<TaskInfo>, StoreError> {
-        let _ = session;
-        todo!("Store::list_tasks")
+        let session = session.clone();
+        self.call(move |conn| queries::list_tasks(conn, &session))
+            .await
     }
 
     // --- plan ---
     pub async fn save_plan(&self, session: &SessionId, plan: &Plan) -> Result<(), StoreError> {
-        let _ = (session, plan);
-        todo!("Store::save_plan")
+        let session = session.clone();
+        let plan = plan.clone();
+        self.call(move |conn| queries::save_plan(conn, &session, &plan))
+            .await
     }
 
     pub async fn load_plan(&self, session: &SessionId) -> Result<Plan, StoreError> {
-        let _ = session;
-        todo!("Store::load_plan")
+        let session = session.clone();
+        self.call(move |conn| queries::load_plan(conn, &session))
+            .await
     }
 
     // --- usage ---
@@ -138,14 +255,18 @@ impl Store {
         usage: &Usage,
         cost_usd: Option<f64>,
     ) -> Result<(), StoreError> {
-        let _ = (session, agent, turn, usage, cost_usd);
-        todo!("Store::add_usage")
+        let session = session.clone();
+        let agent = agent.clone();
+        let usage = *usage;
+        self.call(move |conn| queries::add_usage(conn, &session, &agent, turn, &usage, cost_usd))
+            .await
     }
 
     /// Sums over the session; `context_*` fields stay zero (the core fills them).
     pub async fn usage_totals(&self, session: &SessionId) -> Result<UsageTotals, StoreError> {
-        let _ = session;
-        todo!("Store::usage_totals")
+        let session = session.clone();
+        self.call(move |conn| queries::usage_totals(conn, &session))
+            .await
     }
 
     // --- compaction ---
@@ -156,8 +277,11 @@ impl Store {
         summary: &str,
         upto_seq: u64,
     ) -> Result<(), StoreError> {
-        let _ = (session, agent, summary, upto_seq);
-        todo!("Store::save_compaction")
+        let session = session.clone();
+        let agent = agent.clone();
+        let summary = summary.to_string();
+        self.call(move |conn| queries::save_compaction(conn, &session, &agent, &summary, upto_seq))
+            .await
     }
 
     pub async fn load_compaction(
@@ -165,18 +289,28 @@ impl Store {
         session: &SessionId,
         agent: &AgentId,
     ) -> Result<Option<(String, u64)>, StoreError> {
-        let _ = (session, agent);
-        todo!("Store::load_compaction")
+        let session = session.clone();
+        let agent = agent.clone();
+        self.call(move |conn| queries::load_compaction(conn, &session, &agent))
+            .await
     }
 
     // --- search ---
     pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, StoreError> {
-        let _ = (query, limit);
-        todo!("Store::search")
+        let query = query.to_string();
+        self.call(move |conn| queries::search(conn, &query, limit))
+            .await
     }
 
     /// Flush and stop the writer thread.
     pub async fn close(self) {
-        todo!("Store::close")
+        let _ = self.sender.send(Command::Stop);
+        let handle = {
+            let mut guard = self.handle.lock().ok();
+            guard.as_mut().and_then(|g| g.take())
+        };
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
     }
 }

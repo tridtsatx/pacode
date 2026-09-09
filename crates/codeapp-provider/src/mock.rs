@@ -5,10 +5,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use codeapp_types::{ModelInfo, Usage};
+use codeapp_types::{CallId, ModelInfo, StopReason, StreamEvent, Usage};
 use serde_json::Value;
 
 use crate::{CompletionRequest, EventStream, Provider, ProviderError};
+
+#[cfg(test)]
+#[path = "mock_tests.rs"]
+mod mock_tests;
 
 #[derive(Clone, Debug)]
 pub enum MockResponse {
@@ -49,17 +53,30 @@ impl MockProvider {
     }
 
     pub fn push(&self, response: MockResponse) {
-        self.scripts.lock().expect("mock lock").push_back(response);
+        if let Ok(mut guard) = self.scripts.lock() {
+            guard.push_back(response);
+        }
     }
 
     /// Every request received so far (clones).
     pub fn requests(&self) -> Vec<CompletionRequest> {
-        self.requests.lock().expect("mock lock").clone()
+        self.requests.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
     pub fn pending(&self) -> usize {
-        self.scripts.lock().expect("mock lock").len()
+        self.scripts.lock().map(|s| s.len()).unwrap_or(0)
     }
+}
+
+fn chunk_chars(s: &str, chunk_size: usize) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .chunks(chunk_size)
+        .map(|c| c.iter().collect::<String>())
+        .collect()
 }
 
 #[async_trait]
@@ -69,9 +86,144 @@ impl Provider for MockProvider {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<EventStream, ProviderError> {
-        let _ = req;
-        let _ = &self.usage;
-        todo!("MockProvider::complete")
+        self.requests
+            .lock()
+            .map_err(|_| ProviderError::Config("mock lock poisoned".to_string()))?
+            .push(req);
+
+        let script = self
+            .scripts
+            .lock()
+            .map_err(|_| ProviderError::Config("mock lock poisoned".to_string()))?
+            .pop_front()
+            .ok_or_else(|| ProviderError::Config("mock: no scripted response".to_string()))?;
+
+        match script {
+            MockResponse::Text(text) => {
+                let mut events = Vec::new();
+                for chunk in chunk_chars(&text, 8) {
+                    events.push(StreamEvent::TextDelta { text: chunk });
+                }
+                events.push(StreamEvent::Usage(self.usage));
+                events.push(StreamEvent::MessageEnd {
+                    stop: StopReason::EndTurn,
+                });
+                Ok(Box::pin(tokio_stream::iter(events.into_iter().map(Ok))))
+            }
+            MockResponse::ToolCalls { text, calls } => {
+                let mut events = Vec::new();
+                if let Some(t) = text {
+                    for chunk in chunk_chars(&t, 8) {
+                        events.push(StreamEvent::TextDelta { text: chunk });
+                    }
+                }
+                for (i, (name, input)) in calls.into_iter().enumerate() {
+                    let call_id = CallId::generate();
+                    events.push(StreamEvent::ToolCallStart {
+                        index: i as u32,
+                        id: call_id,
+                        name,
+                    });
+                    events.push(StreamEvent::ToolCallArgsDelta {
+                        index: i as u32,
+                        delta: input.to_string(),
+                    });
+                }
+                events.push(StreamEvent::Usage(self.usage));
+                events.push(StreamEvent::MessageEnd {
+                    stop: StopReason::ToolUse,
+                });
+                Ok(Box::pin(tokio_stream::iter(events.into_iter().map(Ok))))
+            }
+            MockResponse::ReasoningThenText { reasoning, text } => {
+                let mut events = Vec::new();
+                for chunk in chunk_chars(&reasoning, 8) {
+                    events.push(StreamEvent::ReasoningDelta { text: chunk });
+                }
+                for chunk in chunk_chars(&text, 8) {
+                    events.push(StreamEvent::TextDelta { text: chunk });
+                }
+                events.push(StreamEvent::Usage(self.usage));
+                events.push(StreamEvent::MessageEnd {
+                    stop: StopReason::EndTurn,
+                });
+                Ok(Box::pin(tokio_stream::iter(events.into_iter().map(Ok))))
+            }
+            MockResponse::Error(msg) => Err(ProviderError::Http {
+                status: 500,
+                message: msg,
+            }),
+            MockResponse::Slow { text, delay } => {
+                let chars: Vec<char> = text.chars().collect();
+                let mid = chars.len() / 2;
+                let first_half: String = chars[..mid].iter().collect();
+                let second_half: String = chars[mid..].iter().collect();
+                let first_chunks = chunk_chars(&first_half, 8);
+                let second_chunks = chunk_chars(&second_half, 8);
+                let usage = self.usage;
+
+                enum SlowState {
+                    First(VecDeque<String>),
+                    Delay,
+                    Second(VecDeque<String>),
+                    Usage,
+                    End,
+                    Done,
+                }
+
+                let initial_state = SlowState::First(first_chunks.into());
+
+                let stream = futures::stream::unfold(initial_state, move |mut state| {
+                    let second_chunks = second_chunks.clone();
+                    async move {
+                        loop {
+                            match state {
+                                SlowState::First(ref mut chunks) => {
+                                    if let Some(chunk) = chunks.pop_front() {
+                                        return Some((
+                                            Ok(StreamEvent::TextDelta { text: chunk }),
+                                            state,
+                                        ));
+                                    }
+                                    state = SlowState::Delay;
+                                }
+                                SlowState::Delay => {
+                                    tokio::time::sleep(delay).await;
+                                    state = SlowState::Second(second_chunks.clone().into());
+                                }
+                                SlowState::Second(ref mut chunks) => {
+                                    if let Some(chunk) = chunks.pop_front() {
+                                        return Some((
+                                            Ok(StreamEvent::TextDelta { text: chunk }),
+                                            state,
+                                        ));
+                                    }
+                                    state = SlowState::Usage;
+                                }
+                                SlowState::Usage => {
+                                    state = SlowState::End;
+                                    return Some((Ok(StreamEvent::Usage(usage)), state));
+                                }
+                                SlowState::End => {
+                                    state = SlowState::Done;
+                                    return Some((
+                                        Ok(StreamEvent::MessageEnd {
+                                            stop: StopReason::EndTurn,
+                                        }),
+                                        state,
+                                    ));
+                                }
+                                SlowState::Done => {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                Ok(Box::pin(stream))
+            }
+        }
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

@@ -83,10 +83,11 @@ impl ModelRoute {
         if s.is_empty() {
             return None;
         }
-        if let Some((prefix, rest)) = s.split_once('/') {
-            if !rest.is_empty() && known_providers.into_iter().any(|p| p == prefix) {
-                return Some(Self::new(prefix, rest));
-            }
+        if let Some((prefix, rest)) = s.split_once('/')
+            && !rest.is_empty()
+            && known_providers.into_iter().any(|p| p == prefix)
+        {
+            return Some(Self::new(prefix, rest));
         }
         default_provider.map(|p| Self::new(p, s))
     }

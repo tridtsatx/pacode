@@ -13,6 +13,8 @@ pub mod buffer;
 pub mod manager;
 pub mod progress;
 pub mod spec;
+mod state;
+mod supervisor;
 
 pub use buffer::HeadTailBuffer;
 pub use manager::{ExecError, TaskEvent, TaskManager, WaitResult};

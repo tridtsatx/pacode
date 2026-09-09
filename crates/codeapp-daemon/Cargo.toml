@@ -9,6 +9,11 @@ description = "Unix socket server: hello/attach, request routing to core, event 
 codeapp-types = { workspace = true }
 codeapp-config = { workspace = true }
 codeapp-core = { workspace = true }
+codeapp-provider = { workspace = true }
+codeapp-store = { workspace = true }
+codeapp-tools = { workspace = true }
+codeapp-exec = { workspace = true }
+codeapp-mcp = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros", "signal", "fs"] }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }

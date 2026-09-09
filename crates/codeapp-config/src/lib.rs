@@ -35,14 +35,31 @@ pub enum ConfigError {
 /// Load the config file (missing file = defaults) and apply environment overrides:
 /// `CODEAPP_MODEL` (`provider/model`), `CODEAPP_EFFORT`, `CODEAPP_MODE`.
 pub fn load(paths: &Paths) -> Result<Config, ConfigError> {
-    let _ = paths;
-    todo!("config::load")
+    let mut cfg = match std::fs::read_to_string(&paths.config_file) {
+        Ok(text) => parse(&text).map_err(|message| ConfigError::Parse {
+            path: paths.config_file.clone(),
+            message,
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(err) => {
+            return Err(ConfigError::Read {
+                path: paths.config_file.clone(),
+                source: err,
+            });
+        }
+    };
+
+    let env_vars = std::env::vars().collect::<Vec<_>>();
+    apply_env_overrides(
+        &mut cfg,
+        env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    )?;
+    Ok(cfg)
 }
 
 /// Parse TOML text into a `Config` (used by `load` and by tests).
 pub fn parse(text: &str) -> Result<Config, String> {
-    let _ = text;
-    todo!("config::parse")
+    toml::from_str::<Config>(text).map_err(|e| e.to_string())
 }
 
 /// Apply `CODEAPP_MODEL` / `CODEAPP_EFFORT` / `CODEAPP_MODE` from `vars` (an iterator of
@@ -51,14 +68,51 @@ pub fn apply_env_overrides<'a>(
     cfg: &mut Config,
     vars: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<(), ConfigError> {
-    let _ = (cfg, vars);
-    todo!("config::apply_env_overrides")
+    for (k, v) in vars {
+        match k {
+            "CODEAPP_MODEL" => {
+                cfg.provider.default = Some(v.to_string());
+            }
+            "CODEAPP_EFFORT" => {
+                let effort = Effort::parse(v).ok_or_else(|| ConfigError::Env {
+                    var: k.to_string(),
+                    value: v.to_string(),
+                })?;
+                cfg.provider.effort = effort;
+            }
+            "CODEAPP_MODE" => {
+                let mode = Mode::parse(v).ok_or_else(|| ConfigError::Env {
+                    var: k.to_string(),
+                    value: v.to_string(),
+                })?;
+                cfg.permissions.default_mode = mode;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The API key for a provider: inline `api_key`, else the env var named by `api_key_env`.
 pub fn resolve_api_key(cfg: &ProviderConfig) -> Option<String> {
-    let _ = cfg;
-    todo!("config::resolve_api_key")
+    if let Some(key) = &cfg.api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(env_var) = &cfg.api_key_env {
+        let trimmed_var = env_var.trim();
+        if !trimmed_var.is_empty()
+            && let Ok(val) = std::env::var(trimmed_var)
+        {
+            let trimmed_val = val.trim();
+            if !trimmed_val.is_empty() {
+                return Some(trimmed_val.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Effective effort: CLI/env override, else `[provider].effort`.
@@ -70,3 +124,6 @@ pub fn effective_effort(cfg: &Config, override_effort: Option<Effort>) -> Effort
 pub fn effective_mode(cfg: &Config, override_mode: Option<Mode>) -> Mode {
     override_mode.unwrap_or(cfg.permissions.default_mode)
 }
+
+#[cfg(test)]
+mod config_tests;

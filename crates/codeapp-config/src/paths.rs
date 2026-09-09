@@ -15,7 +15,55 @@ impl Paths {
     /// Resolve from the environment (see crate docs). Never fails: falls back to
     /// `$HOME/.codeapp/...` and `/tmp/codeapp-<uid>` when XDG variables are missing.
     pub fn discover() -> Paths {
-        todo!("Paths::discover")
+        if let Some(home) = std::env::var_os("CODEAPP_HOME").filter(|s| !s.is_empty()) {
+            return Paths::under(Path::new(&home));
+        }
+
+        let home_codeapp = dirs::home_dir()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".codeapp");
+
+        let config_file =
+            if let Some(cfg) = std::env::var_os("CODEAPP_CONFIG").filter(|s| !s.is_empty()) {
+                PathBuf::from(cfg)
+            } else if let Some(dir) = dirs::config_dir() {
+                dir.join("codeapp").join("config.toml")
+            } else {
+                home_codeapp.join("config.toml")
+            };
+
+        let data_dir = dirs::data_dir()
+            .map(|d| d.join("codeapp"))
+            .unwrap_or_else(|| home_codeapp.join("data"));
+
+        let state_dir = dirs::state_dir()
+            .or_else(dirs::data_dir)
+            .map(|d| d.join("codeapp"))
+            .unwrap_or_else(|| home_codeapp.join("state"));
+
+        let cache_dir = dirs::cache_dir()
+            .map(|d| d.join("codeapp"))
+            .unwrap_or_else(|| home_codeapp.join("cache"));
+
+        let runtime_dir =
+            if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
+                PathBuf::from(xdg).join("codeapp")
+            } else {
+                #[cfg(unix)]
+                let uid = unsafe { libc::getuid() };
+                #[cfg(not(unix))]
+                let uid = 1000;
+                PathBuf::from(format!("/tmp/codeapp-{uid}"))
+            };
+
+        Paths {
+            config_file,
+            data_dir,
+            state_dir,
+            cache_dir,
+            runtime_dir,
+        }
     }
 
     /// Everything under `root` (tests, `CODEAPP_HOME`).
@@ -31,7 +79,21 @@ impl Paths {
 
     /// Create data/state/cache/runtime dirs (runtime dir mode 0700).
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        todo!("Paths::ensure_dirs")
+        std::fs::create_dir_all(&self.data_dir)?;
+        std::fs::create_dir_all(&self.state_dir)?;
+        std::fs::create_dir_all(&self.cache_dir)?;
+        std::fs::create_dir_all(&self.runtime_dir)?;
+        std::fs::create_dir_all(self.spool_dir())?;
+        std::fs::create_dir_all(self.tool_output_dir())?;
+        std::fs::create_dir_all(self.mcp_cache_dir())?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.runtime_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+
+        Ok(())
     }
 
     pub fn db_file(&self) -> PathBuf {

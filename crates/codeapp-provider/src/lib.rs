@@ -12,6 +12,7 @@
 pub mod mock;
 pub mod openai_compat;
 pub mod registry;
+pub mod sse;
 
 use std::pin::Pin;
 

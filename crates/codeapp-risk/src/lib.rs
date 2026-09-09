@@ -40,6 +40,15 @@ impl RiskAssessment {
         }
     }
 
+    pub fn from_findings(findings: Vec<RiskFinding>) -> Self {
+        let level = findings
+            .iter()
+            .map(|f| f.level)
+            .max()
+            .unwrap_or(RiskLevel::Safe);
+        Self { level, findings }
+    }
+
     /// One-line summary for prompts: the highest finding's reason.
     pub fn summary(&self) -> Option<&str> {
         self.findings
@@ -47,11 +56,40 @@ impl RiskAssessment {
             .max_by_key(|f| f.level)
             .map(|f| f.reason.as_str())
     }
+
+    /// Multi-line explanation of all findings.
+    pub fn explanation(&self) -> String {
+        let mut out = String::new();
+        for finding in &self.findings {
+            out.push_str("- ");
+            out.push_str(&finding.reason);
+            if let Some(target) = &finding.target {
+                out.push_str(&format!(" (target: {target})"));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Whether this command may proceed without a reflection/confirmation prompt.
+    pub fn runs_immediately(&self) -> bool {
+        matches!(self.level, RiskLevel::Safe | RiskLevel::Low)
+    }
+
+    /// Whether any confirmation could ever unlock this.
+    pub fn is_absolute_deny(&self) -> bool {
+        matches!(self.level, RiskLevel::Catastrophic)
+    }
 }
 
 /// Classify `command` (a shell string) executed with `cwd`.
 pub fn classify(command: &str, cwd: &Path) -> RiskAssessment {
     gate::classify(command, cwd)
+}
+
+/// Classify `command` with an explicit `cwd` and `home` directory.
+pub fn classify_with_home(command: &str, cwd: &Path, home: &Path) -> RiskAssessment {
+    gate::classify_with_home(command, cwd, home)
 }
 
 /// True when every simple command in the pipeline is on the read-only allowlist and

@@ -65,6 +65,7 @@ impl Default for ProviderDefaults {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ProviderConfig {
     /// e.g. `https://api.example.com/v1`
     pub base_url: String,
@@ -82,23 +83,6 @@ pub struct ProviderConfig {
     /// Merged into every request body.
     pub extra_body: Option<Value>,
     pub headers: BTreeMap<String, String>,
-}
-
-impl Default for ProviderConfig {
-    fn default() -> Self {
-        Self {
-            base_url: String::new(),
-            api_key_env: None,
-            api_key: None,
-            catalog: false,
-            models: Vec::new(),
-            context_window: None,
-            reasoning: None,
-            effort_map: BTreeMap::new(),
-            extra_body: None,
-            headers: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

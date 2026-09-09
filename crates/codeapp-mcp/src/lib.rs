@@ -19,16 +19,26 @@ pub mod protocol;
 use std::path::PathBuf;
 
 pub use client::McpClient;
-pub use pool::McpPool;
+pub use pool::{McpPool, fingerprint};
 
-#[derive(Clone, Debug, PartialEq)]
+fn default_schema() -> serde_json::Value {
+    serde_json::json!({ "type": "object" })
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct McpToolInfo {
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(
+        default = "default_schema",
+        rename = "inputSchema",
+        alias = "input_schema"
+    )]
     pub input_schema: serde_json::Value,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct McpCallResult {
     /// Text content blocks joined by newlines; non-text blocks summarised as `[image]` etc.
     pub content: String,
@@ -69,3 +79,18 @@ pub fn split_tool_name(name: &str) -> Option<(&str, &str)> {
 
 /// Where the schema cache lives; `None` disables caching.
 pub type CacheDir = Option<PathBuf>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_name_and_split() {
+        let full = tool_name("server1", "my_tool");
+        assert_eq!(full, "server1__my_tool");
+        assert_eq!(split_tool_name(&full), Some(("server1", "my_tool")));
+
+        assert_eq!(split_tool_name("no_separator"), None);
+        assert_eq!(split_tool_name("s__t1__t2"), Some(("s", "t1__t2")));
+    }
+}
