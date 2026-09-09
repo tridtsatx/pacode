@@ -1,0 +1,140 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/codeapp-types",
+    "crates/codeapp-config",
+    "crates/codeapp-risk",
+    "crates/codeapp-render",
+    "crates/codeapp-exec",
+    "crates/codeapp-provider",
+    "crates/codeapp-mcp",
+    "crates/codeapp-store",
+    "crates/codeapp-tools",
+    "crates/codeapp-core",
+    "crates/codeapp-daemon",
+    "crates/codeapp-client",
+    "crates/codeapp-tui",
+    "crates/codeapp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+
+[workspace.dependencies]
+codeapp-types = { path = "crates/codeapp-types" }
+codeapp-config = { path = "crates/codeapp-config" }
+codeapp-risk = { path = "crates/codeapp-risk" }
+codeapp-render = { path = "crates/codeapp-render" }
+codeapp-exec = { path = "crates/codeapp-exec" }
+codeapp-provider = { path = "crates/codeapp-provider" }
+codeapp-mcp = { path = "crates/codeapp-mcp" }
+codeapp-store = { path = "crates/codeapp-store" }
+codeapp-tools = { path = "crates/codeapp-tools" }
+codeapp-core = { path = "crates/codeapp-core" }
+codeapp-daemon = { path = "crates/codeapp-daemon" }
+codeapp-client = { path = "crates/codeapp-client" }
+codeapp-tui = { path = "crates/codeapp-tui" }
+
+# async
+tokio = { version = "1", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
+tokio-stream = { version = "0.1", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+async-trait = "0.1"
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# errors / logging
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+
+# http
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "rustls-tls-native-roots", "system-proxy"] }
+url = "2"
+html2text = "0.13"
+
+# terminal
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+pulldown-cmark = { version = "0.12", default-features = false }
+
+# fs / search
+ignore = "0.4"
+globset = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+similar = "2"
+dirs = "5"
+
+# storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# misc
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rand = "0.9"
+libc = "0.2"
+regex = "1"
+shlex = "1"
+
+# dev
+tempfile = "3"
+insta = { version = "1", features = ["yaml"] }
+pretty_assertions = "1"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 0
+
+# Hot loops of the terminal/render stack stay optimized in dev builds (same rationale as jcode).
+[profile.dev.package.ratatui]
+opt-level = 3
+[profile.dev.package.ratatui-core]
+opt-level = 3
+[profile.dev.package.ratatui-widgets]
+opt-level = 3
+[profile.dev.package.ratatui-crossterm]
+opt-level = 3
+[profile.dev.package.crossterm]
+opt-level = 3
+[profile.dev.package.unicode-width]
+opt-level = 3
+[profile.dev.package.unicode-segmentation]
+opt-level = 3
+[profile.dev.package.regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+[profile.dev.package.rusqlite]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = 0
+strip = "symbols"
+panic = "unwind"
+
+[profile.test]
+debug = 0
+incremental = true

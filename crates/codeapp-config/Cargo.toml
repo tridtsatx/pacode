@@ -1,0 +1,18 @@
+[package]
+name = "codeapp-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XDG paths, TOML config loading, env overrides, file logger"
+
+[dependencies]
+codeapp-types = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

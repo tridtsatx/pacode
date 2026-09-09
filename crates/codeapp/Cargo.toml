@@ -1,0 +1,26 @@
+[package]
+name = "codeapp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codeapp: background-first TUI coding agent (client + daemon)"
+
+[[bin]]
+name = "codeapp"
+path = "src/main.rs"
+
+[dependencies]
+codeapp-types = { workspace = true }
+codeapp-config = { workspace = true }
+codeapp-client = { workspace = true }
+codeapp-daemon = { workspace = true }
+codeapp-tui = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[features]
+default = []
+mimalloc = []
