@@ -265,11 +265,11 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) {
             });
             state.dirty = true;
         }
-        BgResponse::Reply(Ok(Reply::Models(models))) => {
+        BgResponse::Reply(Ok(Reply::Models { models })) => {
             state.models = models;
             state.dirty = true;
         }
-        BgResponse::Reply(Ok(Reply::Sessions(sessions))) => {
+        BgResponse::Reply(Ok(Reply::Sessions { sessions })) => {
             state.sessions = sessions;
             state.dirty = true;
         }

@@ -9,9 +9,10 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+#[cfg(not(unix))]
+use crossterm::terminal::supports_keyboard_enhancement;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -31,9 +32,17 @@ impl TerminalGuard {
             let _ = execute!(stdout, EnableMouseCapture);
         }
 
-        if supports_keyboard_enhancement().unwrap_or(false) {
-            let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+        // `supports_keyboard_enhancement()` blocks up to 2 s waiting for a terminal
+        // reply, which is the whole first-frame budget. Terminals that do not
+        // support the kitty protocol ignore the push sequence, so on unix we push
+        // unconditionally (same choice as codex).
+        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+        #[cfg(unix)]
+        let push = true;
+        #[cfg(not(unix))]
+        let push = supports_keyboard_enhancement().unwrap_or(false);
+        if push {
             let _ = execute!(stdout, PushKeyboardEnhancementFlags(flags));
         }
 

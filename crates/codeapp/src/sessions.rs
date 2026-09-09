@@ -44,7 +44,7 @@ fn list_sessions(limit: u32, socket: Option<PathBuf>, paths: Paths) -> anyhow::R
             .context("failed to list sessions")?;
 
         let sessions = match reply {
-            Reply::Sessions(sessions) => sessions,
+            Reply::Sessions { sessions } => sessions,
             Reply::Error { message } => bail!("daemon error: {message}"),
             other => bail!("unexpected reply: {other:?}"),
         };

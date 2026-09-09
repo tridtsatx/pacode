@@ -256,8 +256,11 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
             },
             other_req => match &attached_session {
                 Some(session_id) => core.handle(session_id, other_req).await,
-                None => Reply::Error {
-                    message: "not attached to a session".to_string(),
+                None => match core.handle_global(&other_req).await {
+                    Some(reply) => reply,
+                    None => Reply::Error {
+                        message: "not attached to a session".to_string(),
+                    },
                 },
             },
         };

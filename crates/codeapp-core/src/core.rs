@@ -101,6 +101,9 @@ impl Core {
     /// `Detach`, `Shutdown`, `Ping`), which the daemon answers itself. Unknown or
     /// inapplicable requests return `Reply::Error`.
     pub async fn handle(&self, id: &SessionId, req: Request) -> Reply {
+        if let Some(reply) = self.handle_global(&req).await {
+            return reply;
+        }
         let session = match self.session(id) {
             Some(s) => s,
             None => {
@@ -238,7 +241,7 @@ impl Core {
                     .list_sessions(codeapp_store::SessionFilter { cwd: None, limit })
                     .await
                 {
-                    Ok(sessions) => Reply::Sessions(sessions),
+                    Ok(sessions) => Reply::Sessions { sessions },
                     Err(e) => Reply::Error {
                         message: e.to_string(),
                     },
@@ -246,7 +249,7 @@ impl Core {
             }
             Request::ListModels => {
                 let models = self.deps.providers.list_all_models().await;
-                Reply::Models(models)
+                Reply::Models { models }
             }
             Request::Compact => {
                 if let Some(main) = session.main_agent() {
@@ -269,6 +272,33 @@ impl Core {
             | Request::Ping => Reply::Error {
                 message: "connection-level request handled by daemon".to_string(),
             },
+        }
+    }
+
+    /// Requests that need no session: `ListSessions`, `ListModels`. Used by the daemon
+    /// for unattached connections too.
+    pub async fn handle_global(&self, req: &Request) -> Option<Reply> {
+        match req {
+            Request::ListSessions { limit } => Some(
+                match self
+                    .deps
+                    .store
+                    .list_sessions(codeapp_store::SessionFilter {
+                        cwd: None,
+                        limit: *limit,
+                    })
+                    .await
+                {
+                    Ok(sessions) => Reply::Sessions { sessions },
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                },
+            ),
+            Request::ListModels => Some(Reply::Models {
+                models: self.deps.providers.list_all_models().await,
+            }),
+            _ => None,
         }
     }
 

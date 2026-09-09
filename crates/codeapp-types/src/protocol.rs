@@ -142,8 +142,12 @@ pub enum Reply {
         lines: Vec<String>,
         total_lines: u64,
     },
-    Sessions(Vec<SessionMeta>),
-    Models(Vec<ModelInfo>),
+    Sessions {
+        sessions: Vec<SessionMeta>,
+    },
+    Models {
+        models: Vec<ModelInfo>,
+    },
     Pong,
 }
 
@@ -245,7 +249,9 @@ mod tests {
         assert_eq!(back, msg);
         let reply = ServerMessage::Reply {
             id: 1,
-            reply: Reply::Pong,
+            reply: Reply::Sessions {
+                sessions: Vec::new(),
+            },
         };
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
