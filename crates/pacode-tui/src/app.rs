@@ -71,6 +71,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             Instant::now(),
         );
     }
+    for warning in std::mem::take(&mut state.keymap_warnings) {
+        state.push_toast(ToastLevel::Warn, warning, None, Instant::now());
+    }
 
     if let Some(prompt) = opts.initial_prompt {
         let _ = client.ok(Request::UserMessage { text: prompt }).await;

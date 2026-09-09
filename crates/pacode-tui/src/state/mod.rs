@@ -129,6 +129,8 @@ pub enum Connection {
 pub struct AppState {
     pub config: Config,
     pub theme: pacode_render::Theme,
+    pub keymap: crate::binding::Keymap,
+    pub keymap_warnings: Vec<String>,
     /// Footer status text set by a plugin via `pacode.status` (plugin name, text).
     pub plugin_status: Option<(String, String)>,
     pub paths: pacode_config::Paths,
@@ -190,9 +192,12 @@ impl AppState {
         };
         let (palette, _) = pacode_config::theme::load_theme(&paths, &config.theme);
         let theme = pacode_render::Theme::from_palette(&palette, truecolor);
+        let (keymap, keymap_warnings) = crate::binding::Keymap::from_config(&config.keys);
         Self {
             config,
             theme,
+            keymap,
+            keymap_warnings,
             plugin_status: None,
             paths,
             app_version,

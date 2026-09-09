@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use pacode_types::state::PermissionDecision;
 use pacode_types::{AgentId, PermissionRequest, Request, TranscriptKind};
 
+use crate::binding::Action as KeyAction;
 use crate::commands;
 use crate::layout::ScreenLayout;
 use crate::state::transcript::CellKind;
@@ -35,10 +36,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         .retain(|t| t.title != crate::ui::popup::POPUP_TOAST_TITLE);
 
     // ctrl+shift+c: copy current selection
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-    {
+    if state.keymap.action_for(key) == Some(KeyAction::CopySelection) {
         if state.selection.is_active() && !state.selection.is_empty() {
             state.selection.request_explicit_copy();
         }
@@ -92,8 +90,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return crate::keys_picker::handle_picker_key(state, key);
     }
 
+    let action = state.keymap.action_for(key);
+
     // 2. Session picker via ctrl+p
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('p')) {
+    if action == Some(KeyAction::SessionPicker) {
         state.focus = Focus::Overlay(Overlay::SessionPicker {
             query: String::new(),
             index: 0,
@@ -102,9 +102,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     // 3. Shift+Tab: cycle permission mode; plain Tab: autocomplete slash command
-    if key.code == KeyCode::BackTab
-        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
-    {
+    if action == Some(KeyAction::CycleMode) {
         let next_mode = state.mode().next();
         return vec![Action::Send(Request::SetMode(next_mode))];
     }
@@ -125,7 +123,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     // 4. Escape: peel layers one by one
-    if key.code == KeyCode::Esc {
+    if action == Some(KeyAction::Cancel) {
         if state.config.ui.vim && state.focus == Focus::Normal {
             // Handled by vim::handle on the normal prompt
         } else {
@@ -134,37 +132,33 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     // 5. Follow shortcut: alt+f
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('f')) {
+    if action == Some(KeyAction::FollowAgent) {
         return handle_follow(state);
     }
 
     // 5.5 Files overlay: alt+b
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('b')) {
+    if action == Some(KeyAction::FilesOverlay) {
         state.focus = Focus::Overlay(Overlay::Files { index: 0 });
         return vec![];
     }
 
     // 6. Navigation: alt+down/ctrl+j (next agent/task), alt+up/ctrl+k (prev agent/task)
-    let is_down = (key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Down))
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('j')));
-    let is_up = (key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Up))
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('k')));
-
-    if is_down {
+    if action == Some(KeyAction::NextAgent) {
         return handle_navigate_down(state);
     }
-    if is_up {
+    if action == Some(KeyAction::PrevAgent) {
         return handle_navigate_up(state);
     }
 
     // 7. Scrolling: PgUp, PgDn, Home, End
-    if matches!(
-        key.code,
-        KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
-    ) {
-        return handle_scroll(state, key.code);
+    if let Some(
+        scroll_act @ (KeyAction::ScrollUp
+        | KeyAction::ScrollDown
+        | KeyAction::ScrollTop
+        | KeyAction::ScrollBottom),
+    ) = action
+    {
+        return handle_scroll(state, scroll_act);
     }
 
     // 8. Interactive permission prompt when input is empty: y / a / n
@@ -196,46 +190,40 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 9. Single keys in empty prompt: '.', 's', 'k'
     if state.input.is_empty() && (!state.config.ui.vim || state.focus != Focus::Normal) {
-        match key.code {
-            KeyCode::Char('.') => {
-                state.focus = Focus::BgList { index: 0 };
-                return vec![];
+        if action == Some(KeyAction::BgList) {
+            state.focus = Focus::BgList { index: 0 };
+            return vec![];
+        }
+        if action == Some(KeyAction::StopAgent)
+            && let Focus::Panel {
+                target: PanelTarget::Agent(ref id),
+                ..
+            } = state.focus
+        {
+            return vec![Action::Send(Request::StopAgent(id.clone()))];
+        }
+        if action == Some(KeyAction::KillTask) {
+            if let Focus::Panel {
+                target: PanelTarget::Task(ref id),
+                ..
+            } = state.focus
+            {
+                return vec![Action::Send(Request::KillTask(id.clone()))];
+            } else if let Focus::BgList { index } = state.focus
+                && let Some(task) = state.rail.tasks.get(index)
+            {
+                return vec![Action::Send(Request::KillTask(task.id.clone()))];
             }
-            KeyCode::Char('s') => {
-                if let Focus::Panel {
-                    target: PanelTarget::Agent(ref id),
-                    ..
-                } = state.focus
-                {
-                    return vec![Action::Send(Request::StopAgent(id.clone()))];
-                }
-            }
-            KeyCode::Char('k') => {
-                if let Focus::Panel {
-                    target: PanelTarget::Task(ref id),
-                    ..
-                } = state.focus
-                {
-                    return vec![Action::Send(Request::KillTask(id.clone()))];
-                } else if let Focus::BgList { index } = state.focus
-                    && let Some(task) = state.rail.tasks.get(index)
-                {
-                    return vec![Action::Send(Request::KillTask(task.id.clone()))];
-                }
-            }
-            _ => {}
         }
     }
 
     // 10. Enter key
-    if key.code == KeyCode::Enter {
-        // Shift+Enter / Alt+Enter -> newline
-        if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT)
-        {
-            state.input.insert_char('\n');
-            return vec![];
-        }
+    if action == Some(KeyAction::Newline) {
+        state.input.insert_char('\n');
+        return vec![];
+    }
 
+    if action == Some(KeyAction::Submit) {
         if !state.input.is_empty() {
             return submit_prompt(state);
         }
@@ -357,19 +345,15 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     // 12. Standard editing bindings
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('w') => {
-                state.input.delete_word();
-                return vec![];
-            }
-            KeyCode::Char('u') => {
-                state.input.text.clear();
-                state.input.cursor = 0;
-                return vec![];
-            }
-            _ => {}
-        }
+    if action == Some(KeyAction::ClearInput) {
+        state.input.text.clear();
+        state.input.cursor = 0;
+        return vec![];
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
+        state.input.delete_word();
+        return vec![];
     }
 
     match key.code {
@@ -562,7 +546,7 @@ fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
     vec![]
 }
 
-fn handle_scroll(state: &mut AppState, code: KeyCode) -> Vec<Action> {
+fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
     let in_panel = matches!(state.focus, Focus::Panel { .. });
     if in_panel {
         if let Focus::Panel {
@@ -571,28 +555,54 @@ fn handle_scroll(state: &mut AppState, code: KeyCode) -> Vec<Action> {
             ..
         } = state.focus
         {
-            if code == KeyCode::PageUp {
+            if action == KeyAction::ScrollUp {
                 *follow_paused = true;
-            } else if code == KeyCode::End {
+            } else if action == KeyAction::ScrollBottom {
                 *follow_paused = false;
                 state.panel.agent_transcript.scroll_to_bottom();
                 return vec![];
             }
         }
-        match code {
-            KeyCode::PageUp => state.panel.agent_transcript.scroll_by(10, 100, 20),
-            KeyCode::PageDown => state.panel.agent_transcript.scroll_by(-10, 100, 20),
-            KeyCode::Home => state.panel.agent_transcript.scroll_by(1000, 100, 20),
-            KeyCode::End => state.panel.agent_transcript.scroll_to_bottom(),
-            _ => {}
+        match action {
+            KeyAction::ScrollUp => state.panel.agent_transcript.scroll_by(10, 100, 20),
+            KeyAction::ScrollDown => state.panel.agent_transcript.scroll_by(-10, 100, 20),
+            KeyAction::ScrollTop => state.panel.agent_transcript.scroll_by(1000, 100, 20),
+            KeyAction::ScrollBottom => state.panel.agent_transcript.scroll_to_bottom(),
+            KeyAction::FollowAgent
+            | KeyAction::FilesOverlay
+            | KeyAction::NextAgent
+            | KeyAction::PrevAgent
+            | KeyAction::SessionPicker
+            | KeyAction::BgList
+            | KeyAction::Cancel
+            | KeyAction::Submit
+            | KeyAction::Newline
+            | KeyAction::ClearInput
+            | KeyAction::StopAgent
+            | KeyAction::KillTask
+            | KeyAction::CycleMode
+            | KeyAction::CopySelection => {}
         }
     } else {
-        match code {
-            KeyCode::PageUp => state.transcript.scroll_by(10, 1000, 25),
-            KeyCode::PageDown => state.transcript.scroll_by(-10, 1000, 25),
-            KeyCode::Home => state.transcript.scroll_by(10000, 1000, 25),
-            KeyCode::End => state.transcript.scroll_to_bottom(),
-            _ => {}
+        match action {
+            KeyAction::ScrollUp => state.transcript.scroll_by(10, 1000, 25),
+            KeyAction::ScrollDown => state.transcript.scroll_by(-10, 1000, 25),
+            KeyAction::ScrollTop => state.transcript.scroll_by(10000, 1000, 25),
+            KeyAction::ScrollBottom => state.transcript.scroll_to_bottom(),
+            KeyAction::FollowAgent
+            | KeyAction::FilesOverlay
+            | KeyAction::NextAgent
+            | KeyAction::PrevAgent
+            | KeyAction::SessionPicker
+            | KeyAction::BgList
+            | KeyAction::Cancel
+            | KeyAction::Submit
+            | KeyAction::Newline
+            | KeyAction::ClearInput
+            | KeyAction::StopAgent
+            | KeyAction::KillTask
+            | KeyAction::CycleMode
+            | KeyAction::CopySelection => {}
         }
     }
     vec![]

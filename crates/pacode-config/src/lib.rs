@@ -199,5 +199,53 @@ pub fn update_config_value(
     Ok(())
 }
 
+/// Remove a nested key in `paths.config_file` by parsing the existing file as a `toml::Table`,
+/// removing the key at the target path, and writing back. If the file, key or intermediate tables
+/// do not exist, this is a no-op. Comments in the file are lost.
+pub fn remove_config_value(paths: &Paths, dotted_key: &str) -> Result<(), ConfigError> {
+    let mut table: toml::Table = match std::fs::read_to_string(&paths.config_file) {
+        Ok(text) => toml::from_str(&text).map_err(|e: toml::de::Error| ConfigError::Parse {
+            path: paths.config_file.clone(),
+            message: e.to_string(),
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(ConfigError::Read {
+                path: paths.config_file.clone(),
+                source: err,
+            });
+        }
+    };
+
+    let parts: Vec<&str> = dotted_key.split('.').collect();
+    if parts.is_empty() || dotted_key.is_empty() {
+        return Ok(());
+    }
+
+    let (parents, last) = parts.split_at(parts.len() - 1);
+    let last_key = last[0];
+
+    let mut current = &mut table;
+    for &part in parents {
+        match current.get_mut(part) {
+            Some(toml::Value::Table(t)) => current = t,
+            _ => return Ok(()),
+        }
+    }
+    current.remove(last_key);
+
+    let serialized = toml::to_string_pretty(&table).map_err(|e| ConfigError::Parse {
+        path: paths.config_file.clone(),
+        message: e.to_string(),
+    })?;
+
+    std::fs::write(&paths.config_file, serialized).map_err(|e| ConfigError::Write {
+        path: paths.config_file.clone(),
+        source: e,
+    })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod config_tests;

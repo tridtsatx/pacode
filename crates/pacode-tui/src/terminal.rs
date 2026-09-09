@@ -124,3 +124,48 @@ pub fn restore_on_panic() {
     let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
+
+/// Suspend the TUI: leave alternate screen and raw mode so child processes (e.g. editor) can run.
+pub fn suspend(mouse: bool) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\");
+    let _ = stdout.flush();
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    if mouse {
+        let _ = execute!(stdout, DisableMouseCapture);
+    }
+    execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+    Ok(())
+}
+
+/// Resume the TUI: re-enter raw mode and alternate screen after child process finishes.
+pub fn resume(mouse: bool) -> std::io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    if mouse {
+        let _ = execute!(stdout, EnableMouseCapture);
+    }
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+    #[cfg(unix)]
+    let push = true;
+    #[cfg(not(unix))]
+    let push = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if push {
+        let _ = execute!(stdout, PushKeyboardEnhancementFlags(flags));
+    }
+    Ok(())
+}
+
+/// Run a closure with the TUI suspended, restoring the terminal state afterwards.
+pub fn run_suspended<F, R>(mouse: bool, f: F) -> std::io::Result<R>
+where
+    F: FnOnce() -> R,
+{
+    suspend(mouse)?;
+    let result = f();
+    resume(mouse)?;
+    Ok(result)
+}

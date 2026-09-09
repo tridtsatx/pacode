@@ -984,3 +984,227 @@ fn test_vim_enabled_keys_routing() {
     );
     assert!(state.input.is_empty());
 }
+
+#[test]
+fn test_default_binding_newline() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.input.insert_str("line1");
+
+    // Shift+Enter inserts newline
+    let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+    let actions = handle_key(&mut state, shift_enter, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "line1\n");
+
+    // Alt+Enter inserts newline
+    let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_enter, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "line1\n\n");
+}
+
+#[test]
+fn test_default_binding_clear_input() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.input.insert_str("some input to clear");
+
+    let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_u, now);
+    assert!(actions.is_empty());
+    assert!(state.input.is_empty());
+    assert_eq!(state.input.cursor, 0);
+}
+
+#[test]
+fn test_default_binding_cycle_mode() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let initial_mode = state.mode();
+    let expected_next = initial_mode.next();
+
+    // Shift+Tab cycles mode
+    let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+    let actions = handle_key(&mut state, shift_tab, now);
+    assert_eq!(actions, vec![Action::Send(Request::SetMode(expected_next))]);
+
+    // BackTab cycles mode
+    let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, backtab, now);
+    assert_eq!(actions, vec![Action::Send(Request::SetMode(expected_next))]);
+}
+
+#[test]
+fn test_default_binding_stop_agent_and_kill_task() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let agent_id = AgentId::new("agt_1");
+    let task_id = pacode_types::TaskId::new("task_42");
+
+    // 's' when focused on agent panel stops agent
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(agent_id.clone()),
+        follow: false,
+        follow_paused: false,
+    };
+    let key_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_s, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::StopAgent(agent_id.clone()))]
+    );
+
+    // 'k' when focused on task panel kills task
+    state.focus = Focus::Panel {
+        target: PanelTarget::Task(task_id.clone()),
+        follow: false,
+        follow_paused: false,
+    };
+    let key_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_k, now);
+    assert_eq!(actions, vec![Action::Send(Request::KillTask(task_id))]);
+
+    // 'k' when focused on BgList kills selected task
+    let bg_task_id = pacode_types::TaskId::new("task_bg");
+    let task = pacode_types::TaskInfo {
+        id: bg_task_id.clone(),
+        session: pacode_types::SessionId::new("ses_1"),
+        owner: agent_id,
+        label: "build".into(),
+        command: "cargo build".into(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        status: pacode_types::state::TaskStatus::Running,
+        backgrounded: true,
+        exit_code: None,
+        started_at_ms: 0,
+        ended_at_ms: None,
+        progress: None,
+        warnings: 0,
+        errors: 0,
+        output_path: std::path::PathBuf::from("/tmp/out"),
+        output_bytes: 0,
+        acked: false,
+    };
+    state.rail.tasks.push(task);
+    state.focus = Focus::BgList { index: 0 };
+    let actions = handle_key(&mut state, key_k, now);
+    assert_eq!(actions, vec![Action::Send(Request::KillTask(bg_task_id))]);
+}
+
+#[test]
+fn test_default_binding_scrolling() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // In normal focus: PageUp, PageDown, Home, End
+    let pgup = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+    let pgdn = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+    let home = KeyEvent::new(KeyCode::Home, KeyModifiers::NONE);
+    let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+
+    assert_eq!(handle_key(&mut state, pgup, now), vec![]);
+    assert_eq!(handle_key(&mut state, pgdn, now), vec![]);
+    assert_eq!(handle_key(&mut state, home, now), vec![]);
+    assert_eq!(handle_key(&mut state, end, now), vec![]);
+
+    // In panel with follow=true: PageUp pauses follow, End unpauses
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(AgentId::new("agt_1")),
+        follow: true,
+        follow_paused: false,
+    };
+    handle_key(&mut state, pgup, now);
+    assert_eq!(
+        state.focus,
+        Focus::Panel {
+            target: PanelTarget::Agent(AgentId::new("agt_1")),
+            follow: true,
+            follow_paused: true,
+        }
+    );
+    handle_key(&mut state, end, now);
+    assert_eq!(
+        state.focus,
+        Focus::Panel {
+            target: PanelTarget::Agent(AgentId::new("agt_1")),
+            follow: true,
+            follow_paused: false,
+        }
+    );
+}
+
+#[test]
+fn test_default_binding_copy_selection() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Selection not active -> does nothing, returns empty
+    let copy_key = KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    let actions = handle_key(&mut state, copy_key, now);
+    assert!(actions.is_empty());
+    assert_eq!(
+        state.selection.copy_request,
+        crate::state::selection::CopyRequest::None
+    );
+
+    // Make selection active and non-empty
+    let rect = ratatui::layout::Rect::new(0, 0, 80, 24);
+    state.selection.start(0, 0, rect);
+    state.selection.drag(5, 0, rect);
+    state.selection.finish();
+    assert!(state.selection.is_active() && !state.selection.is_empty());
+
+    let actions = handle_key(&mut state, copy_key, now);
+    assert!(actions.is_empty());
+    assert_eq!(
+        state.selection.copy_request,
+        crate::state::selection::CopyRequest::Explicit
+    );
+}
+
+#[test]
+fn test_user_override_in_keys_config() {
+    let mut config = Config::default();
+    config
+        .keys
+        .bindings
+        .insert("follow_agent".to_string(), "ctrl+g".to_string());
+    let mut state = AppState::new(config, "0.1.0".into(), 120, 34);
+    let subagent_id = AgentId::new("agt_1");
+    state.rail.upsert_agent(AgentInfo {
+        id: subagent_id.clone(),
+        name: "worker".into(),
+        kind: AgentKind::Sub,
+        status: AgentStatus::Thinking,
+        activity: None,
+        started_at_ms: 1000,
+        finished_at_ms: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: Some(AgentId::main()),
+        summary: None,
+        error: None,
+    });
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(subagent_id),
+        follow: false,
+        follow_paused: false,
+    };
+    let now = Instant::now();
+
+    // Default alt+f no longer triggers follow
+    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_f, now);
+    assert!(matches!(state.focus, Focus::Panel { follow: false, .. }));
+
+    // Overridden ctrl+g triggers follow
+    let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+    handle_key(&mut state, ctrl_g, now);
+    assert!(matches!(state.focus, Focus::Panel { follow: true, .. }));
+}
