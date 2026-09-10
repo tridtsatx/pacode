@@ -526,3 +526,40 @@ async fn test_point_4_assistant_messages_appended_only_at_completion() {
     assert_eq!(stored_msgs_after.len(), 2);
     assert_eq!(stored_msgs_after[1].message.role, Role::Assistant);
 }
+
+/// Resuming keeps only the transcript tail, and the item counter continues past
+/// it: a new item must not land on the seq of a restored one.
+#[test]
+fn restored_transcript_items_do_not_collide_with_new_ones() {
+    use pacode_types::{AgentId, Message};
+    use std::sync::Arc;
+
+    let messages: Vec<(u64, Arc<Message>)> = (0..10)
+        .map(|i| (i, Arc::new(Message::user(format!("message {i}")))))
+        .collect();
+
+    let tail_cap = 4usize;
+    let tail_start = messages.len().saturating_sub(tail_cap);
+    let items = crate::transcript::history_to_items(
+        &AgentId::main(),
+        &messages[tail_start..],
+        tail_start as u64,
+    );
+    assert_eq!(items.len(), tail_cap, "only the tail is rendered");
+    assert_eq!(items[0].seq, tail_start as u64);
+
+    let mut state = crate::transcript::TranscriptState::new(tail_cap);
+    let mut highest = None;
+    for item in items {
+        highest = Some(item.seq);
+        state.upsert(item);
+    }
+    state.next_item_seq = highest.expect("items") + 1;
+
+    let next = state.next_seq();
+    assert_eq!(next, messages.len() as u64);
+    assert!(
+        state.tail.iter().all(|item| item.seq < next),
+        "a new item must not reuse a restored seq"
+    );
+}

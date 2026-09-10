@@ -32,6 +32,8 @@ pub enum MarketplaceError {
     Parse(#[from] serde_json::Error),
     #[error("no plugin named {0:?} in this marketplace")]
     UnknownPlugin(String),
+    #[error("the plugin name {0:?} is not a plain directory name")]
+    UnsafeName(String),
     #[error(transparent)]
     Install(#[from] InstallError),
     #[error("io: {0}")]
@@ -190,10 +192,21 @@ impl Marketplace {
             .get(&archive_url, source::ARCHIVE_MAX_BYTES)
             .await?;
 
+        // The name reached us from a fetched index; nothing is joined onto a path
+        // until it is proven to be one plain directory name.
+        if !manifest::is_valid_plugin_name(&entry.name) {
+            return Err(MarketplaceError::UnsafeName(entry.name.clone()));
+        }
+
         // Stage inside the plugins directory so the final move is a rename on the
         // same filesystem, and so a failure leaves nothing where plugins are read.
         std::fs::create_dir_all(&self.plugins_dir)?;
         let staged = self.plugins_dir.join(format!(".staging-{}", entry.name));
+        // Belt and braces: both paths must sit directly in the plugins directory
+        // before anything is removed or renamed.
+        if staged.parent() != Some(self.plugins_dir.as_path()) {
+            return Err(MarketplaceError::UnsafeName(entry.name.clone()));
+        }
         if staged.exists() {
             std::fs::remove_dir_all(&staged)?;
         }
@@ -221,12 +234,18 @@ impl Marketplace {
         install::write_record(&staged, &record)?;
 
         let final_dir = self.plugins_dir.join(&entry.name);
+        if final_dir.parent() != Some(self.plugins_dir.as_path()) {
+            return Err(MarketplaceError::UnsafeName(entry.name.clone()));
+        }
         install::commit_staged(&staged, &final_dir)?;
         Ok(record)
     }
 
     /// Remove exactly what an install wrote, and the record with it.
     pub fn uninstall(&self, plugin: &str) -> Result<(), MarketplaceError> {
+        if !manifest::is_valid_plugin_name(plugin) {
+            return Err(MarketplaceError::UnsafeName(plugin.to_string()));
+        }
         let dir = self.plugins_dir.join(plugin);
         let Some(record) = install::read_record(&dir) else {
             // Nothing pacode installed: refuse rather than delete a directory a
@@ -247,6 +266,9 @@ impl Marketplace {
 
     /// Components of an installed plugin that pacode will not run.
     pub fn unsupported_components(&self, plugin: &str) -> Vec<Component> {
+        if !manifest::is_valid_plugin_name(plugin) {
+            return Vec::new();
+        }
         let manifest_path = self
             .plugins_dir
             .join(plugin)

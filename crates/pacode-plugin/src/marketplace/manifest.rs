@@ -84,10 +84,26 @@ pub struct PluginEntry {
     pub strict: bool,
 }
 
+/// Whether a plugin name is usable as a single directory name.
+///
+/// The name comes from a fetched index, so it is attacker-controlled as soon as
+/// a user adds someone else's marketplace: without this, a name of `../../..`
+/// would send the installer's `remove_dir_all` and `rename` outside the plugin
+/// directory entirely.
+pub fn is_valid_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 impl PluginEntry {
     fn normalise(mut self) -> Option<Self> {
         self.name = cap(&self.name, NAME_MAX_CHARS);
-        if self.name.is_empty() {
+        if !is_valid_plugin_name(&self.name) {
             return None;
         }
         self.description = cap(&self.description, DESCRIPTION_MAX_CHARS);

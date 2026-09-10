@@ -188,6 +188,28 @@ pub trait MarketplaceFetcher: Send + Sync {
     async fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>, FetchError>;
 }
 
+/// Hosts the GitHub token may be sent to.
+const GITHUB_HOSTS: &[&str] = &[
+    "github.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "codeload.github.com",
+];
+
+/// Whether `url` points at one of GitHub's own hosts.
+pub fn is_github_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    parsed
+        .host_str()
+        .map(|h| h.to_ascii_lowercase())
+        .is_some_and(|host| GITHUB_HOSTS.contains(&host.as_str()))
+}
+
 /// The real fetcher, over the workspace's HTTP client.
 pub struct HttpFetcher {
     client: reqwest::Client,
@@ -216,10 +238,12 @@ impl MarketplaceFetcher for HttpFetcher {
     async fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>, FetchError> {
         let mut request = self.client.get(url);
         // Public repositories need no token; one is used when present purely to
-        // lift the anonymous rate limit.
-        if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        // lift the anonymous rate limit. It goes only to GitHub's own hosts,
+        // matched on the parsed host — a marketplace source is user-supplied, and
+        // a substring test would hand the token to `https://evil.example/github/`.
+        if is_github_host(url)
+            && let Ok(token) = std::env::var("GITHUB_TOKEN")
             && !token.is_empty()
-            && url.contains("github")
         {
             request = request.header("Authorization", format!("Bearer {token}"));
         }

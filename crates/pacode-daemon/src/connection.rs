@@ -19,16 +19,21 @@ pub struct ServerControl {
     pub paths: pacode_config::Paths,
     /// Set by `Shutdown{force:false}`: exit as soon as the core is idle.
     pub shutdown_when_idle: Arc<std::sync::atomic::AtomicBool>,
+    /// Raised when a connection closes, so the idle loop can wait for that event
+    /// instead of polling for it.
+    pub disconnected: Arc<tokio::sync::Notify>,
 }
 
 struct ConnectionGuard {
     connections: Arc<std::sync::atomic::AtomicUsize>,
+    disconnected: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.connections
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.disconnected.notify_waiters();
     }
 }
 
@@ -53,6 +58,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _guard = ConnectionGuard {
         connections: Arc::clone(&control.connections),
+        disconnected: Arc::clone(&control.disconnected),
     };
 
     let (reader, writer) = stream.into_split();

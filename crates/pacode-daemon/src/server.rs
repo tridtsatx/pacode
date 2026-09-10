@@ -7,6 +7,10 @@ use pacode_core::Core;
 use crate::connection::{self, ServerControl};
 use crate::{DaemonError, DaemonOptions};
 
+/// How often the daemon re-checks its idle timeout while nobody is attached.
+/// With a client attached it waits for the disconnect instead of polling.
+const IDLE_POLL_SECS: u64 = 30;
+
 /// Serve until shutdown. Returns after cleanup.
 pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError> {
     let listener = bind_socket(&opts.socket).await?;
@@ -40,6 +44,7 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
         pid,
         paths: opts.paths.clone(),
         shutdown_when_idle: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        disconnected: Arc::new(tokio::sync::Notify::new()),
     };
 
     let mut idle_since: Option<std::time::Instant> = Some(std::time::Instant::now());
@@ -92,11 +97,15 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
             break;
         }
 
+        // The idle timer exists to shut a daemon down once nobody is attached.
+        // While a client is attached there is nothing for it to decide, so it
+        // waits for the disconnect instead of waking every couple of seconds —
+        // which also stopped a full MCP status sweep from running on that tick.
         let idle_timer = async {
             if conns == 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(IDLE_POLL_SECS)).await;
             } else {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                control.disconnected.notified().await;
             }
         };
 
@@ -129,9 +138,6 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
                 }
             }
             _ = idle_timer => {
-                let _ = core
-                    .handle_global(&pacode_types::Request::ListMcpServers)
-                    .await;
                 let current_conns = control.connections.load(std::sync::atomic::Ordering::Relaxed);
                 if current_conns == 0 && core.is_idle() {
                     let idle_start = idle_since.get_or_insert_with(std::time::Instant::now);

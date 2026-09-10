@@ -537,3 +537,81 @@ fn a_manifest_reports_what_pacode_will_not_run() {
         Some(vec!["./agents"])
     );
 }
+
+#[test]
+fn a_plugin_name_that_is_not_a_plain_directory_name_is_dropped() {
+    // The index comes from someone else's repository, so a name is hostile input.
+    for bad in [
+        "../../etc",
+        "..",
+        ".",
+        "a/b",
+        "a\\b",
+        ".hidden",
+        "with space",
+        "nul\0",
+    ] {
+        assert!(
+            !manifest::is_valid_plugin_name(bad),
+            "{bad:?} must be refused"
+        );
+    }
+    for good in ["context7", "skill-creator", "claude_md.management", "a1"] {
+        assert!(manifest::is_valid_plugin_name(good), "{good:?} is fine");
+    }
+
+    let json = serde_json::json!({
+        "plugins": [
+            {"name": "../../../.bashrc", "description": "escape attempt"},
+            {"name": "honest", "description": "fine"}
+        ]
+    })
+    .to_string();
+    let index = MarketplaceIndex::parse(json.as_bytes()).expect("parse");
+    assert_eq!(index.plugins.len(), 1);
+    assert_eq!(index.plugins[0].name, "honest");
+}
+
+#[tokio::test]
+async fn a_hostile_name_never_reaches_a_path_join() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let market = marketplace(
+        std::sync::Arc::new(FakeFetcher::default()),
+        dir.path(),
+        3600,
+    );
+
+    // Nothing outside the plugins directory may be removed, whatever the caller says.
+    let outside = dir.path().join("precious");
+    std::fs::create_dir_all(&outside).expect("mkdir");
+    std::fs::write(outside.join("file"), b"keep me").expect("write");
+
+    assert!(matches!(
+        market.uninstall("../precious"),
+        Err(MarketplaceError::UnsafeName(_))
+    ));
+    assert!(outside.join("file").exists(), "nothing outside was touched");
+    assert!(market.unsupported_components("../../etc").is_empty());
+}
+
+#[test]
+fn the_github_token_goes_only_to_github_hosts() {
+    for url in [
+        "https://raw.githubusercontent.com/o/r/HEAD/.claude-plugin/marketplace.json",
+        "https://codeload.github.com/o/r/tar.gz/HEAD",
+        "https://api.github.com/repos/o/r",
+        "https://GitHub.com/o/r",
+    ] {
+        assert!(source::is_github_host(url), "{url} is GitHub");
+    }
+    for url in [
+        // A substring test would have handed the token to every one of these.
+        "https://evil.example/github/steal",
+        "https://github.com.evil.example/x",
+        "https://raw.githubusercontent.com.evil.example/x",
+        "http://raw.githubusercontent.com/x",
+        "not a url",
+    ] {
+        assert!(!source::is_github_host(url), "{url} is not GitHub");
+    }
+}

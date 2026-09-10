@@ -216,16 +216,27 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 estimated_tokens: est_tokens,
             };
 
+            // The transcript keeps a bounded tail, so only that tail is worth
+            // rendering into items: converting the whole history and letting the
+            // cap evict most of it was work thrown away on every resume.
+            let tail_cap = core.deps.config.session.history_page as usize * 2;
+            let tail_start = messages_after.len().saturating_sub(tail_cap);
             let items = crate::transcript::history_to_items(
                 &pacode_types::AgentId::main(),
-                &messages_after,
-                0,
+                &messages_after[tail_start..],
+                tail_start as u64,
             );
-            let mut transcript_state = crate::transcript::TranscriptState::new(
-                core.deps.config.session.history_page as usize * 2,
-            );
+            let mut transcript_state = crate::transcript::TranscriptState::new(tail_cap);
+            let mut highest_seq = None;
             for item in items {
+                highest_seq = Some(item.seq);
                 transcript_state.upsert(item);
+            }
+            // New items must continue past the restored ones; leaving the counter
+            // at zero would make the first item of the resumed session replace the
+            // first item of the old one.
+            if let Some(seq) = highest_seq {
+                transcript_state.next_item_seq = seq + 1;
             }
 
             let mut agents = BTreeMap::new();
