@@ -816,14 +816,25 @@ fn test_overlay_plugins_picker_keys() {
     state.input.insert_str("/plugins");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let actions = handle_key(&mut state, enter, now);
-    assert_eq!(actions, vec![Action::Send(Request::ListPlugins)]);
+    // With a marketplace configured, opening the screen also asks it for its list.
+    assert_eq!(
+        actions,
+        vec![
+            Action::Send(Request::ListPlugins),
+            Action::Send(Request::BrowseMarketplace {
+                source: "tridtsatx/pacode-plugins".to_string(),
+                query: String::new(),
+            }),
+        ]
+    );
     assert_eq!(
         state.focus,
         Focus::Overlay(Overlay::PluginsPicker {
             tab: crate::state::PluginsTab::Installed,
             market: Vec::new(),
             query: String::new(),
-            loading: false,
+            // The marketplace request is in flight until it answers.
+            loading: true,
             stale: false,
             index: 0,
             plugins: Vec::new(),

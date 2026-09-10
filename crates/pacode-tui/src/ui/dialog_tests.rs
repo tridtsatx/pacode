@@ -140,3 +140,96 @@ fn test_successful_call_is_unchanged() {
         "preview text must be rendered in gutter"
     );
 }
+
+fn long_output_call(lines: usize) -> TranscriptKind {
+    let preview = (0..lines)
+        .map(|i| format!("output line {i} that is long enough to be cut at a narrow width"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    TranscriptKind::ToolCall {
+        call_id: pacode_types::CallId::new("call_1"),
+        name: "bash".into(),
+        title: "bash python3 -c ...".into(),
+        intent: None,
+        status: pacode_types::ToolStatus::Ok,
+        preview,
+        diff: None,
+        duration_ms: Some(237),
+        task: None,
+    }
+}
+
+fn text_of(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
+}
+
+#[test]
+fn a_collapsed_tool_call_shows_a_few_lines_and_says_how_many_are_hidden() {
+    let opts = pacode_render::RenderOptions::new(60, false);
+    let lines = super::render_item_inner(&long_output_call(20), None, 60, &opts, 0, false);
+    let text = text_of(&lines);
+
+    let body: Vec<&String> = text.iter().filter(|l| l.starts_with("  │")).collect();
+    assert_eq!(body.len(), super::COLLAPSED_MAX_LINES + 1, "{body:?}");
+    assert!(
+        body.last().expect("last").contains("+14 more lines"),
+        "{body:?}"
+    );
+    assert!(body.last().expect("last").contains("click to expand"));
+    // Collapsed rows are cut to the width rather than wrapped.
+    assert!(body[0].contains('…'), "{:?}", body[0]);
+}
+
+#[test]
+fn an_expanded_tool_call_shows_every_line_wrapped() {
+    let opts = pacode_render::RenderOptions::new(60, false);
+    let lines = super::render_item_inner(&long_output_call(20), None, 60, &opts, 0, true);
+    let text = text_of(&lines);
+
+    let body: Vec<&String> = text.iter().filter(|l| l.starts_with("  │")).collect();
+    // Every source line is there, and long ones took more than one row.
+    assert!(
+        body.len() > 20,
+        "expanded output must show it all: {}",
+        body.len()
+    );
+    assert!(body.iter().any(|l| l.contains("output line 19")));
+    assert!(
+        body.iter().all(|l| !l.contains('…')),
+        "expanded rows wrap instead of being cut"
+    );
+    assert!(body.iter().all(|l| !l.contains("click to expand")));
+}
+
+#[test]
+fn an_expanded_tool_call_is_still_bounded() {
+    let opts = pacode_render::RenderOptions::new(60, false);
+    let lines = super::render_item_inner(&long_output_call(5000), None, 60, &opts, 0, true);
+    let text = text_of(&lines);
+
+    let body: Vec<&String> = text.iter().filter(|l| l.starts_with("  │")).collect();
+    assert!(
+        body.len() <= super::EXPANDED_MAX_LINES + 1,
+        "an enormous output must stay bounded: {}",
+        body.len()
+    );
+    assert!(
+        body.last().expect("last").contains("output truncated"),
+        "{:?}",
+        body.last()
+    );
+}
+
+#[test]
+fn a_short_output_needs_no_expansion_hint() {
+    let opts = pacode_render::RenderOptions::new(60, false);
+    let lines = super::render_item_inner(&long_output_call(2), None, 60, &opts, 0, false);
+    let text = text_of(&lines);
+    assert!(
+        text.iter().all(|l| !l.contains("click to expand")),
+        "{text:?}"
+    );
+}

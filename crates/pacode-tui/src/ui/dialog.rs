@@ -46,6 +46,22 @@ pub fn draw(
         anim_frame,
     );
 
+    // Remember where each cell landed, so a click on a row finds its cell. The
+    // header block, when there is one, is not a cell and gets no entry.
+    let header_blocks = usize::from(transcript.header.is_some());
+    let mut spans = Vec::with_capacity(cell_snapshots.len());
+    let mut cursor = 0usize;
+    for (i, lines) in cell_lines.iter().enumerate() {
+        let end = cursor + lines.len();
+        if i >= header_blocks
+            && let Some((id, _, _, _)) = cell_snapshots.get(i - header_blocks)
+        {
+            spans.push((*id, cursor, end));
+        }
+        cursor = end;
+    }
+    transcript.cell_lines = spans;
+
     let total_lines: usize = cell_lines.iter().map(|l| l.len()).sum();
     let viewport = area.height as usize;
 
@@ -164,8 +180,12 @@ fn get_or_render_cell(
     opts: &RenderOptions,
     transcript: &mut Transcript,
 ) -> Vec<Line<'static>> {
+    // An expanded cell renders differently, so it is a different cache entry
+    // rather than a stale one.
+    let expanded = transcript.is_expanded(args.cell_id);
+    let expansion_bit = if expanded { 0x4000_0000_0000_0000 } else { 0 };
     let key = CacheKey {
-        cell: args.cell_id ^ ((args.cell_version as u64) << 48),
+        cell: args.cell_id ^ ((args.cell_version as u64) << 48) ^ expansion_bit,
         width: args.width,
     };
 
@@ -187,6 +207,7 @@ fn get_or_render_cell(
             args.width,
             opts,
             args.anim_frame,
+            expanded,
         );
         let cached = transcript.cache.insert(key, rendered);
         return cached.to_vec();
@@ -226,6 +247,7 @@ fn get_or_render_cell(
         args.width,
         opts,
         args.anim_frame,
+        expanded,
     );
     if !is_running_tool {
         let cached = transcript.cache.insert(key, rendered);
@@ -242,7 +264,7 @@ pub(crate) fn render_cell_for_test(
     width: u16,
     opts: &RenderOptions,
 ) -> Vec<Line<'static>> {
-    render_cell(cell_kind, None, width, opts, 0)
+    render_cell(cell_kind, None, width, opts, 0, false)
 }
 
 fn render_cell(
@@ -251,10 +273,11 @@ fn render_cell(
     width: u16,
     opts: &RenderOptions,
     anim_frame: u64,
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     match cell_kind {
         CellKind::Gap => vec![Line::default()],
-        CellKind::Item(kind) => render_item(kind, stats, width, opts, anim_frame),
+        CellKind::Item(kind) => render_item_inner(kind, stats, width, opts, anim_frame, expanded),
         CellKind::BackgroundResult(result) => render_background_result(result, width, opts),
     }
 }
@@ -305,7 +328,25 @@ pub(crate) fn render_item(
     stats: Option<&str>,
     width: u16,
     opts: &RenderOptions,
+    anim_frame: u64,
+) -> Vec<Line<'static>> {
+    render_item_inner(kind, stats, width, opts, anim_frame, false)
+}
+
+/// Output lines shown on a collapsed tool call, and the ceiling on an expanded
+/// one: an expansion is a reading aid, not a reason to render a 200 MB log.
+pub const COLLAPSED_MAX_LINES: usize = 6;
+pub const EXPANDED_MAX_LINES: usize = 400;
+
+/// `expanded` shows a tool call's whole output, wrapped, instead of its first
+/// few lines cut to the width.
+fn render_item_inner(
+    kind: &TranscriptKind,
+    stats: Option<&str>,
+    width: u16,
+    opts: &RenderOptions,
     _anim_frame: u64,
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     match kind {
         TranscriptKind::User { text } => {
@@ -469,14 +510,49 @@ pub(crate) fn render_item(
                         .collect();
 
                     if content_lines.iter().any(|l| !l.trim().is_empty()) {
-                        for pl in content_lines.iter().take(6) {
-                            out.push(Line::from(vec![
-                                Span::styled("  │ ", opts.theme.dim),
-                                Span::styled(
-                                    truncate_to_width(pl, (width as usize).saturating_sub(4), true),
-                                    opts.theme.faint,
-                                ),
-                            ]));
+                        let body_width = (width as usize).saturating_sub(4);
+                        if expanded {
+                            // Expanded: the whole output, wrapped rather than cut,
+                            // and still bounded so one enormous result cannot make
+                            // the transcript unscrollable.
+                            let mut drawn = 0usize;
+                            for pl in &content_lines {
+                                for wrapped in pacode_render::wrap_text(pl, body_width) {
+                                    out.push(Line::from(vec![
+                                        Span::styled("  │ ", opts.theme.dim),
+                                        Span::styled(wrapped, opts.theme.faint),
+                                    ]));
+                                    drawn += 1;
+                                    if drawn >= EXPANDED_MAX_LINES {
+                                        break;
+                                    }
+                                }
+                                if drawn >= EXPANDED_MAX_LINES {
+                                    out.push(Line::from(Span::styled(
+                                        "  │ [output truncated]",
+                                        opts.theme.dim,
+                                    )));
+                                    break;
+                                }
+                            }
+                        } else {
+                            let hidden = content_lines.len().saturating_sub(COLLAPSED_MAX_LINES);
+                            for pl in content_lines.iter().take(COLLAPSED_MAX_LINES) {
+                                out.push(Line::from(vec![
+                                    Span::styled("  │ ", opts.theme.dim),
+                                    Span::styled(
+                                        truncate_to_width(pl, body_width, true),
+                                        opts.theme.faint,
+                                    ),
+                                ]));
+                            }
+                            // Say there is more, and how to see it.
+                            if hidden > 0 {
+                                out.push(Line::from(Span::styled(
+                                    format!("  │ +{hidden} more lines · click to expand"),
+                                    opts.theme.dim,
+                                )));
+                            }
                         }
                     }
                 }

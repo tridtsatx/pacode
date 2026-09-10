@@ -178,6 +178,11 @@ impl<'de> Deserialize<'de> for Ups {
     }
 }
 
+/// pacode's own plugin marketplace.
+fn default_marketplace() -> String {
+    "tridtsatx/pacode-plugins".to_string()
+}
+
 fn default_images() -> String {
     "auto".to_string()
 }
@@ -473,15 +478,15 @@ pub struct PluginsConfig {
     pub lua_memory_mb: u32,
     pub hook_timeout_ms: u64,
     /// Marketplace to browse in `/plugins`: `owner/repo`, `owner/repo@ref` or an
-    /// https URL. Empty means none is configured yet.
-    #[serde(default)]
+    /// https URL. Empty means none.
+    #[serde(default = "default_marketplace")]
     pub marketplace: String,
 }
 
 impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
-            marketplace: String::new(),
+            marketplace: default_marketplace(),
             enabled: true,
             dirs: Vec::new(),
             wasm_memory_mb: 64,

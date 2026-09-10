@@ -586,3 +586,70 @@ fn a_delta_for_an_unknown_cell_is_ignored_and_leaves_the_live_cell_alone() {
         other => panic!("unexpected cell {other:?}"),
     }
 }
+
+fn tool_cell(id: u64, preview: &str) -> Cell {
+    Cell {
+        id,
+        kind: CellKind::Item(pacode_types::TranscriptKind::ToolCall {
+            call_id: pacode_types::CallId::new(format!("call_{id}")),
+            name: "bash".into(),
+            title: "bash echo".into(),
+            intent: None,
+            status: pacode_types::ToolStatus::Ok,
+            preview: preview.to_string(),
+            diff: None,
+            duration_ms: Some(10),
+            task: None,
+        }),
+        version: 0,
+        ts_ms: id,
+        stats: None,
+    }
+}
+
+#[test]
+fn clicking_a_cell_toggles_its_expansion_and_an_unknown_cell_is_ignored() {
+    let mut t = Transcript::new(8);
+    t.cells.push_back(tool_cell(1, "line one\nline two"));
+
+    assert!(!t.is_expanded(1));
+    assert!(t.toggle_expanded(1));
+    assert!(t.is_expanded(1));
+    assert!(t.toggle_expanded(1));
+    assert!(!t.is_expanded(1));
+
+    // A cell that is not there cannot be expanded.
+    assert!(!t.toggle_expanded(99));
+    assert!(!t.is_expanded(99));
+}
+
+#[test]
+fn an_evicted_cell_takes_its_expansion_with_it() {
+    let mut t = Transcript::new(2);
+    t.cells.push_back(tool_cell(1, "a"));
+    t.cells.push_back(tool_cell(2, "b"));
+    t.toggle_expanded(1);
+    assert!(t.is_expanded(1));
+
+    t.cells.push_back(tool_cell(3, "c"));
+    t.enforce_cap();
+
+    assert_eq!(t.cells.len(), 2);
+    assert!(
+        !t.is_expanded(1),
+        "an evicted cell must not leave its id behind"
+    );
+}
+
+#[test]
+fn a_content_line_maps_back_to_the_cell_drawn_there() {
+    let mut t = Transcript::new(8);
+    t.cell_lines = vec![(10, 0, 3), (11, 3, 9), (12, 9, 10)];
+
+    assert_eq!(t.cell_at_line(0), Some(10));
+    assert_eq!(t.cell_at_line(2), Some(10));
+    assert_eq!(t.cell_at_line(3), Some(11));
+    assert_eq!(t.cell_at_line(8), Some(11));
+    assert_eq!(t.cell_at_line(9), Some(12));
+    assert_eq!(t.cell_at_line(10), None);
+}

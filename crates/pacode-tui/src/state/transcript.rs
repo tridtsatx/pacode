@@ -88,6 +88,12 @@ pub struct Transcript {
     /// recent draw. Selection is anchored to content lines, so this is what maps
     /// a screen row to the line the reader actually clicked on.
     pub first_visible_line: usize,
+    /// Cells whose output is shown in full instead of the first few lines.
+    pub expanded: std::collections::HashSet<u64>,
+    /// Which content lines belong to which cell, from the most recent draw:
+    /// `(cell id, first line, one past the last)`. This is how a click on a row
+    /// finds the cell under it.
+    pub cell_lines: Vec<(u64, usize, usize)>,
     pub cache: LineCache,
     /// Streaming reveal buffer for the live assistant cell (`live_cell`).
     pub stream: Option<StreamBuffer>,
@@ -112,6 +118,8 @@ impl Transcript {
             rendered_lines: None,
             viewport_height: None,
             first_visible_line: 0,
+            expanded: std::collections::HashSet::new(),
+            cell_lines: Vec::new(),
             cache: LineCache::new(20_000),
             stream: None,
             live_cell: None,
@@ -435,6 +443,31 @@ impl Transcript {
 
     /// Record the rendered line count and viewport height from the most recent draw,
     /// clamping `scroll_from_bottom` so the view can never sit past the top.
+    /// The cell drawn at content line `line`, from the most recent draw.
+    pub fn cell_at_line(&self, line: usize) -> Option<u64> {
+        self.cell_lines
+            .iter()
+            .find(|(_, start, end)| line >= *start && line < *end)
+            .map(|(id, _, _)| *id)
+    }
+
+    /// Show or hide a cell's full output. Returns true when something changed.
+    pub fn toggle_expanded(&mut self, cell_id: u64) -> bool {
+        if !self.cells.iter().any(|c| c.id == cell_id) {
+            return false;
+        }
+        if !self.expanded.remove(&cell_id) {
+            self.expanded.insert(cell_id);
+        }
+        // The rendered height changes, so the cached lines for that cell are stale.
+        self.cache.invalidate_cell(cell_id);
+        true
+    }
+
+    pub fn is_expanded(&self, cell_id: u64) -> bool {
+        self.expanded.contains(&cell_id)
+    }
+
     pub fn record_render(&mut self, total_lines: usize, viewport: usize) {
         self.rendered_lines = Some(total_lines);
         self.viewport_height = Some(viewport);
@@ -511,6 +544,9 @@ impl Transcript {
                     break;
                 }
                 if let Some(evicted) = self.cells.remove(evict_idx) {
+                    // The expansion belongs to the cell; an evicted cell takes it
+                    // with it rather than leaving an id behind forever.
+                    self.expanded.remove(&evicted.id);
                     self.cache.invalidate_cell(evicted.id);
                 } else {
                     break;

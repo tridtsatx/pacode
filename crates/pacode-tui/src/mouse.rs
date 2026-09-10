@@ -6,6 +6,23 @@ use crate::keys::{Action, handle_navigate_down, handle_navigate_up};
 use crate::layout::ScreenLayout;
 use crate::state::AppState;
 
+/// Show or hide the full output of the cell under a clicked row.
+fn toggle_cell_under(state: &mut AppState, row: u16, dialog: ratatui::layout::Rect) {
+    let replaced = state.agent_replaces_dialog();
+    let transcript = if replaced {
+        &mut state.panel.agent_transcript
+    } else {
+        &mut state.transcript
+    };
+    let line = transcript.first_visible_line + row.saturating_sub(dialog.y) as usize;
+    let Some(cell_id) = transcript.cell_at_line(line) else {
+        return;
+    };
+    if transcript.toggle_expanded(cell_id) {
+        state.dirty = true;
+    }
+}
+
 /// Scrolling with the button still held keeps growing the selection: the pointer
 /// has not moved, but different text is under it now, so the moving end is
 /// re-read from the new content line at the pointer.
@@ -62,7 +79,13 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if state.selection.dragging {
+                // A click that never moved is not a selection: it asks to see the
+                // rest of what the row is showing.
+                let was_a_click = state.selection.is_empty();
                 state.selection.finish();
+                if was_a_click && layout.dialog.contains((col, row).into()) {
+                    toggle_cell_under(state, row, layout.dialog);
+                }
             }
             return vec![];
         }
