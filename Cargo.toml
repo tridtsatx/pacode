@@ -27,26 +27,31 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.90"
+repository = "https://github.com/tridtsatx/pacode"
+homepage = "https://github.com/tridtsatx/pacode"
+readme = "README.md"
+keywords = ["cli", "tui", "agent", "llm", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-pacode-types = { path = "crates/pacode-types" }
-pacode-config = { path = "crates/pacode-config" }
-pacode-risk = { path = "crates/pacode-risk" }
-pacode-render = { path = "crates/pacode-render" }
-pacode-exec = { path = "crates/pacode-exec" }
-pacode-provider = { path = "crates/pacode-provider" }
-pacode-mcp = { path = "crates/pacode-mcp" }
-pacode-store = { path = "crates/pacode-store" }
-pacode-tools = { path = "crates/pacode-tools" }
-pacode-core = { path = "crates/pacode-core" }
-pacode-daemon = { path = "crates/pacode-daemon" }
-pacode-client = { path = "crates/pacode-client" }
-pacode-tui = { path = "crates/pacode-tui" }
-pacode-plugin = { path = "crates/pacode-plugin" }
-pacode-import = { path = "crates/pacode-import" }
-pacode-image = { path = "crates/pacode-image" }
-pacode-skills = { path = "crates/pacode-skills" }
-pacode-acp = { path = "crates/pacode-acp" }
+pacode-types = { path = "crates/pacode-types", version = "0.1.0" }
+pacode-config = { path = "crates/pacode-config", version = "0.1.0" }
+pacode-risk = { path = "crates/pacode-risk", version = "0.1.0" }
+pacode-render = { path = "crates/pacode-render", version = "0.1.0" }
+pacode-exec = { path = "crates/pacode-exec", version = "0.1.0" }
+pacode-provider = { path = "crates/pacode-provider", version = "0.1.0" }
+pacode-mcp = { path = "crates/pacode-mcp", version = "0.1.0" }
+pacode-store = { path = "crates/pacode-store", version = "0.1.0" }
+pacode-tools = { path = "crates/pacode-tools", version = "0.1.0" }
+pacode-core = { path = "crates/pacode-core", version = "0.1.0" }
+pacode-daemon = { path = "crates/pacode-daemon", version = "0.1.0" }
+pacode-client = { path = "crates/pacode-client", version = "0.1.0" }
+pacode-tui = { path = "crates/pacode-tui", version = "0.1.0" }
+pacode-plugin = { path = "crates/pacode-plugin", version = "0.1.0" }
+pacode-import = { path = "crates/pacode-import", version = "0.1.0" }
+pacode-image = { path = "crates/pacode-image", version = "0.1.0" }
+pacode-skills = { path = "crates/pacode-skills", version = "0.1.0" }
+pacode-acp = { path = "crates/pacode-acp", version = "0.1.0" }
 
 # async
 tokio = { version = "1", default-features = false }

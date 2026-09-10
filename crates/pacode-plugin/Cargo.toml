@@ -3,7 +3,13 @@ name = "pacode-plugin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
+description = "pacode: plugin host (Lua and WASM) for the pacode coding agent"
 
 [dependencies]
 pacode-types = { workspace = true }

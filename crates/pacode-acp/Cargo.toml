@@ -3,6 +3,11 @@ name = "pacode-acp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "ACP (Agent Client Protocol) adapter for pacode"
 
 [dependencies]

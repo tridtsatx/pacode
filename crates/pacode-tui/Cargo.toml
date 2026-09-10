@@ -3,6 +3,11 @@ name = "pacode-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "ratatui client: dialog, rail (plan/agents/background/session), agent panel, input, footer"
 
 [dependencies]

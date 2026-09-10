@@ -3,6 +3,11 @@ name = "pacode-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "MCP client over stdio JSON-RPC: server pool, lazy start, tool listing and calls"
 
 [dependencies]

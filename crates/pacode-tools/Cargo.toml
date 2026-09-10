@@ -3,6 +3,11 @@ name = "pacode-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Tool trait, ToolHost, and the built-in tool set (read/write/edit/bash/grep/glob/ls/plan/agent/bg/webfetch/mcp)"
 
 [dependencies]

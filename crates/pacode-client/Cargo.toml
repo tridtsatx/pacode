@@ -3,6 +3,11 @@ name = "pacode-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Daemon connection: autospawn, reconnect with backoff, typed request/reply API, event stream"
 
 [dependencies]

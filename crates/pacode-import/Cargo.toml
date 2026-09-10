@@ -3,6 +3,11 @@ name = "pacode-import"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Discovery and normalization of MCP servers and skills from other coding agents"
 
 [dependencies]

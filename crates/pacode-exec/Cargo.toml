@@ -3,6 +3,11 @@ name = "pacode-exec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Background task manager: processes, output spool, head/tail buffer, progress parsers, stall watchdog"
 
 [dependencies]
