@@ -524,17 +524,31 @@ async fn test_04_injection_at_point_d() {
     let timeout = tokio::time::sleep(Duration::from_secs(4));
     tokio::pin!(timeout);
 
+    let mut task_ended = false;
+    let mut toasts = Vec::new();
+
     loop {
         tokio::select! {
             _ = &mut timeout => panic!("timed out waiting for turn to finish"),
             res = rx.recv() => {
                 let (_seq, event) = res.unwrap();
-                if let Event::TurnEnded { .. } = event {
-                    break;
+                match &event {
+                    Event::TaskUpdated(info) if info.status.is_terminal() => task_ended = true,
+                    Event::Toast { title, .. } => toasts.push(title.clone()),
+                    Event::TurnEnded { .. } if task_ended => break,
+                    _ => {}
                 }
             }
         }
     }
+
+    // A finished task is reported once, as the transcript line the client builds
+    // from `TaskUpdated`. A toast on top of it said the same thing twice.
+    assert!(task_ended, "the task must be reported as ended");
+    assert!(
+        toasts.is_empty(),
+        "a finished task must not also raise a toast: {toasts:?}"
+    );
 
     let reqs = mock.requests();
     assert!(reqs.len() >= 2);

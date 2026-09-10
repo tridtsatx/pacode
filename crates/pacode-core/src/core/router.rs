@@ -45,19 +45,9 @@ pub(crate) fn start_task_router(
                         session.events.emit(Event::TaskUpdated(info.clone()));
                         let _ = session.store.upsert_task(&info).await;
 
-                        let toast = match info.status {
-                            pacode_types::TaskStatus::Completed => Event::Toast {
-                                level: ToastLevel::Success,
-                                title: format!("Task finished: {}", info.label),
-                                detail: Some(format!("exit code: {}", info.exit_code.unwrap_or(0))),
-                            },
-                            _ => Event::Toast {
-                                level: ToastLevel::Error,
-                                title: format!("Task failed: {}", info.label),
-                                detail: info.exit_code.map(|c| format!("exit code: {c}")),
-                            },
-                        };
-                        session.events.emit(toast);
+                        // No toast here: `TaskUpdated` above is what the client
+                        // reports a finished task from, as one transcript line.
+                        // A popup on top of it said the same thing twice.
 
                         let tail_lines = session.tasks.tail(&info.id, 40).await.unwrap_or_default();
                         let tail = tail_lines.join("\n");
