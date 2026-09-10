@@ -1,12 +1,12 @@
 use pacode_tools::builtin::builtin_tools;
 use pacode_tools::{Tool, ToolKind};
-use pacode_types::{Mode, RiskLevel};
+use pacode_types::{Mode, RiskLevel, WebConfig};
 
 use crate::permissions::{GateDecision, gate};
 
 #[test]
 fn test_every_builtin_tool_reports_expected_kind() {
-    let tools = builtin_tools();
+    let tools = builtin_tools(&WebConfig::default());
 
     // Spec §6.3 & §7 kind mapping
     let expected: &[(&str, ToolKind)] = &[

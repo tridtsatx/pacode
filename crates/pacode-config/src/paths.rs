@@ -152,4 +152,13 @@ impl Paths {
             .map(|p| p.join("skills"))
             .unwrap_or_else(|| PathBuf::from("skills"))
     }
+
+    /// Named subagent definitions (`~/.config/pacode/agents` or next to
+    /// `config.toml`), the global half of `.pacode/agents` discovery.
+    pub fn agents_dir(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .map(|p| p.join("agents"))
+            .unwrap_or_else(|| PathBuf::from("agents"))
+    }
 }

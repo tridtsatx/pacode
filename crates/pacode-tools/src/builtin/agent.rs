@@ -1,15 +1,13 @@
 //! `agent`: spawn and manage subagents (spec §8).
 
-use std::time::Duration;
-
 use async_trait::async_trait;
 use pacode_types::AgentId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input};
-use crate::host::AgentSpec;
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WaitOutcome};
+use crate::host::{AgentKindDef, AgentSpec};
+use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "agent";
 
@@ -20,13 +18,13 @@ pub struct AgentTool;
 struct AgentInput {
     action: String,
     prompt: Option<String>,
+    kind: Option<String>,
     name: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     context: Option<String>,
     tools: Option<Vec<String>>,
     agent_id: Option<String>,
-    timeout_secs: Option<u64>,
 }
 
 #[async_trait]
@@ -37,11 +35,13 @@ impl Tool for AgentTool {
 
     fn description(&self) -> &str {
         "Run work in parallel with subagents. `spawn` starts one with its own context \
-         and returns immediately with an agent id; its final report is delivered to you \
-         automatically when it finishes, so continue with other work. `wait` blocks \
-         (bounded) only when you cannot proceed without the result. `stop` cancels, \
-         `list` shows all agents, `ask_status` asks a running subagent for a brief \
-         status that arrives at your next step. Subagents cannot spawn agents."
+         and returns immediately with an agent id; the finished agent's report is \
+         delivered to you automatically as a message, so continue with other work or \
+         end your turn rather than polling. `spawn` takes an optional `kind`: a named \
+         subagent type from `<cwd>/.pacode/agents/*.md` or the global config's \
+         `agents/` dir whose file supplies the brief, tools, and model — `list` shows \
+         the available kinds. `stop` cancels, `ask_status` asks a running subagent for \
+         a brief status that arrives at your next step. Subagents cannot spawn agents."
     }
 
     fn schema(&self) -> Value {
@@ -49,15 +49,15 @@ impl Tool for AgentTool {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "wait", "stop", "list", "ask_status"]},
+                "action": {"type": "string", "enum": ["spawn", "stop", "list", "ask_status"]},
                 "prompt": {"type": "string", "description": "Full task description for the subagent (spawn)."},
+                "kind": {"type": "string", "description": "Named subagent type from `agents/*.md` files; `list` shows what is available."},
                 "name": {"type": "string", "description": "Short name shown in the UI, e.g. `tests`."},
                 "model": {"type": "string", "description": "`provider/model` override."},
                 "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
                 "context": {"type": "string", "enum": ["fresh", "fork"], "default": "fresh", "description": "`fork` copies your conversation so far."},
                 "tools": {"type": "array", "items": {"type": "string"}, "description": "Restrict the subagent to these tools."},
-                "agent_id": {"type": "string"},
-                "timeout_secs": {"type": "integer", "minimum": 1, "default": 300}
+                "agent_id": {"type": "string"}
             }
         })
     }
@@ -66,9 +66,11 @@ impl Tool for AgentTool {
         ToolKind::Control
     }
 
-    /// `spawn` → `host.spawn_agent(AgentSpec{..})` → output `Spawned agent <id> (<name>)`;
-    /// `wait` → `host.wait_agent` then the agent's summary/status; `stop`; `list` → one
-    /// line per agent `<id> <name> <status> <duration> ↓<tokens>`.
+    /// `spawn` → `host.spawn_agent(AgentSpec{..})` → output `Spawned agent <id>
+    /// (<name>)`; a `kind` merges the discovered file's prompt/tools/model unless the
+    /// call overrides them, an unknown `kind` fails listing the available kinds.
+    /// `stop`; `list` → one line per agent `<id> <name> <status> <duration>
+    /// ↓<tokens>` plus the available kinds.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<AgentInput>(input)?;
         match args.action.as_str() {
@@ -77,62 +79,62 @@ impl Tool for AgentTool {
                     .prompt
                     .filter(|p| !p.trim().is_empty())
                     .ok_or_else(|| ToolError::invalid("prompt is required for spawn"))?;
-                let model = args
+                let kind = match args
+                    .kind
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|k| !k.is_empty())
+                {
+                    Some(kind_name) => Some(resolve_kind(ctx, kind_name)?),
+                    None => None,
+                };
+                let mut model = args
                     .model
                     .as_deref()
                     .and_then(pacode_types::ModelRoute::parse_lossy);
+                if model.is_none()
+                    && let Some(def) = &kind
+                    && let Some(route) = def.model.as_deref()
+                {
+                    model = Some(ctx.host.parse_model_route(route).ok_or_else(|| {
+                        ToolError::invalid(format!(
+                            "agent kind '{}' sets an unresolvable model route '{route}'",
+                            def.name
+                        ))
+                    })?);
+                }
                 let effort = args.effort.as_deref().and_then(pacode_types::Effort::parse);
                 let fork = args.context.as_deref() == Some("fork");
+                // The kind file's body is the subagent's brief; the call's prompt
+                // is the concrete task, appended after it.
+                let prompt = match kind.as_ref().map(|k| k.prompt.trim()) {
+                    Some(brief) if !brief.is_empty() => format!("{brief}\n\n{prompt}"),
+                    _ => prompt,
+                };
                 let spec = AgentSpec {
                     prompt,
-                    name: args.name.clone(),
+                    name: args
+                        .name
+                        .clone()
+                        .or_else(|| kind.as_ref().map(|k| k.name.clone())),
                     model,
                     effort,
                     fork,
-                    tools: args.tools,
+                    tools: args
+                        .tools
+                        .clone()
+                        .or_else(|| kind.as_ref().and_then(|k| k.tools.clone())),
                 };
                 let id = ctx.host.spawn_agent(spec).await?;
-                let agent_name = args.name.unwrap_or_else(|| id.to_string());
+                let agent_name = args
+                    .name
+                    .or_else(|| kind.map(|k| k.name))
+                    .unwrap_or_else(|| id.to_string());
                 let content = format!("Spawned agent {id} ({agent_name})");
                 let title = format!("Spawn agent {agent_name}");
                 Ok(ToolOutput::text(content)
                     .with_title(title)
                     .with_preview(format!("agent {id}")))
-            }
-            "wait" => {
-                let agent_id_str = args
-                    .agent_id
-                    .ok_or_else(|| ToolError::invalid("agent_id is required for wait"))?;
-                let id = AgentId::new(agent_id_str);
-                let timeout_secs = args.timeout_secs.unwrap_or(300);
-                let outcome = ctx
-                    .host
-                    .wait_agent(&id, Duration::from_secs(timeout_secs))
-                    .await;
-                match outcome {
-                    WaitOutcome::Finished => {
-                        let info = ctx.host.agent_info(&id);
-                        let summary = info
-                            .as_ref()
-                            .and_then(|i| i.summary.clone())
-                            .unwrap_or_else(|| {
-                                info.as_ref()
-                                    .map(|i| format!("status: {:?}", i.status))
-                                    .unwrap_or_else(|| "finished".to_string())
-                            });
-                        let content = format!("Agent {id} finished. Summary: {summary}");
-                        Ok(ToolOutput::text(content)
-                            .with_title(format!("Agent wait {id}"))
-                            .with_preview("finished"))
-                    }
-                    WaitOutcome::Timeout | WaitOutcome::Progress => {
-                        let content = format!("Agent {id} is still running after {timeout_secs}s.");
-                        Ok(ToolOutput::text(content)
-                            .with_title(format!("Agent wait {id}"))
-                            .with_preview("running"))
-                    }
-                    WaitOutcome::Cancelled => Err(ToolError::Cancelled),
-                }
             }
             "ask_status" => {
                 let agent_id_str = args
@@ -159,7 +161,8 @@ impl Tool for AgentTool {
             }
             "list" => {
                 let agents = ctx.host.list_agents();
-                if agents.is_empty() {
+                let kinds = ctx.host.agent_kinds();
+                if agents.is_empty() && kinds.is_empty() {
                     return Ok(ToolOutput::text("No subagents.").with_title("agent list"));
                 }
                 let now_ms = pacode_types::now_ms();
@@ -172,9 +175,19 @@ impl Tool for AgentTool {
                         a.id, a.name, status_str, dur_s, a.tokens_out
                     ));
                 }
+                if !kinds.is_empty() {
+                    if !lines.is_empty() {
+                        lines.push(String::new());
+                    }
+                    lines.push("Available kinds:".to_string());
+                    for k in &kinds {
+                        let desc: String = k.description.chars().take(120).collect();
+                        lines.push(format!("  {} — {desc}", k.name));
+                    }
+                }
                 let joined = lines.join("\n");
                 let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-                let preview = format!("{} agents", agents.len());
+                let preview = format!("{} agents, {} kinds", agents.len(), kinds.len());
                 Ok(ToolOutput::text(content)
                     .with_title("agent list")
                     .with_preview(preview))
@@ -182,4 +195,25 @@ impl Tool for AgentTool {
             other => Err(ToolError::invalid(format!("unknown action: {other}"))),
         }
     }
+}
+
+/// Look up `name` among the host's discovered agent kinds; an unknown name
+/// fails with the available list so the model can self-correct.
+fn resolve_kind(ctx: &ToolCtx, name: &str) -> Result<AgentKindDef, ToolError> {
+    let kinds = ctx.host.agent_kinds();
+    if let Some(def) = kinds.iter().find(|k| k.name == name) {
+        return Ok(def.clone());
+    }
+    let available = if kinds.is_empty() {
+        "(none)".to_string()
+    } else {
+        kinds
+            .iter()
+            .map(|k| k.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(ToolError::invalid(format!(
+        "unknown agent kind '{name}', available kinds: {available}"
+    )))
 }

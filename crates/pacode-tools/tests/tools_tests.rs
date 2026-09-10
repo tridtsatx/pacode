@@ -16,7 +16,9 @@ use pacode_tools::builtin::multi_edit::MultiEditTool;
 use pacode_tools::builtin::plan::PlanTool;
 use pacode_tools::builtin::read::ReadTool;
 use pacode_tools::builtin::write::WriteTool;
-use pacode_tools::host::{AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
+use pacode_tools::host::{
+    AgentKindDef, AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome,
+};
 use pacode_tools::output::ToolError;
 use pacode_types::{
     AgentId, AgentInfo, AgentStatus, CallId, DiffStat, Effort, ExecConfig, Mode, ModelRoute,
@@ -32,6 +34,8 @@ struct StubHost {
     tasks: Arc<TaskManager>,
     plan: Mutex<Plan>,
     agents: Mutex<Vec<AgentInfo>>,
+    agent_kinds: Mutex<Vec<AgentKindDef>>,
+    spawned_specs: Mutex<Vec<AgentSpec>>,
 }
 
 impl StubHost {
@@ -45,6 +49,8 @@ impl StubHost {
             tasks,
             plan: Mutex::new(Plan::default()),
             agents: Mutex::new(Vec::new()),
+            agent_kinds: Mutex::new(Vec::new()),
+            spawned_specs: Mutex::new(Vec::new()),
         }
     }
 }
@@ -162,7 +168,7 @@ impl ToolHost for StubHost {
 
     async fn spawn_agent(&self, spec: AgentSpec) -> Result<AgentId, ToolError> {
         let id = AgentId::generate();
-        let name = spec.name.unwrap_or_else(|| id.to_string());
+        let name = spec.name.clone().unwrap_or_else(|| id.to_string());
         let info = AgentInfo {
             id: id.clone(),
             name,
@@ -175,6 +181,7 @@ impl ToolHost for StubHost {
             tokens_out: 42,
             model: spec
                 .model
+                .clone()
                 .unwrap_or_else(|| ModelRoute::parse_lossy("mock/test").unwrap()),
             effort: spec.effort.unwrap_or(Effort::Medium),
             parent: None,
@@ -182,6 +189,7 @@ impl ToolHost for StubHost {
             error: None,
         };
         self.agents.lock().unwrap().push(info);
+        self.spawned_specs.lock().unwrap().push(spec);
         Ok(id)
     }
 
@@ -198,8 +206,12 @@ impl ToolHost for StubHost {
         self.agents.lock().unwrap().clone()
     }
 
-    async fn wait_agent(&self, _agent: &AgentId, _timeout: Duration) -> WaitOutcome {
-        WaitOutcome::Finished
+    fn agent_kinds(&self) -> Vec<AgentKindDef> {
+        self.agent_kinds.lock().unwrap().clone()
+    }
+
+    fn parse_model_route(&self, s: &str) -> Option<ModelRoute> {
+        ModelRoute::parse_lossy(s)
     }
 
     fn request_agent_status(&self, _agent: &AgentId) -> Result<(), ToolError> {
@@ -662,6 +674,144 @@ async fn test_agent_spawn_and_list() {
     assert!(list_out.content.contains("worker"));
     assert!(list_out.content.contains("thinking"));
     assert!(list_out.content.contains("↓42"));
+}
+
+fn reviewer_kind(tmp: &std::path::Path) -> AgentKindDef {
+    AgentKindDef {
+        name: "reviewer".to_string(),
+        description: "Reviews code changes".to_string(),
+        tools: Some(vec!["read".to_string(), "grep".to_string()]),
+        model: Some("mock/review-model".to_string()),
+        prompt: "You are a strict code reviewer.".to_string(),
+        path: tmp.join("reviewer.md"),
+    }
+}
+
+#[tokio::test]
+async fn test_agent_spawn_with_named_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    host.agent_kinds
+        .lock()
+        .unwrap()
+        .push(reviewer_kind(tmp.path()));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+
+    let tool = AgentTool;
+    let out = tool
+        .call(
+            json!({"action": "spawn", "kind": "reviewer", "prompt": "Review src/main.rs"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(out.content.contains("Spawned agent"));
+    assert!(out.content.contains("reviewer"));
+
+    let spec = host.spawned_specs.lock().unwrap().last().unwrap().clone();
+    // Kind brief prepends the task prompt; kind tools/model apply; the kind name
+    // is the default display name.
+    assert_eq!(
+        spec.prompt,
+        "You are a strict code reviewer.\n\nReview src/main.rs"
+    );
+    assert_eq!(spec.name.as_deref(), Some("reviewer"));
+    assert_eq!(
+        spec.tools,
+        Some(vec!["read".to_string(), "grep".to_string()])
+    );
+    assert_eq!(spec.model, Some(ModelRoute::new("mock", "review-model")));
+
+    // Explicit params beat the kind file.
+    tool.call(
+        json!({
+            "action": "spawn",
+            "kind": "reviewer",
+            "prompt": "Review again",
+            "name": "second-look",
+            "model": "other/x",
+            "tools": ["ls"]
+        }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let spec = host.spawned_specs.lock().unwrap().last().unwrap().clone();
+    assert_eq!(spec.name.as_deref(), Some("second-look"));
+    assert_eq!(spec.model, Some(ModelRoute::new("other", "x")));
+    assert_eq!(spec.tools, Some(vec!["ls".to_string()]));
+}
+
+#[tokio::test]
+async fn test_agent_spawn_unknown_kind_lists_available() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    host.agent_kinds
+        .lock()
+        .unwrap()
+        .push(reviewer_kind(tmp.path()));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+
+    let tool = AgentTool;
+    let err = tool
+        .call(
+            json!({"action": "spawn", "kind": "nope", "prompt": "do work"}),
+            &ctx,
+        )
+        .await;
+    match err {
+        Err(ToolError::InvalidInput(msg)) => {
+            assert!(msg.contains("unknown agent kind 'nope'"), "got: {msg}");
+            assert!(msg.contains("reviewer"), "should list available: {msg}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+    assert!(host.spawned_specs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_agent_spawn_kind_with_unresolvable_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let mut kind = reviewer_kind(tmp.path());
+    // A route without `provider/` is unresolvable for the lossy stub.
+    kind.model = Some("nosuchmodel".to_string());
+    host.agent_kinds.lock().unwrap().push(kind);
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+
+    let tool = AgentTool;
+    let err = tool
+        .call(
+            json!({"action": "spawn", "kind": "reviewer", "prompt": "do work"}),
+            &ctx,
+        )
+        .await;
+    match err {
+        Err(ToolError::InvalidInput(msg)) => {
+            assert!(msg.contains("unresolvable model"), "got: {msg}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_agent_list_shows_kinds_without_agents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    host.agent_kinds
+        .lock()
+        .unwrap()
+        .push(reviewer_kind(tmp.path()));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+
+    let tool = AgentTool;
+    let out = tool.call(json!({"action": "list"}), &ctx).await.unwrap();
+    assert!(
+        out.content.contains("Available kinds"),
+        "got: {}",
+        out.content
+    );
+    assert!(out.content.contains("reviewer"));
 }
 
 #[test]

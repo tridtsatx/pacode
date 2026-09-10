@@ -1,14 +1,12 @@
 //! `bg`: manage background tasks.
 
-use std::time::Duration;
-
 use async_trait::async_trait;
 use pacode_types::TaskId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WaitOutcome};
+use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "bg";
 
@@ -20,7 +18,6 @@ struct BgInput {
     action: String,
     task_id: Option<String>,
     lines: Option<usize>,
-    timeout_secs: Option<u64>,
     current: Option<u64>,
     total: Option<u64>,
     percent: Option<f64>,
@@ -35,9 +32,10 @@ impl Tool for BgTool {
 
     fn description(&self) -> &str {
         "Background tasks: `list` running/finished tasks, `status` of one, `tail` its \
-         last lines, `wait` until it finishes (bounded), `kill` it, or report \
-         `progress` (current/total or percent) for a task you are supervising. You do \
-         not need to wait: task completion is delivered to you automatically."
+         last lines, `kill` it, or report `progress` (current/total or percent) for \
+         a task you are supervising. A finished task's completion is delivered to \
+         you automatically as a message — continue working or end your turn rather \
+         than polling."
     }
 
     fn schema(&self) -> Value {
@@ -45,10 +43,9 @@ impl Tool for BgTool {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["list", "status", "tail", "wait", "kill", "progress"]},
+                "action": {"type": "string", "enum": ["list", "status", "tail", "kill", "progress"]},
                 "task_id": {"type": "string"},
                 "lines": {"type": "integer", "minimum": 1, "default": 80},
-                "timeout_secs": {"type": "integer", "minimum": 1, "default": 60, "description": "For wait; max 3600."},
                 "current": {"type": "integer"},
                 "total": {"type": "integer"},
                 "percent": {"type": "number"},
@@ -62,10 +59,9 @@ impl Tool for BgTool {
     }
 
     /// `list`: one line per task `<id> <status> <label> <duration> [<progress>]`;
-    /// `status`: full TaskInfo lines; `tail`: last N lines; `wait`: `host.wait_task`
-    /// with `return_on_progress = true` (reports progress and remaining state);
-    /// `kill`: `host.kill_task`; `progress`: `host.report_task_progress` with source
-    /// Reported. Missing task_id where required → InvalidInput.
+    /// `status`: full TaskInfo lines; `tail`: last N lines; `kill`: `host.kill_task`;
+    /// `progress`: `host.report_task_progress` with source Reported. Missing
+    /// task_id where required → InvalidInput.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<BgInput>(input)?;
         match args.action.as_str() {
@@ -153,58 +149,6 @@ impl Tool for BgTool {
                 Ok(ToolOutput::text(content)
                     .with_title(format!("bg tail {id}"))
                     .with_preview(preview))
-            }
-            "wait" => {
-                let task_id_str = args
-                    .task_id
-                    .ok_or_else(|| ToolError::invalid("task_id is required for wait"))?;
-                let id = TaskId::new(task_id_str);
-                let timeout_secs = args.timeout_secs.unwrap_or(60).min(3600);
-                let outcome = ctx
-                    .host
-                    .wait_task(&id, Duration::from_secs(timeout_secs), true)
-                    .await;
-                match outcome {
-                    WaitOutcome::Finished => {
-                        let info = ctx.host.task_info(&id);
-                        let exit_str = info
-                            .as_ref()
-                            .and_then(|i| i.exit_code)
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "none".to_string());
-                        let status_str = info
-                            .as_ref()
-                            .map(|i| format!("{:?}", i.status))
-                            .unwrap_or_else(|| "finished".to_string());
-                        let text = format!(
-                            "Task {id} finished. Status: {status_str}, exit code: {exit_str}"
-                        );
-                        Ok(ToolOutput::text(text)
-                            .with_title(format!("bg wait {id}"))
-                            .with_preview(status_str))
-                    }
-                    WaitOutcome::Progress => {
-                        let info = ctx.host.task_info(&id);
-                        let prog = info
-                            .as_ref()
-                            .and_then(|i| i.progress.as_ref())
-                            .and_then(|p| p.short_label())
-                            .unwrap_or_else(|| "updated".to_string());
-                        let text = format!("Task {id} progress: {prog}");
-                        Ok(ToolOutput::text(text)
-                            .with_title(format!("bg wait {id}"))
-                            .with_preview(prog))
-                    }
-                    WaitOutcome::Timeout => {
-                        let text = format!(
-                            "Wait timed out after {timeout_secs}s; task {id} is still running."
-                        );
-                        Ok(ToolOutput::text(text)
-                            .with_title(format!("bg wait {id}"))
-                            .with_preview("timeout"))
-                    }
-                    WaitOutcome::Cancelled => Err(ToolError::Cancelled),
-                }
             }
             "kill" => {
                 let task_id_str = args

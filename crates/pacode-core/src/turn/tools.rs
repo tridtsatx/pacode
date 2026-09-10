@@ -129,6 +129,17 @@ async fn run_single_tool(
         }
     }
 
+    // `[hooks].pre_tool_use` runs after plugin hooks so it sees the final
+    // input; skipped when the call is already dead. Exit code 2 blocks the
+    // call and the hook's stderr goes back to the model as the tool error.
+    let mut user_hook_block = None;
+    if hook_denied.is_none() && call.parse_err.is_none() {
+        match crate::hooks::pre_tool_use(&session, &agent, &call.name, &call.input).await {
+            crate::hooks::PreToolDecision::Allow => {}
+            crate::hooks::PreToolDecision::Block(reason) => user_hook_block = Some(reason),
+        }
+    }
+
     let tool_opt = agent
         .tools
         .read()
@@ -161,6 +172,15 @@ async fn run_single_tool(
             format!("Permission denied: {reason}"),
             true,
             "Denied".to_string(),
+            None,
+            None,
+            ToolStatus::Denied,
+        )
+    } else if let Some(reason) = user_hook_block {
+        (
+            reason,
+            true,
+            "Blocked by hook".to_string(),
             None,
             None,
             ToolStatus::Denied,
@@ -288,9 +308,13 @@ async fn run_single_tool(
         .run_hooks(&pacode_plugin::HookEvent::PostToolCall {
             name: call.name.clone(),
             input: call.input.clone(),
-            output: output_val,
+            output: output_val.clone(),
         })
         .await;
+
+    // `[hooks].post_tool_use` observes the outcome (denied and errored calls
+    // included); it never blocks and hook stdout is ignored.
+    crate::hooks::post_tool_use(&session, &agent, &call.name, &call.input, &output_val).await;
 
     let item = TranscriptItem {
         seq: call.item_seq,

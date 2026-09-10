@@ -70,6 +70,13 @@ pub async fn run_turn(
         .run_hooks(&pacode_plugin::HookEvent::TurnStart)
         .await;
 
+    // `session_start` fires lazily on the first turn: the session-open path
+    // lives in core/open.rs, so this is the closest owned seam. Deduped per
+    // session id inside the hooks module.
+    if agent.id().is_main() {
+        crate::hooks::session_start(&session, &agent);
+    }
+
     session.events.emit(Event::TurnStarted {
         agent: agent.id(),
         turn: turn_id.clone(),

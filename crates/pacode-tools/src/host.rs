@@ -1,6 +1,7 @@
 //! `ToolHost`: the only interface tools use to reach the core (permissions, background
 //! tasks, subagents, plan, UI previews). The core implements it; tests use a stub.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,13 +135,294 @@ pub struct AgentSpec {
     pub tools: Option<Vec<String>>,
 }
 
-/// Result of waiting on tasks or agents.
+/// Result of waiting on tasks.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WaitOutcome {
     Finished,
     Timeout,
     Progress,
     Cancelled,
+}
+
+/// A named subagent type discovered from an `agents/*.md` file (Claude Code
+/// `.claude/agents` parity): frontmatter fenced by `---` (YAML-style) or `+++`
+/// (TOML) carries `name` (default: file stem), `description` (required — it is
+/// what the model sees when picking a kind), `tools` (restrict the subagent's
+/// tool set) and `model` (a route string); the markdown body is prepended to
+/// the spawn prompt as the agent's brief.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentKindDef {
+    pub name: String,
+    pub description: String,
+    /// `None` = the default subagent tool set.
+    pub tools: Option<Vec<String>>,
+    /// Route string resolved via `ToolHost::parse_model_route` at spawn time.
+    pub model: Option<String>,
+    /// Markdown body prepended to the spawn prompt.
+    pub prompt: String,
+    /// File the kind was loaded from.
+    pub path: PathBuf,
+}
+
+/// A file skipped during [`discover_agent_kinds`]; discovery never fails, it
+/// reports these instead.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentKindWarning {
+    #[error("failed to read agents directory at {path}: {source}")]
+    DirReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read agent definition at {path}: {source}")]
+    ReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid agent definition at {path}: {reason}")]
+    Invalid { path: PathBuf, reason: String },
+}
+
+/// Load agent kinds from `*.md` files in `dirs`. On a name clash the file from
+/// the earlier dir wins, so pass the project dir before the global one.
+/// Missing directories are normal; unreadable or invalid files are skipped and
+/// reported as [`AgentKindWarning`]s.
+pub fn discover_agent_kinds(dirs: &[PathBuf]) -> (Vec<AgentKindDef>, Vec<AgentKindWarning>) {
+    let mut kinds = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen = HashSet::new();
+
+    for dir in dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    warnings.push(AgentKindWarning::DirReadFailed {
+                        path: dir.clone(),
+                        source: err,
+                    });
+                }
+                continue;
+            }
+        };
+
+        let mut files = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(e) => {
+                    let path = e.path();
+                    if path.is_file() && path.extension().is_some_and(|x| x == "md") {
+                        files.push(path);
+                    }
+                }
+                Err(err) => warnings.push(AgentKindWarning::DirReadFailed {
+                    path: dir.clone(),
+                    source: err,
+                }),
+            }
+        }
+        files.sort();
+
+        for path in files {
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(err) => {
+                    warnings.push(AgentKindWarning::ReadFailed { path, source: err });
+                    continue;
+                }
+            };
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            match parse_agent_kind(&content, stem, path.clone()) {
+                Ok(def) => {
+                    if seen.insert(def.name.clone()) {
+                        kinds.push(def);
+                    }
+                }
+                Err(reason) => warnings.push(AgentKindWarning::Invalid { path, reason }),
+            }
+        }
+    }
+
+    kinds.sort_by(|a, b| a.name.cmp(&b.name));
+    (kinds, warnings)
+}
+
+/// Flat frontmatter of an `agents/*.md` file; every field is optional at this
+/// stage and validated in [`parse_agent_kind`].
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct RawKindFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    tools: Option<Vec<String>>,
+    model: Option<String>,
+}
+
+/// Parse one `agents/*.md` file. `Err` carries the reason the file is skipped.
+fn parse_agent_kind(
+    content: &str,
+    fallback_name: &str,
+    path: PathBuf,
+) -> Result<AgentKindDef, String> {
+    let Some((is_toml, frontmatter, body)) = split_kind_frontmatter(content) else {
+        return Err("missing frontmatter (expected a `---` or `+++` fenced block)".to_string());
+    };
+    let raw = if is_toml {
+        toml::from_str::<RawKindFrontmatter>(frontmatter)
+            .map_err(|e| format!("invalid TOML frontmatter: {e}"))?
+    } else {
+        parse_yaml_frontmatter(frontmatter)
+    };
+
+    let name = raw
+        .name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| fallback_name.to_string());
+    if name.is_empty() {
+        return Err("missing `name` and the file has no usable stem".to_string());
+    }
+    let description = raw
+        .description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| "missing required `description`".to_string())?;
+
+    Ok(AgentKindDef {
+        name,
+        description,
+        // An empty list reads as "not set": the default subagent set applies.
+        tools: raw.tools.filter(|t| !t.is_empty()),
+        model: raw
+            .model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty()),
+        prompt: body.trim().to_string(),
+        path,
+    })
+}
+
+/// Split `---` (YAML-style) or `+++` (TOML) frontmatter off the body. Returns
+/// `(is_toml, frontmatter_text, body)`; `None` when there is no fenced block.
+fn split_kind_frontmatter(content: &str) -> Option<(bool, &str, &str)> {
+    let clean = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let (fence, is_toml) = if clean.starts_with("+++") {
+        ("+++", true)
+    } else if clean.starts_with("---") {
+        ("---", false)
+    } else {
+        return None;
+    };
+    let after_open = &clean[fence.len()..];
+    let after_open = after_open
+        .strip_prefix("\r\n")
+        .or_else(|| after_open.strip_prefix('\n'))?;
+
+    let mut offset = 0;
+    while offset < after_open.len() {
+        let slice = &after_open[offset..];
+        if let Some(rest) = slice.strip_prefix(fence) {
+            let frontmatter = &after_open[..offset];
+            if let Some(body) = rest
+                .strip_prefix("\r\n")
+                .or_else(|| rest.strip_prefix('\n'))
+            {
+                return Some((is_toml, frontmatter, body));
+            }
+            if rest.is_empty() {
+                return Some((is_toml, frontmatter, ""));
+            }
+            // The fence followed by more text on the same line is not a closer.
+        }
+        match slice.find('\n') {
+            Some(pos) => offset += pos + 1,
+            None => break,
+        }
+    }
+    None
+}
+
+/// Hand-parse the flat `key: value` frontmatter subset — the same approach as
+/// `pacode_skills`, so no YAML dependency is pulled in. `tools` accepts both
+/// `tools: [a, b]` and a `- item` block list; unknown keys are ignored.
+fn parse_yaml_frontmatter(frontmatter: &str) -> RawKindFrontmatter {
+    let mut raw = RawKindFrontmatter::default();
+    let mut lines = frontmatter.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = strip_quotes(value);
+        match key.trim() {
+            "name" if raw.name.is_none() && !value.is_empty() => {
+                raw.name = Some(value.to_string());
+            }
+            "description" if raw.description.is_none() && !value.is_empty() => {
+                raw.description = Some(value.to_string());
+            }
+            "model" if raw.model.is_none() && !value.is_empty() => {
+                raw.model = Some(value.to_string());
+            }
+            "tools" if raw.tools.is_none() => {
+                raw.tools = Some(parse_yaml_tool_list(value, &mut lines));
+            }
+            _ => {}
+        }
+    }
+    raw
+}
+
+/// `tools` frontmatter value: inline `[a, b]`, a single bare name, or a
+/// `- item` block list consumed from the following lines.
+fn parse_yaml_tool_list<'a>(
+    inline: &str,
+    lines: &mut std::iter::Peekable<std::str::Lines<'a>>,
+) -> Vec<String> {
+    let mut items = Vec::new();
+    if let Some(inner) = inline.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        for part in inner.split(',') {
+            let item = strip_quotes(part);
+            if !item.is_empty() {
+                items.push(item.to_string());
+            }
+        }
+        return items;
+    }
+    if !inline.is_empty() {
+        return vec![inline.to_string()];
+    }
+    while let Some(next) = lines.peek() {
+        let t = next.trim();
+        if t == "-" || t.starts_with("- ") {
+            let item = strip_quotes(t.trim_start_matches('-'));
+            if !item.is_empty() {
+                items.push(item.to_string());
+            }
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    items
+}
+
+fn strip_quotes(s: &str) -> &str {
+    let trimmed = s.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        trimmed[1..trimmed.len() - 1].trim()
+    } else {
+        trimmed
+    }
 }
 
 /// Everything a tool may ask the core for. Implemented by `pacode-core`.
@@ -207,7 +489,13 @@ pub trait ToolHost: Send + Sync {
     async fn spawn_agent(&self, spec: AgentSpec) -> Result<AgentId, ToolError>;
     fn agent_info(&self, agent: &AgentId) -> Option<AgentInfo>;
     fn list_agents(&self) -> Vec<AgentInfo>;
-    async fn wait_agent(&self, agent: &AgentId, timeout: Duration) -> WaitOutcome;
+    /// Named subagent types the `agent` tool may spawn: discovered fresh from
+    /// `agents/*.md` files on each call (spawn/list are rare), project dir
+    /// first so it shadows the global one on a name clash.
+    fn agent_kinds(&self) -> Vec<AgentKindDef>;
+    /// Resolve a `provider/model` route — or a bare model on the default
+    /// provider — against the session's provider registry.
+    fn parse_model_route(&self, s: &str) -> Option<ModelRoute>;
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError>;
     /// Orchestrator → subagent: ask for a brief status. Delivered to the subagent as a
     /// `<status_request>` injection at its next step; it answers with `report_status`.
@@ -226,3 +514,7 @@ pub trait ToolHost: Send + Sync {
     /// Emit a user-visible notice in the session transcript.
     fn emit_notice(&self, level: ToastLevel, text: String);
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod host_tests;

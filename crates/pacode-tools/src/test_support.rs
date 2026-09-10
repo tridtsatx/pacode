@@ -11,13 +11,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pacode_types::state::PermissionDecision;
 use pacode_types::{
-    AgentId, CallId, CronJob, CronJobId, CronSchedule, Mode, MonitorCondition, MonitorId,
-    MonitorInfo, MonitorStatus, SessionId,
+    AgentId, CallId, CronJob, CronJobId, CronSchedule, Mode, ModelRoute, MonitorCondition,
+    MonitorId, MonitorInfo, MonitorStatus, SessionId,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::ToolError;
-use crate::host::{AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
+use crate::host::{AgentKindDef, AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
 
 #[derive(Default)]
 pub struct ScheduleStub {
@@ -242,8 +242,12 @@ impl ToolHost for StubToolHost {
         Vec::new()
     }
 
-    async fn wait_agent(&self, _agent: &AgentId, _timeout: Duration) -> WaitOutcome {
-        WaitOutcome::Timeout
+    fn agent_kinds(&self) -> Vec<AgentKindDef> {
+        Vec::new()
+    }
+
+    fn parse_model_route(&self, s: &str) -> Option<ModelRoute> {
+        ModelRoute::parse_lossy(s)
     }
 
     async fn stop_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {

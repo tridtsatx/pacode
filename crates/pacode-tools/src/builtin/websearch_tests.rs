@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::Tool;
 use crate::builtin::webfetch::extract_html_to_markdown;
-use crate::host::{AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
+use crate::host::{AgentKindDef, AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
 
 #[derive(Default)]
 struct DummyHost {
@@ -115,8 +115,11 @@ impl ToolHost for DummyHost {
     fn list_agents(&self) -> Vec<pacode_types::AgentInfo> {
         Vec::new()
     }
-    async fn wait_agent(&self, _agent: &AgentId, _timeout: Duration) -> WaitOutcome {
-        WaitOutcome::Finished
+    fn agent_kinds(&self) -> Vec<AgentKindDef> {
+        Vec::new()
+    }
+    fn parse_model_route(&self, s: &str) -> Option<pacode_types::ModelRoute> {
+        pacode_types::ModelRoute::parse_lossy(s)
     }
     fn request_agent_status(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Ok(())
@@ -208,7 +211,9 @@ const DDG_RESULTS_FIXTURE: &str = r#"
 
 #[test]
 fn test_parse_ddg_results_order_entities_tags_and_filter() {
-    let results = parse_ddg_results(DDG_RESULTS_FIXTURE, 10).expect("parsing succeeds");
+    let response = parse_ddg_results(DDG_RESULTS_FIXTURE, 10).expect("parsing succeeds");
+    let results = response.results;
+    assert!(response.note.is_none());
 
     // Total 3 non-DDG results (duckduckgo.com self-link dropped)
     assert_eq!(results.len(), 3);
@@ -240,11 +245,15 @@ fn test_parse_ddg_results_order_entities_tags_and_filter() {
 
 #[test]
 fn test_parse_ddg_results_respects_num_results() {
-    let results = parse_ddg_results(DDG_RESULTS_FIXTURE, 1).expect("parsing succeeds");
+    let results = parse_ddg_results(DDG_RESULTS_FIXTURE, 1)
+        .expect("parsing succeeds")
+        .results;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].title, "Rust Programming Language & Tools");
 
-    let results2 = parse_ddg_results(DDG_RESULTS_FIXTURE, 2).expect("parsing succeeds");
+    let results2 = parse_ddg_results(DDG_RESULTS_FIXTURE, 2)
+        .expect("parsing succeeds")
+        .results;
     assert_eq!(results2.len(), 2);
 }
 
@@ -283,7 +292,8 @@ fn test_anti_bot_detector_recognises_challenges() {
         WebSearchError::Challenge(ref reason) => {
             assert_eq!(reason, "anomaly challenge");
             let msg = err.to_string();
-            assert!(msg.contains("TLS fingerprinting or IP reputation"));
+            assert!(msg.contains("search backend blocked by anti-bot"));
+            assert!(msg.contains("try again later"));
         }
         WebSearchError::Network(ref msg) => panic!("expected Challenge, got Network: {msg}"),
         WebSearchError::Parse(ref msg) => panic!("expected Challenge, got Parse: {msg}"),
@@ -308,8 +318,89 @@ fn test_empty_results_not_reported_as_challenge() {
     "#;
 
     assert_eq!(detect_anti_bot_page(normal_empty_html), None);
-    let results = parse_ddg_results(normal_empty_html, 10).expect("normal empty page succeeds");
-    assert!(results.is_empty());
+    let response = parse_ddg_results(normal_empty_html, 10).expect("normal empty page succeeds");
+    assert!(response.results.is_empty());
+    // A declared "no results" page is not markup drift — no diagnostic note.
+    assert!(response.note.is_none());
+}
+
+#[test]
+fn test_parse_result_link_class_fallback() {
+    // lite.duckduckgo.com layout: `result-link` anchors, `result-snippet` cells.
+    let lite_html = r#"
+        <html><body><table>
+          <tr><td><a class="result-link" href="https://alpha.example.com/">Alpha</a></td></tr>
+          <tr><td class="result-snippet">Alpha snippet.</td></tr>
+          <tr><td><a class="result-link" href="https://beta.example.com/">Beta</a></td></tr>
+          <tr><td class="result-snippet">Beta snippet.</td></tr>
+        </table></body></html>
+    "#;
+    let response = parse_ddg_results(lite_html, 10).expect("parsing succeeds");
+    assert_eq!(response.results.len(), 2);
+    assert_eq!(response.results[0].title, "Alpha");
+    assert_eq!(response.results[0].url, "https://alpha.example.com/");
+    assert_eq!(response.results[0].snippet, "Alpha snippet.");
+    assert_eq!(response.results[1].title, "Beta");
+    assert_eq!(response.results[1].url, "https://beta.example.com/");
+}
+
+#[test]
+fn test_parse_result_link_href_before_class() {
+    // Same `result__a` markup with attributes in the other order.
+    let html = r#"
+        <div class="result results_links web-result">
+          <h2 class="result__title">
+            <a href="https://gamma.example.com/" class="result__a">Gamma</a>
+          </h2>
+          <a class="result__snippet" href="https://gamma.example.com/">Gamma snippet.</a>
+        </div>
+    "#;
+    let response = parse_ddg_results(html, 10).expect("parsing succeeds");
+    assert_eq!(response.results.len(), 1);
+    assert_eq!(response.results[0].title, "Gamma");
+    assert_eq!(response.results[0].url, "https://gamma.example.com/");
+    assert_eq!(response.results[0].snippet, "Gamma snippet.");
+}
+
+#[test]
+fn test_parse_container_fallback_any_anchor() {
+    // Markup drift: result containers exist but title anchors carry no known class.
+    let html = r#"
+        <div class="results">
+          <div class="result web-result">
+            <h2><a href="https://delta.example.com/">Delta</a></h2>
+            <p class="desc">Delta snippet-ish.</p>
+          </div>
+          <div class="result web-result">
+            <h2><a href="https://epsilon.example.com/">Epsilon</a></h2>
+          </div>
+        </div>
+    "#;
+    let response = parse_ddg_results(html, 10).expect("parsing succeeds");
+    assert_eq!(response.results.len(), 2);
+    assert_eq!(response.results[0].title, "Delta");
+    assert_eq!(response.results[0].url, "https://delta.example.com/");
+    assert_eq!(response.results[1].title, "Epsilon");
+    assert_eq!(response.results[1].url, "https://epsilon.example.com/");
+}
+
+#[test]
+fn test_parse_unknown_markup_reports_drift_note() {
+    // Non-empty page, not a challenge, no "no results" marker, and markup the
+    // parser cannot map → Ok with a diagnostic note instead of silent [].
+    let html = r#"
+        <html><body>
+          <div class="entries">
+            <div class="entry"><a href="https://x.example.com/">X</a></div>
+          </div>
+        </body></html>
+    "#;
+    let response = parse_ddg_results(html, 10).expect("parsing succeeds");
+    assert!(response.results.is_empty());
+    assert_eq!(
+        response.note.as_deref(),
+        Some("the response page could not be parsed; the search backend markup may have changed")
+    );
 }
 
 #[test]
@@ -342,7 +433,7 @@ fn test_html_decode() {
 }
 
 struct MockBackend {
-    outcome: Result<Vec<SearchResult>, WebSearchError>,
+    outcome: Result<SearchResponse, WebSearchError>,
 }
 
 #[async_trait]
@@ -352,26 +443,85 @@ impl SearchBackend for MockBackend {
         _query: &str,
         _num_results: usize,
         _timeout: Duration,
-    ) -> Result<Vec<SearchResult>, WebSearchError> {
+    ) -> Result<SearchResponse, WebSearchError> {
         self.outcome.clone()
     }
+}
+
+/// Records the arguments the tool passes through, to prove `WebConfig` reaches
+/// the backend call.
+#[derive(Default)]
+struct RecordingBackend {
+    seen_num_results: std::sync::Mutex<Option<usize>>,
+    seen_timeout: std::sync::Mutex<Option<Duration>>,
+}
+
+#[async_trait]
+impl SearchBackend for RecordingBackend {
+    async fn search(
+        &self,
+        _query: &str,
+        num_results: usize,
+        timeout: Duration,
+    ) -> Result<SearchResponse, WebSearchError> {
+        *self.seen_num_results.lock().expect("mutex") = Some(num_results);
+        *self.seen_timeout.lock().expect("mutex") = Some(timeout);
+        Ok(SearchResponse::default())
+    }
+}
+
+/// One-shot HTTP/1.1 server on a raw std socket (the crate has no tokio `net`
+/// feature) answering the first request with `status` and `body`. Returns the
+/// endpoint URL to point a `DuckDuckGoBackend` at via `with_endpoint`.
+fn serve_once(status: &str, body: &str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    let status = status.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        // Drain the request; the header terminator is enough to respond.
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => request.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    format!("http://{addr}/")
 }
 
 #[tokio::test]
 async fn test_websearch_tool_success_and_formatting() {
     let backend = MockBackend {
-        outcome: Ok(vec![
-            SearchResult {
-                title: "Rust Official".to_string(),
-                url: "https://www.rust-lang.org/".to_string(),
-                snippet: "Empowering everyone to build reliable software.".to_string(),
-            },
-            SearchResult {
-                title: "Rust Wikipedia".to_string(),
-                url: "https://en.wikipedia.org/wiki/Rust".to_string(),
-                snippet: "A systems programming language.".to_string(),
-            },
-        ]),
+        outcome: Ok(SearchResponse {
+            results: vec![
+                SearchResult {
+                    title: "Rust Official".to_string(),
+                    url: "https://www.rust-lang.org/".to_string(),
+                    snippet: "Empowering everyone to build reliable software.".to_string(),
+                },
+                SearchResult {
+                    title: "Rust Wikipedia".to_string(),
+                    url: "https://en.wikipedia.org/wiki/Rust".to_string(),
+                    snippet: "A systems programming language.".to_string(),
+                },
+            ],
+            note: None,
+        }),
     };
 
     let tool = WebSearchTool::with_backend_and_config(
@@ -425,12 +575,12 @@ async fn test_websearch_tool_validation_and_errors() {
         .call(json!({"query": "test"}), &ctx)
         .await
         .unwrap_err();
-    assert!(chal_err.to_string().contains("anti-bot challenge"));
     assert!(
         chal_err
             .to_string()
-            .contains("TLS fingerprinting or IP reputation")
+            .contains("search backend blocked by anti-bot")
     );
+    assert!(chal_err.to_string().contains("try again later"));
 
     // Parse error
     let parse_backend = MockBackend {
@@ -446,6 +596,122 @@ async fn test_websearch_tool_validation_and_errors() {
             .to_string()
             .contains("failed to parse search results")
     );
+}
+
+#[tokio::test]
+async fn test_tool_passes_config_to_backend() {
+    let backend = Arc::new(RecordingBackend::default());
+    let tool = WebSearchTool::with_backend_and_config(
+        backend.clone(),
+        WebConfig {
+            default_num_results: 7,
+            request_timeout_secs: 42,
+        },
+    );
+
+    tool.call(json!({"query": "test"}), &dummy_ctx())
+        .await
+        .expect("call succeeds");
+
+    assert_eq!(*backend.seen_num_results.lock().expect("mutex"), Some(7));
+    assert_eq!(
+        *backend.seen_timeout.lock().expect("mutex"),
+        Some(Duration::from_secs(42))
+    );
+}
+
+#[tokio::test]
+async fn test_tool_surfaces_backend_note() {
+    let backend = MockBackend {
+        outcome: Ok(SearchResponse {
+            results: Vec::new(),
+            note: Some("markup drift suspected".to_string()),
+        }),
+    };
+    let tool = WebSearchTool::with_backend(Arc::new(backend));
+    let out = tool
+        .call(json!({"query": "test"}), &dummy_ctx())
+        .await
+        .expect("call succeeds");
+    assert!(!out.is_error);
+    assert!(out.content.contains("No results found for: test"));
+    assert!(out.content.contains("Note: markup drift suspected"));
+    assert_eq!(out.preview, "0 results (markup may have changed)");
+}
+
+#[tokio::test]
+async fn test_ddg_backend_challenge_statuses_error() {
+    for status in ["202 Accepted", "403 Forbidden"] {
+        let endpoint = serve_once(status, "<html><body>Are you a robot?</body></html>");
+        let tool =
+            WebSearchTool::with_backend(Arc::new(DuckDuckGoBackend::new().with_endpoint(endpoint)));
+        let err = tool
+            .call(json!({"query": "test"}), &dummy_ctx())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("search backend blocked by anti-bot") && msg.contains("try again later"),
+            "status {status} should surface a blocked error, got: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_ddg_backend_empty_body_is_challenge_error() {
+    let endpoint = serve_once("200 OK", "   ");
+    let tool =
+        WebSearchTool::with_backend(Arc::new(DuckDuckGoBackend::new().with_endpoint(endpoint)));
+    let err = tool
+        .call(json!({"query": "test"}), &dummy_ctx())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("search backend blocked by anti-bot"),
+        "empty body should surface a blocked error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_ddg_backend_challenge_markup_is_challenge_error() {
+    let endpoint = serve_once(
+        "200 OK",
+        r#"<html><head><script src="/anomaly.js"></script></head><body><div id="anomaly-modal"></div></body></html>"#,
+    );
+    let tool =
+        WebSearchTool::with_backend(Arc::new(DuckDuckGoBackend::new().with_endpoint(endpoint)));
+    let err = tool
+        .call(json!({"query": "test"}), &dummy_ctx())
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("search backend blocked by anti-bot"));
+    assert!(msg.contains("anomaly challenge"));
+}
+
+#[tokio::test]
+async fn test_ddg_backend_parses_results_over_http() {
+    let endpoint = serve_once("200 OK", DDG_RESULTS_FIXTURE);
+    let backend = DuckDuckGoBackend::new().with_endpoint(endpoint);
+    let response = backend
+        .search("rust", 10, Duration::from_secs(5))
+        .await
+        .expect("search succeeds");
+    assert_eq!(response.results.len(), 3);
+    assert_eq!(response.results[0].url, "https://www.rust-lang.org/");
+    assert!(response.note.is_none());
+}
+
+#[tokio::test]
+async fn test_ddg_backend_http_error_is_network_error() {
+    let endpoint = serve_once("500 Internal Server Error", "boom");
+    let backend = DuckDuckGoBackend::new().with_endpoint(endpoint);
+    let err = backend
+        .search("rust", 10, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WebSearchError::Network(_)));
 }
 
 #[test]

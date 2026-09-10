@@ -234,6 +234,7 @@ fn paths_under_layout() {
     assert_eq!(paths.pid_file(), root.join("run/daemon.pid"));
     assert_eq!(paths.memory_file(), root.join("memory.md"));
     assert_eq!(paths.skills_dir(), root.join("skills"));
+    assert_eq!(paths.agents_dir(), root.join("agents"));
 }
 
 #[test]

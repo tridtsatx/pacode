@@ -46,7 +46,7 @@ impl UiSink for DaemonUiSink {
 }
 
 /// providers = `ProviderRegistry::from_config` with keys from
-/// `pacode_config::resolve_api_key`; tools = `pacode_tools::builtin_tools()` +
+/// `pacode_config::resolve_api_key`; tools = `pacode_tools::builtin_tools(&config.web)` +
 /// plugin tools (MCP tools are added per session by the core from the pool);
 /// tasks = `TaskManager::new(paths.spool_dir(), config.exec.clone())`; mcp =
 /// `McpPool::new(config.mcp.servers.clone(), Some(paths.mcp_cache_dir()), None)`;
@@ -117,7 +117,7 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
         )
     };
 
-    let mut tools = builtin_tools();
+    let mut tools = builtin_tools(&opts.config.web);
     for tool in pacode_tools::builtin::plugin::plugin_tools(plugin_host.clone()) {
         tools.register(tool);
     }

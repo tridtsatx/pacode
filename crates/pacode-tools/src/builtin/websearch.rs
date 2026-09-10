@@ -2,8 +2,13 @@
 //!
 //! Ported from the reference implementation in `jcode` (`jcode-app-core/src/tool/websearch.rs`).
 //! DuckDuckGo's HTML endpoint serves an anti-bot challenge (HTTP 202, no results) for plain
-//! GET requests. Submitting the query as a POST form with desktop Chrome headers returns normal
-//! results markup with HTTP 200.
+//! GET requests. Submitting the query as a POST form with desktop browser headers returns
+//! normal results markup with HTTP 200.
+//!
+//! Challenge statuses (202/403), challenge markup, and empty bodies surface as explicit
+//! `Challenge` errors instead of a silent "no results". When the response is neither a
+//! challenge nor a declared no-results page but still yields zero parsed results, the tool
+//! reports `Ok` with a note that the backend markup may have changed.
 
 #[cfg(test)]
 #[path = "websearch_tests.rs"]
@@ -33,9 +38,7 @@ pub struct SearchResult {
 pub enum WebSearchError {
     #[error("network request failed: {0}")]
     Network(String),
-    #[error(
-        "anti-bot challenge encountered ({0}); requests may be blocked by TLS fingerprinting or IP reputation"
-    )]
+    #[error("search backend blocked by anti-bot ({0}); try again later")]
     Challenge(String),
     #[error("failed to parse search results: {0}")]
     Parse(String),
@@ -51,13 +54,23 @@ impl From<WebSearchError> for ToolError {
                 ToolError::failed(format!("network request failed: {msg}"))
             }
             WebSearchError::Challenge(reason) => ToolError::failed(format!(
-                "anti-bot challenge encountered ({reason}); requests may be blocked by TLS fingerprinting or IP reputation"
+                "search backend blocked by anti-bot ({reason}); try again later"
             )),
             WebSearchError::Parse(msg) => {
                 ToolError::failed(format!("failed to parse search results: {msg}"))
             }
         }
     }
+}
+
+/// What a search backend returns. `note` carries a non-fatal diagnostic the tool
+/// appends to its output — set when a response parsed to zero results even though
+/// it was a well-formed, non-challenge page, meaning the markup probably changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchResponse {
+    pub results: Vec<SearchResult>,
+    /// Non-fatal diagnostic surfaced to the model (e.g. suspected markup drift).
+    pub note: Option<String>,
 }
 
 /// Search backend interface so alternative providers can be plugged in.
@@ -68,12 +81,16 @@ pub trait SearchBackend: Send + Sync {
         query: &str,
         num_results: usize,
         timeout: Duration,
-    ) -> Result<Vec<SearchResult>, WebSearchError>;
+    ) -> Result<SearchResponse, WebSearchError>;
 }
+
+/// DuckDuckGo HTML endpoint. Overridable for tests and DDG-compatible mirrors.
+const DDG_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 
 /// DuckDuckGo HTML form POST search backend.
 pub struct DuckDuckGoBackend {
     client: reqwest::Client,
+    endpoint: String,
 }
 
 impl DuckDuckGoBackend {
@@ -82,11 +99,20 @@ impl DuckDuckGoBackend {
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self::with_client(client)
     }
 
     pub fn with_client(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            endpoint: DDG_ENDPOINT.to_string(),
+        }
+    }
+
+    /// Point the backend at a different endpoint (tests, DDG-compatible mirrors).
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
     }
 }
 
@@ -103,16 +129,20 @@ impl SearchBackend for DuckDuckGoBackend {
         query: &str,
         num_results: usize,
         timeout: Duration,
-    ) -> Result<Vec<SearchResult>, WebSearchError> {
+    ) -> Result<SearchResponse, WebSearchError> {
         let response = self
             .client
-            .post("https://html.duckduckgo.com/html/")
+            .post(self.endpoint.as_str())
             .header(
                 reqwest::header::USER_AGENT,
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                  (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             )
-            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .header(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .header(
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
@@ -124,6 +154,12 @@ impl SearchBackend for DuckDuckGoBackend {
             .map_err(|e| WebSearchError::Network(e.to_string()))?;
 
         let status = response.status();
+        // DDG answers suspected bots with 202 (the anomaly challenge) or 403.
+        // 202 is a success status, so without this check it fell through to the
+        // parser and surfaced as a silent empty result.
+        if status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(WebSearchError::Challenge(format!("HTTP {status}")));
+        }
         if !status.is_success() {
             return Err(WebSearchError::Network(format!(
                 "HTTP request returned status {status}"
@@ -134,6 +170,10 @@ impl SearchBackend for DuckDuckGoBackend {
             .text()
             .await
             .map_err(|e| WebSearchError::Network(format!("failed reading response: {e}")))?;
+
+        if body.trim().is_empty() {
+            return Err(WebSearchError::Challenge("empty response body".to_string()));
+        }
 
         parse_ddg_results(&body, num_results)
     }
@@ -221,13 +261,15 @@ impl Tool for WebSearchTool {
             .clamp(1, 50);
         let timeout = Duration::from_secs(self.config.request_timeout_secs);
 
-        let results = self
+        let response = self
             .backend
             .search(query, num_results, timeout)
             .await
             .map_err(ToolError::from)?;
 
-        let formatted = if results.is_empty() {
+        let note = response.note;
+        let results = response.results;
+        let mut formatted = if results.is_empty() {
             format!("No results found for: {query}\n")
         } else {
             let mut out = format!("Search results for: {query}\n\n");
@@ -240,11 +282,21 @@ impl Tool for WebSearchTool {
             }
             out
         };
+        // A backend note (the page parsed to nothing although it was neither a
+        // challenge nor a declared no-results page) is shown to the model so it
+        // can retry later or report the breakage instead of trusting "no results".
+        if let Some(note) = &note {
+            formatted.push_str(&format!("\nNote: {note}\n"));
+        }
 
         let cap = ctx.output_cap_chars;
         let content = cap_output(&formatted, accept_large_output, cap);
         let count = results.len();
-        let preview = format!("{count} results");
+        let preview = if count == 0 && note.is_some() {
+            "0 results (markup may have changed)".to_string()
+        } else {
+            format!("{count} results")
+        };
         let title = format!("Search \"{query}\"");
 
         Ok(ToolOutput::text(content)
@@ -271,6 +323,7 @@ pub fn detect_anti_bot_page(html: &str) -> Option<&'static str> {
         ("verify you are human", "human verification"),
         ("challenge-platform", "cloudflare challenge"),
         ("cf-challenge", "cloudflare challenge"),
+        ("challenge-form", "challenge form"),
     ];
     for (needle, reason) in MARKERS {
         if lowered.contains(needle) {
@@ -280,84 +333,142 @@ pub fn detect_anti_bot_page(html: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether the page explicitly declares the query found nothing — distinguishes a
+/// genuine empty result page from markup the parser failed to understand.
+fn page_reports_no_results(html: &str) -> bool {
+    let lowered = html.to_ascii_lowercase();
+    lowered.contains("no-results")
+        || lowered.contains("no_results")
+        || lowered.contains("no results")
+}
+
 /// Parse search results from DuckDuckGo HTML markup.
-pub fn parse_ddg_results(
-    html: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>, WebSearchError> {
+///
+/// Zero parsed results on a challenge page is a `Challenge` error; on a page that
+/// neither is a challenge nor declares "no results" it comes back `Ok` with a note
+/// saying the markup may have changed.
+pub fn parse_ddg_results(html: &str, max_results: usize) -> Result<SearchResponse, WebSearchError> {
     let results = parse_ddg_html_internal(html, max_results);
-    if results.is_empty()
-        && let Some(reason) = detect_anti_bot_page(html)
-    {
+    if !results.is_empty() {
+        return Ok(SearchResponse {
+            results,
+            note: None,
+        });
+    }
+    if let Some(reason) = detect_anti_bot_page(html) {
         return Err(WebSearchError::Challenge(reason.to_string()));
     }
-    Ok(results)
+    let note = if html.trim().is_empty() || page_reports_no_results(html) {
+        None
+    } else {
+        Some(
+            "the response page could not be parsed; the search backend markup may have changed"
+                .to_string(),
+        )
+    };
+    Ok(SearchResponse { results, note })
+}
+
+/// A link candidate lifted from the page: byte offset plus raw href and inner HTML.
+struct LinkMatch {
+    pos: usize,
+    href: String,
+    inner: String,
+}
+
+/// Collect `<a>` elements matched by `re` (group 1 = all attributes, group 2 =
+/// inner HTML), extracting each href from the attribute string so `href` and
+/// `class` may appear in either order in the tag.
+fn anchors_matching(html: &str, re: &regex::Regex) -> Vec<LinkMatch> {
+    let href_re = search_regex::attr_href();
+    re.captures_iter(html)
+        .map(|cap| LinkMatch {
+            pos: cap.get(0).map(|m| m.start()).unwrap_or(0),
+            href: href_re
+                .captures(&cap[1])
+                .map(|h| h[1].to_string())
+                .unwrap_or_default(),
+            inner: cap[2].to_string(),
+        })
+        .collect()
+}
+
+/// Last-resort extraction for markup drift: take the first `<a>` carrying an href
+/// inside each element whose class list contains a standalone `result` token.
+fn links_in_result_containers(html: &str) -> Vec<LinkMatch> {
+    let container_re = search_regex::result_container();
+    let anchor_re = search_regex::anchor();
+    let href_re = search_regex::attr_href();
+    let starts: Vec<usize> = container_re.find_iter(html).map(|m| m.start()).collect();
+    let mut links = Vec::new();
+    for (i, &start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(html.len());
+        for cap in anchor_re.captures_iter(&html[start..end]) {
+            let Some(href) = href_re.captures(&cap[1]) else {
+                continue;
+            };
+            links.push(LinkMatch {
+                pos: start + cap.get(0).map(|m| m.start()).unwrap_or(0),
+                href: href[1].to_string(),
+                inner: cap[2].to_string(),
+            });
+            break;
+        }
+    }
+    links
+}
+
+/// Snippet texts in document order, paired with byte offsets so each can be
+/// matched to the title link it follows.
+fn collect_snippets(html: &str) -> Vec<(usize, String)> {
+    let tag_re = search_regex::tag();
+    search_regex::result_snippet()
+        .captures_iter(html)
+        .map(|cap| {
+            let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+            let text = html_decode(&tag_re.replace_all(&cap[1], ""));
+            (pos, text)
+        })
+        .collect()
 }
 
 fn parse_ddg_html_internal(html: &str, max_results: usize) -> Vec<SearchResult> {
-    let mut results = Vec::new();
-    let link_re = search_regex::result_link();
-    let snippet_re = search_regex::result_snippet();
-    let tag_re = search_regex::tag();
-
-    // Strategy 1: Block-by-block parsing if result containers exist
-    if html.contains("class=\"result ")
-        || html.contains("class=\"result\"")
-        || html.contains("class='result ")
-    {
-        let parts: Vec<&str> = html.split("class=\"result ").collect();
-        for part in parts.iter().skip(1) {
-            if results.len() >= max_results {
-                break;
-            }
-            if let Some(link_cap) = link_re.captures(part) {
-                let url = decode_ddg_url(&link_cap[1]);
-                let title = html_decode(&tag_re.replace_all(&link_cap[2], ""));
-
-                if !url.starts_with("http") || url.contains("duckduckgo.com") {
-                    continue;
-                }
-
-                let snippet = if let Some(snip_cap) = snippet_re.captures(part) {
-                    html_decode(&tag_re.replace_all(&snip_cap[1], ""))
-                } else {
-                    String::new()
-                };
-
-                results.push(SearchResult {
-                    title,
-                    url,
-                    snippet,
-                });
-            }
-        }
-        if !results.is_empty() {
-            return results;
-        }
+    // Title links are tried in the order of the markup variants DDG has served:
+    // `result__a` (html endpoint), then `result-link` (lite endpoint and older
+    // layouts). Both match regardless of attribute order or quote style.
+    let mut links = anchors_matching(html, search_regex::result_link_a());
+    if links.is_empty() {
+        links = anchors_matching(html, search_regex::result_link_variant());
+    }
+    if links.is_empty() {
+        links = links_in_result_containers(html);
     }
 
-    // Strategy 2: Global captures fallback (matching jcode reference)
-    let links: Vec<_> = link_re.captures_iter(html).collect();
-    let snippets: Vec<_> = snippet_re.captures_iter(html).collect();
+    let snippets = collect_snippets(html);
+    let tag_re = search_regex::tag();
 
-    for (i, link_cap) in links.iter().enumerate() {
+    let mut results = Vec::new();
+    for (i, link) in links.iter().enumerate() {
         if results.len() >= max_results {
             break;
         }
 
-        let url = decode_ddg_url(&link_cap[1]);
-        let title = html_decode(&tag_re.replace_all(&link_cap[2], ""));
-
+        let url = decode_ddg_url(&link.href);
         if !url.starts_with("http") || url.contains("duckduckgo.com") {
             continue;
         }
 
-        let snippet = if i < snippets.len() {
-            let raw = &snippets[i][1];
-            html_decode(&tag_re.replace_all(raw, ""))
-        } else {
-            String::new()
-        };
+        let title = html_decode(&tag_re.replace_all(&link.inner, ""));
+
+        // Snippets pair positionally: the first snippet element after this title
+        // link but before the next title link belongs to this result. Skipped
+        // links still bound their own snippet, so filtering cannot misalign them.
+        let next_pos = links.get(i + 1).map(|l| l.pos).unwrap_or(usize::MAX);
+        let snippet = snippets
+            .iter()
+            .find(|(pos, _)| *pos > link.pos && *pos < next_pos)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
 
         results.push(SearchResult {
             title,
@@ -446,39 +557,43 @@ mod search_regex {
 
     use regex::Regex;
 
-    pub fn result_link() -> &'static Regex {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        RE.get_or_init(|| {
-            // Provably impossible to fail: static literal pattern
-            Regex::new(
-                r#"(?s)<a[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#,
-            )
-            .expect("static regex pattern is valid")
-        })
+    macro_rules! static_regex {
+        ($name:ident, $pat:expr_2021) => {
+            pub fn $name() -> &'static Regex {
+                static RE: OnceLock<Regex> = OnceLock::new();
+                // Provably impossible to fail: static literal pattern
+                RE.get_or_init(|| Regex::new($pat).expect("static regex pattern is valid"))
+            }
+        };
     }
 
-    pub fn result_snippet() -> &'static Regex {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        RE.get_or_init(|| {
-            // Provably impossible to fail: static literal pattern
-            Regex::new(r#"(?s)<a[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</a>"#)
-                .expect("static regex pattern is valid")
-        })
-    }
-
-    pub fn tag() -> &'static Regex {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        RE.get_or_init(|| {
-            // Provably impossible to fail: static literal pattern
-            Regex::new(r"<[^>]+>").expect("static regex pattern is valid")
-        })
-    }
-
-    pub fn numeric_entity() -> &'static Regex {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        RE.get_or_init(|| {
-            // Provably impossible to fail: static literal pattern
-            Regex::new(r"&#(?:(\d+)|x([0-9a-fA-F]+));").expect("static regex pattern is valid")
-        })
-    }
+    // Anchor patterns capture the whole attribute string in group 1 and the inner
+    // HTML in group 2, so `href` and `class` may appear in either order.
+    static_regex!(
+        result_link_a,
+        r#"(?si)<a\b([^>]*class\s*=\s*["'][^"']*\bresult__a\b[^"']*["'][^>]*)>(.*?)</a>"#
+    );
+    static_regex!(
+        result_link_variant,
+        r#"(?si)<a\b([^>]*class\s*=\s*["'][^"']*\bresult[-_]+link\b[^"']*["'][^>]*)>(.*?)</a>"#
+    );
+    static_regex!(anchor, r#"(?si)<a\b([^>]*)>(.*?)</a>"#);
+    // `href` must be preceded by whitespace (or be the first attribute) so
+    // `data-href` and friends cannot be picked up instead.
+    static_regex!(attr_href, r#"(?:^|\s)href\s*=\s*["']([^"']*)["']"#);
+    // Elements whose class list carries a standalone `result` token — i.e. the
+    // token ends at whitespace or the closing quote, excluding `result-link` /
+    // `result__a`-style compound names.
+    static_regex!(
+        result_container,
+        r#"(?si)<[a-zA-Z][a-zA-Z0-9]*[^>]*class\s*=\s*["'][^"']*\bresult[\s"']"#
+    );
+    // Snippet elements: `result__snippet` on html.duckduckgo.com, `result-snippet`
+    // on lite.duckduckgo.com; matched on any tag DDG has used for them.
+    static_regex!(
+        result_snippet,
+        r#"(?si)<(?:a|td|div|span)\b[^>]*class\s*=\s*["'][^"']*\bresult[_-]+snippet\b[^"']*["'][^>]*>(.*?)</(?:a|td|div|span)>"#
+    );
+    static_regex!(tag, r"<[^>]+>");
+    static_regex!(numeric_entity, r"&#(?:(\d+)|x([0-9a-fA-F]+));");
 }

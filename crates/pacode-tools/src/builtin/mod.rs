@@ -35,10 +35,13 @@ pub use skill::SkillTool;
 
 use std::sync::Arc;
 
+use pacode_types::WebConfig;
+
 use crate::registry::ToolRegistry;
 
-/// All built-in tools. MCP tools are added per session by the core.
-pub fn builtin_tools() -> ToolRegistry {
+/// All built-in tools. MCP tools are added per session by the core. `web`
+/// configures `websearch` (default result count, request timeout).
+pub fn builtin_tools(web: &WebConfig) -> ToolRegistry {
     ToolRegistry::new()
         .with(Arc::new(read::ReadTool))
         .with(Arc::new(write::WriteTool))
@@ -55,7 +58,7 @@ pub fn builtin_tools() -> ToolRegistry {
         .with(Arc::new(plan::PlanTool))
         .with(Arc::new(agent::AgentTool))
         .with(Arc::new(webfetch::WebFetchTool))
-        .with(Arc::new(websearch::WebSearchTool::default()))
+        .with(Arc::new(websearch::WebSearchTool::with_config(web.clone())))
         .with(Arc::new(report_status::ReportStatusTool))
         .with(Arc::new(memory::MemoryWriteTool))
         .with(Arc::new(memory::MemoryReadTool))

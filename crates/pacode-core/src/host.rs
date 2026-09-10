@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_exec::TaskSpec;
-use pacode_tools::host::PermissionDraft;
+use pacode_tools::host::{AgentKindDef, PermissionDraft};
 use pacode_tools::{AgentSpec, ToolError, ToolHost, WaitOutcome};
 use pacode_types::{
-    AgentId, AgentInfo, CallId, PermissionDecision, Plan, TaskId, TaskInfo, TaskProgress,
-    ToastLevel,
+    AgentId, AgentInfo, CallId, ModelRoute, PermissionDecision, Plan, TaskId, TaskInfo,
+    TaskProgress, ToastLevel,
 };
 
 use crate::session::Session;
@@ -99,6 +99,11 @@ impl ToolHost for SessionHost {
                 self.session
                     .events
                     .emit(pacode_types::Event::PermissionRequested(perm_req.clone()));
+                crate::hooks::notification(
+                    &self.session,
+                    &draft.agent,
+                    Some(perm_req.tool.clone()),
+                );
 
                 let agent_opt = self.session.agent(&draft.agent);
                 let item_seq = agent_opt
@@ -286,6 +291,7 @@ impl ToolHost for SessionHost {
         self.session
             .events
             .emit(pacode_types::Event::QuestionAsked(question.clone()));
+        crate::hooks::notification(&self.session, &question.agent, None);
 
         // A client that goes away, or an agent that is stopped, drops the sender:
         // the call comes back cancelled rather than waiting for an answer that
@@ -452,51 +458,23 @@ impl ToolHost for SessionHost {
         self.session.agent_infos()
     }
 
-    async fn wait_agent(&self, agent: &AgentId, timeout: Duration) -> WaitOutcome {
-        if let Some(agent_obj) = self.session.agent(agent) {
-            if !agent_obj.status().is_live() {
-                return WaitOutcome::Finished;
-            }
-        } else {
-            return WaitOutcome::Finished;
+    /// `<cwd>/.pacode/agents` first (project kinds shadow global ones), then the
+    /// global `agents/` dir next to `config.toml`. No cache: `spawn`/`list` are
+    /// rare and a scan is a directory listing plus small file reads.
+    fn agent_kinds(&self) -> Vec<AgentKindDef> {
+        let dirs = [
+            self.session.meta().cwd.join(".pacode").join("agents"),
+            pacode_config::Paths::discover().agents_dir(),
+        ];
+        let (kinds, warnings) = pacode_tools::host::discover_agent_kinds(&dirs);
+        for warning in &warnings {
+            log::warn!("{warning}");
         }
+        kinds
+    }
 
-        if timeout.is_zero() {
-            return WaitOutcome::Timeout;
-        }
-
-        let mut events_rx = self.session.events.subscribe();
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return WaitOutcome::Timeout;
-            }
-
-            match tokio::time::timeout(remaining, events_rx.recv()).await {
-                Ok(Ok((_seq, event))) => match event {
-                    pacode_types::Event::AgentUpdated(info) if info.id == *agent => {
-                        if !info.status.is_live() {
-                            return WaitOutcome::Finished;
-                        }
-                    }
-                    pacode_types::Event::TurnEnded { agent: a, .. } if a == *agent => {
-                        return WaitOutcome::Finished;
-                    }
-                    _ => {}
-                },
-                Ok(Err(_)) => {
-                    if let Some(a) = self.session.agent(agent)
-                        && !a.status().is_live()
-                    {
-                        return WaitOutcome::Finished;
-                    }
-                    return WaitOutcome::Timeout;
-                }
-                Err(_) => return WaitOutcome::Timeout,
-            }
-        }
+    fn parse_model_route(&self, s: &str) -> Option<ModelRoute> {
+        self.session.providers.parse_route(s)
     }
 
     fn request_agent_status(&self, agent: &AgentId) -> Result<(), ToolError> {

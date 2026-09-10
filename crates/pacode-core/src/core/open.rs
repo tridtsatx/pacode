@@ -240,7 +240,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
             }
 
             let mut agents = BTreeMap::new();
-            let main_info = stored_agents
+            let mut main_info = stored_agents
                 .iter()
                 .find(|a| a.id.is_main())
                 .cloned()
@@ -263,6 +263,11 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                         error: None,
                     }
                 });
+            // Meta is authoritative for the session route/effort; agent rows
+            // written before `set_model` propagated to agents hold a stale
+            // snapshot that would otherwise resume the old model.
+            main_info.model = meta.model.clone();
+            main_info.effort = meta.effort;
 
             let main_agent = Arc::new(crate::agent::Agent::new_with_transcript(
                 pacode_types::AgentId::main(),

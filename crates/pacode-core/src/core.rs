@@ -187,14 +187,14 @@ impl Core {
                     }
                 }
             }
-            Request::SetModel(route) => match session.set_model(route) {
+            Request::SetModel(route) => match session.set_model(route).await {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error {
                     message: e.to_string(),
                 },
             },
             Request::SetEffort(effort) => {
-                session.set_effort(effort);
+                session.set_effort(effort).await;
                 Reply::Ok
             }
             Request::SetMode(mode) => {
@@ -483,6 +483,7 @@ impl Core {
             sessions.remove(id)
         };
         if let Some(session) = session {
+            crate::hooks::session_end(&session);
             let agents = session
                 .agents
                 .read()

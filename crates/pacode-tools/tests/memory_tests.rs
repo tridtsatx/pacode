@@ -8,11 +8,13 @@ use pacode_tools::Tool;
 use pacode_tools::builtin::memory::{
     MemoryReadTool, MemoryWriteTool, global_memory_path, project_memory_path,
 };
-use pacode_tools::host::{AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
+use pacode_tools::host::{
+    AgentKindDef, AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome,
+};
 use pacode_tools::output::ToolError;
 use pacode_types::{
-    AgentId, AgentInfo, CallId, ExecConfig, Mode, PermissionDecision, Plan, SessionId, TaskId,
-    TaskInfo, TaskProgress,
+    AgentId, AgentInfo, CallId, ExecConfig, Mode, ModelRoute, PermissionDecision, Plan, SessionId,
+    TaskId, TaskInfo, TaskProgress,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -168,8 +170,12 @@ impl ToolHost for StubHost {
         self.agents.lock().unwrap().clone()
     }
 
-    async fn wait_agent(&self, _agent: &AgentId, _timeout: Duration) -> WaitOutcome {
-        WaitOutcome::Finished
+    fn agent_kinds(&self) -> Vec<AgentKindDef> {
+        Vec::new()
+    }
+
+    fn parse_model_route(&self, s: &str) -> Option<ModelRoute> {
+        ModelRoute::parse_lossy(s)
     }
 
     fn request_agent_status(&self, _agent: &AgentId) -> Result<(), ToolError> {

@@ -12,7 +12,9 @@ use pacode_provider::ProviderRegistry;
 use pacode_provider::mock::{MockProvider, MockResponse};
 use pacode_store::Store;
 use pacode_tools::builtin_tools;
-use pacode_types::{Attach, Config, Event, ModelRoute, Reply, Request, ToolStatus, TranscriptKind};
+use pacode_types::{
+    Attach, Config, Event, ModelRoute, Reply, Request, ToolStatus, TranscriptKind, WebConfig,
+};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_lua_plugin_full_flow() {
@@ -40,7 +42,7 @@ async fn test_lua_plugin_full_flow() {
     let ui_sink = Arc::new(NoopUiSink);
     let plugin_host = Arc::new(PluginHost::load(&config.plugins, ui_sink).await);
 
-    let mut tools = builtin_tools();
+    let mut tools = builtin_tools(&WebConfig::default());
     for tool in pacode_tools::builtin::plugin::plugin_tools(plugin_host.clone()) {
         tools.register(tool);
     }

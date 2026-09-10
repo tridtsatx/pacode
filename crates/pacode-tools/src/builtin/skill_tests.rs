@@ -12,7 +12,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::builtin::skill::SkillTool;
-use crate::host::PermissionDraft;
+use crate::host::{AgentKindDef, PermissionDraft};
 use crate::{AgentSpec, Tool, ToolCtx, ToolError, ToolHost, WaitOutcome};
 use pacode_exec::TaskSpec;
 
@@ -144,8 +144,11 @@ impl ToolHost for DummyHost {
     fn list_agents(&self) -> Vec<AgentInfo> {
         Vec::new()
     }
-    async fn wait_agent(&self, _agent: &AgentId, _timeout: Duration) -> WaitOutcome {
-        WaitOutcome::Finished
+    fn agent_kinds(&self) -> Vec<AgentKindDef> {
+        Vec::new()
+    }
+    fn parse_model_route(&self, s: &str) -> Option<pacode_types::ModelRoute> {
+        pacode_types::ModelRoute::parse_lossy(s)
     }
     async fn stop_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Ok(())

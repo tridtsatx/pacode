@@ -13,12 +13,14 @@
 //! - `compaction`: threshold check and summary turn
 //! - `transcript`: history → `TranscriptItem`, event sink with seq, delta coalescing
 //! - `host`: `ToolHost` implementation handed to tools
+//! - `hooks`: user `[hooks]` shell commands on tool/lifecycle events
 //! - `naming`: session title generation after the first reply
 
 pub mod agent;
 pub mod compaction;
 pub mod core;
 pub mod expand;
+pub mod hooks;
 pub mod host;
 pub mod inject;
 pub mod naming;

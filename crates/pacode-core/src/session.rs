@@ -253,20 +253,54 @@ impl Session {
         self.permissions.resolve(id, decision)
     }
 
-    pub fn set_model(&self, route: ModelRoute) -> Result<(), CoreError> {
-        {
+    /// Switch the session model. The route must resolve against this session's
+    /// provider registry — the turn loop resolves the same way, so an unknown
+    /// provider is rejected here instead of failing the next turn.
+    ///
+    /// The route propagates to the main agent's `AgentInfo` and to every live
+    /// subagent still on the old session model: those inherited it via
+    /// `spec.model = None`, while subagents spawned with an explicit model keep
+    /// theirs. Each updated info is persisted and broadcast, so the next loop
+    /// iteration of a running turn sees the new route too.
+    pub async fn set_model(&self, route: ModelRoute) -> Result<(), CoreError> {
+        self.providers.resolve(&route)?;
+
+        let old_model = {
             let mut meta = self.meta.write().unwrap_or_else(|p| p.into_inner());
-            meta.model = route;
-        }
+            std::mem::replace(&mut meta.model, route.clone())
+        };
+
+        self.update_agent_infos(|info| {
+            if info.id.is_main() || (info.status.is_live() && info.model == old_model) {
+                info.model = route.clone();
+                true
+            } else {
+                false
+            }
+        })
+        .await;
+
         self.touch();
         Ok(())
     }
 
-    pub fn set_effort(&self, effort: Effort) {
-        {
+    /// Same propagation as `set_model`, for the reasoning effort.
+    pub async fn set_effort(&self, effort: Effort) {
+        let old_effort = {
             let mut meta = self.meta.write().unwrap_or_else(|p| p.into_inner());
-            meta.effort = effort;
-        }
+            std::mem::replace(&mut meta.effort, effort)
+        };
+
+        self.update_agent_infos(|info| {
+            if info.id.is_main() || (info.status.is_live() && info.effort == old_effort) {
+                info.effort = effort;
+                true
+            } else {
+                false
+            }
+        })
+        .await;
+
         self.touch();
     }
 
@@ -276,6 +310,41 @@ impl Session {
             meta.mode = mode;
         }
         self.touch();
+    }
+
+    /// Run `update` against each agent's `AgentInfo`; where it returns `true`,
+    /// persist the row and emit `AgentUpdated`.
+    async fn update_agent_infos(&self, update: impl Fn(&mut AgentInfo) -> bool) {
+        let agents: Vec<Arc<Agent>> = self
+            .agents
+            .read()
+            .map(|a| a.values().cloned().collect())
+            .unwrap_or_default();
+        for agent in agents {
+            let updated_info = {
+                let mut info = agent.info.write().unwrap_or_else(|p| p.into_inner());
+                if update(&mut info) {
+                    Some(info.clone())
+                } else {
+                    None
+                }
+            };
+            let Some(info) = updated_info else {
+                continue;
+            };
+            if let Err(e) = self
+                .store
+                .upsert_agent(&self.id, &info, agent.prompt().as_deref())
+                .await
+            {
+                log::warn!(
+                    "failed to persist agent {} in session {}: {e}",
+                    info.id,
+                    self.id
+                );
+            }
+            self.events.emit(pacode_types::Event::AgentUpdated(info));
+        }
     }
 
     /// Spawn a subagent (depth 1, `agents.max_live` cap) and start its turn.

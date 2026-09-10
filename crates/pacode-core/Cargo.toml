@@ -20,11 +20,12 @@ pacode-exec = { workspace = true }
 pacode-mcp = { workspace = true }
 pacode-plugin = { workspace = true }
 pacode-store = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "fs", "process"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "fs", "process", "io-util"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }

@@ -79,7 +79,17 @@ pub enum ValidationError {
 }
 
 /// Explicit, named skip list for collection-valued fields that cannot be edited in a simple list UI.
-pub const SKIP_LIST: &[&str] = &["providers", "pricing", "plugins.dirs", "skills.dirs"];
+pub const SKIP_LIST: &[&str] = &[
+    "providers",
+    "pricing",
+    "plugins.dirs",
+    "skills.dirs",
+    "hooks.pre_tool_use",
+    "hooks.post_tool_use",
+    "hooks.session_start",
+    "hooks.session_end",
+    "hooks.notification",
+];
 
 pub const SECTIONS: &[&str] = &[
     "provider",

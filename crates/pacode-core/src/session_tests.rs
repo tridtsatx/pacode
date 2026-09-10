@@ -9,7 +9,7 @@ use pacode_provider::mock::{MockProvider, MockResponse};
 use pacode_store::Store;
 use pacode_tools::ToolRegistry;
 use pacode_types::{
-    AgentId, AgentStatus, Attach, Config, Event, ModelRoute, Reply, Request, Role, TurnStop,
+    AgentId, AgentStatus, Attach, Config, Effort, Event, ModelRoute, Reply, Request, Role, TurnStop,
 };
 
 use crate::core::{Core, CoreDeps};
@@ -531,6 +531,207 @@ async fn test_point_4_assistant_messages_appended_only_at_completion() {
         .unwrap();
     assert_eq!(stored_msgs_after.len(), 2);
     assert_eq!(stored_msgs_after[1].message.role, Role::Assistant);
+}
+
+/// `set_model` must reach the turn loop: it rewrites the session meta, the main
+/// agent's `AgentInfo`, and every live subagent that inherited the old session
+/// model (`spec.model = None`). A subagent spawned with an explicit model keeps
+/// it, and each updated info lands in the store for the resume path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_set_model_propagates_to_agents() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+
+    // Slow responses keep both subagents live while set_model runs.
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "inherited subagent working".into(),
+    });
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "pinned subagent working".into(),
+    });
+
+    let inherited_id = session
+        .spawn_agent(pacode_tools::AgentSpec {
+            name: Some("inherited".into()),
+            prompt: "work".into(),
+            tools: None,
+            fork: false,
+            model: None,
+            effort: None,
+        })
+        .await
+        .unwrap();
+
+    let pinned_route = ModelRoute::new("mock", "pinned-model");
+    let pinned_id = session
+        .spawn_agent(pacode_tools::AgentSpec {
+            name: Some("pinned".into()),
+            prompt: "work".into(),
+            tools: None,
+            fork: false,
+            model: Some(pinned_route.clone()),
+            effort: None,
+        })
+        .await
+        .unwrap();
+
+    let new_route = ModelRoute::new("mock", "new-model");
+    session.set_model(new_route.clone()).await.unwrap();
+
+    assert_eq!(session.meta().model, new_route);
+    assert_eq!(session.main_agent().unwrap().info().model, new_route);
+    assert_eq!(
+        session.agent(&inherited_id).unwrap().info().model,
+        new_route,
+        "subagent that inherited the session model follows it"
+    );
+    assert_eq!(
+        session.agent(&pinned_id).unwrap().info().model,
+        pinned_route,
+        "subagent spawned with an explicit model keeps it"
+    );
+
+    // The resume path reads agent rows back, so the update must be persisted.
+    let stored = session.store.list_agents(&session.id).await.unwrap();
+    assert_eq!(
+        stored.iter().find(|a| a.id.is_main()).unwrap().model,
+        new_route
+    );
+    assert_eq!(
+        stored.iter().find(|a| a.id == inherited_id).unwrap().model,
+        new_route
+    );
+    assert_eq!(
+        stored.iter().find(|a| a.id == pinned_id).unwrap().model,
+        pinned_route
+    );
+}
+
+/// A route to a provider this session cannot reach is rejected before anything
+/// is mutated.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_set_model_rejects_unknown_provider() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let original = session.meta().model;
+
+    let err = session
+        .set_model(ModelRoute::new("nope", "some-model"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown provider"),
+        "expected unknown-provider error, got: {err}"
+    );
+
+    assert_eq!(session.meta().model, original);
+    assert_eq!(session.main_agent().unwrap().info().model, original);
+
+    let reply = core
+        .handle(
+            &session_id,
+            Request::SetModel(ModelRoute::new("nope", "some-model")),
+        )
+        .await;
+    match reply {
+        Reply::Error { message } => assert!(message.contains("unknown provider")),
+        other => panic!("expected Reply::Error, got {other:?}"),
+    }
+}
+
+/// `set_effort` propagates exactly like `set_model`: main plus live subagents
+/// still on the old session effort; a pinned-effort subagent keeps its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_set_effort_propagates_to_agents() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "inherited subagent working".into(),
+    });
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "pinned subagent working".into(),
+    });
+
+    let inherited_id = session
+        .spawn_agent(pacode_tools::AgentSpec {
+            name: Some("inherited".into()),
+            prompt: "work".into(),
+            tools: None,
+            fork: false,
+            model: None,
+            effort: None,
+        })
+        .await
+        .unwrap();
+
+    let pinned_id = session
+        .spawn_agent(pacode_tools::AgentSpec {
+            name: Some("pinned".into()),
+            prompt: "work".into(),
+            tools: None,
+            fork: false,
+            model: None,
+            effort: Some(Effort::Low),
+        })
+        .await
+        .unwrap();
+
+    session.set_effort(Effort::High).await;
+
+    assert_eq!(session.meta().effort, Effort::High);
+    assert_eq!(session.main_agent().unwrap().info().effort, Effort::High);
+    assert_eq!(
+        session.agent(&inherited_id).unwrap().info().effort,
+        Effort::High,
+        "subagent that inherited the session effort follows it"
+    );
+    assert_eq!(
+        session.agent(&pinned_id).unwrap().info().effort,
+        Effort::Low,
+        "subagent spawned with an explicit effort keeps it"
+    );
+}
+
+/// End-to-end seam: the next turn's `CompletionRequest` carries the model and
+/// effort set mid-session.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_turn_after_set_model_uses_new_route() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+
+    session
+        .set_model(ModelRoute::new("mock", "switched-model"))
+        .await
+        .unwrap();
+    session.set_effort(Effort::Max).await;
+
+    let mut rx = core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::Text("ok".into()));
+    session.submit_user_message("hi".into()).await.unwrap();
+
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, .. })) = res
+                    && agent.is_main()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    let req = mock.requests().last().unwrap().clone();
+    assert_eq!(req.model, "switched-model");
+    assert_eq!(req.effort, Some(Effort::Max));
 }
 
 /// Resuming keeps only the transcript tail, and the item counter continues past

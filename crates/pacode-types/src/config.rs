@@ -33,6 +33,7 @@ pub struct Config {
     pub font: FontConfig,
     pub keys: KeysConfig,
     pub web: WebConfig,
+    pub hooks: HooksConfig,
 }
 
 impl Config {
@@ -535,6 +536,51 @@ impl Default for WebConfig {
     }
 }
 
+/// `[hooks]`: user shell commands fired on tool/lifecycle events, Claude-Code
+/// style. Each matching rule runs `sh -c <command>` with the event context in
+/// `PACODE_HOOK_*` env vars and a JSON payload on stdin. Absent means no hooks.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    /// Run before a tool call: exit code 2 blocks the call and the hook's
+    /// stderr goes back to the model as the tool error; any other nonzero exit
+    /// only warns. Timeouts and spawn failures are fail-open.
+    pub pre_tool_use: Vec<HookRule>,
+    /// Run after a tool call: a nonzero exit surfaces stderr as a notice.
+    /// Never blocks.
+    pub post_tool_use: Vec<HookRule>,
+    /// Fired when a session starts (lazily, on its first turn).
+    pub session_start: Vec<HookRule>,
+    /// Fired when a session ends.
+    pub session_end: Vec<HookRule>,
+    /// Fired on permission requests and user-question prompts.
+    pub notification: Vec<HookRule>,
+}
+
+/// One `[[hooks.<event>]]` rule: run `command` when `matcher` accepts the tool
+/// name.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HookRule {
+    /// Regex matched against the tool name; empty or `.*` matches everything.
+    pub matcher: String,
+    /// Shell command run via `sh -c`.
+    pub command: String,
+    /// Kill the hook after this many seconds; a timed-out `pre_tool_use` hook
+    /// allows the call (fail-open).
+    pub timeout_secs: u64,
+}
+
+impl Default for HookRule {
+    fn default() -> Self {
+        Self {
+            matcher: String::new(),
+            command: String::new(),
+            timeout_secs: 10,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +604,33 @@ mod tests {
         assert_eq!(cfg.web.request_timeout_secs, 15);
         assert_eq!(cfg.mcp.idle_timeout_secs, 300);
         assert!(cfg.default_route().is_none());
+        assert!(cfg.hooks.pre_tool_use.is_empty());
+        assert!(cfg.hooks.post_tool_use.is_empty());
+        assert!(cfg.hooks.session_start.is_empty());
+        assert!(cfg.hooks.session_end.is_empty());
+        assert!(cfg.hooks.notification.is_empty());
+    }
+
+    #[test]
+    fn hooks_config_parses() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "hooks": {
+                "pre_tool_use": [
+                    { "matcher": "bash|edit", "command": "./check.sh", "timeout_secs": 5 },
+                    { "command": "echo all" }
+                ],
+                "notification": [{ "matcher": ".*", "command": "notify-send hi" }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.hooks.pre_tool_use.len(), 2);
+        assert_eq!(cfg.hooks.pre_tool_use[0].matcher, "bash|edit");
+        assert_eq!(cfg.hooks.pre_tool_use[0].command, "./check.sh");
+        assert_eq!(cfg.hooks.pre_tool_use[0].timeout_secs, 5);
+        // Absent fields take the HookRule defaults.
+        assert_eq!(cfg.hooks.pre_tool_use[1].matcher, "");
+        assert_eq!(cfg.hooks.pre_tool_use[1].timeout_secs, 10);
+        assert_eq!(cfg.hooks.notification.len(), 1);
     }
 
     #[test]

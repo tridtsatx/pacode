@@ -14,7 +14,7 @@ use pacode_tools::builtin_tools;
 use pacode_types::protocol::{
     Attach, ClientHello, Envelope, PROTOCOL_VERSION, Reply, Request, ServerMessage,
 };
-use pacode_types::{ClientId, Config, ExecConfig, ModelRoute};
+use pacode_types::{ClientId, Config, ExecConfig, ModelRoute, WebConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 
@@ -59,7 +59,7 @@ async fn build_test_core(tmp: &tempfile::TempDir, config: Arc<Config>) -> Arc<Co
     providers.insert(mock);
     providers.set_default_route(Some(ModelRoute::new("mock", "mock-model")));
 
-    let tools = builtin_tools();
+    let tools = builtin_tools(&WebConfig::default());
 
     let deps = CoreDeps {
         marketplace: std::sync::Arc::new(pacode_plugin::marketplace::Marketplace::new(
