@@ -148,6 +148,22 @@ model is size-capped; anything that caches states its cap, its invalidation and
 its owner. If a fix needs a hack, say so in the code with the condition for
 removing it.
 
+## Prior art
+
+pacode is not the first terminal coding agent and does not pretend to be. It was
+built while reading, and borrowing ideas from:
+
+- [Claude Code](https://www.anthropic.com/claude-code) — the shape of the whole
+  thing: the turn loop, permission modes, subagents, skills, and the plugin
+  format this marketplace speaks. Not open source; the influence is on the
+  design, not the code.
+- [OpenCode](https://github.com/sst/opencode) — a daemon a thin client attaches
+  to, and sessions that outlive the terminal.
+- [Codex](https://github.com/openai/codex) — supervised process execution and
+  output handling; the head/tail output buffer here is a port of its idea.
+- jcode — an earlier agent of my own, where the rail layout and much of the TUI
+  vocabulary came from.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
