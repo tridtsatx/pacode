@@ -323,6 +323,9 @@ fn render_background_result(
     ])]
 }
 
+/// Render one item in its folded form. Only tests reach for this directly; the
+/// transcript goes through the cache, which knows whether the cell is expanded.
+#[cfg(test)]
 pub(crate) fn render_item(
     kind: &TranscriptKind,
     stats: Option<&str>,
