@@ -665,3 +665,114 @@ async fn an_installed_plugins_skills_and_mcp_servers_are_exposed_to_the_host() {
         vec![Component::Commands]
     );
 }
+
+#[test]
+fn a_plugin_source_names_this_repository_or_another_one() {
+    use install::PluginSource;
+
+    // In this repository.
+    assert_eq!(
+        PluginSource::parse("./context7"),
+        PluginSource::InRepo("./context7".into())
+    );
+    assert_eq!(
+        PluginSource::parse("./packs/context7"),
+        PluginSource::InRepo("./packs/context7".into())
+    );
+    assert_eq!(
+        PluginSource::parse("context7"),
+        PluginSource::InRepo("context7".into())
+    );
+    // A bare `a/b` is `owner/repo`, which is why an in-repo path is written with
+    // the leading `./` upstream uses.
+    assert!(matches!(
+        PluginSource::parse("packs/context7"),
+        PluginSource::Repository { .. }
+    ));
+
+    // Somewhere else, whole repository.
+    let PluginSource::Repository { source, subdir } = PluginSource::parse("obra/superpowers")
+    else {
+        panic!("owner/repo names another repository");
+    };
+    assert_eq!(source.display(), "obra/superpowers");
+    assert_eq!(subdir, None);
+
+    // Somewhere else, pinned, one directory of it.
+    let PluginSource::Repository { source, subdir } =
+        PluginSource::parse("owner/repo@v1.0#packs/thing")
+    else {
+        panic!("owner/repo@ref#dir names another repository");
+    };
+    assert_eq!(source.display(), "owner/repo@v1.0");
+    assert_eq!(subdir.as_deref(), Some("packs/thing"));
+
+    // A traversal attempt is not a repository spec, so it stays a path and the
+    // unpack guards refuse it.
+    assert_eq!(
+        PluginSource::parse("../../etc"),
+        PluginSource::InRepo("../../etc".into())
+    );
+}
+
+#[tokio::test]
+async fn a_plugin_maintained_elsewhere_installs_from_its_own_repository() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = github();
+    let index = serde_json::json!({
+        "name": "pacode-plugins",
+        "plugins": [{
+            "name": "superpowers",
+            "source": "obra/superpowers",
+            "description": "Core skills library",
+            "version": "6.3.0"
+        }]
+    })
+    .to_string()
+    .into_bytes();
+
+    let fetcher = std::sync::Arc::new(FakeFetcher::with(&source.index_url(), index));
+    // The archive comes from the other repository, not from the marketplace.
+    let upstream = MarketplaceSource::parse("obra/superpowers").expect("upstream");
+    fetcher.set(
+        &upstream.archive_url().expect("archive url"),
+        Ok(tarball(&[
+            (".claude-plugin/plugin.json", br#"{"name":"superpowers"}"#),
+            ("skills/brainstorming/SKILL.md", b"# brainstorming\n"),
+        ])),
+    );
+    let market = marketplace(fetcher.clone(), dir.path(), 3600);
+
+    let record = market
+        .install(&source, "superpowers", NOW)
+        .await
+        .expect("install");
+    assert_eq!(record.name, "superpowers");
+
+    let plugin_dir = market.plugins_dir().join("superpowers");
+    assert!(plugin_dir.join("skills/brainstorming/SKILL.md").exists());
+    assert!(plugin_dir.join(".claude-plugin/plugin.json").exists());
+    assert_eq!(market.skill_dirs().len(), 1);
+
+    // The marketplace archive was never fetched: only the index and the upstream.
+    let calls = fetcher.calls.lock().expect("lock").clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.contains("codeload.github.com/anthropics")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn a_whole_repository_unpacks_from_its_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive = tarball(&[
+        (".claude-plugin/plugin.json", br#"{"name":"x"}"#),
+        ("skills/a/SKILL.md", b"# a"),
+    ]);
+    let dest = dir.path().join("x");
+    let files = install::unpack_subdir(&archive, "", "x", &dest).expect("unpack");
+    assert_eq!(files.len(), 2);
+    assert!(dest.join("skills/a/SKILL.md").exists());
+}

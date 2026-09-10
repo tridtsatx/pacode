@@ -184,9 +184,20 @@ impl Marketplace {
             .cloned()
             .ok_or_else(|| MarketplaceError::UnknownPlugin(plugin.to_string()))?;
 
-        let archive_url = source
+        // A plugin either lives in this repository or points at another one; the
+        // second form is what lets a marketplace list a plugin maintained
+        // elsewhere instead of vendoring a copy that goes stale.
+        let (fetch_from, subpath) = match install::PluginSource::parse(&entry.source) {
+            install::PluginSource::InRepo(path) => (source.clone(), path),
+            install::PluginSource::Repository {
+                source: other,
+                subdir,
+            } => (other, subdir.unwrap_or_default()),
+        };
+
+        let archive_url = fetch_from
             .archive_url()
-            .ok_or_else(|| InstallError::NeedsRepository(source.display()))?;
+            .ok_or_else(|| InstallError::NeedsRepository(fetch_from.display()))?;
         let archive = self
             .fetcher
             .get(&archive_url, source::ARCHIVE_MAX_BYTES)
@@ -210,7 +221,7 @@ impl Marketplace {
         if staged.exists() {
             std::fs::remove_dir_all(&staged)?;
         }
-        let unpack = install::unpack_plugin(&archive, &entry, &staged);
+        let unpack = install::unpack_subdir(&archive, &subpath, &entry.name, &staged);
         let files = match unpack {
             Ok(files) => files,
             Err(e) => {

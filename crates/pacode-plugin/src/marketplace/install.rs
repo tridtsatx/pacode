@@ -66,7 +66,18 @@ pub fn unpack_plugin(
     entry: &PluginEntry,
     dest: &Path,
 ) -> Result<Vec<String>, InstallError> {
-    let wanted = plugin_subpath(&entry.source);
+    unpack_subdir(archive, &entry.source, &entry.name, dest)
+}
+
+/// Unpack `subpath` out of a repository tarball. An empty `subpath` takes the
+/// whole repository, which is what a plugin that *is* a repository needs.
+pub fn unpack_subdir(
+    archive: &[u8],
+    subpath: &str,
+    plugin_name: &str,
+    dest: &Path,
+) -> Result<Vec<String>, InstallError> {
+    let wanted = plugin_subpath(subpath);
     let decoder = flate2::read::GzDecoder::new(archive);
     let mut tar = tar::Archive::new(decoder);
 
@@ -117,7 +128,7 @@ pub fn unpack_plugin(
         // A symlink could point anywhere once the plugin directory is read, so
         // links are dropped rather than followed.
         if item.header().entry_type().is_symlink() {
-            log::warn!("skipping symlink {safe:?} in plugin {}", entry.name);
+            log::warn!("skipping symlink {safe:?} in plugin {plugin_name}");
             continue;
         }
         if let Some(parent) = target.parent() {
@@ -135,8 +146,58 @@ pub fn unpack_plugin(
     Ok(written)
 }
 
+/// Where a plugin's files come from.
+///
+/// An index is a list of pointers, so an entry may name a directory inside the
+/// marketplace repository or another repository entirely — the second form is
+/// what lets a marketplace list a plugin maintained elsewhere without vendoring
+/// a copy of it that goes stale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginSource {
+    /// A directory inside the marketplace repository.
+    InRepo(String),
+    /// Another repository, optionally with a directory inside it after `#`.
+    Repository {
+        source: super::MarketplaceSource,
+        subdir: Option<String>,
+    },
+}
+
+impl PluginSource {
+    /// Read an entry's `source` field.
+    ///
+    /// `./skills-pack`, `/foo` and a bare `foo` are directories in this
+    /// repository; `owner/repo`, `owner/repo@ref` and `owner/repo@ref#sub/dir`
+    /// are elsewhere, and so is an https URL to a repository.
+    ///
+    /// A bare `a/b` reads as `owner/repo`, which is why a nested directory in
+    /// this repository is written with the leading `./` upstream uses.
+    pub fn parse(source: &str) -> Self {
+        let trimmed = source.trim();
+        let looks_local = trimmed.starts_with("./")
+            || trimmed.starts_with("../")
+            || trimmed.starts_with('/')
+            || !trimmed.contains('/');
+        if looks_local {
+            return Self::InRepo(trimmed.to_string());
+        }
+
+        let (spec, subdir) = match trimmed.split_once('#') {
+            Some((spec, sub)) if !sub.is_empty() => (spec, Some(sub.to_string())),
+            Some((spec, _)) => (spec, None),
+            None => (trimmed, None),
+        };
+        match super::MarketplaceSource::parse(spec) {
+            Ok(source) => Self::Repository { source, subdir },
+            // Anything that is not a repository spec is treated as a path, which
+            // the traversal guards then have to accept before it is used.
+            Err(_) => Self::InRepo(trimmed.to_string()),
+        }
+    }
+}
+
 /// `./foo`, `foo/bar` and `/foo` all mean the same directory inside the archive.
-fn plugin_subpath(source: &str) -> PathBuf {
+pub(crate) fn plugin_subpath(source: &str) -> PathBuf {
     let trimmed = source
         .trim()
         .trim_start_matches("./")
