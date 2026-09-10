@@ -150,6 +150,18 @@ pub trait ToolHost: Send + Sync {
     /// permission matrix and the `AllowSession` cache before prompting.
     async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision;
 
+    /// Ask the user a question and wait for the answer. The turn blocks exactly
+    /// as it does for a permission prompt; a dismissed question comes back as a
+    /// cancelled answer rather than hanging.
+    async fn ask_question(
+        &self,
+        call_id: &CallId,
+        header: String,
+        question: String,
+        options: Vec<pacode_types::QuestionOption>,
+        multi_select: bool,
+    ) -> Result<pacode_types::QuestionAnswer, ToolError>;
+
     // --- scheduling (owner = session) ---
     /// Register a scheduled prompt. The schedule is validated here, so an
     /// unusable expression is an error the model can correct rather than a job

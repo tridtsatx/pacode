@@ -361,6 +361,7 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::GetMcpPrompt { .. }
         | Request::ListPlugins
         | Request::RunPluginCommand { .. }
+        | Request::AnswerQuestion { .. }
         | Request::ListCronJobs
         | Request::AddCronJob { .. }
         | Request::RemoveCronJob(_)

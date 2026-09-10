@@ -71,7 +71,9 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::ConfigPicker => {
                 crate::ui::config_view::draw(frame, area, state, opts);
             }
-            Overlay::ModelPicker { .. }
+            // Drawn as a bottom picker, not as a centred overlay.
+            Overlay::QuestionPicker { .. }
+            | Overlay::ModelPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
             | Overlay::ThemePicker { .. } => {}

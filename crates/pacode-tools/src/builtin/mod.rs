@@ -10,6 +10,7 @@
 //!   `ctx.cwd` require permission even in Auto mode (spec §6.3 "запись только внутри cwd").
 
 pub mod agent;
+pub mod ask_question;
 pub mod bash;
 pub mod bg;
 pub mod edit;
@@ -44,6 +45,7 @@ pub fn builtin_tools() -> ToolRegistry {
         .with(Arc::new(edit::EditTool))
         .with(Arc::new(multi_edit::MultiEditTool))
         .with(Arc::new(bash::BashTool))
+        .with(Arc::new(ask_question::AskQuestionTool))
         .with(Arc::new(bg::BgTool))
         .with(Arc::new(schedule::CronTool))
         .with(Arc::new(schedule::MonitorTool))

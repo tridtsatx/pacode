@@ -252,6 +252,7 @@ fn make_base_snapshot() -> SessionSnapshot {
     ];
 
     SessionSnapshot {
+        pending_questions: Vec::new(),
         cron_jobs: Vec::new(),
         monitors: Vec::new(),
         seq: 10,

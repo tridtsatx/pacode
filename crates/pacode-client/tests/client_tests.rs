@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 fn dummy_snapshot() -> SessionSnapshot {
     SessionSnapshot {
+        pending_questions: Vec::new(),
         cron_jobs: Vec::new(),
         monitors: Vec::new(),
         meta: SessionMeta {

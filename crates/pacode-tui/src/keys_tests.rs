@@ -1908,3 +1908,206 @@ fn test_agent_navigation_opens_the_overlay_when_the_rail_is_hidden() {
     handle_key(&mut state, alt_down, now);
     assert_ne!(state.focus, Focus::Overlay(Overlay::RailOverlay));
 }
+
+fn test_question() -> pacode_types::Question {
+    pacode_types::Question::new(
+        pacode_types::QuestionId::new("qst_1"),
+        pacode_types::QuestionOrigin::new(
+            AgentId::main(),
+            "main",
+            pacode_types::CallId::new("call_1"),
+        ),
+        "Storage",
+        "Where should the cache live?",
+        vec![
+            pacode_types::QuestionOption::new("Cache dir", "the usual place"),
+            pacode_types::QuestionOption::new("Next to the project", "portable").recommended(),
+        ],
+        false,
+        0,
+    )
+    .expect("question")
+}
+
+fn ask(state: &mut AppState, question: pacode_types::Question, now: Instant) {
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 1,
+            event: pacode_types::Event::QuestionAsked(question),
+        },
+        now,
+    );
+}
+
+#[test]
+fn test_a_question_takes_the_keyboard_and_starts_on_the_recommended_option() {
+    let mut state = make_test_state();
+    ask(&mut state, test_question(), Instant::now());
+
+    match &state.focus {
+        Focus::Overlay(Overlay::QuestionPicker { index, .. }) => assert_eq!(*index, 1),
+        other => panic!("expected the question picker, got {other:?}"),
+    }
+    assert!(state.is_bottom_picker());
+}
+
+#[test]
+fn test_enter_answers_with_the_option_under_the_cursor() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    assert_eq!(state.focus, Focus::Normal);
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { question, answer })] => {
+            assert_eq!(question.as_str(), "qst_1");
+            assert_eq!(answer.selected, vec![1]);
+            assert!(!answer.cancelled);
+        }
+        other => panic!("expected one answer action, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_a_digit_picks_that_option_directly() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { answer, .. })] => {
+            assert_eq!(answer.selected, vec![0]);
+        }
+        other => panic!("expected an answer, got {other:?}"),
+    }
+
+    // A digit past the last option does nothing rather than answering wrongly.
+    let mut state = make_test_state();
+    ask(&mut state, test_question(), now);
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE),
+        now,
+    );
+    assert!(actions.is_empty());
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::QuestionPicker { .. })
+    ));
+}
+
+#[test]
+fn test_esc_dismisses_the_question_rather_than_leaving_the_turn_waiting() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { answer, .. })] => assert!(answer.cancelled),
+        other => panic!("dismissing must answer, got {other:?}"),
+    }
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_typing_an_answer_of_your_own() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        now,
+    );
+    for c in "elsewhere".chars() {
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            now,
+        );
+    }
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { answer, .. })] => {
+            assert_eq!(answer.free_text.as_deref(), Some("elsewhere"));
+            assert!(answer.selected.is_empty());
+        }
+        other => panic!("expected the typed answer, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_multi_select_toggles_with_space() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let mut q = test_question();
+    q.multi_select = true;
+    ask(&mut state, q, now);
+
+    // Cursor starts on the recommended option; toggle it and the one above.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        now,
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        now,
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        now,
+    );
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { answer, .. })] => {
+            assert_eq!(answer.selected, vec![1, 0]);
+        }
+        other => panic!("expected both options, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_resolving_the_question_elsewhere_closes_the_picker() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 2,
+            event: pacode_types::Event::QuestionResolved {
+                question: pacode_types::QuestionId::new("qst_1"),
+                answer: pacode_types::QuestionAnswer::choice(0),
+            },
+        },
+        now,
+    );
+    assert_eq!(state.focus, Focus::Normal);
+}

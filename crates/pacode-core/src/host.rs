@@ -219,6 +219,83 @@ impl ToolHost for SessionHost {
         }
     }
 
+    async fn ask_question(
+        &self,
+        call_id: &pacode_types::CallId,
+        header: String,
+        question: String,
+        options: Vec<pacode_types::QuestionOption>,
+        multi_select: bool,
+    ) -> Result<pacode_types::QuestionAnswer, ToolError> {
+        let agent_id = self.agent.clone();
+        let agent_name = self
+            .session
+            .agent(&agent_id)
+            .map(|a| a.info().name)
+            .unwrap_or_else(|| "main".to_string());
+
+        let question = pacode_types::Question::new(
+            pacode_types::QuestionId::generate(),
+            pacode_types::QuestionOrigin::new(agent_id.clone(), agent_name, call_id.clone()),
+            header,
+            question,
+            options,
+            multi_select,
+            pacode_types::now_ms(),
+        )
+        .map_err(|e| ToolError::invalid(e.to_string()))?;
+
+        let Some(rx) = self.session.questions.register(question.clone()) else {
+            return Err(ToolError::Failed(
+                "too many questions are already waiting for an answer".to_string(),
+            ));
+        };
+
+        // The question goes into the transcript so the conversation shows what was
+        // asked even after it is answered, and as an event so the client can put a
+        // picker in front of the user.
+        let agent_opt = self.session.agent(&agent_id);
+        let item_seq = agent_opt
+            .as_ref()
+            .map(|a| {
+                a.transcript
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .next_seq()
+            })
+            .unwrap_or(0);
+        let item = pacode_types::TranscriptItem {
+            seq: item_seq,
+            agent: agent_id,
+            ts_ms: question.created_at_ms,
+            kind: pacode_types::TranscriptKind::Question {
+                question: question.clone(),
+                answer: None,
+            },
+        };
+        if let Some(agent) = &agent_opt {
+            agent
+                .transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .upsert(item.clone());
+        }
+        self.session
+            .events
+            .emit(pacode_types::Event::ItemAdded(item));
+        self.session
+            .events
+            .emit(pacode_types::Event::QuestionAsked(question.clone()));
+
+        // A client that goes away, or an agent that is stopped, drops the sender:
+        // the call comes back cancelled rather than waiting for an answer that
+        // will never arrive.
+        match rx.await {
+            Ok(answer) => Ok(answer),
+            Err(_) => Ok(pacode_types::QuestionAnswer::cancelled()),
+        }
+    }
+
     async fn add_cron_job(
         &self,
         name: String,

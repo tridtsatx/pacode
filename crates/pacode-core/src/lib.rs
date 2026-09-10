@@ -24,6 +24,7 @@ pub mod inject;
 pub mod naming;
 pub mod permissions;
 pub mod prompt;
+pub mod questions;
 pub mod sampling;
 pub mod schedule;
 pub mod session;

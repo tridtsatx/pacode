@@ -144,6 +144,11 @@ id_type!(
     "cli"
 );
 id_type!(
+    /// A question the model asked the user; the turn waits for its answer.
+    QuestionId,
+    "qst"
+);
+id_type!(
     /// A scheduled prompt (cron job). Persisted; survives a daemon restart.
     CronJobId,
     "cron"

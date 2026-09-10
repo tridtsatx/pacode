@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{
-    AgentId, ClientId, CronJobId, MonitorId, PermissionId, SessionId, TaskId, TurnId,
+    AgentId, ClientId, CronJobId, MonitorId, PermissionId, QuestionId, SessionId, TaskId, TurnId,
 };
 use crate::model::{Effort, ModelInfo, ModelRoute};
+use crate::question::{Question, QuestionAnswer};
 use crate::schedule::{CronJob, CronSchedule, MonitorInfo};
 use crate::state::{
     AgentInfo, Mode, PermissionDecision, PermissionRequest, Plan, SessionMeta, TaskInfo,
@@ -124,6 +125,11 @@ pub enum Request {
         name: String,
         args: String,
     },
+    /// Answer a question the model asked (`Event::QuestionAsked`).
+    AnswerQuestion {
+        question: QuestionId,
+        answer: QuestionAnswer,
+    },
     /// Cron jobs of the attached session (`Reply::CronJobs`).
     ListCronJobs,
     /// Register a scheduled prompt (`Reply::CronJobs` with the new job appended).
@@ -201,6 +207,9 @@ pub struct SessionSnapshot {
     pub transcript: Vec<TranscriptItem>,
     pub has_more_history: bool,
     pub pending_permissions: Vec<PermissionRequest>,
+    /// Questions the model is waiting on, so a reconnecting client can answer them.
+    #[serde(default)]
+    pub pending_questions: Vec<Question>,
     pub turn_active: bool,
     /// Cron jobs of this session, with `next_run_ms` already computed.
     #[serde(default)]
@@ -330,6 +339,13 @@ pub enum Event {
     PluginStatus {
         plugin: String,
         text: String,
+    },
+    /// The model asked the user something and its turn is waiting.
+    QuestionAsked(Question),
+    /// The question was answered or dismissed; clients drop their picker.
+    QuestionResolved {
+        question: QuestionId,
+        answer: QuestionAnswer,
     },
     /// A cron job was added, edited, enabled/disabled or fired.
     CronUpdated(CronJob),

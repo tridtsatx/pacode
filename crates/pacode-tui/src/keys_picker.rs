@@ -41,6 +41,94 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
 
 fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     match &mut state.focus {
+        Focus::Overlay(Overlay::QuestionPicker {
+            question,
+            index,
+            selected,
+            typed,
+            typing,
+        }) => {
+            let count = question.options.len();
+            let multi = question.multi_select;
+            let id = question.id.clone();
+
+            if *typing {
+                match key.code {
+                    KeyCode::Esc => {
+                        *typing = false;
+                        typed.clear();
+                    }
+                    KeyCode::Enter => {
+                        let answer = pacode_types::QuestionAnswer::typed(typed.clone());
+                        state.focus = Focus::Normal;
+                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
+                            question: id,
+                            answer,
+                        })];
+                    }
+                    KeyCode::Backspace => {
+                        typed.pop();
+                    }
+                    KeyCode::Char(c) => typed.push(c),
+                    _ => {}
+                }
+                state.dirty = true;
+                return vec![];
+            }
+
+            match key.code {
+                // Dismissing answers the question as dismissed: the turn is
+                // waiting on it, so leaving it unanswered would hang the model.
+                KeyCode::Esc => {
+                    state.focus = Focus::Normal;
+                    return vec![Action::Send(pacode_types::Request::AnswerQuestion {
+                        question: id,
+                        answer: pacode_types::QuestionAnswer::cancelled(),
+                    })];
+                }
+                KeyCode::Up | KeyCode::Char('k') => *index = index.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *index = (*index + 1).min(count.saturating_sub(1));
+                }
+                KeyCode::Char('t') => *typing = true,
+                KeyCode::Char(' ') if multi => {
+                    if let Some(pos) = selected.iter().position(|i| i == index) {
+                        selected.remove(pos);
+                    } else {
+                        selected.push(*index);
+                    }
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    let picked = (c as usize) - ('0' as usize) - 1;
+                    if picked < count {
+                        state.focus = Focus::Normal;
+                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
+                            question: id,
+                            answer: pacode_types::QuestionAnswer::choice(picked),
+                        })];
+                    }
+                }
+                KeyCode::Enter => {
+                    let answer = if multi && !selected.is_empty() {
+                        pacode_types::QuestionAnswer {
+                            selected: selected.clone(),
+                            free_text: None,
+                            cancelled: false,
+                        }
+                    } else {
+                        pacode_types::QuestionAnswer::choice(*index)
+                    };
+                    state.focus = Focus::Normal;
+                    return vec![Action::Send(pacode_types::Request::AnswerQuestion {
+                        question: id,
+                        answer,
+                    })];
+                }
+                _ => {}
+            }
+            state.dirty = true;
+            vec![]
+        }
         Focus::Overlay(Overlay::EffortPicker { index }) => {
             match key.code {
                 KeyCode::Esc => state.focus = Focus::Normal,

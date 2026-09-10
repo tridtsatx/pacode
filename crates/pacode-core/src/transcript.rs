@@ -75,6 +75,17 @@ impl TranscriptState {
         seq
     }
 
+    /// Seq of the item carrying `question`, when it is still in the tail. A
+    /// question answered after the tail rolled over simply has nothing to update.
+    pub fn find_question_seq(&self, id: &pacode_types::QuestionId) -> Option<u64> {
+        self.tail.iter().rev().find_map(|item| match &item.kind {
+            pacode_types::TranscriptKind::Question { question, .. } if &question.id == id => {
+                Some(item.seq)
+            }
+            _ => None,
+        })
+    }
+
     /// Insert or replace (same seq) in the tail, evicting the oldest past the cap.
     pub fn upsert(&mut self, item: TranscriptItem) {
         let mut replaced = false;
@@ -113,6 +124,7 @@ impl TranscriptState {
             pacode_types::TranscriptKind::User { .. }
             | pacode_types::TranscriptKind::Notice { .. }
             | pacode_types::TranscriptKind::Permission(_)
+            | pacode_types::TranscriptKind::Question { .. }
             | pacode_types::TranscriptKind::BashCommand { .. } => {}
         }
     }

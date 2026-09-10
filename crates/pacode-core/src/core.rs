@@ -300,6 +300,20 @@ impl Core {
                 let models = self.providers().list_all_models().await;
                 Reply::Models { models }
             }
+            Request::AnswerQuestion { question, answer } => {
+                match session.questions.resolve(&question, answer.clone()) {
+                    Some(q) => {
+                        session.record_question_answer(&q, &answer);
+                        session
+                            .events
+                            .emit(Event::QuestionResolved { question, answer });
+                        Reply::Ok
+                    }
+                    None => Reply::Error {
+                        message: "unknown question".to_string(),
+                    },
+                }
+            }
             Request::ListCronJobs => Reply::CronJobs {
                 jobs: session.scheduler.jobs(),
             },

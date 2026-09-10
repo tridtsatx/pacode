@@ -59,6 +59,12 @@ pub enum TranscriptKind {
         text: String,
     },
     Permission(PermissionRequest),
+    /// A question the model asked, with the answer once it has one.
+    Question {
+        question: crate::question::Question,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<crate::question::QuestionAnswer>,
+    },
     BashCommand {
         command: String,
         output: String,

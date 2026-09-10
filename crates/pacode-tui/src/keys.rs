@@ -553,6 +553,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 Overlay::Files { .. }
                 | Overlay::ModePicker { .. }
                 | Overlay::ConfigPicker
+                | Overlay::QuestionPicker { .. }
                 | Overlay::McpPicker { .. }
                 | Overlay::PluginsPicker { .. }
                 | Overlay::Import(_)

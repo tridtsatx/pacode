@@ -26,6 +26,17 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         Focus::Overlay(Overlay::ModelPicker { query, index }) => {
             draw_model(frame, area, state, query, *index, opts);
         }
+        Focus::Overlay(Overlay::QuestionPicker {
+            question,
+            index,
+            selected,
+            typed,
+            typing,
+        }) => {
+            draw_question(
+                frame, area, question, *index, selected, typed, *typing, opts,
+            );
+        }
         Focus::Overlay(Overlay::ThemePicker { .. }) => {
             crate::ui::theme_picker::draw(frame, area, state, opts);
         }
@@ -335,6 +346,80 @@ fn draw_model(
     // Set cursor on query input
     let cursor_x = area.x + 2 + (query.len() as u16).min(area.width.saturating_sub(3));
     frame.set_cursor_position((cursor_x, area.y + 1));
+}
+
+/// The question the model asked, as a bottom picker: the header chip, the
+/// question, one row per option with its description, and the key hints.
+#[allow(clippy::too_many_arguments)]
+fn draw_question(
+    frame: &mut Frame,
+    area: Rect,
+    question: &pacode_types::Question,
+    index: usize,
+    selected: &[usize],
+    typed: &str,
+    typing: bool,
+    opts: &RenderOptions,
+) {
+    let width = area.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if !question.header.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" {} ", question.header),
+            opts.theme.selected_bg,
+        )));
+    }
+    for line in pacode_render::wrap_text(&question.question, width) {
+        lines.push(Line::from(Span::styled(line, opts.theme.bold)));
+    }
+
+    for (i, option) in question.options.iter().enumerate() {
+        let is_cursor = i == index;
+        let is_selected = selected.contains(&i);
+        let marker = if is_selected {
+            opts.glyphs.ok
+        } else if is_cursor {
+            opts.glyphs.pointer
+        } else {
+            " "
+        };
+        let mut label = format!("{marker} {}. {}", i + 1, option.label);
+        if option.recommended {
+            label.push_str(" (recommended)");
+        }
+        let style = if is_cursor {
+            opts.theme.bold
+        } else {
+            opts.theme.fg
+        };
+        lines.push(Line::from(Span::styled(
+            pacode_render::truncate_to_width(&label, width, true),
+            style,
+        )));
+        if is_cursor && !option.description.is_empty() {
+            for dl in pacode_render::wrap_text(&option.description, width.saturating_sub(4)) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {dl}"),
+                    opts.theme.dim,
+                )));
+            }
+        }
+    }
+
+    let hint = if typing {
+        format!("type an answer · enter send · esc back    {typed}")
+    } else if question.multi_select {
+        "space toggle · enter send · 1-9 pick one · t type · esc dismiss".to_string()
+    } else {
+        "enter select · 1-9 pick · t type an answer · esc dismiss".to_string()
+    };
+    lines.push(Line::from(Span::styled(
+        pacode_render::truncate_to_width(&hint, width, true),
+        opts.theme.faint,
+    )));
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]

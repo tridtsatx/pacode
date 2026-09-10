@@ -51,6 +51,19 @@ impl StubHost {
 
 #[async_trait]
 impl ToolHost for StubHost {
+    async fn ask_question(
+        &self,
+        _call_id: &pacode_types::CallId,
+        _header: String,
+        _question: String,
+        options: Vec<pacode_types::QuestionOption>,
+        _multi_select: bool,
+    ) -> Result<pacode_types::QuestionAnswer, ToolError> {
+        // A stub user always takes the recommended option, or the first one.
+        let index = options.iter().position(|o| o.recommended).unwrap_or(0);
+        Ok(pacode_types::QuestionAnswer::choice(index))
+    }
+
     async fn add_cron_job(
         &self,
         name: String,

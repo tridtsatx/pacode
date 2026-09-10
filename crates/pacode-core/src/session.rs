@@ -26,6 +26,8 @@ pub struct Session {
     pub plan: RwLock<Plan>,
     pub usage: RwLock<UsageTotals>,
     pub permissions: PermissionState,
+    /// Questions the model asked and is waiting on.
+    pub questions: crate::questions::QuestionState,
     pub events: EventSink,
     pub tasks: Arc<TaskManager>,
     pub store: Store,
@@ -42,6 +44,40 @@ pub struct Session {
 }
 
 impl Session {
+    /// Record the answer on the question's transcript item, so the conversation
+    /// shows what was asked and what was chosen rather than only the tool result.
+    pub fn record_question_answer(
+        &self,
+        question: &pacode_types::Question,
+        answer: &pacode_types::QuestionAnswer,
+    ) {
+        let Some(agent) = self.agent(&question.agent) else {
+            return;
+        };
+        let seq = {
+            let transcript = agent.transcript.lock().unwrap_or_else(|p| p.into_inner());
+            transcript.find_question_seq(&question.id)
+        };
+        let Some(seq) = seq else {
+            return;
+        };
+        let item = pacode_types::TranscriptItem {
+            seq,
+            agent: question.agent.clone(),
+            ts_ms: pacode_types::time::now_ms(),
+            kind: pacode_types::TranscriptKind::Question {
+                question: question.clone(),
+                answer: Some(answer.clone()),
+            },
+        };
+        agent
+            .transcript
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .upsert(item.clone());
+        self.events.emit(pacode_types::Event::ItemUpdated(item));
+    }
+
     /// Tell the main agent that a monitor it started has fired. Injections reach
     /// the model between steps, never mid-stream (spec §6.2).
     pub fn inject_monitor_fired(&self, monitor: &pacode_types::MonitorInfo) {
@@ -186,6 +222,9 @@ impl Session {
 
     /// Cancel the main agent's running turn (history kept).
     pub fn interrupt(&self) {
+        // A question the turn is blocked on has to go with the turn, or the tool
+        // call keeps waiting for an answer nobody will give now.
+        self.cancel_questions_for(&AgentId::main());
         if let Some(main) = self.main_agent()
             && let Some(cancel) = main
                 .cancel
@@ -194,6 +233,19 @@ impl Session {
                 .as_ref()
         {
             cancel.cancel();
+        }
+    }
+
+    /// Dismiss every question an agent is waiting on, telling clients to drop
+    /// their pickers.
+    pub fn cancel_questions_for(&self, agent: &AgentId) {
+        for question in self.questions.cancel_for_agent(agent) {
+            let answer = pacode_types::QuestionAnswer::cancelled();
+            self.record_question_answer(&question, &answer);
+            self.events.emit(pacode_types::Event::QuestionResolved {
+                question: question.id,
+                answer,
+            });
         }
     }
 
@@ -345,6 +397,7 @@ impl Session {
         {
             cancel.cancel();
         }
+        self.cancel_questions_for(id);
         agent.set_status(pacode_types::AgentStatus::Stopped, None);
         let info = agent.info();
         let _ = self
@@ -590,6 +643,7 @@ impl Session {
         let seq = self.events.last_seq();
 
         SessionSnapshot {
+            pending_questions: self.questions.pending(),
             cron_jobs: self.scheduler.jobs(),
             monitors: self.scheduler.monitors(),
             meta,

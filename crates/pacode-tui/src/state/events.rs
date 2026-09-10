@@ -258,6 +258,28 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             // single report; a toast on top of it was the same text twice.
             state.rail.upsert_task(info);
         }
+        Event::QuestionAsked(question) => {
+            // The turn is blocked on this, so it takes the keyboard immediately.
+            state.focus = Focus::Overlay(crate::state::Overlay::QuestionPicker {
+                index: question.recommended_index().unwrap_or(0),
+                question: Box::new(question),
+                selected: Vec::new(),
+                typed: String::new(),
+                typing: false,
+            });
+            state.dirty = true;
+        }
+        Event::QuestionResolved { question, answer } => {
+            // Another client may have answered it; drop our picker either way.
+            if let Focus::Overlay(crate::state::Overlay::QuestionPicker { question: q, .. }) =
+                &state.focus
+                && q.id == question
+            {
+                state.focus = Focus::Normal;
+            }
+            let _ = answer;
+            state.dirty = true;
+        }
         Event::CronUpdated(job) => {
             state.rail.upsert_cron_job(job);
             state.dirty = true;

@@ -274,7 +274,8 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
             }
             TranscriptKind::User { .. }
             | TranscriptKind::Notice { .. }
-            | TranscriptKind::Permission(_) => vec![],
+            | TranscriptKind::Permission(_)
+            | TranscriptKind::Question { .. } => vec![],
         },
         Event::ItemUpdated(item) => match &item.kind {
             TranscriptKind::ToolCall {
@@ -324,7 +325,8 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
             TranscriptKind::BashCommand { .. }
             | TranscriptKind::User { .. }
             | TranscriptKind::Notice { .. }
-            | TranscriptKind::Permission(_) => vec![],
+            | TranscriptKind::Permission(_)
+            | TranscriptKind::Question { .. } => vec![],
         },
         Event::PlanUpdated(plan) => {
             vec![SessionUpdate::Plan(plan_to_acp(plan))]
@@ -369,6 +371,9 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         | Event::PluginStatus { .. }
         // Scheduling has no ACP counterpart: a cron job or a monitor is a pacode
         // session concern, and the prompt a fired job sends arrives as a normal turn.
+        // A question is answered in pacode's own picker; ACP has no equivalent.
+        | Event::QuestionAsked(_)
+        | Event::QuestionResolved { .. }
         | Event::CronUpdated(_)
         | Event::CronRemoved(_)
         | Event::MonitorUpdated(_) => vec![],
@@ -447,7 +452,7 @@ pub fn transcript_item_to_session_updates(item: &TranscriptItem) -> Vec<SessionU
                 ContentBlock::Text(TextContent::new(format!("[{level:?}] {text}\n"))),
             ))]
         }
-        TranscriptKind::Permission(_) => vec![],
+        TranscriptKind::Permission(_) | TranscriptKind::Question { .. } => vec![],
     }
 }
 

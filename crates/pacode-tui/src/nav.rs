@@ -100,6 +100,7 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
         Overlay::KeysPicker { .. } => "KeysPicker",
         Overlay::ThemePicker { .. } => "ThemePicker",
         Overlay::ConfigPicker => "ConfigPicker",
+        Overlay::QuestionPicker { .. } => "QuestionPicker",
     }
 }
 
@@ -214,6 +215,7 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
             Overlay::Files { .. }
             | Overlay::ModePicker { .. }
             | Overlay::ConfigPicker
+            | Overlay::QuestionPicker { .. }
             | Overlay::McpPicker { .. }
             | Overlay::PluginsPicker { .. }
             | Overlay::Import(_)
@@ -260,6 +262,7 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
             | Overlay::Files { .. }
             | Overlay::ModePicker { .. }
             | Overlay::ConfigPicker
+            | Overlay::QuestionPicker { .. }
             | Overlay::McpPicker { .. }
             | Overlay::PluginsPicker { .. }
             | Overlay::Import(_)

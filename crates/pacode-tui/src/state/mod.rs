@@ -89,6 +89,18 @@ pub enum Overlay {
     /// The settings view. Its state lives in `AppState::config_view`; the
     /// variant only says which overlay is open.
     ConfigPicker,
+    /// A question the model asked. The turn is waiting on the answer, so this
+    /// overlay owns the keyboard until it is answered or dismissed.
+    QuestionPicker {
+        question: Box<pacode_types::Question>,
+        index: usize,
+        /// Chosen options, in the order they were picked (multi-select only).
+        selected: Vec<usize>,
+        /// Free text typed instead of picking.
+        typed: String,
+        /// Whether the reader is typing rather than choosing.
+        typing: bool,
+    },
     ThemePicker {
         index: usize,
         original_theme: Box<pacode_render::Theme>,
@@ -709,6 +721,7 @@ impl AppState {
             Focus::Overlay(Overlay::EffortPicker { .. })
                 | Focus::Overlay(Overlay::ModePicker { .. })
                 | Focus::Overlay(Overlay::ModelPicker { .. })
+                | Focus::Overlay(Overlay::QuestionPicker { .. })
                 | Focus::Overlay(Overlay::ThemePicker { .. })
         )
     }
@@ -719,6 +732,10 @@ impl AppState {
             | Focus::Overlay(Overlay::ModePicker { .. }) => 7,
             Focus::Overlay(Overlay::ModelPicker { .. })
             | Focus::Overlay(Overlay::ThemePicker { .. }) => 12,
+            // Header, question, one row per option, and the hint line.
+            Focus::Overlay(Overlay::QuestionPicker { question, .. }) => {
+                (question.options.len() as u16).saturating_add(5).min(16)
+            }
             _ => 0,
         }
     }
