@@ -44,6 +44,7 @@ impl SamplingHandler for CoreSamplingHandler {
                 })?;
             let provider = providers
                 .resolve(&route)
+                .await
                 .map_err(|e| McpError::Protocol(e.to_string()))?;
             (provider, route.model)
         };

@@ -100,6 +100,10 @@ impl Paths {
         self.config_file.clone()
     }
 
+    pub fn auth_file(&self) -> PathBuf {
+        self.state_dir.join("auth.json")
+    }
+
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("pacode.db")
     }

@@ -104,6 +104,10 @@ pub enum Overlay {
         query: String,
         index: usize,
     },
+    LoginPicker {
+        query: String,
+        index: usize,
+    },
     EffortPicker {
         index: usize,
     },
@@ -228,6 +232,8 @@ pub struct AppState {
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
+    /// Providers with auth status for the login picker (filled by `ListAuth` or `AuthUpdated`).
+    pub auth_providers: Vec<pacode_types::ProviderAuthInfo>,
     pub sessions: Vec<SessionMeta>,
     pub plugins: Vec<PluginInfo>,
     /// Set by any mutation; cleared after a frame is drawn.
@@ -348,6 +354,7 @@ impl AppState {
             config_view: crate::ui::config_view::ConfigViewState::default(),
             toasts: VecDeque::new(),
             models: Vec::new(),
+            auth_providers: Vec::new(),
             sessions: Vec::new(),
             plugins: Vec::new(),
             dirty: true,
@@ -832,6 +839,7 @@ impl AppState {
             Focus::Overlay(Overlay::EffortPicker { .. })
                 | Focus::Overlay(Overlay::ModePicker { .. })
                 | Focus::Overlay(Overlay::ModelPicker { .. })
+                | Focus::Overlay(Overlay::LoginPicker { .. })
                 | Focus::Overlay(Overlay::QuestionPicker { .. })
                 | Focus::Overlay(Overlay::ThemePicker { .. })
         )
@@ -843,6 +851,7 @@ impl AppState {
             | Focus::Overlay(Overlay::ModePicker { .. }) => 7,
             Focus::Overlay(Overlay::ModelPicker { .. })
             | Focus::Overlay(Overlay::ThemePicker { .. }) => 12,
+            Focus::Overlay(Overlay::LoginPicker { .. }) => 13,
             // Header, question, one row per option, and the hint line.
             Focus::Overlay(Overlay::QuestionPicker { question, .. }) => {
                 (question.options.len() as u16).saturating_add(5).min(16)

@@ -12,6 +12,7 @@ pub mod header;
 pub mod import;
 pub mod input;
 pub mod keys_overlay;
+pub mod login_picker;
 pub mod mascot;
 pub mod mcp;
 pub mod overlays;
@@ -60,6 +61,7 @@ pub fn focus_key(focus: &Focus) -> u8 {
             Overlay::Import(_) => 21,
             Overlay::RailOverlay => 22,
             Overlay::Help => 23,
+            Overlay::LoginPicker { .. } => 24,
         },
     }
 }

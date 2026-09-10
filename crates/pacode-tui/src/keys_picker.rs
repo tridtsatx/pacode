@@ -223,6 +223,125 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
+        Focus::Overlay(Overlay::LoginPicker { query, index }) => {
+            let q_lower = query.to_lowercase();
+            let filtered_count = state
+                .auth_providers
+                .iter()
+                .filter(|p| {
+                    q_lower.is_empty()
+                        || p.id.to_lowercase().contains(&q_lower)
+                        || p.display_name.to_lowercase().contains(&q_lower)
+                        || p.auth_kind.to_lowercase().contains(&q_lower)
+                        || p.detail.to_lowercase().contains(&q_lower)
+                })
+                .count();
+
+            if is_prev(&key) && *index > 0 {
+                *index -= 1;
+                state.dirty = true;
+                return vec![];
+            }
+            if is_next(&key) && filtered_count > 0 && *index + 1 < filtered_count {
+                *index += 1;
+                state.dirty = true;
+                return vec![];
+            }
+
+            match key.code {
+                KeyCode::Esc => {
+                    state.focus = Focus::Normal;
+                    state.dirty = true;
+                }
+                KeyCode::Enter => {
+                    let filtered: Vec<_> = state
+                        .auth_providers
+                        .iter()
+                        .filter(|p| {
+                            q_lower.is_empty()
+                                || p.id.to_lowercase().contains(&q_lower)
+                                || p.display_name.to_lowercase().contains(&q_lower)
+                                || p.auth_kind.to_lowercase().contains(&q_lower)
+                                || p.detail.to_lowercase().contains(&q_lower)
+                        })
+                        .collect();
+                    if let Some(p) = filtered.get(*index) {
+                        let provider = p.id.clone();
+                        return vec![Action::Send(Request::Login { provider })];
+                    }
+                }
+                KeyCode::Char('a')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let filtered: Vec<_> = state
+                        .auth_providers
+                        .iter()
+                        .filter(|p| {
+                            q_lower.is_empty()
+                                || p.id.to_lowercase().contains(&q_lower)
+                                || p.display_name.to_lowercase().contains(&q_lower)
+                                || p.auth_kind.to_lowercase().contains(&q_lower)
+                                || p.detail.to_lowercase().contains(&q_lower)
+                        })
+                        .collect();
+                    if let Some(p) = filtered.get(*index)
+                        && p.accounts.len() > 1
+                    {
+                        let cur = p
+                            .active
+                            .as_ref()
+                            .and_then(|act| p.accounts.iter().position(|acc| acc == act))
+                            .unwrap_or(0);
+                        let next = (cur + 1) % p.accounts.len();
+                        let label = p.accounts[next].clone();
+                        return vec![Action::Send(Request::SetAuthAccount {
+                            provider: p.id.clone(),
+                            label,
+                        })];
+                    }
+                    query.push('a');
+                    *index = 0;
+                    state.dirty = true;
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let filtered: Vec<_> = state
+                        .auth_providers
+                        .iter()
+                        .filter(|p| {
+                            q_lower.is_empty()
+                                || p.id.to_lowercase().contains(&q_lower)
+                                || p.display_name.to_lowercase().contains(&q_lower)
+                                || p.auth_kind.to_lowercase().contains(&q_lower)
+                                || p.detail.to_lowercase().contains(&q_lower)
+                        })
+                        .collect();
+                    if let Some(p) = filtered.get(*index) {
+                        return vec![Action::Send(Request::Logout {
+                            provider: p.id.clone(),
+                            label: p.active.clone(),
+                        })];
+                    }
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *index = 0;
+                    state.dirty = true;
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    query.push(c);
+                    *index = 0;
+                    state.dirty = true;
+                }
+                _ => {}
+            }
+            vec![]
+        }
         Focus::Overlay(Overlay::SessionPicker { query, index }) => {
             let q_lower = query.to_lowercase();
             let filtered_count = state

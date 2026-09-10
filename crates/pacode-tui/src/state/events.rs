@@ -317,6 +317,75 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                 state.plugin_status = Some((plugin, text));
             }
         }
+        Event::LoginProgress { provider, stage } => {
+            match stage {
+                pacode_types::LoginStage::OpenUrl { url, opened } => {
+                    let text = if opened {
+                        format!("Opened browser to sign in to {provider}: {url}")
+                    } else {
+                        format!("Open this URL in your browser to sign in to {provider}:\n{url}")
+                    };
+                    state.push_notice_with_level(ToastLevel::Info, text);
+                }
+                pacode_types::LoginStage::Waiting => {
+                    state.push_notice_with_level(
+                        ToastLevel::Info,
+                        format!("Waiting for authorization from {provider}..."),
+                    );
+                }
+                pacode_types::LoginStage::Exchanging => {
+                    state.push_notice_with_level(
+                        ToastLevel::Info,
+                        format!("Exchanging authorization code with {provider}..."),
+                    );
+                }
+                pacode_types::LoginStage::Done { label } => {
+                    state.push_notice_with_level(
+                        ToastLevel::Success,
+                        format!("Successfully signed in to {provider} ({label})"),
+                    );
+                    state.push_toast(
+                        ToastLevel::Success,
+                        format!("Signed in to {provider}"),
+                        Some(label),
+                        now,
+                    );
+                    if matches!(
+                        state.focus,
+                        Focus::Overlay(crate::state::Overlay::LoginPicker { .. })
+                    ) {
+                        state.focus = Focus::Normal;
+                    }
+                }
+                pacode_types::LoginStage::Failed { message } => {
+                    state.push_notice_with_level(
+                        ToastLevel::Error,
+                        format!("Login to {provider} failed: {message}"),
+                    );
+                    state.push_toast(
+                        ToastLevel::Error,
+                        format!("Login failed: {provider}"),
+                        Some(message),
+                        now,
+                    );
+                    if matches!(
+                        state.focus,
+                        Focus::Overlay(crate::state::Overlay::LoginPicker { .. })
+                    ) {
+                        state.focus = Focus::Normal;
+                    }
+                }
+            }
+            state.dirty = true;
+        }
+        Event::AuthUpdated(info) => {
+            if let Some(pos) = state.auth_providers.iter().position(|p| p.id == info.id) {
+                state.auth_providers[pos] = info;
+            } else {
+                state.auth_providers.push(info);
+            }
+            state.dirty = true;
+        }
     }
     state.rail.update_idle(state.turn_active, now);
 }

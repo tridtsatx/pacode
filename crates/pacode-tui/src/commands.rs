@@ -65,6 +65,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
+        name: Cow::Borrowed("login"),
+        usage: Cow::Borrowed("/login"),
+        help: Cow::Borrowed("sign in to a model provider"),
+        arg_hint: Cow::Borrowed("[provider]"),
+    },
+    SlashCommand {
         name: Cow::Borrowed("mcp"),
         usage: Cow::Borrowed("/mcp"),
         help: Cow::Borrowed("manage MCP servers"),
@@ -238,6 +244,19 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
     let arg = parts.collect::<Vec<_>>().join(" ");
 
     match cmd {
+        "login" => {
+            if arg.is_empty() {
+                log::debug!("open overlay: LoginPicker");
+                state.focus = Focus::Overlay(Overlay::LoginPicker {
+                    query: String::new(),
+                    index: 0,
+                });
+                state.dirty = true;
+                vec![Action::Send(Request::ListAuth)]
+            } else {
+                vec![Action::Send(Request::Login { provider: arg })]
+            }
+        }
         "model" => {
             if arg.is_empty() {
                 log::debug!("open overlay: ModelPicker");
@@ -564,6 +583,9 @@ mod tests {
 
     #[test]
     fn test_commands_arg_hints() {
+        let login = COMMANDS.iter().find(|c| c.name == "login").unwrap();
+        assert_eq!(login.arg_hint, "[provider]");
+
         let effort = COMMANDS.iter().find(|c| c.name == "effort").unwrap();
         assert_eq!(effort.arg_hint, "[low|medium|high|xhigh|max]");
 

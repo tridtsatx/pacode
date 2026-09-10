@@ -17,6 +17,7 @@
 //! - `naming`: session title generation after the first reply
 
 pub mod agent;
+pub mod auth;
 pub mod compaction;
 pub mod core;
 pub mod expand;

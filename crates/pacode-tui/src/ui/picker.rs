@@ -27,6 +27,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         Focus::Overlay(Overlay::ModelPicker { query, index }) => {
             draw_model(frame, area, state, query, *index, opts);
         }
+        Focus::Overlay(Overlay::LoginPicker { query, index }) => {
+            crate::ui::login_picker::draw(frame, area, state, query, *index, opts);
+        }
         Focus::Overlay(Overlay::QuestionPicker {
             question,
             index,

@@ -263,7 +263,7 @@ impl Session {
     /// theirs. Each updated info is persisted and broadcast, so the next loop
     /// iteration of a running turn sees the new route too.
     pub async fn set_model(&self, route: ModelRoute) -> Result<(), CoreError> {
-        self.providers.resolve(&route)?;
+        self.providers.resolve(&route).await?;
 
         let old_model = {
             let mut meta = self.meta.write().unwrap_or_else(|p| p.into_inner());

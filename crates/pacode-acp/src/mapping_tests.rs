@@ -371,6 +371,10 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::SetCronEnabled { .. }
         | Request::RunCronJobNow(_)
         | Request::ListMonitors
-        | Request::StopMonitor(_) => panic!("expected Request::Interrupt"),
+        | Request::StopMonitor(_)
+        | Request::ListAuth
+        | Request::Login { .. }
+        | Request::Logout { .. }
+        | Request::SetAuthAccount { .. } => panic!("expected Request::Interrupt"),
     }
 }
