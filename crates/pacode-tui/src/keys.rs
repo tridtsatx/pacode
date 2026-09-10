@@ -66,7 +66,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
         return vec![];
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('d')) {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('d'))
+        && !matches!(state.focus, Focus::Overlay(Overlay::LoginPicker { .. }))
+    {
         state.quit = true;
         return vec![Action::Quit];
     }
@@ -560,7 +563,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | Overlay::RailOverlay
                 | Overlay::Help
                 | Overlay::ThemePicker { .. }
-                | Overlay::KeysPicker { .. },
+                | Overlay::KeysPicker { .. }
+                | Overlay::LoginPicker { .. },
             ) => {}
         }
         return vec![];

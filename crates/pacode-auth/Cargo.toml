@@ -1,0 +1,27 @@
+[package]
+name = "pacode-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "OAuth and credential store core for pacode"
+
+[dependencies]
+pacode-config = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "net", "io-util"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

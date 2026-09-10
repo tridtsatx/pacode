@@ -100,6 +100,7 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             // Drawn as a bottom picker, not as a centred overlay.
             Overlay::QuestionPicker { .. }
             | Overlay::ModelPicker { .. }
+            | Overlay::LoginPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
             | Overlay::ThemePicker { .. } => {}
@@ -171,6 +172,7 @@ fn wanted_height(state: &AppState) -> u16 {
             Overlay::ConfigPicker | Overlay::RailOverlay | Overlay::Help => u16::MAX,
             Overlay::QuestionPicker { .. }
             | Overlay::ModelPicker { .. }
+            | Overlay::LoginPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
             | Overlay::ThemePicker { .. } => 0,

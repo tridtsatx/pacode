@@ -13,6 +13,7 @@ description = "Session and agent runtime: turn loop, injections, permissions, co
 [dependencies]
 pacode-types = { workspace = true }
 pacode-config = { workspace = true }
+pacode-auth = { workspace = true }
 pacode-skills = { workspace = true }
 pacode-provider = { workspace = true }
 pacode-tools = { workspace = true }

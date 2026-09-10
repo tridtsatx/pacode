@@ -9,7 +9,10 @@
 //! - `mock`: `MockProvider` with scripted responses (behind `cfg(any(test, feature = "mock"))`
 //!   and always compiled for downstream tests via the `mock` feature)
 
+pub mod anthropic;
 pub mod catalog_cache;
+pub mod codex;
+pub mod devin;
 pub mod mock;
 pub mod openai_compat;
 pub mod registry;

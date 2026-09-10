@@ -142,6 +142,14 @@ impl Core {
             Request::ListPlugins => Some(Reply::Plugins {
                 plugins: self.installed_plugins(),
             }),
+            Request::ListAuth => Some(self.handle_list_auth()),
+            Request::Login { provider } => Some(self.handle_login(provider.clone())),
+            Request::Logout { provider, label } => {
+                Some(self.handle_logout(provider.clone(), label.clone()))
+            }
+            Request::SetAuthAccount { provider, label } => {
+                Some(self.handle_set_auth_account(provider.clone(), label.clone()))
+            }
             Request::RunPluginCommand { name, args } => {
                 match self.deps.plugins.run_command(name, args.clone()).await {
                     Ok(outcome) => {

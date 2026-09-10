@@ -2194,3 +2194,197 @@ fn test_resolving_the_question_elsewhere_closes_the_picker() {
     );
     assert_eq!(state.focus, Focus::Normal);
 }
+
+#[test]
+fn test_overlay_login_picker_keys_filtering_selection_and_actions() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    let p1 = pacode_types::ProviderAuthInfo {
+        id: "devin".into(),
+        display_name: "Devin".into(),
+        auth_kind: "oauth".into(),
+        detail: "Autonomous AI software engineer".into(),
+        recommended: true,
+        state: pacode_types::AuthState::Configured,
+        accounts: vec!["acc1".into(), "acc2".into()],
+        active: Some("acc1".into()),
+    };
+    let p2 = pacode_types::ProviderAuthInfo {
+        id: "anthropic".into(),
+        display_name: "Anthropic Claude".into(),
+        auth_kind: "oauth".into(),
+        detail: "Claude 3.5 Sonnet & Haiku".into(),
+        recommended: false,
+        state: pacode_types::AuthState::NotConfigured,
+        accounts: vec![],
+        active: None,
+    };
+    let p3 = pacode_types::ProviderAuthInfo {
+        id: "openai".into(),
+        display_name: "OpenAI".into(),
+        auth_kind: "api_key".into(),
+        detail: "GPT-4o & o1".into(),
+        recommended: false,
+        state: pacode_types::AuthState::NeedsAttention {
+            reason: "API key expired".into(),
+        },
+        accounts: vec!["primary".into()],
+        active: Some("primary".into()),
+    };
+
+    state.auth_providers = vec![p1, p2, p3];
+
+    // Open login picker
+    state.focus = Focus::Overlay(Overlay::LoginPicker {
+        query: String::new(),
+        index: 0,
+    });
+
+    // 1. Down moves index to 1
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::LoginPicker {
+            query: String::new(),
+            index: 1,
+        })
+    );
+
+    // 2. Ctrl+N moves index to 2
+    let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+    handle_key(&mut state, ctrl_n, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::LoginPicker {
+            query: String::new(),
+            index: 2,
+        })
+    );
+
+    // 3. Ctrl+P moves index back to 1
+    let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+    handle_key(&mut state, ctrl_p, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::LoginPicker {
+            query: String::new(),
+            index: 1,
+        })
+    );
+
+    // 4. Up moves index back to 0 (devin)
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    handle_key(&mut state, up, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::LoginPicker {
+            query: String::new(),
+            index: 0,
+        })
+    );
+
+    // 5. Account switching with 'a': devin has 2 accounts ["acc1", "acc2"], active is "acc1"
+    let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_a, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::SetAuthAccount {
+            provider: "devin".into(),
+            label: "acc2".into(),
+        })]
+    );
+    // Query remains empty because 'a' cycled accounts
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::LoginPicker {
+            query: String::new(),
+            index: 0,
+        })
+    );
+
+    // 6. Ctrl+D on devin sends Request::Logout for active account "acc1" and does NOT quit
+    let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_d, now);
+    assert!(!state.quit, "ctrl+d in login picker must not quit app");
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::Logout {
+            provider: "devin".into(),
+            label: Some("acc1".into()),
+        })]
+    );
+
+    // 7. Filtering: move to anthropic, press 'o' to filter
+    let char_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+    handle_key(&mut state, char_o, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::LoginPicker {
+            query: "o".into(),
+            index: 0,
+        })
+    );
+
+    // Backspace clears query
+    let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+    handle_key(&mut state, backspace, now);
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::LoginPicker {
+            query: String::new(),
+            index: 0,
+        })
+    );
+
+    // 8. Enter sends Request::Login for selected provider (devin)
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::Login {
+            provider: "devin".into(),
+        })]
+    );
+
+    // 9. Esc closes login picker
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_overlay_login_picker_a_key_types_when_single_or_no_accounts() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    let p1 = pacode_types::ProviderAuthInfo {
+        id: "anthropic".into(),
+        display_name: "Anthropic Claude".into(),
+        auth_kind: "oauth".into(),
+        detail: "Claude 3.5 Sonnet & Haiku".into(),
+        recommended: false,
+        state: pacode_types::AuthState::NotConfigured,
+        accounts: vec![],
+        active: None,
+    };
+    state.auth_providers = vec![p1];
+
+    state.focus = Focus::Overlay(Overlay::LoginPicker {
+        query: String::new(),
+        index: 0,
+    });
+
+    // Press 'a': since accounts is empty, it types 'a' into the query
+    let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_a, now);
+    assert!(actions.is_empty());
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::LoginPicker {
+            query: "a".into(),
+            index: 0,
+        })
+    );
+}

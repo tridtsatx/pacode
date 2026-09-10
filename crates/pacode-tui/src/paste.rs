@@ -85,7 +85,8 @@ pub fn handle_paste_with_runner(
     }
 
     match &mut state.focus {
-        Focus::Overlay(Overlay::ModelPicker { query, index }) => {
+        Focus::Overlay(Overlay::ModelPicker { query, index })
+        | Focus::Overlay(Overlay::LoginPicker { query, index }) => {
             paste_into_filter(query, index, &text);
             state.dirty = true;
             vec![]

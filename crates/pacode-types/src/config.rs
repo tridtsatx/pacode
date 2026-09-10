@@ -75,10 +75,23 @@ impl Default for ProviderDefaults {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    #[serde(alias = "openai")]
+    OpenAi,
+    Anthropic,
+    Codex,
+    Devin,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct ProviderConfig {
+    #[serde(default)]
+    pub kind: ProviderKind,
     /// e.g. `https://api.example.com/v1`
     pub base_url: String,
     pub api_key_env: Option<String>,

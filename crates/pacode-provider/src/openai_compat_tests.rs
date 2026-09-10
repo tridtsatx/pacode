@@ -16,6 +16,7 @@ fn make_provider(
     extra_body: Option<serde_json::Value>,
 ) -> OpenAiCompat {
     let cfg = ProviderConfig {
+        kind: Default::default(),
         base_url: "https://api.openai.com/v1".to_string(),
         api_key: None,
         api_key_env: None,
@@ -336,6 +337,7 @@ fn test_model_info() {
     );
 
     let cfg = ProviderConfig {
+        kind: Default::default(),
         base_url: "https://api.openai.com/v1".to_string(),
         api_key: None,
         api_key_env: None,
@@ -380,6 +382,7 @@ fn test_model_info() {
 #[tokio::test]
 async fn test_list_models_catalog_false() {
     let cfg = ProviderConfig {
+        kind: Default::default(),
         base_url: "https://api.openai.com/v1".to_string(),
         api_key: None,
         api_key_env: None,
@@ -446,6 +449,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
     });
 
     let cfg = ProviderConfig {
+        kind: Default::default(),
         base_url: format!("http://127.0.0.1:{port}"),
         api_key: None,
         api_key_env: None,
@@ -570,6 +574,7 @@ async fn test_complete_non_2xx_carries_full_error_body() {
     });
 
     let cfg = ProviderConfig {
+        kind: Default::default(),
         base_url: format!("http://127.0.0.1:{port}"),
         api_key: Some("test-key".to_string()),
         api_key_env: None,

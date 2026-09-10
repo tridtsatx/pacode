@@ -106,6 +106,7 @@ async fn test_e2e_retry_and_sse_stream() {
     });
 
     let cfg = ProviderConfig {
+        kind: Default::default(),
         base_url: format!("http://127.0.0.1:{port}"),
         api_key: None,
         api_key_env: None,

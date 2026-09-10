@@ -122,7 +122,7 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
         .and_then(|m| session.providers.parse_route(m))
         .unwrap_or_else(|| agent_info.model.clone());
 
-    let provider = session.providers.resolve(&route)?;
+    let provider = session.providers.resolve(&route).await?;
     let req = pacode_provider::CompletionRequest {
         model: route.model.clone(),
         system_static: "You are a concise conversation summarizer.".to_string(),

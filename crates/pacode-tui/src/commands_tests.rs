@@ -107,6 +107,48 @@ fn test_plugin_command_registration_and_execution() {
 }
 
 #[test]
+fn test_login_command_registration_and_execution() {
+    let mut state = make_test_state();
+
+    // 1. Registered in commands
+    let all = commands::all_commands();
+    let login_cmd = all
+        .iter()
+        .find(|c| c.name == "login")
+        .expect("login command exists");
+    assert_eq!(login_cmd.usage, "/login");
+    assert_eq!(login_cmd.help, "sign in to a model provider");
+    assert_eq!(login_cmd.arg_hint, "[provider]");
+
+    // 2. Matching
+    let matches = commands::matching("log");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].name, "login");
+
+    // 3. Execution without argument: opens Overlay::LoginPicker and sends ListAuth
+    let actions = commands::execute(&mut state, "/login");
+    assert_eq!(actions, vec![crate::keys::Action::Send(Request::ListAuth)]);
+    assert_eq!(
+        state.focus,
+        crate::state::Focus::Overlay(crate::state::Overlay::LoginPicker {
+            query: String::new(),
+            index: 0,
+        })
+    );
+
+    // 4. Execution with argument: sends Request::Login { provider }
+    state.focus = crate::state::Focus::Normal;
+    let actions = commands::execute(&mut state, "/login devin");
+    assert_eq!(
+        actions,
+        vec![crate::keys::Action::Send(Request::Login {
+            provider: "devin".into(),
+        })]
+    );
+    assert_eq!(state.focus, crate::state::Focus::Normal);
+}
+
+#[test]
 fn test_mcp_invalid_format_pushes_notice() {
     let mut state = make_test_state();
     let initial_cell_count = state.transcript.cells.len();

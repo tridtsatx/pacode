@@ -376,7 +376,11 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         | Event::QuestionResolved { .. }
         | Event::CronUpdated(_)
         | Event::CronRemoved(_)
-        | Event::MonitorUpdated(_) => vec![],
+        | Event::MonitorUpdated(_)
+        // Logging in is a pacode-side concern: an ACP client authenticates the agent
+        // through its own `authenticate` call, not through session updates.
+        | Event::LoginProgress { .. }
+        | Event::AuthUpdated(_) => vec![],
     }
 }
 

@@ -90,6 +90,7 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
         Overlay::EffortPicker { .. } => "EffortPicker",
         Overlay::ModePicker { .. } => "ModePicker",
         Overlay::ModelPicker { .. } => "ModelPicker",
+        Overlay::LoginPicker { .. } => "LoginPicker",
         Overlay::SessionPicker { .. } => "SessionPicker",
         Overlay::Files { .. } => "Files",
         Overlay::RailOverlay => "RailOverlay",
@@ -205,6 +206,7 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
             }
         }
         Focus::Overlay(Overlay::ModelPicker { index, .. })
+        | Focus::Overlay(Overlay::LoginPicker { index, .. })
         | Focus::Overlay(Overlay::EffortPicker { index })
         | Focus::Overlay(Overlay::SessionPicker { index, .. }) => {
             *index += 1;
@@ -247,6 +249,7 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
             }
         }
         Focus::Overlay(Overlay::ModelPicker { index, .. })
+        | Focus::Overlay(Overlay::LoginPicker { index, .. })
         | Focus::Overlay(Overlay::EffortPicker { index })
         | Focus::Overlay(Overlay::SessionPicker { index, .. })
             if *index > 0 =>
@@ -257,6 +260,7 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
         | Focus::Panel { .. }
         | Focus::Overlay(
             Overlay::ModelPicker { .. }
+            | Overlay::LoginPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::SessionPicker { .. }
             | Overlay::Files { .. }

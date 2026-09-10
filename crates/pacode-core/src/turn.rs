@@ -153,7 +153,7 @@ pub async fn run_turn(
             max_output_tokens: None,
         };
 
-        let provider = match session.providers.resolve(&agent_info.model) {
+        let provider = match session.providers.resolve(&agent_info.model).await {
             Ok(p) => p,
             Err(e) => {
                 emit_failure_notice(&session, &agent, &e.to_string());

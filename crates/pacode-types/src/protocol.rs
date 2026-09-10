@@ -165,6 +165,75 @@ pub enum Request {
     /// Monitors of the attached session (`Reply::Monitors`).
     ListMonitors,
     StopMonitor(MonitorId),
+    /// Providers with their credential status (`Reply::AuthStatus`).
+    ListAuth,
+    /// Start a login flow for one provider. Progress arrives as `Event::LoginProgress`,
+    /// the immediate reply is `Reply::Ok`.
+    Login {
+        provider: String,
+    },
+    /// Drop stored credentials (`Reply::AuthStatus`). Without `label`, every account
+    /// of the provider is removed.
+    Logout {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Pick which stored account a provider uses (`Reply::AuthStatus`).
+    SetAuthAccount {
+        provider: String,
+        label: String,
+    },
+}
+
+/// One provider row in the `/login` picker.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderAuthInfo {
+    pub id: String,
+    pub display_name: String,
+    /// `oauth` | `api_key` | `local`
+    pub auth_kind: String,
+    /// One line of help: what the provider needs.
+    pub detail: String,
+    pub recommended: bool,
+    pub state: AuthState,
+    /// Labels of stored accounts, and which one is active.
+    #[serde(default)]
+    pub accounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthState {
+    /// Usable right now.
+    Configured,
+    /// Credentials exist but are expired or rejected.
+    NeedsAttention { reason: String },
+    /// Nothing stored.
+    NotConfigured,
+}
+
+/// Stages of a running login flow.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LoginStage {
+    /// The browser was opened, or could not be and the user should follow the URL.
+    OpenUrl {
+        url: String,
+        opened: bool,
+    },
+    /// Waiting for the loopback callback.
+    Waiting,
+    /// Trading the authorization code for tokens.
+    Exchanging,
+    Done {
+        label: String,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// One MCP server as shown in the `/mcp` picker.
@@ -358,6 +427,9 @@ pub enum Reply {
     Monitors {
         monitors: Vec<MonitorInfo>,
     },
+    AuthStatus {
+        providers: Vec<ProviderAuthInfo>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -437,6 +509,13 @@ pub enum Event {
     CronRemoved(CronJobId),
     /// A monitor started, checked, fired or stopped.
     MonitorUpdated(MonitorInfo),
+    /// One step of a running login flow.
+    LoginProgress {
+        provider: String,
+        stage: LoginStage,
+    },
+    /// Credentials of a provider changed (login, logout, account switch).
+    AuthUpdated(ProviderAuthInfo),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

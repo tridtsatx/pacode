@@ -13,6 +13,8 @@ use pacode_types::{Attach, Config, Effort, Mode, ModelRoute, SessionId};
 mod daemon;
 #[path = "import_cmd.rs"]
 mod import_cmd;
+#[path = "login_cmd.rs"]
+mod login_cmd;
 #[path = "mcp_cmd.rs"]
 mod mcp_cmd;
 #[path = "plugins_cmd.rs"]
@@ -170,6 +172,17 @@ pub enum Command {
         /// Overwrite existing servers or skill directories on conflict.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Sign in to a model provider.
+    Login {
+        /// Provider identifier to sign in to (e.g. devin, anthropic, openai).
+        #[arg(long, value_name = "ID")]
+        provider: Option<String>,
+
+        /// List available providers and their status.
+        #[arg(long)]
+        list: bool,
     },
 
     /// Query status or request shutdown of the background daemon.
@@ -417,6 +430,15 @@ pub fn main() -> anyhow::Result<()> {
                 force,
             };
             import_cmd::run(args, &paths)
+        }
+        Some(Command::Login { provider, list }) => {
+            pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
+                .context("failed to initialize client logger")?;
+            log::info!(
+                "pacode login cli starting (pid={}, log_level={log_level:?})",
+                std::process::id()
+            );
+            login_cmd::run(provider, list, Some(socket), paths)
         }
         Some(Command::Daemon { action }) => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)

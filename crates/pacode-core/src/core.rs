@@ -42,7 +42,9 @@ pub struct Core {
     /// Live provider registry; replaced by `reload_config` (new sessions use it).
     pub(crate) providers: RwLock<Arc<ProviderRegistry>>,
     pub(crate) config: RwLock<Arc<Config>>,
+    pub(crate) auth_driver: RwLock<Arc<dyn crate::auth::AuthDriver>>,
     pub(crate) sessions: RwLock<BTreeMap<SessionId, Arc<Session>>>,
+    pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Core>>,
     /// Routes `TaskEvent`s to the owning session (injections + UI events).
     pub(crate) task_router: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) cached_mcp_tools: std::sync::Mutex<Option<Vec<Arc<dyn Tool>>>>,
@@ -54,16 +56,21 @@ impl Core {
         let rx = deps.tasks.subscribe();
         let providers = RwLock::new(deps.providers.clone());
         let config = RwLock::new(deps.config.clone());
+        let auth_driver: RwLock<Arc<dyn crate::auth::AuthDriver>> =
+            RwLock::new(Arc::new(crate::auth::DefaultAuthDriver));
         let core = Arc::new(Core {
             deps,
             providers,
             config,
+            auth_driver,
             sessions: RwLock::new(BTreeMap::new()),
+            self_weak: std::sync::OnceLock::new(),
             task_router: std::sync::Mutex::new(None),
             cached_mcp_tools: std::sync::Mutex::new(None),
         });
 
         let core_weak = Arc::downgrade(&core);
+        let _ = core.self_weak.set(core_weak.clone());
         let handle = router::start_task_router(core_weak, rx);
         *core.task_router.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
         core
@@ -437,7 +444,11 @@ impl Core {
             | Request::RunPluginCommand { .. }
             | Request::BrowseMarketplace { .. }
             | Request::InstallPlugin { .. }
-            | Request::UninstallPlugin { .. } => {
+            | Request::UninstallPlugin { .. }
+            | Request::ListAuth
+            | Request::Login { .. }
+            | Request::Logout { .. }
+            | Request::SetAuthAccount { .. } => {
                 self.handle_global(&req)
                     .await
                     .unwrap_or_else(|| Reply::Error {
@@ -445,6 +456,152 @@ impl Core {
                     })
             }
         }
+    }
+
+    pub fn set_auth_driver(&self, driver: Arc<dyn crate::auth::AuthDriver>) {
+        if let Ok(mut g) = self.auth_driver.write() {
+            *g = driver;
+        }
+    }
+
+    pub fn load_auth_store(&self) -> pacode_auth::store::AuthStore {
+        let path = self.deps.paths.auth_file();
+        pacode_auth::store::AuthStore::load_from(&path)
+            .unwrap_or_else(|_| pacode_auth::store::AuthStore::new_empty(path))
+    }
+
+    pub fn handle_list_auth(&self) -> Reply {
+        let store = self.load_auth_store();
+        let providers = crate::auth::build_auth_status(&store, &self.config().providers);
+        Reply::AuthStatus { providers }
+    }
+
+    pub fn handle_login(&self, provider: String) -> Reply {
+        let driver = self
+            .auth_driver
+            .read()
+            .map(|d| Arc::clone(&*d))
+            .unwrap_or_else(|p| Arc::clone(&*p.into_inner()));
+        let core_weak = self.self_weak.get().cloned().unwrap_or_default();
+        let provider_clone = provider.clone();
+
+        tokio::spawn(async move {
+            let on_progress_provider = provider_clone.clone();
+            let on_progress_weak = core_weak.clone();
+            let on_progress: crate::auth::ProgressCallback = Arc::new(move |progress| {
+                if let Some(core) = on_progress_weak.upgrade() {
+                    let stage = match progress {
+                        crate::auth::Progress::OpenUrl { url, opened } => {
+                            pacode_types::protocol::LoginStage::OpenUrl { url, opened }
+                        }
+                        crate::auth::Progress::Waiting => {
+                            pacode_types::protocol::LoginStage::Waiting
+                        }
+                        crate::auth::Progress::Exchanging => {
+                            pacode_types::protocol::LoginStage::Exchanging
+                        }
+                    };
+                    core.broadcast_event(Event::LoginProgress {
+                        provider: on_progress_provider.clone(),
+                        stage,
+                    });
+                }
+            });
+
+            match driver.login(&provider_clone, on_progress).await {
+                Ok(outcome) => {
+                    if let Some(core) = core_weak.upgrade() {
+                        let mut store = core.load_auth_store();
+                        store.upsert(&provider_clone, outcome.account.clone());
+                        if let Err(e) = store.save() {
+                            log::warn!("failed to save auth store after login: {e}");
+                        }
+
+                        let _ = core
+                            .providers()
+                            .rebuild_provider_from_store(&provider_clone, &store);
+
+                        if let Some(info) = crate::auth::get_provider_auth_info(
+                            &store,
+                            &core.config().providers,
+                            &provider_clone,
+                        ) {
+                            core.broadcast_event(Event::AuthUpdated(info));
+                        }
+
+                        core.broadcast_event(Event::LoginProgress {
+                            provider: provider_clone,
+                            stage: pacode_types::protocol::LoginStage::Done {
+                                label: outcome.account.label,
+                            },
+                        });
+                    }
+                }
+                Err(err) => {
+                    if let Some(core) = core_weak.upgrade() {
+                        core.broadcast_event(Event::LoginProgress {
+                            provider: provider_clone,
+                            stage: pacode_types::protocol::LoginStage::Failed { message: err },
+                        });
+                    }
+                }
+            }
+        });
+
+        Reply::Ok
+    }
+
+    pub fn handle_logout(&self, provider: String, label: Option<String>) -> Reply {
+        let mut store = self.load_auth_store();
+        if let Some(lbl) = &label {
+            store.remove(&provider, lbl);
+        } else {
+            let accounts = store.accounts(&provider).to_vec();
+            for acc in accounts {
+                store.remove(&provider, &acc.label);
+            }
+        }
+        if let Err(e) = store.save() {
+            log::warn!("failed to save auth store after logout: {e}");
+        }
+
+        let _ = self
+            .providers()
+            .rebuild_provider_from_store(&provider, &store);
+
+        if let Some(info) =
+            crate::auth::get_provider_auth_info(&store, &self.config().providers, &provider)
+        {
+            self.broadcast_event(Event::AuthUpdated(info));
+        }
+
+        let providers = crate::auth::build_auth_status(&store, &self.config().providers);
+        Reply::AuthStatus { providers }
+    }
+
+    pub fn handle_set_auth_account(&self, provider: String, label: String) -> Reply {
+        let mut store = self.load_auth_store();
+        if let Err(e) = store.set_active(&provider, &label) {
+            return Reply::Error {
+                message: e.to_string(),
+            };
+        }
+        if let Err(e) = store.save() {
+            log::warn!("failed to save auth store after set_auth_account: {e}");
+        }
+
+        let _ = self
+            .providers()
+            .rebuild_provider_from_store(&provider, &store);
+
+        if let Some(info) =
+            crate::auth::get_provider_auth_info(&store, &self.config().providers, &provider)
+        {
+            self.broadcast_event(Event::AuthUpdated(info));
+        }
+
+        let providers = crate::auth::build_auth_status(&store, &self.config().providers);
+        Reply::AuthStatus { providers }
     }
 
     pub fn broadcast_event(&self, event: Event) {

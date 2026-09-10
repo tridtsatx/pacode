@@ -95,6 +95,7 @@ mod tests {
         assert!(help.contains("mcp"));
         assert!(help.contains("plugins"));
         assert!(help.contains("daemon"));
+        assert!(help.contains("login"));
     }
 
     #[test]
@@ -412,6 +413,47 @@ mod tests {
                 assert_eq!(id, "ses_abc123");
             }
             other => panic!("expected Sessions Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_login_shapes() {
+        let cli = Cli::try_parse_from(["pacode", "login"]).expect("login plain");
+        match cli.command {
+            Some(Command::Login { provider, list }) => {
+                assert!(provider.is_none());
+                assert!(!list);
+            }
+            other => panic!("expected Login empty, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["pacode", "login", "--list"]).expect("login list");
+        match cli.command {
+            Some(Command::Login { provider, list }) => {
+                assert!(provider.is_none());
+                assert!(list);
+            }
+            other => panic!("expected Login list, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["pacode", "login", "--provider", "devin"])
+            .expect("login provider");
+        match cli.command {
+            Some(Command::Login { provider, list }) => {
+                assert_eq!(provider.as_deref(), Some("devin"));
+                assert!(!list);
+            }
+            other => panic!("expected Login provider, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["pacode", "login", "--provider", "devin", "--list"])
+            .expect("login provider list");
+        match cli.command {
+            Some(Command::Login { provider, list }) => {
+                assert_eq!(provider.as_deref(), Some("devin"));
+                assert!(list);
+            }
+            other => panic!("expected Login provider list, got {other:?}"),
         }
     }
 

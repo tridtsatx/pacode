@@ -499,6 +499,11 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             state.dirty = true;
             vec![]
         }
+        BgResponse::Reply(Ok(Reply::AuthStatus { providers })) => {
+            state.auth_providers = providers;
+            state.dirty = true;
+            vec![]
+        }
         BgResponse::Reply(Ok(Reply::Sessions { sessions })) => {
             state.sessions = sessions;
             state.dirty = true;

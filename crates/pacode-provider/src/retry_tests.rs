@@ -45,6 +45,7 @@ async fn write_sse(socket: &mut TcpStream, body: &str) {
 
 fn provider_for(port: u16, max_retries: u32) -> OpenAiCompat {
     let cfg = ProviderConfig {
+        kind: Default::default(),
         base_url: format!("http://127.0.0.1:{port}"),
         api_key: None,
         api_key_env: None,
