@@ -185,8 +185,9 @@ built while reading, and borrowing ideas from:
   to, and sessions that outlive the terminal.
 - [Codex](https://github.com/openai/codex) — supervised process execution and
   output handling; the head/tail output buffer here is a port of its idea.
-- jcode — an earlier agent of my own, where the rail layout and much of the TUI
-  vocabulary came from.
+- [jcode](https://github.com/1jehuang/jcode) — the most RAM-efficient harness,
+  and the reason this one measures itself at all; the rail layout and much of the
+  TUI vocabulary came from reading it.
 
 ## License
 
