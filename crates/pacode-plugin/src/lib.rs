@@ -3,6 +3,7 @@
 pub mod error;
 pub mod host;
 pub mod lua;
+pub mod marketplace;
 pub mod runtime;
 pub mod sink;
 pub mod types;
