@@ -12,6 +12,23 @@ fn installed(name: &str) -> PluginInfo {
         tools: vec!["do_thing".to_string()],
         commands: Vec::new(),
         error: None,
+        loaded: true,
+        ..PluginInfo::default()
+    }
+}
+
+fn marketplace(name: &str) -> PluginInfo {
+    PluginInfo {
+        name: name.to_string(),
+        version: "2.1.0".to_string(),
+        description: "drives a real browser".to_string(),
+        author: "someone".to_string(),
+        source: "owner/repo".to_string(),
+        installed_at_ms: 1_700_000_000_000,
+        mcp_servers: vec!["playwright".to_string()],
+        skill_dirs: 2,
+        unsupported: vec!["hooks".to_string()],
+        ..PluginInfo::default()
     }
 }
 
@@ -60,6 +77,30 @@ fn the_installed_tab_lists_loaded_plugins() {
 }
 
 #[test]
+fn the_installed_tab_shows_marketplace_plugins() {
+    let plugins = [marketplace("playwright")];
+    let view = PluginsView {
+        index: 0,
+        plugins: &plugins,
+        tab: PluginsTab::Installed,
+        market: &[],
+        query: "",
+        loading: false,
+        stale: false,
+        source: "owner/repo",
+    };
+    let text = render(&view);
+    assert!(text.contains("playwright"), "{text}");
+    assert!(text.contains("drives a real browser"), "{text}");
+    assert!(text.contains("owner/repo"), "{text}");
+    assert!(text.contains("mcp: playwright"), "{text}");
+    assert!(
+        text.contains("hooks are declared but not applied"),
+        "unsupported components must be visible: {text}"
+    );
+}
+
+#[test]
 fn an_empty_installed_tab_says_so() {
     let view = PluginsView {
         index: 0,
@@ -71,7 +112,9 @@ fn an_empty_installed_tab_says_so() {
         stale: false,
         source: "",
     };
-    assert!(render(&view).contains("No plugins loaded"));
+    let text = render(&view);
+    assert!(text.contains("No plugins installed"), "{text}");
+    assert!(text.contains("tab Discover"), "{text}");
 }
 
 #[test]
@@ -87,7 +130,7 @@ fn discover_without_a_marketplace_says_how_to_add_one() {
         source: "",
     };
     let text = render(&view);
-    assert!(text.contains("no marketplace configured"), "{text}");
+    assert!(text.contains("No marketplace configured"), "{text}");
     assert!(text.contains("/plugins owner/repo"), "{text}");
 }
 
@@ -108,7 +151,7 @@ fn discover_shows_the_search_box_installed_marks_and_updates() {
         source: "owner/repo",
     };
     let text = render(&view);
-    assert!(text.contains("search: cre"), "{text}");
+    assert!(text.contains("> cre"), "{text}");
     assert!(text.contains("context7"), "{text}");
     assert!(
         text.contains("update"),

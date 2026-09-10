@@ -119,6 +119,29 @@ fn test_non_truecolor_converts_hex_to_ansi16() {
 }
 
 #[test]
+fn test_spinner_cycles_and_falls_back_to_ascii() {
+    let uni = Glyphs::new(false);
+    assert_eq!(uni.spinner(0), "⠋");
+    assert_eq!(uni.spinner(1), "⠙");
+    assert_eq!(uni.spinner(9), "⠏");
+    assert_eq!(uni.spinner(10), "⠋");
+    // The whole cycle is drawn, not just the ends.
+    let frames: Vec<&str> = (0..10).map(|f| uni.spinner(f)).collect();
+    for (i, f) in frames.iter().enumerate() {
+        assert_eq!(*f, uni.spinner(i as u64));
+    }
+    assert!(frames.iter().all(|f| f.chars().count() == 1));
+
+    let ascii = Glyphs::new(true);
+    assert_eq!(ascii.spinner(0), "-");
+    assert_eq!(ascii.spinner(1), "\\");
+    assert_eq!(ascii.spinner(2), "|");
+    assert_eq!(ascii.spinner(3), "/");
+    assert_eq!(ascii.spinner(4), "-");
+    assert!(ascii.spinner(u64::MAX).chars().count() == 1);
+}
+
+#[test]
 fn test_builtins_palettes_exist() {
     let builtins = builtin_palettes();
     assert_eq!(builtins.len(), 4);

@@ -188,7 +188,10 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
     let (left_spans, show_context) = match &state.connection {
         Connection::Reconnecting { attempt } => (
             vec![Span::styled(
-                format!("reconnecting… (attempt {attempt})"),
+                format!(
+                    "reconnecting{} (attempt {attempt})",
+                    crate::state::activity::trailing_dots(state.anim_frame, &opts.glyphs)
+                ),
                 opts.theme.red,
             )],
             true,
@@ -202,13 +205,18 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         ),
         Connection::Connected => {
             if let Some(req) = pending_perm {
+                // A pending permission is activity: the chevrons and title
+                // pulse accent <-> yellow on the shared blink phase.
+                let lit = state.pulse_lit(std::time::Instant::now());
+                let pulse = if lit {
+                    opts.theme.accent
+                } else {
+                    opts.theme.yellow
+                };
                 (
                     vec![
-                        Span::styled(
-                            format!("{} permission: ", opts.glyphs.chevrons),
-                            opts.theme.accent,
-                        ),
-                        Span::styled(format!("{} · ", req.title), opts.theme.bold),
+                        Span::styled(format!("{} permission: ", opts.glyphs.chevrons), pulse),
+                        Span::styled(format!("{} · ", req.title), opts.theme.bold.patch(pulse)),
                         Span::styled("y allow · a session · n deny", opts.theme.cyan),
                     ],
                     true,

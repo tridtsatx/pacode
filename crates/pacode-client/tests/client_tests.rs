@@ -763,6 +763,8 @@ async fn test_mcp_and_plugin_helpers() {
                             tools: vec!["tool1".into()],
                             commands: vec!["hello".into()],
                             error: None,
+                            loaded: true,
+                            ..pacode_types::PluginInfo::default()
                         }],
                     },
                     Request::RunPluginCommand { name, args } => {
@@ -965,6 +967,8 @@ fn test_mcp_and_plugin_wire_serialization_round_trip() {
                 tools: vec![],
                 commands: vec!["run".into()],
                 error: None,
+                loaded: true,
+                ..pacode_types::PluginInfo::default()
             }],
         },
     };

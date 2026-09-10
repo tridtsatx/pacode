@@ -22,20 +22,46 @@ const BYLINE: &str = "made by tridtsat";
 /// below it the phrase is dropped rather than crowding the title.
 const PHRASE_GAP: usize = 4;
 
+/// Welcome cascade stagger: one mascot row arrives per this many milliseconds,
+/// then the title, then the byline.
+const CASCADE_ROW_MS: u64 = 40;
+
 /// Render the non-persisted header transcript cell.
 /// Below width 40 the mascot is dropped.
+///
+/// `welcome_ms` is the age of the session UI. Inside the welcome window the
+/// banner cascades in: mascot rows top-down, one per `CASCADE_ROW_MS`, then the
+/// title, then the byline. Rows that have not arrived yet are blank
+/// placeholders, so the banner's height — and the transcript's scroll — never
+/// shifts while the cascade plays. Past the window this is the same static
+/// banner as before.
 pub fn render(
     info: &HeaderInfo,
     width: u16,
     opts: &RenderOptions,
     frame: u64,
+    welcome_ms: u64,
 ) -> Vec<Line<'static>> {
     let title = format!("pacode v{}", info.version);
 
+    let stage = if welcome_ms < crate::state::WELCOME_ANIM_MS {
+        welcome_ms / CASCADE_ROW_MS
+    } else {
+        u64::MAX
+    };
+
     if width < 40 {
         return vec![
-            Line::from(Span::styled(title, opts.theme.bold)),
-            Line::from(Span::styled(BYLINE, opts.theme.faint)),
+            if stage > 0 {
+                Line::from(Span::styled(title, opts.theme.bold))
+            } else {
+                Line::default()
+            },
+            if stage > 1 {
+                Line::from(Span::styled(BYLINE, opts.theme.faint))
+            } else {
+                Line::default()
+            },
             Line::default(),
         ];
     }
@@ -63,11 +89,18 @@ pub fn render(
         .map(|slack| slack + PHRASE_GAP);
 
     let mascot_rows = mascot_lines.len();
+    // The title arrives once every mascot row has landed; the byline one step later.
+    let title_due = stage > mascot_rows as u64;
+    let byline_due = stage > mascot_rows as u64 + 1;
     let mut lines = Vec::with_capacity(mascot_rows + 2);
     for (row, mascot_line) in mascot_lines.into_iter().enumerate() {
+        if row as u64 >= stage {
+            lines.push(Line::default());
+            continue;
+        }
         let drawn = line_width(&mascot_line);
         let mut spans = mascot_line.spans;
-        if row == title_row {
+        if row == title_row && title_due {
             let pad = mascot_width.saturating_sub(drawn) + GAP;
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::styled(title.clone(), opts.theme.bold));
@@ -75,7 +108,7 @@ pub fn render(
                 spans.push(Span::raw(" ".repeat(pad)));
                 spans.push(Span::styled(phrase, opts.theme.faint));
             }
-        } else if row == title_row + 1 {
+        } else if row == title_row + 1 && byline_due {
             let pad = mascot_width.saturating_sub(drawn) + GAP;
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::styled(BYLINE, opts.theme.faint));
@@ -84,10 +117,14 @@ pub fn render(
     }
     // A mascot too short to hold the byline row still gets the byline, under the block.
     if title_row + 1 >= mascot_rows {
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(mascot_width + GAP)),
-            Span::styled(BYLINE, opts.theme.faint),
-        ]));
+        lines.push(if byline_due {
+            Line::from(vec![
+                Span::raw(" ".repeat(mascot_width + GAP)),
+                Span::styled(BYLINE, opts.theme.faint),
+            ])
+        } else {
+            Line::default()
+        });
     }
     lines.push(Line::default());
 

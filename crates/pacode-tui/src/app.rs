@@ -3,7 +3,10 @@
 //! One `tokio::select!` over: client events (`ClientEvent`), terminal events
 //! (`crossterm::event::EventStream`), the stream tick (paced by `config.ui.ups`,
 //! only while `state.needs_stream_tick()`), the second tick (1 s, only while
-//! `state.needs_second_tick()`), and toast expiry (armed only while toasts exist).
+//! `state.needs_second_tick()`), the animation tick (the pacman interval while
+//! the turn runs; 125 ms for ambient pulses; 70 ms while a transient animation —
+//! toast slide/fade, overlay unfold, welcome cascade — is on screen), and toast
+//! expiry (armed only while toasts exist).
 //! A frame is drawn when `state.dirty` and the frame interval has passed since the
 //! last frame (otherwise a deferred draw is scheduled). Nothing ticks in the idle state.
 //!
@@ -194,14 +197,26 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         };
 
         let anim_sleep = async {
+            // Every arm of this sleep is a visible animation; while nothing
+            // animates, the future stays pending and no timer runs.
+            let now = Instant::now();
+            let fast = state.fast_anim_active(now);
             if state.turn_active || state.transcript.has_backlog() {
-                let interval_ms = crate::ui::anim::pacman_interval_ms(
+                let mut interval_ms = crate::ui::anim::pacman_interval_ms(
                     state.transcript.stream_backlog_chars(),
                     state.transcript.has_pending_final(),
                 );
+                if fast {
+                    interval_ms = interval_ms.min(crate::ui::anim::TRANSIENT_TICK_MS);
+                }
                 tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            } else if state.needs_anim_tick() {
-                tokio::time::sleep(Duration::from_millis(125)).await;
+            } else if state.needs_anim_tick(now) || state.toast_needs_anim(now) {
+                let interval_ms = if fast {
+                    crate::ui::anim::TRANSIENT_TICK_MS
+                } else {
+                    125
+                };
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
             } else {
                 std::future::pending::<()>().await;
             }
@@ -292,6 +307,12 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
             _ = second_sleep => {
                 let now = Instant::now();
+                // The 1 s blink phase for rail pulses that run while the fast
+                // anim tick does not (idle main, background work alive).
+                state.second_parity = !state.second_parity;
+                if state.rail.has_live_agents() || state.rail.has_running_tasks() {
+                    state.dirty = true;
+                }
                 if state.rail.update_idle(state.turn_active, now) {
                     state.dirty = true;
                 }

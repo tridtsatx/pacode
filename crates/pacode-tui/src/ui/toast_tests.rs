@@ -14,6 +14,50 @@ use crate::state::selection::CopyRequest;
 use crate::state::transcript::{Cell, CellKind};
 
 #[test]
+fn enter_offset_eases_from_four_cells_to_zero() {
+    assert_eq!(enter_offset(0), 4);
+    // Ease-out: the first half covers most of the travel.
+    assert_eq!(enter_offset(crate::state::TOAST_ENTER_MS / 2), 1);
+    assert_eq!(enter_offset(crate::state::TOAST_ENTER_MS - 1), 0);
+    assert_eq!(enter_offset(crate::state::TOAST_ENTER_MS), 0);
+    assert_eq!(enter_offset(crate::state::TOAST_ENTER_MS * 10), 0);
+    // Monotonically non-increasing.
+    let mut prev = enter_offset(0);
+    for age in 1..=crate::state::TOAST_ENTER_MS {
+        let cur = enter_offset(age);
+        assert!(cur <= prev, "offset grew at {age}ms");
+        prev = cur;
+    }
+}
+
+#[test]
+fn a_toast_fades_only_inside_the_exit_window() {
+    let ttl_ms = crate::state::TOAST_TTL_SECS * 1000;
+    assert!(!is_fading(0));
+    assert!(!is_fading(ttl_ms - crate::state::TOAST_EXIT_MS));
+    assert!(is_fading(ttl_ms - crate::state::TOAST_EXIT_MS + 1));
+    assert!(is_fading(ttl_ms - 1));
+    // Past TTL the toast is gone anyway, but the predicate stays monotone.
+    assert!(is_fading(ttl_ms + 1));
+}
+
+#[test]
+fn toast_needs_anim_only_while_a_toast_is_young_or_expiring() {
+    let now = Instant::now();
+    let mut state = AppState::new(Config::default(), "0.1.0".into(), 80, 24);
+    assert!(!state.toast_needs_anim(now));
+
+    state.push_toast(ToastLevel::Info, "fresh".into(), None, now);
+    assert!(state.toast_needs_anim(now));
+
+    let middle = now + std::time::Duration::from_millis(3000);
+    assert!(!state.toast_needs_anim(middle));
+
+    let late = now + std::time::Duration::from_millis(crate::state::TOAST_TTL_SECS * 1000 - 300);
+    assert!(state.toast_needs_anim(late));
+}
+
+#[test]
 fn test_toast_without_detail_no_dot_to_open_and_has_borders() {
     let mut state = AppState::new(Config::default(), "0.1.0".into(), 80, 24);
     state.push_toast(

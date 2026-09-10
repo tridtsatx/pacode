@@ -288,25 +288,50 @@ impl Marketplace {
             .collect()
     }
 
+    /// How many skills one installed plugin ships: directories under
+    /// `<plugin>/skills/`, which is where the skill loader looks.
+    pub fn skill_count(&self, plugin: &str) -> usize {
+        if !manifest::is_valid_plugin_name(plugin) {
+            return 0;
+        }
+        let dir = self.plugins_dir.join(plugin).join("skills");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count()
+    }
+
+    /// The parsed manifest of an installed plugin, when it has a readable
+    /// `<plugin>/.claude-plugin/plugin.json`.
+    pub fn installed_manifest(&self, plugin: &str) -> Option<PluginManifest> {
+        if !manifest::is_valid_plugin_name(plugin) {
+            return None;
+        }
+        let path = self
+            .plugins_dir
+            .join(plugin)
+            .join(".claude-plugin")
+            .join("plugin.json");
+        let bytes = std::fs::read(&path).ok()?;
+        match PluginManifest::parse(&bytes) {
+            Ok(manifest) => Some(manifest),
+            Err(e) => {
+                log::warn!("unreadable plugin.json for {plugin}: {e}");
+                None
+            }
+        }
+    }
+
     /// MCP servers declared by installed plugins, keyed by `<plugin>/<server>` so
     /// two plugins cannot collide on a common name like `github`.
     pub fn mcp_servers(&self) -> Vec<(String, manifest::McpServerDecl)> {
         let mut out = Vec::new();
         for installed in self.installed() {
-            let path = self
-                .plugins_dir
-                .join(&installed.name)
-                .join(".claude-plugin")
-                .join("plugin.json");
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Some(manifest) = self.installed_manifest(&installed.name) else {
                 continue;
-            };
-            let manifest = match PluginManifest::parse(&bytes) {
-                Ok(m) => m,
-                Err(e) => {
-                    log::warn!("unreadable plugin.json for {}: {e}", installed.name);
-                    continue;
-                }
             };
             for (name, decl) in manifest.mcp_server_decls() {
                 out.push((format!("{}/{name}", installed.name), decl));
@@ -317,23 +342,9 @@ impl Marketplace {
 
     /// Components of an installed plugin that pacode will not run.
     pub fn unsupported_components(&self, plugin: &str) -> Vec<Component> {
-        if !manifest::is_valid_plugin_name(plugin) {
-            return Vec::new();
-        }
-        let manifest_path = self
-            .plugins_dir
-            .join(plugin)
-            .join(".claude-plugin")
-            .join("plugin.json");
-        let Ok(bytes) = std::fs::read(manifest_path) else {
-            return Vec::new();
-        };
-        match PluginManifest::parse(&bytes) {
-            Ok(manifest) => manifest::unsupported_components(&manifest),
-            Err(e) => {
-                log::warn!("unreadable plugin.json for {plugin}: {e}");
-                Vec::new()
-            }
+        match self.installed_manifest(plugin) {
+            Some(manifest) => manifest::unsupported_components(&manifest),
+            None => Vec::new(),
         }
     }
 }

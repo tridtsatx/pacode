@@ -76,7 +76,7 @@ pub enum PanelTarget {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginsTab {
-    /// Plugins loaded in this session.
+    /// Plugins live in this session or installed from a marketplace.
     Installed,
     /// Plugins the configured marketplace offers.
     Discover,
@@ -184,6 +184,14 @@ pub struct Toast {
 
 pub const TOAST_TTL_SECS: u64 = 6;
 pub const TOAST_MAX: usize = 2;
+/// Toast enter window: the slide-in lasts this long.
+pub const TOAST_ENTER_MS: u64 = 150;
+/// Toast exit window: the fade starts this long before expiry.
+pub const TOAST_EXIT_MS: u64 = 600;
+/// Overlay/picker unfold duration (the centred grow-in, spec §animation).
+pub const OVERLAY_GROW_MS: u64 = 140;
+/// Welcome cascade window after attach: the header animates only inside it.
+pub const WELCOME_ANIM_MS: u64 = 400;
 /// AGENTS ⇄ SESSION switch debounce (spec §5).
 pub const IDLE_DEBOUNCE_MS: u64 = 2000;
 
@@ -262,6 +270,18 @@ pub struct AppState {
     /// Age of `phase`, refreshed by the event loop before each draw so the draw
     /// path stays a pure function of state.
     pub phase_elapsed_ms: u64,
+    /// When this session's UI came up; drives the welcome cascade in the
+    /// header. Re-armed on every snapshot so a re-attach replays the cascade.
+    pub started_at: Instant,
+    /// Toggles once per second tick; the 1 s blink phase for pulses that run
+    /// while only the second tick is armed (idle main, background work alive).
+    pub second_parity: bool,
+    /// Focus layer seen by the last draw, as a small key (`ui::focus_key`), so
+    /// a new overlay can restart its unfold without inspecting the enum again.
+    pub last_focus_key: u8,
+    /// When the current overlay/picker focus layer opened (render-side clock
+    /// for the ~140 ms unfold); `None` while the focus layer is not a popup.
+    pub overlay_since: Option<Instant>,
 }
 
 /// What the panel shows.
@@ -349,6 +369,10 @@ impl AppState {
             pasted_images: crate::clipboard_read::PastedImages::new(),
             phase: None,
             phase_elapsed_ms: 0,
+            started_at: Instant::now(),
+            second_parity: false,
+            last_focus_key: 0,
+            overlay_since: None,
         }
     }
 
@@ -469,6 +493,9 @@ impl AppState {
             }
             ClientEvent::Snapshot(snapshot) => {
                 self.connection = Connection::Connected;
+                // The header banner is (re)installed below, so the welcome
+                // cascade re-arms here: a re-attach replays it.
+                self.started_at = now;
                 self.meta = Some(snapshot.meta.clone());
                 self.record_slot(
                     self.active_slot,
@@ -575,6 +602,47 @@ impl AppState {
             self.dirty = true;
         }
         changed
+    }
+
+    /// Whether a toast sits inside its enter or exit window, i.e. the fast
+    /// tick has visible work. Bounded: ~750 ms around each toast's life.
+    pub fn toast_needs_anim(&self, now: Instant) -> bool {
+        let ttl_ms = TOAST_TTL_SECS * 1000;
+        self.toasts.iter().any(|t| {
+            let age = now.saturating_duration_since(t.shown_at).as_millis() as u64;
+            age < TOAST_ENTER_MS || ttl_ms.saturating_sub(age) < TOAST_EXIT_MS
+        })
+    }
+
+    /// Whether the welcome cascade is still playing (bounded: first 400 ms
+    /// after `started_at`).
+    pub fn welcome_playing(&self, now: Instant) -> bool {
+        (now.saturating_duration_since(self.started_at).as_millis() as u64) < WELCOME_ANIM_MS
+    }
+
+    /// Whether the current overlay/picker is inside its unfold window.
+    pub fn overlay_growing(&self, now: Instant) -> bool {
+        self.overlay_since.is_some_and(|t| {
+            (now.saturating_duration_since(t).as_millis() as u64) < OVERLAY_GROW_MS
+        })
+    }
+
+    /// Whether a short-lived animation (toast slide/fade, overlay unfold,
+    /// welcome cascade) wants the fast tick instead of the ambient 125 ms one.
+    pub fn fast_anim_active(&self, now: Instant) -> bool {
+        self.toast_needs_anim(now) || self.welcome_playing(now) || self.overlay_growing(now)
+    }
+
+    /// The shared two-state blink phase for pulsing dots: driven by
+    /// `anim_frame` while the fast anim tick is armed, by `second_parity` when
+    /// only the 1 s tick runs. Either way it is a pure function of counters the
+    /// existing timers already advance — it never arms a timer of its own.
+    pub fn pulse_lit(&self, now: Instant) -> bool {
+        if self.turn_active || self.transcript.has_backlog() || self.needs_anim_tick(now) {
+            self.anim_frame % 4 < 2
+        } else {
+            self.second_parity
+        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -788,9 +856,27 @@ impl AppState {
         self.turn_active || self.rail.has_live_agents() || self.rail.has_running_tasks()
     }
 
-    /// Whether the 8 fps (125 ms) animation tick is needed (turn active or active panel agent).
-    pub fn needs_anim_tick(&self) -> bool {
+    /// Whether the animation tick is needed: the turn running, an active panel
+    /// agent, a pending permission pulse, a young overlay unfold, the welcome
+    /// cascade, or the reconnect dots. Every arm is a visible animation.
+    pub fn needs_anim_tick(&self, now: Instant) -> bool {
         if self.turn_active {
+            return true;
+        }
+        if self.welcome_playing(now) || self.overlay_growing(now) {
+            return true;
+        }
+        // A permission request pulses until it is answered; waiting on the
+        // reader is activity, so the tick is allowed.
+        let permission_pending = self
+            .transcript
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Permission(_))));
+        if permission_pending {
+            return true;
+        }
+        if matches!(self.connection, Connection::Reconnecting { .. }) {
             return true;
         }
         match &self.focus {

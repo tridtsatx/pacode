@@ -12,7 +12,7 @@ use pacode_types::ToastLevel;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::keys::Action;
 use crate::state::AppState;
@@ -178,27 +178,22 @@ pub fn handle_key(
 
 /// Draw the import overlay.
 pub fn draw(frame: &mut Frame, area: Rect, state: &ImportOverlayState, opts: &RenderOptions) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " Import MCP Servers & Skills ",
-            opts.theme.bold,
-        ))
-        .title_bottom(Span::styled(
-            " space toggle · a all · enter apply · esc close ",
-            opts.theme.dim,
-        ))
-        .border_style(opts.theme.dim);
+    let block = crate::ui::overlays::menu_block(
+        "Import MCP Servers & Skills",
+        " space toggle · a all · enter apply · esc close ",
+        opts,
+    );
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if state.rows.is_empty() {
-        let msg = Line::from(Span::styled(
+        let lines = crate::ui::overlays::empty_lines(
             "No MCP servers or skills found to import",
-            opts.theme.faint,
-        ));
-        frame.render_widget(Paragraph::new(vec![msg]), inner);
+            "nothing importable in the supported config locations",
+            opts,
+        );
+        frame.render_widget(Paragraph::new(lines), inner);
         return;
     }
 
@@ -238,22 +233,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ImportOverlayState, opts: &Re
             let (box_str, box_style, name_style, kind_style) = if row.already_imported {
                 ("[x]", opts.theme.dim, opts.theme.dim, opts.theme.dim)
             } else if row.checked {
-                (
-                    "[x]",
-                    opts.theme.green,
-                    if is_sel {
-                        opts.theme.selected_bg.patch(opts.theme.bold)
-                    } else {
-                        opts.theme.bold
-                    },
-                    opts.theme.cyan,
-                )
+                ("[x]", opts.theme.green, opts.theme.bold, opts.theme.cyan)
             } else {
                 (
                     "[ ]",
                     opts.theme.dim,
                     if is_sel {
-                        opts.theme.selected_bg.patch(opts.theme.bold)
+                        opts.theme.bold
                     } else {
                         opts.theme.fg
                     },
@@ -290,7 +276,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ImportOverlayState, opts: &Re
                 }
             }
 
-            lines.push(Line::from(row_spans));
+            let line = Line::from(row_spans);
+            if is_sel {
+                lines.push(crate::ui::overlays::selected_row(line, inner.width, opts));
+            } else {
+                lines.push(line);
+            }
         }
     }
 

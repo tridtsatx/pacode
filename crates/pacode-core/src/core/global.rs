@@ -139,23 +139,9 @@ impl Core {
                 Some(self.install_plugin(source, name).await)
             }
             Request::UninstallPlugin { name } => Some(self.uninstall_plugin(name).await),
-            Request::ListPlugins => {
-                let plugins = self
-                    .deps
-                    .plugins
-                    .list()
-                    .into_iter()
-                    .map(|p| pacode_types::protocol::PluginInfo {
-                        name: p.name,
-                        version: p.version,
-                        kind: p.kind.map(|k| k.to_string()).unwrap_or_default(),
-                        tools: p.tools.into_iter().map(|t| t.name).collect(),
-                        commands: p.commands.into_iter().map(|c| c.name).collect(),
-                        error: p.error,
-                    })
-                    .collect();
-                Some(Reply::Plugins { plugins })
-            }
+            Request::ListPlugins => Some(Reply::Plugins {
+                plugins: self.installed_plugins(),
+            }),
             Request::RunPluginCommand { name, args } => {
                 match self.deps.plugins.run_command(name, args.clone()).await {
                     Ok(outcome) => {
@@ -183,6 +169,98 @@ impl Core {
 }
 
 impl Core {
+    /// Everything the `/plugins` Installed tab lists: plugins live in the
+    /// runtime merged with what the marketplace installed, by name. A plugin
+    /// that is both keeps one row.
+    fn installed_plugins(&self) -> Vec<pacode_types::protocol::PluginInfo> {
+        use pacode_types::protocol::PluginInfo;
+
+        let mut out: Vec<PluginInfo> = self
+            .deps
+            .plugins
+            .list()
+            .into_iter()
+            .map(|p| PluginInfo {
+                loaded: p.error.is_none(),
+                name: p.name,
+                version: p.version,
+                kind: p.kind.map(|k| k.to_string()).unwrap_or_default(),
+                tools: p.tools.into_iter().map(|t| t.name).collect(),
+                commands: p.commands.into_iter().map(|c| c.name).collect(),
+                error: p.error,
+                description: p.description.unwrap_or_default(),
+                ..PluginInfo::default()
+            })
+            .collect();
+
+        let mut installed = self.deps.marketplace.installed();
+        installed.sort_by(|a, b| a.name.cmp(&b.name));
+        for record in installed {
+            let manifest = self.deps.marketplace.installed_manifest(&record.name);
+            let mcp_servers = manifest
+                .as_ref()
+                .map(|m| {
+                    m.mcp_server_decls()
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let unsupported = manifest
+                .as_ref()
+                .map(|m| {
+                    pacode_plugin::marketplace::manifest::unsupported_components(m)
+                        .into_iter()
+                        .map(|c| c.as_str().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let skill_dirs = self.deps.marketplace.skill_count(&record.name) as u32;
+
+            // A plugin that is both installed and loaded merges into its row:
+            // runtime data wins, the record adds where it came from.
+            if let Some(p) = out.iter_mut().find(|p| p.name == record.name) {
+                p.source = record.source;
+                p.installed_at_ms = record.installed_at_ms;
+                if p.version.is_empty() {
+                    p.version = record.version;
+                }
+                if p.description.is_empty() {
+                    p.description = manifest
+                        .as_ref()
+                        .map(|m| m.description.clone())
+                        .unwrap_or_default();
+                }
+                p.author = manifest
+                    .as_ref()
+                    .map(|m| m.author.display())
+                    .unwrap_or_default();
+                p.mcp_servers = mcp_servers;
+                p.skill_dirs = skill_dirs;
+                p.unsupported = unsupported;
+            } else {
+                let manifest = manifest.as_ref();
+                out.push(PluginInfo {
+                    name: record.name,
+                    version: if record.version.is_empty() {
+                        manifest.map(|m| m.version.clone()).unwrap_or_default()
+                    } else {
+                        record.version
+                    },
+                    description: manifest.map(|m| m.description.clone()).unwrap_or_default(),
+                    author: manifest.map(|m| m.author.display()).unwrap_or_default(),
+                    source: record.source,
+                    installed_at_ms: record.installed_at_ms,
+                    mcp_servers,
+                    skill_dirs,
+                    unsupported,
+                    ..PluginInfo::default()
+                });
+            }
+        }
+        out
+    }
+
     /// Plugins a marketplace offers, with their installed state.
     async fn browse_marketplace(&self, source: &str, query: &str) -> Reply {
         let source = match pacode_plugin::marketplace::MarketplaceSource::parse(source) {
@@ -246,26 +324,19 @@ impl Core {
     }
 
     async fn uninstall_plugin(&self, name: &str) -> Reply {
+        // The reply refreshes the picker's Discover tab with the marketplace
+        // the record came from, so read the source before it is gone.
+        let source = self
+            .deps
+            .marketplace
+            .installed()
+            .into_iter()
+            .find(|i| i.name == name)
+            .map(|i| i.source);
         match self.deps.marketplace.uninstall(name) {
-            Ok(()) => Reply::MarketplacePlugins {
-                plugins: self
-                    .deps
-                    .marketplace
-                    .installed()
-                    .into_iter()
-                    .map(|installed| pacode_types::MarketplacePluginInfo {
-                        name: installed.name,
-                        description: String::new(),
-                        version: installed.version.clone(),
-                        author: String::new(),
-                        category: String::new(),
-                        marketplace: installed.source,
-                        installed: true,
-                        installed_version: Some(installed.version),
-                        update_available: false,
-                    })
-                    .collect(),
-                stale: false,
+            Ok(()) => match source {
+                Some(source) => self.browse_marketplace(&source, "").await,
+                None => Reply::Ok,
             },
             Err(e) => Reply::Error {
                 message: e.to_string(),

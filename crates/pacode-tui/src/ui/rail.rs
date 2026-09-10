@@ -1,5 +1,7 @@
 //! The rail (spec §4): header, PLAN, AGENTS (or SESSION when idle), BACKGROUND, anchor.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -175,6 +177,28 @@ fn draw_plan(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Symbol and style for an agent's rail dot. Live agents breathe on the shared
+/// pulse phase (`AppState::pulse_lit`); terminal ones stay put — a stopped dot
+/// keeps its static dim look rather than blinking.
+fn agent_dot(
+    agent: &pacode_types::AgentInfo,
+    lit: bool,
+    opts: &RenderOptions,
+) -> (&'static str, ratatui::style::Style) {
+    match agent.status {
+        AgentStatus::Failed => (opts.glyphs.fail, opts.theme.red),
+        AgentStatus::Finished => (opts.glyphs.ok, opts.theme.green),
+        AgentStatus::Stopped => (opts.glyphs.agent_dot, opts.theme.dim),
+        AgentStatus::Idle
+        | AgentStatus::Thinking
+        | AgentStatus::RunningTool
+        | AgentStatus::WaitingApproval => (
+            opts.glyphs.agent_dot,
+            crate::ui::anim::pulse(&opts.theme, opts.theme.green, lit),
+        ),
+    }
+}
+
 fn draw_agents(
     frame: &mut Frame,
     area: Rect,
@@ -195,6 +219,21 @@ fn draw_agents(
         return;
     }
 
+    // Live indicators pulse: on the anim frame while the fast tick is armed,
+    // on the second parity when only background work keeps the 1 s tick alive.
+    let lit = state.pulse_lit(Instant::now());
+    let main_live = state.turn_active
+        || state
+            .rail
+            .agents
+            .iter()
+            .any(|a| a.id.is_main() && a.status.is_live());
+    let main_dot_style = if main_live {
+        crate::ui::anim::pulse(&opts.theme, opts.theme.green, lit)
+    } else {
+        opts.theme.green
+    };
+
     let mut lines = Vec::new();
     let title_text = "AGENTS";
     let right_text = format!("{count} ");
@@ -203,7 +242,7 @@ fn draw_agents(
         Span::styled(title_text, opts.theme.faint),
         Span::raw(" ".repeat(spaces)),
         Span::styled(right_text, opts.theme.dim),
-        Span::styled(opts.glyphs.main_dot, opts.theme.green),
+        Span::styled(opts.glyphs.main_dot, main_dot_style),
     ]));
 
     let now = now_ms();
@@ -218,16 +257,16 @@ fn draw_agents(
         let dur_str = crate::state::activity::format_activity_secs(
             crate::state::activity::displayed_secs(elapsed),
         );
-        let label = phase.label(elapsed);
+        let label = phase.label(elapsed, state.anim_frame, &opts.glyphs);
         Line::from(vec![
-            Span::styled(opts.glyphs.main_dot, opts.theme.green),
+            Span::styled(opts.glyphs.main_dot, main_dot_style),
             Span::raw(" "),
             Span::styled("main  ", opts.theme.bold),
             Span::styled(format!("{label} · {dur_str}"), opts.theme.faint),
         ])
     } else {
         Line::from(vec![
-            Span::styled(opts.glyphs.main_dot, opts.theme.green),
+            Span::styled(opts.glyphs.main_dot, main_dot_style),
             Span::raw(" "),
             Span::styled("main", opts.theme.bold),
         ])
@@ -260,20 +299,7 @@ fn draw_agents(
                 break;
             }
             let is_sel = i == selected_idx;
-            let dot = if agent.status == AgentStatus::Failed {
-                opts.glyphs.fail
-            } else if agent.status == AgentStatus::Finished {
-                opts.glyphs.ok
-            } else {
-                opts.glyphs.agent_dot
-            };
-            let dot_style = if agent.status == AgentStatus::Failed {
-                opts.theme.red
-            } else if agent.status == AgentStatus::Finished {
-                opts.theme.green
-            } else {
-                opts.theme.dim
-            };
+            let (dot, dot_style) = agent_dot(agent, lit, opts);
 
             if is_sel {
                 let dur = format_duration_ms(agent.duration_ms(now));
@@ -322,20 +348,7 @@ fn draw_agents(
 
         if all_fit_3 {
             for agent in subagents {
-                let dot = if agent.status == AgentStatus::Failed {
-                    opts.glyphs.fail
-                } else if agent.status == AgentStatus::Finished {
-                    opts.glyphs.ok
-                } else {
-                    opts.glyphs.agent_dot
-                };
-                let dot_style = if agent.status == AgentStatus::Failed {
-                    opts.theme.red
-                } else if agent.status == AgentStatus::Finished {
-                    opts.theme.green
-                } else {
-                    opts.theme.dim
-                };
+                let (dot, dot_style) = agent_dot(agent, lit, opts);
 
                 let dur = format_duration_ms(agent.duration_ms(now));
                 let tok = format_tokens(agent.tokens_in);
@@ -359,20 +372,7 @@ fn draw_agents(
             }
         } else if all_fit_1 {
             for agent in subagents {
-                let dot = if agent.status == AgentStatus::Failed {
-                    opts.glyphs.fail
-                } else if agent.status == AgentStatus::Finished {
-                    opts.glyphs.ok
-                } else {
-                    opts.glyphs.agent_dot
-                };
-                let dot_style = if agent.status == AgentStatus::Failed {
-                    opts.theme.red
-                } else if agent.status == AgentStatus::Finished {
-                    opts.theme.green
-                } else {
-                    opts.theme.dim
-                };
+                let (dot, dot_style) = agent_dot(agent, lit, opts);
                 let dur = format_duration_ms(agent.duration_ms(now));
                 lines.push(Line::from(vec![
                     Span::styled(dot, dot_style),
@@ -385,20 +385,7 @@ fn draw_agents(
         } else {
             let visible = rem_h.saturating_sub(1);
             for agent in subagents.iter().take(visible) {
-                let dot = if agent.status == AgentStatus::Failed {
-                    opts.glyphs.fail
-                } else if agent.status == AgentStatus::Finished {
-                    opts.glyphs.ok
-                } else {
-                    opts.glyphs.agent_dot
-                };
-                let dot_style = if agent.status == AgentStatus::Failed {
-                    opts.theme.red
-                } else if agent.status == AgentStatus::Finished {
-                    opts.theme.green
-                } else {
-                    opts.theme.dim
-                };
+                let (dot, dot_style) = agent_dot(agent, lit, opts);
                 let dur = format_duration_ms(agent.duration_ms(now));
                 lines.push(Line::from(vec![
                     Span::styled(dot, dot_style),

@@ -77,6 +77,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                     &mut state.panel.agent_transcript,
                     opts,
                     state.anim_frame,
+                    std::time::Instant::now()
+                        .saturating_duration_since(state.started_at)
+                        .as_millis() as u64,
                 );
             }
         }

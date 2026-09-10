@@ -131,12 +131,18 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
         .filter(|t| t.status == TaskStatus::Completed)
         .count();
 
+    // The running glyph breathes in its own hue: violet means "in progress"
+    // everywhere in the rail, so the pulse dims it instead of borrowing green
+    // (which already means "done").
+    let lit = state.pulse_lit(std::time::Instant::now());
+    let running_style = crate::ui::anim::pulse(&opts.theme, opts.theme.violet, lit);
+
     let title_text = "BACKGROUND";
     let mut right_spans = Vec::new();
     if running > 0 {
         right_spans.push(Span::styled(
             format!("{running} {} ", opts.glyphs.running),
-            opts.theme.violet,
+            running_style,
         ));
     }
     if completed > 0 {
@@ -172,11 +178,11 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
 
     if tasks.len() <= rem {
         for t in tasks {
-            lines.push(render_task_line(t, area.width as usize, opts, now));
+            lines.push(render_task_line(t, area.width as usize, opts, now, lit));
         }
     } else if rem > 1 {
         for t in tasks.iter().take(rem - 1) {
-            lines.push(render_task_line(t, area.width as usize, opts, now));
+            lines.push(render_task_line(t, area.width as usize, opts, now, lit));
         }
         let more = tasks.len() - (rem - 1);
         lines.push(Line::from(Span::styled(
@@ -261,10 +267,14 @@ fn render_task_line(
     width: usize,
     opts: &RenderOptions,
     now: u64,
+    lit: bool,
 ) -> Line<'static> {
     let dur = format_duration_ms(task.duration_ms(now));
     let (sym, sym_style) = match task.status {
-        TaskStatus::Running => (opts.glyphs.running, opts.theme.violet),
+        TaskStatus::Running => (
+            opts.glyphs.running,
+            crate::ui::anim::pulse(&opts.theme, opts.theme.violet, lit),
+        ),
         TaskStatus::Completed => (opts.glyphs.ok, opts.theme.green),
         TaskStatus::Failed | TaskStatus::Killed => (opts.glyphs.fail, opts.theme.red),
     };

@@ -7,6 +7,8 @@
 
 use ratatui::style::Color;
 
+use pacode_render::Glyphs;
+
 #[cfg(test)]
 #[path = "activity_tests.rs"]
 mod activity_tests;
@@ -44,10 +46,11 @@ impl Phase {
         }
     }
 
-    /// Text shown after the bar. `elapsed_ms` is the age of this phase.
-    pub fn label(&self, elapsed_ms: u64) -> String {
+    /// Text shown after the bar. `elapsed_ms` is the age of this phase, `frame`
+    /// the shared animation counter that makes the trailing dots move.
+    pub fn label(&self, elapsed_ms: u64, frame: u64, glyphs: &Glyphs) -> String {
         match self {
-            Self::Thinking => thinking_label(elapsed_ms).to_string(),
+            Self::Thinking => thinking_label(elapsed_ms, frame, glyphs),
             Self::Responding => "responding…".to_string(),
             Self::Tool(title) => title.clone(),
             Self::WaitingAgent(name) => format!("waiting for agent {name}"),
@@ -62,17 +65,29 @@ impl Phase {
     }
 }
 
-/// Thinking wording for the age of the thinking phase.
-pub fn thinking_label(elapsed_ms: u64) -> &'static str {
-    if elapsed_ms < STAGE_1_MS {
-        "thinking…"
-    } else if elapsed_ms < STAGE_2_MS {
-        "thinking a bit more…"
-    } else if elapsed_ms < STAGE_3_MS {
-        "thinking a lot…"
-    } else {
-        "almost done thinking…"
+/// Trailing dots for an in-progress label: `.`, `..`, `…` picked by
+/// `frame % 3` (`...` for the last step under ASCII).
+pub fn trailing_dots(frame: u64, glyphs: &Glyphs) -> &'static str {
+    match frame % 3 {
+        0 => ".",
+        1 => "..",
+        _ => glyphs.ellipsis,
     }
+}
+
+/// Thinking wording for the age of the thinking phase; the trailing dots move
+/// with the animation frame so the line reads as alive while the model thinks.
+pub fn thinking_label(elapsed_ms: u64, frame: u64, glyphs: &Glyphs) -> String {
+    let base = if elapsed_ms < STAGE_1_MS {
+        "thinking"
+    } else if elapsed_ms < STAGE_2_MS {
+        "thinking a bit more"
+    } else if elapsed_ms < STAGE_3_MS {
+        "thinking a lot"
+    } else {
+        "almost done thinking"
+    };
+    format!("{base}{}", trailing_dots(frame, glyphs))
 }
 
 /// Thinking colour: drifts from `from` (the normal foreground) to `to` (yellow),

@@ -849,6 +849,8 @@ fn test_overlay_plugins_picker_keys() {
         tools: vec![],
         commands: vec!["c1".into()],
         error: None,
+        loaded: true,
+        ..pacode_types::PluginInfo::default()
     };
     let p2 = pacode_types::PluginInfo {
         name: "plug2".into(),
@@ -857,6 +859,8 @@ fn test_overlay_plugins_picker_keys() {
         tools: vec![],
         commands: vec![],
         error: None,
+        loaded: true,
+        ..pacode_types::PluginInfo::default()
     };
     state.focus = Focus::Overlay(Overlay::PluginsPicker {
         tab: crate::state::PluginsTab::Installed,
@@ -893,6 +897,59 @@ fn test_overlay_plugins_picker_keys() {
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_plugins_picker_x_uninstalls_only_installed_plugins() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // A plugin dropped into the dir by hand has no install record — `x` has
+    // nothing to remove.
+    let manual = pacode_types::PluginInfo {
+        name: "manual".into(),
+        version: "1.0.0".into(),
+        kind: "lua".into(),
+        loaded: true,
+        ..pacode_types::PluginInfo::default()
+    };
+    // A marketplace-installed plugin does — `x` removes it and refreshes.
+    let installed = pacode_types::PluginInfo {
+        name: "playwright".into(),
+        version: "2.1.0".into(),
+        source: "owner/repo".into(),
+        installed_at_ms: 1_700_000_000_000,
+        ..pacode_types::PluginInfo::default()
+    };
+    state.focus = Focus::Overlay(Overlay::PluginsPicker {
+        tab: crate::state::PluginsTab::Installed,
+        market: Vec::new(),
+        query: String::new(),
+        loading: false,
+        stale: false,
+        index: 0,
+        plugins: vec![manual, installed],
+    });
+
+    let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, x, now);
+    assert!(
+        actions.is_empty(),
+        "no install record, nothing to uninstall"
+    );
+
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    let actions = handle_key(&mut state, x, now);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Send(Request::UninstallPlugin {
+                name: "playwright".into()
+            }),
+            Action::Send(Request::ListPlugins),
+        ]
+    );
 }
 
 #[test]

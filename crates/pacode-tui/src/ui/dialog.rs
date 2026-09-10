@@ -23,6 +23,7 @@ pub fn draw(
     transcript: &mut Transcript,
     opts: &RenderOptions,
     anim_frame: u64,
+    welcome_ms: u64,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -44,6 +45,7 @@ pub fn draw(
         width,
         opts,
         anim_frame,
+        welcome_ms,
     );
 
     // Remember where each cell landed, so a click on a row finds its cell. The
@@ -107,11 +109,14 @@ fn build_cell_lines(
     width: u16,
     opts: &RenderOptions,
     anim_frame: u64,
+    welcome_ms: u64,
 ) -> Vec<Vec<Line<'static>>> {
     let mut cell_lines: Vec<Vec<Line<'static>>> = Vec::with_capacity(cell_snapshots.len() + 1);
 
     if let Some(info) = transcript.header.clone() {
-        cell_lines.push(crate::ui::header::render(&info, width, opts, anim_frame));
+        cell_lines.push(crate::ui::header::render(
+            &info, width, opts, anim_frame, welcome_ms,
+        ));
     }
 
     for (id, version, kind, stats) in cell_snapshots {
@@ -139,6 +144,7 @@ pub(crate) fn plain_lines(
     width: u16,
     opts: &RenderOptions,
     anim_frame: u64,
+    welcome_ms: u64,
 ) -> Vec<String> {
     let live_id = transcript.live_cell;
     let cell_snapshots: Vec<(u64, u32, CellKind, Option<String>)> = transcript
@@ -153,6 +159,7 @@ pub(crate) fn plain_lines(
         width,
         opts,
         anim_frame,
+        welcome_ms,
     )
     .into_iter()
     .flatten()
@@ -348,7 +355,7 @@ fn render_item_inner(
     stats: Option<&str>,
     width: u16,
     opts: &RenderOptions,
-    _anim_frame: u64,
+    anim_frame: u64,
     expanded: bool,
 ) -> Vec<Line<'static>> {
     match kind {
@@ -446,10 +453,16 @@ fn render_item_inner(
             match status {
                 ToolStatus::Running => {
                     spans.push(Span::raw(" "));
+                    // The cell bypasses the line cache while running, so the
+                    // braille spinner can turn on the anim frame alone.
+                    let spinner = opts.glyphs.spinner(anim_frame);
                     let label = if let Some(ms) = duration_ms {
-                        format!("running {}", pacode_types::time::format_duration_ms(*ms))
+                        format!(
+                            "{spinner} running {}",
+                            pacode_types::time::format_duration_ms(*ms)
+                        )
                     } else {
-                        "running".to_string()
+                        format!("{spinner} running")
                     };
                     spans.push(Span::styled(label, opts.theme.accent));
                 }

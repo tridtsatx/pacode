@@ -371,6 +371,8 @@ pub struct Glyphs {
     pub vline: &'static str,
     pub hline: &'static str,
     pub chevrons: &'static str,
+    pub disabled: &'static str,
+    pub stopped: &'static str,
 }
 
 impl Glyphs {
@@ -399,6 +401,8 @@ impl Glyphs {
                 vline: "|",
                 hline: "-",
                 chevrons: ">>",
+                disabled: "o",
+                stopped: "-",
             }
         } else {
             Self {
@@ -424,7 +428,21 @@ impl Glyphs {
                 vline: "│",
                 hline: "─",
                 chevrons: "»",
+                disabled: "⊘",
+                stopped: "■",
             }
+        }
+    }
+
+    /// Braille spinner frame for `frame` (`-\|/` under ASCII). A method rather
+    /// than a field because the glyph is a cycle, not a constant.
+    pub fn spinner(&self, frame: u64) -> &'static str {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const ASCII: [&str; 4] = ["-", "\\", "|", "/"];
+        if self.ascii {
+            ASCII[(frame as usize) % ASCII.len()]
+        } else {
+            FRAMES[(frame as usize) % FRAMES.len()]
         }
     }
 

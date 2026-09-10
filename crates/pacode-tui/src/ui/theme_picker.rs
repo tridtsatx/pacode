@@ -12,6 +12,7 @@ use ratatui::widgets::Paragraph;
 use pacode_render::RenderOptions;
 
 use crate::state::{AppState, Focus, Overlay, ThemePickerStep};
+use crate::ui::overlays::selected_row;
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOptions) {
     let Focus::Overlay(Overlay::ThemePicker {
@@ -27,117 +28,84 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
     let builtins = pacode_render::builtin_palettes();
     let mut lines = Vec::new();
 
-    match step {
+    // (title, rows) per step; a row is the label plus the dim tag behind it.
+    let (title, rows): (&str, Vec<(String, &str)>) = match step {
         ThemePickerStep::SelectTheme => {
-            // Title
-            lines.push(Line::from(Span::styled(
-                "Color Theme",
-                opts.theme.bold.patch(opts.theme.accent),
-            )));
-
-            let mut rows: Vec<String> = Vec::new();
+            let mut rows: Vec<(String, &str)> = Vec::new();
             for p in builtins {
-                if p.light {
-                    let name = &p.name;
-                    rows.push(format!("{name} (built-in, light)"));
+                let tag = if p.light {
+                    "built-in · light"
                 } else {
-                    let name = &p.name;
-                    rows.push(format!("{name} (built-in)"));
-                }
+                    "built-in"
+                };
+                rows.push((p.name.clone(), tag));
             }
             for u in user_themes {
-                rows.push(format!("{u} (user)"));
+                rows.push((u.clone(), "user"));
             }
-            rows.push("Create new one…".to_string());
-
-            let list_height = (area.height as usize).saturating_sub(2).min(8);
-            let sel_idx = if rows.is_empty() {
-                0
+            let create = if opts.glyphs.ascii {
+                "Create new one...".to_string()
             } else {
-                index % rows.len()
+                "Create new one…".to_string()
             };
-            let start = if sel_idx >= list_height {
-                sel_idx + 1 - list_height
-            } else {
-                0
-            };
-
-            for (i, row_text) in rows.iter().enumerate().skip(start).take(list_height) {
-                let is_sel = i == sel_idx;
-                let padded = format!(
-                    "{:<width$}",
-                    row_text,
-                    width = (area.width as usize).saturating_sub(2)
-                );
-                if is_sel {
-                    lines.push(Line::from(Span::styled(
-                        format!("▸ {padded}"),
-                        opts.theme
-                            .selected_bg
-                            .patch(opts.theme.bold)
-                            .patch(opts.theme.accent),
-                    )));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(row_text.clone(), opts.theme.fg),
-                    ]));
-                }
-            }
+            rows.push((create, ""));
+            ("Color Theme", rows)
         }
-        ThemePickerStep::SelectBase => {
-            // Title
-            lines.push(Line::from(Span::styled(
-                "Select Base Theme",
-                opts.theme.bold.patch(opts.theme.accent),
-            )));
-
-            let rows: Vec<String> = builtins
+        ThemePickerStep::SelectBase => (
+            "Select Base Theme",
+            builtins
                 .iter()
                 .map(|p| {
-                    if p.light {
-                        let name = &p.name;
-                        format!("{name} (light)")
-                    } else {
-                        p.name.clone()
-                    }
+                    let tag = if p.light { "light" } else { "" };
+                    (p.name.clone(), tag)
                 })
-                .collect();
+                .collect(),
+        ),
+    };
 
-            let list_height = (area.height as usize).saturating_sub(2).min(8);
-            let sel_idx = if rows.is_empty() {
-                0
-            } else {
-                index % rows.len()
-            };
-            let start = if sel_idx >= list_height {
-                sel_idx + 1 - list_height
-            } else {
-                0
-            };
+    // 0: Title
+    lines.push(Line::from(Span::styled(
+        title,
+        opts.theme.bold.patch(opts.theme.accent),
+    )));
 
-            for (i, row_text) in rows.iter().enumerate().skip(start).take(list_height) {
-                let is_sel = i == sel_idx;
-                let padded = format!(
-                    "{:<width$}",
-                    row_text,
-                    width = (area.width as usize).saturating_sub(2)
-                );
-                if is_sel {
-                    lines.push(Line::from(Span::styled(
-                        format!("▸ {padded}"),
-                        opts.theme
-                            .selected_bg
-                            .patch(opts.theme.bold)
-                            .patch(opts.theme.accent),
-                    )));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(row_text.clone(), opts.theme.fg),
-                    ]));
-                }
-            }
+    let list_height = (area.height as usize).saturating_sub(2).min(8);
+    let sel_idx = if rows.is_empty() {
+        0
+    } else {
+        index % rows.len()
+    };
+    let start = if sel_idx >= list_height {
+        sel_idx + 1 - list_height
+    } else {
+        0
+    };
+
+    for (i, (name, tag)) in rows.iter().enumerate().skip(start).take(list_height) {
+        let is_sel = i == sel_idx;
+        let mut spans = vec![Span::styled(
+            format!("{} ", if is_sel { opts.glyphs.pointer } else { " " }),
+            opts.theme.accent,
+        )];
+        spans.push(Span::styled(
+            name.clone(),
+            if is_sel {
+                opts.theme.bold
+            } else {
+                opts.theme.fg
+            },
+        ));
+        if !tag.is_empty() {
+            spans.push(Span::styled(
+                format!("{sep}{tag}", sep = opts.glyphs.dot_sep),
+                opts.theme.faint,
+            ));
+        }
+        let line = Line::from(spans);
+        if is_sel {
+            lines.push(selected_row(line, area.width, opts));
+        } else {
+            lines.push(line);
         }
     }
 
@@ -150,7 +118,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
     } else {
         "↑/↓ select · enter confirm · esc cancel"
     };
-    lines.push(Line::from(Span::styled(hint, opts.theme.faint)));
+    lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
 
     frame.render_widget(Paragraph::new(lines), area);
 }

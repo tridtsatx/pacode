@@ -37,22 +37,20 @@ pub fn draw(
     state: &mut AppState,
     opts: &RenderOptions,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" Touched Files ", opts.theme.bold))
-        .title_bottom(Span::styled(
-            " enter copy path · esc close ",
-            opts.theme.dim,
-        ))
-        .border_style(opts.theme.dim);
+    let block =
+        crate::ui::overlays::menu_block("Touched Files", " enter copy path · esc close ", opts);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if state.files.is_empty() {
         state.files.clear_preview();
-        let msg = Line::from(Span::styled("No files touched yet", opts.theme.faint));
-        frame.render_widget(Paragraph::new(vec![msg]), inner);
+        let lines = crate::ui::overlays::empty_lines(
+            "No files touched yet",
+            "files the agent reads or writes land here",
+            opts,
+        );
+        frame.render_widget(Paragraph::new(lines), inner);
         return;
     }
 
@@ -143,7 +141,7 @@ fn render_file_list(
 
         let path_text = truncate_left(&row.path, avail_path_width, opts.glyphs.ascii);
         let path_style = if is_sel {
-            opts.theme.selected_bg.patch(opts.theme.bold)
+            opts.theme.bold
         } else {
             opts.theme.fg
         };
@@ -152,7 +150,7 @@ fn render_file_list(
         let age_ms = now.saturating_sub(row.last_ts_ms);
         let age_str = format!("{:>7}", format_duration_ms(age_ms));
 
-        lines.push(Line::from(vec![
+        let line = Line::from(vec![
             Span::styled(pointer, pointer_style),
             Span::raw(" "),
             r_badge,
@@ -165,7 +163,12 @@ fn render_file_list(
             Span::styled(count_str, opts.theme.dim),
             Span::raw(" "),
             Span::styled(age_str, opts.theme.faint),
-        ]));
+        ]);
+        if is_sel {
+            lines.push(crate::ui::overlays::selected_row(line, area.width, opts));
+        } else {
+            lines.push(line);
+        }
     }
 
     frame.render_widget(Paragraph::new(lines), area);

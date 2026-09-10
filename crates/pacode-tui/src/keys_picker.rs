@@ -406,7 +406,12 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                         let name = market[(*index).min(market.len() - 1)].name.clone();
                         *loading = true;
                         state.dirty = true;
-                        return vec![Action::Send(Request::InstallPlugin { source, name })];
+                        // The install reply refreshes Discover; ListPlugins
+                        // makes the new plugin show up under Installed.
+                        return vec![
+                            Action::Send(Request::InstallPlugin { source, name }),
+                            Action::Send(Request::ListPlugins),
+                        ];
                     }
                     _ => {
                         query.push(c);
@@ -426,9 +431,19 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     return vec![Action::Send(Request::BrowseMarketplace { source, query })];
                 }
                 KeyCode::Char('x') if *tab == PluginsTab::Installed && !plugins.is_empty() => {
-                    let name = plugins[(*index).min(plugins.len() - 1)].name.clone();
-                    state.dirty = true;
-                    return vec![Action::Send(Request::UninstallPlugin { name })];
+                    let p = &plugins[(*index).min(plugins.len() - 1)];
+                    // Uninstall removes exactly what an install record tracks, so
+                    // only marketplace-installed plugins are removable here.
+                    if p.is_installed() {
+                        let name = p.name.clone();
+                        state.dirty = true;
+                        // ListPlugins refreshes the Installed tab; the uninstall
+                        // reply itself refreshes the Discover tab.
+                        return vec![
+                            Action::Send(Request::UninstallPlugin { name }),
+                            Action::Send(Request::ListPlugins),
+                        ];
+                    }
                 }
                 _ => {}
             }

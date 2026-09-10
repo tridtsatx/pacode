@@ -234,6 +234,49 @@ fn a_short_output_needs_no_expansion_hint() {
     );
 }
 
+#[test]
+fn a_running_tool_call_spins_on_the_anim_frame() {
+    let opts = RenderOptions::new(80, false);
+    let kind = TranscriptKind::ToolCall {
+        call_id: "call_run".into(),
+        name: "bash".into(),
+        title: "bash cargo test".into(),
+        intent: None,
+        status: ToolStatus::Running,
+        preview: "".into(),
+        diff: None,
+        duration_ms: Some(12_000),
+        task: None,
+    };
+    let text = |frame: u64| {
+        super::render_item_inner(&kind, None, 80, &opts, frame, false)[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+    assert!(text(0).contains("⠋ running 12s"), "{}", text(0));
+    assert!(text(1).contains("⠙ running 12s"), "{}", text(1));
+    assert!(text(10).contains("⠋ running 12s"), "{}", text(10));
+
+    let ascii = RenderOptions::new(80, true);
+    let text_ascii = |frame: u64| {
+        super::render_item_inner(&kind, None, 80, &ascii, frame, false)[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+    assert!(text_ascii(0).contains("- running 12s"), "{}", text_ascii(0));
+    assert!(
+        text_ascii(1).contains("\\ running 12s"),
+        "{}",
+        text_ascii(1)
+    );
+    assert!(text_ascii(2).contains("| running 12s"), "{}", text_ascii(2));
+    assert!(text_ascii(3).contains("/ running 12s"), "{}", text_ascii(3));
+}
+
 fn question_cell(answer: Option<pacode_types::QuestionAnswer>) -> TranscriptKind {
     let question = pacode_types::Question::new(
         pacode_types::QuestionId::new("qst_1"),

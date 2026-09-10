@@ -282,10 +282,20 @@ fn create_state(cols: u16, rows: u16, snapshot: SessionSnapshot) -> AppState {
     if let Some(header) = state.transcript.header.as_mut() {
         header.day = 0;
     }
+    // The welcome cascade plays for the first 400 ms; pin the start back so
+    // the header is fully arrived and snapshots stay deterministic.
+    state.started_at = Instant::now() - std::time::Duration::from_secs(60);
     // The event loop refreshes the activity phase before every draw; these tests
     // drive `ui::draw` directly, so they have to do the same.
     state.tick_phase(now);
     state
+}
+
+/// Tests that set `focus` directly skip the event loop, so the first draw would
+/// record a fresh `overlay_since` and the overlay would render mid-unfold.
+/// Marking the layer already seen keeps the snapshot at full size.
+fn settle_focus(state: &mut AppState) {
+    state.last_focus_key = pacode_tui::ui::focus_key(&state.focus);
 }
 
 #[test]
@@ -389,6 +399,7 @@ fn test_mockup_state_02_select_agent() {
     let snapshot = make_base_snapshot();
     let mut state = create_state(120, 34, snapshot);
     state.focus = Focus::SelectAgent { index: 3 };
+    settle_focus(&mut state);
 
     let backend = TestBackend::new(120, 34);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -416,6 +427,7 @@ fn test_mockup_state_03_panel() {
         follow_paused: false,
     };
     state.panel.target = Some(target);
+    settle_focus(&mut state);
 
     let panel_items = vec![
         TranscriptItem {
@@ -494,13 +506,16 @@ fn test_mockup_state_05_bglist() {
         source: ProgressSource::Reported,
         updated_at_ms: 1500,
     };
+    // A running task's rendered duration is `now - started`, so start it
+    // relative to now — a fixed epoch timestamp would grow every run.
+    let now = pacode_types::time::now_ms();
     snapshot.tasks = vec![
         make_task(
             "tsk_1",
             "cargo test --all",
             TaskStatus::Running,
             Some(prog),
-            1500,
+            now - 214_000,
             None,
             0,
         ),
@@ -535,6 +550,7 @@ fn test_mockup_state_05_bglist() {
 
     let mut state = create_state(120, 34, snapshot);
     state.focus = Focus::BgList { index: 0 };
+    settle_focus(&mut state);
 
     let backend = TestBackend::new(120, 34);
     let mut terminal = Terminal::new(backend).unwrap();

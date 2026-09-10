@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 
 use pacode_config::registry::{self, SettingEntry, SettingKind};
 use pacode_render::RenderOptions;
@@ -21,6 +21,7 @@ use pacode_types::{Config, ToastLevel};
 
 use crate::keys::Action;
 use crate::state::{AppState, Focus};
+use crate::ui::overlays::{menu_block, selected_row};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConfigRow {
@@ -125,10 +126,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
 
     frame.render_widget(Clear, area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" Settings ", opts.theme.bold))
-        .border_style(opts.theme.dim);
+    let cv = &state.config_view;
+    let sep = if opts.glyphs.ascii { " . " } else { " · " };
+    let hint = if cv.editing.is_some() {
+        format!(" enter confirm{sep}esc cancel ")
+    } else {
+        let arrows = if opts.glyphs.ascii { "^/v" } else { "↑/↓" };
+        format!(" {arrows} select{sep}enter edit{sep}ctrl+r reset{sep}esc close ")
+    };
+    let block = menu_block("Settings", &hint, opts);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -137,12 +143,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         return;
     }
 
-    let cv = &state.config_view;
     let matching = filter_entries(&cv.query);
     let rows = build_rows(&matching);
 
     let header_rows = 2; // query + blank
-    let footer_rows = 2; // error/more + hints
+    let footer_rows = 1; // error/more line; the key hints sit on the border now
     let viewport_height = (inner.height as usize).saturating_sub(header_rows + footer_rows);
 
     let scroll = adjust_scroll(cv.selected, &rows, viewport_height, cv.scroll_offset);
@@ -172,11 +177,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
             } => {
                 let is_sel = *selectable_index == cv.selected;
                 let pointer = if is_sel { opts.glyphs.pointer } else { " " };
-                let pointer_style = if is_sel {
-                    opts.theme.accent
-                } else {
-                    opts.theme.fg
-                };
 
                 let is_overridden = registry::is_modified(&state.config, entry);
                 let cur_val =
@@ -195,7 +195,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
                 };
 
                 let label_style = if is_sel {
-                    opts.theme.selected_bg.patch(opts.theme.bold)
+                    opts.theme.bold
                 } else {
                     opts.theme.fg
                 };
@@ -207,23 +207,27 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
                 let left_w = 2 + pacode_render::display_width(&label_display);
                 let padding = (inner.width as usize).saturating_sub(left_w + right_w);
 
-                lines.push(Line::from(vec![
-                    Span::styled(pointer, pointer_style),
-                    Span::raw(" "),
+                let line = Line::from(vec![
+                    Span::styled(format!("{pointer} "), opts.theme.accent),
                     Span::styled(label_display, label_style),
                     Span::raw(" ".repeat(padding)),
                     Span::styled(right_str, right_style),
-                ]));
+                ]);
+                if is_sel {
+                    lines.push(selected_row(line, inner.width, opts));
+                } else {
+                    lines.push(line);
+                }
             }
         }
     }
 
-    // Pad until footer
+    // Pad until the notice line so it always sits on the last inner row.
     while lines.len() < (inner.height as usize).saturating_sub(footer_rows) {
         lines.push(Line::default());
     }
 
-    // Notice / more below line
+    // Notice / more below line; the key hints live on the bottom border.
     let displayed_count = rows.len().saturating_sub(scroll).min(viewport_height);
     let hidden_below = rows.len().saturating_sub(scroll + displayed_count);
 
@@ -241,16 +245,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
     } else {
         lines.push(Line::default());
     }
-
-    // Footer hint line
-    let sep = if opts.glyphs.ascii { " . " } else { " · " };
-    let hint = if cv.editing.is_some() {
-        format!("enter confirm{sep}esc cancel")
-    } else {
-        let arrows = if opts.glyphs.ascii { "^/v" } else { "↑/↓" };
-        format!("{arrows} select{sep}enter edit{sep}ctrl+r reset{sep}esc close")
-    };
-    lines.push(Line::from(Span::styled(hint, opts.theme.faint)));
 
     frame.render_widget(Paragraph::new(lines), inner);
 

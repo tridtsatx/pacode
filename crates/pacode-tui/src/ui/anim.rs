@@ -4,14 +4,38 @@
 //! line is rendered as the last line of the dialog area:
 //! `C` moving right over candies, alternating `C`/`c` each frame.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::state::activity::{Phase, displayed_secs, format_activity_secs, thinking_color};
-use pacode_render::{Glyphs, RenderOptions, truncate_to_width};
+use pacode_render::{Glyphs, RenderOptions, Theme, truncate_to_width};
 
 /// Display width of the activity bar, including its brackets.
 const PACMAN_WIDTH: usize = 24;
+
+/// Tick interval for short-lived animations (toast slide/fade, overlay
+/// unfold, welcome cascade): ~14 fps is smooth enough for a sub-200 ms move
+/// and still bounded — the tick stops as soon as the window closes.
+pub const TRANSIENT_TICK_MS: u64 = 70;
+
+/// The dim half of a two-state pulse: `base` halfway to `faint` when both ends
+/// are RGB, else `base` with the terminal's DIM modifier. Two states are
+/// enough for a pulse — a lerp would need frames the tick does not provide.
+pub fn dimmed(base: Style, faint: Style) -> Style {
+    match (base.fg, faint.fg) {
+        (Some(Color::Rgb(r0, g0, b0)), Some(Color::Rgb(r1, g1, b1))) => base.fg(Color::Rgb(
+            ((r0 as u16 + r1 as u16) / 2) as u8,
+            ((g0 as u16 + g1 as u16) / 2) as u8,
+            ((b0 as u16 + b1 as u16) / 2) as u8,
+        )),
+        _ => base.add_modifier(Modifier::DIM),
+    }
+}
+
+/// `base` while the pulse is lit, `dimmed` toward `faint` while it is not.
+pub fn pulse(theme: &Theme, base: Style, lit: bool) -> Style {
+    if lit { base } else { dimmed(base, theme.faint) }
+}
 
 /// Environment variable that decides which activity bar is drawn, named after
 /// the `pacman.conf` option it is a nod to.
@@ -136,7 +160,10 @@ pub fn render_activity_line(
     };
 
     if !phase.shows_pacman() {
-        let tail = format!("{} · {dur_str}", phase.label(elapsed_ms));
+        let tail = format!(
+            "{} · {dur_str}",
+            phase.label(elapsed_ms, frame, &opts.glyphs)
+        );
         let trunc = truncate_to_width(&tail, max_line_width, true);
         return Line::from(Span::styled(trunc, text_style));
     }
@@ -150,7 +177,10 @@ pub fn render_activity_line(
         )]
     };
     let used_w = PACMAN_WIDTH;
-    let tail = format!(" {} · {dur_str}", phase.label(elapsed_ms));
+    let tail = format!(
+        " {} · {dur_str}",
+        phase.label(elapsed_ms, frame, &opts.glyphs)
+    );
     let avail = max_line_width.saturating_sub(used_w);
     spans.push(Span::styled(
         truncate_to_width(&tail, avail, true),
@@ -285,5 +315,44 @@ mod tests {
 
         let f10 = pacman_frame(10, 24, &glyphs);
         assert_eq!(display_width(&f10), 24);
+    }
+
+    #[test]
+    fn thinking_dots_advance_on_the_activity_line() {
+        let opts = RenderOptions::new(80, false);
+        let phase = Phase::Thinking;
+        let text = |frame: u64| {
+            render_activity_line(frame, &opts, &phase, 0, 80)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(text(0).contains("thinking."), "{}", text(0));
+        assert!(text(1).contains("thinking.."), "{}", text(1));
+        assert!(text(2).contains("thinking…"), "{}", text(2));
+        assert!(text(3).contains("thinking."), "{}", text(3));
+    }
+
+    #[test]
+    fn dimmed_goes_halfway_to_faint_on_rgb_and_uses_dim_elsewhere() {
+        let theme = Theme::truecolor();
+        let d = dimmed(theme.green, theme.faint);
+        let Some(Color::Rgb(r, g, b)) = d.fg else {
+            panic!("expected an rgb colour");
+        };
+        // Midpoint of green (0x96,0xb3,0x5d) and faint (0x43,0x46,0x3f).
+        assert_eq!((r, g, b), (0x6c, 0x7c, 0x4e));
+
+        let ansi = Theme::ansi();
+        let d = dimmed(ansi.green, ansi.faint);
+        assert!(d.add_modifier.contains(Modifier::DIM));
+
+        // pulse() is `base` lit, `dimmed` unlit.
+        assert_eq!(pulse(&theme, theme.green, true), theme.green);
+        assert_eq!(
+            pulse(&theme, theme.green, false),
+            dimmed(theme.green, theme.faint)
+        );
     }
 }

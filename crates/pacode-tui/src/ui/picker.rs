@@ -8,6 +8,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use pacode_render::RenderOptions;
 
 use crate::state::{AppState, Focus, Overlay};
+use crate::ui::overlays::selected_row;
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOptions) {
     if area.width == 0 || area.height == 0 {
@@ -152,7 +153,7 @@ fn draw_effort(
     } else {
         "←/→ adjust · enter confirm · esc cancel"
     };
-    lines.push(Line::from(Span::styled(hint, opts.theme.faint)));
+    lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -242,7 +243,7 @@ fn draw_mode(
     } else {
         "←/→ adjust · enter confirm · esc cancel"
     };
-    lines.push(Line::from(Span::styled(hint, opts.theme.faint)));
+    lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -265,8 +266,8 @@ fn draw_model(
 
     // 1: Query input
     lines.push(Line::from(vec![
-        Span::styled("> ", opts.theme.dim),
-        Span::styled(query, opts.theme.fg),
+        Span::styled("> ", opts.theme.accent),
+        Span::styled(query.to_string(), opts.theme.fg),
     ]));
 
     let query_lower = query.to_lowercase();
@@ -283,11 +284,15 @@ fn draw_model(
     let list_height = (area.height as usize).saturating_sub(3).min(8);
 
     if state.models.is_empty() {
-        lines.push(Line::from(Span::styled("  loading…", opts.theme.dim)));
+        lines.push(Line::from(Span::styled("  loading…", opts.theme.faint)));
     } else if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no matching models",
             opts.theme.dim,
+        )));
+        lines.push(Line::from(Span::styled(
+            "  backspace to clear the filter",
+            opts.theme.faint,
         )));
     } else {
         let sel_idx = if filtered.is_empty() {
@@ -304,28 +309,26 @@ fn draw_model(
         for (i, m) in filtered.iter().enumerate().skip(start).take(list_height) {
             let is_sel = i == sel_idx;
             let route_str = m.route.to_string();
-            let disp = format!("{route_str}  {}", m.display_name);
-            let line_text = format!(
-                "{:<width$}",
-                disp,
-                width = (area.width as usize).saturating_sub(2)
-            );
-
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{} ", if is_sel { opts.glyphs.pointer } else { " " }),
+                    opts.theme.accent,
+                ),
+                Span::styled(
+                    route_str,
+                    if is_sel {
+                        opts.theme.bold
+                    } else {
+                        opts.theme.fg
+                    },
+                ),
+                Span::raw("  "),
+                Span::styled(m.display_name.clone(), opts.theme.dim),
+            ]);
             if is_sel {
-                lines.push(Line::from(Span::styled(
-                    format!("▸ {line_text}"),
-                    opts.theme
-                        .selected_bg
-                        .patch(opts.theme.bold)
-                        .patch(opts.theme.accent),
-                )));
+                lines.push(selected_row(line, area.width, opts));
             } else {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(route_str, opts.theme.fg),
-                    Span::raw("  "),
-                    Span::styled(&m.display_name, opts.theme.dim),
-                ]));
+                lines.push(line);
             }
         }
     }
@@ -339,7 +342,7 @@ fn draw_model(
     } else {
         "↑/↓ select · enter confirm · esc cancel"
     };
-    lines.push(Line::from(Span::styled(hint, opts.theme.faint)));
+    lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
 
     frame.render_widget(Paragraph::new(lines), area);
 
@@ -384,25 +387,38 @@ fn draw_question(
         } else {
             " "
         };
-        let mut label = format!("{marker} {}. {}", i + 1, option.label);
-        if option.recommended {
-            label.push_str(" (recommended)");
-        }
-        let style = if is_cursor {
-            opts.theme.bold
+        let marker_style = if is_selected {
+            opts.theme.green
         } else {
-            opts.theme.fg
+            opts.theme.accent
         };
-        lines.push(Line::from(Span::styled(
-            pacode_render::truncate_to_width(&label, width, true),
-            style,
-        )));
+        let mut spans = vec![
+            Span::styled(format!("{marker} "), marker_style),
+            Span::styled(
+                format!("{}. {}", i + 1, option.label),
+                if is_cursor {
+                    opts.theme.bold
+                } else {
+                    opts.theme.fg
+                },
+            ),
+        ];
+        if option.recommended {
+            spans.push(Span::styled(" (recommended)", opts.theme.faint));
+        }
+        let line = Line::from(spans);
+        if is_cursor {
+            lines.push(selected_row(line, width as u16, opts));
+        } else {
+            lines.push(line);
+        }
         if is_cursor && !option.description.is_empty() {
             for dl in pacode_render::wrap_text(&option.description, width.saturating_sub(4)) {
-                lines.push(Line::from(Span::styled(
-                    format!("    {dl}"),
-                    opts.theme.dim,
-                )));
+                lines.push(selected_row(
+                    Line::from(Span::styled(format!("    {dl}"), opts.theme.dim)),
+                    width as u16,
+                    opts,
+                ));
             }
         }
     }
@@ -416,7 +432,7 @@ fn draw_question(
     };
     lines.push(Line::from(Span::styled(
         pacode_render::truncate_to_width(&hint, width, true),
-        opts.theme.faint,
+        opts.theme.dim,
     )));
 
     frame.render_widget(Paragraph::new(lines), area);

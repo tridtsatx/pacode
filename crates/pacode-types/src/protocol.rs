@@ -183,17 +183,53 @@ pub struct McpServerInfo {
     pub prompt_names: Vec<String>,
 }
 
-/// One loaded plugin as shown in the `/plugins` picker.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// One plugin as the `/plugins` picker shows it: loaded into the runtime
+/// (`plugin.toml`), installed from a marketplace (`.pacode-install.json` +
+/// `.claude-plugin/plugin.json`), or both.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub name: String,
     pub version: String,
-    /// `lua` | `wasm`
+    /// `lua` | `wasm`; empty when the plugin is installed but not loaded.
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub tools: Vec<String>,
+    #[serde(default)]
     pub commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True when the plugin is live in the runtime; `kind`/`tools`/`commands`
+    /// only carry data then.
+    #[serde(default)]
+    pub loaded: bool,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub author: String,
+    /// Marketplace the plugin was installed from (`owner/repo`); empty for one
+    /// dropped into the plugins directory by hand.
+    #[serde(default)]
+    pub source: String,
+    /// Install time in ms since the epoch; 0 when not marketplace-installed.
+    #[serde(default)]
+    pub installed_at_ms: u64,
+    /// MCP server names the plugin manifest declares.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    /// Skill directories under `<plugin>/skills/`.
+    #[serde(default)]
+    pub skill_dirs: u32,
+    /// Manifest components pacode does not run (`hooks`, `agents`, `commands`).
+    #[serde(default)]
+    pub unsupported: Vec<String>,
+}
+
+impl PluginInfo {
+    /// Whether a marketplace install record exists, so `x` can uninstall it.
+    pub fn is_installed(&self) -> bool {
+        !self.source.is_empty()
+    }
 }
 
 /// One plugin as the marketplace screen shows it.

@@ -77,6 +77,8 @@ fn test_plugin_command_registration_and_execution() {
         tools: vec![],
         commands: vec!["format_code".into()],
         error: None,
+        loaded: true,
+        ..PluginInfo::default()
     };
     commands::register_plugins(std::slice::from_ref(&plugin));
     state.plugins.push(plugin);

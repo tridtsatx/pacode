@@ -33,10 +33,79 @@ use ratatui::widgets::Paragraph;
 use pacode_render::RenderOptions;
 
 use crate::layout::ScreenLayout;
-use crate::state::{AppState, Focus};
+use crate::state::{AppState, Focus, Overlay};
+
+/// A small key identifying the focus layer, so a draw can tell "a different
+/// popup opened" without matching on payloads. Changing the index inside a
+/// picker keeps the same key, so navigating does not replay the unfold. `pub`
+/// for tests that set `state.focus` directly and mark it already seen.
+pub fn focus_key(focus: &Focus) -> u8 {
+    match focus {
+        Focus::Normal => 0,
+        Focus::SelectAgent { .. } => 1,
+        Focus::Panel { .. } => 2,
+        Focus::BgList { .. } => 3,
+        Focus::Overlay(overlay) => match overlay {
+            Overlay::ModelPicker { .. } => 10,
+            Overlay::EffortPicker { .. } => 11,
+            Overlay::ModePicker { .. } => 12,
+            Overlay::ConfigPicker => 13,
+            Overlay::QuestionPicker { .. } => 14,
+            Overlay::ThemePicker { .. } => 15,
+            Overlay::SessionPicker { .. } => 16,
+            Overlay::Files { .. } => 17,
+            Overlay::McpPicker { .. } => 18,
+            Overlay::PluginsPicker { .. } => 19,
+            Overlay::KeysPicker { .. } => 20,
+            Overlay::Import(_) => 21,
+            Overlay::RailOverlay => 22,
+            Overlay::Help => 23,
+        },
+    }
+}
+
+/// Ease-out cubic height for the unfold: 1 row at elapsed 0, the full `height`
+/// at `OVERLAY_GROW_MS`. Pure, so tests can pin the curve.
+fn eased_height(height: u16, elapsed_ms: u64) -> u16 {
+    if height == 0 || elapsed_ms >= crate::state::OVERLAY_GROW_MS {
+        return height;
+    }
+    let t = elapsed_ms as f32 / crate::state::OVERLAY_GROW_MS as f32;
+    let eased = 1.0 - (1.0 - t).powi(3);
+    ((height as f32) * eased).round().max(1.0) as u16
+}
+
+/// `area` shrunk vertically for the first `OVERLAY_GROW_MS` of an overlay's
+/// life, centred on `area` — an unfold. Purely subtractive: the overlay draws
+/// into the smaller rect and is clipped, so no part of it appears early.
+fn grow_rect(area: Rect, elapsed_ms: u64) -> Rect {
+    let h = eased_height(area.height, elapsed_ms);
+    Rect::new(area.x, area.y + (area.height - h) / 2, area.width, h)
+}
+
+/// The same unfold, anchored to the bottom edge: bottom pickers grow upward
+/// from where the input line was.
+fn grow_rect_bottom(area: Rect, elapsed_ms: u64) -> Rect {
+    let h = eased_height(area.height, elapsed_ms);
+    Rect::new(area.x, area.bottom() - h, area.width, h)
+}
 
 /// Draw the whole screen; returns the layout used (for mouse hit-testing).
 pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
+    let now = std::time::Instant::now();
+    // Age of the session UI: drives the welcome cascade in the header banner.
+    let welcome_ms = now.saturating_duration_since(state.started_at).as_millis() as u64;
+    // Render-side open tracking: a new overlay/picker layer gets `overlay_since`
+    // and unfolds for ~140 ms; anything else clears it.
+    let fkey = focus_key(&state.focus);
+    if fkey != state.last_focus_key {
+        state.last_focus_key = fkey;
+        state.overlay_since = (fkey >= 3).then_some(now);
+    }
+    let grow_ms = state
+        .overlay_since
+        .map(|t| now.saturating_duration_since(t).as_millis() as u64);
+
     // In replace mode a selected subagent takes over the conversation column, so
     // no second column is laid out at all.
     let panel_open = (state.panel.target.is_some() || matches!(state.focus, Focus::Panel { .. }))
@@ -144,6 +213,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 transcript,
                 &dialog_opts,
                 state.anim_frame,
+                welcome_ms,
             );
 
             let anim_line = anim::render_activity_line(
@@ -166,6 +236,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 transcript,
                 &dialog_opts,
                 state.anim_frame,
+                welcome_ms,
             );
         }
 
@@ -211,6 +282,11 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             frame.area().width
         };
         let picker_area = Rect::new(layout.dialog.x, picker_y, picker_w, picker_h);
+        // Bottom pickers unfold upward from the bottom edge for ~140 ms.
+        let picker_area = match grow_ms {
+            Some(ms) => grow_rect_bottom(picker_area, ms),
+            None => picker_area,
+        };
         picker::draw(frame, picker_area, state, &opts);
     } else {
         input::draw(frame, &layout, state, &opts);
@@ -238,7 +314,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     } else {
         frame.area()
     };
-    overlays::draw(frame, dialog_or_full, state, &opts);
+    // Centred overlays unfold for ~140 ms: drawing into the shrinking rect is
+    // all the animation needs — no timer, no interim layout.
+    let overlay_area = match grow_ms.filter(|_| !is_picker) {
+        Some(ms) => grow_rect(dialog_or_full, ms),
+        None => dialog_or_full,
+    };
+    overlays::draw(frame, overlay_area, state, &opts);
 
     let copy_req = state.selection.copy_request;
     let should_copy = match copy_req {
@@ -262,6 +344,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 dialog_area.width,
                 &dialog_opts,
                 anim_frame,
+                welcome_ms,
             )
         } else {
             dialog::plain_lines(
@@ -269,6 +352,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 dialog_area.width,
                 &dialog_opts,
                 anim_frame,
+                welcome_ms,
             )
         };
         let text = extract_selection_text(&lines, &state.selection, dialog_area.width);
@@ -390,4 +474,65 @@ pub(crate) fn extract_selection_text(
         out.push(slice);
     }
     out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eased_height_unfolds_ease_out_to_full() {
+        let h = 20;
+        assert_eq!(eased_height(h, 0), 1, "starts at the 1-row minimum");
+        // Ease-out: well past half the height by mid-window.
+        let mid = eased_height(h, crate::state::OVERLAY_GROW_MS / 2);
+        assert!(mid > h / 2, "mid was {mid}");
+        assert!(mid < h, "mid was {mid}");
+        assert_eq!(eased_height(h, crate::state::OVERLAY_GROW_MS), h);
+        assert_eq!(eased_height(h, crate::state::OVERLAY_GROW_MS * 10), h);
+        assert_eq!(eased_height(0, 0), 0);
+        assert_eq!(eased_height(1, 0), 1);
+        // Monotone non-decreasing.
+        let mut prev = 0;
+        for ms in 0..crate::state::OVERLAY_GROW_MS {
+            let cur = eased_height(h, ms);
+            assert!(cur >= prev, "shrank at {ms}ms");
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn grow_rect_stays_inside_area_and_centres() {
+        let area = Rect::new(10, 5, 40, 24);
+        let grown = grow_rect(area, crate::state::OVERLAY_GROW_MS / 2);
+        assert!(grown.height < area.height);
+        assert!(grown.y >= area.y);
+        assert!(grown.bottom() <= area.bottom());
+        // Centred: equal slack above and below (off by one on odd heights).
+        let top = grown.y - area.y;
+        let bottom = area.bottom() - grown.bottom();
+        assert!((top as i32 - bottom as i32).abs() <= 1);
+        // Bottom-anchored variant keeps the bottom edge.
+        let grown_b = grow_rect_bottom(area, crate::state::OVERLAY_GROW_MS / 2);
+        assert_eq!(grown_b.bottom(), area.bottom());
+    }
+
+    #[test]
+    fn focus_key_distinguishes_layers_not_indexes() {
+        assert_eq!(focus_key(&Focus::Normal), 0);
+        assert_eq!(focus_key(&Focus::SelectAgent { index: 2 }), 1);
+        assert_ne!(
+            focus_key(&Focus::Overlay(Overlay::Help)),
+            focus_key(&Focus::Overlay(Overlay::RailOverlay))
+        );
+        // Index changes inside one picker keep the key — no replayed unfold.
+        assert_eq!(
+            focus_key(&Focus::Overlay(Overlay::EffortPicker { index: 0 })),
+            focus_key(&Focus::Overlay(Overlay::EffortPicker { index: 4 }))
+        );
+        assert_ne!(
+            focus_key(&Focus::Normal),
+            focus_key(&Focus::BgList { index: 0 })
+        );
+    }
 }
