@@ -40,6 +40,12 @@ away costs one wakeup a minute to redraw its countdown, not sixty.
 ## Install
 
 ```sh
+cargo install pacode
+```
+
+Or from source, which is what you want if you intend to change anything:
+
+```sh
 git clone https://github.com/tridtsatx/pacode.git
 cd pacode
 cargo build --release
