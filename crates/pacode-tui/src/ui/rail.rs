@@ -195,23 +195,23 @@ fn draw_agents(
     ]));
 
     let now = now_ms();
-    let main_agent = state.rail.agents.iter().find(|a| a.id.is_main());
-    let main_line = if state.turn_active {
-        let dur_ms = state
-            .turn_started_at
-            .map(|t| {
-                std::time::Instant::now()
-                    .saturating_duration_since(t)
-                    .as_millis() as u64
-            })
-            .or_else(|| main_agent.map(|a| a.duration_ms(now)))
-            .unwrap_or(0);
-        let dur_str = format_duration_ms(dur_ms);
+    // The rail says the same thing as the activity line: whatever the main agent
+    // is really doing, aged from the same phase start, in whole seconds.
+    let main_line = if let Some((phase, _)) = state
+        .phase
+        .as_ref()
+        .filter(|(p, _)| p.shows_pacman() && state.turn_active)
+    {
+        let elapsed = state.phase_elapsed_ms;
+        let dur_str = crate::state::activity::format_activity_secs(
+            crate::state::activity::displayed_secs(elapsed),
+        );
+        let label = phase.label(elapsed);
         Line::from(vec![
             Span::styled(opts.glyphs.main_dot, opts.theme.green),
             Span::raw(" "),
             Span::styled("main  ", opts.theme.bold),
-            Span::styled(format!("thinking · {dur_str}"), opts.theme.faint),
+            Span::styled(format!("{label} · {dur_str}"), opts.theme.faint),
         ])
     } else {
         Line::from(vec![

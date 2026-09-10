@@ -108,9 +108,11 @@ fn test_read_image_data_wayland_success() {
     let res = read_image_data(&runner, ClipboardPlatform::Linux);
     assert_eq!(res, ClipboardImageResult::Image(fake_png));
 
+    // One type listing plus the read itself.
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, "wl-paste");
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|c| c.0 == "wl-paste"));
+    assert_eq!(calls[0].1, vec!["--list-types".to_string()]);
 }
 
 #[test]
@@ -150,10 +152,13 @@ fn test_read_image_data_wayland_fallback_to_x11_on_failure() {
     let res = read_image_data(&runner, ClipboardPlatform::Linux);
     assert_eq!(res, ClipboardImageResult::Image(fake_png));
 
+    // Type listing + failed read on wl-paste, then listing + read on xclip.
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 4);
     assert_eq!(calls[0].0, "wl-paste");
-    assert_eq!(calls[1].0, "xclip");
+    assert_eq!(calls[1].0, "wl-paste");
+    assert_eq!(calls[2].0, "xclip");
+    assert_eq!(calls[3].0, "xclip");
 }
 
 #[test]
@@ -240,4 +245,103 @@ fn test_pasted_images_size_cap_rejected() {
     let large_bytes = vec![0u8; IMAGE_PASTE_MAX_BYTES + 1];
     let res = manager.create_image_file(&large_bytes);
     assert!(res.is_err());
+}
+
+fn wl_runner() -> MockCommandRunner {
+    let mut runner = MockCommandRunner::new();
+    runner.available.insert("wl-paste".to_string());
+    runner
+}
+
+fn key(binary: &str, args: &[&str]) -> (String, Vec<String>) {
+    (
+        binary.to_string(),
+        args.iter().map(|s| s.to_string()).collect(),
+    )
+}
+
+#[test]
+fn test_image_read_requests_a_jpeg_when_png_is_not_offered() {
+    let mut runner = wl_runner();
+    runner.responses.insert(
+        key("wl-paste", &["--list-types"]),
+        Ok(b"text/html\nimage/jpeg\n".to_vec()),
+    );
+    runner.responses.insert(
+        key("wl-paste", &["--type", "image/jpeg", "--no-newline"]),
+        Ok(vec![0xFF, 0xD8, 0xFF]),
+    );
+
+    let result = read_image_data(&runner, ClipboardPlatform::Linux);
+    assert_eq!(result, ClipboardImageResult::Image(vec![0xFF, 0xD8, 0xFF]));
+}
+
+#[test]
+fn test_image_read_prefers_png_when_several_types_are_offered() {
+    let mut runner = wl_runner();
+    runner.responses.insert(
+        key("wl-paste", &["--list-types"]),
+        Ok(b"image/webp\nimage/png\nimage/jpeg\n".to_vec()),
+    );
+    runner.responses.insert(
+        key("wl-paste", &["--type", "image/png", "--no-newline"]),
+        Ok(vec![0x89, 0x50]),
+    );
+
+    assert_eq!(
+        read_image_data(&runner, ClipboardPlatform::Linux),
+        ClipboardImageResult::Image(vec![0x89, 0x50])
+    );
+}
+
+#[test]
+fn test_image_read_falls_back_to_png_when_the_listing_fails() {
+    let mut runner = wl_runner();
+    runner.responses.insert(
+        key("wl-paste", &["--type", "image/png", "--no-newline"]),
+        Ok(vec![0x89]),
+    );
+
+    assert_eq!(
+        read_image_data(&runner, ClipboardPlatform::Linux),
+        ClipboardImageResult::Image(vec![0x89])
+    );
+}
+
+#[test]
+fn test_text_read_returns_clipboard_text() {
+    let mut runner = wl_runner();
+    runner.responses.insert(
+        key("wl-paste", &["--no-newline", "--type", "text/plain"]),
+        Ok(b"hello".to_vec()),
+    );
+
+    assert_eq!(
+        read_text_data(&runner, ClipboardPlatform::Linux),
+        Some("hello".to_string())
+    );
+}
+
+#[test]
+fn test_text_read_reports_nothing_for_empty_or_missing_clipboard() {
+    let mut runner = wl_runner();
+    runner.responses.insert(
+        key("wl-paste", &["--no-newline", "--type", "text/plain"]),
+        Ok(Vec::new()),
+    );
+    assert_eq!(read_text_data(&runner, ClipboardPlatform::Linux), None);
+
+    let bare = MockCommandRunner::new();
+    assert_eq!(read_text_data(&bare, ClipboardPlatform::Linux), None);
+    assert_eq!(read_text_data(&bare, ClipboardPlatform::Other), None);
+}
+
+#[test]
+fn test_text_read_rejects_non_utf8() {
+    let mut runner = wl_runner();
+    runner.responses.insert(
+        key("wl-paste", &["--no-newline", "--type", "text/plain"]),
+        Ok(vec![0xFF, 0xFE, 0x00]),
+    );
+    assert_eq!(read_text_data(&runner, ClipboardPlatform::Linux), None);
 }

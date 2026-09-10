@@ -128,6 +128,10 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
         }
 
+        // Refresh the activity phase before drawing, so the draw path reads state
+        // only and the displayed duration never depends on when a redraw happened.
+        state.tick_phase(Instant::now());
+
         // Redraw if dirty and frame interval elapsed
         let now = Instant::now();
         let can_draw = match frame_interval {
@@ -174,10 +178,16 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
         };
 
-        let needs_second = state.needs_second_tick();
+        // The second tick is armed to the next boundary of the displayed clock, not
+        // to a full second from now. Every other timer in this select! cancels and
+        // re-creates this future; measuring from `now` meant a plain 1 s sleep was
+        // restarted by each animation frame and never fired, so the duration only
+        // moved on unrelated redraws and read 0.1 -> 0.3 -> 0.5 instead of ticking.
+        let needs_second = state.needs_second_tick() || state.phase.is_some();
+        let next_boundary_ms = crate::state::activity::ms_to_next_second(state.phase_elapsed_ms);
         let second_sleep = async {
             if needs_second {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(next_boundary_ms)).await;
             } else {
                 std::future::pending::<()>().await;
             }
@@ -285,6 +295,8 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                 if state.rail.update_idle(state.turn_active, now) {
                     state.dirty = true;
                 }
+                // Marks the frame dirty itself when the whole-second reading changed.
+                state.tick_phase(now);
             }
             _ = anim_sleep => {
                 state.anim_frame = state.anim_frame.wrapping_add(1);

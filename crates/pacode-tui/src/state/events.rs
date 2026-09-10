@@ -21,6 +21,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             }
             let header = crate::state::transcript::HeaderInfo {
                 version: state.app_version.clone(),
+                day: crate::ui::phrases::day_index(pacode_types::time::now_ms()),
                 mascot: state.mascot,
                 truecolor: state.truecolor,
             };

@@ -132,6 +132,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return crate::paste::handle_paste_image(state, true, now);
     }
 
+    // ctrl+v / ctrl+shift+v: image when the clipboard holds one, otherwise text.
+    // Terminals that translate ctrl+shift+v into a bracketed paste never reach this,
+    // and that path already handles both cases.
+    if action == Some(KeyAction::PasteClipboard) {
+        return crate::paste::handle_paste_clipboard(state, now);
+    }
+
     // 2. Session picker via ctrl+p
     if action == Some(KeyAction::SessionPicker) {
         log::debug!("open overlay: SessionPicker");

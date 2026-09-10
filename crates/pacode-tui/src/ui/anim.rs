@@ -4,10 +4,14 @@
 //! line is rendered as the last line of the dialog area:
 //! `C` moving right over candies, alternating `C`/`c` each frame.
 
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 
-use pacode_render::{Glyphs, RenderOptions, display_width, truncate_to_width};
-use pacode_types::time::format_duration_ms;
+use pacode_render::{Glyphs, RenderOptions, truncate_to_width};
+use crate::state::activity::{Phase, displayed_secs, format_activity_secs, thinking_color};
+
+/// Display width of the pacman bar, including its brackets.
+const PACMAN_WIDTH: usize = 24;
 
 /// Pure function generating the pacman progress bar frame.
 ///
@@ -70,15 +74,49 @@ pub fn pacman_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
     out
 }
 
-/// Renders the animated status line: styled pacman (width 24) followed by activity and duration.
-pub fn render_pacman_line(
+/// Renders the activity line for `phase`.
+///
+/// The pacman bar is drawn only while the model itself is working; waiting on a
+/// subagent or a background task gets a plain line. The duration is whole seconds,
+/// so a redraw between ticks shows the same value as the tick before it.
+pub fn render_activity_line(
     frame: u64,
-    width: usize,
     opts: &RenderOptions,
-    activity: &str,
+    phase: &Phase,
     elapsed_ms: u64,
     max_line_width: usize,
 ) -> Line<'static> {
+    let secs = displayed_secs(elapsed_ms);
+    let dur_str = format_activity_secs(secs);
+    let text_style = match phase {
+        Phase::Thinking => {
+            let from = opts.theme.fg.fg.unwrap_or(Color::White);
+            let to = opts.theme.yellow.fg.unwrap_or(Color::Yellow);
+            opts.theme.fg.fg(thinking_color(elapsed_ms, from, to))
+        }
+        Phase::Responding | Phase::Tool(_) => opts.theme.fg,
+        Phase::WaitingAgent(_) | Phase::WaitingTask(_) => opts.theme.faint,
+    };
+
+    if !phase.shows_pacman() {
+        let tail = format!("{} · {dur_str}", phase.label(elapsed_ms));
+        let trunc = truncate_to_width(&tail, max_line_width, true);
+        return Line::from(Span::styled(trunc, text_style));
+    }
+
+    let mut spans = pacman_spans(frame, PACMAN_WIDTH, opts);
+    let used_w = PACMAN_WIDTH;
+    let tail = format!(" {} · {dur_str}", phase.label(elapsed_ms));
+    let avail = max_line_width.saturating_sub(used_w);
+    spans.push(Span::styled(
+        truncate_to_width(&tail, avail, true),
+        text_style,
+    ));
+    Line::from(spans)
+}
+
+/// Styled pacman bar of `width` cells: eaten track dim, pacman yellow, candies plain.
+fn pacman_spans(frame: u64, width: usize, opts: &RenderOptions) -> Vec<Span<'static>> {
     let raw = pacman_frame(frame, width, &opts.glyphs);
     let candy_sym = if opts.glyphs.ascii { 'o' } else { '•' };
 
@@ -103,16 +141,7 @@ pub fn render_pacman_line(
     if !buf.is_empty() {
         spans.push(Span::styled(buf, opts.theme.dim));
     }
-
-    // Append activity and duration
-    let dur_str = format_duration_ms(elapsed_ms);
-    let tail = format!(" {activity} · {dur_str}");
-    let used_w = display_width(&raw);
-    let avail = max_line_width.saturating_sub(used_w);
-    let trunc_tail = truncate_to_width(&tail, avail, true);
-
-    spans.push(Span::styled(trunc_tail, opts.theme.fg));
-    Line::from(spans)
+    spans
 }
 
 /// Dynamic animation frame interval based on stream backlog and draining phase.
@@ -132,6 +161,7 @@ pub fn pacman_interval_ms(backlog_chars: usize, draining: bool) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pacode_render::display_width;
 
     #[test]
     fn test_pacman_interval_ms() {

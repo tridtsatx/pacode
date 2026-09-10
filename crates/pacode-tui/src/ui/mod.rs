@@ -16,6 +16,7 @@ pub mod mascot;
 pub mod mcp;
 pub mod overlays;
 pub mod panel;
+pub mod phrases;
 pub mod picker;
 pub mod plugins;
 pub mod popup;
@@ -30,11 +31,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use pacode_render::RenderOptions;
-use pacode_types::TranscriptKind;
-use pacode_types::transcript::ToolStatus;
 
 use crate::layout::ScreenLayout;
-use crate::state::transcript::CellKind;
 use crate::state::{AppState, Focus};
 
 /// Draw the whole screen; returns the layout used (for mouse hit-testing).
@@ -86,7 +84,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             state.theme.clone(),
         )
         .thinking(state.config.ui.thinking);
-        if state.turn_active && dialog_area.height > 1 {
+        // The activity line is drawn whenever there is something to report, which
+        // includes waiting on a subagent or a background task with the turn over.
+        let phase = state.phase.as_ref().map(|(p, _)| p.clone());
+        if let Some(phase) = phase.filter(|_| dialog_area.height > 1) {
             let trans_h = dialog_area.height - 1;
             let trans_area = Rect::new(dialog_area.x, dialog_area.y, dialog_area.width, trans_h);
             let anim_area = Rect::new(
@@ -103,37 +104,11 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 state.anim_frame,
             );
 
-            let running_tool = state.transcript.cells.iter().rev().find_map(|c| {
-                if let CellKind::Item(TranscriptKind::ToolCall {
-                    status: ToolStatus::Running,
-                    title,
-                    ..
-                }) = &c.kind
-                {
-                    Some(title.clone())
-                } else {
-                    None
-                }
-            });
-            let activity = running_tool.unwrap_or_else(|| "thinking…".to_string());
-            let elapsed_ms = state
-                .turn_started_at
-                .map(|t| {
-                    std::time::Instant::now()
-                        .saturating_duration_since(t)
-                        .as_millis() as u64
-                })
-                .or_else(|| {
-                    let main_agent = state.rail.agents.iter().find(|a| a.id.is_main());
-                    main_agent.map(|a| a.duration_ms(pacode_types::time::now_ms()))
-                })
-                .unwrap_or(0);
-            let anim_line = anim::render_pacman_line(
+            let anim_line = anim::render_activity_line(
                 state.anim_frame,
-                24,
                 &dialog_opts,
-                &activity,
-                elapsed_ms,
+                &phase,
+                state.phase_elapsed_ms,
                 dialog_area.width as usize,
             );
             frame.render_widget(Paragraph::new(anim_line), anim_area);

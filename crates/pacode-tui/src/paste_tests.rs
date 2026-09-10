@@ -308,3 +308,85 @@ fn test_vim_mode_paste_normal_insert_visual() {
     assert_eq!(state.vim.mode, VimMode::Normal);
     assert_eq!(state.vim.visual_anchor, None);
 }
+
+fn paste_key(binary: &str, args: &[&str]) -> (String, Vec<String>) {
+    (
+        binary.to_string(),
+        args.iter().map(|s| s.to_string()).collect(),
+    )
+}
+
+#[test]
+fn test_ctrl_v_pastes_clipboard_text_when_there_is_no_image() {
+    let mut state = make_state();
+    let mut runner = MockCommandRunner::new();
+    runner.available.insert("wl-paste".to_string());
+    runner.responses.insert(
+        paste_key("wl-paste", &["--no-newline", "--type", "text/plain"]),
+        Ok(b"from clipboard".to_vec()),
+    );
+
+    let actions = handle_paste_clipboard_with_runner(
+        &mut state,
+        &runner,
+        ClipboardPlatform::Linux,
+        Instant::now(),
+    );
+
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "from clipboard");
+}
+
+#[test]
+fn test_ctrl_v_prefers_an_image_over_text() {
+    let tmp = TempDir::new().expect("tempdir");
+    let mut state = make_state();
+    state.pasted_images = PastedImages::new_in(tmp.path().to_path_buf());
+
+    let mut runner = MockCommandRunner::new();
+    runner.available.insert("wl-paste".to_string());
+    runner.responses.insert(
+        paste_key("wl-paste", &["--list-types"]),
+        Ok(b"image/png\n".to_vec()),
+    );
+    runner.responses.insert(
+        paste_key("wl-paste", &["--type", "image/png", "--no-newline"]),
+        Ok(vec![0x89, 0x50, 0x4E, 0x47]),
+    );
+    runner.responses.insert(
+        paste_key("wl-paste", &["--no-newline", "--type", "text/plain"]),
+        Ok(b"text too".to_vec()),
+    );
+
+    handle_paste_clipboard_with_runner(
+        &mut state,
+        &runner,
+        ClipboardPlatform::Linux,
+        Instant::now(),
+    );
+
+    assert!(
+        state.input.text.starts_with('@'),
+        "got {}",
+        state.input.text
+    );
+    assert!(!state.input.text.contains("text too"));
+}
+
+#[test]
+fn test_ctrl_v_on_an_empty_clipboard_reports_and_inserts_nothing() {
+    let mut state = make_state();
+    let runner = MockCommandRunner::new();
+
+    let actions = handle_paste_clipboard_with_runner(
+        &mut state,
+        &runner,
+        ClipboardPlatform::Linux,
+        Instant::now(),
+    );
+
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "");
+    assert_eq!(state.toasts.len(), 1);
+    assert_eq!(state.toasts[0].level, ToastLevel::Info);
+}

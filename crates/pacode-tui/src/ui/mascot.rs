@@ -53,6 +53,23 @@ const PACMAN: &[&str] = &[
     "    ######    ",
 ];
 
+/// Mouth-closed Pac-Man: the same circle with the wedge filled in. Alternating it
+/// with `PACMAN` is the chomp. Row widths stay identical so the block never moves.
+const PACMAN_CLOSED: &[&str] = &[
+    "    ######    ",
+    "  ##########  ",
+    " ######kk#### ",
+    "#######kk#####",
+    "##############",
+    "##############",
+    "##############",
+    "##############",
+    "##############",
+    " ############ ",
+    "  ##########  ",
+    "    ######    ",
+];
+
 const GHOST: &[&str] = &[
     "    ######    ",
     "  ##########  ",
@@ -67,6 +84,25 @@ const GHOST: &[&str] = &[
     "##..##..##..##",
     "##..##..##..##",
 ];
+
+/// The ghost with its skirt shifted one pixel: the tentacles wave.
+const GHOST_ALT: &[&str] = &[
+    "    ######    ",
+    "  ##########  ",
+    " ############ ",
+    "##wwww##wwww##",
+    "##wbbw##wbbw##",
+    "##wbbw##wbbw##",
+    "##wwww##wwww##",
+    "##############",
+    "##############",
+    "##############",
+    "#..##..##..###",
+    "#..##..##..###",
+];
+
+/// Number of animation frames every mascot has.
+pub const FRAMES: u64 = 2;
 
 /// Which mascot the session shows. Picked once per run so the banner is stable
 /// within a session and deterministic in tests.
@@ -92,26 +128,28 @@ impl MascotKind {
         Self::ALL[rand::random_range(0..Self::ALL.len())]
     }
 
-    fn sprite(self) -> Sprite {
+    fn sprite(self, frame: u64) -> Sprite {
+        let second = !frame.is_multiple_of(2);
+        let ghost = if second { GHOST_ALT } else { GHOST };
         match self {
             MascotKind::Pacman => Sprite {
-                pixels: PACMAN,
+                pixels: if second { PACMAN_CLOSED } else { PACMAN },
                 body: PACMAN_YELLOW,
             },
             MascotKind::Blinky => Sprite {
-                pixels: GHOST,
+                pixels: ghost,
                 body: BLINKY_RED,
             },
             MascotKind::Inky => Sprite {
-                pixels: GHOST,
+                pixels: ghost,
                 body: INKY_CYAN,
             },
             MascotKind::Clyde => Sprite {
-                pixels: GHOST,
+                pixels: ghost,
                 body: CLYDE_ORANGE,
             },
             MascotKind::Pinky => Sprite {
-                pixels: GHOST,
+                pixels: ghost,
                 body: PINKY_PINK,
             },
         }
@@ -143,9 +181,19 @@ fn pixel_color(ch: char, body: (u8, u8, u8), truecolor: bool) -> Option<Color> {
     Some(color(rgb, truecolor))
 }
 
-/// Render `kind` into `HEIGHT` lines of `WIDTH` columns.
+/// Render `kind` into `HEIGHT` lines of `WIDTH` columns, at rest.
 pub fn render(kind: MascotKind, truecolor: bool) -> Vec<Line<'static>> {
-    render_sprite(&kind.sprite(), truecolor)
+    render_frame(kind, 0, truecolor)
+}
+
+/// Render animation frame `frame` of `kind`.
+///
+/// The frames are static data of identical width and height, and nothing here
+/// arms a timer: the caller passes the animation counter that already advances
+/// for other reasons, so an idle session keeps drawing the same frame and costs
+/// nothing.
+pub fn render_frame(kind: MascotKind, frame: u64, truecolor: bool) -> Vec<Line<'static>> {
+    render_sprite(&kind.sprite(frame % FRAMES), truecolor)
 }
 
 fn render_sprite(sprite: &Sprite, truecolor: bool) -> Vec<Line<'static>> {
@@ -179,11 +227,21 @@ fn render_sprite(sprite: &Sprite, truecolor: bool) -> Vec<Line<'static>> {
 
 /// ASCII fallback used when the terminal is restricted to ASCII glyphs.
 pub fn render_ascii(truecolor: bool) -> Vec<Line<'static>> {
+    render_ascii_frame(0, truecolor)
+}
+
+/// ASCII fallback, animated: the mouth opens and closes on the same two frames.
+pub fn render_ascii_frame(frame: u64, truecolor: bool) -> Vec<Line<'static>> {
     let yellow = Style::default().fg(color(PACMAN_YELLOW, truecolor));
+    let (mouth_top, mouth_bottom) = if frame.is_multiple_of(2) {
+        ("\\    <", " '--'")
+    } else {
+        ("\\    |", " '--\'")
+    };
     vec![
         Line::from(Span::styled(" .--.", yellow)),
         Line::from(Span::styled("/ o  \\", yellow)),
-        Line::from(Span::styled("\\    <", yellow)),
-        Line::from(Span::styled(" '--'", yellow)),
+        Line::from(Span::styled(mouth_top, yellow)),
+        Line::from(Span::styled(mouth_bottom, yellow)),
     ]
 }

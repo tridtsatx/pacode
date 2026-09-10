@@ -42,7 +42,7 @@ pub fn draw(
     // The header banner lives outside `cells` so a transcript seq can never
     // collide with it; it is always the first block of lines.
     if let Some(info) = transcript.header.clone() {
-        cell_lines.push(crate::ui::header::render(&info, width, opts));
+        cell_lines.push(crate::ui::header::render(&info, width, opts, anim_frame));
     }
 
     for (id, version, kind, stats) in &cell_snapshots {

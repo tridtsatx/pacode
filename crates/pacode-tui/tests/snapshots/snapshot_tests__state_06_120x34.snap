@@ -4,8 +4,8 @@ expression: view
 ---
 "  ▄▄▀▀▀▀▀▀▄▄                                                                           │Refactor TUI layout             "
 "▄▀▀▀▀▀▀▀▀▀▀▀▀                                                                          │ses_abcdef123                   "
-"▀▀▀▀▀▀▀▀▀▀       pacode v0.1.0-dev                                                     │                                "
-"▀▀▀▀▀▀▀▀▀▄                                                                             │PLAN                   1/4 · 40%"
+"▀▀▀▀▀▀▀▀▀▀       pacode v0.1.0-dev                      eat the dots, dodge the ghosts │                                "
+"▀▀▀▀▀▀▀▀▀▄       made by tridtsat                                                      │PLAN                   1/4 · 40%"
 "▀▀▀▀▀▀▀▀▀▀▀▀▄                                                                          │[✓] Read codebase & analyze arc…"
 "  ▀▀▀▀▀▀▀▀▀▀                                                                           │[•] Implement TUI layout & widg…"
 "                                                                                       │    ▰▰▰▰▰▱▱▱ 60%                "

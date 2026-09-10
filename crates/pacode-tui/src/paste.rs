@@ -6,6 +6,7 @@ use pacode_types::ToastLevel;
 
 use crate::clipboard_read::{
     ClipboardImageResult, ClipboardPlatform, CommandRunner, SystemCommandRunner, read_image_data,
+    read_text_data,
 };
 use crate::keys::Action;
 use crate::state::input::char_to_byte_index;
@@ -22,6 +23,41 @@ pub const PASTE_MAX_CHARS: usize = 65_536;
 
 /// Maximum length for a filter box query pasted from clipboard.
 pub const FILTER_MAX_CHARS: usize = 512;
+
+/// Handles `ctrl+v` / `ctrl+shift+v`: an image from the clipboard when there is one,
+/// otherwise the clipboard text, read through the same helper programs.
+pub fn handle_paste_clipboard(state: &mut AppState, now: Instant) -> Vec<Action> {
+    handle_paste_clipboard_with_runner(
+        state,
+        &SystemCommandRunner,
+        ClipboardPlatform::current(),
+        now,
+    )
+}
+
+/// `handle_paste_clipboard` with an injectable command runner for tests.
+pub fn handle_paste_clipboard_with_runner(
+    state: &mut AppState,
+    runner: &dyn CommandRunner,
+    platform: ClipboardPlatform,
+    now: Instant,
+) -> Vec<Action> {
+    if let ClipboardImageResult::Image(_) = read_image_data(runner, platform) {
+        return handle_paste_image_with_runner(state, true, runner, platform, now);
+    }
+    match read_text_data(runner, platform) {
+        Some(text) => handle_paste_with_runner(state, text, runner, platform, now),
+        None => {
+            state.push_toast(
+                ToastLevel::Info,
+                "Clipboard is empty".to_string(),
+                None,
+                now,
+            );
+            vec![]
+        }
+    }
+}
 
 /// Handles a bracketed paste event from the terminal.
 pub fn handle_paste(state: &mut AppState, text: String, now: Instant) -> Vec<Action> {

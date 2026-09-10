@@ -1,6 +1,7 @@
 //! All mutable UI state. Widgets read it; `app` and `keys` mutate it; `apply_event`
 //! folds daemon events in. Nothing here touches the terminal.
 
+pub mod activity;
 pub mod events;
 pub mod files;
 pub mod input;
@@ -19,7 +20,7 @@ use pacode_client::ClientEvent;
 use pacode_types::time::now_ms;
 use pacode_types::{
     AgentId, Config, Effort, Event, McpServerInfo, Mode, ModelInfo, ModelRoute, PluginInfo,
-    SessionMeta, TaskId, ToastLevel, TranscriptKind,
+    SessionMeta, TaskId, ToastLevel, ToolStatus, TranscriptKind,
 };
 
 pub use files::FilesState;
@@ -193,6 +194,13 @@ pub struct AppState {
     pub running_bash: Option<tokio::sync::oneshot::Sender<()>>,
     /// Temporary files created for pasted images.
     pub pasted_images: crate::clipboard_read::PastedImages,
+    /// Current activity phase and when it started. The activity line ages from
+    /// this instant, so the thinking wording and its colour reset after every
+    /// tool call instead of drifting with the whole turn.
+    pub phase: Option<(crate::state::activity::Phase, Instant)>,
+    /// Age of `phase`, refreshed by the event loop before each draw so the draw
+    /// path stays a pure function of state.
+    pub phase_elapsed_ms: u64,
 }
 
 /// What the panel shows.
@@ -262,7 +270,97 @@ impl AppState {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             running_bash: None,
             pasted_images: crate::clipboard_read::PastedImages::new(),
+            phase: None,
+            phase_elapsed_ms: 0,
         }
+    }
+
+    /// The phase the session is in right now, from what the transcript and the rail
+    /// show. Pure: it reads state only, never the clock.
+    pub fn current_phase(&self) -> Option<crate::state::activity::Phase> {
+        use crate::state::activity::Phase;
+
+        if self.turn_active {
+            // A tool that is executing wins: that is what the session is doing,
+            // whatever the model streamed before starting it.
+            if let Some(title) = self
+                .transcript
+                .cells
+                .iter()
+                .rev()
+                .find_map(|c| match &c.kind {
+                    CellKind::Item(TranscriptKind::ToolCall {
+                        status: ToolStatus::Running,
+                        title,
+                        ..
+                    }) => Some(title.clone()),
+                    _ => None,
+                })
+            {
+                return Some(Phase::Tool(title));
+            }
+            // Answer text already arriving (or still draining) is responding, not thinking.
+            let responding = self.transcript.has_backlog()
+                || self
+                    .transcript
+                    .cells
+                    .iter()
+                    .rev()
+                    .find_map(|c| match &c.kind {
+                        CellKind::Item(TranscriptKind::Assistant { complete, .. }) => {
+                            Some(!complete)
+                        }
+                        CellKind::Item(TranscriptKind::Reasoning { .. }) => Some(false),
+                        CellKind::Item(TranscriptKind::ToolCall { .. }) => Some(false),
+                        _ => None,
+                    })
+                    == Some(true);
+            return Some(if responding {
+                Phase::Responding
+            } else {
+                Phase::Thinking
+            });
+        }
+
+        // The main agent is idle: the session may still be waiting on someone else.
+        if let Some(agent) = self.rail.live_agents().next() {
+            return Some(Phase::WaitingAgent(agent.name.clone()));
+        }
+        let running = self.rail.running_task_count();
+        if running > 0 {
+            return Some(Phase::WaitingTask(running));
+        }
+        None
+    }
+
+    /// Recompute the phase and keep its start instant across redraws. Returns the
+    /// phase with the milliseconds it has been running.
+    pub fn tick_phase(&mut self, now: Instant) -> Option<(crate::state::activity::Phase, u64)> {
+        let current = self.current_phase();
+        let out = match (&current, &self.phase) {
+            (Some(new), Some((old, since))) if new == old => {
+                let elapsed = now.saturating_duration_since(*since).as_millis() as u64;
+                Some((old.clone(), elapsed))
+            }
+            (Some(new), _) => {
+                self.phase = Some((new.clone(), now));
+                Some((new.clone(), 0))
+            }
+            (None, _) => {
+                self.phase = None;
+                None
+            }
+        };
+        let elapsed = out.as_ref().map(|(_, ms)| *ms).unwrap_or(0);
+        // A redraw between ticks must not change the reading, so only whole
+        // seconds are kept; the sub-second remainder only paces the next tick.
+        if crate::state::activity::displayed_secs(elapsed)
+            != crate::state::activity::displayed_secs(self.phase_elapsed_ms)
+        {
+            self.dirty = true;
+        }
+        self.phase_elapsed_ms = elapsed;
+        out
     }
 
     pub fn is_running_bash(&self) -> bool {
@@ -306,6 +404,7 @@ impl AppState {
                     .reset(snapshot.transcript.clone(), snapshot.has_more_history);
                 let header = crate::state::transcript::HeaderInfo {
                     version: self.app_version.clone(),
+                    day: crate::ui::phrases::day_index(pacode_types::time::now_ms()),
                     mascot: self.mascot,
                     truecolor: self.truecolor,
                 };

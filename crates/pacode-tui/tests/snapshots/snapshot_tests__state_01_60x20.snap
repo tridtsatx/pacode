@@ -4,7 +4,7 @@ expression: view
 ---
 "▄▀▀▀▀▀▀▀▀▀▀▀▀                                               "
 "▀▀▀▀▀▀▀▀▀▀       pacode v0.1.0-dev                          "
-"▀▀▀▀▀▀▀▀▀▄                                                  "
+"▀▀▀▀▀▀▀▀▀▄       made by tridtsat                           "
 "▀▀▀▀▀▀▀▀▀▀▀▀▄                                               "
 "  ▀▀▀▀▀▀▀▀▀▀                                                "
 "                                                            "
@@ -16,7 +16,7 @@ expression: view
 "▣ Read_file crates/pacode-tui/src/layout.rs ok 120ms        "
 "  │ pub fn compute(area: Rect) -> ScreenLayout...           "
 "                                                            "
-"[  C • • • • • • • • • ] thinking… · 400ms                  "
+"[  C • • • • • • • • • ] thinking… · 0s                     "
 "────────────────────────────────────────────────────────────"
 "❯                                                           "
 "────────────────────────────────────────────────────────────"

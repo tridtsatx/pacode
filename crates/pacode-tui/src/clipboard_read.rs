@@ -146,14 +146,12 @@ pub fn read_image_data(
         Err(msg) => return ClipboardImageResult::HelperMissing(msg),
     };
 
+    let mime = clipboard_image_mime(runner, helper);
     let result = match helper {
-        ClipboardHelper::WlPaste => {
-            runner.run("wl-paste", &["--type", "image/png", "--no-newline"])
+        ClipboardHelper::WlPaste => runner.run("wl-paste", &["--type", &mime, "--no-newline"]),
+        ClipboardHelper::Xclip => {
+            runner.run("xclip", &["-selection", "clipboard", "-t", &mime, "-o"])
         }
-        ClipboardHelper::Xclip => runner.run(
-            "xclip",
-            &["-selection", "clipboard", "-t", "image/png", "-o"],
-        ),
         ClipboardHelper::Pngpaste => runner.run("pngpaste", &["-"]),
     };
 
@@ -170,15 +168,73 @@ pub fn read_image_data(
             // fall back to xclip if present.
             if helper == ClipboardHelper::WlPaste
                 && runner.which("xclip")
-                && let Ok(bytes) = runner.run(
-                    "xclip",
-                    &["-selection", "clipboard", "-t", "image/png", "-o"],
-                )
+                && let Ok(bytes) = {
+                    let mime = clipboard_image_mime(runner, ClipboardHelper::Xclip);
+                    runner.run("xclip", &["-selection", "clipboard", "-t", &mime, "-o"])
+                }
                 && !bytes.is_empty()
             {
                 return ClipboardImageResult::Image(bytes);
             }
             ClipboardImageResult::NoImage
+        }
+    }
+}
+
+/// Image MIME type to request from the clipboard.
+///
+/// The clipboard offers a list of types; screenshots are usually `image/png`, but a
+/// browser copy can offer only `image/jpeg`, `image/webp` or `image/gif`. Asking for
+/// `image/png` unconditionally is why such a copy read back as "no image". The listing
+/// is advisory: when it cannot be obtained, `image/png` stays the request.
+fn clipboard_image_mime(runner: &dyn CommandRunner, helper: ClipboardHelper) -> String {
+    const DEFAULT_MIME: &str = "image/png";
+    let listing = match helper {
+        ClipboardHelper::WlPaste => runner.run("wl-paste", &["--list-types"]),
+        ClipboardHelper::Xclip => {
+            runner.run("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        }
+        ClipboardHelper::Pngpaste => return DEFAULT_MIME.to_string(),
+    };
+    let Ok(bytes) = listing else {
+        return DEFAULT_MIME.to_string();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut offered: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|t| t.starts_with("image/"))
+        .collect();
+    if offered.is_empty() {
+        return DEFAULT_MIME.to_string();
+    }
+    // PNG first when offered: it is lossless and the format the rest of the pipeline expects.
+    offered.sort_by_key(|t| if *t == DEFAULT_MIME { 0 } else { 1 });
+    offered[0].to_string()
+}
+
+/// Reads UTF-8 text from the system clipboard, for terminals that do not deliver a
+/// bracketed paste on `ctrl+v`. `None` means no helper, no text, or non-UTF-8 content.
+pub fn read_text_data(runner: &dyn CommandRunner, platform: ClipboardPlatform) -> Option<String> {
+    let result = match platform {
+        ClipboardPlatform::Linux => {
+            if runner.which("wl-paste") {
+                runner.run("wl-paste", &["--no-newline", "--type", "text/plain"])
+            } else if runner.which("xclip") {
+                runner.run("xclip", &["-selection", "clipboard", "-o"])
+            } else {
+                return None;
+            }
+        }
+        ClipboardPlatform::MacOs => runner.run("pbpaste", &[]),
+        ClipboardPlatform::Other => return None,
+    };
+    match result {
+        Ok(bytes) if !bytes.is_empty() => String::from_utf8(bytes).ok().filter(|s| !s.is_empty()),
+        Ok(_) => None,
+        Err(err) => {
+            log::debug!("clipboard text read failed: {err}");
+            None
         }
     }
 }

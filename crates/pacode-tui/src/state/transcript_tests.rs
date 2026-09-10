@@ -200,6 +200,7 @@ fn test_header_is_not_a_cell_and_survives_a_seq_zero_item() {
     let mut t = Transcript::new(2);
     t.set_header(HeaderInfo {
         version: "0.1.0".into(),
+        day: 0,
         mascot: crate::ui::mascot::MascotKind::Pacman,
         truecolor: true,
     });
@@ -228,6 +229,7 @@ fn test_header_is_not_a_cell_and_survives_a_seq_zero_item() {
         t.header,
         Some(HeaderInfo {
             version: "0.1.0".into(),
+            day: 0,
             mascot: crate::ui::mascot::MascotKind::Pacman,
             truecolor: true,
         })
@@ -239,6 +241,7 @@ fn test_set_header_is_idempotent() {
     let mut t = Transcript::new(4);
     let info = HeaderInfo {
         version: "0.1.0".into(),
+        day: 0,
         mascot: crate::ui::mascot::MascotKind::Pacman,
         truecolor: true,
     };
@@ -251,6 +254,7 @@ fn test_set_header_is_idempotent() {
     );
     t.set_header(HeaderInfo {
         version: "0.2.0".into(),
+        day: 0,
         mascot: crate::ui::mascot::MascotKind::Pacman,
         truecolor: true,
     });

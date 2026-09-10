@@ -54,6 +54,8 @@ pub enum Action {
     RemoveQueued,
     ClearQueue,
     PasteImage,
+    /// Paste from the system clipboard: an image when one is there, otherwise text.
+    PasteClipboard,
 }
 
 impl Action {
@@ -102,6 +104,7 @@ impl Action {
             Self::RemoveQueued => "remove_queued",
             Self::ClearQueue => "clear_queue",
             Self::PasteImage => "paste_image",
+            Self::PasteClipboard => "paste_clipboard",
         }
     }
 
@@ -150,6 +153,7 @@ impl Action {
             Self::RemoveQueued => "Remove last queued prompt",
             Self::ClearQueue => "Clear prompt queue",
             Self::PasteImage => "Paste image from clipboard",
+            Self::PasteClipboard => "Paste from clipboard (image or text)",
         }
     }
 }
@@ -378,6 +382,7 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("remove_queued", Action::RemoveQueued),
     ("clear_queue", Action::ClearQueue),
     ("paste_image", Action::PasteImage),
+    ("paste_clipboard", Action::PasteClipboard),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -624,6 +629,24 @@ impl Keymap {
                 code: KeyCode::Char('v'),
                 mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
             }],
+        );
+        // ctrl+v and, where the terminal forwards it, ctrl+shift+v: image first, text otherwise.
+        bindings.insert(
+            Action::PasteClipboard,
+            vec![
+                Binding {
+                    code: KeyCode::Char('v'),
+                    mods: KeyModifiers::CONTROL,
+                },
+                Binding {
+                    code: KeyCode::Char('v'),
+                    mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                },
+                Binding {
+                    code: KeyCode::Char('V'),
+                    mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                },
+            ],
         );
 
         Self {

@@ -275,6 +275,13 @@ fn create_state(cols: u16, rows: u16, snapshot: SessionSnapshot) -> AppState {
     let now = Instant::now();
     state.apply_client_event(ClientEvent::Snapshot(snapshot), now);
     state.turn_started_at = None;
+    // The phrase of the day rotates daily; pin it so snapshots stay deterministic.
+    if let Some(header) = state.transcript.header.as_mut() {
+        header.day = 0;
+    }
+    // The event loop refreshes the activity phase before every draw; these tests
+    // drive `ui::draw` directly, so they have to do the same.
+    state.tick_phase(now);
     state
 }
 

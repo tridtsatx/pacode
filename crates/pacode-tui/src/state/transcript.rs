@@ -25,6 +25,8 @@ pub struct Cell {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeaderInfo {
     pub version: String,
+    /// Days since the Unix epoch; picks the phrase of the day (stable for the whole day).
+    pub day: u64,
     pub mascot: crate::ui::mascot::MascotKind,
     /// Whether the terminal takes RGB, so the mascot can use the arcade palette
     /// instead of folding it down to the nearest ANSI colour.
