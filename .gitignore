@@ -8,3 +8,8 @@
 *.snap.new
 __pycache__/
 HYGIENE.md
+
+# Local-only: instructions, working specs and helper scripts stay on this machine.
+/CLAUDE.md
+/docs/superpowers/
+/scripts/
