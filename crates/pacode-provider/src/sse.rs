@@ -104,6 +104,72 @@ fn parse_sse_event_block(event_str: &str) -> Option<String> {
     }
 }
 
+/// Cap for the text extracted from an in-stream `error` object (spec §6.4: everything
+/// that can reach the model context or the UI is bounded).
+pub(crate) const MAX_STREAM_ERROR_TEXT_BYTES: usize = 2000;
+
+/// Classify an `error` object carried *inside* an SSE chunk.
+///
+/// Gateways (OpenRouter-style pools, opencode zen, ...) answer with HTTP 200 and then
+/// push the upstream failure as `{"error":{"message":..,"code":429,"metadata":{"raw":..}}}`.
+/// Mapping the numeric `code` back onto [`ProviderError`] is what makes a mid-stream 429
+/// retryable again, and `metadata.raw` is the only place the useful upstream text lives.
+pub fn stream_error_to_provider_error(err_val: &Value) -> ProviderError {
+    let message = match err_val.get("message").and_then(|v| v.as_str()) {
+        Some(msg) => msg.to_string(),
+        None => match err_val.as_str() {
+            Some(s) => s.to_string(),
+            None => err_val.to_string(),
+        },
+    };
+
+    let detail = match err_val.get("metadata").and_then(|m| m.get("raw")) {
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed == message {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Some(other @ (Value::Object(_) | Value::Array(_))) => Some(other.to_string()),
+        Some(Value::Null | Value::Bool(_) | Value::Number(_)) | None => None,
+    };
+
+    let text = match detail {
+        Some(raw) => {
+            truncate_on_char_boundary(&format!("{message}: {raw}"), MAX_STREAM_ERROR_TEXT_BYTES)
+        }
+        None => truncate_on_char_boundary(&message, MAX_STREAM_ERROR_TEXT_BYTES),
+    };
+
+    let code = err_val.get("code").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+    });
+
+    match code {
+        Some(status @ (401 | 403)) => ProviderError::Auth(format!("{status}: {text}")),
+        Some(429) => ProviderError::RateLimited(text),
+        Some(status) if (400..=599).contains(&status) => ProviderError::Http {
+            status: status as u16,
+            message: text,
+        },
+        Some(_) | None => ProviderError::Malformed(text),
+    }
+}
+
+fn truncate_on_char_boundary(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &input[..end])
+}
+
 /// Translate one chat-completions chunk (already parsed JSON) into stream events.
 /// `state` carries tool-call bookkeeping across chunks.
 pub fn chunk_to_events(
@@ -111,14 +177,7 @@ pub fn chunk_to_events(
     state: &mut ChunkState,
 ) -> Result<Vec<StreamEvent>, ProviderError> {
     if let Some(err_val) = chunk.get("error") {
-        let message = if let Some(msg) = err_val.get("message").and_then(|v| v.as_str()) {
-            msg.to_string()
-        } else if let Some(s) = err_val.as_str() {
-            s.to_string()
-        } else {
-            err_val.to_string()
-        };
-        return Err(ProviderError::Malformed(message));
+        return Err(stream_error_to_provider_error(err_val));
     }
 
     let mut events = Vec::new();
@@ -309,6 +368,9 @@ pub(crate) fn create_event_stream(
         parser: SseParser,
         chunk_state: ChunkState,
         pending_events: VecDeque<StreamEvent>,
+        /// Error to surface once `pending_events` is drained: events parsed from earlier
+        /// payloads of the same byte chunk must not be lost because a later payload failed.
+        pending_error: Option<ProviderError>,
         model: Option<String>,
         message_start_emitted: bool,
         stream_ended: bool,
@@ -321,6 +383,7 @@ pub(crate) fn create_event_stream(
         parser: SseParser::new(),
         chunk_state: ChunkState::default(),
         pending_events: VecDeque::new(),
+        pending_error: None,
         model: Some(req_model),
         message_start_emitted: false,
         stream_ended: false,
@@ -332,6 +395,11 @@ pub(crate) fn create_event_stream(
         loop {
             if let Some(event) = state.pending_events.pop_front() {
                 return Some((Ok(event), state));
+            }
+
+            if let Some(err) = state.pending_error.take() {
+                state.stream_ended = true;
+                return Some((Err(err), state));
             }
 
             if state.stream_ended {
@@ -371,10 +439,10 @@ pub(crate) fn create_event_stream(
                         match serde_json::from_str::<Value>(&payload) {
                             Err(e) => {
                                 state.stream_ended = true;
-                                return Some((
-                                    Err(ProviderError::Malformed(format!("invalid SSE JSON: {e}"))),
-                                    state,
-                                ));
+                                state.pending_error = Some(ProviderError::Malformed(format!(
+                                    "invalid SSE JSON: {e}"
+                                )));
+                                break;
                             }
                             Ok(json) => {
                                 if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
@@ -384,7 +452,8 @@ pub(crate) fn create_event_stream(
                                 match chunk_to_events(&json, &mut state.chunk_state) {
                                     Err(err) => {
                                         state.stream_ended = true;
-                                        return Some((Err(err), state));
+                                        state.pending_error = Some(err);
+                                        break;
                                     }
                                     Ok(events) => {
                                         for event in events {

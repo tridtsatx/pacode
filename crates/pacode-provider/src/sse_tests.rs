@@ -305,3 +305,150 @@ fn test_chunk_to_events_error_payload() {
         other => panic!("expected Malformed error, got {other:?}"),
     }
 }
+
+#[test]
+fn test_chunk_to_events_gateway_rate_limit_is_retryable() {
+    let mut state = ChunkState::default();
+    let chunk = json!({
+        "error": {
+            "message": "Provider returned error",
+            "code": 429,
+            "metadata": {
+                "raw": "deepseek/deepseek-v4.1-flash is temporarily rate-limited upstream. Please retry shortly.",
+                "provider_name": "Novita"
+            }
+        },
+        "user_id": "user_123"
+    });
+
+    let err = chunk_to_events(&chunk, &mut state).expect_err("should fail");
+    match err {
+        crate::ProviderError::RateLimited(msg) => {
+            assert!(msg.starts_with("Provider returned error: "), "got {msg}");
+            assert!(
+                msg.contains("temporarily rate-limited upstream"),
+                "got {msg}"
+            );
+        }
+        other => panic!("expected RateLimited error, got {other:?}"),
+    }
+    assert!(
+        chunk_to_events(
+            &json!({"error": {"message": "x", "code": 429}}),
+            &mut ChunkState::default()
+        )
+        .expect_err("should fail")
+        .is_retryable()
+    );
+}
+
+#[test]
+fn test_chunk_to_events_gateway_400_maps_to_http() {
+    let mut state = ChunkState::default();
+    let chunk = json!({
+        "error": {
+            "message": "Provider returned error",
+            "code": 400,
+            "metadata": {
+                "raw": "{\"message\":\"invalid request error trace_id: abc\",\"type\":\"invalid_request_error\"}\n",
+                "provider_name": "Novita"
+            }
+        }
+    });
+
+    match chunk_to_events(&chunk, &mut state).expect_err("should fail") {
+        crate::ProviderError::Http { status, message } => {
+            assert_eq!(status, 400);
+            assert!(message.contains("invalid request error trace_id: abc"));
+            // raw is trimmed of surrounding whitespace
+            assert!(!message.ends_with('\n'));
+        }
+        other => panic!("expected Http error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_chunk_to_events_gateway_403_maps_to_auth() {
+    let mut state = ChunkState::default();
+    let chunk = json!({
+        "error": { "message": "no access", "code": 403 }
+    });
+
+    match chunk_to_events(&chunk, &mut state).expect_err("should fail") {
+        crate::ProviderError::Auth(msg) => assert_eq!(msg, "403: no access"),
+        other => panic!("expected Auth error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_chunk_to_events_string_code_variants() {
+    let numeric_string = json!({ "error": { "message": "slow down", "code": "429" } });
+    match chunk_to_events(&numeric_string, &mut ChunkState::default()).expect_err("should fail") {
+        crate::ProviderError::RateLimited(msg) => assert_eq!(msg, "slow down"),
+        other => panic!("expected RateLimited error, got {other:?}"),
+    }
+
+    let non_numeric = json!({ "error": { "message": "bad", "code": "invalid_request_error" } });
+    match chunk_to_events(&non_numeric, &mut ChunkState::default()).expect_err("should fail") {
+        crate::ProviderError::Malformed(msg) => assert_eq!(msg, "bad"),
+        other => panic!("expected Malformed error, got {other:?}"),
+    }
+
+    let out_of_range = json!({ "error": { "message": "weird", "code": 200 } });
+    match chunk_to_events(&out_of_range, &mut ChunkState::default()).expect_err("should fail") {
+        crate::ProviderError::Malformed(msg) => assert_eq!(msg, "weird"),
+        other => panic!("expected Malformed error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_chunk_to_events_error_raw_object_and_truncation() {
+    let object_raw = json!({
+        "error": {
+            "message": "Provider returned error",
+            "code": 500,
+            "metadata": { "raw": { "detail": "upstream exploded" } }
+        }
+    });
+    match chunk_to_events(&object_raw, &mut ChunkState::default()).expect_err("should fail") {
+        crate::ProviderError::Http { status, message } => {
+            assert_eq!(status, 500);
+            assert_eq!(
+                message,
+                "Provider returned error: {\"detail\":\"upstream exploded\"}"
+            );
+        }
+        other => panic!("expected Http error, got {other:?}"),
+    }
+
+    let long_raw = "я".repeat(4000);
+    let huge = json!({
+        "error": { "message": "boom", "code": 500, "metadata": { "raw": long_raw } }
+    });
+    match chunk_to_events(&huge, &mut ChunkState::default()).expect_err("should fail") {
+        crate::ProviderError::Http { message, .. } => {
+            assert!(message.len() <= crate::sse::MAX_STREAM_ERROR_TEXT_BYTES + 4);
+            assert!(message.ends_with('…'));
+            // still valid UTF-8 with whole characters only
+            assert!(message.chars().all(|c| c == '…'
+                || c == 'я'
+                || c == 'b'
+                || c == 'o'
+                || c == 'm'
+                || c == ':'
+                || c == ' '));
+        }
+        other => panic!("expected Http error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_chunk_to_events_error_raw_equal_to_message_not_duplicated() {
+    let chunk = json!({
+        "error": { "message": "same text", "metadata": { "raw": "  same text  " } }
+    });
+    match chunk_to_events(&chunk, &mut ChunkState::default()).expect_err("should fail") {
+        crate::ProviderError::Malformed(msg) => assert_eq!(msg, "same text"),
+        other => panic!("expected Malformed error, got {other:?}"),
+    }
+}

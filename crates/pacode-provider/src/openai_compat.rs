@@ -19,9 +19,11 @@
 //! `prompt_tokens_details.cached_tokens`), `[DONE]`. Unknown fields ignored. An
 //! `error` object in the stream or a non-2xx status becomes `ProviderError`.
 //!
-//! Retries: connection/429/5xx retried with backoff 1 s → 30 s (jitter), up to
-//! `max_retries`; a stream idle longer than `stream_idle_secs × effort factor` ends with
-//! `ProviderError::IdleTimeout`.
+//! Retries (see `retry.rs`): connection/429/5xx retried with backoff 1 s → 30 s (jitter),
+//! up to `max_retries`. A retryable error arriving *inside* the stream (gateways report
+//! upstream 429/5xx as an `error` object in an HTTP 200 body) reopens the request as long
+//! as the turn has not emitted any output yet. A stream idle longer than
+//! `stream_idle_secs × effort factor` ends with `ProviderError::IdleTimeout`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
@@ -32,7 +34,6 @@ use pacode_types::{
     ContentBlock, Effort, ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, Role,
     prettify_model_name,
 };
-use rand::Rng;
 use serde_json::Value;
 
 pub use crate::sse::{ChunkState, SseParser, chunk_to_events};
@@ -66,6 +67,8 @@ pub struct OpenAiCompat {
     pricing: BTreeMap<String, Pricing>,
     client: reqwest::Client,
     catalog_cache: Mutex<Option<Vec<ModelInfo>>>,
+    /// First retry backoff step; only tuned down by tests.
+    backoff_base: Duration,
 }
 
 impl OpenAiCompat {
@@ -98,7 +101,15 @@ impl OpenAiCompat {
             pricing,
             client,
             catalog_cache: Mutex::new(None),
+            backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
         })
+    }
+
+    /// Shorten the retry backoff schedule (tests drive real retries without real waits).
+    #[cfg(test)]
+    pub(crate) fn with_backoff_base(mut self, base: Duration) -> Self {
+        self.backoff_base = base;
+        self
     }
 
     /// The JSON body for `req` (public for tests and `pacode run --debug-request`).
@@ -378,17 +389,6 @@ fn deep_merge(target: &mut Value, source: &Value) {
     }
 }
 
-async fn sleep_backoff(attempt: u32) {
-    let exp = 1u64.checked_shl(attempt.min(5)).unwrap_or(32);
-    let base_secs = (exp as f64).min(30.0);
-    let delay_secs = {
-        let mut rng = rand::rng();
-        let jitter_ratio = rng.random_range(-0.2..=0.2);
-        (base_secs * (1.0 + jitter_ratio)).max(0.01)
-    };
-    tokio::time::sleep(Duration::from_secs_f64(delay_secs)).await;
-}
-
 /// Redact sensitive information (`api_key`, `authorization`, `Bearer ...`) from log messages.
 pub fn redact(input: &str) -> String {
     let mut result = redact_bearer(input);
@@ -666,77 +666,29 @@ impl Provider for OpenAiCompat {
         let body_redacted = redact(&serialized_body);
         log::trace!("request body: {body_redacted}");
 
-        let mut attempt = 0;
-        let response = loop {
-            let mut req_builder = self
-                .client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .json(&body);
-
-            if let Some(key) = &self.api_key
-                && !key.is_empty()
-            {
-                req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
-            }
-
-            for (k, v) in &self.cfg.headers {
-                req_builder = req_builder.header(k, v);
-            }
-
-            match req_builder.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        break resp;
-                    }
-
-                    let status_u16 = status.as_u16();
-                    let text = resp.text().await.unwrap_or_default();
-                    let redacted_body = redact(&text);
-                    log::trace!("response body: {redacted_body}");
-                    log::warn!("request failed ({status_u16}): {redacted_body}");
-
-                    if status_u16 == 401 || status_u16 == 403 {
-                        return Err(ProviderError::Auth(format!("{status_u16}: {text}")));
-                    }
-
-                    let is_retryable = status_u16 == 429 || status_u16 >= 500;
-                    if is_retryable && attempt < max_retries {
-                        sleep_backoff(attempt).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    if status_u16 == 429 {
-                        return Err(ProviderError::RateLimited(text));
-                    }
-                    return Err(ProviderError::Http {
-                        status: status_u16,
-                        message: text,
-                    });
-                }
-                Err(err) => {
-                    let err_str = err.to_string();
-                    let redacted_err = redact(&err_str);
-                    log::warn!("request transport error: {redacted_err}");
-                    if attempt < max_retries {
-                        sleep_backoff(attempt).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(ProviderError::Transport(err.to_string()));
-                }
-            }
+        let effort = req.effort.unwrap_or(self.defaults.effort);
+        let opener = crate::retry::StreamOpener {
+            client: self.client.clone(),
+            url,
+            api_key: self.api_key.clone(),
+            headers: self
+                .cfg
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            body,
+            model: req.model,
+            stream_idle_secs: self.defaults.stream_idle_secs,
+            effort,
+            max_retries,
+            backoff_base: self.backoff_base,
         };
 
-        let effort = req.effort.unwrap_or(self.defaults.effort);
-        Ok(crate::sse::create_event_stream(
-            response,
-            req.model,
-            self.defaults.stream_idle_secs,
-            effort,
-        ))
+        // The first open is eager: a hard failure (auth, 4xx) is reported by `complete`
+        // itself rather than as the first item of an otherwise valid stream.
+        let inner = opener.open().await?;
+        Ok(crate::retry::retrying_stream(opener, inner))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

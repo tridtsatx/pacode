@@ -13,6 +13,7 @@ pub mod catalog_cache;
 pub mod mock;
 pub mod openai_compat;
 pub mod registry;
+mod retry;
 pub mod sse;
 
 use std::pin::Pin;
