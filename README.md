@@ -1,17 +1,24 @@
-# pacode
+<div align="center">
 
-A coding agent that lives in your terminal, written in Rust.
+<img src="assets/logo.png" alt="pacode" width="420">
 
-```
- ▄▄▄▄▄
-█ ▀ ██   pacode v0.1.0
-███▀     made by tridtsat
- ▀▀▀▀▀
-```
+**A coding agent that lives in your terminal.** Written in Rust, one binary, no runtime.
+
+[![Apache 2.0](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-edition%202024-orange)](https://www.rust-lang.org)
+[![status](https://img.shields.io/badge/status-work%20in%20progress-yellow)](#status)
+
+</div>
+
+> **Status: work in progress.** It builds, it runs and it is used daily, but the
+> API and the config are still moving. Proper documentation and a contributing
+> guide are coming shortly; until then this README is the documentation.
 
 A background daemon owns the sessions; the TUI is a thin client that attaches to
 it. Close the terminal and the work keeps running — reattach and it is still
 there, transcript and all.
+
+<img src="assets/screenshot-agents.png" alt="Plan, subagents and background tasks in the rail" width="100%">
 
 ## Why another one
 
@@ -78,6 +85,8 @@ blocks on a wait.
 **Questions.** The model can put a decision to you with real options, one marked
 as recommended, and wait for the answer the way a permission prompt waits.
 
+<img src="assets/screenshot-question.png" alt="The model asking which platform to build for" width="100%">
+
 **Plugins.** A marketplace in the Claude Code layout, so plugins written for it
 work here unchanged: `/plugins` browses, installs and removes them. Skills and MCP
 servers from an installed plugin are wired up; what pacode will not run is said
@@ -134,6 +143,21 @@ Nineteen crates, each with one job:
 House rules: modules under 500 lines, exhaustive matches, no `unwrap()` outside
 tests, `thiserror` in public APIs, and a clean `cargo clippy --workspace
 --all-targets` on every commit.
+
+## Status
+
+Work in progress, and honest about it:
+
+- **Works today:** sessions, subagents, permissions, background commands, cron
+  jobs and monitors, questions, MCP, plugins and the marketplace, skills, ACP,
+  import from other agents.
+- **Coming shortly:** proper documentation, a contributing guide, and the
+  remaining tabs of the plugin screen.
+- **Not there yet:** Windows (Unix sockets and process groups are assumed), and
+  running Claude Code hooks or markdown slash commands from a plugin.
+
+Issues and pull requests are welcome meanwhile; the checks below are what CI will
+run.
 
 ## Contributing
 

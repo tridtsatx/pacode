@@ -611,41 +611,38 @@ fn render_item_inner(
             for line in pacode_render::wrap_text(&question.question, width as usize) {
                 lines.push(Line::from(Span::styled(line, opts.theme.bold)));
             }
-            for (i, option) in question.options.iter().enumerate() {
-                let chosen = answer.as_ref().is_some_and(|a| a.selected.contains(&i));
-                let marker = if chosen { opts.glyphs.ok } else { " " };
-                let mut label = format!("{}. {}", i + 1, option.label);
-                if option.recommended {
-                    label.push_str(" (recommended)");
-                }
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{marker} "), opts.theme.green),
-                    Span::styled(
-                        truncate_to_width(&label, (width as usize).saturating_sub(3), true),
-                        if chosen {
-                            opts.theme.bold
-                        } else {
-                            opts.theme.fg
-                        },
-                    ),
-                ]));
-                if !option.description.is_empty() {
-                    for dl in pacode_render::wrap_text(
-                        &option.description,
-                        (width as usize).saturating_sub(4),
-                    ) {
-                        lines.push(Line::from(Span::styled(
-                            format!("    {dl}"),
-                            opts.theme.dim,
-                        )));
-                    }
-                }
-            }
+
             match answer {
+                // Unanswered: the picker below is showing the options and the
+                // keys, so repeating them here would put the same card on screen
+                // twice.
+                None => lines.push(Line::from(Span::styled(
+                    "waiting for your answer",
+                    opts.theme.faint,
+                ))),
                 Some(a) if a.cancelled => {
-                    lines.push(Line::from(Span::styled("dismissed", opts.theme.faint)))
+                    lines.push(Line::from(Span::styled("dismissed", opts.theme.faint)));
                 }
                 Some(a) => {
+                    for (i, option) in question.options.iter().enumerate() {
+                        let chosen = a.selected.contains(&i);
+                        let marker = if chosen { opts.glyphs.ok } else { " " };
+                        let mut label = format!("{}. {}", i + 1, option.label);
+                        if option.recommended {
+                            label.push_str(" (recommended)");
+                        }
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{marker} "), opts.theme.green),
+                            Span::styled(
+                                truncate_to_width(&label, (width as usize).saturating_sub(3), true),
+                                if chosen {
+                                    opts.theme.bold
+                                } else {
+                                    opts.theme.dim
+                                },
+                            ),
+                        ]));
+                    }
                     if let Some(text) = a.free_text.as_ref().filter(|t| !t.trim().is_empty()) {
                         lines.push(Line::from(Span::styled(
                             format!("typed: {text}"),
@@ -653,10 +650,6 @@ fn render_item_inner(
                         )));
                     }
                 }
-                None => lines.push(Line::from(Span::styled(
-                    "1-9 choose · t type an answer · esc dismiss",
-                    opts.theme.cyan,
-                ))),
             }
             lines.push(Line::default());
             lines
