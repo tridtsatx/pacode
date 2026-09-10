@@ -86,6 +86,14 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
     });
 
     let plugin_host = Arc::new(PluginHost::load(&opts.config.plugins, ui_sink).await);
+    // Installs land in the same directory the host scans, so a fetched plugin is
+    // picked up like a hand-written one.
+    let marketplace = Arc::new(pacode_plugin::marketplace::Marketplace::new(
+        Arc::new(pacode_plugin::marketplace::HttpFetcher::new()),
+        opts.paths.cache_dir.join("marketplace"),
+        PluginHost::install_dir(&opts.config.plugins),
+        pacode_plugin::marketplace::cache::DEFAULT_TTL_SECS,
+    ));
 
     let (skill_registry, _warnings) = if opts.config.skills.enabled {
         let dirs = if opts.config.skills.dirs.is_empty() {
@@ -133,6 +141,7 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
         tasks,
         mcp: mcp.clone(),
         plugins: plugin_host,
+        marketplace,
         store,
         app_version: opts.app_version.clone(),
         skills: skill_registry,

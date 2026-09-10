@@ -62,6 +62,12 @@ async fn build_test_core(tmp: &tempfile::TempDir, config: Arc<Config>) -> Arc<Co
     let tools = builtin_tools();
 
     let deps = CoreDeps {
+        marketplace: std::sync::Arc::new(pacode_plugin::marketplace::Marketplace::new(
+            std::sync::Arc::new(pacode_plugin::marketplace::HttpFetcher::new()),
+            paths.cache_dir.join("marketplace"),
+            paths.cache_dir.join("plugins"),
+            pacode_plugin::marketplace::cache::DEFAULT_TTL_SECS,
+        )),
         config,
         paths,
         providers: Arc::new(providers),

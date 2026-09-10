@@ -502,6 +502,26 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             state.dirty = true;
             vec![]
         }
+        BgResponse::Reply(Ok(Reply::MarketplacePlugins {
+            plugins: listing,
+            stale: is_stale,
+        })) => {
+            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
+                ref mut market,
+                ref mut loading,
+                ref mut stale,
+                ref mut index,
+                ..
+            }) = state.focus
+            {
+                *index = (*index).min(listing.len().saturating_sub(1));
+                *market = listing;
+                *loading = false;
+                *stale = is_stale;
+                state.dirty = true;
+            }
+            vec![]
+        }
         BgResponse::Reply(Ok(Reply::Plugins { plugins })) => {
             crate::commands::register_plugins(&plugins);
             state.plugins = plugins.clone();

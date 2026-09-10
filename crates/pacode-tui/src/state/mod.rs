@@ -74,6 +74,30 @@ pub enum PanelTarget {
     Task(TaskId),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginsTab {
+    /// Plugins loaded in this session.
+    Installed,
+    /// Plugins the configured marketplace offers.
+    Discover,
+}
+
+impl PluginsTab {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Installed => Self::Discover,
+            Self::Discover => Self::Installed,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Installed => "Installed",
+            Self::Discover => "Discover",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Overlay {
     ModelPicker {
@@ -123,6 +147,16 @@ pub enum Overlay {
     PluginsPicker {
         index: usize,
         plugins: Vec<PluginInfo>,
+        /// Which list is on screen.
+        tab: PluginsTab,
+        /// What the configured marketplace offers, once it has answered.
+        market: Vec<pacode_types::MarketplacePluginInfo>,
+        /// Filter typed in the Discover tab.
+        query: String,
+        /// A marketplace request is in flight.
+        loading: bool,
+        /// The listing came from a cached copy past its TTL.
+        stale: bool,
     },
     KeysPicker {
         index: usize,
@@ -689,6 +723,15 @@ impl AppState {
         });
         self.transcript.scroll_to_bottom();
         self.dirty = true;
+    }
+
+    /// Remember the marketplace `/plugins <source>` pointed at.
+    pub fn save_pref_marketplace(&self, source: &str) {
+        let mut prefs = pacode_config::load_prefs(&self.paths);
+        prefs.marketplace = Some(source.to_string());
+        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
+            log::warn!("failed to save prefs (marketplace): {e}");
+        }
     }
 
     pub fn save_pref_model(&self, model: &str) {

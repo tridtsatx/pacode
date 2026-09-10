@@ -356,8 +356,23 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
-        Focus::Overlay(Overlay::PluginsPicker { index, plugins }) => {
-            let count = plugins.len();
+        Focus::Overlay(Overlay::PluginsPicker {
+            index,
+            plugins,
+            tab,
+            market,
+            query,
+            loading,
+            stale,
+        }) => {
+            use crate::state::PluginsTab;
+
+            let count = match tab {
+                PluginsTab::Installed => plugins.len(),
+                PluginsTab::Discover => market.len(),
+            };
+            let source = state.config.plugins.marketplace.clone();
+
             if is_overlay_up(&key) && *index > 0 {
                 *index -= 1;
                 return vec![];
@@ -366,9 +381,58 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 *index += 1;
                 return vec![];
             }
-            if key.code == KeyCode::Esc {
-                state.focus = Focus::Normal;
+
+            match key.code {
+                KeyCode::Esc => {
+                    state.focus = Focus::Normal;
+                    state.dirty = true;
+                    return vec![];
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    *tab = tab.next();
+                    *index = 0;
+                    state.dirty = true;
+                    // The Discover tab is empty until the marketplace answers.
+                    if *tab == PluginsTab::Discover && market.is_empty() && !source.is_empty() {
+                        *loading = true;
+                        let query = query.clone();
+                        return vec![Action::Send(Request::BrowseMarketplace { source, query })];
+                    }
+                }
+                // Typing filters Discover; the request goes out on every keystroke
+                // but the index is served from cache, so it costs no network.
+                KeyCode::Char(c) if *tab == PluginsTab::Discover && !source.is_empty() => match c {
+                    'i' if !market.is_empty() => {
+                        let name = market[(*index).min(market.len() - 1)].name.clone();
+                        *loading = true;
+                        state.dirty = true;
+                        return vec![Action::Send(Request::InstallPlugin { source, name })];
+                    }
+                    _ => {
+                        query.push(c);
+                        *index = 0;
+                        *loading = true;
+                        state.dirty = true;
+                        let query = query.clone();
+                        return vec![Action::Send(Request::BrowseMarketplace { source, query })];
+                    }
+                },
+                KeyCode::Backspace if *tab == PluginsTab::Discover && !source.is_empty() => {
+                    query.pop();
+                    *index = 0;
+                    *loading = true;
+                    state.dirty = true;
+                    let query = query.clone();
+                    return vec![Action::Send(Request::BrowseMarketplace { source, query })];
+                }
+                KeyCode::Char('x') if *tab == PluginsTab::Installed && !plugins.is_empty() => {
+                    let name = plugins[(*index).min(plugins.len() - 1)].name.clone();
+                    state.dirty = true;
+                    return vec![Action::Send(Request::UninstallPlugin { name })];
+                }
+                _ => {}
             }
+            let _ = stale;
             vec![]
         }
         Focus::Overlay(Overlay::KeysPicker { index, capturing }) => {

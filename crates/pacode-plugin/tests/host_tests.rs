@@ -93,6 +93,7 @@ async fn test_host_load_from_dir() {
         .join("fixtures");
 
     let config = PluginsConfig {
+        marketplace: String::new(),
         enabled: true,
         dirs: vec![fix_dir],
         wasm_memory_mb: 64,
@@ -140,6 +141,7 @@ async fn test_host_disabled_config() {
         .join("fixtures");
 
     let config = PluginsConfig {
+        marketplace: String::new(),
         enabled: false,
         dirs: vec![fix_dir],
         wasm_memory_mb: 64,
@@ -258,6 +260,7 @@ async fn test_host_invalid_manifest_records_error() {
     std::fs::write(bad_plugin_dir.join("plugin.toml"), "invalid toml :::").unwrap();
 
     let config = PluginsConfig {
+        marketplace: String::new(),
         enabled: true,
         dirs: vec![temp.path().to_path_buf()],
         wasm_memory_mb: 64,

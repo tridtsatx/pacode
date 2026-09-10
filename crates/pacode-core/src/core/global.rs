@@ -132,6 +132,13 @@ impl Core {
                     }),
                 }
             }
+            Request::BrowseMarketplace { source, query } => {
+                Some(self.browse_marketplace(source, query).await)
+            }
+            Request::InstallPlugin { source, name } => {
+                Some(self.install_plugin(source, name).await)
+            }
+            Request::UninstallPlugin { name } => Some(self.uninstall_plugin(name).await),
             Request::ListPlugins => {
                 let plugins = self
                     .deps
@@ -172,5 +179,113 @@ impl Core {
             }
             _ => None,
         }
+    }
+}
+
+impl Core {
+    /// Plugins a marketplace offers, with their installed state.
+    async fn browse_marketplace(&self, source: &str, query: &str) -> Reply {
+        let source = match pacode_plugin::marketplace::MarketplaceSource::parse(source) {
+            Ok(s) => s,
+            Err(e) => {
+                return Reply::Error {
+                    message: e.to_string(),
+                };
+            }
+        };
+        match self
+            .deps
+            .marketplace
+            .list(&source, query, pacode_types::now_ms())
+            .await
+        {
+            Ok(listings) => {
+                // Whether the listing is stale is a property of the index, so it
+                // is read once rather than per plugin.
+                let stale = self
+                    .deps
+                    .marketplace
+                    .index(&source, pacode_types::now_ms())
+                    .await
+                    .map(|i| i.stale)
+                    .unwrap_or(false);
+                Reply::MarketplacePlugins {
+                    plugins: listings.iter().map(to_info).collect(),
+                    stale,
+                }
+            }
+            Err(e) => Reply::Error {
+                message: e.to_string(),
+            },
+        }
+    }
+
+    async fn install_plugin(&self, source: &str, name: &str) -> Reply {
+        let parsed = match pacode_plugin::marketplace::MarketplaceSource::parse(source) {
+            Ok(s) => s,
+            Err(e) => {
+                return Reply::Error {
+                    message: e.to_string(),
+                };
+            }
+        };
+        match self
+            .deps
+            .marketplace
+            .install(&parsed, name, pacode_types::now_ms())
+            .await
+        {
+            Ok(record) => {
+                log::info!("installed plugin {} from {}", record.name, record.source);
+                self.browse_marketplace(source, "").await
+            }
+            Err(e) => Reply::Error {
+                message: e.to_string(),
+            },
+        }
+    }
+
+    async fn uninstall_plugin(&self, name: &str) -> Reply {
+        match self.deps.marketplace.uninstall(name) {
+            Ok(()) => Reply::MarketplacePlugins {
+                plugins: self
+                    .deps
+                    .marketplace
+                    .installed()
+                    .into_iter()
+                    .map(|installed| pacode_types::MarketplacePluginInfo {
+                        name: installed.name,
+                        description: String::new(),
+                        version: installed.version.clone(),
+                        author: String::new(),
+                        category: String::new(),
+                        marketplace: installed.source,
+                        installed: true,
+                        installed_version: Some(installed.version),
+                        update_available: false,
+                    })
+                    .collect(),
+                stale: false,
+            },
+            Err(e) => Reply::Error {
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
+fn to_info(
+    listing: &pacode_plugin::marketplace::PluginListing,
+) -> pacode_types::MarketplacePluginInfo {
+    pacode_types::MarketplacePluginInfo {
+        name: listing.entry.name.clone(),
+        description: listing.entry.description.clone(),
+        version: listing.entry.version.clone(),
+        author: listing.entry.author.display(),
+        category: listing.entry.category.clone(),
+        marketplace: listing.marketplace.clone(),
+        installed: listing.installed.is_some(),
+        installed_version: listing.installed.as_ref().map(|i| i.version.clone()),
+        update_available: listing.update_available(),
     }
 }

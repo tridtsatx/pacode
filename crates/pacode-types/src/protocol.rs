@@ -125,6 +125,23 @@ pub enum Request {
         name: String,
         args: String,
     },
+    /// Plugins a marketplace offers (`Reply::MarketplacePlugins`).
+    BrowseMarketplace {
+        /// `owner/repo`, `owner/repo@ref`, or an https URL to a marketplace.json.
+        source: String,
+        /// Free-text filter over name, description, category and keywords.
+        #[serde(default)]
+        query: String,
+    },
+    /// Install one plugin from a marketplace (`Reply::MarketplacePlugins`).
+    InstallPlugin {
+        source: String,
+        name: String,
+    },
+    /// Remove a plugin pacode installed (`Reply::MarketplacePlugins`).
+    UninstallPlugin {
+        name: String,
+    },
     /// Answer a question the model asked (`Event::QuestionAsked`).
     AnswerQuestion {
         question: QuestionId,
@@ -177,6 +194,30 @@ pub struct PluginInfo {
     pub commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// One plugin as the marketplace screen shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplacePluginInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub category: String,
+    /// Which marketplace it came from, in display form.
+    #[serde(default)]
+    pub marketplace: String,
+    #[serde(default)]
+    pub installed: bool,
+    /// Version installed, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default)]
+    pub update_available: bool,
 }
 
 /// Result of a plugin slash command.
@@ -265,6 +306,14 @@ pub enum Reply {
         plugins: Vec<PluginInfo>,
     },
     PluginCommand(PluginCommandOutcome),
+    /// Answer to every marketplace request.
+    MarketplacePlugins {
+        plugins: Vec<MarketplacePluginInfo>,
+        /// True when the listing came from a cached copy past its TTL because
+        /// the fetch failed, so the client can say so.
+        #[serde(default)]
+        stale: bool,
+    },
     /// Answer to `ListCronJobs` and to every mutating cron request.
     CronJobs {
         jobs: Vec<CronJob>,

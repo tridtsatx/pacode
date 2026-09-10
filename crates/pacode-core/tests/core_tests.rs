@@ -240,6 +240,12 @@ async fn setup_test_core() -> (Arc<Core>, Arc<MockProvider>, tempfile::TempDir) 
     tools.register(Arc::new(StubTriggerBgTask));
 
     let deps = CoreDeps {
+        marketplace: std::sync::Arc::new(pacode_plugin::marketplace::Marketplace::new(
+            std::sync::Arc::new(pacode_plugin::marketplace::HttpFetcher::new()),
+            paths.cache_dir.join("marketplace"),
+            paths.cache_dir.join("plugins"),
+            pacode_plugin::marketplace::cache::DEFAULT_TTL_SECS,
+        )),
         config: Arc::new(config),
         paths,
         providers: Arc::new(reg),

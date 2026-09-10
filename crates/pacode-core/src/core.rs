@@ -29,6 +29,8 @@ pub struct CoreDeps {
     pub tasks: Arc<TaskManager>,
     pub mcp: Arc<McpPool>,
     pub plugins: Arc<pacode_plugin::PluginHost>,
+    /// Reads plugin marketplaces and installs from them.
+    pub marketplace: Arc<pacode_plugin::marketplace::Marketplace>,
     pub store: Store,
     /// Shown in the rail anchor and in `SessionMeta` logs.
     pub app_version: String,
@@ -432,7 +434,10 @@ impl Core {
             | Request::SetMcpServerEnabled { .. }
             | Request::GetMcpPrompt { .. }
             | Request::ListPlugins
-            | Request::RunPluginCommand { .. } => {
+            | Request::RunPluginCommand { .. }
+            | Request::BrowseMarketplace { .. }
+            | Request::InstallPlugin { .. }
+            | Request::UninstallPlugin { .. } => {
                 self.handle_global(&req)
                     .await
                     .unwrap_or_else(|| Reply::Error {

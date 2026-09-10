@@ -382,12 +382,37 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
         }
         "plugins" => {
             log::debug!("open overlay: PluginsPicker");
+            // `/plugins <source>` points the Discover tab at a marketplace and
+            // remembers it; `/plugins` alone uses the configured one.
+            let source = arg.trim();
+            if !source.is_empty() {
+                state.config.plugins.marketplace = source.to_string();
+                state.save_pref_marketplace(source);
+            }
+            let market_source = state.config.plugins.marketplace.clone();
+            let has_market = !market_source.is_empty();
             state.focus = Focus::Overlay(Overlay::PluginsPicker {
                 index: 0,
                 plugins: state.plugins.clone(),
+                tab: if has_market && !source.is_empty() {
+                    crate::state::PluginsTab::Discover
+                } else {
+                    crate::state::PluginsTab::Installed
+                },
+                market: Vec::new(),
+                query: String::new(),
+                loading: has_market,
+                stale: false,
             });
             state.dirty = true;
-            vec![Action::Send(Request::ListPlugins)]
+            let mut actions = vec![Action::Send(Request::ListPlugins)];
+            if has_market {
+                actions.push(Action::Send(Request::BrowseMarketplace {
+                    source: market_source,
+                    query: String::new(),
+                }));
+            }
+            actions
         }
         "keys" => {
             log::debug!("open overlay: KeysPicker");

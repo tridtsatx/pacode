@@ -362,6 +362,9 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::ListPlugins
         | Request::RunPluginCommand { .. }
         | Request::AnswerQuestion { .. }
+        | Request::BrowseMarketplace { .. }
+        | Request::InstallPlugin { .. }
+        | Request::UninstallPlugin { .. }
         | Request::ListCronJobs
         | Request::AddCronJob { .. }
         | Request::RemoveCronJob(_)

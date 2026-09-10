@@ -29,6 +29,26 @@ impl PluginHost {
         }
     }
 
+    /// Where plugins are installed by default, and the first place they are
+    /// scanned from. The marketplace installs here so a fetched plugin is picked
+    /// up by the same scan as a hand-written one.
+    pub fn default_install_dir() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".config")
+            .join("pacode")
+            .join("plugins")
+    }
+
+    /// The directory plugins are installed into for `config`.
+    pub fn install_dir(config: &PluginsConfig) -> PathBuf {
+        config
+            .dirs
+            .first()
+            .cloned()
+            .unwrap_or_else(Self::default_install_dir)
+    }
+
     pub async fn load(config: &PluginsConfig, ui_sink: Arc<dyn UiSink>) -> Self {
         let mut host = Self::new();
         if !config.enabled {
@@ -36,11 +56,7 @@ impl PluginHost {
         }
 
         let scan_dirs: Vec<PathBuf> = if config.dirs.is_empty() {
-            let mut dirs = Vec::new();
-            if let Some(home) = dirs::home_dir() {
-                dirs.push(home.join(".config").join("pacode").join("plugins"));
-            }
-            dirs
+            vec![Self::default_install_dir()]
         } else {
             config.dirs.clone()
         };

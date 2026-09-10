@@ -17,6 +17,9 @@ pub struct Prefs {
     pub effort: Option<Effort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
+    /// Marketplace last pointed at with `/plugins <source>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<String>,
 }
 
 pub fn prefs_file(paths: &Paths) -> PathBuf {

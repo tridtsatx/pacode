@@ -556,6 +556,7 @@ fn prefs_round_trip() {
 
     // Save prefs
     let custom = crate::Prefs {
+        marketplace: None,
         model: Some("anthropic/claude-3-7-sonnet".to_string()),
         effort: Some(Effort::Max),
         mode: Some(Mode::Bypass),

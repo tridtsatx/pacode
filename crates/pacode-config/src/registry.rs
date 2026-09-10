@@ -127,6 +127,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "ui.transcript_cells", label: "Transcript Cells", description: "Max transcript cells kept in RAM before evicting", section: "ui", default_value: "500", kind: SettingKind::Integer { min: 10, max: 100000 }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.images", label: "Image Rendering", description: "Terminal image protocol: auto or off", section: "ui", default_value: "auto", kind: SettingKind::Enum { options: IMAGE_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.vim", label: "Vim Keybindings", description: "Vim modal editing in prompt", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "plugins.marketplace", label: "Plugin Marketplace", description: "Marketplace browsed by /plugins: owner/repo, owner/repo@ref or an https URL", section: "plugins", default_value: "", kind: SettingKind::String, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.agent_view", label: "Subagent View", description: "Where a selected subagent's chat opens: replace the main chat or split beside it", section: "ui", default_value: "replace", kind: SettingKind::Enum { options: AGENT_VIEW_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.thinking", label: "Show Thinking", description: "Draw model reasoning / thinking lines in transcript", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
 
@@ -232,6 +233,7 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "ui.vim" => Some(config.ui.vim.to_string()),
         "ui.thinking" => Some(config.ui.thinking.to_string()),
         "ui.agent_view" => Some(config.ui.agent_view.as_str().to_string()),
+        "plugins.marketplace" => Some(config.plugins.marketplace.clone()),
         "exec.yield_after_secs" => Some(config.exec.yield_after_secs.to_string()),
         "exec.stall_secs" => Some(config.exec.stall_secs.to_string()),
         "exec.max_spool_bytes" => Some(config.exec.max_spool_bytes.to_string()),
@@ -492,6 +494,11 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "ui.thinking" => {
             if let toml::Value::Boolean(b) = value {
                 config.ui.thinking = *b;
+            }
+        }
+        "plugins.marketplace" => {
+            if let toml::Value::String(v) = value {
+                config.plugins.marketplace = v.clone();
             }
         }
         "ui.agent_view" => {

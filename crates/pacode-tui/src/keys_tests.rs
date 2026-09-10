@@ -820,6 +820,11 @@ fn test_overlay_plugins_picker_keys() {
     assert_eq!(
         state.focus,
         Focus::Overlay(Overlay::PluginsPicker {
+            tab: crate::state::PluginsTab::Installed,
+            market: Vec::new(),
+            query: String::new(),
+            loading: false,
+            stale: false,
             index: 0,
             plugins: Vec::new(),
         })
@@ -843,6 +848,11 @@ fn test_overlay_plugins_picker_keys() {
         error: None,
     };
     state.focus = Focus::Overlay(Overlay::PluginsPicker {
+        tab: crate::state::PluginsTab::Installed,
+        market: Vec::new(),
+        query: String::new(),
+        loading: false,
+        stale: false,
         index: 0,
         plugins: vec![p1.clone(), p2.clone()],
     });
@@ -853,6 +863,11 @@ fn test_overlay_plugins_picker_keys() {
     assert_eq!(
         state.focus,
         Focus::Overlay(Overlay::PluginsPicker {
+            tab: crate::state::PluginsTab::Installed,
+            market: Vec::new(),
+            query: String::new(),
+            loading: false,
+            stale: false,
             index: 1,
             plugins: vec![p1, p2],
         })

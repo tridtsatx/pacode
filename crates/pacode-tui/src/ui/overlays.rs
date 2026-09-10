@@ -53,8 +53,26 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             } => {
                 crate::ui::mcp::draw(frame, area, *index, servers, *loading, opts);
             }
-            Overlay::PluginsPicker { index, plugins } => {
-                crate::ui::plugins::draw(frame, area, *index, plugins, opts);
+            Overlay::PluginsPicker {
+                index,
+                plugins,
+                tab,
+                market,
+                query,
+                loading,
+                stale,
+            } => {
+                let view = crate::ui::plugins::PluginsView {
+                    index: *index,
+                    plugins,
+                    tab: *tab,
+                    market,
+                    query,
+                    loading: *loading,
+                    stale: *stale,
+                    source: &state.config.plugins.marketplace,
+                };
+                crate::ui::plugins::draw(frame, area, &view, opts);
             }
             Overlay::Import(import_state) => {
                 crate::ui::import::draw(frame, area, import_state, opts);
