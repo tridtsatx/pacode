@@ -37,28 +37,14 @@ pub fn draw(
         .map(|c| (c.id, c.version, c.kind.clone(), c.stats.clone()))
         .collect();
 
-    let mut cell_lines: Vec<Vec<Line<'static>>> = Vec::with_capacity(cell_snapshots.len() + 1);
-
-    // The header banner lives outside `cells` so a transcript seq can never
-    // collide with it; it is always the first block of lines.
-    if let Some(info) = transcript.header.clone() {
-        cell_lines.push(crate::ui::header::render(&info, width, opts, anim_frame));
-    }
-
-    for (id, version, kind, stats) in &cell_snapshots {
-        let is_live = live_id == Some(*id);
-        let args = CellRenderArgs {
-            cell_id: *id,
-            cell_version: *version,
-            cell_kind: kind,
-            cell_stats: stats.as_deref(),
-            is_live,
-            width,
-            anim_frame,
-        };
-        let lines = get_or_render_cell(args, opts, transcript);
-        cell_lines.push(lines);
-    }
+    let cell_lines = build_cell_lines(
+        transcript,
+        &cell_snapshots,
+        live_id,
+        width,
+        opts,
+        anim_frame,
+    );
 
     let total_lines: usize = cell_lines.iter().map(|l| l.len()).sum();
     let viewport = area.height as usize;
@@ -93,6 +79,74 @@ pub fn draw(
     }
 
     frame.render_widget(Paragraph::new(visible_lines), area);
+}
+
+/// Render every block of the transcript in display order: the header banner
+/// first (it lives outside `cells` so a transcript seq can never collide with
+/// it), then one block per cell.
+fn build_cell_lines(
+    transcript: &mut Transcript,
+    cell_snapshots: &[(u64, u32, CellKind, Option<String>)],
+    live_id: Option<u64>,
+    width: u16,
+    opts: &RenderOptions,
+    anim_frame: u64,
+) -> Vec<Vec<Line<'static>>> {
+    let mut cell_lines: Vec<Vec<Line<'static>>> = Vec::with_capacity(cell_snapshots.len() + 1);
+
+    if let Some(info) = transcript.header.clone() {
+        cell_lines.push(crate::ui::header::render(&info, width, opts, anim_frame));
+    }
+
+    for (id, version, kind, stats) in cell_snapshots {
+        let is_live = live_id == Some(*id);
+        let args = CellRenderArgs {
+            cell_id: *id,
+            cell_version: *version,
+            cell_kind: kind,
+            cell_stats: stats.as_deref(),
+            is_live,
+            width,
+            anim_frame,
+        };
+        cell_lines.push(get_or_render_cell(args, opts, transcript));
+    }
+
+    cell_lines
+}
+
+/// The transcript as plain text, one entry per rendered line, in the same order
+/// and with the same indices the selection uses. Rendering goes through the same
+/// line cache as drawing, so this costs a walk of already-rendered lines.
+pub(crate) fn plain_lines(
+    transcript: &mut Transcript,
+    width: u16,
+    opts: &RenderOptions,
+    anim_frame: u64,
+) -> Vec<String> {
+    let live_id = transcript.live_cell;
+    let cell_snapshots: Vec<(u64, u32, CellKind, Option<String>)> = transcript
+        .cells
+        .iter()
+        .map(|c| (c.id, c.version, c.kind.clone(), c.stats.clone()))
+        .collect();
+    build_cell_lines(
+        transcript,
+        &cell_snapshots,
+        live_id,
+        width,
+        opts,
+        anim_frame,
+    )
+    .into_iter()
+    .flatten()
+    .map(|line| {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    })
+    .collect()
 }
 
 struct CellRenderArgs<'a> {

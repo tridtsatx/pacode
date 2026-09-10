@@ -1,4 +1,11 @@
-//! Screen-coordinate mouse selection state in the dialog area.
+//! Mouse selection in the dialog area, anchored to transcript content.
+//!
+//! Selection used to live in screen coordinates and was copied out of the screen
+//! buffer. That made it wrong the moment the transcript moved: scrolling left the
+//! highlight on the same rows while different text sat under it, and a selection
+//! could never reach further than one screenful. Anchoring both ends to content
+//! line indices fixes both — scrolling now carries the highlight with its text,
+//! and dragging past the edge keeps extending a selection the viewport cannot show.
 
 use std::ops::RangeInclusive;
 
@@ -19,11 +26,20 @@ pub enum CopyRequest {
     Explicit,
 }
 
-/// Active mouse selection state in screen coordinates.
+/// One end of a selection: a column, and the transcript content line it sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub struct Point {
+    /// Index into the transcript's rendered lines, independent of scrolling.
+    pub line: usize,
+    /// Column offset from the left edge of the dialog area.
+    pub col: u16,
+}
+
+/// Active mouse selection, in transcript content coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Selection {
-    pub anchor: (u16, u16),
-    pub head: (u16, u16),
+    pub anchor: Point,
+    pub head: Point,
     pub active: bool,
     pub dragging: bool,
     pub copy_request: CopyRequest,
@@ -48,19 +64,30 @@ impl Selection {
         self.copy_request = CopyRequest::None;
     }
 
-    pub fn start(&mut self, col: u16, row: u16, dialog_rect: Rect) {
-        let (c, r) = clamp_to_rect(col, row, dialog_rect);
-        self.anchor = (c, r);
-        self.head = (c, r);
+    /// Begin a selection at a screen position. `first_visible_line` is the content
+    /// line currently drawn at the top of `dialog_rect`.
+    pub fn start(&mut self, col: u16, row: u16, dialog_rect: Rect, first_visible_line: usize) {
+        let point = point_at(col, row, dialog_rect, first_visible_line);
+        self.anchor = point;
+        self.head = point;
         self.active = true;
         self.dragging = true;
         self.copy_request = CopyRequest::None;
     }
 
-    pub fn drag(&mut self, col: u16, row: u16, dialog_rect: Rect) {
+    /// Move the moving end of the selection to a screen position.
+    pub fn drag(&mut self, col: u16, row: u16, dialog_rect: Rect, first_visible_line: usize) {
         if self.dragging {
-            let (c, r) = clamp_to_rect(col, row, dialog_rect);
-            self.head = (c, r);
+            self.head = point_at(col, row, dialog_rect, first_visible_line);
+        }
+    }
+
+    /// Extend the moving end to a content line directly. Used while the reader
+    /// scrolls with a drag still in progress: the pointer has not moved, but the
+    /// text under it has, and the selection must follow the text.
+    pub fn drag_to_line(&mut self, line: usize, col: u16) {
+        if self.dragging {
+            self.head = Point { line, col };
         }
     }
 
@@ -83,60 +110,45 @@ impl Selection {
         }
     }
 
-    /// Returns normalized start and end: `((start_col, start_row), (end_col, end_row))`
-    /// in reading order (top-to-bottom, left-to-right).
-    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
-        let (a_col, a_row) = self.anchor;
-        let (h_col, h_row) = self.head;
-
-        if a_row < h_row || (a_row == h_row && a_col <= h_col) {
-            ((a_col, a_row), (h_col, h_row))
+    /// Both ends in reading order (top-to-bottom, left-to-right).
+    pub fn normalized(&self) -> (Point, Point) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
         } else {
-            ((h_col, h_row), (a_col, a_row))
+            (self.head, self.anchor)
         }
     }
 
-    /// Returns the selected row range clamped to the dialog rect, if active and non-empty.
-    pub fn row_range(&self, dialog_rect: Rect) -> Option<RangeInclusive<u16>> {
-        if !self.active || self.is_empty() || dialog_rect.width == 0 || dialog_rect.height == 0 {
+    /// Content lines the selection covers, if it covers anything.
+    pub fn line_range(&self) -> Option<RangeInclusive<usize>> {
+        if !self.active || self.is_empty() {
             return None;
         }
-        let ((_, start_row), (_, end_row)) = self.normalized();
-        let min_dialog_row = dialog_rect.y;
-        let max_dialog_row = dialog_rect
-            .y
-            .saturating_add(dialog_rect.height)
-            .saturating_sub(1);
-        let r_start = start_row.max(min_dialog_row);
-        let r_end = end_row.min(max_dialog_row);
-        if r_start <= r_end {
-            Some(r_start..=r_end)
-        } else {
-            None
-        }
+        let (start, end) = self.normalized();
+        Some(start.line..=end.line)
     }
 
-    /// Returns the inclusive column range for a specific row within the dialog rect.
-    pub fn col_range_for_row(&self, row: u16, dialog_rect: Rect) -> Option<RangeInclusive<u16>> {
-        let row_range = self.row_range(dialog_rect)?;
-        if !row_range.contains(&row) {
+    /// Column range selected on `line`, as offsets from the left edge of the
+    /// dialog area. `width` bounds the last column of a fully covered line.
+    pub fn col_range_for_line(&self, line: usize, width: u16) -> Option<RangeInclusive<u16>> {
+        if width == 0 {
             return None;
         }
-        let ((start_col, start_row), (end_col, end_row)) = self.normalized();
-        let dialog_left = dialog_rect.x;
-        let dialog_right = dialog_rect
-            .x
-            .saturating_add(dialog_rect.width)
-            .saturating_sub(1);
+        let range = self.line_range()?;
+        if !range.contains(&line) {
+            return None;
+        }
+        let (start, end) = self.normalized();
+        let last = width - 1;
 
-        let (c_start, c_end) = if start_row == end_row {
-            (start_col.max(dialog_left), end_col.min(dialog_right))
-        } else if row == start_row {
-            (start_col.max(dialog_left), dialog_right)
-        } else if row == end_row {
-            (dialog_left, end_col.min(dialog_right))
+        let (c_start, c_end) = if start.line == end.line {
+            (start.col, end.col.min(last))
+        } else if line == start.line {
+            (start.col, last)
+        } else if line == end.line {
+            (0, end.col.min(last))
         } else {
-            (dialog_left, dialog_right)
+            (0, last)
         };
 
         if c_start <= c_end {
@@ -146,10 +158,19 @@ impl Selection {
         }
     }
 
-    /// Whether a specific (col, row) cell is inside the selection.
-    pub fn contains_cell(&self, col: u16, row: u16, dialog_rect: Rect) -> bool {
-        self.col_range_for_row(row, dialog_rect)
+    /// Whether a content cell is selected.
+    pub fn contains_cell(&self, line: usize, col: u16, width: u16) -> bool {
+        self.col_range_for_line(line, width)
             .is_some_and(|range| range.contains(&col))
+    }
+}
+
+/// The content point under a screen position, clamped into the dialog area.
+fn point_at(col: u16, row: u16, dialog_rect: Rect, first_visible_line: usize) -> Point {
+    let (c, r) = clamp_to_rect(col, row, dialog_rect);
+    Point {
+        line: first_visible_line + (r.saturating_sub(dialog_rect.y)) as usize,
+        col: c.saturating_sub(dialog_rect.x),
     }
 }
 

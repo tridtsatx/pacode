@@ -186,8 +186,8 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
     let dialog_area = Rect::new(0, 0, 60, 20);
 
     // 1. Selection with CopyRequest::Auto
-    state.selection.start(2, 0, dialog_area);
-    state.selection.drag(15, 0, dialog_area);
+    state.selection.start(2, 0, dialog_area, 0);
+    state.selection.drag(15, 0, dialog_area, 0);
     state.selection.finish(); // Sets copy_request = CopyRequest::Auto
     assert_eq!(state.selection.copy_request, CopyRequest::Auto);
 
@@ -224,8 +224,8 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
     assert!(view.contains('╯'));
 
     // 2. Selection with CopyRequest::Explicit
-    state.selection.start(2, 0, dialog_area);
-    state.selection.drag(15, 0, dialog_area);
+    state.selection.start(2, 0, dialog_area, 0);
+    state.selection.drag(15, 0, dialog_area, 0);
     state.selection.finish();
     state.selection.request_explicit_copy(); // Sets copy_request = CopyRequest::Explicit
     assert_eq!(state.selection.copy_request, CopyRequest::Explicit);

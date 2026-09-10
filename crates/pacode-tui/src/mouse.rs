@@ -6,6 +6,31 @@ use crate::keys::{Action, handle_navigate_down, handle_navigate_up};
 use crate::layout::ScreenLayout;
 use crate::state::AppState;
 
+/// Scrolling with the button still held keeps growing the selection: the pointer
+/// has not moved, but different text is under it now, so the moving end is
+/// re-read from the new content line at the pointer.
+fn extend_selection_after_scroll(
+    state: &mut AppState,
+    col: u16,
+    row: u16,
+    dialog: ratatui::layout::Rect,
+) {
+    if !state.selection.dragging {
+        return;
+    }
+    let first = visible_transcript(state).first_visible_line;
+    state.selection.drag(col, row, dialog, first);
+}
+
+/// The transcript the dialog column is showing right now.
+fn visible_transcript(state: &AppState) -> &crate::state::Transcript {
+    if state.agent_replaces_dialog() {
+        &state.panel.agent_transcript
+    } else {
+        &state.transcript
+    }
+}
+
 pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayout) -> Vec<Action> {
     state.dirty = true;
     let col = mouse.column;
@@ -23,13 +48,15 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
         MouseEventKind::Down(MouseButton::Left) => {
             state.selection.clear();
             if layout.dialog.contains((col, row).into()) {
-                state.selection.start(col, row, layout.dialog);
+                let first = visible_transcript(state).first_visible_line;
+                state.selection.start(col, row, layout.dialog, first);
             }
             return vec![];
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if state.selection.dragging {
-                state.selection.drag(col, row, layout.dialog);
+                let first = visible_transcript(state).first_visible_line;
+                state.selection.drag(col, row, layout.dialog, first);
             }
             return vec![];
         }
@@ -49,6 +76,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
                 } else {
                     state.transcript.scroll_by(delta);
                 }
+                extend_selection_after_scroll(state, col, row, layout.dialog);
             } else if layout.input.contains((col, row).into()) {
                 let max_scroll = state
                     .input
@@ -74,6 +102,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
                 } else {
                     state.transcript.scroll_by(delta);
                 }
+                extend_selection_after_scroll(state, col, row, layout.dialog);
                 if state.transcript.is_at_top() && state.can_load_history() {
                     state.transcript.loading_history = true;
                     return vec![Action::LoadHistory];

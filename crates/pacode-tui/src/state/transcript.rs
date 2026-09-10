@@ -84,6 +84,10 @@ pub struct Transcript {
     pub rendered_lines: Option<usize>,
     /// Viewport height recorded by the most recent draw. `None` before first draw.
     pub viewport_height: Option<usize>,
+    /// Index of the content line drawn at the top of the viewport by the most
+    /// recent draw. Selection is anchored to content lines, so this is what maps
+    /// a screen row to the line the reader actually clicked on.
+    pub first_visible_line: usize,
     pub cache: LineCache,
     /// Streaming reveal buffer for the live assistant cell (`live_cell`).
     pub stream: Option<StreamBuffer>,
@@ -107,6 +111,7 @@ impl Transcript {
             scroll_from_bottom: 0,
             rendered_lines: None,
             viewport_height: None,
+            first_visible_line: 0,
             cache: LineCache::new(20_000),
             stream: None,
             live_cell: None,
@@ -421,6 +426,7 @@ impl Transcript {
         self.viewport_height = Some(viewport);
         let max_scroll = total_lines.saturating_sub(viewport);
         self.scroll_from_bottom = self.scroll_from_bottom.min(max_scroll);
+        self.first_visible_line = max_scroll.saturating_sub(self.scroll_from_bottom);
     }
 
     pub fn scroll_by(&mut self, delta: i32) {

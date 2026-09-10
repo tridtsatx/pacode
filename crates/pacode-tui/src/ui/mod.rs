@@ -169,7 +169,18 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             );
         }
 
-        apply_selection_highlight(frame, &state.selection, dialog_area, opts.theme.selected_bg);
+        let first_visible = if state.agent_replaces_dialog() {
+            state.panel.agent_transcript.first_visible_line
+        } else {
+            state.transcript.first_visible_line
+        };
+        apply_selection_highlight(
+            frame,
+            &state.selection,
+            dialog_area,
+            first_visible,
+            opts.theme.selected_bg,
+        );
     }
 
     if let Some(panel_rect) = layout.panel {
@@ -238,7 +249,29 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     state.selection.copy_request = crate::state::selection::CopyRequest::None;
 
     if should_copy && state.selection.is_active() && !state.selection.is_empty() {
-        let text = extract_selection_text(frame.buffer_mut(), &state.selection, dialog_area);
+        let dialog_opts = RenderOptions::with_theme(
+            dialog_area.width,
+            state.config.ui.ascii_only,
+            state.theme.clone(),
+        )
+        .thinking(state.config.ui.thinking);
+        let anim_frame = state.anim_frame;
+        let lines = if state.agent_replaces_dialog() {
+            dialog::plain_lines(
+                &mut state.panel.agent_transcript,
+                dialog_area.width,
+                &dialog_opts,
+                anim_frame,
+            )
+        } else {
+            dialog::plain_lines(
+                &mut state.transcript,
+                dialog_area.width,
+                &dialog_opts,
+                anim_frame,
+            )
+        };
+        let text = extract_selection_text(&lines, &state.selection, dialog_area.width);
         if !text.is_empty() {
             let count = text.chars().count();
             if let Err(e) = crate::clipboard::copy(&text) {
@@ -290,48 +323,71 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     layout
 }
 
+/// Paint the part of the selection that is currently on screen. The selection
+/// itself is in content coordinates, so scrolling moves the highlight with the
+/// text rather than leaving it on the same rows.
 pub(crate) fn apply_selection_highlight(
     frame: &mut Frame,
     selection: &crate::state::Selection,
     dialog_area: Rect,
+    first_visible_line: usize,
     selected_bg: ratatui::style::Style,
 ) {
-    if !selection.is_active() || selection.is_empty() {
+    if !selection.is_active() || selection.is_empty() || dialog_area.width == 0 {
         return;
     }
-    let Some(row_range) = selection.row_range(dialog_area) else {
-        return;
-    };
-    for row in row_range {
-        if let Some(col_range) = selection.col_range_for_row(row, dialog_area) {
-            for col in col_range {
-                if let Some(cell) = frame.buffer_mut().cell_mut((col, row)) {
-                    cell.set_style(cell.style().patch(selected_bg));
-                }
+    for screen_row in 0..dialog_area.height {
+        let line = first_visible_line + screen_row as usize;
+        let Some(col_range) = selection.col_range_for_line(line, dialog_area.width) else {
+            continue;
+        };
+        for col in col_range {
+            let x = dialog_area.x + col;
+            let y = dialog_area.y + screen_row;
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                cell.set_style(cell.style().patch(selected_bg));
             }
         }
     }
 }
 
+/// Upper bound on one copy, so selecting a very long transcript cannot build an
+/// unbounded string in memory. 4 MiB of text is far past any real selection.
+pub const COPY_MAX_CHARS: usize = 4 * 1024 * 1024;
+
+/// The selected text, taken from the transcript's own lines rather than from the
+/// screen buffer, so a selection that runs past the viewport copies in full.
 pub(crate) fn extract_selection_text(
-    buffer: &ratatui::buffer::Buffer,
+    lines: &[String],
     selection: &crate::state::Selection,
-    dialog_area: Rect,
+    width: u16,
 ) -> String {
-    let Some(row_range) = selection.row_range(dialog_area) else {
+    let Some(line_range) = selection.line_range() else {
         return String::new();
     };
-    let mut rows = Vec::new();
-    for row in row_range {
-        if let Some(col_range) = selection.col_range_for_row(row, dialog_area) {
-            let mut row_str = String::new();
-            for col in col_range {
-                if let Some(cell) = buffer.cell((col, row)) {
-                    row_str.push_str(cell.symbol());
-                }
-            }
-            rows.push(row_str.trim_end().to_string());
+    let mut out: Vec<String> = Vec::new();
+    let mut budget = COPY_MAX_CHARS;
+    for line_idx in line_range {
+        let Some(col_range) = selection.col_range_for_line(line_idx, width) else {
+            continue;
+        };
+        let Some(text) = lines.get(line_idx) else {
+            continue;
+        };
+        let start = *col_range.start() as usize;
+        let end = *col_range.end() as usize;
+        let slice: String = text
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start) + 1)
+            .collect();
+        let slice = slice.trim_end().to_string();
+        if slice.chars().count() > budget {
+            out.push(slice.chars().take(budget).collect());
+            break;
         }
+        budget -= slice.chars().count();
+        out.push(slice);
     }
-    rows.join("\n")
+    out.join("\n")
 }

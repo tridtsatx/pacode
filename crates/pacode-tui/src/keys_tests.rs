@@ -1141,8 +1141,8 @@ fn test_default_binding_copy_selection() {
 
     // Make selection active and non-empty
     let rect = ratatui::layout::Rect::new(0, 0, 80, 24);
-    state.selection.start(0, 0, rect);
-    state.selection.drag(5, 0, rect);
+    state.selection.start(0, 0, rect, 0);
+    state.selection.drag(5, 0, rect, 0);
     state.selection.finish();
     assert!(state.selection.is_active() && !state.selection.is_empty());
 
