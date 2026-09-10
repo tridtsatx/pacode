@@ -2813,6 +2813,7 @@ dependencies = [
  "libc",
  "log",
  "pacode-acp",
+ "pacode-auth",
  "pacode-client",
  "pacode-config",
  "pacode-daemon",
@@ -2848,6 +2849,7 @@ name = "pacode-auth"
 version = "0.1.3"
 dependencies = [
  "base64 0.22.1",
+ "dirs",
  "pacode-config",
  "rand 0.9.5",
  "reqwest",
@@ -2857,6 +2859,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "toml",
  "tracing",
  "url",
 ]

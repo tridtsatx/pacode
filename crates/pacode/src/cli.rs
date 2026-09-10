@@ -305,7 +305,22 @@ pub fn parse_model_override(
         .default_route()
         .map(|r| r.provider)
         .or_else(|| config.providers.keys().next().cloned());
-    let known = config.providers.keys().map(String::as_str);
+    // A provider can exist purely because the user logged in to it, with no entry in
+    // config.toml; the daemon synthesizes those, so accept them here too.
+    let logged_in: Vec<String> = pacode_auth::store::AuthStore::load()
+        .map(|store| {
+            pacode_auth::catalog::LOGIN_PROVIDERS
+                .iter()
+                .filter(|p| store.get(p.id).is_some())
+                .map(|p| p.id.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let known = config
+        .providers
+        .keys()
+        .map(String::as_str)
+        .chain(logged_in.iter().map(String::as_str));
     let route = ModelRoute::parse(s, known, default_provider.as_deref())
         .or_else(|| ModelRoute::parse_lossy(s))
         .ok_or_else(|| anyhow::anyhow!("invalid model: {s}"))?;

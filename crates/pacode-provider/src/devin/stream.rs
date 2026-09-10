@@ -5,36 +5,41 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
-use pacode_types::{Effort, ProviderConfig, ProviderDefaults, StopReason, StreamEvent, Usage};
-use serde_json::Value;
+use pacode_types::{
+    CallId, Effort, ProviderConfig, ProviderDefaults, StopReason, StreamEvent, Usage,
+};
 
 use super::connect::ConnectClient;
-use super::wire::{
-    AssignModelRequest, AssignModelResponse, GetChatMessageRequest, GetChatMessageResponse,
-};
+use super::tool_parser::InlineToolCallParser;
+use super::wire::{decode_get_chat_message_response, encode_get_chat_message_request};
 use crate::{CompletionRequest, EventStream, ProviderError};
 
-/// Create an [`EventStream`] decoding Devin Connect JSON values into [`StreamEvent`]s.
+/// Create an [`EventStream`] decoding Devin protobuf frames into [`StreamEvent`]s.
 pub fn create_devin_event_stream(
-    inner: Pin<Box<dyn Stream<Item = Result<Value, ProviderError>> + Send>>,
+    inner: Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>,
     model: String,
 ) -> EventStream {
     struct StreamState {
-        inner: Pin<Box<dyn Stream<Item = Result<Value, ProviderError>> + Send>>,
+        inner: Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>,
         model: String,
+        tool_parser: InlineToolCallParser,
         pending_events: VecDeque<StreamEvent>,
         message_start_emitted: bool,
         message_end_emitted: bool,
         stream_ended: bool,
+        /// Tool calls the server delivered structurally, used to number them.
+        structured_tool_calls: u32,
     }
 
     let initial = StreamState {
         inner,
         model,
+        tool_parser: InlineToolCallParser::new(),
         pending_events: VecDeque::new(),
         message_start_emitted: false,
         message_end_emitted: false,
         stream_ended: false,
+        structured_tool_calls: 0,
     };
 
     let stream = futures::stream::unfold(initial, |mut state| async move {
@@ -48,8 +53,8 @@ pub fn create_devin_event_stream(
             }
 
             match state.inner.next().await {
-                Some(Ok(value)) => {
-                    let resp = match serde_json::from_value::<GetChatMessageResponse>(value) {
+                Some(Ok(bytes)) => {
+                    let resp = match decode_get_chat_message_response(&bytes) {
                         Ok(r) => r,
                         Err(e) => {
                             state.stream_ended = true;
@@ -62,43 +67,85 @@ pub fn create_devin_event_stream(
                         }
                     };
 
-                    let has_content = resp.delta_thinking.as_ref().is_some_and(|t| !t.is_empty())
-                        || resp.delta_text.as_ref().is_some_and(|t| !t.is_empty());
-
-                    if has_content && !state.message_start_emitted {
-                        state.pending_events.push_back(StreamEvent::MessageStart {
-                            model: Some(state.model.clone()),
-                        });
-                        state.message_start_emitted = true;
+                    if let Some(m) = resp.model_name
+                        && !m.is_empty()
+                    {
+                        state.model = m;
                     }
 
                     if let Some(thinking) = resp.delta_thinking
                         && !thinking.is_empty()
                     {
+                        if !state.message_start_emitted {
+                            state.pending_events.push_back(StreamEvent::MessageStart {
+                                model: Some(state.model.clone()),
+                            });
+                            state.message_start_emitted = true;
+                        }
                         state
                             .pending_events
                             .push_back(StreamEvent::ReasoningDelta { text: thinking });
                     }
 
+                    if let Some(call) = resp.tool_call {
+                        if !state.message_start_emitted {
+                            state.pending_events.push_back(StreamEvent::MessageStart {
+                                model: Some(state.model.clone()),
+                            });
+                            state.message_start_emitted = true;
+                        }
+                        let index = state.structured_tool_calls;
+                        state.structured_tool_calls += 1;
+                        state.pending_events.push_back(StreamEvent::ToolCallStart {
+                            index,
+                            id: CallId::generate(),
+                            name: call.name,
+                        });
+                        state
+                            .pending_events
+                            .push_back(StreamEvent::ToolCallArgsDelta {
+                                index,
+                                delta: call.arguments_json,
+                            });
+                    }
+
                     if let Some(text) = resp.delta_text
                         && !text.is_empty()
                     {
-                        state
-                            .pending_events
-                            .push_back(StreamEvent::TextDelta { text });
+                        let parsed_events = state.tool_parser.feed(&text);
+                        for event in parsed_events {
+                            if !state.message_start_emitted {
+                                state.pending_events.push_back(StreamEvent::MessageStart {
+                                    model: Some(state.model.clone()),
+                                });
+                                state.message_start_emitted = true;
+                            }
+                            state.pending_events.push_back(event);
+                        }
                     }
 
                     if let Some(u) = resp.usage {
                         state.pending_events.push_back(StreamEvent::Usage(Usage {
                             input_tokens: u.input_tokens,
                             output_tokens: u.output_tokens,
-                            reasoning_tokens: u.reasoning_tokens,
-                            cache_read_tokens: u.cache_read_input_tokens,
-                            cache_write_tokens: u.cache_creation_input_tokens,
+                            reasoning_tokens: 0,
+                            cache_read_tokens: u.cached_input_tokens,
+                            cache_write_tokens: 0,
                         }));
                     }
 
-                    if let Some(sr) = resp.stop_reason {
+                    if let Some(code) = resp.stop_reason {
+                        let flushed = state.tool_parser.flush();
+                        for event in flushed {
+                            if !state.message_start_emitted {
+                                state.pending_events.push_back(StreamEvent::MessageStart {
+                                    model: Some(state.model.clone()),
+                                });
+                                state.message_start_emitted = true;
+                            }
+                            state.pending_events.push_back(event);
+                        }
+
                         if !state.message_start_emitted {
                             state.pending_events.push_back(StreamEvent::MessageStart {
                                 model: Some(state.model.clone()),
@@ -106,12 +153,18 @@ pub fn create_devin_event_stream(
                             state.message_start_emitted = true;
                         }
 
-                        let stop = match sr.as_str() {
-                            "end_turn" | "stop" | "complete" => StopReason::EndTurn,
-                            "tool_use" | "tool_calls" => StopReason::ToolUse,
-                            "max_tokens" | "length" => StopReason::MaxTokens,
-                            "content_filter" => StopReason::ContentFilter,
-                            other => StopReason::Other(other.to_string()),
+                        let stop = if state.tool_parser.has_tool_calls()
+                            || state.structured_tool_calls > 0
+                            || code == 4
+                            || code == 10
+                        {
+                            StopReason::ToolUse
+                        } else {
+                            match code {
+                                1 | 2 => StopReason::EndTurn,
+                                3 => StopReason::MaxTokens,
+                                other => StopReason::Other(format!("{other}")),
+                            }
                         };
                         state
                             .pending_events
@@ -125,6 +178,17 @@ pub fn create_devin_event_stream(
                 }
                 None => {
                     state.stream_ended = true;
+                    let flushed = state.tool_parser.flush();
+                    for event in flushed {
+                        if !state.message_start_emitted {
+                            state.pending_events.push_back(StreamEvent::MessageStart {
+                                model: Some(state.model.clone()),
+                            });
+                            state.message_start_emitted = true;
+                        }
+                        state.pending_events.push_back(event);
+                    }
+
                     if !state.message_end_emitted {
                         if !state.message_start_emitted {
                             state.pending_events.push_back(StreamEvent::MessageStart {
@@ -132,9 +196,14 @@ pub fn create_devin_event_stream(
                             });
                             state.message_start_emitted = true;
                         }
-                        state.pending_events.push_back(StreamEvent::MessageEnd {
-                            stop: StopReason::EndTurn,
-                        });
+                        let stop = if state.tool_parser.has_tool_calls() {
+                            StopReason::ToolUse
+                        } else {
+                            StopReason::EndTurn
+                        };
+                        state
+                            .pending_events
+                            .push_back(StreamEvent::MessageEnd { stop });
                         state.message_end_emitted = true;
                     }
                 }
@@ -148,6 +217,7 @@ pub fn create_devin_event_stream(
 /// Owned configuration for opening (and reopening) a Devin streaming completion.
 pub struct DevinStreamOpener {
     pub connect_client: ConnectClient,
+    pub session_token: String,
     pub req: CompletionRequest,
     pub defaults: ProviderDefaults,
     pub cfg: ProviderConfig,
@@ -158,7 +228,7 @@ pub struct DevinStreamOpener {
 }
 
 impl DevinStreamOpener {
-    /// Execute AssignModel then GetChatMessage, retrying the connection with backoff.
+    /// Execute GetChatMessage directly, selecting the model via request field 21.
     pub async fn open(&self) -> Result<EventStream, ProviderError> {
         let mut attempt = 0;
         let timeout_secs = self.stream_idle_secs * self.effort.idle_timeout_factor();
@@ -170,36 +240,14 @@ impl DevinStreamOpener {
         };
 
         loop {
-            let assign_req = AssignModelRequest::to_wire(&self.req.model);
-            let assign_result = self
-                .connect_client
-                .unary::<_, AssignModelResponse>(
-                    "/exa.api_server_pb.ApiServerService/AssignModel",
-                    &assign_req,
-                )
-                .await;
-
-            let assign_resp = match assign_result {
-                Ok(resp) => resp,
-                Err(err) => {
-                    if err.is_retryable() && attempt < self.max_retries {
-                        crate::retry::sleep_backoff(attempt, self.backoff_base).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(err);
-                }
-            };
-
-            let jwt = assign_resp.assignment.assignment_jwt;
-            let chat_req =
-                GetChatMessageRequest::to_wire(&jwt, &self.req, &self.defaults, &self.cfg);
+            let req_bytes =
+                encode_get_chat_message_request(&self.session_token, &self.req, &self.cfg);
 
             let stream_result = self
                 .connect_client
                 .server_stream_with_idle_timeout(
                     "/exa.api_server_pb.ApiServerService/GetChatMessage",
-                    &chat_req,
+                    &req_bytes,
                     idle_timeout,
                 )
                 .await;

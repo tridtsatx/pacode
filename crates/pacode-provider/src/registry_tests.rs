@@ -231,7 +231,7 @@ fn test_transport_selection_per_kind() {
     assert!(reg.get("my-anthropic").is_some());
     assert!(reg.get("my-codex").is_some());
 
-    // Devin returns error when explicitly configured because devin transport is guarded
+    // Devin builds like any other transport now that the protocol is implemented.
     let mut devin_providers = BTreeMap::new();
     devin_providers.insert(
         "my-devin".to_string(),
@@ -247,7 +247,11 @@ fn test_transport_selection_per_kind() {
     };
     let devin_res =
         ProviderRegistry::from_config_with_store(&devin_cfg, &BTreeMap::new(), Some(&store));
-    assert!(devin_res.is_err());
+    let devin_reg = devin_res.expect("devin registry builds");
+    assert!(
+        devin_reg.get("my-devin").is_some(),
+        "devin transport is wired"
+    );
 }
 
 #[test]
@@ -373,6 +377,10 @@ async fn test_resolve_refreshes_token_when_changed() {
             extra: serde_json::Map::new(),
         },
     );
+
+    store
+        .save()
+        .expect("persist store so a refresh reads the same file");
 
     let empty_cfg = Config::default();
     let mut reg =

@@ -245,8 +245,9 @@ async fn test_login_emits_progress_events_in_order_and_persists_on_success() {
     let core = build_test_core(paths).await;
     core.set_auth_driver(Arc::new(FakeAuthDriver { fail: false }));
 
-    // Open a session to receive broadcast events
-    let session_id = core
+    // A session is opened only to give the login something to rebuild against; the
+    // events themselves arrive on the daemon-wide channel.
+    let _session_id = core
         .open_session(Attach::New {
             cwd: temp_dir.path().to_path_buf(),
             model: Some(pacode_types::ModelRoute::new("mock", "mock-model")),
@@ -256,7 +257,8 @@ async fn test_login_emits_progress_events_in_order_and_persists_on_success() {
         .await
         .expect("open session");
 
-    let mut event_rx = core.subscribe(&session_id).expect("subscribe");
+    // Login progress is a daemon-wide event: a client sees it without a session.
+    let mut event_rx = core.subscribe_global();
 
     // Capture broadcast events in background
     let received_events = Arc::new(Mutex::new(Vec::new()));
@@ -342,7 +344,7 @@ async fn test_login_failure_emits_failed_stage() {
     let core = build_test_core(paths).await;
     core.set_auth_driver(Arc::new(FakeAuthDriver { fail: true }));
 
-    let session_id = core
+    let _session_id = core
         .open_session(Attach::New {
             cwd: temp_dir.path().to_path_buf(),
             model: Some(pacode_types::ModelRoute::new("mock", "mock-model")),
@@ -352,7 +354,8 @@ async fn test_login_failure_emits_failed_stage() {
         .await
         .expect("open session");
 
-    let mut event_rx = core.subscribe(&session_id).expect("subscribe");
+    // Login progress is a daemon-wide event: a client sees it without a session.
+    let mut event_rx = core.subscribe_global();
     let received_events = Arc::new(Mutex::new(Vec::new()));
     let rec_clone = Arc::clone(&received_events);
 

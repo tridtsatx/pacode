@@ -1,17 +1,18 @@
-//! Devin (devin.ai / Cognition) transport over Connect-RPC.
+//! Devin (devin.ai / Cognition) transport over Connect-RPC with protobuf codec.
 //!
 //! Protocol flow:
 //! 1. `list_models`: calls `/exa.api_server_pb.ApiServerService/GetCliModelConfigs`
-//!    returning `GetCliModelConfigsResponse`. Merges returned model configs with
-//!    statically configured models.
-//! 2. `complete`: first calls `/exa.api_server_pb.ApiServerService/AssignModel`
-//!    to retrieve an `assignment_jwt`, then opens a Connect server stream
-//!    `/exa.api_server_pb.ApiServerService/GetChatMessage` carrying that JWT.
-//!    Decodes `GetChatMessageResponse` frames into [`StreamEvent`] items.
+//!    encoded as `{1 metadata}` and returns repeated model configurations. Merges
+//!    returned models with statically configured ones.
+//! 2. `complete`: calls `/exa.api_server_pb.ApiServerService/GetChatMessage` server stream
+//!    directly (model selected in request field 21). Decodes protobuf frames and detects
+//!    inline tool calls within `delta_text`.
 //! 3. Retries and idle timeouts reuse the crate's backoff and timeout machinery.
 
 pub mod connect;
+pub mod proto;
 pub mod stream;
+pub mod tool_parser;
 pub mod wire;
 
 use std::collections::{BTreeMap, HashSet};
@@ -26,7 +27,9 @@ use pacode_types::{
 pub use connect::{
     CONNECT_FLAG_END_STREAM, ConnectClient, ConnectFrameDecoder, DecodedFrame, encode_connect_frame,
 };
+pub use proto::{ProtoError, Reader, WireType, WireValue, Writer, decode_varint, encode_varint};
 pub use stream::{DevinStreamOpener, create_devin_event_stream, devin_retrying_stream};
+pub use tool_parser::{InlineToolCallParser, find_json_object_end};
 pub use wire::*;
 
 use crate::{CompletionRequest, EventStream, Provider, ProviderError, redact};
@@ -64,12 +67,13 @@ impl IntoOptionString for &str {
     }
 }
 
-/// Devin provider implementation communicating via Connect-RPC.
+/// Devin provider implementation communicating via Connect-RPC with protobuf payloads.
 pub struct Devin {
     id: String,
     cfg: ProviderConfig,
     defaults: ProviderDefaults,
     api_key: String,
+    session_token: String,
     api_server_url: String,
     pricing: BTreeMap<String, Pricing>,
     connect_client: ConnectClient,
@@ -78,17 +82,19 @@ pub struct Devin {
 }
 
 impl Devin {
-    /// Construct a new Devin provider instance.
+    /// Construct a new Devin provider instance with both api_key and session_token.
     pub fn new(
         id: impl Into<String>,
         cfg: ProviderConfig,
         defaults: ProviderDefaults,
         api_key: impl IntoOptionString,
+        session_token: impl IntoOptionString,
         api_server_url: impl IntoOptionString,
         pricing: BTreeMap<String, Pricing>,
     ) -> Result<Self, ProviderError> {
         let id = id.into();
         let api_key = api_key.into_option_string().unwrap_or_default();
+        let session_token = session_token.into_option_string().unwrap_or_default();
         let api_server_url = api_server_url
             .into_option_string()
             .filter(|u| !u.trim().is_empty())
@@ -115,6 +121,7 @@ impl Devin {
             client,
             api_server_url.clone(),
             api_key.clone(),
+            session_token.clone(),
             custom_headers,
         );
 
@@ -123,6 +130,7 @@ impl Devin {
             cfg,
             defaults,
             api_key,
+            session_token,
             api_server_url,
             pricing,
             connect_client,
@@ -143,6 +151,10 @@ impl Devin {
 
     pub fn api_key(&self) -> &str {
         &self.api_key
+    }
+
+    pub fn session_token(&self) -> &str {
+        &self.session_token
     }
 
     pub fn connect_client(&self) -> &ConnectClient {
@@ -171,17 +183,17 @@ impl Devin {
             return Ok(configured_models);
         }
 
-        let req = GetCliModelConfigsRequest::to_wire();
+        let req_bytes = encode_get_cli_model_configs_request(&self.session_token);
         let rpc_result = self
             .connect_client
-            .unary::<_, GetCliModelConfigsResponse>(
+            .unary(
                 "/exa.api_server_pb.ApiServerService/GetCliModelConfigs",
-                &req,
+                &req_bytes,
             )
             .await;
 
-        let response = match rpc_result {
-            Ok(resp) => resp,
+        let resp_bytes = match rpc_result {
+            Ok(b) => b,
             Err(err) => {
                 if !configured_models.is_empty() {
                     let url_redacted = redact(&self.api_server_url);
@@ -195,8 +207,25 @@ impl Devin {
             }
         };
 
+        let response = match decode_get_cli_model_configs_response(&resp_bytes) {
+            Ok(r) => r,
+            Err(err) => {
+                if !configured_models.is_empty() {
+                    let url_redacted = redact(&self.api_server_url);
+                    log::warn!("failed to parse Devin models proto from {url_redacted}: {err}");
+                    if let Ok(mut guard) = self.catalog_cache.lock() {
+                        *guard = Some(configured_models.clone());
+                    }
+                    return Ok(configured_models);
+                }
+                return Err(ProviderError::Malformed(format!(
+                    "failed to parse GetCliModelConfigs response: {err}"
+                )));
+            }
+        };
+
         let mut all_models = configured_models;
-        for model_cfg in response.client_model_configs {
+        for model_cfg in response.models {
             if let Some(uid) = model_cfg.model_uid
                 && !uid.is_empty()
                 && seen.insert(uid.clone())
@@ -208,40 +237,10 @@ impl Devin {
                     info.display_name = dn;
                 }
                 if let Some(cw) = model_cfg.context_window {
-                    info.context_window = Some(cw);
-                }
-                if let Some(r) = model_cfg.supports_reasoning {
-                    info.supports_reasoning = r;
+                    info.context_window = Some(cw as u32);
                 }
                 all_models.push(info);
             }
-        }
-
-        if let Some(sub_uid) = response.subagent_default_model_uid
-            && !sub_uid.is_empty()
-            && seen.insert(sub_uid.clone())
-        {
-            all_models.push(self.model_info(&sub_uid));
-        }
-
-        if let Some(ov_cfg) = response.default_override_model_config
-            && let Some(uid) = ov_cfg.model_uid
-            && !uid.is_empty()
-            && seen.insert(uid.clone())
-        {
-            let mut info = self.model_info(&uid);
-            if let Some(dn) = ov_cfg.display_name
-                && !dn.is_empty()
-            {
-                info.display_name = dn;
-            }
-            if let Some(cw) = ov_cfg.context_window {
-                info.context_window = Some(cw);
-            }
-            if let Some(r) = ov_cfg.supports_reasoning {
-                info.supports_reasoning = r;
-            }
-            all_models.push(info);
         }
 
         if let Ok(mut guard) = self.catalog_cache.lock() {
@@ -262,6 +261,7 @@ impl Provider for Devin {
         let effort = req.effort.unwrap_or(self.defaults.effort);
         let opener = DevinStreamOpener {
             connect_client: self.connect_client.clone(),
+            session_token: self.session_token.clone(),
             req,
             defaults: self.defaults.clone(),
             cfg: self.cfg.clone(),

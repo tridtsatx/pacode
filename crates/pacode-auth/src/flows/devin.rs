@@ -148,6 +148,18 @@ pub async fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> Re
 pub async fn login(
     on_progress: Arc<dyn Fn(Progress) + Send + Sync>,
 ) -> Result<crate::flows::LoginOutcome> {
+    // The official CLI already keeps a working credential on this machine, and its
+    // token exchange is the one part of the flow we could not confirm against live
+    // traffic. Reuse the existing credential when it is there: it is read in place,
+    // never modified, and it makes the login instant and exact.
+    if let Some(account) = crate::import::devin_account("devin-1")? {
+        on_progress(Progress::Exchanging);
+        return Ok(crate::flows::LoginOutcome {
+            provider: "devin".to_string(),
+            account,
+        });
+    }
+
     let pkce = Pkce::generate();
     let state = random_state();
     let listener = crate::callback::bind_callback(None)?;

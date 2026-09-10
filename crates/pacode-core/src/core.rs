@@ -48,6 +48,9 @@ pub struct Core {
     /// Routes `TaskEvent`s to the owning session (injections + UI events).
     pub(crate) task_router: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) cached_mcp_tools: std::sync::Mutex<Option<Vec<Arc<dyn Tool>>>>,
+    /// Events that belong to the daemon rather than to a session (login progress,
+    /// credential changes). A client sees them without attaching to a session.
+    pub(crate) global_events: crate::transcript::EventSink,
 }
 
 impl Core {
@@ -67,6 +70,7 @@ impl Core {
             self_weak: std::sync::OnceLock::new(),
             task_router: std::sync::Mutex::new(None),
             cached_mcp_tools: std::sync::Mutex::new(None),
+            global_events: crate::transcript::EventSink::new(),
         });
 
         let core_weak = Arc::downgrade(&core);
@@ -501,7 +505,7 @@ impl Core {
                             pacode_types::protocol::LoginStage::Exchanging
                         }
                     };
-                    core.broadcast_event(Event::LoginProgress {
+                    core.emit_global(Event::LoginProgress {
                         provider: on_progress_provider.clone(),
                         stage,
                     });
@@ -526,10 +530,10 @@ impl Core {
                             &core.config().providers,
                             &provider_clone,
                         ) {
-                            core.broadcast_event(Event::AuthUpdated(info));
+                            core.emit_global(Event::AuthUpdated(info));
                         }
 
-                        core.broadcast_event(Event::LoginProgress {
+                        core.emit_global(Event::LoginProgress {
                             provider: provider_clone,
                             stage: pacode_types::protocol::LoginStage::Done {
                                 label: outcome.account.label,
@@ -539,7 +543,7 @@ impl Core {
                 }
                 Err(err) => {
                     if let Some(core) = core_weak.upgrade() {
-                        core.broadcast_event(Event::LoginProgress {
+                        core.emit_global(Event::LoginProgress {
                             provider: provider_clone,
                             stage: pacode_types::protocol::LoginStage::Failed { message: err },
                         });
@@ -602,6 +606,17 @@ impl Core {
 
         let providers = crate::auth::build_auth_status(&store, &self.config().providers);
         Reply::AuthStatus { providers }
+    }
+
+    /// Emit a daemon-wide event. Unlike [`Self::broadcast_event`] this reaches every
+    /// connected client, including one that never attached to a session.
+    pub fn emit_global(&self, event: Event) -> u64 {
+        self.global_events.emit(event)
+    }
+
+    /// Subscribe to daemon-wide events.
+    pub fn subscribe_global(&self) -> tokio::sync::broadcast::Receiver<(u64, Event)> {
+        self.global_events.subscribe()
     }
 
     pub fn broadcast_event(&self, event: Event) {

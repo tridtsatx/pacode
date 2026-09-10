@@ -1,22 +1,23 @@
-//! Connect-RPC client transport for Devin API.
+//! Connect-RPC transport for Devin API using protobuf payloads.
 //!
 //! Protocol facts:
 //! - POST `{api_server_url}/{package}.{Service}/{Method}`
-//! - Headers: `content-type: application/json`, `connect-protocol-version: 1`,
-//!   and `authorization: Bearer <api_key>`.
-//! - Unary RPCs return raw JSON responses.
+//! - Headers:
+//!   - `content-type: application/proto` for unary calls
+//!   - `content-type: application/connect+proto` for server-streaming calls
+//!   - `connect-protocol-version: 1`
+//!   - `authorization: Basic {api_key}-{session_token}` (literal dash concatenation, not base64)
+//! - Unary RPCs return raw protobuf bytes.
 //! - Streaming RPCs use Connect 5-byte envelope framing:
 //!   - Byte 0: flags (bit 0x01 = compressed, bit 0x02 = end-of-stream trailer)
 //!   - Bytes 1..5: length (u32 big-endian)
-//!   - Payload: JSON data or trailer with optional error `{"code": ..., "message": ...}`.
+//!   - Payload: protobuf bytes for data frames, JSON `{}` or error for trailer frames.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::ProviderError;
@@ -30,6 +31,7 @@ pub struct ConnectClient {
     client: reqwest::Client,
     api_server_url: String,
     api_key: String,
+    session_token: String,
     custom_headers: Vec<(String, String)>,
 }
 
@@ -38,12 +40,14 @@ impl ConnectClient {
         client: reqwest::Client,
         api_server_url: impl Into<String>,
         api_key: impl Into<String>,
+        session_token: impl Into<String>,
         custom_headers: Vec<(String, String)>,
     ) -> Self {
         Self {
             client,
             api_server_url: api_server_url.into(),
             api_key: api_key.into(),
+            session_token: session_token.into(),
             custom_headers,
         }
     }
@@ -56,21 +60,26 @@ impl ConnectClient {
         &self.api_key
     }
 
+    pub fn session_token(&self) -> &str {
+        &self.session_token
+    }
+
     fn build_url(&self, method: &str) -> String {
         let path = method.strip_prefix('/').unwrap_or(method);
         format!("{}/{}", self.api_server_url.trim_end_matches('/'), path)
     }
 
-    fn prepare_request(&self, url: &str) -> reqwest::RequestBuilder {
+    fn prepare_request(&self, url: &str, content_type: &str) -> reqwest::RequestBuilder {
         let mut builder = self
             .client
             .post(url)
-            .header("content-type", "application/json")
+            .header("content-type", content_type)
             .header("connect-protocol-version", "1");
 
         let key = self.api_key.trim();
-        if !key.is_empty() {
-            builder = builder.header("authorization", format!("Bearer {key}"));
+        let token = self.session_token.trim();
+        if !key.is_empty() || !token.is_empty() {
+            builder = builder.header("authorization", format!("Basic {key}-{token}"));
         }
 
         for (k, v) in &self.custom_headers {
@@ -80,17 +89,13 @@ impl ConnectClient {
         builder
     }
 
-    /// Perform a unary Connect-RPC call.
-    pub async fn unary<Req: Serialize, Resp: DeserializeOwned>(
-        &self,
-        method: &str,
-        body: &Req,
-    ) -> Result<Resp, ProviderError> {
+    /// Perform a unary Connect-RPC call sending and receiving raw protobuf bytes.
+    pub async fn unary(&self, method: &str, body: &[u8]) -> Result<Vec<u8>, ProviderError> {
         let url = self.build_url(method);
-        let req_builder = self.prepare_request(&url);
+        let req_builder = self.prepare_request(&url, "application/proto");
 
         let response = req_builder
-            .json(body)
+            .body(body.to_vec())
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -102,40 +107,28 @@ impl ConnectClient {
             return Err(parse_connect_error(&text, status_u16));
         }
 
-        let text = response
-            .text()
+        let bytes = response
+            .bytes()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        serde_json::from_str::<Resp>(&text).map_err(|e| {
-            ProviderError::Malformed(format!("{method} failed to deserialize response: {e}"))
-        })
-    }
-
-    /// Perform a server-streaming Connect-RPC call without idle timeout.
-    pub async fn server_stream<Req: Serialize>(
-        &self,
-        method: &str,
-        body: &Req,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Value, ProviderError>> + Send>>, ProviderError>
-    {
-        self.server_stream_with_idle_timeout(method, body, None)
-            .await
+        Ok(bytes.to_vec())
     }
 
     /// Perform a server-streaming Connect-RPC call with optional idle timeout.
-    pub async fn server_stream_with_idle_timeout<Req: Serialize>(
+    pub async fn server_stream_with_idle_timeout(
         &self,
         method: &str,
-        body: &Req,
+        body: &[u8],
         idle_timeout: Option<(Duration, u64)>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Value, ProviderError>> + Send>>, ProviderError>
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>, ProviderError>
     {
         let url = self.build_url(method);
-        let req_builder = self.prepare_request(&url);
+        let req_builder = self.prepare_request(&url, "application/connect+proto");
 
+        let framed_body = encode_connect_frame(0x00, body);
         let response = req_builder
-            .json(body)
+            .body(framed_body)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -164,10 +157,10 @@ pub fn encode_connect_frame(flags: u8, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// A decoded Connect frame: either data payload or end-of-stream trailer.
+/// A decoded Connect frame: either data payload bytes or end-of-stream trailer.
 #[derive(Debug)]
 pub enum DecodedFrame {
-    Data(Value),
+    Data(Vec<u8>),
     End { error: Option<ProviderError> },
 }
 
@@ -176,7 +169,7 @@ impl DecodedFrame {
         matches!(self, DecodedFrame::Data(_))
     }
 
-    pub fn data(&self) -> Option<&Value> {
+    pub fn data(&self) -> Option<&[u8]> {
         match self {
             DecodedFrame::Data(v) => Some(v),
             DecodedFrame::End { .. } => None,
@@ -244,6 +237,12 @@ impl ConnectFrameDecoder {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("Connect RPC error");
                                 Some(map_connect_error_code(code, message.to_string(), 200))
+                            } else if let Some(code) = json.get("code").and_then(|v| v.as_str()) {
+                                let message = json
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Connect RPC error");
+                                Some(map_connect_error_code(code, message.to_string(), 200))
                             } else {
                                 None
                             }
@@ -257,10 +256,7 @@ impl ConnectFrameDecoder {
                 };
                 frames.push(DecodedFrame::End { error });
             } else {
-                let value = serde_json::from_slice::<Value>(&payload).map_err(|e| {
-                    ProviderError::Malformed(format!("invalid JSON in Connect frame: {e}"))
-                })?;
-                frames.push(DecodedFrame::Data(value));
+                frames.push(DecodedFrame::Data(payload));
             }
         }
 
@@ -282,7 +278,7 @@ impl ConnectFrameDecoder {
 fn decode_response_stream(
     response: reqwest::Response,
     idle_timeout: Option<(Duration, u64)>,
-) -> Pin<Box<dyn Stream<Item = Result<Value, ProviderError>> + Send>> {
+) -> Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>> {
     struct StreamContext<S> {
         byte_stream: S,
         decoder: ConnectFrameDecoder,
@@ -305,7 +301,7 @@ fn decode_response_stream(
         loop {
             if let Some(frame) = ctx.pending_frames.pop_front() {
                 match frame {
-                    DecodedFrame::Data(value) => return Some((Ok(value), ctx)),
+                    DecodedFrame::Data(bytes) => return Some((Ok(bytes), ctx)),
                     DecodedFrame::End { error } => {
                         ctx.stream_ended = true;
                         if let Some(err) = error {

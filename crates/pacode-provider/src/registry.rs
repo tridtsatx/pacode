@@ -236,10 +236,31 @@ fn build_transport(
             }
         },
         ProviderKind::Devin => {
-            // Devin transport module is guarded because it is not yet available in the crate.
-            Err(ProviderError::Config(format!(
-                "provider '{id}' has kind 'devin', but the devin transport is not yet available"
-            )))
+            // The Devin credential is a pair: the stored key plus the session token the
+            // login handed out. `api_server_url` is per account, so it comes from the
+            // credential rather than from the static config.
+            let (api_key, session_token, api_server_url) = match credential {
+                ResolvedCredential::StoreOAuth(acc) => {
+                    let extra =
+                        |k: &str| acc.extra.get(k).and_then(|v| v.as_str()).map(String::from);
+                    (
+                        Some(acc.access.clone()),
+                        extra("session_token").or_else(|| Some(acc.access.clone())),
+                        extra("api_server_url"),
+                    )
+                }
+                _ => (credential.api_key().map(String::from), None, None),
+            };
+            let provider = crate::devin::Devin::new(
+                id.to_string(),
+                pcfg.clone(),
+                defaults.clone(),
+                api_key,
+                session_token,
+                api_server_url,
+                pricing.clone(),
+            )?;
+            Ok(Arc::new(provider))
         }
     }
 }
@@ -253,6 +274,9 @@ pub struct ProviderRegistry {
     defaults: Arc<RwLock<ProviderDefaults>>,
     pricing: Arc<RwLock<BTreeMap<String, Pricing>>>,
     store_providers: Arc<RwLock<BTreeMap<String, String>>>,
+    /// Credential file the store providers came from, so a refresh reads and writes
+    /// the same file the registry was built from rather than a global default.
+    auth_path: Option<std::path::PathBuf>,
     token_refresher: Option<TokenRefresher>,
 }
 
@@ -270,6 +294,7 @@ impl ProviderRegistry {
             defaults: Arc::new(RwLock::new(ProviderDefaults::default())),
             pricing: Arc::new(RwLock::new(BTreeMap::new())),
             store_providers: Arc::new(RwLock::new(BTreeMap::new())),
+            auth_path: None,
             token_refresher: None,
         }
     }
@@ -299,6 +324,7 @@ impl ProviderRegistry {
 
         let mut all_providers = cfg.providers.clone();
         if let Some(store) = store {
+            registry.auth_path = Some(store.path().to_path_buf());
             synthesize_builtin_providers(&mut all_providers, store);
         }
 
@@ -420,10 +446,10 @@ impl ProviderRegistry {
                     Err(e) => return Err(e),
                 }
             } else {
-                // No test seam installed: go through the auth crate so an expired
-                // OAuth token is refreshed before the turn uses it. A provider whose
-                // credential needs no refresh (api key, devin) returns it unchanged.
-                match pacode_auth::flows::access_token(&route.provider).await {
+                // No seam installed: go through the auth crate so an expired OAuth
+                // token is refreshed before the turn uses it. A credential that needs
+                // no refresh (api key, devin) comes back unchanged.
+                match self.refresh_from_store(&route.provider).await {
                     Ok(token) => Some(token),
                     Err(e) => {
                         return Err(ProviderError::Config(format!(
@@ -452,6 +478,24 @@ impl ProviderRegistry {
         let prov_id = &route.provider;
         self.get(prov_id)
             .ok_or_else(|| ProviderError::Config(format!("unknown provider '{prov_id}'")))
+    }
+
+    /// Refresh the stored credential of `provider` against the credential file this
+    /// registry was built from. A refreshed token is persisted back to that file.
+    async fn refresh_from_store(&self, provider: &str) -> Result<String, String> {
+        match &self.auth_path {
+            Some(path) => {
+                let mut store = AuthStore::load_from(path).map_err(|e| e.to_string())?;
+                let token = pacode_auth::flows::access_token_in(&mut store, provider)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                store.save().map_err(|e| e.to_string())?;
+                Ok(token)
+            }
+            None => pacode_auth::flows::access_token(provider)
+                .await
+                .map_err(|e| e.to_string()),
+        }
     }
 
     pub fn rebuild_provider_with_token(

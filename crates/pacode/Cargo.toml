@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 pacode-types = { workspace = true }
 pacode-config = { workspace = true }
+pacode-auth = { workspace = true }
 pacode-client = { workspace = true }
 pacode-daemon = { workspace = true }
 pacode-tui = { workspace = true }

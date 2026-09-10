@@ -168,6 +168,31 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
     let mut attached_session: Option<SessionId> = None;
     let mut forwarder_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Daemon-wide events (login progress, credential changes) reach this client whether
+    // or not it ever attaches to a session, so `pacode login` sees its own flow.
+    let global_handle = {
+        let mut global_rx = core.subscribe_global();
+        let event_tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match global_rx.recv().await {
+                    Ok((seq, event)) => {
+                        let msg = ServerMessage::Event { seq, event };
+                        if let Ok(mut s) = serde_json::to_string(&msg) {
+                            s.push('\n');
+                            let _ = event_tx.try_send(s);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("global event receiver lagged by {n} events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    };
+
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -323,6 +348,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
     if let Some(handle) = forwarder_handle.take() {
         handle.abort();
     }
+    global_handle.abort();
     log::info!("client {} disconnected", hello.client_id);
     drop(tx);
     let _ = writer_handle.await;
