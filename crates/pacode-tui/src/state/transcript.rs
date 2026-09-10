@@ -178,6 +178,26 @@ impl Transcript {
         self.header_version = self.header_version.wrapping_add(1);
     }
 
+    /// Hand the paced stream over to a different cell.
+    ///
+    /// The buffer belongs to whichever cell is live. Carrying it across a switch
+    /// replayed one cell's undrained tail into the next one, which is how the
+    /// first grapheme of an answer ended up alone in the reasoning cell above it
+    /// while the rest of the sentence went to the answer cell. Anything still
+    /// buffered is flushed into the cell that produced it before the new cell
+    /// starts with an empty buffer.
+    fn set_live_cell(&mut self, seq: u64, now: Instant) {
+        if self.live_cell == Some(seq) {
+            self.stream.get_or_insert_with(|| StreamBuffer::new(now));
+            return;
+        }
+        if self.live_cell.is_some() && self.has_backlog() {
+            self.flush_stream();
+        }
+        self.live_cell = Some(seq);
+        self.stream = Some(StreamBuffer::new(now));
+    }
+
     /// `ItemAdded` / `ItemUpdated`: insert or replace by seq. Assistant/Reasoning items
     /// that are not complete become the live cell with an empty revealed text.
     pub fn upsert(&mut self, item: TranscriptItem, now: Instant) {
@@ -185,17 +205,17 @@ impl Transcript {
         match item.kind {
             TranscriptKind::Assistant { text, complete } => {
                 if !complete {
-                    self.live_cell = Some(seq);
-                    let mut sb = self.stream.take().unwrap_or_else(|| StreamBuffer::new(now));
-                    if !text.is_empty() {
-                        sb.push(StreamKind::Text, &text);
-                    }
-                    self.stream = Some(sb);
                     let kind = TranscriptKind::Assistant {
                         text: String::new(),
                         complete: false,
                     };
                     self.insert_or_replace(seq, kind, item.ts_ms);
+                    self.set_live_cell(seq, now);
+                    if !text.is_empty()
+                        && let Some(sb) = self.stream.as_mut()
+                    {
+                        sb.push(StreamKind::Text, &text);
+                    }
                 } else {
                     if self.live_cell == Some(seq) && self.has_backlog() {
                         self.pending_final = Some(TranscriptItem {
@@ -222,17 +242,17 @@ impl Transcript {
             }
             TranscriptKind::Reasoning { text, complete } => {
                 if !complete {
-                    self.live_cell = Some(seq);
-                    let mut sb = self.stream.take().unwrap_or_else(|| StreamBuffer::new(now));
-                    if !text.is_empty() {
-                        sb.push(StreamKind::Reasoning, &text);
-                    }
-                    self.stream = Some(sb);
                     let kind = TranscriptKind::Reasoning {
                         text: String::new(),
                         complete: false,
                     };
                     self.insert_or_replace(seq, kind, item.ts_ms);
+                    self.set_live_cell(seq, now);
+                    if !text.is_empty()
+                        && let Some(sb) = self.stream.as_mut()
+                    {
+                        sb.push(StreamKind::Reasoning, &text);
+                    }
                 } else {
                     if self.live_cell == Some(seq) && self.has_backlog() {
                         self.pending_final = Some(TranscriptItem {
@@ -285,24 +305,22 @@ impl Transcript {
         if text.is_empty() {
             return;
         }
+        let kind = if reasoning {
+            StreamKind::Reasoning
+        } else {
+            StreamKind::Text
+        };
         if self.live_cell == Some(item_seq) {
             let sb = self.stream.get_or_insert_with(|| StreamBuffer::new(now));
-            let kind = if reasoning {
-                StreamKind::Reasoning
-            } else {
-                StreamKind::Text
-            };
             sb.push(kind, text);
-        } else if let Some(cell) = self.cells.iter_mut().find(|c| c.id == item_seq) {
-            self.live_cell = Some(item_seq);
-            let sb = self.stream.get_or_insert_with(|| StreamBuffer::new(now));
-            let kind = if reasoning {
-                StreamKind::Reasoning
-            } else {
-                StreamKind::Text
-            };
-            sb.push(kind, text);
-            cell.version = cell.version.wrapping_add(1);
+        } else if self.cells.iter().any(|c| c.id == item_seq) {
+            self.set_live_cell(item_seq, now);
+            if let Some(sb) = self.stream.as_mut() {
+                sb.push(kind, text);
+            }
+            if let Some(cell) = self.cells.iter_mut().find(|c| c.id == item_seq) {
+                cell.version = cell.version.wrapping_add(1);
+            }
         }
     }
 
@@ -322,18 +340,16 @@ impl Transcript {
         if let Some(cell) = self.cells.iter_mut().find(|c| c.id == live_id) {
             for op in ops {
                 match op {
-                    StreamOp::Text(s) => match &mut cell.kind {
-                        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+                    // Text only ever reaches the cell that produced it now that
+                    // the buffer is per-cell; a reasoning cell is never rewritten
+                    // into an answer cell mid-stream.
+                    StreamOp::Text(s) => {
+                        if let CellKind::Item(TranscriptKind::Assistant { text, .. }) =
+                            &mut cell.kind
+                        {
                             text.push_str(&s);
                         }
-                        CellKind::Item(TranscriptKind::Reasoning { .. }) => {
-                            cell.kind = CellKind::Item(TranscriptKind::Assistant {
-                                text: s,
-                                complete: false,
-                            });
-                        }
-                        _ => {}
-                    },
+                    }
                     StreamOp::Reasoning(s) => {
                         if let CellKind::Item(TranscriptKind::Reasoning { text, .. }) =
                             &mut cell.kind
@@ -376,18 +392,16 @@ impl Transcript {
         if let Some(cell) = self.cells.iter_mut().find(|c| c.id == live_id) {
             for op in ops {
                 match op {
-                    StreamOp::Text(s) => match &mut cell.kind {
-                        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+                    // Text only ever reaches the cell that produced it now that
+                    // the buffer is per-cell; a reasoning cell is never rewritten
+                    // into an answer cell mid-stream.
+                    StreamOp::Text(s) => {
+                        if let CellKind::Item(TranscriptKind::Assistant { text, .. }) =
+                            &mut cell.kind
+                        {
                             text.push_str(&s);
                         }
-                        CellKind::Item(TranscriptKind::Reasoning { .. }) => {
-                            cell.kind = CellKind::Item(TranscriptKind::Assistant {
-                                text: s,
-                                complete: false,
-                            });
-                        }
-                        _ => {}
-                    },
+                    }
                     StreamOp::Reasoning(s) => {
                         if let CellKind::Item(TranscriptKind::Reasoning { text, .. }) =
                             &mut cell.kind

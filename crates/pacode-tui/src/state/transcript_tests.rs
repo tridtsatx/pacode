@@ -487,3 +487,102 @@ fn test_scroll_down_always_returns_to_bottom() {
     t.scroll_to_bottom();
     assert_eq!(t.scroll_from_bottom, 0);
 }
+
+/// Reasoning and the answer are separate cells fed by one paced stream. When the
+/// live cell moved, the previous cell's undrained tail used to be replayed into
+/// the new cell, which left the first grapheme of the answer stranded in the
+/// reasoning cell above it.
+#[test]
+fn switching_the_live_cell_does_not_move_text_between_cells() {
+    use pacode_types::{AgentId, TranscriptItem, TranscriptKind};
+
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    // Reasoning starts and buffers some text that has not been revealed yet.
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Reasoning {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(1, "weighing the options", true, now);
+
+    // The answer begins before that backlog drained.
+    t.upsert(
+        TranscriptItem {
+            seq: 2,
+            agent: agent.clone(),
+            ts_ms: 1,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(2, "No game running, safe to build.", false, now);
+    t.flush_stream();
+
+    let reasoning = t
+        .cells
+        .iter()
+        .find(|c| c.id == 1)
+        .map(|c| c.kind.clone())
+        .expect("reasoning cell");
+    let answer = t
+        .cells
+        .iter()
+        .find(|c| c.id == 2)
+        .map(|c| c.kind.clone())
+        .expect("answer cell");
+
+    match reasoning {
+        CellKind::Item(TranscriptKind::Reasoning { text, .. }) => {
+            assert_eq!(text, "weighing the options");
+        }
+        other => panic!("the reasoning cell was rewritten: {other:?}"),
+    }
+    match answer {
+        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+            assert_eq!(text, "No game running, safe to build.");
+        }
+        other => panic!("expected an answer cell, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_delta_for_an_unknown_cell_is_ignored_and_leaves_the_live_cell_alone() {
+    use pacode_types::{AgentId, TranscriptItem, TranscriptKind};
+
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    t.upsert(
+        TranscriptItem {
+            seq: 7,
+            agent: AgentId::main(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(7, "hello", false, now);
+    t.push_delta(999, "stray", false, now);
+    t.flush_stream();
+
+    assert_eq!(t.cells.len(), 1);
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, .. }) => assert_eq!(text, "hello"),
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
