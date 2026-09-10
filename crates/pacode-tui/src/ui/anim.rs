@@ -10,8 +10,45 @@ use ratatui::text::{Line, Span};
 use crate::state::activity::{Phase, displayed_secs, format_activity_secs, thinking_color};
 use pacode_render::{Glyphs, RenderOptions, truncate_to_width};
 
-/// Display width of the pacman bar, including its brackets.
+/// Display width of the activity bar, including its brackets.
 const PACMAN_WIDTH: usize = 24;
+
+/// Environment variable that decides which activity bar is drawn, named after
+/// the `pacman.conf` option it is a nod to.
+pub const CANDY_VAR: &str = "ILOVECANDY";
+
+/// Whether the Pac-Man bar is drawn, from the value of [`CANDY_VAR`].
+///
+/// Unset means yes: this is pacode, the candy is the point. `0`, `false`, `no`
+/// and `off` turn it into a plain progress bar for anyone who wants their
+/// terminal quiet.
+pub fn candy_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None => true,
+        Some(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | ""
+        ),
+    }
+}
+
+/// A plain bar of the same width, for when the candy is switched off.
+fn plain_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
+    if width < 3 {
+        return "#".chars().take(width).collect();
+    }
+    let inner = width - 2;
+    let filled = ((frame as usize) % (inner + 1)).min(inner);
+    let full = if glyphs.ascii { '#' } else { '█' };
+    let empty = if glyphs.ascii { '-' } else { '░' };
+    let mut out = String::with_capacity(width);
+    out.push('[');
+    for i in 0..inner {
+        out.push(if i < filled { full } else { empty });
+    }
+    out.push(']');
+    out
+}
 
 /// Pure function generating the pacman progress bar frame.
 ///
@@ -104,7 +141,14 @@ pub fn render_activity_line(
         return Line::from(Span::styled(trunc, text_style));
     }
 
-    let mut spans = pacman_spans(frame, PACMAN_WIDTH, opts);
+    let mut spans = if candy_enabled(std::env::var(CANDY_VAR).ok().as_deref()) {
+        pacman_spans(frame, PACMAN_WIDTH, opts)
+    } else {
+        vec![Span::styled(
+            plain_frame(frame, PACMAN_WIDTH, &opts.glyphs),
+            opts.theme.dim,
+        )]
+    };
     let used_w = PACMAN_WIDTH;
     let tail = format!(" {} · {dur_str}", phase.label(elapsed_ms));
     let avail = max_line_width.saturating_sub(used_w);
@@ -162,6 +206,34 @@ pub fn pacman_interval_ms(backlog_chars: usize, draining: bool) -> u64 {
 mod tests {
     use super::*;
     use pacode_render::display_width;
+
+    #[test]
+    fn candy_is_on_unless_it_is_switched_off() {
+        // Unset, and anything that is not a denial, means candy.
+        assert!(candy_enabled(None));
+        assert!(candy_enabled(Some("true")));
+        assert!(candy_enabled(Some("1")));
+        assert!(candy_enabled(Some("yes")));
+        assert!(candy_enabled(Some("  TRUE  ")));
+
+        for off in ["0", "false", "FALSE", "no", "off", " ", ""] {
+            assert!(!candy_enabled(Some(off)), "{off:?} must switch it off");
+        }
+    }
+
+    #[test]
+    fn the_plain_bar_is_the_same_width_as_the_candy_one() {
+        let glyphs = Glyphs::new(false);
+        for frame in [0, 1, 7, 23, 24, 99] {
+            assert_eq!(display_width(&plain_frame(frame, 24, &glyphs)), 24);
+            assert_eq!(display_width(&pacman_frame(frame, 24, &glyphs)), 24);
+        }
+        let ascii = Glyphs::new(true);
+        assert_eq!(display_width(&plain_frame(3, 24, &ascii)), 24);
+        // It fills as the frame advances, and never past the end.
+        let full = plain_frame(1000, 24, &ascii);
+        assert!(full.starts_with('[') && full.ends_with(']'));
+    }
 
     #[test]
     fn test_pacman_interval_ms() {
