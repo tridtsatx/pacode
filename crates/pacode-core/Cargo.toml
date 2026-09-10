@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
+croner = { version = "4", default-features = false, features = ["chrono"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

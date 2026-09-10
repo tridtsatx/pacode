@@ -22,6 +22,12 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
 
     log::info!("daemon listening on {}", opts.socket.display());
 
+    // One-shot background warm-up of the model catalog
+    let providers_for_warmup = core.providers();
+    tokio::spawn(async move {
+        providers_for_warmup.prefetch().await;
+    });
+
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(DaemonError::Io)?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())

@@ -1,10 +1,14 @@
 //! `ProviderRegistry`: `provider/model` routes → provider instances.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use pacode_types::{Config, ModelInfo, ModelRoute};
 
+use crate::catalog_cache::{
+    CatalogCache, DEFAULT_CATALOG_TTL_SECS, DEFAULT_MAX_MODELS_PER_PROVIDER,
+};
 use crate::openai_compat::OpenAiCompat;
 use crate::{Provider, ProviderError};
 
@@ -16,6 +20,7 @@ mod registry_tests;
 pub struct ProviderRegistry {
     providers: BTreeMap<String, Arc<dyn Provider>>,
     default_route: Option<ModelRoute>,
+    catalog_cache: Arc<CatalogCache>,
 }
 
 impl ProviderRegistry {
@@ -23,6 +28,11 @@ impl ProviderRegistry {
         Self {
             providers: BTreeMap::new(),
             default_route: None,
+            catalog_cache: Arc::new(CatalogCache::new(
+                None,
+                DEFAULT_CATALOG_TTL_SECS,
+                DEFAULT_MAX_MODELS_PER_PROVIDER,
+            )),
         }
     }
 
@@ -34,6 +44,12 @@ impl ProviderRegistry {
         api_keys: &BTreeMap<String, Option<String>>,
     ) -> Result<Self, ProviderError> {
         let mut registry = Self::empty();
+        let cache_path = pacode_config::Paths::discover().catalog_cache_file();
+        registry.catalog_cache = Arc::new(CatalogCache::new(
+            Some(cache_path),
+            cfg.provider.catalog_ttl_secs,
+            DEFAULT_MAX_MODELS_PER_PROVIDER,
+        ));
         for (id, pcfg) in &cfg.providers {
             if pcfg.base_url.trim().is_empty() {
                 return Err(ProviderError::Config(format!(
@@ -52,6 +68,28 @@ impl ProviderRegistry {
         }
         registry.set_default_route(cfg.default_route());
         Ok(registry)
+    }
+
+    pub fn with_catalog_cache(mut self, cache: Arc<CatalogCache>) -> Self {
+        self.catalog_cache = cache;
+        self
+    }
+
+    pub fn catalog_cache(&self) -> Arc<CatalogCache> {
+        Arc::clone(&self.catalog_cache)
+    }
+
+    pub fn set_cache_path(&self, path: PathBuf) {
+        self.catalog_cache.set_cache_path(path);
+    }
+
+    pub fn set_ttl_secs(&self, ttl: u64) {
+        self.catalog_cache.set_ttl_secs(ttl);
+    }
+
+    /// Warm the model catalog in the background.
+    pub async fn prefetch(&self) {
+        let _ = self.list_all_models().await;
     }
 
     pub fn insert(&mut self, provider: Arc<dyn Provider>) {
@@ -89,16 +127,15 @@ impl ProviderRegistry {
         ModelRoute::parse(s, self.ids(), fallback)
     }
 
-    /// Catalog of every provider (errors of one provider are logged and skipped).
+    /// Catalog of every provider (cached immediately; refreshed in background when stale).
     pub async fn list_all_models(&self) -> Vec<ModelInfo> {
         let mut all_models = Vec::new();
         for (id, provider) in &self.providers {
-            match provider.list_models().await {
-                Ok(models) => all_models.extend(models),
-                Err(err) => {
-                    log::warn!("failed to list models for provider '{id}': {err}");
-                }
-            }
+            let models = self
+                .catalog_cache
+                .get_models_for_provider(id, provider)
+                .await;
+            all_models.extend(models);
         }
         all_models
     }

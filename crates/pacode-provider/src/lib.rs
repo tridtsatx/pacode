@@ -9,6 +9,7 @@
 //! - `mock`: `MockProvider` with scripted responses (behind `cfg(any(test, feature = "mock"))`
 //!   and always compiled for downstream tests via the `mock` feature)
 
+pub mod catalog_cache;
 pub mod mock;
 pub mod openai_compat;
 pub mod registry;
@@ -20,6 +21,9 @@ use async_trait::async_trait;
 use futures::Stream;
 use pacode_types::{Effort, Message, ModelInfo, StreamEvent, ToolDefinition};
 
+pub use catalog_cache::{
+    CATALOG_CACHE_VERSION, CatalogCache, DEFAULT_CATALOG_TTL_SECS, DEFAULT_MAX_MODELS_PER_PROVIDER,
+};
 pub use mock::MockProvider;
 pub use openai_compat::{OpenAiCompat, redact};
 pub use registry::ProviderRegistry;
@@ -83,6 +87,10 @@ pub trait Provider: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<EventStream, ProviderError>;
     /// Live catalog (`GET /models`) merged with configured models.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;
+    /// Live catalog fetch, bypassing any provider-internal cache.
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        self.list_models().await
+    }
     /// Static knowledge about a model (context window, reasoning) without a network call.
     fn model_info(&self, model: &str) -> ModelInfo;
 }

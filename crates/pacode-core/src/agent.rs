@@ -69,6 +69,8 @@ pub struct Agent {
     pub turns: Mutex<u32>,
     /// History snapshot as it stood before the current turn began (for turn detach).
     pub history_before_turn: Mutex<Option<History>>,
+    /// Turn-scoped prompt cache (invalidation point: turn start).
+    pub prompt_cache: Mutex<Option<crate::prompt::TurnPromptCache>>,
 }
 
 impl Agent {
@@ -92,6 +94,7 @@ impl Agent {
             prompt: RwLock::new(prompt),
             turns: Mutex::new(0),
             history_before_turn: Mutex::new(None),
+            prompt_cache: Mutex::new(None),
         }
     }
 
@@ -115,6 +118,7 @@ impl Agent {
             prompt: RwLock::new(prompt),
             turns: Mutex::new(0),
             history_before_turn: Mutex::new(None),
+            prompt_cache: Mutex::new(None),
         }
     }
 

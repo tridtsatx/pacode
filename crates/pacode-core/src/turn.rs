@@ -77,59 +77,44 @@ pub async fn run_turn(
     agent.set_status(AgentStatus::Thinking, Some("thinking".to_string()));
     session.events.emit(Event::AgentUpdated(agent.info()));
 
+    // Turn start is the explicit invalidation point for prompt caching
+    let meta = session.meta();
+    let home_config = pacode_config::Paths::discover()
+        .config_file
+        .parent()
+        .map(|d| d.to_path_buf());
+    let prompt_cache = crate::prompt::TurnPromptCache::new(
+        &meta.cwd,
+        home_config.as_deref(),
+        session.config.context.instructions_cap_chars,
+        session.config.context.memory_cap_chars,
+    );
+    *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(prompt_cache.clone());
+
     let mut turn_usage = Usage::default();
 
     loop {
         if cancel.is_cancelled() {
-            agent.set_status(AgentStatus::Idle, None);
-            session.events.emit(Event::AgentUpdated(agent.info()));
-            let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
-            let output_tokens = turn_usage.output_tokens;
-            log::info!(
-                "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
-                session.id,
-                agent.id(),
-                turn_id,
-                duration_ms
-            );
-            let _ = session
-                .plugins
-                .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
-                    duration_ms,
-                    output_tokens,
-                })
-                .await;
-            session.events.emit(Event::TurnEnded {
-                agent: agent.id(),
-                turn: turn_id,
-                usage: Some(turn_usage),
-                stop: TurnStop::Interrupted,
-            });
-            return TurnStop::Interrupted;
+            *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return lifecycle::handle_interrupted(
+                &session,
+                &agent,
+                &turn_id,
+                turn_start_instant,
+                turn_usage,
+            )
+            .await;
         }
-
-        let meta = session.meta();
-        let branch = crate::prompt::git_branch(&meta.cwd);
-        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let home_config = pacode_config::Paths::discover()
-            .config_file
-            .parent()
-            .map(|d| d.to_path_buf());
-        let instructions = crate::prompt::load_instructions(
-            &meta.cwd,
-            home_config.as_deref(),
-            session.config.context.instructions_cap_chars,
-        );
 
         let system_dynamic = {
             let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
             let dyn_ctx = DynamicContext {
                 cwd: &meta.cwd,
-                git_branch: branch.as_deref(),
-                date: &date,
+                git_branch: prompt_cache.git_branch.as_deref(),
+                date: &prompt_cache.date,
                 mode: meta.mode,
                 plan: &plan_guard,
-                instructions: instructions.as_deref(),
+                instructions: prompt_cache.instructions.as_deref(),
                 is_subagent: !agent.id().is_main(),
                 skills: session.skills.skills(),
                 skills_enabled: session.config.skills.enabled,
@@ -255,31 +240,15 @@ pub async fn run_turn(
         turn_usage = outcome.usage;
 
         if outcome.interrupted {
-            agent.set_status(AgentStatus::Idle, None);
-            session.events.emit(Event::AgentUpdated(agent.info()));
-            let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
-            let output_tokens = turn_usage.output_tokens;
-            log::info!(
-                "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
-                session.id,
-                agent.id(),
-                turn_id,
-                duration_ms
-            );
-            let _ = session
-                .plugins
-                .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
-                    duration_ms,
-                    output_tokens,
-                })
-                .await;
-            session.events.emit(Event::TurnEnded {
-                agent: agent.id(),
-                turn: turn_id,
-                usage: Some(turn_usage),
-                stop: TurnStop::Interrupted,
-            });
-            return TurnStop::Interrupted;
+            *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return lifecycle::handle_interrupted(
+                &session,
+                &agent,
+                &turn_id,
+                turn_start_instant,
+                turn_usage,
+            )
+            .await;
         }
 
         let mut content_blocks = Vec::new();
@@ -381,60 +350,16 @@ pub async fn run_turn(
 
         let tool_interrupted =
             tools::execute_tool_calls(&session, &agent, &cancel, outcome.tool_calls).await;
-        if tool_interrupted {
-            agent.set_status(AgentStatus::Idle, None);
-            session.events.emit(Event::AgentUpdated(agent.info()));
-            let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
-            let output_tokens = turn_usage.output_tokens;
-            log::info!(
-                "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
-                session.id,
-                agent.id(),
-                turn_id,
-                duration_ms
-            );
-            let _ = session
-                .plugins
-                .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
-                    duration_ms,
-                    output_tokens,
-                })
-                .await;
-            session.events.emit(Event::TurnEnded {
-                agent: agent.id(),
-                turn: turn_id,
-                usage: Some(turn_usage),
-                stop: TurnStop::Interrupted,
-            });
-            return TurnStop::Interrupted;
-        }
-
-        if cancel.is_cancelled() {
-            agent.set_status(AgentStatus::Idle, None);
-            session.events.emit(Event::AgentUpdated(agent.info()));
-            let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
-            let output_tokens = turn_usage.output_tokens;
-            log::info!(
-                "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
-                session.id,
-                agent.id(),
-                turn_id,
-                duration_ms
-            );
-            let _ = session
-                .plugins
-                .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
-                    duration_ms,
-                    output_tokens,
-                })
-                .await;
-            session.events.emit(Event::TurnEnded {
-                agent: agent.id(),
-                turn: turn_id,
-                usage: Some(turn_usage),
-                stop: TurnStop::Interrupted,
-            });
-            return TurnStop::Interrupted;
+        if tool_interrupted || cancel.is_cancelled() {
+            *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return lifecycle::handle_interrupted(
+                &session,
+                &agent,
+                &turn_id,
+                turn_start_instant,
+                turn_usage,
+            )
+            .await;
         }
 
         let drained = agent.injections.drain();
@@ -459,9 +384,20 @@ pub async fn run_turn(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .estimated_tokens;
-        let context_window = session.config.context.default_context_window;
+        // Spec §6.4: trigger based on last observed usage.input_tokens (or est_tokens if none)
+        // against the active model's context window.
+        let last_input_tokens = if turn_usage.input_tokens > 0 {
+            turn_usage.input_tokens as u32
+        } else {
+            est_tokens
+        };
+        let model_info = provider.model_info(&agent_info.model.model);
+        let context_window = crate::compaction::resolve_context_window(
+            Some(&model_info),
+            session.config.context.default_context_window,
+        );
         let threshold = session.config.context.compaction_threshold;
-        if crate::compaction::needs_compaction(est_tokens, context_window, threshold) {
+        if crate::compaction::needs_compaction(last_input_tokens, context_window, threshold) {
             let _ = crate::compaction::compact(&session, &agent).await;
         }
 
@@ -534,6 +470,8 @@ pub async fn run_turn(
         usage: Some(turn_usage),
         stop: TurnStop::Completed,
     });
+
+    *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     TurnStop::Completed
 }

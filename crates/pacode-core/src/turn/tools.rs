@@ -129,6 +129,12 @@ async fn run_single_tool(
         }
     }
 
+    let tool_opt = agent
+        .tools
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&call.name);
+
     let host = Arc::new(crate::host::SessionHost {
         session: session.clone(),
         agent: agent.id(),
@@ -145,6 +151,8 @@ async fn run_single_tool(
         output_cap_chars: session.config.context.tool_output_cap_chars,
         exec_yield_after: Duration::from_secs(session.config.exec.yield_after_secs),
         exec_default_timeout: Duration::from_secs(session.config.exec.default_timeout_secs),
+        tool_name: Some(call.name.clone()),
+        tool_kind: tool_opt.as_ref().map(|t| t.kind()),
     };
 
     let start = Instant::now();
@@ -167,11 +175,6 @@ async fn run_single_tool(
             ToolStatus::Error,
         )
     } else {
-        let tool_opt = agent
-            .tools
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&call.name);
         match tool_opt {
             Some(tool) => {
                 let call_fut = tool.call(call.input.clone(), &ctx);

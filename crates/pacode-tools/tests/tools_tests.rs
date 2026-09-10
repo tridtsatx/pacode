@@ -199,6 +199,8 @@ fn make_ctx(cwd: PathBuf, host: Arc<dyn ToolHost>) -> ToolCtx {
         output_cap_chars: 16_000,
         exec_yield_after: Duration::from_secs(10),
         exec_default_timeout: Duration::from_secs(30),
+        tool_name: None,
+        tool_kind: None,
     }
 }
 

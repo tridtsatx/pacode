@@ -12,15 +12,26 @@ mod wrap_tests;
 
 /// Display width in terminal cells.
 pub fn display_width(s: &str) -> usize {
-    let mut clean = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if ch == '\t' {
-            clean.push_str("    ");
-        } else if !ch.is_control() {
-            clean.push(ch);
+    let mut total = 0;
+    for g in s.graphemes(true) {
+        if g == "\t" {
+            total += 4;
+        } else if g.chars().all(|ch| ch.is_control()) {
+            continue;
+        } else if g.contains('\u{200D}') {
+            // An emoji ZWJ sequence (e.g. 👩‍💻, 👨‍👩‍👧‍👦) renders as a single 2-cell glyph.
+            total += 2;
+        } else {
+            let mut clean = String::with_capacity(g.len());
+            for ch in g.chars() {
+                if !ch.is_control() {
+                    clean.push(ch);
+                }
+            }
+            total += UnicodeWidthStr::width(clean.as_str());
         }
     }
-    UnicodeWidthStr::width(clean.as_str())
+    total
 }
 
 /// Cut to `width` cells; when `ellipsis` and the text was cut, the last cell(s) show `…`.

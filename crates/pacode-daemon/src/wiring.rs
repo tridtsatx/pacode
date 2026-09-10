@@ -66,6 +66,7 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
 
     let mut providers =
         ProviderRegistry::from_config(&opts.config, &api_keys).map_err(DaemonError::Provider)?;
+    providers.set_cache_path(opts.paths.catalog_cache_file());
 
     if std::env::var("PACODE_MOCK_PROVIDER").is_ok() {
         let mock = MockProvider::new("mock");

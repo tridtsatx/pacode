@@ -102,7 +102,8 @@ pub const DEFAULT_MEMORY_CAP_CHARS: usize = 8000;
 /// Load global (`~/.config/pacode/memory.md`) and project (`<cwd>/.pacode/memory.md`)
 /// memory files, formatted under `# Memory (global)` and `# Memory (project)`.
 /// Missing or empty files are skipped. Total text is capped at `memory_cap_chars`
-/// by truncating oldest lines first (i.e. keeping the tail).
+/// by truncating oldest entries first (i.e. keeping the tail), with a visible marker
+/// consistent with [`pacode_types::truncate_head_tail`].
 pub fn load_memory(
     cwd: &Path,
     home_config: Option<&Path>,
@@ -156,31 +157,30 @@ pub fn load_memory(
         parts.join("\n\n")
     };
 
-    let mut g_start = 0;
-    let mut p_start = 0;
-
-    let mut rendered = render(&g_lines[g_start..], &p_lines[p_start..]);
-    while rendered.chars().count() > memory_cap_chars {
-        if g_start < g_lines.len() {
-            g_start += 1;
-        } else if p_start < p_lines.len() {
-            p_start += 1;
-        } else {
-            break;
-        }
-        rendered = render(&g_lines[g_start..], &p_lines[p_start..]);
+    let full = render(&g_lines, &p_lines);
+    let total_chars = full.chars().count();
+    if total_chars <= memory_cap_chars {
+        return Some(full);
     }
 
-    if rendered.chars().count() > memory_cap_chars {
-        let skip = rendered.chars().count().saturating_sub(memory_cap_chars);
-        rendered = rendered.chars().skip(skip).collect();
+    // When cap is too small to fit the visible marker (consistent with pacode_types::truncate_head_tail),
+    // truncate directly on character boundary keeping the tail.
+    if memory_cap_chars < 64 {
+        let tail: String = full
+            .chars()
+            .skip(total_chars.saturating_sub(memory_cap_chars))
+            .collect();
+        return if tail.is_empty() { None } else { Some(tail) };
     }
 
-    if rendered.is_empty() {
-        None
-    } else {
-        Some(rendered)
-    }
+    // Visible marker consistent with truncate_head_tail format: [... N characters truncated ...]
+    let marker_estimate = format!("[... {total_chars} characters truncated ...]\n\n");
+    let marker_chars = marker_estimate.chars().count();
+    let keep_tail_chars = memory_cap_chars.saturating_sub(marker_chars);
+    let dropped = total_chars.saturating_sub(keep_tail_chars);
+    let marker = format!("[... {dropped} characters truncated ...]\n\n");
+    let tail: String = full.chars().skip(dropped).collect();
+    Some(format!("{marker}{tail}"))
 }
 
 /// Collect `AGENTS.md`, `PACODE.md`, and `CLAUDE.md` from `cwd` up to the filesystem root
@@ -307,228 +307,40 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Turn-scoped prompt cache for expensive or filesystem-backed prompt components.
+/// Initialized at turn start (the explicit invalidation point) and reused across
+/// all steps of a single turn to preserve provider prefix caching and avoid syscalls.
+#[derive(Clone, Debug)]
+pub struct TurnPromptCache {
+    pub git_branch: Option<String>,
+    pub instructions: Option<String>,
+    pub date: String,
+}
 
-    #[test]
-    fn test_load_instructions_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home_config");
-        let parent = tmp.path().join("parent");
-        let child = parent.join("child");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&child).unwrap();
-
-        std::fs::write(home.join("AGENTS.md"), "global agents").unwrap();
-        std::fs::write(home.join("PACODE.md"), "global pacode").unwrap();
-
-        std::fs::write(parent.join("AGENTS.md"), "parent agents").unwrap();
-        std::fs::write(parent.join("PACODE.md"), "parent pacode").unwrap();
-        std::fs::write(parent.join("CLAUDE.md"), "parent claude").unwrap();
-
-        std::fs::write(child.join("AGENTS.md"), "child agents").unwrap();
-        std::fs::write(child.join("PACODE.md"), "child pacode").unwrap();
-        std::fs::write(child.join("CLAUDE.md"), "child claude").unwrap();
-
-        let loaded = load_instructions(&child, Some(&home), 100_000).unwrap();
-
-        let pos_global_agents = loaded.find("global agents").unwrap();
-        let pos_global_pacode = loaded.find("global pacode").unwrap();
-        let pos_parent_agents = loaded.find("parent agents").unwrap();
-        let pos_parent_pacode = loaded.find("parent pacode").unwrap();
-        let pos_parent_claude = loaded.find("parent claude").unwrap();
-        let pos_child_agents = loaded.find("child agents").unwrap();
-        let pos_child_pacode = loaded.find("child pacode").unwrap();
-        let pos_child_claude = loaded.find("child claude").unwrap();
-
-        assert!(pos_global_agents < pos_global_pacode);
-        assert!(pos_global_pacode < pos_parent_agents);
-        assert!(pos_parent_agents < pos_parent_pacode);
-        assert!(pos_parent_pacode < pos_parent_claude);
-        assert!(pos_parent_claude < pos_child_agents);
-        assert!(pos_child_agents < pos_child_pacode);
-        assert!(pos_child_pacode < pos_child_claude);
-    }
-
-    #[test]
-    fn test_load_memory_skipping_missing_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home_config");
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&proj).unwrap();
-
-        // 1. Neither exists -> None
-        assert!(load_memory(&proj, Some(&home), 8000).is_none());
-
-        // 2. Only global exists
-        std::fs::write(home.join("memory.md"), "- global note 1\n- global note 2\n").unwrap();
-        let loaded_global = load_memory(&proj, Some(&home), 8000).unwrap();
-        assert!(loaded_global.starts_with("# Memory (global)"));
-        assert!(loaded_global.contains("- global note 1"));
-        assert!(loaded_global.contains("- global note 2"));
-        assert!(!loaded_global.contains("# Memory (project)"));
-
-        // 3. Only project exists
-        std::fs::remove_file(home.join("memory.md")).unwrap();
-        let proj_pacode = proj.join(".pacode");
-        std::fs::create_dir_all(&proj_pacode).unwrap();
-        std::fs::write(proj_pacode.join("memory.md"), "- proj note 1\n").unwrap();
-        let loaded_proj = load_memory(&proj, Some(&home), 8000).unwrap();
-        assert!(!loaded_proj.contains("# Memory (global)"));
-        assert!(loaded_proj.starts_with("# Memory (project)"));
-        assert!(loaded_proj.contains("- proj note 1"));
-    }
-
-    #[test]
-    fn test_load_memory_capping_keeps_tail() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home_config");
-        let proj = tmp.path().join("proj");
-        let proj_pacode = proj.join(".pacode");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&proj_pacode).unwrap();
-
-        // Global has older notes; project has newer notes
-        std::fs::write(
-            home.join("memory.md"),
-            "- global line 1 (oldest)\n- global line 2\n- global line 3\n",
-        )
-        .unwrap();
-        std::fs::write(
-            proj_pacode.join("memory.md"),
-            "- proj line 1\n- proj line 2 (newest)\n",
-        )
-        .unwrap();
-
-        let full = load_memory(&proj, Some(&home), 8000).unwrap();
-        assert!(full.contains("global line 1"));
-        assert!(full.contains("proj line 2"));
-
-        // Cap to length that drops oldest global line(s)
-        let capped = load_memory(&proj, Some(&home), 90).unwrap();
-        assert!(capped.chars().count() <= 90);
-        // Newest line must be kept
-        assert!(capped.contains("proj line 2 (newest)"));
-        // Oldest global line must be dropped
-        assert!(!capped.contains("global line 1 (oldest)"));
-
-        // Even tighter cap drops all global lines and keeps only project tail
-        let tight = load_memory(&proj, Some(&home), 50).unwrap();
-        assert!(tight.chars().count() <= 50);
-        assert!(!tight.contains("# Memory (global)"));
-        assert!(tight.contains("proj line 2 (newest)"));
-    }
-
-    #[test]
-    fn test_load_instructions_appends_memory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home_config");
-        let proj = tmp.path().join("proj");
-        let proj_pacode = proj.join(".pacode");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&proj_pacode).unwrap();
-
-        std::fs::write(proj.join("AGENTS.md"), "instruction content").unwrap();
-        std::fs::write(home.join("memory.md"), "- remember global").unwrap();
-        std::fs::write(proj_pacode.join("memory.md"), "- remember project").unwrap();
-
-        let loaded = load_instructions(&proj, Some(&home), 10_000).unwrap();
-        assert!(loaded.contains("instruction content"));
-        assert!(loaded.contains("# Memory (global)"));
-        assert!(loaded.contains("- remember global"));
-        assert!(loaded.contains("# Memory (project)"));
-        assert!(loaded.contains("- remember project"));
-
-        let pos_instr = loaded.find("instruction content").unwrap();
-        let pos_global = loaded.find("# Memory (global)").unwrap();
-        let pos_proj = loaded.find("# Memory (project)").unwrap();
-
-        assert!(pos_instr < pos_global);
-        assert!(pos_global < pos_proj);
-    }
-
-    #[test]
-    fn test_system_dynamic_skills_section() {
-        let cwd = std::path::PathBuf::from("/test/cwd");
-        let plan = pacode_types::Plan::default();
-
-        let long_desc = "x".repeat(300);
-        let skills = vec![
-            pacode_skills::Skill {
-                name: "skill-a".to_string(),
-                description: "Description for skill A".to_string(),
-                dir: cwd.join("skills/skill-a"),
-                path: cwd.join("skills/skill-a/SKILL.md"),
-            },
-            pacode_skills::Skill {
-                name: "skill-b".to_string(),
-                description: long_desc,
-                dir: cwd.join("skills/skill-b"),
-                path: cwd.join("skills/skill-b/SKILL.md"),
-            },
-            pacode_skills::Skill {
-                name: "skill-c".to_string(),
-                description: "Skill C should be omitted if max_listed is 2".to_string(),
-                dir: cwd.join("skills/skill-c"),
-                path: cwd.join("skills/skill-c/SKILL.md"),
-            },
-        ];
-
-        // 1. Skills enabled and present
-        let ctx = DynamicContext {
-            cwd: &cwd,
-            git_branch: None,
-            date: "2026-09-09",
-            mode: Mode::Build,
-            plan: &plan,
-            instructions: None,
-            is_subagent: false,
-            skills: &skills,
-            skills_enabled: true,
-            max_listed_skills: 2,
-        };
-        let out = system_dynamic(&ctx);
-        assert!(out.contains("## Skills\n"));
-        assert!(out.contains("- skill-a: Description for skill A\n"));
-        // skill-b description must be capped at 200 chars
-        assert!(out.contains(&format!("- skill-b: {}\n", "x".repeat(200))));
-        assert!(!out.contains(&"x".repeat(201)));
-        // skill-c should not be present because max_listed_skills is 2
-        assert!(!out.contains("- skill-c"));
-
-        // 2. Skills disabled -> emits NOTHING about skills
-        let ctx_disabled = DynamicContext {
-            cwd: &cwd,
-            git_branch: None,
-            date: "2026-09-09",
-            mode: Mode::Build,
-            plan: &plan,
-            instructions: None,
-            is_subagent: false,
-            skills: &skills,
-            skills_enabled: false,
-            max_listed_skills: 10,
-        };
-        let out_disabled = system_dynamic(&ctx_disabled);
-        assert!(!out_disabled.contains("## Skills"));
-        assert!(!out_disabled.contains("skill-a"));
-
-        // 3. Skills empty -> emits NOTHING about skills
-        let ctx_empty = DynamicContext {
-            cwd: &cwd,
-            git_branch: None,
-            date: "2026-09-09",
-            mode: Mode::Build,
-            plan: &plan,
-            instructions: None,
-            is_subagent: false,
-            skills: &[],
-            skills_enabled: true,
-            max_listed_skills: 10,
-        };
-        let out_empty = system_dynamic(&ctx_empty);
-        assert!(!out_empty.contains("## Skills"));
+impl TurnPromptCache {
+    /// Invalidation point: compute fresh values at turn start.
+    pub fn new(
+        cwd: &Path,
+        home_config: Option<&Path>,
+        instructions_cap_chars: usize,
+        memory_cap_chars: usize,
+    ) -> Self {
+        let git_branch = git_branch(cwd);
+        let instructions = load_instructions_with_memory(
+            cwd,
+            home_config,
+            instructions_cap_chars,
+            memory_cap_chars,
+        );
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        Self {
+            git_branch,
+            instructions,
+            date,
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "prompt_tests.rs"]
+mod prompt_tests;

@@ -28,39 +28,44 @@ impl ToolHost for SessionHost {
     /// `WaitingApproval`, awaits the decision (cancel → Deny), emits
     /// `PermissionResolved`, caches `AllowSession`.
     async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
-        let tool_name = {
-            let prefix = draft
-                .title
-                .split(|c: char| c == ':' || c.is_whitespace())
-                .next()
-                .unwrap_or("")
-                .to_lowercase();
+        let (tool_name, kind) = {
             let session_tools = self.session.tools.read().unwrap_or_else(|p| p.into_inner());
-            if session_tools.get(&prefix).is_some() {
-                prefix
-            } else if draft.risk.is_some() {
-                "bash".to_string()
-            } else {
-                prefix
-            }
-        };
 
-        let kind = if draft.risk.is_some() {
-            pacode_tools::ToolKind::Exec
-        } else if let Some(t) = self
-            .session
-            .tools
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&tool_name)
-        {
-            t.kind()
-        } else if tool_name == "bash" {
-            pacode_tools::ToolKind::Exec
-        } else if tool_name == "write" || tool_name == "edit" || tool_name == "multi_edit" {
-            pacode_tools::ToolKind::Edit
-        } else {
-            pacode_tools::ToolKind::ReadOnly
+            let name = if let Some(ref name) = draft.tool_name {
+                name.clone()
+            } else {
+                let prefix = draft
+                    .title
+                    .split(|c: char| c == ':' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                if session_tools.get(&prefix).is_some() {
+                    prefix
+                } else if draft.risk.is_some() {
+                    "bash".to_string()
+                } else {
+                    prefix
+                }
+            };
+
+            let kind = if let Some(k) = draft.tool_kind {
+                k
+            } else if draft.risk.is_some() {
+                pacode_tools::ToolKind::Exec
+            } else if let Some(t) = session_tools.get(&name) {
+                t.kind()
+            } else if name == "bash" {
+                pacode_tools::ToolKind::Exec
+            } else if name == "write" || name == "edit" || name == "multi_edit" {
+                pacode_tools::ToolKind::Edit
+            } else {
+                // Unknown or unclassifiable tool MUST fail closed:
+                // treat as the most restrictive kind so it requires an explicit permission prompt.
+                pacode_tools::ToolKind::Exec
+            };
+
+            (name, kind)
         };
 
         let mode = self.session.meta().mode;
@@ -436,3 +441,7 @@ impl ToolHost for SessionHost {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod host_tests;

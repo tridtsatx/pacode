@@ -17,16 +17,27 @@ pub struct McpTool {
     info: McpToolInfo,
     /// `<server>__<tool>`
     name: String,
+    kind: ToolKind,
 }
 
 impl McpTool {
     pub fn new(pool: Arc<McpPool>, server: String, info: McpToolInfo) -> Self {
+        Self::with_kind(pool, server, info, ToolKind::Exec)
+    }
+
+    pub fn with_kind(
+        pool: Arc<McpPool>,
+        server: String,
+        info: McpToolInfo,
+        kind: ToolKind,
+    ) -> Self {
         let name = pacode_mcp::tool_name(&server, &info.name);
         Self {
             pool,
             server,
             info,
             name,
+            kind,
         }
     }
 }
@@ -82,14 +93,14 @@ impl Tool for McpTool {
         self.info.input_schema.clone()
     }
 
-    /// MCP tools are treated as `Network` (no prompt in Build mode, no edit gate); a
-    /// future manifest annotation may refine this.
+    /// MCP tools default to `ToolKind::Exec` (fail closed: requires permission prompt in
+    /// Build and Auto modes) unless explicitly configured otherwise.
     fn kind(&self) -> ToolKind {
-        ToolKind::Network
+        self.kind
     }
 
-    /// Strips `intent`/`accept_large_output` from the input, calls
-    /// `pool.call(server, tool, args)`, maps `is_error`, caps output.
+    /// Strips `intent`/`accept_large_output` from the input, requests permission,
+    /// calls `pool.call(server, tool, args)`, maps `is_error`, caps output.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let accept_large_output = input
             .get(ACCEPT_LARGE_OUTPUT_KEY)
@@ -101,6 +112,15 @@ impl Tool for McpTool {
             map.remove(INTENT_KEY);
             map.remove(ACCEPT_LARGE_OUTPUT_KEY);
         }
+
+        let title = format!("MCP: {}", self.name);
+        let detail = format!(
+            "Server: {}\nTool: {}\nArguments: {}",
+            self.server,
+            self.info.name,
+            serde_json::to_string_pretty(&args).unwrap_or_else(|_| args.to_string())
+        );
+        ctx.require_permission(title, detail, None).await?;
 
         let result = self
             .pool
@@ -152,7 +172,7 @@ impl Tool for McpResourceTool {
     }
 
     fn kind(&self) -> ToolKind {
-        ToolKind::Network
+        ToolKind::ReadOnly
     }
 
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {

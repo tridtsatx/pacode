@@ -6,6 +6,7 @@ license.workspace = true
 description = "Provider trait, OpenAI-compatible chat completions streaming, model catalog, retries"
 
 [dependencies]
+pacode-config = { workspace = true }
 pacode-types = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
@@ -21,3 +22,4 @@ rand = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

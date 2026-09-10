@@ -124,6 +124,10 @@ impl Paths {
         self.cache_dir.join("mcp")
     }
 
+    pub fn catalog_cache_file(&self) -> PathBuf {
+        self.cache_dir.join("catalog.json")
+    }
+
     pub fn socket_path(&self) -> PathBuf {
         self.runtime_dir.join("daemon.sock")
     }

@@ -8,6 +8,29 @@ use crate::CoreError;
 use crate::agent::Agent;
 use crate::session::Session;
 
+/// Default fallback context window when neither provider nor config specifies one.
+pub const DEFAULT_FALLBACK_CONTEXT_WINDOW: u32 = 128_000;
+
+/// Resolves the effective context window for a model per spec §6.4.
+///
+/// Resolution order:
+/// 1. `model_info.context_window` if present and > 0 (advertised by provider).
+/// 2. `config_default` if > 0 (from `[context].default_context_window`).
+/// 3. [`DEFAULT_FALLBACK_CONTEXT_WINDOW`] (128,000 tokens).
+pub fn resolve_context_window(
+    model_info: Option<&pacode_types::ModelInfo>,
+    config_default: u32,
+) -> u32 {
+    model_info
+        .and_then(|info| info.context_window)
+        .filter(|&w| w > 0)
+        .unwrap_or(if config_default > 0 {
+            config_default
+        } else {
+            DEFAULT_FALLBACK_CONTEXT_WINDOW
+        })
+}
+
 /// True when the last reported input tokens (or the estimate) exceed
 /// `threshold × context_window`.
 pub fn needs_compaction(context_tokens: u32, context_window: u32, threshold: f32) -> bool {
@@ -175,57 +198,5 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pacode_types::{CallId, ContentBlock, Message, Role};
-
-    #[test]
-    fn test_needs_compaction() {
-        assert!(!needs_compaction(500, 1000, 0.8));
-        assert!(!needs_compaction(799, 1000, 0.8));
-        assert!(needs_compaction(800, 1000, 0.8));
-        assert!(needs_compaction(1200, 1000, 0.8));
-        assert!(!needs_compaction(1000, 0, 0.8));
-    }
-
-    #[test]
-    fn test_split_for_compaction_basic() {
-        let msgs: Vec<Arc<Message>> = (0..10)
-            .map(|i| Arc::new(Message::user(format!("msg {i}"))))
-            .collect();
-
-        let (to_summarize, to_keep) = split_for_compaction(&msgs, 4);
-        assert_eq!(to_summarize.len(), 6);
-        assert_eq!(to_keep.len(), 4);
-        assert_eq!(to_summarize[0].text(), "msg 0");
-        assert_eq!(to_keep[0].text(), "msg 6");
-    }
-
-    #[test]
-    fn test_split_for_compaction_keeps_tool_pairs() {
-        let call_id = CallId::generate();
-        let msgs = vec![
-            Arc::new(Message::user("do something")),
-            Arc::new(Message::new(
-                Role::Assistant,
-                vec![ContentBlock::ToolUse {
-                    id: call_id.clone(),
-                    name: "bash".into(),
-                    input: serde_json::json!({"command": "ls"}),
-                }],
-            )),
-            Arc::new(Message::tool_result(call_id, "file1.txt", false)),
-            Arc::new(Message::user("next prompt")),
-        ];
-
-        // If keep_recent = 2, naive cut would be at index 2 (ToolResult),
-        // which would separate ToolUse (index 1) and ToolResult (index 2).
-        // The algorithm must shift cut to 1 so that both ToolUse and ToolResult stay in keep!
-        let (to_summarize, to_keep) = split_for_compaction(&msgs, 2);
-        assert_eq!(to_summarize.len(), 1);
-        assert_eq!(to_summarize[0].text(), "do something");
-        assert_eq!(to_keep.len(), 3);
-        assert_eq!(to_keep[0].role, Role::Assistant);
-        assert_eq!(to_keep[1].role, Role::Tool);
-    }
-}
+#[path = "compaction_tests.rs"]
+mod compaction_tests;

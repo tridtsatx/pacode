@@ -36,6 +36,10 @@ pub struct MockProvider {
     scripts: Mutex<VecDeque<MockResponse>>,
     requests: Mutex<Vec<CompletionRequest>>,
     usage: Usage,
+    models: Mutex<Vec<ModelInfo>>,
+    list_models_calls: std::sync::atomic::AtomicUsize,
+    list_models_delay: Mutex<Option<Duration>>,
+    list_models_error: Mutex<Option<String>>,
 }
 
 impl MockProvider {
@@ -49,7 +53,34 @@ impl MockProvider {
                 output_tokens: 20,
                 ..Usage::default()
             },
+            models: Mutex::new(Vec::new()),
+            list_models_calls: std::sync::atomic::AtomicUsize::new(0),
+            list_models_delay: Mutex::new(None),
+            list_models_error: Mutex::new(None),
         }
+    }
+
+    pub fn set_models(&self, models: Vec<ModelInfo>) {
+        if let Ok(mut guard) = self.models.lock() {
+            *guard = models;
+        }
+    }
+
+    pub fn set_list_models_delay(&self, delay: Duration) {
+        if let Ok(mut guard) = self.list_models_delay.lock() {
+            *guard = Some(delay);
+        }
+    }
+
+    pub fn set_list_models_error(&self, err: Option<String>) {
+        if let Ok(mut guard) = self.list_models_error.lock() {
+            *guard = err;
+        }
+    }
+
+    pub fn list_models_count(&self) -> usize {
+        self.list_models_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn push(&self, response: MockResponse) {
@@ -227,7 +258,26 @@ impl Provider for MockProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(vec![self.model_info("mock-model")])
+        self.list_models_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = self.list_models_delay.lock().ok().and_then(|g| *g);
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
+        if let Some(err) = self.list_models_error.lock().ok().and_then(|g| g.clone()) {
+            return Err(ProviderError::Transport(err));
+        }
+        let custom = self
+            .models
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if custom.is_empty() {
+            Ok(vec![self.model_info("mock-model")])
+        } else {
+            Ok(custom)
+        }
     }
 
     fn model_info(&self, model: &str) -> ModelInfo {

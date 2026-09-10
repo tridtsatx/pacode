@@ -11,6 +11,94 @@ fn display_width_counts_columns() {
 }
 
 #[test]
+fn display_width_combining_marks_and_zwj_sequences() {
+    // Single combining mark on base character occupies 1 cell
+    assert_eq!(display_width("e\u{0301}"), 1);
+    // Multiple combining marks on one base character occupy 1 cell
+    assert_eq!(display_width("a\u{0300}\u{0315}"), 1);
+    // Woman technologist emoji ZWJ sequence occupies 2 cells
+    assert_eq!(display_width("👩‍💻"), 2);
+    // Family emoji ZWJ sequence (4 emojis + 3 ZWJs) occupies 2 cells
+    assert_eq!(display_width("👨‍👩‍👧‍👦"), 2);
+    // Mixed text with emoji ZWJ sequence
+    assert_eq!(display_width("dev: 👩‍💻 done"), 5 + 2 + 5);
+}
+
+#[test]
+fn truncate_to_width_boundary_and_over_width_cases() {
+    // Exactly at width
+    assert_eq!(truncate_to_width("abcde", 5, true), "abcde");
+    assert_eq!(truncate_to_width("abcde", 5, false), "abcde");
+
+    // One cell over width
+    assert_eq!(truncate_to_width("abcdef", 5, true), "abcd…");
+    assert_eq!(truncate_to_width("abcdef", 5, false), "abcde");
+
+    // Token much longer than width
+    assert_eq!(truncate_to_width("abcdefghij", 5, true), "abcd…");
+    assert_eq!(truncate_to_width("abcdefghij", 5, false), "abcde");
+
+    // Wide (CJK) grapheme never placed half over boundary
+    // "你好世界" is 4 CJK chars (2 cells each = 8 cells).
+    // At width 5 with ellipsis (target 4): "你好…" (2+2+1 = 5 cells)
+    assert_eq!(truncate_to_width("你好世界", 5, true), "你好…");
+    // At width 5 without ellipsis: "你好" (4 cells, 3rd char "世" needs cell 5 and 6, so excluded)
+    assert_eq!(truncate_to_width("你好世界", 5, false), "你好");
+    assert!(display_width(&truncate_to_width("你好世界", 5, false)) <= 5);
+    // At width 4 with ellipsis (target 3): "你…" (2+1 = 3 cells, "好" cannot fit in 1 cell)
+    assert_eq!(truncate_to_width("你好世界", 4, true), "你…");
+    assert!(display_width(&truncate_to_width("你好世界", 4, true)) <= 4);
+    // At width 3 with ellipsis (target 2): "你…" (2+1 = 3 cells)
+    assert_eq!(truncate_to_width("你好世界", 3, true), "你…");
+    assert!(display_width(&truncate_to_width("你好世界", 3, true)) <= 3);
+}
+
+#[test]
+fn wrap_line_boundary_and_over_width_cases() {
+    // Line exactly at width (5 cells)
+    let line = Line::from("abcde");
+    let wrapped = wrap_line(line, 5, 0);
+    assert_eq!(wrapped.len(), 1);
+    assert_eq!(wrapped[0].to_string(), "abcde");
+
+    // Token one cell over width (6 cells at width 5)
+    let line = Line::from("abcdef");
+    let wrapped = wrap_line(line, 5, 0);
+    assert_eq!(wrapped.len(), 2);
+    assert_eq!(wrapped[0].to_string(), "abcde");
+    assert_eq!(wrapped[1].to_string(), "f");
+
+    // Token longer than width (10 cells at width 4)
+    let line = Line::from("0123456789");
+    let wrapped = wrap_line(line, 4, 0);
+    assert_eq!(wrapped.len(), 3);
+    assert_eq!(wrapped[0].to_string(), "0123");
+    assert_eq!(wrapped[1].to_string(), "4567");
+    assert_eq!(wrapped[2].to_string(), "89");
+
+    // Wide (CJK) grapheme never placed half over boundary
+    // Line of width 5: "a" (1 cell) + "你好" (4 cells) = 5 cells.
+    // Adding "世界" (4 cells) forces wrap at CJK boundary.
+    let line = Line::from("a你好世界");
+    let wrapped = wrap_line(line, 5, 0);
+    for l in &wrapped {
+        assert!(display_width(&l.to_string()) <= 5);
+    }
+    assert_eq!(wrapped[0].to_string(), "a你好");
+    assert_eq!(wrapped[1].to_string(), "世界");
+}
+
+#[test]
+fn cyrillic_paragraph_at_wide_dialog_area_does_not_break_after_single_char() {
+    let text = "Игры нет — можно собирать полностью. Запускаю clippy и тесты в фоне, параллельно проверяю правила кода.";
+    let line = Line::from(text);
+    let wrapped = wrap_line(line, 120, 0);
+    // At width 120, the whole 105-column paragraph must remain on a single line
+    assert_eq!(wrapped.len(), 1);
+    assert_eq!(wrapped[0].to_string(), text);
+}
+
+#[test]
 fn truncate_to_width_cases() {
     assert_eq!(truncate_to_width("hello", 10, true), "hello");
     assert_eq!(truncate_to_width("hello world", 8, true), "hello w…");

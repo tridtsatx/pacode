@@ -12,11 +12,16 @@ use crate::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, Tool, ToolCtx, ToolError, ToolK
 pub struct PluginTool {
     host: Arc<PluginHost>,
     def: PluginToolDef,
+    kind: ToolKind,
 }
 
 impl PluginTool {
     pub fn new(host: Arc<PluginHost>, def: PluginToolDef) -> Self {
-        Self { host, def }
+        Self::with_kind(host, def, ToolKind::Exec)
+    }
+
+    pub fn with_kind(host: Arc<PluginHost>, def: PluginToolDef, kind: ToolKind) -> Self {
+        Self { host, def, kind }
     }
 }
 
@@ -43,9 +48,10 @@ impl Tool for PluginTool {
         self.def.schema.clone()
     }
 
-    /// Plugin tools are treated as `Network` (safest existing kind matching MCP tools).
+    /// Plugin tools default to `ToolKind::Exec` (fail closed: requires permission prompt in
+    /// Build and Auto modes) unless explicitly configured otherwise.
     fn kind(&self) -> ToolKind {
-        ToolKind::Network
+        self.kind
     }
 
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
@@ -59,6 +65,14 @@ impl Tool for PluginTool {
             map.remove(INTENT_KEY);
             map.remove(ACCEPT_LARGE_OUTPUT_KEY);
         }
+
+        let title = format!("Plugin: {}", self.def.name);
+        let detail = format!(
+            "Plugin: {}\nArguments: {}",
+            self.def.name,
+            serde_json::to_string_pretty(&args).unwrap_or_else(|_| args.to_string())
+        );
+        ctx.require_permission(title, detail, None).await?;
 
         let result = self
             .host

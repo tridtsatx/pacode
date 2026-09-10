@@ -56,6 +56,8 @@ impl Tool for StubBash {
                 title: format!("Bash: {cmd}"),
                 detail: cmd.to_string(),
                 risk: Some(risk),
+                tool_name: Some("bash".to_string()),
+                tool_kind: Some(ToolKind::Exec),
             })
             .await;
         match decision {
@@ -102,6 +104,8 @@ impl Tool for StubWrite {
                 title: format!("Write {path}"),
                 detail: format!("{path}\n{content}"),
                 risk: None,
+                tool_name: Some("write".to_string()),
+                tool_kind: Some(ToolKind::Edit),
             })
             .await;
         match decision {

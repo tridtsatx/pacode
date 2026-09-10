@@ -248,6 +248,111 @@ impl OpenAiCompat {
         }
         model_heuristic_reasoning(model)
     }
+
+    pub fn clear_catalog_cache(&self) {
+        if let Ok(mut guard) = self.catalog_cache.lock() {
+            *guard = None;
+        }
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        let mut configured_models = Vec::new();
+        let mut seen = HashSet::new();
+        for m in &self.cfg.models {
+            if seen.insert(m.id.clone()) {
+                configured_models.push(self.model_info(&m.id));
+            }
+        }
+
+        if !self.cfg.catalog {
+            if let Ok(mut guard) = self.catalog_cache.lock() {
+                *guard = Some(configured_models.clone());
+            }
+            return Ok(configured_models);
+        }
+
+        let url = format!("{}/models", self.cfg.base_url.trim_end_matches('/'));
+        let mut req_builder = self.client.get(&url);
+        if let Some(key) = &self.api_key
+            && !key.is_empty()
+        {
+            req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
+        }
+        for (k, v) in &self.cfg.headers {
+            req_builder = req_builder.header(k, v);
+        }
+
+        let response = match req_builder.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if !configured_models.is_empty() {
+                    let url_redacted = redact(&url);
+                    log::warn!("failed to fetch models from {url_redacted}: {err}");
+                    if let Ok(mut guard) = self.catalog_cache.lock() {
+                        *guard = Some(configured_models.clone());
+                    }
+                    return Ok(configured_models);
+                }
+                return Err(ProviderError::Transport(err.to_string()));
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            let redacted_text = redact(&text);
+            log::trace!("models response body: {redacted_text}");
+            if !configured_models.is_empty() {
+                let url_redacted = redact(&url);
+                log::warn!(
+                    "models endpoint {url_redacted} returned status {status}: {redacted_text}"
+                );
+                if let Ok(mut guard) = self.catalog_cache.lock() {
+                    *guard = Some(configured_models.clone());
+                }
+                return Ok(configured_models);
+            }
+            log::warn!("request failed ({status}): {redacted_text}");
+            return Err(ProviderError::Http {
+                status,
+                message: text,
+            });
+        }
+
+        let json_text = response.text().await.unwrap_or_default();
+        let redacted_json = redact(&json_text);
+        log::trace!("models response body: {redacted_json}");
+        let json_val = match serde_json::from_str::<Value>(&json_text) {
+            Ok(j) => j,
+            Err(err) => {
+                if !configured_models.is_empty() {
+                    let url_redacted = redact(&url);
+                    log::warn!("failed to parse JSON from {url_redacted}: {err}");
+                    if let Ok(mut guard) = self.catalog_cache.lock() {
+                        *guard = Some(configured_models.clone());
+                    }
+                    return Ok(configured_models);
+                }
+                return Err(ProviderError::Malformed(err.to_string()));
+            }
+        };
+
+        let mut all_models = configured_models;
+        if let Some(data) = json_val.get("data").and_then(|v| v.as_array()) {
+            for item in data {
+                if let Some(id) = item.get("id").and_then(|v| v.as_str())
+                    && seen.insert(id.to_string())
+                {
+                    all_models.push(self.model_info(id));
+                }
+            }
+        }
+
+        if let Ok(mut guard) = self.catalog_cache.lock() {
+            *guard = Some(all_models.clone());
+        }
+        Ok(all_models)
+    }
 }
 
 fn model_heuristic_reasoning(model: &str) -> bool {
@@ -641,102 +746,11 @@ impl Provider for OpenAiCompat {
             return Ok(cached.clone());
         }
 
-        let mut configured_models = Vec::new();
-        let mut seen = HashSet::new();
-        for m in &self.cfg.models {
-            if seen.insert(m.id.clone()) {
-                configured_models.push(self.model_info(&m.id));
-            }
-        }
+        self.fetch_models().await
+    }
 
-        if !self.cfg.catalog {
-            if let Ok(mut guard) = self.catalog_cache.lock() {
-                *guard = Some(configured_models.clone());
-            }
-            return Ok(configured_models);
-        }
-
-        let url = format!("{}/models", self.cfg.base_url.trim_end_matches('/'));
-        let mut req_builder = self.client.get(&url);
-        if let Some(key) = &self.api_key
-            && !key.is_empty()
-        {
-            req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
-        }
-        for (k, v) in &self.cfg.headers {
-            req_builder = req_builder.header(k, v);
-        }
-
-        let response = match req_builder.send().await {
-            Ok(resp) => resp,
-            Err(err) => {
-                if !configured_models.is_empty() {
-                    let url_redacted = redact(&url);
-                    log::warn!("failed to fetch models from {url_redacted}: {err}");
-                    if let Ok(mut guard) = self.catalog_cache.lock() {
-                        *guard = Some(configured_models.clone());
-                    }
-                    return Ok(configured_models);
-                }
-                return Err(ProviderError::Transport(err.to_string()));
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            let redacted_text = redact(&text);
-            log::trace!("models response body: {redacted_text}");
-            if !configured_models.is_empty() {
-                let url_redacted = redact(&url);
-                log::warn!(
-                    "models endpoint {url_redacted} returned status {status}: {redacted_text}"
-                );
-                if let Ok(mut guard) = self.catalog_cache.lock() {
-                    *guard = Some(configured_models.clone());
-                }
-                return Ok(configured_models);
-            }
-            log::warn!("request failed ({status}): {redacted_text}");
-            return Err(ProviderError::Http {
-                status,
-                message: text,
-            });
-        }
-
-        let json_text = response.text().await.unwrap_or_default();
-        let redacted_json = redact(&json_text);
-        log::trace!("models response body: {redacted_json}");
-        let json_val = match serde_json::from_str::<Value>(&json_text) {
-            Ok(j) => j,
-            Err(err) => {
-                if !configured_models.is_empty() {
-                    let url_redacted = redact(&url);
-                    log::warn!("failed to parse JSON from {url_redacted}: {err}");
-                    if let Ok(mut guard) = self.catalog_cache.lock() {
-                        *guard = Some(configured_models.clone());
-                    }
-                    return Ok(configured_models);
-                }
-                return Err(ProviderError::Malformed(err.to_string()));
-            }
-        };
-
-        let mut all_models = configured_models;
-        if let Some(data) = json_val.get("data").and_then(|v| v.as_array()) {
-            for item in data {
-                if let Some(id) = item.get("id").and_then(|v| v.as_str())
-                    && seen.insert(id.to_string())
-                {
-                    all_models.push(self.model_info(id));
-                }
-            }
-        }
-
-        if let Ok(mut guard) = self.catalog_cache.lock() {
-            *guard = Some(all_models.clone());
-        }
-        Ok(all_models)
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        self.fetch_models().await
     }
 
     fn model_info(&self, model: &str) -> ModelInfo {

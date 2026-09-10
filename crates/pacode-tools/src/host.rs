@@ -32,9 +32,19 @@ pub struct ToolCtx {
     pub exec_yield_after: Duration,
     /// From `[exec].default_timeout_secs`.
     pub exec_default_timeout: Duration,
+    /// Explicit tool name when called through the runtime.
+    pub tool_name: Option<String>,
+    /// Explicit tool kind when called through the runtime.
+    pub tool_kind: Option<crate::ToolKind>,
 }
 
 impl ToolCtx {
+    /// Attach explicit tool identity to this context.
+    pub fn with_tool(mut self, name: impl Into<String>, kind: crate::ToolKind) -> Self {
+        self.tool_name = Some(name.into());
+        self.tool_kind = Some(kind);
+        self
+    }
     /// Resolve a model-supplied path against the working directory.
     pub fn resolve(&self, path: &Path) -> PathBuf {
         if path.is_absolute() {
@@ -61,6 +71,8 @@ impl ToolCtx {
                 title: title.into(),
                 detail: detail.into(),
                 risk,
+                tool_name: self.tool_name.clone(),
+                tool_kind: self.tool_kind,
             })
             .await;
         match decision {
@@ -78,6 +90,36 @@ pub struct PermissionDraft {
     pub title: String,
     pub detail: String,
     pub risk: Option<RiskLevel>,
+    pub tool_name: Option<String>,
+    pub tool_kind: Option<crate::ToolKind>,
+}
+
+impl PermissionDraft {
+    pub fn new(
+        agent: AgentId,
+        agent_name: impl Into<String>,
+        call_id: CallId,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        risk: Option<RiskLevel>,
+    ) -> Self {
+        Self {
+            agent,
+            agent_name: agent_name.into(),
+            call_id,
+            title: title.into(),
+            detail: detail.into(),
+            risk,
+            tool_name: None,
+            tool_kind: None,
+        }
+    }
+
+    pub fn with_tool(mut self, name: impl Into<String>, kind: crate::ToolKind) -> Self {
+        self.tool_name = Some(name.into());
+        self.tool_kind = Some(kind);
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

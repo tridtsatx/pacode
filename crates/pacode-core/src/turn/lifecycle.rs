@@ -2,11 +2,46 @@
 
 use std::sync::Arc;
 
-use pacode_types::{AgentStatus, Event, Role, TurnStop};
+use pacode_types::{AgentStatus, Event, Role, TurnId, TurnStop, Usage};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
 use crate::session::Session;
+
+/// Handles turn interruption: sets agent to Idle, logs, fires plugin hook and emits TurnEnded.
+pub(crate) async fn handle_interrupted(
+    session: &Arc<Session>,
+    agent: &Arc<Agent>,
+    turn_id: &TurnId,
+    start_instant: std::time::Instant,
+    turn_usage: Usage,
+) -> TurnStop {
+    agent.set_status(AgentStatus::Idle, None);
+    session.events.emit(Event::AgentUpdated(agent.info()));
+    let duration_ms = start_instant.elapsed().as_millis() as u64;
+    let output_tokens = turn_usage.output_tokens;
+    log::info!(
+        "turn end: session={} agent={} turn={} stop=Interrupted duration={}ms",
+        session.id,
+        agent.id(),
+        turn_id,
+        duration_ms
+    );
+    let _ = session
+        .plugins
+        .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
+            duration_ms,
+            output_tokens,
+        })
+        .await;
+    session.events.emit(Event::TurnEnded {
+        agent: agent.id(),
+        turn: turn_id.clone(),
+        usage: Some(turn_usage),
+        stop: TurnStop::Interrupted,
+    });
+    TurnStop::Interrupted
+}
 
 /// Surface a turn failure in the transcript (error notice item) so clients and
 /// `pacode run` see why nothing happened.
