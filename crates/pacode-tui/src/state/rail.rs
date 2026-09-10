@@ -7,6 +7,11 @@ use pacode_types::{AgentId, AgentInfo, Plan, TaskId, TaskInfo, UsageTotals};
 #[derive(Default)]
 pub struct RailState {
     pub plan: Plan,
+    /// Scheduled prompts of this session, newest first in creation order.
+    pub cron_jobs: Vec<pacode_types::CronJob>,
+    /// Condition watchers of this session; terminal ones are kept until the next
+    /// turn so the reader sees what fired.
+    pub monitors: Vec<pacode_types::MonitorInfo>,
     /// Sorted by start time, order never changes while displayed (spec §4.3).
     pub agents: Vec<AgentInfo>,
     pub tasks: Vec<TaskInfo>,
@@ -31,6 +36,57 @@ impl RailState {
                 self.agents.sort_by_key(|a| a.started_at_ms);
             }
         }
+    }
+
+    pub fn upsert_cron_job(&mut self, job: pacode_types::CronJob) {
+        match self.cron_jobs.iter_mut().find(|j| j.id == job.id) {
+            Some(existing) => *existing = job,
+            None => {
+                self.cron_jobs.push(job);
+                self.cron_jobs.sort_by_key(|j| j.created_at_ms);
+            }
+        }
+    }
+
+    pub fn remove_cron_job(&mut self, id: &pacode_types::CronJobId) {
+        self.cron_jobs.retain(|j| &j.id != id);
+    }
+
+    pub fn upsert_monitor(&mut self, info: pacode_types::MonitorInfo) {
+        match self.monitors.iter_mut().find(|m| m.id == info.id) {
+            Some(existing) => *existing = info,
+            None => {
+                self.monitors.push(info);
+                self.monitors.sort_by_key(|m| m.started_at_ms);
+            }
+        }
+    }
+
+    /// How long until a countdown on screen would change, in milliseconds.
+    ///
+    /// The rail shows seconds under a minute and whole minutes above it, so a
+    /// distant job needs one redraw a minute rather than sixty. `None` means
+    /// nothing on screen counts down and no tick is needed at all.
+    pub fn schedule_tick_ms(&self, now_ms: u64) -> Option<u64> {
+        let next = self
+            .cron_jobs
+            .iter()
+            .filter(|j| j.enabled)
+            .filter_map(|j| j.due_in_ms(now_ms))
+            .min()?;
+        if next <= 60_000 {
+            // Second resolution: wake on the next whole second of the countdown.
+            Some(next % 1000 + 1)
+        } else {
+            // Minute resolution: wake when the displayed minute changes.
+            Some(next % 60_000 + 1)
+        }
+    }
+
+    /// Cron jobs and monitors worth a row: enabled jobs, and monitors still
+    /// watching or freshly fired.
+    pub fn has_schedule_rows(&self) -> bool {
+        self.cron_jobs.iter().any(|j| j.enabled) || self.monitors.iter().any(|m| m.status.is_live())
     }
 
     pub fn upsert_task(&mut self, info: TaskInfo) {

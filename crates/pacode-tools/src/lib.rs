@@ -6,6 +6,7 @@ pub mod builtin;
 pub mod host;
 pub mod output;
 pub mod registry;
+pub mod test_support;
 
 pub use builtin::{builtin_tools, subagent_tool_names};
 pub use host::{AgentSpec, ToolCtx, ToolHost, WaitOutcome};

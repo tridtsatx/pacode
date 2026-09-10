@@ -69,3 +69,93 @@ fn the_idle_debounce_keeps_the_tick_armed_until_it_completes() {
     assert!(!rail.show_session_stats);
     assert!(!rail.idle_debounce_pending());
 }
+
+#[test]
+fn the_schedule_countdown_ticks_at_the_resolution_it_shows() {
+    use pacode_types::{CronJob, CronJobId, CronSchedule};
+
+    let mut rail = RailState::default();
+    // Nothing scheduled: no tick at all.
+    assert_eq!(rail.schedule_tick_ms(1_000), None);
+
+    let mut job = CronJob {
+        id: CronJobId::new("cron_1"),
+        name: "nightly".to_string(),
+        schedule: CronSchedule::every(3600),
+        prompt: "x".to_string(),
+        enabled: true,
+        created_at_ms: 0,
+        last_run_ms: None,
+        next_run_ms: Some(100_000),
+        last_status: None,
+    };
+    rail.upsert_cron_job(job.clone());
+
+    // Far away: the rail shows whole minutes, so one wake a minute is enough.
+    let tick = rail.schedule_tick_ms(0).expect("tick");
+    assert!(tick <= 60_000, "a distant job must not tick every second");
+
+    // Inside the last minute the countdown shows seconds.
+    job.next_run_ms = Some(30_400);
+    rail.upsert_cron_job(job.clone());
+    let tick = rail.schedule_tick_ms(0).expect("tick");
+    assert!(tick <= 1_000, "a near job ticks per second: {tick}");
+
+    // A disabled job counts down to nothing and needs no tick.
+    job.enabled = false;
+    rail.upsert_cron_job(job);
+    assert_eq!(rail.schedule_tick_ms(0), None);
+}
+
+#[test]
+fn cron_jobs_and_monitors_are_upserted_by_id() {
+    use pacode_types::{
+        CronJob, CronJobId, CronSchedule, MonitorCondition, MonitorId, MonitorInfo, MonitorStatus,
+    };
+
+    let mut rail = RailState::default();
+    let job = CronJob {
+        id: CronJobId::new("cron_1"),
+        name: "first".to_string(),
+        schedule: CronSchedule::every(60),
+        prompt: "x".to_string(),
+        enabled: true,
+        created_at_ms: 10,
+        last_run_ms: None,
+        next_run_ms: Some(70),
+        last_status: None,
+    };
+    rail.upsert_cron_job(job.clone());
+    let mut renamed = job.clone();
+    renamed.name = "renamed".to_string();
+    rail.upsert_cron_job(renamed);
+    assert_eq!(rail.cron_jobs.len(), 1);
+    assert_eq!(rail.cron_jobs[0].name, "renamed");
+    assert!(rail.has_schedule_rows());
+
+    rail.remove_cron_job(&CronJobId::new("cron_1"));
+    assert!(rail.cron_jobs.is_empty());
+    assert!(!rail.has_schedule_rows());
+
+    let monitor = MonitorInfo {
+        id: MonitorId::new("mon_1"),
+        label: "build".to_string(),
+        condition: MonitorCondition::FileExists {
+            path: "done".to_string(),
+        },
+        poll_interval_secs: 5,
+        started_at_ms: 0,
+        status: MonitorStatus::Watching,
+        last_check_ms: None,
+        fired_at_ms: None,
+    };
+    rail.upsert_monitor(monitor.clone());
+    assert!(rail.has_schedule_rows());
+
+    let mut fired = monitor;
+    fired.status = MonitorStatus::Fired;
+    rail.upsert_monitor(fired);
+    assert_eq!(rail.monitors.len(), 1);
+    // A monitor that fired is no longer waiting for anything.
+    assert!(!rail.has_schedule_rows());
+}

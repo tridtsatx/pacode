@@ -300,6 +300,92 @@ impl Core {
                 let models = self.providers().list_all_models().await;
                 Reply::Models { models }
             }
+            Request::ListCronJobs => Reply::CronJobs {
+                jobs: session.scheduler.jobs(),
+            },
+            Request::AddCronJob {
+                name,
+                schedule,
+                prompt,
+            } => match session.scheduler.add_job(
+                name,
+                schedule,
+                prompt,
+                pacode_types::time::now_ms(),
+            ) {
+                Ok(job) => {
+                    if let Err(e) = session.store.upsert_cron_job(&session.id, &job).await {
+                        log::warn!("failed to persist cron job {}: {e}", job.id);
+                    }
+                    session.events.emit(Event::CronUpdated(job));
+                    Reply::CronJobs {
+                        jobs: session.scheduler.jobs(),
+                    }
+                }
+                Err(e) => Reply::Error {
+                    message: e.to_string(),
+                },
+            },
+            Request::RemoveCronJob(id) => match session.scheduler.remove_job(&id) {
+                Ok(()) => {
+                    if let Err(e) = session.store.delete_cron_job(&id).await {
+                        log::warn!("failed to delete cron job {id}: {e}");
+                    }
+                    session.events.emit(Event::CronRemoved(id));
+                    Reply::CronJobs {
+                        jobs: session.scheduler.jobs(),
+                    }
+                }
+                Err(e) => Reply::Error {
+                    message: e.to_string(),
+                },
+            },
+            Request::SetCronEnabled { id, enabled } => {
+                match session
+                    .scheduler
+                    .set_enabled(&id, enabled, pacode_types::time::now_ms())
+                {
+                    Ok(job) => {
+                        if let Err(e) = session.store.upsert_cron_job(&session.id, &job).await {
+                            log::warn!("failed to persist cron job {}: {e}", job.id);
+                        }
+                        session.events.emit(Event::CronUpdated(job));
+                        Reply::CronJobs {
+                            jobs: session.scheduler.jobs(),
+                        }
+                    }
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Request::RunCronJobNow(id) => {
+                match session.scheduler.run_now(&id, pacode_types::time::now_ms()) {
+                    Ok(job) => {
+                        session.events.emit(Event::CronUpdated(job));
+                        Reply::CronJobs {
+                            jobs: session.scheduler.jobs(),
+                        }
+                    }
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Request::ListMonitors => Reply::Monitors {
+                monitors: session.scheduler.monitors(),
+            },
+            Request::StopMonitor(id) => match session.scheduler.stop_monitor(&id) {
+                Ok(info) => {
+                    session.events.emit(Event::MonitorUpdated(info));
+                    Reply::Monitors {
+                        monitors: session.scheduler.monitors(),
+                    }
+                }
+                Err(e) => Reply::Error {
+                    message: e.to_string(),
+                },
+            },
             Request::Compact => {
                 if let Some(main) = session.main_agent() {
                     match crate::compaction::compact(&session, &main).await {

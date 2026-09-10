@@ -37,9 +37,26 @@ pub struct Session {
     pub plugins: Arc<pacode_plugin::PluginHost>,
     pub app_version: String,
     pub skills: Arc<pacode_skills::SkillRegistry>,
+    /// Cron jobs and monitors of this session. Dropping the session stops them.
+    pub scheduler: Arc<crate::schedule::Scheduler>,
 }
 
 impl Session {
+    /// Tell the main agent that a monitor it started has fired. Injections reach
+    /// the model between steps, never mid-stream (spec §6.2).
+    pub fn inject_monitor_fired(&self, monitor: &pacode_types::MonitorInfo) {
+        let Some(main) = self.main_agent() else {
+            return;
+        };
+        let text = format!(
+            "Monitor {} fired: {}",
+            monitor.label,
+            monitor.condition.describe()
+        );
+        main.injections
+            .push(crate::inject::Injection::SystemNotice(text));
+    }
+
     pub fn main_agent(&self) -> Option<Arc<Agent>> {
         self.agents.read().ok()?.get(&AgentId::main()).cloned()
     }
@@ -573,6 +590,8 @@ impl Session {
         let seq = self.events.last_seq();
 
         SessionSnapshot {
+            cron_jobs: self.scheduler.jobs(),
+            monitors: self.scheduler.monitors(),
             meta,
             agents,
             plan,

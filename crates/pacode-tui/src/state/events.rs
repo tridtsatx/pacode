@@ -258,6 +258,18 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             // single report; a toast on top of it was the same text twice.
             state.rail.upsert_task(info);
         }
+        Event::CronUpdated(job) => {
+            state.rail.upsert_cron_job(job);
+            state.dirty = true;
+        }
+        Event::CronRemoved(id) => {
+            state.rail.remove_cron_job(&id);
+            state.dirty = true;
+        }
+        Event::MonitorUpdated(info) => {
+            state.rail.upsert_monitor(info);
+            state.dirty = true;
+        }
         Event::UsageUpdated(usage) => {
             state.rail.usage = usage;
         }

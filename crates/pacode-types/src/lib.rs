@@ -7,10 +7,12 @@
 
 pub mod at_ref;
 pub mod config;
+pub mod cron_expr;
 pub mod ids;
 pub mod message;
 pub mod model;
 pub mod protocol;
+pub mod schedule;
 pub mod state;
 pub mod stream;
 pub mod time;
@@ -22,6 +24,7 @@ pub use ids::*;
 pub use message::*;
 pub use model::*;
 pub use protocol::*;
+pub use schedule::*;
 pub use state::*;
 pub use stream::*;
 pub use time::now_ms;

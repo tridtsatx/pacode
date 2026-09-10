@@ -10,8 +10,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, PermissionId, SessionId, TaskId, TurnId};
+use crate::ids::{
+    AgentId, ClientId, CronJobId, MonitorId, PermissionId, SessionId, TaskId, TurnId,
+};
 use crate::model::{Effort, ModelInfo, ModelRoute};
+use crate::schedule::{CronJob, CronSchedule, MonitorInfo};
 use crate::state::{
     AgentInfo, Mode, PermissionDecision, PermissionRequest, Plan, SessionMeta, TaskInfo,
     ToastLevel, UsageTotals,
@@ -121,6 +124,24 @@ pub enum Request {
         name: String,
         args: String,
     },
+    /// Cron jobs of the attached session (`Reply::CronJobs`).
+    ListCronJobs,
+    /// Register a scheduled prompt (`Reply::CronJobs` with the new job appended).
+    AddCronJob {
+        name: String,
+        schedule: CronSchedule,
+        prompt: String,
+    },
+    RemoveCronJob(CronJobId),
+    SetCronEnabled {
+        id: CronJobId,
+        enabled: bool,
+    },
+    /// Fire a job outside its schedule (`Reply::Ok`).
+    RunCronJobNow(CronJobId),
+    /// Monitors of the attached session (`Reply::Monitors`).
+    ListMonitors,
+    StopMonitor(MonitorId),
 }
 
 /// One MCP server as shown in the `/mcp` picker.
@@ -181,6 +202,12 @@ pub struct SessionSnapshot {
     pub has_more_history: bool,
     pub pending_permissions: Vec<PermissionRequest>,
     pub turn_active: bool,
+    /// Cron jobs of this session, with `next_run_ms` already computed.
+    #[serde(default)]
+    pub cron_jobs: Vec<CronJob>,
+    /// Live and terminal monitors of this session (in memory only).
+    #[serde(default)]
+    pub monitors: Vec<MonitorInfo>,
     /// Last event seq included in this snapshot; later events carry larger seqs.
     pub seq: u64,
 }
@@ -229,6 +256,14 @@ pub enum Reply {
         plugins: Vec<PluginInfo>,
     },
     PluginCommand(PluginCommandOutcome),
+    /// Answer to `ListCronJobs` and to every mutating cron request.
+    CronJobs {
+        jobs: Vec<CronJob>,
+    },
+    /// Answer to `ListMonitors` and to `StopMonitor`.
+    Monitors {
+        monitors: Vec<MonitorInfo>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -296,6 +331,11 @@ pub enum Event {
         plugin: String,
         text: String,
     },
+    /// A cron job was added, edited, enabled/disabled or fired.
+    CronUpdated(CronJob),
+    CronRemoved(CronJobId),
+    /// A monitor started, checked, fired or stopped.
+    MonitorUpdated(MonitorInfo),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

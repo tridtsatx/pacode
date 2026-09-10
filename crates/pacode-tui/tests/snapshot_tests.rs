@@ -252,6 +252,8 @@ fn make_base_snapshot() -> SessionSnapshot {
     ];
 
     SessionSnapshot {
+        cron_jobs: Vec::new(),
+        monitors: Vec::new(),
         seq: 10,
         meta,
         transcript,

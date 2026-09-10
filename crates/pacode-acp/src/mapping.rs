@@ -366,7 +366,12 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         | Event::Toast { .. }
         | Event::DaemonShuttingDown
         | Event::PluginToast { .. }
-        | Event::PluginStatus { .. } => vec![],
+        | Event::PluginStatus { .. }
+        // Scheduling has no ACP counterpart: a cron job or a monitor is a pacode
+        // session concern, and the prompt a fired job sends arrives as a normal turn.
+        | Event::CronUpdated(_)
+        | Event::CronRemoved(_)
+        | Event::MonitorUpdated(_) => vec![],
     }
 }
 

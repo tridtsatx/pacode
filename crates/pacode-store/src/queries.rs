@@ -4,10 +4,12 @@ use std::path::PathBuf;
 
 use pacode_types::{AgentId, Message, SessionId};
 
+pub(crate) mod cron;
 pub(crate) mod message;
 pub(crate) mod session;
 pub(crate) mod state;
 
+pub use cron::{delete_cron_job, list_cron_jobs, upsert_cron_job};
 pub use message::{append_message, load_messages, load_messages_before, search};
 pub use session::{delete_session, get_session, list_sessions, upsert_session};
 pub use state::{

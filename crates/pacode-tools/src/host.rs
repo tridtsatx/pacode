@@ -150,6 +150,30 @@ pub trait ToolHost: Send + Sync {
     /// permission matrix and the `AllowSession` cache before prompting.
     async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision;
 
+    // --- scheduling (owner = session) ---
+    /// Register a scheduled prompt. The schedule is validated here, so an
+    /// unusable expression is an error the model can correct rather than a job
+    /// that silently never fires.
+    async fn add_cron_job(
+        &self,
+        name: String,
+        schedule: pacode_types::CronSchedule,
+        prompt: String,
+    ) -> Result<pacode_types::CronJob, ToolError>;
+    fn list_cron_jobs(&self) -> Vec<pacode_types::CronJob>;
+    async fn remove_cron_job(&self, id: &pacode_types::CronJobId) -> Result<(), ToolError>;
+
+    /// Start watching a condition. The monitor belongs to the session and stops
+    /// with it; it fires at most once and then stops polling.
+    fn add_monitor(
+        &self,
+        label: String,
+        condition: pacode_types::MonitorCondition,
+        poll_interval_secs: Option<u64>,
+    ) -> Result<pacode_types::MonitorInfo, ToolError>;
+    fn list_monitors(&self) -> Vec<pacode_types::MonitorInfo>;
+    fn stop_monitor(&self, id: &pacode_types::MonitorId) -> Result<(), ToolError>;
+
     // --- background tasks (owner = session) ---
     async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError>;
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo>;

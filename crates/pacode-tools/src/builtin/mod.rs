@@ -24,6 +24,7 @@ pub mod plan;
 pub mod plugin;
 pub mod read;
 pub mod report_status;
+pub mod schedule;
 pub mod skill;
 pub mod webfetch;
 pub mod websearch;
@@ -44,6 +45,8 @@ pub fn builtin_tools() -> ToolRegistry {
         .with(Arc::new(multi_edit::MultiEditTool))
         .with(Arc::new(bash::BashTool))
         .with(Arc::new(bg::BgTool))
+        .with(Arc::new(schedule::CronTool))
+        .with(Arc::new(schedule::MonitorTool))
         .with(Arc::new(grep::GrepTool))
         .with(Arc::new(glob::GlobTool))
         .with(Arc::new(ls::LsTool))

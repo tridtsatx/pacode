@@ -30,10 +30,22 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
     };
 
     let bg_tasks_count = state.rail.background_tasks().count() as u16;
-    let bg_lines = if bg_tasks_count > 0 {
-        1 + bg_tasks_count.min(4)
+    let schedule_count = state.rail.cron_jobs.iter().filter(|j| j.enabled).count()
+        + state
+            .rail
+            .monitors
+            .iter()
+            .filter(|m| m.status.is_live())
+            .count();
+    let schedule_lines = if schedule_count > 0 {
+        1 + (schedule_count as u16).min(4)
     } else {
         0
+    };
+    let bg_lines = if bg_tasks_count > 0 {
+        1 + bg_tasks_count.min(4) + schedule_lines
+    } else {
+        schedule_lines
     };
 
     let select_mode = matches!(state.focus, Focus::SelectAgent { .. });

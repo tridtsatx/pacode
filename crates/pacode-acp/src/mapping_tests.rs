@@ -360,6 +360,13 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::SetMcpServerEnabled { .. }
         | Request::GetMcpPrompt { .. }
         | Request::ListPlugins
-        | Request::RunPluginCommand { .. } => panic!("expected Request::Interrupt"),
+        | Request::RunPluginCommand { .. }
+        | Request::ListCronJobs
+        | Request::AddCronJob { .. }
+        | Request::RemoveCronJob(_)
+        | Request::SetCronEnabled { .. }
+        | Request::RunCronJobNow(_)
+        | Request::ListMonitors
+        | Request::StopMonitor(_) => panic!("expected Request::Interrupt"),
     }
 }

@@ -155,14 +155,18 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
     let right_len: usize = right_spans.iter().map(|s| display_width(&s.content)).sum();
     let spaces = (area.width as usize).saturating_sub(title_text.len() + right_len);
 
-    let mut header_spans = vec![
-        Span::styled(title_text, opts.theme.faint),
-        Span::raw(" ".repeat(spaces)),
-    ];
-    header_spans.extend(right_spans);
-    lines.push(Line::from(header_spans));
-
     let tasks: Vec<_> = state.rail.background_tasks().collect();
+    // With nothing running, the zone belongs to the schedule rows alone and the
+    // BACKGROUND header would name an empty list.
+    if !tasks.is_empty() {
+        let mut header_spans = vec![
+            Span::styled(title_text, opts.theme.faint),
+            Span::raw(" ".repeat(spaces)),
+        ];
+        header_spans.extend(right_spans);
+        lines.push(Line::from(header_spans));
+    }
+
     let rem = (area.height as usize).saturating_sub(1);
     let now = now_ms();
 
@@ -181,7 +185,75 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
         )));
     }
 
+    // The schedule rows share this zone: a cron job or a monitor is background
+    // work the reader watches the same way, and giving it its own zone would cost
+    // a rail block that most sessions never use.
+    let used = lines.len();
+    let left = (area.height as usize).saturating_sub(used);
+    if left > 1 && state.rail.has_schedule_rows() {
+        lines.extend(schedule_lines(
+            state,
+            area.width as usize,
+            opts,
+            now,
+            left - 1,
+        ));
+    }
+
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// `SCHEDULE` header plus one row per enabled job and live monitor, newest last.
+fn schedule_lines(
+    state: &AppState,
+    width: usize,
+    opts: &RenderOptions,
+    now: u64,
+    budget: usize,
+) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled("SCHEDULE", opts.theme.faint))];
+    let mut rows = Vec::new();
+
+    for job in state.rail.cron_jobs.iter().filter(|j| j.enabled) {
+        let due = job
+            .due_in_ms(now)
+            .map(|ms| format!("in {}", format_duration_ms(ms)))
+            .unwrap_or_else(|| "paused".to_string());
+        rows.push((opts.glyphs.running, opts.theme.cyan, job.name.clone(), due));
+    }
+    for monitor in state.rail.monitors.iter().filter(|m| m.status.is_live()) {
+        rows.push((
+            opts.glyphs.running,
+            opts.theme.violet,
+            monitor.label.clone(),
+            "watching".to_string(),
+        ));
+    }
+
+    let budget = budget.saturating_sub(1);
+    let shown = rows.len().min(budget);
+    for (sym, style, label, tail) in rows.iter().take(shown) {
+        let tail_w = display_width(tail);
+        let label_w = width.saturating_sub(tail_w + 4);
+        let label = truncate_to_width(label, label_w, true);
+        let pad = width
+            .saturating_sub(display_width(&label) + tail_w + 3)
+            .max(1);
+        out.push(Line::from(vec![
+            Span::styled(format!("{sym} "), *style),
+            Span::styled(label, opts.theme.fg),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(tail.clone(), opts.theme.faint),
+        ]));
+    }
+    if rows.len() > shown {
+        let more = rows.len() - shown;
+        out.push(Line::from(Span::styled(
+            format!("  and {more} more"),
+            opts.theme.faint,
+        )));
+    }
+    out
 }
 
 fn render_task_line(

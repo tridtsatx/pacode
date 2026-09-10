@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Create or upgrade the schema. Idempotent.
 pub fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -118,6 +118,31 @@ pub fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             CREATE INDEX IF NOT EXISTS idx_usage_session ON usage(session_id);
 
             PRAGMA user_version = 1;
+            "#,
+        )?;
+        tx.commit()?;
+    }
+
+    if current_version < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cron_jobs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                schedule TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                last_run_at INTEGER,
+                next_run_at INTEGER,
+                last_status TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cron_jobs_session ON cron_jobs(session_id);
+
+            PRAGMA user_version = 2;
             "#,
         )?;
         tx.commit()?;

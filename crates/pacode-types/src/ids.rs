@@ -143,6 +143,16 @@ id_type!(
     ClientId,
     "cli"
 );
+id_type!(
+    /// A scheduled prompt (cron job). Persisted; survives a daemon restart.
+    CronJobId,
+    "cron"
+);
+id_type!(
+    /// A condition watcher owned by a session. In memory only.
+    MonitorId,
+    "mon"
+);
 
 impl AgentId {
     pub const MAIN: &'static str = "main";

@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 fn dummy_snapshot() -> SessionSnapshot {
     SessionSnapshot {
+        cron_jobs: Vec::new(),
+        monitors: Vec::new(),
         meta: SessionMeta {
             id: SessionId::new("ses_test"),
             name: Some("test session".into()),

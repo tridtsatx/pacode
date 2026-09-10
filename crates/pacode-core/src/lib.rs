@@ -25,6 +25,7 @@ pub mod naming;
 pub mod permissions;
 pub mod prompt;
 pub mod sampling;
+pub mod schedule;
 pub mod session;
 pub mod transcript;
 pub mod turn;

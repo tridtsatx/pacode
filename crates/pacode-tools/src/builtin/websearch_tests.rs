@@ -11,10 +11,48 @@ use crate::Tool;
 use crate::builtin::webfetch::extract_html_to_markdown;
 use crate::host::{AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
 
-struct DummyHost;
+#[derive(Default)]
+struct DummyHost {
+    schedule: crate::test_support::ScheduleStub,
+}
 
 #[async_trait]
 impl ToolHost for DummyHost {
+    async fn add_cron_job(
+        &self,
+        name: String,
+        schedule: pacode_types::CronSchedule,
+        prompt: String,
+    ) -> Result<pacode_types::CronJob, ToolError> {
+        self.schedule.add_cron_job(name, schedule, prompt)
+    }
+
+    fn list_cron_jobs(&self) -> Vec<pacode_types::CronJob> {
+        self.schedule.list_cron_jobs()
+    }
+
+    async fn remove_cron_job(&self, id: &pacode_types::CronJobId) -> Result<(), ToolError> {
+        self.schedule.remove_cron_job(id)
+    }
+
+    fn add_monitor(
+        &self,
+        label: String,
+        condition: pacode_types::MonitorCondition,
+        poll_interval_secs: Option<u64>,
+    ) -> Result<pacode_types::MonitorInfo, ToolError> {
+        self.schedule
+            .add_monitor(label, condition, poll_interval_secs)
+    }
+
+    fn list_monitors(&self) -> Vec<pacode_types::MonitorInfo> {
+        self.schedule.list_monitors()
+    }
+
+    fn stop_monitor(&self, id: &pacode_types::MonitorId) -> Result<(), ToolError> {
+        self.schedule.stop_monitor(id)
+    }
+
     async fn request_permission(&self, _draft: PermissionDraft) -> PermissionDecision {
         PermissionDecision::AllowOnce
     }
@@ -92,7 +130,7 @@ fn dummy_ctx() -> ToolCtx {
         call_id: CallId::new("call_test"),
         cwd: std::env::current_dir().unwrap_or_default(),
         mode: Mode::Build,
-        host: Arc::new(DummyHost),
+        host: Arc::new(DummyHost::default()),
         cancel: CancellationToken::new(),
         output_cap_chars: 16_000,
         exec_yield_after: Duration::from_secs(10),

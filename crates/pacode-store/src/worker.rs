@@ -232,6 +232,33 @@ impl Store {
             .await
     }
 
+    // --- cron jobs ---
+    pub async fn upsert_cron_job(
+        &self,
+        session: &SessionId,
+        job: &pacode_types::CronJob,
+    ) -> Result<(), StoreError> {
+        let session = session.clone();
+        let job = job.clone();
+        self.call(move |conn| queries::upsert_cron_job(conn, &session, &job))
+            .await
+    }
+
+    pub async fn delete_cron_job(&self, id: &pacode_types::CronJobId) -> Result<bool, StoreError> {
+        let id = id.clone();
+        self.call(move |conn| queries::delete_cron_job(conn, &id))
+            .await
+    }
+
+    pub async fn list_cron_jobs(
+        &self,
+        session: &SessionId,
+    ) -> Result<Vec<pacode_types::CronJob>, StoreError> {
+        let session = session.clone();
+        self.call(move |conn| queries::list_cron_jobs(conn, &session))
+            .await
+    }
+
     // --- plan ---
     pub async fn save_plan(&self, session: &SessionId, plan: &Plan) -> Result<(), StoreError> {
         let session = session.clone();

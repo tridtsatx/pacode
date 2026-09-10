@@ -219,6 +219,87 @@ impl ToolHost for SessionHost {
         }
     }
 
+    async fn add_cron_job(
+        &self,
+        name: String,
+        schedule: pacode_types::CronSchedule,
+        prompt: String,
+    ) -> Result<pacode_types::CronJob, ToolError> {
+        let job = self
+            .session
+            .scheduler
+            .add_job(name, schedule, prompt, pacode_types::time::now_ms())
+            .map_err(|e| ToolError::invalid(e.to_string()))?;
+        if let Err(e) = self
+            .session
+            .store
+            .upsert_cron_job(&self.session.id, &job)
+            .await
+        {
+            log::warn!("failed to persist cron job {}: {e}", job.id);
+        }
+        self.session
+            .events
+            .emit(pacode_types::Event::CronUpdated(job.clone()));
+        Ok(job)
+    }
+
+    fn list_cron_jobs(&self) -> Vec<pacode_types::CronJob> {
+        self.session.scheduler.jobs()
+    }
+
+    async fn remove_cron_job(&self, id: &pacode_types::CronJobId) -> Result<(), ToolError> {
+        self.session
+            .scheduler
+            .remove_job(id)
+            .map_err(|e| ToolError::invalid(e.to_string()))?;
+        if let Err(e) = self.session.store.delete_cron_job(id).await {
+            log::warn!("failed to delete cron job {id}: {e}");
+        }
+        self.session
+            .events
+            .emit(pacode_types::Event::CronRemoved(id.clone()));
+        Ok(())
+    }
+
+    fn add_monitor(
+        &self,
+        label: String,
+        condition: pacode_types::MonitorCondition,
+        poll_interval_secs: Option<u64>,
+    ) -> Result<pacode_types::MonitorInfo, ToolError> {
+        let info = self
+            .session
+            .scheduler
+            .add_monitor(
+                label,
+                condition,
+                poll_interval_secs,
+                pacode_types::time::now_ms(),
+            )
+            .map_err(|e| ToolError::invalid(e.to_string()))?;
+        self.session
+            .events
+            .emit(pacode_types::Event::MonitorUpdated(info.clone()));
+        Ok(info)
+    }
+
+    fn list_monitors(&self) -> Vec<pacode_types::MonitorInfo> {
+        self.session.scheduler.monitors()
+    }
+
+    fn stop_monitor(&self, id: &pacode_types::MonitorId) -> Result<(), ToolError> {
+        let info = self
+            .session
+            .scheduler
+            .stop_monitor(id)
+            .map_err(|e| ToolError::invalid(e.to_string()))?;
+        self.session
+            .events
+            .emit(pacode_types::Event::MonitorUpdated(info));
+        Ok(())
+    }
+
     async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError> {
         let info = self
             .session

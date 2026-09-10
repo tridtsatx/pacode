@@ -26,6 +26,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 struct StubHost {
+    schedule: pacode_tools::test_support::ScheduleStub,
     drafts: Mutex<Vec<PermissionDraft>>,
     decision: Mutex<PermissionDecision>,
     tasks: Arc<TaskManager>,
@@ -38,6 +39,7 @@ impl StubHost {
         let exec_cfg = ExecConfig::default();
         let tasks = TaskManager::new(spool_dir, exec_cfg);
         Self {
+            schedule: pacode_tools::test_support::ScheduleStub::default(),
             drafts: Mutex::new(Vec::new()),
             decision: Mutex::new(PermissionDecision::AllowOnce),
             tasks,
@@ -49,6 +51,41 @@ impl StubHost {
 
 #[async_trait]
 impl ToolHost for StubHost {
+    async fn add_cron_job(
+        &self,
+        name: String,
+        schedule: pacode_types::CronSchedule,
+        prompt: String,
+    ) -> Result<pacode_types::CronJob, ToolError> {
+        self.schedule.add_cron_job(name, schedule, prompt)
+    }
+
+    fn list_cron_jobs(&self) -> Vec<pacode_types::CronJob> {
+        self.schedule.list_cron_jobs()
+    }
+
+    async fn remove_cron_job(&self, id: &pacode_types::CronJobId) -> Result<(), ToolError> {
+        self.schedule.remove_cron_job(id)
+    }
+
+    fn add_monitor(
+        &self,
+        label: String,
+        condition: pacode_types::MonitorCondition,
+        poll_interval_secs: Option<u64>,
+    ) -> Result<pacode_types::MonitorInfo, ToolError> {
+        self.schedule
+            .add_monitor(label, condition, poll_interval_secs)
+    }
+
+    fn list_monitors(&self) -> Vec<pacode_types::MonitorInfo> {
+        self.schedule.list_monitors()
+    }
+
+    fn stop_monitor(&self, id: &pacode_types::MonitorId) -> Result<(), ToolError> {
+        self.schedule.stop_monitor(id)
+    }
+
     async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
         let dec = *self.decision.lock().unwrap();
         self.drafts.lock().unwrap().push(draft.clone());

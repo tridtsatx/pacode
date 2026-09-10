@@ -467,6 +467,8 @@ impl AppState {
                 self.rail.agents = snapshot.agents;
                 self.rail.agents.sort_by_key(|a| a.started_at_ms);
                 self.rail.tasks = snapshot.tasks;
+                self.rail.cron_jobs = snapshot.cron_jobs;
+                self.rail.monitors = snapshot.monitors;
                 self.rail.tasks.sort_by_key(|t| t.started_at_ms);
                 self.rail.usage = snapshot.usage;
                 self.rail.update_idle(self.turn_active, now);

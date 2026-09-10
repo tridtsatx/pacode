@@ -115,7 +115,10 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 plugins: core.deps.plugins.clone(),
                 app_version: core.deps.app_version.clone(),
                 skills: core.deps.skills.clone(),
+                scheduler: crate::schedule::Scheduler::new(),
             });
+
+            start_scheduler(&session).await;
 
             if let Ok(mut sessions) = core.sessions.write() {
                 sessions.insert(id.clone(), session);
@@ -299,7 +302,10 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 plugins: core.deps.plugins.clone(),
                 app_version: core.deps.app_version.clone(),
                 skills: core.deps.skills.clone(),
+                scheduler: crate::schedule::Scheduler::new(),
             });
+
+            start_scheduler(&session).await;
 
             if let Ok(mut sessions) = core.sessions.write() {
                 sessions.insert(session_id.clone(), session);
@@ -308,4 +314,17 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
             Ok(session_id)
         }
     }
+}
+
+/// Load the session's persisted cron jobs and start the one task that fires both
+/// them and its monitors. A resumed session keeps the jobs it had; their next run
+/// is recomputed from now, so a daemon that was down does not replay every missed
+/// firing at once.
+async fn start_scheduler(session: &Arc<Session>) {
+    let now = pacode_types::time::now_ms();
+    match session.store.list_cron_jobs(&session.id).await {
+        Ok(jobs) => session.scheduler.load_jobs(jobs, now),
+        Err(e) => log::warn!("failed to load cron jobs for {}: {e}", session.id),
+    }
+    session.scheduler.start(Arc::downgrade(session));
 }
