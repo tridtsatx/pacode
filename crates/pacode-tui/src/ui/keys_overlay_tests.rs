@@ -318,10 +318,10 @@ fn test_conflicting_capture_pushes_warning_and_leaves_untouched() {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
     );
 
-    // Press alt+b (which is default for FilesOverlay)
+    // Press alt+f (which is default for FilesOverlay)
     handle_picker_key(
         &mut state,
-        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
     );
 
     // Capture mode is left

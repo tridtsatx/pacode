@@ -73,9 +73,9 @@ fn test_focus_machine_transitions() {
     assert_eq!(actions, vec![Action::LoadPanel]);
     assert!(matches!(state.focus, Focus::Panel { follow: false, .. }));
 
-    // 4. Alt+F -> Follow
-    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
-    let actions = handle_key(&mut state, alt_f, now);
+    // 4. Alt+B -> Follow
+    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_b, now);
     assert!(actions.is_empty());
     assert!(matches!(state.focus, Focus::Panel { follow: true, .. }));
 
@@ -427,7 +427,7 @@ fn test_overlay_session_picker_navigation_focus_and_esc() {
 }
 
 #[test]
-fn test_overlay_files_alt_b_navigation_enter_and_esc() {
+fn test_overlay_files_alt_f_navigation_enter_and_esc() {
     let mut state = make_test_state();
     let now = Instant::now();
 
@@ -438,9 +438,9 @@ fn test_overlay_files_alt_b_navigation_enter_and_esc() {
         .files
         .observe_tool_item("write", &serde_json::json!({"path": "src/second.rs"}), 200);
 
-    // 1. alt+b opens Overlay::Files
-    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
-    handle_key(&mut state, alt_b, now);
+    // 1. alt+f opens Overlay::Files
+    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_f, now);
     assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
 
     // 2. Down key increments index
@@ -464,21 +464,21 @@ fn test_overlay_files_alt_b_navigation_enter_and_esc() {
     assert_eq!(state.focus, Focus::Normal);
     assert_eq!(state.input.text, "src/second.rs");
 
-    // 6. Reopen with alt+b and press Esc to close
-    handle_key(&mut state, alt_b, now);
+    // 6. Reopen with alt+f and press Esc to close
+    handle_key(&mut state, alt_f, now);
     assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
 
-    // 7. Verify alt+f is follow (does not open files)
-    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
-    handle_key(&mut state, alt_f, now);
+    // 7. Verify alt+b is follow (does not open files)
+    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_b, now);
     assert_ne!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
 }
 
 #[test]
-fn test_alt_f_toggles_follow() {
+fn test_alt_b_toggles_follow() {
     let mut state = make_test_state();
     let now = Instant::now();
     let subagent_id = AgentId::new("agt_1");
@@ -491,9 +491,9 @@ fn test_alt_f_toggles_follow() {
     };
     state.panel.target = Some(PanelTarget::Agent(subagent_id.clone()));
 
-    // 1. alt+f toggles follow to true
-    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
-    let actions = handle_key(&mut state, alt_f, now);
+    // 1. alt+b toggles follow to true
+    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_b, now);
     assert!(actions.is_empty());
     assert_eq!(
         state.focus,
@@ -504,8 +504,8 @@ fn test_alt_f_toggles_follow() {
         }
     );
 
-    // 2. alt+f toggles follow back to false
-    let actions = handle_key(&mut state, alt_f, now);
+    // 2. alt+b toggles follow back to false
+    let actions = handle_key(&mut state, alt_b, now);
     assert!(actions.is_empty());
     assert_eq!(
         state.focus,
@@ -516,9 +516,9 @@ fn test_alt_f_toggles_follow() {
         }
     );
 
-    // 3. alt+f on SelectAgent for a subagent opens panel with follow = true
+    // 3. alt+b on SelectAgent for a subagent opens panel with follow = true
     state.focus = Focus::SelectAgent { index: 1 };
-    let actions = handle_key(&mut state, alt_f, now);
+    let actions = handle_key(&mut state, alt_b, now);
     assert_eq!(actions, vec![Action::LoadPanel]);
     assert_eq!(
         state.focus,
@@ -529,22 +529,22 @@ fn test_alt_f_toggles_follow() {
         }
     );
 
-    // 4. alt+f on SelectAgent for main returns to Focus::Normal without opening panel
+    // 4. alt+b on SelectAgent for main returns to Focus::Normal without opening panel
     state.focus = Focus::SelectAgent { index: 0 };
-    let actions = handle_key(&mut state, alt_f, now);
+    let actions = handle_key(&mut state, alt_b, now);
     assert!(actions.is_empty());
     assert_eq!(state.focus, Focus::Normal);
     assert_eq!(state.panel.target, None);
 }
 
 #[test]
-fn test_alt_b_opens_files_overlay() {
+fn test_alt_f_opens_files_overlay() {
     let mut state = make_test_state();
     let now = Instant::now();
 
     assert_eq!(state.focus, Focus::Normal);
-    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
-    let actions = handle_key(&mut state, alt_b, now);
+    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_f, now);
     assert!(actions.is_empty());
     assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
 }
@@ -1186,9 +1186,9 @@ fn test_user_override_in_keys_config() {
     };
     let now = Instant::now();
 
-    // Default alt+f no longer triggers follow
-    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
-    handle_key(&mut state, alt_f, now);
+    // Default alt+b no longer triggers follow
+    let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_b, now);
     assert!(matches!(state.focus, Focus::Panel { follow: false, .. }));
 
     // Overridden ctrl+g triggers follow
@@ -1874,4 +1874,37 @@ fn test_short_successful_background_task_is_not_reported() {
 
     assert_eq!(state.transcript.cells.len(), before);
     assert!(state.toasts.is_empty());
+}
+
+#[test]
+fn test_alt_r_opens_the_plan_and_agents_overlay() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    let alt_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+    handle_key(&mut state, alt_r, now);
+    assert_eq!(state.focus, Focus::Overlay(Overlay::RailOverlay));
+
+    // Esc closes it again.
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_agent_navigation_opens_the_overlay_when_the_rail_is_hidden() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // Below 80 columns the rail is not drawn, so there is nothing to navigate.
+    state.cols = 70;
+    let alt_down = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT);
+    handle_key(&mut state, alt_down, now);
+    assert_eq!(state.focus, Focus::Overlay(Overlay::RailOverlay));
+
+    // Wide enough for the rail: navigation selects in the rail as before.
+    state.focus = Focus::Normal;
+    state.cols = 120;
+    handle_key(&mut state, alt_down, now);
+    assert_ne!(state.focus, Focus::Overlay(Overlay::RailOverlay));
 }

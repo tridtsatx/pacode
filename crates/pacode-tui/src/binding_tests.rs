@@ -215,7 +215,7 @@ fn test_format_and_parse_roundtrip() {
             mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         },
         Binding {
-            code: KeyCode::Char('f'),
+            code: KeyCode::Char('b'),
             mods: KeyModifiers::ALT,
         },
         Binding {
@@ -419,19 +419,19 @@ fn test_keymap_reset_default() {
 #[test]
 fn test_keymap_find_conflict() {
     let keymap = Keymap::defaults();
-    let alt_f = Binding {
-        code: KeyCode::Char('f'),
+    let alt_b = Binding {
+        code: KeyCode::Char('b'),
         mods: KeyModifiers::ALT,
     };
 
     // Collides with follow_agent when checking for another action
     assert_eq!(
-        keymap.find_conflict(&alt_f, Action::SessionPicker),
+        keymap.find_conflict(&alt_b, Action::SessionPicker),
         Some(("follow_agent", Action::FollowAgent))
     );
 
     // Returns None for the action's own binding
-    assert_eq!(keymap.find_conflict(&alt_f, Action::FollowAgent), None);
+    assert_eq!(keymap.find_conflict(&alt_b, Action::FollowAgent), None);
 
     // Unbound key has no conflict
     let unbound = Binding {
@@ -447,11 +447,11 @@ fn test_keymap_action_for() {
 
     // Resolves default bindings
     assert_eq!(
-        keymap.action_for(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)),
+        keymap.action_for(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)),
         Some(Action::FollowAgent)
     );
     assert_eq!(
-        keymap.action_for(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)),
+        keymap.action_for(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)),
         Some(Action::FilesOverlay)
     );
     assert_eq!(

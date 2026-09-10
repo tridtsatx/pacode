@@ -117,6 +117,25 @@ impl RailState {
             }
         }
     }
+
+    /// Whether the SESSION block is still waiting out its debounce.
+    ///
+    /// The debounce fires only when everything has gone quiet, which is exactly
+    /// when the second tick used to be disarmed — so the block never appeared.
+    /// The event loop keeps the tick armed while this is true.
+    pub fn idle_debounce_pending(&self) -> bool {
+        self.idle_since.is_some() && !self.show_session_stats
+    }
+
+    /// Milliseconds left of the debounce, if one is running.
+    pub fn idle_debounce_remaining_ms(&self, now: Instant) -> Option<u64> {
+        let since = self.idle_since?;
+        if self.show_session_stats {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(since).as_millis() as u64;
+        Some(crate::state::IDLE_DEBOUNCE_MS.saturating_sub(elapsed))
+    }
 }
 
 #[cfg(test)]

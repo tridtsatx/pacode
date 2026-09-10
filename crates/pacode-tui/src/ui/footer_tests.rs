@@ -109,7 +109,7 @@ fn test_footer_select_agent_shows_main_and_subagents() {
     let text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(text.contains("main 1/3"), "text was: {text}");
     assert!(
-        text.contains("enter open · alt+f follow · esc clear"),
+        text.contains("enter open · alt+b follow · esc clear"),
         "text was: {text}"
     );
 
@@ -119,11 +119,11 @@ fn test_footer_select_agent_shows_main_and_subagents() {
     let text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(text.contains("waiter-1 2/3"), "text was: {text}");
     assert!(
-        text.contains("enter open · alt+f follow · esc clear"),
+        text.contains("enter open · alt+b follow · esc clear"),
         "text was: {text}"
     );
 
-    // 3. Panel with follow = true: hint shows alt+f release
+    // 3. Panel with follow = true: hint shows alt+b release
     state.focus = Focus::Panel {
         target: PanelTarget::Agent(AgentId::new("sub_1")),
         follow: true,
@@ -132,11 +132,11 @@ fn test_footer_select_agent_shows_main_and_subagents() {
     let row2 = render_row2(120, &state, &opts);
     let text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
-        text.contains("pgup pause · alt+f release"),
+        text.contains("pgup pause · alt+b release"),
         "text was: {text}"
     );
 
-    // 4. Panel with follow = false: hint shows alt+f follow
+    // 4. Panel with follow = false: hint shows alt+b follow
     state.focus = Focus::Panel {
         target: PanelTarget::Agent(AgentId::new("sub_1")),
         follow: false,
@@ -145,7 +145,7 @@ fn test_footer_select_agent_shows_main_and_subagents() {
     let row2 = render_row2(120, &state, &opts);
     let text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
-        text.contains("esc back · alt+f follow · s stop"),
+        text.contains("esc back · alt+b follow · s stop"),
         "text was: {text}"
     );
 }

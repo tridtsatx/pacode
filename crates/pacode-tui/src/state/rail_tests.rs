@@ -37,3 +37,35 @@ fn test_rail_idle_debounce() {
     assert!(!rail.show_session_stats);
     assert!(rail.idle_since.is_none());
 }
+
+#[test]
+fn the_idle_debounce_keeps_the_tick_armed_until_it_completes() {
+    use std::time::Duration;
+
+    let mut rail = RailState::default();
+    let start = Instant::now();
+
+    // Going quiet starts the debounce; nothing is shown yet, but the tick must
+    // stay armed or the block would never appear.
+    assert!(!rail.update_idle(false, start));
+    assert!(rail.idle_debounce_pending());
+    assert_eq!(
+        rail.idle_debounce_remaining_ms(start),
+        Some(crate::state::IDLE_DEBOUNCE_MS)
+    );
+
+    let midway = start + Duration::from_millis(crate::state::IDLE_DEBOUNCE_MS / 2);
+    assert!(!rail.update_idle(false, midway));
+    assert!(rail.idle_debounce_pending());
+
+    let due = start + Duration::from_millis(crate::state::IDLE_DEBOUNCE_MS);
+    assert!(rail.update_idle(false, due));
+    assert!(rail.show_session_stats);
+    assert!(!rail.idle_debounce_pending());
+    assert_eq!(rail.idle_debounce_remaining_ms(due), None);
+
+    // A new turn hides the block again and re-arms nothing until it ends.
+    assert!(rail.update_idle(true, due));
+    assert!(!rail.show_session_stats);
+    assert!(!rail.idle_debounce_pending());
+}

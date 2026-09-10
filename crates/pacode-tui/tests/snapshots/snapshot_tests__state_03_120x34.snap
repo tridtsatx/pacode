@@ -35,4 +35,4 @@ expression: view
 "❯                                                                                      │◍ cargo test --all 214/380      "
 "────────────────────────────────────────────────────────────────────────────────────── │       ~/zed/pacode:master      "
 "Build · Claude 3 7 Sonnet | high /effort                                        /model │                                "
-"» codegen · esc back · alt+f follow · s stop                                           │                                "
+"» codegen · esc back · alt+b follow · s stop                                           │                                "

@@ -332,7 +332,8 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::RemoveQueued
             | KeyAction::ClearQueue
             | KeyAction::PasteImage
-            | KeyAction::PasteClipboard => {}
+            | KeyAction::PasteClipboard
+            | KeyAction::RailOverlay => {}
         }
     } else {
         match action {
@@ -378,7 +379,8 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::RemoveQueued
             | KeyAction::ClearQueue
             | KeyAction::PasteImage
-            | KeyAction::PasteClipboard => {}
+            | KeyAction::PasteClipboard
+            | KeyAction::RailOverlay => {}
         }
         if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
             && state.transcript.is_at_top()

@@ -56,6 +56,8 @@ pub enum Action {
     PasteImage,
     /// Paste from the system clipboard: an image when one is there, otherwise text.
     PasteClipboard,
+    /// Open the plan/agents overlay, which is where the rail lives below 80 columns.
+    RailOverlay,
 }
 
 impl Action {
@@ -105,6 +107,7 @@ impl Action {
             Self::ClearQueue => "clear_queue",
             Self::PasteImage => "paste_image",
             Self::PasteClipboard => "paste_clipboard",
+            Self::RailOverlay => "rail_overlay",
         }
     }
 
@@ -154,6 +157,7 @@ impl Action {
             Self::ClearQueue => "Clear prompt queue",
             Self::PasteImage => "Paste image from clipboard",
             Self::PasteClipboard => "Paste from clipboard (image or text)",
+            Self::RailOverlay => "Show plan and agents",
         }
     }
 }
@@ -383,6 +387,7 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("clear_queue", Action::ClearQueue),
     ("paste_image", Action::PasteImage),
     ("paste_clipboard", Action::PasteClipboard),
+    ("rail_overlay", Action::RailOverlay),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -396,17 +401,19 @@ impl Keymap {
     /// Return the default key bindings reproducing existing pacode-tui key bindings exactly.
     pub fn defaults() -> Self {
         let mut bindings = BTreeMap::new();
+        // Spec §6/§7/§13: alt+b follows the selected agent, alt+f opens the file
+        // overlay. The two were swapped here.
         bindings.insert(
             Action::FollowAgent,
             vec![Binding {
-                code: KeyCode::Char('f'),
+                code: KeyCode::Char('b'),
                 mods: KeyModifiers::ALT,
             }],
         );
         bindings.insert(
             Action::FilesOverlay,
             vec![Binding {
-                code: KeyCode::Char('b'),
+                code: KeyCode::Char('f'),
                 mods: KeyModifiers::ALT,
             }],
         );
@@ -628,6 +635,13 @@ impl Keymap {
             vec![Binding {
                 code: KeyCode::Char('v'),
                 mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
+            }],
+        );
+        bindings.insert(
+            Action::RailOverlay,
+            vec![Binding {
+                code: KeyCode::Char('r'),
+                mods: KeyModifiers::ALT,
             }],
         );
         // ctrl+v and, where the terminal forwards it, ctrl+shift+v: image first, text otherwise.

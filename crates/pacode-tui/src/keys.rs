@@ -229,7 +229,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
     }
 
-    // 5. Follow shortcut: alt+f
+    // 5. Follow shortcut: alt+b
     if action == Some(KeyAction::FollowAgent) {
         return handle_follow(state);
     }
@@ -272,18 +272,39 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return switch_to_session_slot(state, slot_idx);
     }
 
-    // 5.5 Files overlay: alt+b
+    // 5.5 Files overlay: alt+f
     if action == Some(KeyAction::FilesOverlay) {
         log::debug!("open overlay: Files");
         state.focus = Focus::Overlay(Overlay::Files { index: 0 });
         return vec![];
     }
 
+    // 5.6 Plan & agents overlay. Below 80 columns the rail is not drawn at all
+    // (spec §8), so this overlay is the only way to reach the plan and the agent
+    // list there; above that width it is a shortcut to the same content.
+    if action == Some(KeyAction::RailOverlay) {
+        state.focus = Focus::Overlay(Overlay::RailOverlay);
+        state.dirty = true;
+        return vec![];
+    }
+
     // 6. Navigation: alt+down/ctrl+j (next agent/task), alt+up/ctrl+k (prev agent/task)
+    // With the rail hidden there is nothing on screen to move a selection through,
+    // so agent navigation opens the overlay that holds it instead.
     if action == Some(KeyAction::NextAgent) {
+        if rail_is_hidden(state) {
+            state.focus = Focus::Overlay(Overlay::RailOverlay);
+            state.dirty = true;
+            return vec![];
+        }
         return handle_navigate_down(state);
     }
     if action == Some(KeyAction::PrevAgent) {
+        if rail_is_hidden(state) {
+            state.focus = Focus::Overlay(Overlay::RailOverlay);
+            state.dirty = true;
+            return vec![];
+        }
         return handle_navigate_up(state);
     }
 
@@ -719,3 +740,8 @@ fn find_pending_permission(state: &AppState) -> Option<PermissionRequest> {
 }
 
 pub use crate::mouse::handle_mouse;
+
+/// Whether the rail is off screen, which below 80 columns it always is (spec §8).
+fn rail_is_hidden(state: &AppState) -> bool {
+    crate::layout::WidthTier::for_width(state.cols).rail_width() == 0
+}

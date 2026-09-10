@@ -237,7 +237,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     opts.theme.bold,
                                 ),
                                 Span::styled(
-                                    "enter open · alt+f follow · esc clear",
+                                    "enter open · alt+b follow · esc clear",
                                     opts.theme.dim,
                                 ),
                             ],
@@ -273,7 +273,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     Span::styled("FOLLOW", opts.theme.selected_bg),
                                     Span::raw(" "),
                                     Span::styled(format!("{name} {dur} · "), opts.theme.bold),
-                                    Span::styled("pgup pause · alt+f release", opts.theme.dim),
+                                    Span::styled("pgup pause · alt+b release", opts.theme.dim),
                                 ],
                                 false,
                             )
@@ -286,7 +286,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     ),
                                     Span::styled(format!("{name} · "), opts.theme.bold),
                                     Span::styled(
-                                        "esc back · alt+f follow · s stop",
+                                        "esc back · alt+b follow · s stop",
                                         opts.theme.dim,
                                     ),
                                 ],
