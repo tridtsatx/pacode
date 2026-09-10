@@ -167,8 +167,38 @@ pub enum McpError {
 }
 
 /// `<server>__<tool>`; split back with [`split_tool_name`].
+///
+/// Both halves are sanitised: providers constrain function names to
+/// `[A-Za-z0-9_.:-]` (Gemini rejects the request outright, OpenAI is stricter
+/// still), and a plugin-provided server is named `<plugin>/<server>`, so the
+/// raw join would emit a name every strict provider refuses.
 pub fn tool_name(server: &str, tool: &str) -> String {
+    let server = sanitize_name_part(server);
+    let tool = sanitize_name_part(tool);
     format!("{server}__{tool}")
+}
+
+/// Map a name part onto the character set every provider accepts. Anything
+/// outside `[A-Za-z0-9_.:-]` becomes `_`; a leading digit, dot, colon or dash
+/// gets an `_` prefix because a function name must start with a letter or an
+/// underscore.
+pub(crate) fn sanitize_name_part(part: &str) -> String {
+    let mut out = String::with_capacity(part.len());
+    for ch in part.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_ascii_alphabetic() && c != '_')
+    {
+        out.insert(0, '_');
+    }
+    out
 }
 
 pub fn split_tool_name(name: &str) -> Option<(&str, &str)> {

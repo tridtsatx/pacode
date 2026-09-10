@@ -7,7 +7,7 @@ use std::path::Path;
 use pacode_types::McpServerConfig;
 use serde::{Deserialize, Serialize};
 
-use crate::{McpPrompt, McpResource, McpToolInfo};
+use crate::{McpPrompt, McpResource, McpToolInfo, sanitize_name_part};
 
 pub const CACHE_VERSION: u32 = 2;
 
@@ -53,13 +53,21 @@ pub fn fingerprint(cfg: &McpServerConfig) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Cache file for a server. The name is sanitised because a plugin-provided
+/// server is named `<plugin>/<server>`, and joining that raw would point at a
+/// subdirectory that was never created.
+fn cache_file(cache_dir: &Path, server: &str) -> std::path::PathBuf {
+    let server = sanitize_name_part(server);
+    cache_dir.join(format!("{server}.json"))
+}
+
 pub fn load_disk_cache(
     cache_dir: &Path,
     server: &str,
     cfg: &McpServerConfig,
     mem: &mut HashMap<String, ServerSchemaCache>,
 ) -> Option<ServerSchemaCache> {
-    let path = cache_dir.join(format!("{server}.json"));
+    let path = cache_file(cache_dir, server);
     let content = std::fs::read_to_string(&path).ok()?;
     let entry: DiskCacheEntry = serde_json::from_str(&content).ok()?;
     if entry.version == CACHE_VERSION && entry.fingerprint == fingerprint(cfg) {
@@ -90,7 +98,7 @@ pub fn save_disk_cache(
         );
         return;
     }
-    let path = cache_dir.join(format!("{server}.json"));
+    let path = cache_file(cache_dir, server);
     let entry = DiskCacheEntry {
         version: CACHE_VERSION,
         fingerprint: fingerprint(cfg),

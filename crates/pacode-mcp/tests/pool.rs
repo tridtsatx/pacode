@@ -34,6 +34,22 @@ fn test_tool_name_and_split_unit() {
     );
 }
 
+/// A plugin-provided server is named `<plugin>/<server>`, and a function name
+/// carrying that slash is rejected by strict providers, so the join has to
+/// fold it into the accepted character set.
+#[test]
+fn test_tool_name_sanitizes_parts() {
+    assert_eq!(
+        tool_name("playwright/playwright", "browser_click"),
+        "playwright_playwright__browser_click"
+    );
+    assert_eq!(tool_name("a b@c", "do!it"), "a_b_c__do_it");
+    assert_eq!(tool_name("srv.v1:beta-2", "read"), "srv.v1:beta-2__read");
+    assert_eq!(tool_name("2fast", "go"), "_2fast__go");
+    assert_eq!(tool_name("-lead", "go"), "_-lead__go");
+    assert_eq!(tool_name("srv", "9lives"), "srv___9lives");
+}
+
 #[tokio::test]
 async fn test_client_start_list_call() {
     if !has_python3() {
