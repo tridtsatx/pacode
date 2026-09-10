@@ -132,7 +132,7 @@ fn defaults_from_empty_text() {
     assert_eq!(cfg.provider.stream_idle_secs, 180);
     assert_eq!(cfg.provider.max_retries, 5);
 
-    assert_eq!(cfg.exec.yield_after_secs, 10);
+    assert_eq!(cfg.exec.yield_after_secs, 5);
     assert_eq!(cfg.exec.stall_secs, 120);
     assert_eq!(cfg.exec.max_spool_bytes, 50 * 1024 * 1024);
     assert_eq!(cfg.exec.tail_bytes, 64 * 1024);

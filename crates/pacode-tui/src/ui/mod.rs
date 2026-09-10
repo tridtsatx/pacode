@@ -37,7 +37,10 @@ use crate::state::{AppState, Focus};
 
 /// Draw the whole screen; returns the layout used (for mouse hit-testing).
 pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
-    let panel_open = state.panel.target.is_some() || matches!(state.focus, Focus::Panel { .. });
+    // In replace mode a selected subagent takes over the conversation column, so
+    // no second column is laid out at all.
+    let panel_open = (state.panel.target.is_some() || matches!(state.focus, Focus::Panel { .. }))
+        && !state.agent_replaces_dialog();
     let temp_layout = crate::layout::compute(frame.area(), 1, panel_open);
     let input_lines = state.input.wrapped_lines(temp_layout.input.width);
     let layout = crate::layout::compute(frame.area(), input_lines, panel_open);
@@ -86,6 +89,40 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         .thinking(state.config.ui.thinking);
         // The activity line is drawn whenever there is something to report, which
         // includes waiting on a subagent or a background task with the turn over.
+        // Whose conversation is on screen must be visible: the column looks the
+        // same whether it holds the main thread or a subagent.
+        let takeover = state.agent_replaces_dialog();
+        let dialog_area = if takeover && dialog_area.height > 1 {
+            let name = match state.panel_agent_target() {
+                Some(crate::state::PanelTarget::Agent(id)) => state
+                    .rail
+                    .agent(&id)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| id.to_string()),
+                Some(crate::state::PanelTarget::Task(_)) | None => String::new(),
+            };
+            let banner = Line::from(vec![
+                Span::styled(
+                    format!("{} agent ", opts.glyphs.agent_dot),
+                    opts.theme.accent,
+                ),
+                Span::styled(name, opts.theme.bold),
+                Span::styled("  ·  esc for the main chat", opts.theme.faint),
+            ]);
+            frame.render_widget(
+                Paragraph::new(banner),
+                Rect::new(dialog_area.x, dialog_area.y, dialog_area.width, 1),
+            );
+            Rect::new(
+                dialog_area.x,
+                dialog_area.y + 1,
+                dialog_area.width,
+                dialog_area.height - 1,
+            )
+        } else {
+            dialog_area
+        };
+
         let phase = state.phase.as_ref().map(|(p, _)| p.clone());
         if let Some(phase) = phase.filter(|_| dialog_area.height > 1) {
             let trans_h = dialog_area.height - 1;
@@ -96,10 +133,15 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 dialog_area.width,
                 1,
             );
+            let transcript = if state.agent_replaces_dialog() {
+                &mut state.panel.agent_transcript
+            } else {
+                &mut state.transcript
+            };
             dialog::draw(
                 frame,
                 trans_area,
-                &mut state.transcript,
+                transcript,
                 &dialog_opts,
                 state.anim_frame,
             );
@@ -113,10 +155,15 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             );
             frame.render_widget(Paragraph::new(anim_line), anim_area);
         } else {
+            let transcript = if state.agent_replaces_dialog() {
+                &mut state.panel.agent_transcript
+            } else {
+                &mut state.transcript
+            };
             dialog::draw(
                 frame,
                 dialog_area,
-                &mut state.transcript,
+                transcript,
                 &dialog_opts,
                 state.anim_frame,
             );

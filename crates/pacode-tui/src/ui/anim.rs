@@ -7,8 +7,8 @@
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 
-use pacode_render::{Glyphs, RenderOptions, truncate_to_width};
 use crate::state::activity::{Phase, displayed_secs, format_activity_secs, thinking_color};
+use pacode_render::{Glyphs, RenderOptions, truncate_to_width};
 
 /// Display width of the pacman bar, including its brackets.
 const PACMAN_WIDTH: usize = 24;

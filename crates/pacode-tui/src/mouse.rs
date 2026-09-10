@@ -42,7 +42,13 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
         MouseEventKind::ScrollDown => {
             let delta = -3;
             if layout.dialog.contains((col, row).into()) {
-                state.transcript.scroll_by(delta);
+                // In replace mode the dialog column shows the subagent, so the
+                // wheel has to move the transcript that is actually on screen.
+                if state.agent_replaces_dialog() {
+                    state.panel.agent_transcript.scroll_by(delta);
+                } else {
+                    state.transcript.scroll_by(delta);
+                }
             } else if layout.input.contains((col, row).into()) {
                 let max_scroll = state
                     .input
@@ -61,7 +67,13 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
         MouseEventKind::ScrollUp => {
             let delta = 3;
             if layout.dialog.contains((col, row).into()) {
-                state.transcript.scroll_by(delta);
+                // In replace mode the dialog column shows the subagent, so the
+                // wheel has to move the transcript that is actually on screen.
+                if state.agent_replaces_dialog() {
+                    state.panel.agent_transcript.scroll_by(delta);
+                } else {
+                    state.transcript.scroll_by(delta);
+                }
                 if state.transcript.is_at_top() && state.can_load_history() {
                     state.transcript.loading_history = true;
                     return vec![Action::LoadHistory];

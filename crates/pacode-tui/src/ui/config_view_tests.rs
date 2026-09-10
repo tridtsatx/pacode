@@ -105,7 +105,7 @@ fn test_ctrl_r_removes_override() {
     state.config_view.query = "exec.yield_after_secs".to_string();
     state.config_view.selected = 0;
 
-    // Mutate the config away from default (10 -> 99)
+    // Mutate the config away from default (5 -> 99)
     state.config.exec.yield_after_secs = 99;
     assert_eq!(state.config.exec.yield_after_secs, 99);
 
@@ -113,7 +113,7 @@ fn test_ctrl_r_removes_override() {
     let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
     handle_key(&mut state, ctrl_r);
 
-    assert_eq!(state.config.exec.yield_after_secs, 10);
+    assert_eq!(state.config.exec.yield_after_secs, 5);
 }
 
 #[test]

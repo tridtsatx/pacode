@@ -2,8 +2,7 @@
 
 use std::time::Instant;
 
-use pacode_types::time::now_ms;
-use pacode_types::{Event, PermissionDecision, TaskStatus, ToastLevel, TranscriptKind};
+use pacode_types::{Event, PermissionDecision, ToastLevel, TranscriptKind};
 
 use crate::state::stats;
 use crate::state::transcript::{Cell, CellKind, Transcript};
@@ -236,19 +235,18 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             state.rail.upsert_agent(info);
         }
         Event::AgentUpdated(info) => {
+            // Following a subagent stops when that subagent stops. No toast here:
+            // `observe_background_completion` already puts the finished agent in
+            // the transcript, and saying it twice was noise.
             if !info.status.is_live()
                 && let Focus::Panel {
                     target: PanelTarget::Agent(ref id),
                     ref mut follow,
                     ..
                 } = state.focus
+                && *id == info.id
             {
-                if *id == info.id {
-                    *follow = false;
-                } else if *follow {
-                    let title = format!("{} finished", info.name);
-                    state.push_toast(ToastLevel::Info, title, info.summary.clone(), now);
-                }
+                *follow = false;
             }
             state.rail.upsert_agent(info);
         }
@@ -256,25 +254,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             state.rail.upsert_task(info);
         }
         Event::TaskUpdated(info) => {
-            if info.status.is_terminal()
-                && let Focus::Panel { follow: true, .. } = state.focus
-            {
-                let level = match info.status {
-                    TaskStatus::Failed => ToastLevel::Error,
-                    _ => ToastLevel::Success,
-                };
-                let duration = pacode_types::time::format_duration_ms(info.duration_ms(now_ms()));
-                let title = format!(
-                    "{} {}",
-                    info.label,
-                    if info.status == TaskStatus::Failed {
-                        "failed"
-                    } else {
-                        "completed"
-                    }
-                );
-                state.push_toast(level, title, Some(duration), now);
-            }
+            // The transcript line from `observe_background_completion` is the
+            // single report; a toast on top of it was the same text twice.
             state.rail.upsert_task(info);
         }
         Event::UsageUpdated(usage) => {

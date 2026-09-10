@@ -272,13 +272,49 @@ fn test_action_setting_not_directly_editable() {
 #[test]
 fn test_apply_and_reset_in_config() {
     let mut cfg = Config::default();
-    assert_eq!(cfg.exec.yield_after_secs, 10);
+    assert_eq!(cfg.exec.yield_after_secs, 5);
 
     apply_to_config(&mut cfg, "exec.yield_after_secs", &toml::Value::Integer(45));
     assert_eq!(cfg.exec.yield_after_secs, 45);
 
     reset_in_config(&mut cfg, "exec.yield_after_secs");
-    assert_eq!(cfg.exec.yield_after_secs, 10);
+    assert_eq!(cfg.exec.yield_after_secs, 5);
+}
+
+#[test]
+fn test_catalog_ttl_secs_round_trip() {
+    let mut cfg = Config::default();
+    assert_eq!(cfg.provider.catalog_ttl_secs, 86400);
+    assert_eq!(
+        read_value(&cfg, "provider.catalog_ttl_secs"),
+        Some("86400".to_string())
+    );
+
+    let entry = find_entry("provider.catalog_ttl_secs").unwrap();
+    assert_eq!(entry.default_value, "86400");
+    assert_eq!(entry.apply, ApplyMode::NextTurn);
+
+    let parsed = validate_candidate(entry, "3600").unwrap();
+    assert_eq!(parsed, toml::Value::Integer(3600));
+
+    apply_to_config(&mut cfg, "provider.catalog_ttl_secs", &parsed);
+    assert_eq!(cfg.provider.catalog_ttl_secs, 3600);
+    assert_eq!(
+        read_value(&cfg, "provider.catalog_ttl_secs"),
+        Some("3600".to_string())
+    );
+
+    reset_in_config(&mut cfg, "provider.catalog_ttl_secs");
+    assert_eq!(cfg.provider.catalog_ttl_secs, 86400);
+    assert_eq!(
+        read_value(&cfg, "provider.catalog_ttl_secs"),
+        Some("86400".to_string())
+    );
+
+    // Rejects out of range (e.g. 0 or too high)
+    assert!(validate_candidate(entry, "0").is_err());
+    assert!(validate_candidate(entry, "3000000").is_err());
+    assert!(validate_candidate(entry, "not-a-number").is_err());
 }
 
 #[test]

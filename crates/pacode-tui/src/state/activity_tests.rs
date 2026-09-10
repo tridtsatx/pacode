@@ -98,3 +98,43 @@ fn the_duration_text_is_whole_seconds_then_minutes() {
     assert_eq!(format_activity_secs(60), "1m00s");
     assert_eq!(format_activity_secs(125), "2m05s");
 }
+
+#[test]
+fn only_long_or_failed_background_jobs_earn_a_transcript_line() {
+    use crate::state::{BackgroundOutcome, background_worth_reporting};
+
+    assert!(!background_worth_reporting(BackgroundOutcome::Completed, 0));
+    assert!(!background_worth_reporting(
+        BackgroundOutcome::Completed,
+        29_999
+    ));
+    assert!(background_worth_reporting(
+        BackgroundOutcome::Completed,
+        30_000
+    ));
+    // A job that failed is reported however briefly it ran.
+    assert!(background_worth_reporting(BackgroundOutcome::Failed, 5));
+    assert!(background_worth_reporting(BackgroundOutcome::Killed, 5));
+}
+
+#[test]
+fn a_selected_subagent_replaces_the_chat_by_default_and_splits_when_configured() {
+    use crate::state::{AppState, Focus, PanelTarget};
+    use pacode_types::config::AgentView;
+    use pacode_types::{AgentId, Config};
+
+    let mut state = AppState::new(Config::default(), "0.0.0".into(), 100, 30);
+    assert_eq!(state.config.ui.agent_view, AgentView::Replace);
+    // Nothing selected: the main chat owns the column.
+    assert!(!state.agent_replaces_dialog());
+
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(AgentId::new("agt_1")),
+        follow: false,
+        follow_paused: false,
+    };
+    assert!(state.agent_replaces_dialog());
+
+    state.config.ui.agent_view = AgentView::Panel;
+    assert!(!state.agent_replaces_dialog());
+}

@@ -103,6 +103,7 @@ const EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const SUBAGENT_EFFORT_OPTIONS: &[&str] = &["", "low", "medium", "high", "xhigh", "max"];
 const COLOR_OPTIONS: &[&str] = &["auto", "truecolor", "ansi"];
 const IMAGE_OPTIONS: &[&str] = &["auto", "off"];
+const AGENT_VIEW_OPTIONS: &[&str] = &["replace", "panel"];
 const PERM_OPTIONS: &[&str] = &["build", "auto", "plan", "bypass"];
 const FONT_WEIGHT_OPTIONS: &[&str] = &["", "normal", "bold"];
 
@@ -113,6 +114,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "provider.effort", label: "Reasoning Effort", description: "Base reasoning effort level", section: "provider", default_value: "medium", kind: SettingKind::Enum { options: EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.stream_idle_secs", label: "Stream Idle Timeout", description: "Base idle timeout in seconds for streaming responses", section: "provider", default_value: "180", kind: SettingKind::Integer { min: 1, max: 3600 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.max_retries", label: "Max Retries", description: "Maximum retries for failed provider requests", section: "provider", default_value: "5", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "provider.catalog_ttl_secs", label: "Catalog TTL Seconds", description: "Seconds before cached model catalog is considered stale", section: "provider", default_value: "86400", kind: SettingKind::Integer { min: 1, max: 2592000 }, apply: ApplyMode::NextTurn },
 
     // ui
     SettingEntry { dotted_key: "ui.hints.model", label: "Model Hint", description: "Show model route hint in prompt area", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
@@ -125,10 +127,11 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "ui.transcript_cells", label: "Transcript Cells", description: "Max transcript cells kept in RAM before evicting", section: "ui", default_value: "500", kind: SettingKind::Integer { min: 10, max: 100000 }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.images", label: "Image Rendering", description: "Terminal image protocol: auto or off", section: "ui", default_value: "auto", kind: SettingKind::Enum { options: IMAGE_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.vim", label: "Vim Keybindings", description: "Vim modal editing in prompt", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.agent_view", label: "Subagent View", description: "Where a selected subagent's chat opens: replace the main chat or split beside it", section: "ui", default_value: "replace", kind: SettingKind::Enum { options: AGENT_VIEW_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.thinking", label: "Show Thinking", description: "Draw model reasoning / thinking lines in transcript", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
 
     // exec
-    SettingEntry { dotted_key: "exec.yield_after_secs", label: "Yield After Seconds", description: "Foreground wait in seconds before backgrounding command", section: "exec", default_value: "10", kind: SettingKind::Integer { min: 1, max: 3600 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "exec.yield_after_secs", label: "Yield After Seconds", description: "Foreground wait in seconds before backgrounding command", section: "exec", default_value: "5", kind: SettingKind::Integer { min: 1, max: 3600 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "exec.stall_secs", label: "Stall Seconds", description: "Silence duration in seconds before stall notification", section: "exec", default_value: "120", kind: SettingKind::Integer { min: 1, max: 86400 }, apply: ApplyMode::Restart },
     SettingEntry { dotted_key: "exec.max_spool_bytes", label: "Max Spool Bytes", description: "Maximum spool file size in bytes per task", section: "exec", default_value: "52428800", kind: SettingKind::Integer { min: 1024, max: 10737418240 }, apply: ApplyMode::Restart },
     SettingEntry { dotted_key: "exec.tail_bytes", label: "Tail Bytes", description: "In-memory tail buffer size in bytes per task", section: "exec", default_value: "65536", kind: SettingKind::Integer { min: 1024, max: 104857600 }, apply: ApplyMode::Restart },
@@ -212,6 +215,7 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "provider.effort" => Some(config.provider.effort.as_str().to_string()),
         "provider.stream_idle_secs" => Some(config.provider.stream_idle_secs.to_string()),
         "provider.max_retries" => Some(config.provider.max_retries.to_string()),
+        "provider.catalog_ttl_secs" => Some(config.provider.catalog_ttl_secs.to_string()),
         "ui.hints.model" => Some(config.ui.hints.model.to_string()),
         "ui.hints.effort" => Some(config.ui.hints.effort.to_string()),
         "ui.ascii_only" => Some(config.ui.ascii_only.to_string()),
@@ -227,6 +231,7 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "ui.images" => Some(config.ui.images.clone()),
         "ui.vim" => Some(config.ui.vim.to_string()),
         "ui.thinking" => Some(config.ui.thinking.to_string()),
+        "ui.agent_view" => Some(config.ui.agent_view.as_str().to_string()),
         "exec.yield_after_secs" => Some(config.exec.yield_after_secs.to_string()),
         "exec.stall_secs" => Some(config.exec.stall_secs.to_string()),
         "exec.max_spool_bytes" => Some(config.exec.max_spool_bytes.to_string()),
@@ -428,6 +433,11 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 config.provider.max_retries = *n as u32;
             }
         }
+        "provider.catalog_ttl_secs" => {
+            if let toml::Value::Integer(n) = value {
+                config.provider.catalog_ttl_secs = *n as u64;
+            }
+        }
         "ui.hints.model" => {
             if let toml::Value::Boolean(b) = value {
                 config.ui.hints.model = *b;
@@ -482,6 +492,13 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "ui.thinking" => {
             if let toml::Value::Boolean(b) = value {
                 config.ui.thinking = *b;
+            }
+        }
+        "ui.agent_view" => {
+            if let toml::Value::String(v) = value
+                && let Some(parsed) = pacode_types::config::AgentView::parse(v)
+            {
+                config.ui.agent_view = parsed;
             }
         }
         "exec.yield_after_secs" => {

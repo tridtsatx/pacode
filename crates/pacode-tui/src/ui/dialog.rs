@@ -181,6 +181,16 @@ fn get_or_render_cell(
     }
 }
 
+/// Test-only entry point: render one cell exactly as the transcript would.
+#[cfg(test)]
+pub(crate) fn render_cell_for_test(
+    cell_kind: &CellKind,
+    width: u16,
+    opts: &RenderOptions,
+) -> Vec<Line<'static>> {
+    render_cell(cell_kind, None, width, opts, 0)
+}
+
 fn render_cell(
     cell_kind: &CellKind,
     stats: Option<&str>,
@@ -191,7 +201,49 @@ fn render_cell(
     match cell_kind {
         CellKind::Gap => vec![Line::default()],
         CellKind::Item(kind) => render_item(kind, stats, width, opts, anim_frame),
+        CellKind::BackgroundResult(result) => render_background_result(result, width, opts),
     }
+}
+
+/// A finished background job, drawn in the tool-call idiom: symbol, what ran,
+/// then the outcome with its duration and exit code.
+fn render_background_result(
+    result: &crate::state::BackgroundResult,
+    width: u16,
+    opts: &RenderOptions,
+) -> Vec<Line<'static>> {
+    use crate::state::{BackgroundKind, BackgroundOutcome};
+
+    let noun = match result.kind {
+        BackgroundKind::Task => "Background",
+        BackgroundKind::Agent => "Agent",
+    };
+    let dur = pacode_types::time::format_duration_ms(result.duration_ms);
+    let (word, style) = match result.outcome {
+        BackgroundOutcome::Completed => ("done", opts.theme.green),
+        BackgroundOutcome::Failed => ("failed", opts.theme.red),
+        BackgroundOutcome::Killed => ("killed", opts.theme.yellow),
+    };
+    let mut tail = format!("{word} {dur}");
+    if let Some(code) = result.exit_code
+        && code != 0
+    {
+        tail.push_str(&format!(" · exit {code}"));
+    }
+
+    // The label is the part that can be arbitrarily long, so it is the part that
+    // gets an ellipsis: the outcome must stay readable at any width.
+    let sym = opts.glyphs.tool;
+    let head = format!("{sym} {noun} ");
+    let fixed = pacode_render::display_width(&head) + pacode_render::display_width(&tail) + 1;
+    let label = truncate_to_width(&result.label, (width as usize).saturating_sub(fixed), true);
+
+    vec![Line::from(vec![
+        Span::styled(head, opts.theme.cyan),
+        Span::styled(label, opts.theme.dim),
+        Span::raw(" "),
+        Span::styled(tail, style),
+    ])]
 }
 
 pub(crate) fn render_item(

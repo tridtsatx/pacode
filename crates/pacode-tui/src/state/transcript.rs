@@ -39,6 +39,35 @@ pub enum CellKind {
     Item(TranscriptKind),
     /// Divider between turns (drawn as a blank line).
     Gap,
+    /// A background task or subagent that ended. Client-side only: the daemon
+    /// reports the task, the client decides whether it was long enough to be
+    /// worth a line and renders it like a tool call rather than as prose.
+    BackgroundResult(BackgroundResult),
+}
+
+/// What a finished background job is shown as.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundResult {
+    /// `task` for a command, `agent` for a subagent.
+    pub kind: BackgroundKind,
+    /// Command line or agent name.
+    pub label: String,
+    pub outcome: BackgroundOutcome,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundKind {
+    Task,
+    Agent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundOutcome {
+    Completed,
+    Failed,
+    Killed,
 }
 
 pub struct Transcript {

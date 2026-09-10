@@ -403,6 +403,8 @@ fn test_mockup_state_02_select_agent() {
 fn test_mockup_state_03_panel() {
     let snapshot = make_base_snapshot();
     let mut state = create_state(120, 34, snapshot);
+    // This mockup is the split view; the replace view has its own snapshot below.
+    state.config.ui.agent_view = pacode_types::config::AgentView::Panel;
 
     let target = PanelTarget::Agent(AgentId::new("agt_3"));
     state.focus = Focus::Panel {
@@ -459,6 +461,23 @@ fn test_mockup_state_03_panel() {
 
     let view = format!("{}", terminal.backend());
     insta::assert_snapshot!("state_03_120x34", view);
+
+    // Same selection under the default view: the subagent takes the column over
+    // and says whose conversation is on screen.
+    state.config.ui.agent_view = pacode_types::config::AgentView::Replace;
+    let backend = TestBackend::new(120, 34);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            ui::draw(f, &mut state);
+        })
+        .unwrap();
+    let view = format!("{}", terminal.backend());
+    assert!(
+        view.contains("agent codegen"),
+        "the takeover banner must name the agent"
+    );
+    insta::assert_snapshot!("state_03_replace_120x34", view);
 }
 
 #[test]

@@ -1780,7 +1780,7 @@ fn test_ctrl_enter_submit_now_behavior() {
 }
 
 #[test]
-fn test_background_completion_renders_notice_with_exit_code() {
+fn test_background_completion_renders_a_result_cell_with_exit_code() {
     let mut state = make_test_state();
     let now = Instant::now();
 
@@ -1813,36 +1813,65 @@ fn test_background_completion_renders_notice_with_exit_code() {
         now,
     );
 
-    // Verify notice cell was added
     let cell = state
         .transcript
         .cells
         .back()
-        .expect("notice cell was added");
-    let (level, text) = match &cell.kind {
-        CellKind::Item(TranscriptKind::Notice { level, text }) => (*level, text.clone()),
-        _ => panic!("expected TranscriptKind::Notice item"),
+        .expect("background result cell was added");
+    let result = match &cell.kind {
+        CellKind::BackgroundResult(r) => r.clone(),
+        other => panic!("expected a background result cell, got {other:?}"),
     };
+    assert_eq!(result.outcome, crate::state::BackgroundOutcome::Failed);
+    assert_eq!(result.exit_code, Some(101));
+    assert_eq!(result.label, "cargo test");
 
-    assert_eq!(level, pacode_types::ToastLevel::Error);
-    assert!(
-        text.contains("101"),
-        "exit code 101 must be visible in notice: '{text}'"
-    );
-    assert!(text.contains("cargo test") || text.contains("test run"));
+    // A failure is reported however short it was, and the toast is gone: the
+    // transcript line is the single report.
+    assert!(state.toasts.is_empty(), "the duplicate toast must be gone");
 
-    // Verify rendered output is exactly one notice line (+ blank spacing line)
     let opts = pacode_render::RenderOptions::new(80, false);
-    let kind = match &cell.kind {
-        CellKind::Item(k) => k,
-        _ => panic!("expected CellKind::Item"),
+    let lines = crate::ui::dialog::render_cell_for_test(&cell.kind, 80, &opts);
+    assert_eq!(lines.len(), 1);
+    let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(rendered.contains("101"), "exit code missing: {rendered}");
+    assert!(rendered.contains("cargo test"), "label missing: {rendered}");
+    assert!(rendered.contains("failed"), "outcome missing: {rendered}");
+}
+
+#[test]
+fn test_short_successful_background_task_is_not_reported() {
+    let mut state = make_test_state();
+    let before = state.transcript.cells.len();
+
+    let quick = pacode_types::TaskInfo {
+        id: pacode_types::TaskId::new("task_q1"),
+        session: pacode_types::SessionId::new("ses_1"),
+        owner: AgentId::main(),
+        label: "quick".into(),
+        command: "true".into(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        status: pacode_types::state::TaskStatus::Completed,
+        backgrounded: true,
+        exit_code: Some(0),
+        started_at_ms: pacode_types::time::now_ms(),
+        ended_at_ms: Some(pacode_types::time::now_ms() + 200),
+        progress: None,
+        warnings: 0,
+        errors: 0,
+        output_path: std::path::PathBuf::from("/tmp/out"),
+        output_bytes: 0,
+        acked: false,
     };
-    let lines = crate::ui::dialog::render_item(kind, None, 80, &opts, 0);
-    let content_lines: Vec<_> = lines
-        .iter()
-        .filter(|l| !l.spans.is_empty() && !l.spans[0].content.is_empty())
-        .collect();
-    assert_eq!(content_lines.len(), 1);
-    let rendered_text = &content_lines[0].spans[0].content;
-    assert!(rendered_text.contains("101"));
+
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 1,
+            event: pacode_types::Event::TaskUpdated(quick),
+        },
+        Instant::now(),
+    );
+
+    assert_eq!(state.transcript.cells.len(), before);
+    assert!(state.toasts.is_empty());
 }

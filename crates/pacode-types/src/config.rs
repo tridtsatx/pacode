@@ -58,6 +58,8 @@ pub struct ProviderDefaults {
     /// Base idle timeout of a streaming response, scaled by effort.
     pub stream_idle_secs: u64,
     pub max_retries: u32,
+    /// Time-to-live in seconds for cached model catalog (background refresh).
+    pub catalog_ttl_secs: u64,
 }
 
 impl Default for ProviderDefaults {
@@ -67,6 +69,7 @@ impl Default for ProviderDefaults {
             effort: Effort::Medium,
             stream_idle_secs: 180,
             max_retries: 5,
+            catalog_ttl_secs: 86400,
         }
     }
 }
@@ -202,6 +205,39 @@ pub struct UiConfig {
     /// reasoning is still recorded, it is just not drawn.
     #[serde(default)]
     pub thinking: bool,
+    /// Where a selected subagent's conversation is shown.
+    #[serde(default)]
+    pub agent_view: AgentView,
+}
+
+/// Where a selected subagent's conversation goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentView {
+    /// The subagent takes over the conversation column; the main thread comes
+    /// back when the subagent is deselected. The default: on a normal terminal
+    /// a split column leaves neither conversation readable.
+    #[default]
+    Replace,
+    /// The subagent opens beside the main conversation, splitting the column.
+    Panel,
+}
+
+impl AgentView {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Panel => "panel",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "replace" => Some(Self::Replace),
+            "panel" => Some(Self::Panel),
+            _ => None,
+        }
+    }
 }
 
 impl Default for UiConfig {
@@ -217,6 +253,7 @@ impl Default for UiConfig {
             images: default_images(),
             vim: false,
             thinking: false,
+            agent_view: AgentView::default(),
         }
     }
 }
@@ -262,7 +299,7 @@ pub struct ExecConfig {
 impl Default for ExecConfig {
     fn default() -> Self {
         Self {
-            yield_after_secs: 10,
+            yield_after_secs: 5,
             stall_secs: 120,
             max_spool_bytes: 50 * 1024 * 1024,
             tail_bytes: 64 * 1024,
@@ -495,7 +532,8 @@ mod tests {
     #[test]
     fn empty_toml_gives_defaults() {
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.exec.yield_after_secs, 10);
+        assert_eq!(cfg.exec.yield_after_secs, 5);
+        assert_eq!(cfg.provider.catalog_ttl_secs, 86400);
         assert_eq!(cfg.permissions.default_mode, Mode::Build);
         assert!(!cfg.ui.hints.model);
         assert_eq!(cfg.ui.ups, Ups::Fixed(10));

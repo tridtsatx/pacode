@@ -28,7 +28,22 @@ pub use input::InputState;
 pub use rail::RailState;
 pub use selection::Selection;
 pub use slots::{NUM_SLOTS, SessionSlot};
-pub use transcript::{Cell, CellKind, Transcript};
+pub use transcript::{
+    BackgroundKind, BackgroundOutcome, BackgroundResult, Cell, CellKind, Transcript,
+};
+
+/// A background job shorter than this is not reported in the transcript: it is
+/// over before the reader could act on it, and the rail already carried it.
+pub const BACKGROUND_NOTICE_MIN_MS: u64 = 30_000;
+
+/// Whether a finished background job earns a transcript line. Failures always do,
+/// however brief: a command that died immediately is exactly what must be seen.
+pub fn background_worth_reporting(outcome: BackgroundOutcome, duration_ms: u64) -> bool {
+    match outcome {
+        BackgroundOutcome::Completed => duration_ms >= BACKGROUND_NOTICE_MIN_MS,
+        BackgroundOutcome::Failed | BackgroundOutcome::Killed => true,
+    }
+}
 pub use vim::{VimEffect, VimMode, VimState};
 
 /// Interaction modes (spec §5). Layers are removed one at a time by `esc`.
@@ -213,6 +228,22 @@ pub struct PanelState {
 }
 
 impl AppState {
+    /// Whether a subagent (or task) takes over the conversation column instead of
+    /// splitting it. Task output always splits: it is read against the chat.
+    pub fn agent_replaces_dialog(&self) -> bool {
+        self.config.ui.agent_view == pacode_types::config::AgentView::Replace
+            && matches!(self.panel_agent_target(), Some(PanelTarget::Agent(_)))
+    }
+
+    /// The panel's current target, whether it came from focus or from a previous
+    /// selection that is still open.
+    pub fn panel_agent_target(&self) -> Option<PanelTarget> {
+        match &self.focus {
+            Focus::Panel { target, .. } => Some(target.clone()),
+            _ => self.panel.target.clone(),
+        }
+    }
+
     pub fn new(config: Config, app_version: String, cols: u16, rows: u16) -> Self {
         let cells = config.ui.transcript_cells;
         let paths = pacode_config::Paths::discover();
@@ -550,7 +581,13 @@ impl AppState {
         }
     }
 
-    /// Observe background tasks and subagents ending and record a notice in the transcript.
+    /// Observe background tasks and subagents ending and record a line in the transcript.
+    ///
+    /// Only jobs that actually ran for a while are worth interrupting the reader
+    /// for: anything shorter than `BACKGROUND_NOTICE_MIN_MS` finished about as
+    /// fast as reading about it would take, and the rail already showed it. The
+    /// line is the only report — the toast that used to accompany it said the
+    /// same thing twice.
     pub fn observe_background_completion(&mut self, event: &Event) {
         match event {
             Event::TaskUpdated(info) if info.status.is_terminal() => {
@@ -560,34 +597,37 @@ impl AppState {
                     .iter()
                     .find(|t| t.id == info.id)
                     .is_some_and(|t| t.status.is_terminal());
-                if !was_terminal {
-                    let cmd = if info.command.is_empty() {
-                        &info.label
-                    } else {
-                        &info.command
-                    };
-                    let short_cmd = pacode_types::truncate_head_tail(cmd, 60);
-                    let exit_str = match info.exit_code {
-                        Some(c) => format!(" (exit code {c})"),
-                        None => String::new(),
-                    };
-                    let (status_word, level) = match info.status {
-                        pacode_types::TaskStatus::Completed => {
-                            let lvl = if info.exit_code.unwrap_or(0) == 0 {
-                                ToastLevel::Success
-                            } else {
-                                ToastLevel::Error
-                            };
-                            ("completed", lvl)
-                        }
-                        pacode_types::TaskStatus::Failed => ("failed", ToastLevel::Error),
-                        pacode_types::TaskStatus::Killed => ("killed", ToastLevel::Warn),
-                        pacode_types::TaskStatus::Running => return,
-                    };
-                    let text =
-                        format!("Background command \"{short_cmd}\" {status_word}{exit_str}");
-                    self.push_notice_with_level(level, text);
+                if was_terminal {
+                    return;
                 }
+                let outcome = match info.status {
+                    pacode_types::TaskStatus::Completed => {
+                        if info.exit_code.unwrap_or(0) == 0 {
+                            BackgroundOutcome::Completed
+                        } else {
+                            BackgroundOutcome::Failed
+                        }
+                    }
+                    pacode_types::TaskStatus::Failed => BackgroundOutcome::Failed,
+                    pacode_types::TaskStatus::Killed => BackgroundOutcome::Killed,
+                    pacode_types::TaskStatus::Running => return,
+                };
+                let duration_ms = info.duration_ms(now_ms());
+                if !background_worth_reporting(outcome, duration_ms) {
+                    return;
+                }
+                let label = if info.command.is_empty() {
+                    info.label.clone()
+                } else {
+                    info.command.clone()
+                };
+                self.push_background_result(BackgroundResult {
+                    kind: BackgroundKind::Task,
+                    label,
+                    outcome,
+                    exit_code: info.exit_code,
+                    duration_ms,
+                });
             }
             Event::AgentUpdated(info) if !info.id.is_main() && !info.status.is_live() => {
                 let was_finished = self
@@ -596,19 +636,45 @@ impl AppState {
                     .iter()
                     .find(|a| a.id == info.id)
                     .is_some_and(|a| !a.status.is_live());
-                if !was_finished {
-                    let (status_word, level) = match info.status {
-                        pacode_types::AgentStatus::Finished => ("completed", ToastLevel::Success),
-                        pacode_types::AgentStatus::Stopped => ("stopped", ToastLevel::Warn),
-                        pacode_types::AgentStatus::Failed => ("failed", ToastLevel::Error),
-                        _ => return,
-                    };
-                    let text = format!("Background agent \"{}\" {status_word}", info.name);
-                    self.push_notice_with_level(level, text);
+                if was_finished {
+                    return;
                 }
+                let outcome = match info.status {
+                    pacode_types::AgentStatus::Finished => BackgroundOutcome::Completed,
+                    pacode_types::AgentStatus::Stopped => BackgroundOutcome::Killed,
+                    pacode_types::AgentStatus::Failed => BackgroundOutcome::Failed,
+                    pacode_types::AgentStatus::Idle
+                    | pacode_types::AgentStatus::Thinking
+                    | pacode_types::AgentStatus::RunningTool
+                    | pacode_types::AgentStatus::WaitingApproval => return,
+                };
+                let duration_ms = info.duration_ms(now_ms());
+                if !background_worth_reporting(outcome, duration_ms) {
+                    return;
+                }
+                self.push_background_result(BackgroundResult {
+                    kind: BackgroundKind::Agent,
+                    label: info.name.clone(),
+                    outcome,
+                    exit_code: None,
+                    duration_ms,
+                });
             }
             _ => {}
         }
+    }
+
+    fn push_background_result(&mut self, result: BackgroundResult) {
+        let now = now_ms();
+        self.transcript.cells.push_back(Cell {
+            id: now,
+            kind: CellKind::BackgroundResult(result),
+            version: 0,
+            ts_ms: now,
+            stats: None,
+        });
+        self.transcript.scroll_to_bottom();
+        self.dirty = true;
     }
 
     pub fn save_pref_model(&self, model: &str) {
