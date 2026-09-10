@@ -2806,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "pacode"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2829,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-acp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agent-client-protocol",
  "chrono",
@@ -2845,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-client"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "log",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-config"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "dirs",
@@ -2878,7 +2878,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2905,7 +2905,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-daemon"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "log",
@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-exec"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "log",
@@ -2944,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-image"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -2954,7 +2954,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-import"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "pacode-types",
  "serde",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-mcp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "futures",
@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-plugin"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "dirs",
@@ -3004,7 +3004,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-provider"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "futures",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-render"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "insta",
  "pacode-types",
@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-risk"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "pacode-types",
  "pretty_assertions",
@@ -3047,14 +3047,14 @@ dependencies = [
 
 [[package]]
 name = "pacode-skills"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "pacode-store"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "log",
  "pacode-types",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-tools"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "dom_smoothie",
@@ -3103,7 +3103,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arboard",
  "chrono",
@@ -3131,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-types"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "pretty_assertions",
  "rand 0.9.5",
