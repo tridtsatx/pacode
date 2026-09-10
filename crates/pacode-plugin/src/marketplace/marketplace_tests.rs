@@ -524,8 +524,10 @@ fn a_manifest_reports_what_pacode_will_not_run() {
     assert!(ignored.contains(&Component::Hooks));
     assert!(ignored.contains(&Component::Agents));
     assert!(Component::Skills.supported());
-    assert!(Component::Commands.supported());
     assert!(Component::McpServers.supported());
+    // Markdown slash commands are declared by many plugins but pacode's own
+    // commands come from its plugin runtime, so they are reported as ignored.
+    assert!(!Component::Commands.supported());
 
     // A component path written either way reads back the same.
     assert_eq!(
@@ -614,4 +616,52 @@ fn the_github_token_goes_only_to_github_hosts() {
     ] {
         assert!(!source::is_github_host(url), "{url} is not GitHub");
     }
+}
+
+#[tokio::test]
+async fn an_installed_plugins_skills_and_mcp_servers_are_exposed_to_the_host() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = github();
+    let fetcher = std::sync::Arc::new(FakeFetcher::with(&source.index_url(), index_json()));
+    let manifest = br#"{
+        "name": "context7",
+        "skills": "./skills",
+        "commands": "./commands",
+        "mcpServers": {
+            "context7": {"command": "npx", "args": ["-y", "@upstash/context7-mcp"]},
+            "remote": {"url": "https://mcp.example/sse"},
+            "broken": {"description": "neither a command nor a url"}
+        }
+    }"#;
+    fetcher.set(
+        &source.archive_url().expect("archive url"),
+        Ok(tarball(&[
+            ("context7/.claude-plugin/plugin.json", manifest),
+            ("context7/skills/lookup/SKILL.md", b"# lookup\n"),
+        ])),
+    );
+    let market = marketplace(fetcher, dir.path(), 3600);
+    market
+        .install(&source, "context7", NOW)
+        .await
+        .expect("install");
+
+    // Skills sit where pacode's own loader reads them.
+    let skill_dirs = market.skill_dirs();
+    assert_eq!(skill_dirs.len(), 1);
+    assert!(skill_dirs[0].join("lookup/SKILL.md").exists());
+
+    // MCP servers are namespaced by plugin, and one with nothing to start is left out.
+    let servers = market.mcp_servers();
+    assert_eq!(servers.len(), 2, "{servers:?}");
+    let names: Vec<&str> = servers.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"context7/context7"));
+    assert!(names.contains(&"context7/remote"));
+    assert!(!names.contains(&"context7/broken"));
+
+    // Commands are declared but pacode does not run markdown commands: say so.
+    assert_eq!(
+        market.unsupported_components("context7"),
+        vec![Component::Commands]
+    );
 }

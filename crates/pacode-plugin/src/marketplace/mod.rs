@@ -264,6 +264,46 @@ impl Marketplace {
         Ok(())
     }
 
+    /// Skill directories of every installed plugin, for the skill loader.
+    ///
+    /// A Claude Code plugin keeps its skills at `<plugin>/skills/<name>/SKILL.md`,
+    /// which is the layout pacode's own loader reads — so pointing the loader at
+    /// these directories is all it takes for an installed plugin's skills to work.
+    pub fn skill_dirs(&self) -> Vec<PathBuf> {
+        self.installed()
+            .into_iter()
+            .map(|installed| self.plugins_dir.join(installed.name).join("skills"))
+            .filter(|dir| dir.is_dir())
+            .collect()
+    }
+
+    /// MCP servers declared by installed plugins, keyed by `<plugin>/<server>` so
+    /// two plugins cannot collide on a common name like `github`.
+    pub fn mcp_servers(&self) -> Vec<(String, manifest::McpServerDecl)> {
+        let mut out = Vec::new();
+        for installed in self.installed() {
+            let path = self
+                .plugins_dir
+                .join(&installed.name)
+                .join(".claude-plugin")
+                .join("plugin.json");
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let manifest = match PluginManifest::parse(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("unreadable plugin.json for {}: {e}", installed.name);
+                    continue;
+                }
+            };
+            for (name, decl) in manifest.mcp_server_decls() {
+                out.push((format!("{}/{name}", installed.name), decl));
+            }
+        }
+        out
+    }
+
     /// Components of an installed plugin that pacode will not run.
     pub fn unsupported_components(&self, plugin: &str) -> Vec<Component> {
         if !manifest::is_valid_plugin_name(plugin) {

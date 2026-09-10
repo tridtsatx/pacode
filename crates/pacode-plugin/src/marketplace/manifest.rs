@@ -199,7 +199,13 @@ pub struct PluginManifest {
     pub skills: Option<PathList>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Upstream spells this `mcpServers`; the snake_case spelling is accepted too.
+    #[serde(
+        default,
+        rename = "mcpServers",
+        alias = "mcp_servers",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mcp_servers: Option<serde_json::Value>,
 }
 
@@ -233,6 +239,52 @@ impl PluginManifest {
     }
 }
 
+/// One MCP server as a plugin declares it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerDecl {
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// An http server instead of a spawned command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+impl PluginManifest {
+    /// MCP servers the manifest declares, skipping any that name neither a
+    /// command nor a URL — there would be nothing to start.
+    pub fn mcp_server_decls(&self) -> Vec<(String, McpServerDecl)> {
+        let Some(value) = &self.mcp_servers else {
+            return Vec::new();
+        };
+        let Some(map) = value.as_object() else {
+            return Vec::new();
+        };
+        map.iter()
+            .filter_map(|(name, decl)| {
+                match serde_json::from_value::<McpServerDecl>(decl.clone()) {
+                    Ok(decl) if !decl.command.is_empty() || decl.url.is_some() => {
+                        Some((cap(name, NAME_MAX_CHARS), decl))
+                    }
+                    Ok(_) => {
+                        log::warn!("mcp server {name:?} declares neither a command nor a url");
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("mcp server {name:?} is unreadable: {e}");
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
 /// What pacode can and cannot honour from a Claude Code plugin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Component {
@@ -258,9 +310,13 @@ impl Component {
     /// to the caller as a warning rather than dropped in silence.
     pub fn supported(self) -> bool {
         match self {
-            Self::Skills | Self::Commands | Self::McpServers => true,
-            // pacode has its own subagent model and no hook runner yet.
-            Self::Hooks | Self::Agents => false,
+            // Skills are read from `<plugin>/skills/*/SKILL.md`, which is the
+            // layout pacode's own skill loader already reads; MCP servers are
+            // merged into the pool under a per-plugin name.
+            Self::Skills | Self::McpServers => true,
+            // pacode has its own subagent model, no hook runner, and its slash
+            // commands come from its own plugin runtime rather than from markdown.
+            Self::Commands | Self::Hooks | Self::Agents => false,
         }
     }
 }
@@ -273,6 +329,9 @@ pub fn unsupported_components(manifest: &PluginManifest) -> Vec<Component> {
     }
     if manifest.agents.is_some() {
         out.push(Component::Agents);
+    }
+    if manifest.commands.is_some() {
+        out.push(Component::Commands);
     }
     out.retain(|c| !c.supported());
     out

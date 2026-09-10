@@ -96,11 +96,15 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
     ));
 
     let (skill_registry, _warnings) = if opts.config.skills.enabled {
-        let dirs = if opts.config.skills.dirs.is_empty() {
+        let mut dirs = if opts.config.skills.dirs.is_empty() {
             vec![opts.paths.skills_dir()]
         } else {
             opts.config.skills.dirs.clone()
         };
+        // A plugin installed from a marketplace keeps its skills in the Claude
+        // Code layout, which is the one this loader reads: pointing it at those
+        // directories is what makes an installed plugin's skills actually work.
+        dirs.extend(marketplace.skill_dirs());
         let (reg, warnings) = pacode_skills::SkillRegistry::load(&dirs);
         for warning in &warnings {
             log::warn!("{warning}");
@@ -125,11 +129,25 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
     }
 
     let tasks = TaskManager::new(opts.paths.spool_dir(), opts.config.exec.clone());
-    let mcp = McpPool::new(
-        opts.config.mcp.servers.clone(),
-        Some(opts.paths.mcp_cache_dir()),
-        None,
-    );
+    // MCP servers declared by installed plugins join the configured ones under a
+    // `<plugin>/<server>` name, so two plugins cannot collide on `github`.
+    let mut mcp_servers = opts.config.mcp.servers.clone();
+    for (name, decl) in marketplace.mcp_servers() {
+        mcp_servers
+            .entry(name)
+            .or_insert(pacode_types::McpServerConfig {
+                command: decl.command,
+                args: decl.args,
+                env: decl.env,
+                url: decl.url,
+                headers: decl.headers,
+                enabled: true,
+                lazy: true,
+                timeout_secs: pacode_types::McpServerConfig::default().timeout_secs,
+            });
+    }
+
+    let mcp = McpPool::new(mcp_servers, Some(opts.paths.mcp_cache_dir()), None);
     mcp.set_idle_timeout_secs(opts.config.mcp.idle_timeout_secs);
     let store = Store::open(&opts.paths.db_file()).map_err(DaemonError::Store)?;
 
