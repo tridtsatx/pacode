@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.90"
@@ -34,24 +34,24 @@ keywords = ["cli", "tui", "agent", "llm", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-pacode-types = { path = "crates/pacode-types", version = "0.1.0" }
-pacode-config = { path = "crates/pacode-config", version = "0.1.0" }
-pacode-risk = { path = "crates/pacode-risk", version = "0.1.0" }
-pacode-render = { path = "crates/pacode-render", version = "0.1.0" }
-pacode-exec = { path = "crates/pacode-exec", version = "0.1.0" }
-pacode-provider = { path = "crates/pacode-provider", version = "0.1.0" }
-pacode-mcp = { path = "crates/pacode-mcp", version = "0.1.0" }
-pacode-store = { path = "crates/pacode-store", version = "0.1.0" }
-pacode-tools = { path = "crates/pacode-tools", version = "0.1.0" }
-pacode-core = { path = "crates/pacode-core", version = "0.1.0" }
-pacode-daemon = { path = "crates/pacode-daemon", version = "0.1.0" }
-pacode-client = { path = "crates/pacode-client", version = "0.1.0" }
-pacode-tui = { path = "crates/pacode-tui", version = "0.1.0" }
-pacode-plugin = { path = "crates/pacode-plugin", version = "0.1.0" }
-pacode-import = { path = "crates/pacode-import", version = "0.1.0" }
-pacode-image = { path = "crates/pacode-image", version = "0.1.0" }
-pacode-skills = { path = "crates/pacode-skills", version = "0.1.0" }
-pacode-acp = { path = "crates/pacode-acp", version = "0.1.0" }
+pacode-types = { path = "crates/pacode-types", version = "0.1.1" }
+pacode-config = { path = "crates/pacode-config", version = "0.1.1" }
+pacode-risk = { path = "crates/pacode-risk", version = "0.1.1" }
+pacode-render = { path = "crates/pacode-render", version = "0.1.1" }
+pacode-exec = { path = "crates/pacode-exec", version = "0.1.1" }
+pacode-provider = { path = "crates/pacode-provider", version = "0.1.1" }
+pacode-mcp = { path = "crates/pacode-mcp", version = "0.1.1" }
+pacode-store = { path = "crates/pacode-store", version = "0.1.1" }
+pacode-tools = { path = "crates/pacode-tools", version = "0.1.1" }
+pacode-core = { path = "crates/pacode-core", version = "0.1.1" }
+pacode-daemon = { path = "crates/pacode-daemon", version = "0.1.1" }
+pacode-client = { path = "crates/pacode-client", version = "0.1.1" }
+pacode-tui = { path = "crates/pacode-tui", version = "0.1.1" }
+pacode-plugin = { path = "crates/pacode-plugin", version = "0.1.1" }
+pacode-import = { path = "crates/pacode-import", version = "0.1.1" }
+pacode-image = { path = "crates/pacode-image", version = "0.1.1" }
+pacode-skills = { path = "crates/pacode-skills", version = "0.1.1" }
+pacode-acp = { path = "crates/pacode-acp", version = "0.1.1" }
 
 # async
 tokio = { version = "1", default-features = false }
