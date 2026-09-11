@@ -56,6 +56,7 @@ fn provider_for(port: u16, max_retries: u32) -> OpenAiCompat {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
     let defaults = ProviderDefaults {
         max_retries,

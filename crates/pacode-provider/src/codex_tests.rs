@@ -41,6 +41,7 @@ fn make_test_provider(auth: Option<CodexAuth>, base_url: Option<&str>) -> Codex 
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     Codex::new(
@@ -367,6 +368,7 @@ fn test_build_body_reasoning_block() {
         effort_map,
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = Codex::new(
@@ -735,6 +737,7 @@ async fn test_complete_e2e_streaming_success() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = Codex::new(
@@ -816,6 +819,7 @@ async fn test_complete_e2e_401_auth_error() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = Codex::new(
@@ -886,6 +890,7 @@ async fn test_complete_e2e_429_rate_limit_error() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let defaults = ProviderDefaults {
@@ -973,6 +978,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = Codex::new(
@@ -1030,6 +1036,7 @@ fn test_model_info_pricing_and_reasoning() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = Codex::new(
@@ -1055,4 +1062,31 @@ fn test_model_info_pricing_and_reasoning() {
     // Unconfigured non-reasoning model
     let info3 = provider.model_info("gpt-4o");
     assert!(!info3.supports_reasoning);
+}
+
+#[test]
+fn test_codex_malformed_proxy_names_provider_and_offending_value() {
+    let cfg = ProviderConfig {
+        base_url: "https://api.openai.com/v1".to_string(),
+        proxy: Some("invalid-url-value".to_string()),
+        ..Default::default()
+    };
+    let res = Codex::new(
+        "codex-prov",
+        cfg,
+        ProviderDefaults::default(),
+        None,
+        BTreeMap::new(),
+    );
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("codex-prov"),
+        "error must name provider: {msg}"
+    );
+    assert!(
+        msg.contains("invalid-url-value"),
+        "error must name offending value: {msg}"
+    );
 }

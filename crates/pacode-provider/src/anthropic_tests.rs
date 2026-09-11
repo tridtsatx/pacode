@@ -33,6 +33,7 @@ fn make_anthropic_provider(
         effort_map: BTreeMap::new(),
         extra_body,
         headers: BTreeMap::new(),
+        proxy: None,
     };
     Anthropic::new(
         "anthropic",
@@ -823,6 +824,7 @@ async fn test_http_status_errors_and_overloaded() {
             effort_map: BTreeMap::new(),
             extra_body: None,
             headers: BTreeMap::new(),
+            proxy: None,
         };
         let defaults = ProviderDefaults {
             max_retries: 0,
@@ -879,6 +881,7 @@ async fn test_http_status_errors_and_overloaded() {
             effort_map: BTreeMap::new(),
             extra_body: None,
             headers: BTreeMap::new(),
+            proxy: None,
         };
         let defaults = ProviderDefaults {
             max_retries: 0,
@@ -1025,6 +1028,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = Anthropic::new(
@@ -1044,4 +1048,31 @@ async fn test_list_models_catalog_fetch_and_merge() {
     assert_eq!(models[0].display_name, "Custom Sonnet");
     assert_eq!(models[1].route.model, "claude-3-5-haiku-20241022");
     assert_eq!(models[1].context_window, Some(200_000));
+}
+
+#[test]
+fn test_anthropic_malformed_proxy_names_provider_and_offending_value() {
+    let cfg = ProviderConfig {
+        base_url: "https://api.anthropic.com/v1".to_string(),
+        proxy: Some("bad://invalid:99".to_string()),
+        ..Default::default()
+    };
+    let res = Anthropic::new(
+        "claude-prov",
+        cfg,
+        ProviderDefaults::default(),
+        None,
+        BTreeMap::new(),
+    );
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("claude-prov"),
+        "error must name provider: {msg}"
+    );
+    assert!(
+        msg.contains("bad://invalid:99"),
+        "error must name offending value: {msg}"
+    );
 }

@@ -26,6 +26,7 @@ fn make_test_provider(base_url: &str, api_key: Option<&str>, session_token: Opti
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let defaults = ProviderDefaults {
@@ -213,6 +214,7 @@ fn test_exact_byte_layout_of_get_chat_message_request() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let session_token = "sess-tok-xyz-987";
@@ -860,6 +862,7 @@ async fn test_list_models_mapping_and_merge() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = Devin::new(
@@ -1050,6 +1053,7 @@ async fn test_idle_timeout_surfaces_error() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let defaults = ProviderDefaults {
@@ -1630,6 +1634,7 @@ fn test_assistant_message_with_signature_re_encoded_as_11_12_18() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let encoded = encode_get_chat_message_request("session-token", &req, &cfg, None);
@@ -1729,4 +1734,33 @@ fn test_conversation_id_is_stable_across_turns_of_one_conversation() {
     let id = conversation_id(&first);
     assert_eq!(id.len(), 36, "uuid shaped: {id}");
     assert_eq!(id.as_bytes()[14], b'4', "version nibble: {id}");
+}
+
+#[test]
+fn test_devin_malformed_proxy_names_provider_and_offending_value() {
+    let cfg = ProviderConfig {
+        base_url: "https://server.codeium.com".to_string(),
+        proxy: Some("bad-proxy-url".to_string()),
+        ..Default::default()
+    };
+    let res = Devin::new(
+        "devin-prov",
+        cfg,
+        ProviderDefaults::default(),
+        "key",
+        "token",
+        "https://server.codeium.com",
+        BTreeMap::new(),
+    );
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("devin-prov"),
+        "error must name provider: {msg}"
+    );
+    assert!(
+        msg.contains("bad-proxy-url"),
+        "error must name offending value: {msg}"
+    );
 }

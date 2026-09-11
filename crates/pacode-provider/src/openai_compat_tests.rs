@@ -27,6 +27,7 @@ fn make_provider(
         effort_map,
         extra_body,
         headers: BTreeMap::new(),
+        proxy: None,
     };
     OpenAiCompat::new(
         "openai",
@@ -353,6 +354,7 @@ fn test_model_info() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = OpenAiCompat::new("my-openai", cfg, ProviderDefaults::default(), None, pricing)
@@ -406,6 +408,7 @@ async fn test_list_models_catalog_false() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = OpenAiCompat::new(
@@ -465,6 +468,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = OpenAiCompat::new(
@@ -585,6 +589,7 @@ async fn test_complete_non_2xx_carries_full_error_body() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let provider = OpenAiCompat::new(
@@ -627,5 +632,81 @@ async fn test_complete_non_2xx_carries_full_error_body() {
     assert_eq!(
         err_str,
         "request failed (400): {\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Invalid model specified: foo\"}}"
+    );
+}
+
+#[tokio::test]
+async fn test_provider_with_proxy_routes_through_proxy_rather_than_base_url() {
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let proxy_handle = tokio::spawn(async move {
+        let (mut socket, _) = proxy_listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let n = socket.read(&mut buf).await.unwrap();
+        let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+        let body = json!({ "data": [] }).to_string();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(resp.as_bytes()).await.unwrap();
+        req_str
+    });
+
+    let unreachable_base = "http://unreachable.test.invalid:9999/v1";
+    let cfg = ProviderConfig {
+        base_url: unreachable_base.to_string(),
+        proxy: Some(format!("http://{proxy_addr}")),
+        catalog: true,
+        ..Default::default()
+    };
+    let defaults = ProviderDefaults::default();
+    let provider = OpenAiCompat::new(
+        "test-provider",
+        cfg,
+        defaults,
+        Some("test-key".to_string()),
+        BTreeMap::new(),
+    )
+    .expect("provider with proxy should build");
+
+    let models = provider
+        .refresh_models()
+        .await
+        .expect("fetch models via proxy");
+    assert!(models.is_empty());
+
+    let received = proxy_handle.await.unwrap();
+    assert!(
+        received.starts_with("GET http://unreachable.test.invalid:9999/v1/models HTTP/1.1"),
+        "expected absolute URI request routed to proxy, got: {received}"
+    );
+}
+
+#[test]
+fn test_provider_malformed_proxy_names_provider_and_offending_value() {
+    let cfg = ProviderConfig {
+        base_url: "https://api.openai.com/v1".to_string(),
+        proxy: Some("invalid-proxy-scheme://host:1234".to_string()),
+        ..Default::default()
+    };
+    let res = OpenAiCompat::new(
+        "broken-prov",
+        cfg,
+        ProviderDefaults::default(),
+        None,
+        BTreeMap::new(),
+    );
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    let err_msg = format!("{err}");
+    assert!(
+        err_msg.contains("broken-prov"),
+        "error must name provider: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("invalid-proxy-scheme://host:1234"),
+        "error must name offending value: {err_msg}"
     );
 }

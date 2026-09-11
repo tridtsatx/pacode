@@ -87,7 +87,14 @@ impl OpenAiCompat {
             )));
         }
 
-        let client = reqwest::Client::builder()
+        let proxy_setting =
+            pacode_net::ProxySetting::resolve(cfg.proxy.as_deref(), defaults.proxy.as_deref())
+                .map_err(|e| {
+                    ProviderError::Config(format!("provider '{id}' has invalid proxy: {e}"))
+                })?;
+
+        let client = pacode_net::client_builder(&proxy_setting)
+            .map_err(|e| ProviderError::Config(format!("provider '{id}' proxy error: {e}")))?
             .connect_timeout(Duration::from_secs(30))
             .user_agent(format!("pacode/{}", env!("CARGO_PKG_VERSION")))
             .build()

@@ -117,6 +117,7 @@ async fn test_e2e_retry_and_sse_stream() {
         effort_map: BTreeMap::new(),
         extra_body: None,
         headers: BTreeMap::new(),
+        proxy: None,
     };
 
     let defaults = ProviderDefaults {

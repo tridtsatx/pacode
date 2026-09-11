@@ -198,3 +198,100 @@ async fn test_login_unknown_provider_error() {
     assert!(res.is_err());
     assert!(matches!(res.unwrap_err(), AuthError::UnknownProvider(_)));
 }
+
+#[test]
+fn test_auth_client_proxy_resolution_and_validation() {
+    // 1. Provider proxy wins over global
+    let cfg: pacode_types::Config = serde_json::from_value(serde_json::json!({
+        "provider": { "proxy": "http://global:8080" },
+        "providers": {
+            "claude": { "proxy": "http://prov:8080", "base_url": "https://api.anthropic.com" }
+        }
+    }))
+    .unwrap();
+    let client = auth_client_from_config(&cfg, "claude");
+    assert!(client.is_ok());
+
+    // 2. Global applies when provider has none
+    let cfg_global: pacode_types::Config = serde_json::from_value(serde_json::json!({
+        "provider": { "proxy": "http://global:8080" },
+        "providers": {
+            "openai": { "base_url": "https://api.openai.com" }
+        }
+    }))
+    .unwrap();
+    let client = auth_client_from_config(&cfg_global, "openai");
+    assert!(client.is_ok());
+
+    // 3. Provider "none" overrides global
+    let cfg_disabled: pacode_types::Config = serde_json::from_value(serde_json::json!({
+        "provider": { "proxy": "http://global:8080" },
+        "providers": {
+            "devin": { "proxy": "none", "base_url": "https://api.devin.ai" }
+        }
+    }))
+    .unwrap();
+    let client = auth_client_from_config(&cfg_disabled, "devin");
+    assert!(client.is_ok());
+
+    // 4. Malformed proxy produces AuthError::Config naming provider and offending value
+    let cfg_bad: pacode_types::Config = serde_json::from_value(serde_json::json!({
+        "providers": {
+            "claude": { "proxy": "unsupported-scheme://host:9090", "base_url": "https://api.anthropic.com" }
+        }
+    }))
+    .unwrap();
+    let res = auth_client_from_config(&cfg_bad, "claude");
+    assert!(res.is_err());
+    match res {
+        Err(AuthError::Config(msg)) => {
+            assert!(msg.contains("claude"), "error must name provider: {msg}");
+            assert!(
+                msg.contains("unsupported-scheme://host:9090"),
+                "error must name offending value: {msg}"
+            );
+        }
+        other => panic!("expected AuthError::Config, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_auth_client_routes_through_proxy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+
+    let proxy_handle = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let n = socket.read(&mut buf).await.unwrap();
+        let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+        let body = "{\"access_token\":\"mock_token\",\"expires_in\":3600}";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(resp.as_bytes()).await.unwrap();
+        req_str
+    });
+
+    let cfg: pacode_types::Config = serde_json::from_value(serde_json::json!({
+        "providers": {
+            "claude": { "proxy": format!("http://{proxy_addr}"), "base_url": "https://api.anthropic.com" }
+        }
+    }))
+    .unwrap();
+
+    let client = auth_client_from_config(&cfg, "claude").expect("client builds");
+    let resp = client
+        .post("http://anthropic.auth.test:80/token")
+        .send()
+        .await;
+    assert!(resp.is_ok());
+
+    let received = proxy_handle.await.unwrap();
+    assert!(
+        received.starts_with("POST http://anthropic.auth.test/token HTTP/1.1"),
+        "expected auth request to reach proxy with absolute URI, got: {received}"
+    );
+}

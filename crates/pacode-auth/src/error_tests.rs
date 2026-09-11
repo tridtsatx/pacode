@@ -22,6 +22,9 @@ fn test_error_display() {
 
     let unknown = AuthError::UnknownProvider("foo".to_string());
     assert_eq!(format!("{unknown}"), "unknown provider: foo");
+
+    let cfg_err = AuthError::Config("bad proxy".to_string());
+    assert_eq!(format!("{cfg_err}"), "config error: bad proxy");
 }
 
 #[test]

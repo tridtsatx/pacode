@@ -38,6 +38,32 @@ pub(crate) struct RefreshedTokens {
 static SINGLE_FLIGHT: LazyLock<SingleFlight<RefreshedTokens>> = LazyLock::new(SingleFlight::new);
 static REFRESH_STATE: LazyLock<RefreshState> = LazyLock::new(RefreshState::new);
 
+/// Build an HTTP client for an auth flow using the provider's configured proxy setting.
+pub(crate) fn auth_client_for_provider(provider_id: &str) -> Result<reqwest::Client> {
+    let paths = pacode_config::Paths::discover();
+    let cfg = pacode_config::load(&paths).map_err(|e| AuthError::Config(e.to_string()))?;
+    auth_client_from_config(&cfg, provider_id)
+}
+
+/// Build an HTTP client from an explicit configuration object.
+pub(crate) fn auth_client_from_config(
+    cfg: &pacode_types::Config,
+    provider_id: &str,
+) -> Result<reqwest::Client> {
+    let provider_proxy = cfg
+        .providers
+        .get(provider_id)
+        .and_then(|p| p.proxy.as_deref());
+    let global_proxy = cfg.provider.proxy.as_deref();
+    let setting = pacode_net::ProxySetting::resolve(provider_proxy, global_proxy).map_err(|e| {
+        AuthError::Config(format!("provider '{provider_id}' has invalid proxy: {e}"))
+    })?;
+    pacode_net::client_builder(&setting)
+        .map_err(|e| AuthError::Config(format!("provider '{provider_id}' proxy error: {e}")))?
+        .build()
+        .map_err(AuthError::Http)
+}
+
 /// Pure-Rust RFC 3986 percent-encoder.
 pub(crate) fn urlencode(input: &str) -> String {
     let mut encoded = String::with_capacity(input.len() * 3 / 2);

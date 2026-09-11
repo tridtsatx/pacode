@@ -156,7 +156,7 @@ pub async fn exchange_code_at_url(
         state,
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::flows::auth_client_for_provider("claude")?;
     let resp = client
         .post(token_url)
         .header("content-type", "application/json")
@@ -232,7 +232,7 @@ pub(crate) async fn refresh_tokens_at_url(
     token_url: &str,
     refresh_token: &str,
 ) -> Result<RefreshedTokens> {
-    let client = reqwest::Client::new();
+    let client = crate::flows::auth_client_for_provider("claude")?;
 
     // First attempt with REFRESH_SCOPES
     let payload = ClaudeRefreshRequest {

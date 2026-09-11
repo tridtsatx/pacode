@@ -26,6 +26,7 @@ fn test_registry_from_config_empty_base_url() {
             effort_map: BTreeMap::new(),
             extra_body: None,
             headers: BTreeMap::new(),
+            proxy: None,
         },
     );
 
@@ -66,6 +67,7 @@ fn test_registry_from_config_and_routes() {
             effort_map: BTreeMap::new(),
             extra_body: None,
             headers: BTreeMap::new(),
+            proxy: None,
         },
     );
 

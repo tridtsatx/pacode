@@ -14,6 +14,7 @@ description = "Provider trait, OpenAI-compatible chat completions streaming, mod
 pacode-config = { workspace = true }
 pacode-types = { workspace = true }
 pacode-auth = { workspace = true }
+pacode-net = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-stream = { workspace = true }

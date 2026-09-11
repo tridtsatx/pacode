@@ -61,6 +61,7 @@ pub struct ProviderDefaults {
     pub max_retries: u32,
     /// Time-to-live in seconds for cached model catalog (background refresh).
     pub catalog_ttl_secs: u64,
+    pub proxy: Option<String>,
 }
 
 impl Default for ProviderDefaults {
@@ -71,6 +72,7 @@ impl Default for ProviderDefaults {
             stream_idle_secs: 180,
             max_retries: 5,
             catalog_ttl_secs: 86400,
+            proxy: None,
         }
     }
 }
@@ -108,6 +110,7 @@ pub struct ProviderConfig {
     /// Merged into every request body.
     pub extra_body: Option<Value>,
     pub headers: BTreeMap<String, String>,
+    pub proxy: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -603,6 +606,7 @@ mod tests {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.exec.yield_after_secs, 5);
         assert_eq!(cfg.provider.catalog_ttl_secs, 86400);
+        assert!(cfg.provider.proxy.is_none());
         assert_eq!(cfg.permissions.default_mode, Mode::Build);
         assert!(!cfg.ui.hints.model);
         assert_eq!(cfg.ui.ups, Ups::Fixed(10));
@@ -644,6 +648,29 @@ mod tests {
         assert_eq!(cfg.hooks.pre_tool_use[1].matcher, "");
         assert_eq!(cfg.hooks.pre_tool_use[1].timeout_secs, 10);
         assert_eq!(cfg.hooks.notification.len(), 1);
+    }
+
+    #[test]
+    fn proxy_config_serde() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider": { "proxy": "http://global-proxy:8080" },
+            "providers": {
+                "custom": { "base_url": "https://custom.api/v1", "proxy": "socks5://127.0.0.1:1080" },
+                "direct": { "base_url": "https://direct.api/v1", "proxy": "none" },
+                "defaulted": { "base_url": "https://defaulted.api/v1" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.provider.proxy.as_deref(),
+            Some("http://global-proxy:8080")
+        );
+        assert_eq!(
+            cfg.providers["custom"].proxy.as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        assert_eq!(cfg.providers["direct"].proxy.as_deref(), Some("none"));
+        assert_eq!(cfg.providers["defaulted"].proxy, None);
     }
 
     #[test]

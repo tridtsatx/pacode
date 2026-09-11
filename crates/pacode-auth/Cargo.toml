@@ -12,6 +12,8 @@ description = "OAuth and credential store core for pacode"
 
 [dependencies]
 pacode-config = { workspace = true }
+pacode-net = { workspace = true }
+pacode-types = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "net", "io-util"] }
 reqwest = { workspace = true }
 serde = { workspace = true }

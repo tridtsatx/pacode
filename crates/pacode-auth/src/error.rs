@@ -36,6 +36,10 @@ pub enum AuthError {
     /// Provider requested was not recognized in the catalog or store.
     #[error("unknown provider: {0}")]
     UnknownProvider(String),
+
+    /// Configuration or proxy resolution error.
+    #[error("config error: {0}")]
+    Config(String),
 }
 
 /// A specialized [`Result`](std::result::Result) type for `pacode-auth` operations.

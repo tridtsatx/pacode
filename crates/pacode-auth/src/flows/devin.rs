@@ -90,7 +90,7 @@ pub async fn exchange_code_at_urls(
         redirect_uri,
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::flows::auth_client_for_provider("devin")?;
     let resp = client
         .post(connect_url)
         .header("content-type", "application/json")

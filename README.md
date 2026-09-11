@@ -64,7 +64,26 @@ pacode run --json "..."     # headless, one turn, events on stdout
 ```
 
 Configuration lives in `~/.config/pacode/config.toml`; `/config` edits it from
-inside the TUI.
+inside the TUI. `/login` signs in to a provider that uses OAuth, and
+`pacode login --list` shows what is configured.
+
+A provider can be sent through a proxy:
+
+```toml
+[provider]
+proxy = "http://corp-proxy:3128"     # default for every provider
+
+[providers.openrouter]
+proxy = "socks5h://user:pass@127.0.0.1:1080"  # overrides the default
+[providers.ollama]
+proxy = "none"                       # direct, ignoring the environment too
+```
+
+`http`, `https`, `socks5` and `socks5h` are accepted. Without the key the usual
+`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` environment variables apply, with
+`NO_PROXY` honoured; a proxy written in the config is used unconditionally, and
+`"none"` means a direct connection even when those variables are set. The same
+proxy carries that provider's login and token refresh.
 
 ## What it does
 

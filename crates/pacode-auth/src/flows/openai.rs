@@ -133,7 +133,7 @@ pub async fn exchange_code_at_url(
         urlencode(redirect_uri),
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::flows::auth_client_for_provider("openai")?;
     let resp = client
         .post(token_url)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -221,7 +221,7 @@ pub(crate) async fn refresh_tokens_at_url(
         urlencode(refresh_token),
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::flows::auth_client_for_provider("openai")?;
     let resp = client
         .post(token_url)
         .header("content-type", "application/x-www-form-urlencoded")
