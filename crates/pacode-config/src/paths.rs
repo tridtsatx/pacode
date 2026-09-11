@@ -100,6 +100,22 @@ impl Paths {
         self.config_file.clone()
     }
 
+    /// Provider definitions live next to `config.toml` in `providers.toml`.
+    pub fn providers_file(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .map(|p| p.join("providers.toml"))
+            .unwrap_or_else(|| PathBuf::from("providers.toml"))
+    }
+
+    /// Custom key bindings live next to `config.toml` in `keybindings.toml`.
+    pub fn keybindings_file(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .map(|p| p.join("keybindings.toml"))
+            .unwrap_or_else(|| PathBuf::from("keybindings.toml"))
+    }
+
     pub fn auth_file(&self) -> PathBuf {
         self.state_dir.join("auth.json")
     }

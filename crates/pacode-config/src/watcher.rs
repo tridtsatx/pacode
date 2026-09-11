@@ -95,6 +95,14 @@ impl ConfigWatcher {
             .map(std::ffi::OsStr::to_os_string)
             .unwrap_or_else(|| OsString::from("config.toml"));
 
+        // The config is split across config.toml + providers.toml +
+        // keybindings.toml in one directory; a change to any of them reloads.
+        let target_filenames: Arc<[OsString]> = Arc::from([
+            target_filename,
+            OsString::from(crate::PROVIDERS_FILENAME),
+            OsString::from(crate::KEYBINDINGS_FILENAME),
+        ]);
+
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(100);
 
         let mut watcher = RecommendedWatcher::new(
@@ -124,7 +132,11 @@ impl ConfigWatcher {
             run_debounced(
                 rx,
                 debounce,
-                move |ev| is_relevant_event(ev, &target_filename),
+                move |ev| {
+                    target_filenames
+                        .iter()
+                        .any(|name| is_relevant_event(ev, name.as_os_str()))
+                },
                 move || {
                     let result = load_from_path(&config_path);
                     on_change(result);

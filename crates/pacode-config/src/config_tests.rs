@@ -756,3 +756,283 @@ fn a_quiet_setting_also_silences_dependencies() {
         "PACODE_LOG=error must not be raised back to warn for dependencies"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Split config files: config.toml + providers.toml + keybindings.toml
+// ---------------------------------------------------------------------------
+
+fn providers_file(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .config_file
+        .parent()
+        .expect("config parent")
+        .join("providers.toml")
+}
+
+fn keybindings_file(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .config_file
+        .parent()
+        .expect("config parent")
+        .join("keybindings.toml")
+}
+
+fn backup_file(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .config_file
+        .parent()
+        .expect("config parent")
+        .join("config.toml.bak")
+}
+
+#[test]
+fn load_merges_three_files() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    fs::write(
+        &paths.config_file,
+        "zdr = \"always\"\n[ui]\nmouse = false\n",
+    )
+    .expect("write config");
+    fs::write(
+        providers_file(&paths),
+        "[providers.acme]\nbase_url = \"https://acme.example/v1\"\n",
+    )
+    .expect("write providers");
+    fs::write(
+        keybindings_file(&paths),
+        "[keys]\nfollow_agent = \"ctrl+a\"\n",
+    )
+    .expect("write keybindings");
+
+    let cfg = load(&paths).expect("merged load must succeed");
+    assert!(!cfg.ui.mouse);
+    assert_eq!(cfg.zdr, pacode_types::ZdrMode::Always);
+    assert_eq!(
+        cfg.providers.get("acme").map(|p| p.base_url.as_str()),
+        Some("https://acme.example/v1")
+    );
+    assert_eq!(
+        cfg.keys.bindings.get("follow_agent").map(|s| s.as_str()),
+        Some("ctrl+a")
+    );
+
+    // Merging must not create backup files.
+    assert!(!backup_file(&paths).exists());
+}
+
+#[test]
+fn load_missing_sibling_files_ok() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+    fs::write(&paths.config_file, "[ui]\nascii_only = true\n").expect("write config");
+
+    let cfg = load(&paths).expect("load with only config.toml must succeed");
+    assert!(cfg.ui.ascii_only);
+    assert!(cfg.providers.is_empty());
+    assert!(cfg.keys.bindings.is_empty());
+}
+
+#[test]
+fn load_migrates_legacy_providers_and_keys() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    let legacy = r#"
+[provider]
+default = "legacy/model-1"
+
+[providers.legacy]
+base_url = "https://legacy.example/v1"
+api_key_env = "LEGACY_KEY"
+
+[keys]
+follow_agent = "alt+f"
+
+[ui]
+mouse = false
+"#;
+    fs::write(&paths.config_file, legacy).expect("write legacy config");
+
+    let cfg = load(&paths).expect("migrating load must succeed");
+    assert_eq!(cfg.provider.default.as_deref(), Some("legacy/model-1"));
+    assert_eq!(
+        cfg.providers.get("legacy").map(|p| p.base_url.as_str()),
+        Some("https://legacy.example/v1")
+    );
+    assert_eq!(
+        cfg.keys.bindings.get("follow_agent").map(|s| s.as_str()),
+        Some("alt+f")
+    );
+    assert!(!cfg.ui.mouse);
+
+    // Three files exist afterwards.
+    let providers_text = fs::read_to_string(providers_file(&paths)).expect("providers.toml");
+    assert!(
+        providers_text.contains("[providers.legacy]"),
+        "{providers_text}"
+    );
+    assert!(providers_text.contains("https://legacy.example/v1"));
+
+    let keys_text = fs::read_to_string(keybindings_file(&paths)).expect("keybindings.toml");
+    assert!(keys_text.contains("[keys]"), "{keys_text}");
+    assert!(keys_text.contains("follow_agent"));
+
+    // config.toml no longer carries the moved sections but keeps the rest.
+    let stripped = fs::read_to_string(&paths.config_file).expect("stripped config.toml");
+    assert!(!stripped.contains("[providers"), "{stripped}");
+    assert!(!stripped.contains("[keys]"), "{stripped}");
+    assert!(stripped.contains("mouse = false"), "{stripped}");
+    assert!(stripped.contains("[provider]"), "{stripped}");
+
+    // Original preserved verbatim as .bak.
+    let bak = fs::read_to_string(backup_file(&paths)).expect("config.toml.bak");
+    assert_eq!(bak, legacy);
+}
+
+#[test]
+fn migration_prefers_split_file_values_on_conflict() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    fs::write(
+        &paths.config_file,
+        "[providers.acme]\nbase_url = \"https://old.example/v1\"\ncatalog = true\n",
+    )
+    .expect("write legacy config");
+    fs::write(
+        providers_file(&paths),
+        "[providers.acme]\nbase_url = \"https://new.example/v1\"\n",
+    )
+    .expect("write existing providers.toml");
+
+    let cfg = load(&paths).expect("load must succeed");
+    let acme = cfg.providers.get("acme").expect("acme provider");
+    // New file wins on conflicting keys…
+    assert_eq!(acme.base_url, "https://new.example/v1");
+    // …while legacy keys not defined there are merged in.
+    assert!(acme.catalog);
+
+    let providers_text = fs::read_to_string(providers_file(&paths)).expect("providers.toml");
+    assert!(providers_text.contains("https://new.example/v1"));
+    assert!(!providers_text.contains("https://old.example"));
+    assert!(
+        providers_text.contains("catalog = true"),
+        "{providers_text}"
+    );
+}
+
+#[test]
+fn migration_is_idempotent() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    fs::write(
+        &paths.config_file,
+        "[providers.p]\nbase_url = \"https://p.example/v1\"\n[keys]\nquit = \"ctrl+q\"\n",
+    )
+    .expect("write legacy config");
+
+    load(&paths).expect("first load migrates");
+
+    let config_after = fs::read_to_string(&paths.config_file).expect("config after");
+    let providers_after = fs::read_to_string(providers_file(&paths)).expect("providers after");
+    let keys_after = fs::read_to_string(keybindings_file(&paths)).expect("keys after");
+    let bak_after = fs::read_to_string(backup_file(&paths)).expect("bak after");
+
+    // Second load must not rewrite anything (no providers/keys left in config.toml).
+    load(&paths).expect("second load is a no-op");
+
+    assert_eq!(
+        fs::read_to_string(&paths.config_file).expect("config"),
+        config_after
+    );
+    assert_eq!(
+        fs::read_to_string(providers_file(&paths)).expect("providers"),
+        providers_after
+    );
+    assert_eq!(
+        fs::read_to_string(keybindings_file(&paths)).expect("keys"),
+        keys_after
+    );
+    assert_eq!(
+        fs::read_to_string(backup_file(&paths)).expect("bak"),
+        bak_after
+    );
+}
+
+#[test]
+fn update_config_value_routes_to_split_files() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    crate::update_config_value(
+        &paths,
+        "providers.acme.base_url",
+        toml::Value::String("https://acme.example/v1".to_string()),
+    )
+    .expect("route providers.* to providers.toml");
+    assert!(
+        providers_file(&paths).exists(),
+        "providers.toml must be created"
+    );
+    let providers_text = fs::read_to_string(providers_file(&paths)).expect("read providers");
+    assert!(providers_text.contains("https://acme.example/v1"));
+    assert!(
+        !paths.config_file.exists()
+            || !fs::read_to_string(&paths.config_file)
+                .expect("config")
+                .contains("acme"),
+        "providers.* must not land in config.toml"
+    );
+
+    crate::update_config_value(
+        &paths,
+        "keys.follow_agent",
+        toml::Value::String("ctrl+a".to_string()),
+    )
+    .expect("route keys.* to keybindings.toml");
+    let keys_text = fs::read_to_string(keybindings_file(&paths)).expect("read keybindings");
+    assert!(keys_text.contains("ctrl+a"));
+
+    crate::update_config_value(&paths, "ui.mouse", toml::Value::Boolean(false))
+        .expect("route ui.* to config.toml");
+    crate::update_config_value(&paths, "zdr", toml::Value::String("always".to_string()))
+        .expect("route zdr to config.toml");
+    let config_text = fs::read_to_string(&paths.config_file).expect("read config");
+    assert!(config_text.contains("mouse = false"), "{config_text}");
+    assert!(config_text.contains("zdr"), "{config_text}");
+
+    let cfg = load(&paths).expect("merged load");
+    assert_eq!(
+        cfg.providers.get("acme").map(|p| p.base_url.as_str()),
+        Some("https://acme.example/v1")
+    );
+    assert_eq!(
+        cfg.keys.bindings.get("follow_agent").map(|s| s.as_str()),
+        Some("ctrl+a")
+    );
+    assert!(!cfg.ui.mouse);
+    assert_eq!(cfg.zdr, pacode_types::ZdrMode::Always);
+}
+
+#[test]
+fn remove_config_value_routes_to_split_files() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    crate::update_config_value(
+        &paths,
+        "keys.follow_agent",
+        toml::Value::String("ctrl+a".to_string()),
+    )
+    .expect("seed keybinding");
+    crate::remove_config_value(&paths, "keys.follow_agent").expect("remove binding");
+
+    let keys_text = fs::read_to_string(keybindings_file(&paths)).expect("read keybindings");
+    assert!(!keys_text.contains("follow_agent"), "{keys_text}");
+
+    let cfg = load(&paths).expect("load after remove");
+    assert_eq!(cfg.keys.bindings.get("follow_agent"), None);
+}

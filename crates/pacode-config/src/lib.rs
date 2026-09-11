@@ -1,7 +1,10 @@
 //! Paths, config loading and the file logger.
 //!
 //! Layout (XDG, all overridable by `PACODE_HOME` which then holds everything):
-//! - config:  `~/.config/pacode/config.toml`   (`PACODE_CONFIG` overrides the file)
+//! - config:  `~/.config/pacode/config.toml`   (`PACODE_CONFIG` overrides the file),
+//!   plus `providers.toml` (`[providers]`) and `keybindings.toml` (`[keys]`)
+//!   next to it — merged on load, later files win. A legacy `config.toml`
+//!   carrying `[providers]`/`[keys]` is migrated once and kept as `config.toml.bak`.
 //! - data:    `~/.local/share/pacode/`  → `pacode.db`
 //! - state:   `~/.local/state/pacode/`  → `daemon.log`, `tasks/<id>.out`, `tool-output/`
 //! - cache:   `~/.cache/pacode/`        → `mcp/<server>.json`
@@ -23,6 +26,7 @@ pub use toml;
 pub use watcher::ConfigWatcher;
 
 use pacode_types::{Config, Effort, Mode, ProviderConfig};
+use serde::Deserialize;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -47,21 +51,144 @@ pub enum ConfigError {
     Env { var: String, value: String },
 }
 
-/// Load config from a specific file path and apply environment overrides.
-pub fn load_from_path(path: &std::path::Path) -> Result<Config, ConfigError> {
-    let mut cfg = match std::fs::read_to_string(path) {
-        Ok(text) => parse(&text).map_err(|message| ConfigError::Parse {
-            path: path.to_path_buf(),
-            message,
-        })?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
-        Err(err) => {
-            return Err(ConfigError::Read {
-                path: path.to_path_buf(),
-                source: err,
-            });
+/// Sibling config filename for the `[providers]` table.
+pub const PROVIDERS_FILENAME: &str = "providers.toml";
+/// Sibling config filename for the `[keys]` table.
+pub const KEYBINDINGS_FILENAME: &str = "keybindings.toml";
+
+/// `providers.toml` / `keybindings.toml` live next to `config.toml`.
+fn sibling_file(config_path: &std::path::Path, name: &str) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .map(|p| p.join(name))
+        .unwrap_or_else(|| std::path::PathBuf::from(name))
+}
+
+/// Read a TOML file into a table; `Ok(None)` when the file is missing.
+fn read_table(path: &std::path::Path) -> Result<Option<toml::Table>, ConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            toml::from_str::<toml::Table>(&text)
+                .map(Some)
+                .map_err(|e| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    message: e.to_string(),
+                })
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ConfigError::Read {
+            path: path.to_path_buf(),
+            source: err,
+        }),
+    }
+}
+
+fn write_table(path: &std::path::Path, table: &toml::Table) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let serialized = toml::to_string_pretty(table).map_err(|e| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    std::fs::write(path, serialized).map_err(|e| ConfigError::Write {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
+/// Deep-merge `overlay` into `base`: tables merge recursively, anything else
+/// (and type mismatches) is overwritten by the overlay value.
+fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base_t)), toml::Value::Table(over_t)) => {
+                deep_merge(base_t, over_t);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// One-time migration: a legacy `config.toml` carrying `[providers]` and/or
+/// `[keys]` tables is split into `providers.toml`/`keybindings.toml` next to it.
+/// The original is preserved as `config.toml.bak`; values already present in the
+/// new files win on conflicts, legacy keys are merged in. Idempotent: once the
+/// sections are gone from `config.toml` this is a no-op.
+fn migrate_split_files(config_path: &std::path::Path) -> Result<(), ConfigError> {
+    let Some(mut table) = read_table(config_path)? else {
+        return Ok(());
     };
+
+    let has_providers = table.contains_key("providers");
+    let has_keys = table.contains_key("keys");
+    if !has_providers && !has_keys {
+        return Ok(());
+    }
+
+    // Back up the original first so a crash mid-migration loses nothing; an
+    // existing .bak is kept (it is the oldest untouched original).
+    let backup = sibling_file(config_path, "config.toml.bak");
+    if !backup.exists() {
+        std::fs::copy(config_path, &backup).map_err(|e| ConfigError::Write {
+            path: backup.clone(),
+            source: e,
+        })?;
+    }
+
+    for (section, filename) in [
+        ("providers", PROVIDERS_FILENAME),
+        ("keys", KEYBINDINGS_FILENAME),
+    ] {
+        let Some(legacy) = table.remove(section) else {
+            continue;
+        };
+        let target = sibling_file(config_path, filename);
+        let mut target_table = read_table(&target)?.unwrap_or_default();
+        // Merge: existing file's section wins over the legacy one.
+        let merged = match (legacy, target_table.remove(section)) {
+            (toml::Value::Table(mut legacy_t), Some(toml::Value::Table(existing_t))) => {
+                deep_merge(&mut legacy_t, existing_t);
+                toml::Value::Table(legacy_t)
+            }
+            (_, Some(existing)) => existing,
+            (legacy, None) => legacy,
+        };
+        target_table.insert(section.to_string(), merged);
+        write_table(&target, &target_table)?;
+    }
+
+    write_table(config_path, &table)?;
+    log::info!(
+        "migrated [providers]/[keys] out of {}",
+        config_path.display()
+    );
+    Ok(())
+}
+
+/// Load config from `path` plus its `providers.toml` / `keybindings.toml`
+/// siblings, run legacy-section migration, and apply environment overrides.
+/// Later files win on conflicting keys; missing files are treated as empty.
+pub fn load_from_path(path: &std::path::Path) -> Result<Config, ConfigError> {
+    migrate_split_files(path)?;
+
+    let mut merged = read_table(path)?.unwrap_or_default();
+    for file in [
+        sibling_file(path, PROVIDERS_FILENAME),
+        sibling_file(path, KEYBINDINGS_FILENAME),
+    ] {
+        if let Some(table) = read_table(&file)? {
+            deep_merge(&mut merged, table);
+        }
+    }
+
+    let mut cfg =
+        Config::deserialize(toml::Value::Table(merged)).map_err(|e| ConfigError::Parse {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
 
     let env_vars = std::env::vars().collect::<Vec<_>>();
     apply_env_overrides(
@@ -71,7 +198,7 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, ConfigError> {
     Ok(cfg)
 }
 
-/// Load the config file (missing file = defaults) and apply environment overrides:
+/// Load the config files (missing files = defaults) and apply environment overrides:
 /// `PACODE_MODEL` (`provider/model`), `PACODE_EFFORT`, `PACODE_MODE`.
 pub fn load(paths: &Paths) -> Result<Config, ConfigError> {
     load_from_path(&paths.config_file)
@@ -145,33 +272,32 @@ pub fn effective_mode(cfg: &Config, override_mode: Option<Mode>) -> Mode {
     override_mode.unwrap_or(cfg.permissions.default_mode)
 }
 
-/// Set a nested key in `paths.config_file` by parsing the existing file as a `toml::Table`,
-/// creating tables for intermediate keys as needed, setting `value` at the target key,
-/// and writing back. Comments in the file are lost.
+/// Which config file owns a dotted key: `providers.*` → `providers.toml`,
+/// `keys.*` → `keybindings.toml`, everything else → `config.toml`.
+pub fn file_for_key(paths: &Paths, dotted_key: &str) -> std::path::PathBuf {
+    match dotted_key.split('.').next() {
+        Some("providers") => paths.providers_file(),
+        Some("keys") => paths.keybindings_file(),
+        _ => paths.config_file.clone(),
+    }
+}
+
+/// Set a nested key in the owning split file (`providers.*` → `providers.toml`,
+/// `keys.*` → `keybindings.toml`, else `config.toml`) by parsing the existing
+/// file as a `toml::Table`, creating tables for intermediate keys as needed,
+/// setting `value` at the target key, and writing back. Comments are lost.
 pub fn update_config_value(
     paths: &Paths,
     dotted_key: &str,
     value: toml::Value,
 ) -> Result<(), ConfigError> {
-    let mut table: toml::Table = match std::fs::read_to_string(&paths.config_file) {
-        Ok(text) => toml::from_str(&text).map_err(|e: toml::de::Error| ConfigError::Parse {
-            path: paths.config_file.clone(),
-            message: e.to_string(),
-        })?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-        Err(err) => {
-            return Err(ConfigError::Read {
-                path: paths.config_file.clone(),
-                source: err,
-            });
-        }
-    };
-
-    let parts: Vec<&str> = dotted_key.split('.').collect();
-    if parts.is_empty() || dotted_key.is_empty() {
+    if dotted_key.is_empty() {
         return Ok(());
     }
+    let file = file_for_key(paths, dotted_key);
+    let mut table = read_table(&file)?.unwrap_or_default();
 
+    let parts: Vec<&str> = dotted_key.split('.').collect();
     let (parents, last) = parts.split_at(parts.len() - 1);
     let last_key = last[0];
 
@@ -190,46 +316,22 @@ pub fn update_config_value(
     }
     current.insert(last_key.to_string(), value);
 
-    if let Some(parent) = paths.config_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let serialized = toml::to_string_pretty(&table).map_err(|e| ConfigError::Parse {
-        path: paths.config_file.clone(),
-        message: e.to_string(),
-    })?;
-
-    std::fs::write(&paths.config_file, serialized).map_err(|e| ConfigError::Write {
-        path: paths.config_file.clone(),
-        source: e,
-    })?;
-
-    Ok(())
+    write_table(&file, &table)
 }
 
-/// Remove a nested key in `paths.config_file` by parsing the existing file as a `toml::Table`,
-/// removing the key at the target path, and writing back. If the file, key or intermediate tables
-/// do not exist, this is a no-op. Comments in the file are lost.
+/// Remove a nested key in the owning split file (same routing as
+/// [`update_config_value`]). If the file, key or intermediate tables do not
+/// exist, this is a no-op. Comments are lost.
 pub fn remove_config_value(paths: &Paths, dotted_key: &str) -> Result<(), ConfigError> {
-    let mut table: toml::Table = match std::fs::read_to_string(&paths.config_file) {
-        Ok(text) => toml::from_str(&text).map_err(|e: toml::de::Error| ConfigError::Parse {
-            path: paths.config_file.clone(),
-            message: e.to_string(),
-        })?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(ConfigError::Read {
-                path: paths.config_file.clone(),
-                source: err,
-            });
-        }
+    if dotted_key.is_empty() {
+        return Ok(());
+    }
+    let file = file_for_key(paths, dotted_key);
+    let Some(mut table) = read_table(&file)? else {
+        return Ok(());
     };
 
     let parts: Vec<&str> = dotted_key.split('.').collect();
-    if parts.is_empty() || dotted_key.is_empty() {
-        return Ok(());
-    }
-
     let (parents, last) = parts.split_at(parts.len() - 1);
     let last_key = last[0];
 
@@ -242,17 +344,7 @@ pub fn remove_config_value(paths: &Paths, dotted_key: &str) -> Result<(), Config
     }
     current.remove(last_key);
 
-    let serialized = toml::to_string_pretty(&table).map_err(|e| ConfigError::Parse {
-        path: paths.config_file.clone(),
-        message: e.to_string(),
-    })?;
-
-    std::fs::write(&paths.config_file, serialized).map_err(|e| ConfigError::Write {
-        path: paths.config_file.clone(),
-        source: e,
-    })?;
-
-    Ok(())
+    write_table(&file, &table)
 }
 
 #[cfg(test)]
