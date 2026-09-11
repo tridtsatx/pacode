@@ -13,7 +13,7 @@ pub enum GraphicsProtocol {
     Kitty,
     /// iTerm2 inline image protocol (iTerm.app).
     Iterm2,
-    /// Sixel graphics protocol. Note: falls back to HalfBlocks in detect/render.
+    /// Sixel graphics protocol (foot, mlterm, xterm builds advertising it).
     Sixel,
     /// Fallback half-block UTF-8 characters (`▀`).
     HalfBlocks,
@@ -41,9 +41,6 @@ pub fn detect() -> GraphicsProtocol {
 ///      support Sixel graphics.
 ///    - `TERM` contains `xterm-256color` and `COLORTERM=sixel`: certain xterm builds advertise
 ///      sixel capability via this pair of variables.
-///    - Fallback note: pacode-image does not hand-roll a sixel encoder. As specified,
-///      terminals matching Sixel conditions fall back to `HalfBlocks` in the returned
-///      protocol so the caller never claims sixel support it does not have.
 /// 4. Otherwise:
 ///    - `HalfBlocks`: Unicode half-block characters (`▀`), works on any modern terminal.
 pub fn detect_from(env: &dyn Fn(&str) -> Option<String>) -> GraphicsProtocol {
@@ -64,9 +61,8 @@ pub fn detect_from(env: &dyn Fn(&str) -> Option<String>) -> GraphicsProtocol {
     }
 
     // 3. Sixel: recognized from foot, mlterm, or xterm-256color + COLORTERM=sixel.
-    // Falls back to HalfBlocks so the caller never claims sixel support it does not have.
     if is_sixel_env(env) {
-        return GraphicsProtocol::HalfBlocks;
+        return GraphicsProtocol::Sixel;
     }
 
     // 4. Fallback: half-blocks

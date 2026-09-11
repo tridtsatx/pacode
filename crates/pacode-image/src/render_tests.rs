@@ -33,7 +33,7 @@ fn test_render_halfblocks_success() {
 }
 
 #[test]
-fn test_render_sixel_falls_back_to_halfblocks() {
+fn test_render_sixel_produces_escape() {
     let file = create_test_png(10, 10);
     let req = PreviewRequest {
         path: file.path().to_path_buf(),
@@ -43,10 +43,11 @@ fn test_render_sixel_falls_back_to_halfblocks() {
 
     let res = render(&req, GraphicsProtocol::Sixel).unwrap();
     match res {
-        Preview::Cells(cells) => {
-            assert!(!cells.is_empty());
+        Preview::Escape(esc) => {
+            assert!(esc.starts_with("\x1bP"));
+            assert!(esc.ends_with("\x1b\\"));
         }
-        Preview::Escape(_) => panic!("Expected cells preview for sixel fallback"),
+        Preview::Cells(_) => panic!("Expected escape preview for sixel"),
     }
 }
 

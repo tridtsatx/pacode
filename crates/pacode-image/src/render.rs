@@ -6,6 +6,7 @@ use crate::detect::GraphicsProtocol;
 use crate::halfblocks::{self, PreviewCell};
 use crate::iterm2;
 use crate::kitty;
+use crate::sixel;
 
 #[cfg(test)]
 #[path = "render_tests.rs"]
@@ -52,6 +53,9 @@ pub enum ImageError {
 
     #[error("image decode error: {0}")]
     Image(#[from] image::ImageError),
+
+    #[error("sixel encode error: {0}")]
+    Sixel(String),
 }
 
 /// Render an image preview using the specified graphics protocol.
@@ -95,8 +99,12 @@ pub fn render(req: &PreviewRequest, proto: GraphicsProtocol) -> Result<Preview, 
             let esc = iterm2::encode_iterm2(&bytes, req.cell_w, req.cell_h);
             Ok(Preview::Escape(esc))
         }
-        GraphicsProtocol::Sixel | GraphicsProtocol::HalfBlocks => {
-            // Sixel falls back to HalfBlocks as specified
+        GraphicsProtocol::Sixel => {
+            let img = image::load_from_memory(&bytes)?;
+            let esc = sixel::encode_sixel(&img, req.cell_w, req.cell_h)?;
+            Ok(Preview::Escape(esc))
+        }
+        GraphicsProtocol::HalfBlocks => {
             let img = image::load_from_memory(&bytes)?;
             let cells = halfblocks::render_halfblocks(&img, req.cell_w, req.cell_h);
             Ok(Preview::Cells(cells))
