@@ -24,7 +24,9 @@ use crate::state::{
 use crate::stream::Usage;
 use crate::transcript::TranscriptItem;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bumped on any wire-visible change: v2 added `SetZdr`/`SetModelFlag`,
+/// `SessionMeta.zdr` and `ModelInfo.supported_efforts`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {

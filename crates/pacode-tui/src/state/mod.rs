@@ -606,6 +606,12 @@ impl AppState {
             }
             ClientEvent::Snapshot(snapshot) => {
                 self.connection = Connection::Connected;
+                // One-time config-split migration notice (spec §5): the
+                // daemon leaves a marker when it split `config.toml`; the
+                // first attach to see it toasts the message.
+                if let Some(msg) = pacode_config::take_migration_notice(&self.paths) {
+                    self.push_toast(ToastLevel::Info, msg, None, now);
+                }
                 // The header banner is (re)installed below, so the welcome
                 // cascade re-arms here: a re-attach replays it.
                 self.started_at = now;

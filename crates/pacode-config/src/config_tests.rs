@@ -1045,3 +1045,46 @@ fn remove_config_value_routes_to_split_files() {
     let cfg = load(&paths).expect("load after remove");
     assert_eq!(cfg.keys.bindings.get("follow_agent"), None);
 }
+
+#[test]
+fn migration_notice_is_reported_once() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    // No marker -> no notice.
+    assert_eq!(crate::take_migration_notice(&paths), None);
+
+    // Marker -> the message is delivered exactly once.
+    let marker = paths
+        .config_file
+        .parent()
+        .expect("config dir")
+        .join("config.toml.migrated");
+    fs::write(&marker, "moved [providers]\n").expect("write marker");
+    assert_eq!(
+        crate::take_migration_notice(&paths).as_deref(),
+        Some("moved [providers]")
+    );
+    assert_eq!(crate::take_migration_notice(&paths), None);
+}
+
+#[test]
+fn migration_leaves_notice_marker() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+    fs::write(
+        &paths.config_file,
+        "[providers.acme]\nbase_url = \"https://acme.example/v1\"\n",
+    )
+    .expect("write legacy config");
+
+    load(&paths).expect("migrating load");
+    // The migration drops the marker for the next attach to consume.
+    let notice = crate::take_migration_notice(&paths);
+    assert!(
+        notice
+            .as_deref()
+            .is_some_and(|n| n.contains("providers.toml")),
+        "expected a migration notice, got {notice:?}"
+    );
+}

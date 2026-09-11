@@ -161,11 +161,42 @@ fn migrate_split_files(config_path: &std::path::Path) -> Result<(), ConfigError>
     }
 
     write_table(config_path, &table)?;
+    // Marker the TUI consumes on next attach to toast the migration once
+    // (spec §5); failing to write it only means no notice is shown.
+    let _ = std::fs::write(
+        sibling_file(config_path, "config.toml.migrated"),
+        MIGRATION_NOTICE,
+    );
     log::info!(
         "migrated [providers]/[keys] out of {}",
         config_path.display()
     );
     Ok(())
+}
+
+/// Human message delivered once via toast on the next attach after a
+/// config-split migration (spec §5).
+const MIGRATION_NOTICE: &str = "migrated [providers]/[keys] to providers.toml/keybindings.toml; original kept as config.toml.bak";
+
+/// One-shot notice for the config-split migration: when `load_from_path`
+/// migrated a legacy `config.toml` it left a `config.toml.migrated` marker
+/// next to it; the first caller to observe the marker gets the message and
+/// the marker is removed, so later attaches don't repeat the toast.
+pub fn take_migration_notice(paths: &Paths) -> Option<String> {
+    let marker = paths
+        .config_file
+        .parent()
+        .map(|p| p.join("config.toml.migrated"))?;
+    if !marker.is_file() {
+        return None;
+    }
+    let msg = std::fs::read_to_string(&marker)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| MIGRATION_NOTICE.to_string());
+    let _ = std::fs::remove_file(&marker);
+    Some(msg)
 }
 
 /// Load config from `path` plus its `providers.toml` / `keybindings.toml`
