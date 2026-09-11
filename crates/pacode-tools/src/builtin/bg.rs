@@ -31,11 +31,10 @@ impl Tool for BgTool {
     }
 
     fn description(&self) -> &str {
-        "Background tasks: `list` running/finished tasks, `status` of one, `tail` its \
-         last lines, `kill` it, or report `progress` (current/total or percent) for \
-         a task you are supervising. A finished task's completion is delivered to \
-         you automatically as a message — continue working or end your turn rather \
-         than polling."
+        "Manage background tasks; `progress` reports current/total or percent for a \
+         task you are supervising. A finished task's completion is delivered to you \
+         automatically as a message — continue working or end your turn rather than \
+         polling."
     }
 
     fn schema(&self) -> Value {

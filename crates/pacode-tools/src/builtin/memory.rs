@@ -86,9 +86,9 @@ impl Tool for MemoryWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Append a memory bullet point to persistent storage ('global' or 'project' scope). \
-         Newlines are collapsed to spaces, trimmed, and capped at 500 chars. \
-         Exact duplicate lines are not appended. Returns 'stored' or 'already stored'."
+        "Append a memory bullet point to persistent storage. Newlines are collapsed \
+         to spaces, trimmed, and capped at 500 chars. Exact duplicate lines are not \
+         appended. Returns 'stored' or 'already stored'."
     }
 
     fn schema(&self) -> Value {
@@ -203,8 +203,7 @@ impl Tool for MemoryReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read persistent memory files. Optionally specify 'global' or 'project' scope; \
-         if omitted, returns both."
+        "Read persistent memory files."
     }
 
     fn schema(&self) -> Value {

@@ -34,15 +34,13 @@ impl Tool for AgentTool {
     }
 
     fn description(&self) -> &str {
-        "Run work in parallel with subagents. `spawn` starts one with its own context \
-         and returns immediately with an agent id; the finished agent's report is \
-         delivered to you automatically as a message, so continue with other work or \
-         end your turn rather than polling. `spawn` takes an optional `kind`: a named \
-         subagent type from `<cwd>/.pacode/agents/*.md` or the global config's \
-         `agents/` dir whose file supplies the brief, tools, and model — `list` shows \
-         the available kinds. `stop` cancels, `continue` resumes a stopped agent with \
-         its context intact, `ask_status` asks a running subagent for a brief status \
-         that arrives at your next step. Subagents cannot spawn agents."
+        "Run work in parallel with subagents. `spawn` returns an agent id \
+         immediately; the finished agent's report is delivered to you as a message \
+         — continue working or end your turn rather than polling. A `kind` names a \
+         subagent type defined in `<cwd>/.pacode/agents/*.md` or the global config's \
+         `agents/` dir; the file supplies the brief, tools and model. `stop` cancels; \
+         `continue` resumes a stopped agent with its context intact; `ask_status` \
+         delivers a brief status at your next step. Subagents cannot spawn agents."
     }
 
     fn schema(&self) -> Value {

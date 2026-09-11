@@ -52,10 +52,9 @@ impl Tool for CronTool {
 
     fn description(&self) -> &str {
         "Scheduled prompts. `add` a job that sends `prompt` to this session on a \
-         schedule (`every 30m`, `every 2h`, or a five-field cron expression in UTC \
-         like `0 3 * * *`), `list` the jobs with the time until each next run, or \
-         `remove` one by id. Jobs survive a daemon restart. Use this for work that \
-         should happen again later, not to wait for something to finish."
+         `schedule`, `list` the jobs with the time until each next run, or `remove` \
+         one by id. Jobs survive a daemon restart. Use this for work that should \
+         happen again later, not to wait for something to finish."
     }
 
     fn schema(&self) -> Value {
@@ -180,10 +179,10 @@ impl Tool for MonitorTool {
 
     fn description(&self) -> &str {
         "Watch for a condition and be told once when it becomes true, instead of \
-         blocking on a wait. Conditions: `command_succeeds` (a shell command exits 0), \
-         `process_gone` (nothing matches a process pattern any more), `file_exists`, \
-         `file_matches` (a file contains a substring). `list` shows the live monitors, \
-         `stop` ends one. A monitor fires at most once and stops with the session."
+         blocking on a wait. `command_succeeds` = the command exits 0; \
+         `process_gone` = nothing matches the `process` pattern any more; \
+         `file_matches` = `path` contains `pattern`. A monitor fires at most once \
+         and stops with the session."
     }
 
     fn schema(&self) -> Value {
