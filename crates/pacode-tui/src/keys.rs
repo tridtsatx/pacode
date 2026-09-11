@@ -406,7 +406,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         state.pasted_images.mark_submitted(&text);
         return vec![
             Action::Send(Request::DetachTurn),
-            Action::Send(Request::UserMessage { text }),
+            Action::Send(Request::UserMessage {
+                text,
+                images: Vec::new(),
+            }),
         ];
     }
 
@@ -729,7 +732,10 @@ fn submit_prompt(state: &mut AppState) -> Vec<Action> {
                 return vec![Action::RunBashCaptured { command: cmd }];
             }
         }
-        return vec![Action::Send(Request::UserMessage { text })];
+        return vec![Action::Send(Request::UserMessage {
+            text,
+            images: Vec::new(),
+        })];
     }
     vec![]
 }

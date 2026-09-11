@@ -34,6 +34,8 @@ pub struct Config {
     pub keys: KeysConfig,
     pub web: WebConfig,
     pub hooks: HooksConfig,
+    /// Zero-data-retention routing (`zdr = "always" | "session" | "off"`).
+    pub zdr: ZdrMode,
 }
 
 impl Config {
@@ -73,6 +75,37 @@ impl Default for ProviderDefaults {
             max_retries: 5,
             catalog_ttl_secs: 86400,
             proxy: None,
+        }
+    }
+}
+
+/// Zero-data-retention mode (spec §3). `always` hard-locks the session to
+/// ZDR-capable models; `session` lets the user toggle it (Alt+Z); `off`
+/// disables the feature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZdrMode {
+    Always,
+    #[default]
+    Session,
+    Off,
+}
+
+impl ZdrMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Session => "session",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "always" => Some(Self::Always),
+            "session" => Some(Self::Session),
+            "off" => Some(Self::Off),
+            _ => None,
         }
     }
 }
@@ -735,6 +768,26 @@ mod tests {
         assert_eq!(serde_json::to_string(&Ups::Fixed(10)).unwrap(), "10");
         assert_eq!(serde_json::to_string(&Ups::Dynamic).unwrap(), "\"dynamic\"");
         assert_eq!(serde_json::to_string(&Ups::Auto).unwrap(), "\"auto\"");
+    }
+
+    #[test]
+    fn zdr_mode_serde() {
+        // `session` is the default both for a missing key and a missing table.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.zdr, ZdrMode::Session);
+        assert_eq!(ZdrMode::default(), ZdrMode::Session);
+
+        for (raw, want) in [
+            ("always", ZdrMode::Always),
+            ("session", ZdrMode::Session),
+            ("off", ZdrMode::Off),
+        ] {
+            let cfg: Config = serde_json::from_str(&format!("{{\"zdr\": \"{raw}\"}}")).unwrap();
+            assert_eq!(cfg.zdr, want);
+            assert_eq!(serde_json::to_string(&want).unwrap(), format!("\"{raw}\""));
+        }
+
+        assert!(serde_json::from_str::<ZdrMode>("\"sometimes\"").is_err());
     }
 }
 

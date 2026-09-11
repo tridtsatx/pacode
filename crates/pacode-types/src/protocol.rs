@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{
     AgentId, ClientId, CronJobId, MonitorId, PermissionId, QuestionId, SessionId, TaskId, TurnId,
 };
+use crate::message::ImageSource;
 use crate::model::{Effort, ModelInfo, ModelRoute};
 use crate::question::{Question, QuestionAnswer};
 use crate::schedule::{CronJob, CronSchedule, MonitorInfo};
@@ -63,9 +64,15 @@ pub enum Request {
     /// Starts a turn when idle; queued as a steer injection while a turn runs.
     UserMessage {
         text: String,
+        /// Images attached to the prompt (`[Image N]` paste chips, `@`-refs);
+        /// appended to the user message as `ContentBlock::Image` blocks.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageSource>,
     },
     /// Cancel the running turn (history is kept).
     Interrupt,
+    /// Cancel every running agent in the session (main + subagents).
+    InterruptAll,
     PermissionReply {
         permission: PermissionId,
         decision: PermissionDecision,
@@ -533,7 +540,10 @@ mod tests {
     fn envelope_flattens_request() {
         let env = Envelope {
             id: 7,
-            req: Request::UserMessage { text: "hi".into() },
+            req: Request::UserMessage {
+                text: "hi".into(),
+                images: Vec::new(),
+            },
         };
         let json = serde_json::to_value(&env).unwrap();
         assert_eq!(json["id"], 7);
@@ -591,5 +601,54 @@ mod tests {
         assert!(line.contains("\"agent\":\"agt_test123\""));
         let back_reply: ServerMessage = serde_json::from_str(&line).unwrap();
         assert_eq!(back_reply, reply_msg);
+    }
+
+    #[test]
+    fn user_message_with_images_round_trip() {
+        let env = Envelope {
+            id: 9,
+            req: Request::UserMessage {
+                text: "what is this".into(),
+                images: vec![
+                    crate::message::ImageSource::Path(std::path::PathBuf::from("/tmp/p.png")),
+                    crate::message::ImageSource::Bytes {
+                        mime: "image/png".into(),
+                        data: vec![7, 8],
+                    },
+                ],
+            },
+        };
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["type"], "user_message");
+        assert_eq!(json["images"].as_array().unwrap().len(), 2);
+        let back: Envelope = serde_json::from_value(json).unwrap();
+        assert_eq!(back, env);
+
+        // Backwards compatible: a client that sends no `images` key still loads.
+        let env: Envelope = serde_json::from_value(serde_json::json!({
+            "id": 10,
+            "type": "user_message",
+            "text": "hi",
+        }))
+        .unwrap();
+        assert_eq!(
+            env.req,
+            Request::UserMessage {
+                text: "hi".into(),
+                images: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn interrupt_all_round_trip() {
+        let env = Envelope {
+            id: 11,
+            req: Request::InterruptAll,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"interrupt_all\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, env);
     }
 }

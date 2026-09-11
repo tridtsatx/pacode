@@ -111,6 +111,14 @@ fn build_messages(messages: &[pacode_types::Message], is_oauth: bool) -> Vec<Val
                             }
                         }
                         ContentBlock::Reasoning { .. } => {}
+                        // Degrade to a text placeholder until the vision wire
+                        // format lands (spec §1 providers step).
+                        ContentBlock::Image { source } => {
+                            content.push(serde_json::json!({
+                                "type": "text",
+                                "text": source.placeholder(),
+                            }));
+                        }
                         ContentBlock::ToolUse { id, name, input } => {
                             let tool_name = if is_oauth {
                                 map_tool_name_for_oauth(name)
@@ -162,6 +170,12 @@ fn build_messages(messages: &[pacode_types::Message], is_oauth: bool) -> Vec<Val
                                     "signature": sig,
                                 }));
                             }
+                        }
+                        ContentBlock::Image { source } => {
+                            content.push(serde_json::json!({
+                                "type": "text",
+                                "text": source.placeholder(),
+                            }));
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             let tool_name = if is_oauth {
@@ -219,6 +233,12 @@ fn build_messages(messages: &[pacode_types::Message], is_oauth: bool) -> Vec<Val
                             }
                         }
                         ContentBlock::Reasoning { .. } => {}
+                        ContentBlock::Image { source } => {
+                            content.push(serde_json::json!({
+                                "type": "text",
+                                "text": source.placeholder(),
+                            }));
+                        }
                         ContentBlock::ToolUse { id, name, input } => {
                             let tool_name = if is_oauth {
                                 map_tool_name_for_oauth(name)

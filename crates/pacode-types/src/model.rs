@@ -178,6 +178,13 @@ pub struct ModelInfo {
     pub context_window: Option<u32>,
     #[serde(default)]
     pub supports_reasoning: bool,
+    /// Accepts [`crate::message::ContentBlock::Image`] input (spec §1).
+    #[serde(default)]
+    pub supports_vision: bool,
+    /// Effort levels the model supports; `None` means every [`Effort`] is
+    /// selectable (spec §6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_efforts: Option<Vec<Effort>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<Pricing>,
 }
@@ -222,5 +229,30 @@ mod tests {
         };
         let cost = p.cost_usd(&usage);
         assert!((cost - (0.5 + 1.0 + 0.05)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_info_defaults_for_new_fields() {
+        // Catalog entries written before vision/efforts existed must still load.
+        let info: ModelInfo = serde_json::from_value(serde_json::json!({
+            "route": {"provider": "bubna", "model": "gemini-3.8-flash"},
+            "display_name": "Gemini 3.8 Flash",
+        }))
+        .unwrap();
+        assert!(!info.supports_vision);
+        assert_eq!(info.supported_efforts, None);
+
+        let info: ModelInfo = serde_json::from_value(serde_json::json!({
+            "route": {"provider": "bubna", "model": "m"},
+            "display_name": "M",
+            "supports_vision": true,
+            "supported_efforts": ["low", "xhigh"],
+        }))
+        .unwrap();
+        assert!(info.supports_vision);
+        assert_eq!(
+            info.supported_efforts,
+            Some(vec![Effort::Low, Effort::XHigh])
+        );
     }
 }

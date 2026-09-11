@@ -698,7 +698,10 @@ impl AppState {
             let text = self.input.prompt_queue.pop_front()?;
             self.turn_active = true;
             self.dirty = true;
-            Some(pacode_types::Request::UserMessage { text })
+            Some(pacode_types::Request::UserMessage {
+                text,
+                images: Vec::new(),
+            })
         } else {
             None
         }

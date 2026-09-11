@@ -116,6 +116,7 @@ const IMAGE_OPTIONS: &[&str] = &["auto", "off"];
 const AGENT_VIEW_OPTIONS: &[&str] = &["replace", "panel"];
 const PERM_OPTIONS: &[&str] = &["build", "auto", "plan", "bypass"];
 const FONT_WEIGHT_OPTIONS: &[&str] = &["", "normal", "bold"];
+const ZDR_OPTIONS: &[&str] = &["always", "session", "off"];
 
 #[rustfmt::skip]
 pub static SETTINGS: &[SettingEntry] = &[
@@ -183,6 +184,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     // session
     SettingEntry { dotted_key: "session.title_model", label: "Session Title Model", description: "Model used to name sessions after first reply", section: "session", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "session.history_page", label: "History Page Size", description: "Transcript items per historical page load", section: "session", default_value: "200", kind: SettingKind::Integer { min: 1, max: 5000 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "zdr", label: "ZDR Mode", description: "Zero-data-retention routing: always, session (Alt+Z toggle), or off", section: "session", default_value: "session", kind: SettingKind::Enum { options: ZDR_OPTIONS }, apply: ApplyMode::NextTurn },
 
     // plugins
     SettingEntry { dotted_key: "plugins.enabled", label: "Plugins Enabled", description: "Enable plugin subsystem", section: "plugins", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Restart },
@@ -290,6 +292,7 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "mcp.idle_timeout_secs" => Some(config.mcp.idle_timeout_secs.to_string()),
         "session.title_model" => Some(config.session.title_model.clone().unwrap_or_default()),
         "session.history_page" => Some(config.session.history_page.to_string()),
+        "zdr" => Some(config.zdr.as_str().to_string()),
         "plugins.enabled" => Some(config.plugins.enabled.to_string()),
         "plugins.wasm_memory_mb" => Some(config.plugins.wasm_memory_mb.to_string()),
         "plugins.lua_memory_mb" => Some(config.plugins.lua_memory_mb.to_string()),
@@ -662,6 +665,13 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "session.history_page" => {
             if let toml::Value::Integer(n) = value {
                 config.session.history_page = *n as u32;
+            }
+        }
+        "zdr" => {
+            if let toml::Value::String(s) = value
+                && let Some(m) = pacode_types::config::ZdrMode::parse(s)
+            {
+                config.zdr = m;
             }
         }
         "plugins.enabled" => {

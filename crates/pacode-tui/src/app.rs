@@ -91,7 +91,12 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     }
 
     if let Some(prompt) = opts.initial_prompt {
-        let _ = client.ok(Request::UserMessage { text: prompt }).await;
+        let _ = client
+            .ok(Request::UserMessage {
+                text: prompt,
+                images: Vec::new(),
+            })
+            .await;
     }
 
     let mut term_events = EventStream::new();
@@ -568,7 +573,10 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                 vec![]
             }
             PluginCommandOutcome::SendPrompt { text } => {
-                vec![Action::Send(Request::UserMessage { text })]
+                vec![Action::Send(Request::UserMessage {
+                    text,
+                    images: Vec::new(),
+                })]
             }
             PluginCommandOutcome::Nothing => vec![],
         },

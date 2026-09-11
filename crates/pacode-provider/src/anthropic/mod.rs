@@ -419,6 +419,8 @@ impl Provider for Anthropic {
             display_name,
             context_window: Some(context_window),
             supports_reasoning,
+            supports_vision: false,
+            supported_efforts: None,
             pricing,
         }
     }

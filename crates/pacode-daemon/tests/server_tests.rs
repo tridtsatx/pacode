@@ -272,6 +272,7 @@ async fn full_flow_hello_attach_message_events_snapshot_shutdown() {
         id: 3,
         req: Request::UserMessage {
             text: "Hello agent".to_string(),
+            images: Vec::new(),
         },
     };
     send_env(&mut writer, &msg_req).await;
@@ -471,6 +472,7 @@ async fn unattached_requests_behavior() {
             id: 5,
             req: Request::UserMessage {
                 text: "test".to_string(),
+                images: Vec::new(),
             },
         },
     )

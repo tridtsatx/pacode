@@ -339,6 +339,7 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::Attach(_)
         | Request::Detach
         | Request::DetachTurn
+        | Request::InterruptAll
         | Request::UserMessage { .. }
         | Request::PermissionReply { .. }
         | Request::SetModel(_)

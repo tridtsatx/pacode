@@ -176,14 +176,26 @@ impl Core {
         };
 
         match req {
-            Request::UserMessage { text } => match session.submit_user_message(text).await {
-                Ok(()) => Reply::Ok,
-                Err(e) => Reply::Error {
-                    message: e.to_string(),
-                },
-            },
+            Request::UserMessage { text, images } => {
+                match session.submit_user_message_with_images(text, images).await {
+                    Ok(()) => Reply::Ok,
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
             Request::Interrupt => {
                 session.interrupt();
+                Reply::Ok
+            }
+            Request::InterruptAll => {
+                // Main agent's turn plus every live subagent.
+                session.interrupt();
+                for info in session.agent_infos() {
+                    if !info.id.is_main() && info.status.is_live() {
+                        let _ = session.stop_agent(&info.id).await;
+                    }
+                }
                 Reply::Ok
             }
             Request::PermissionReply {

@@ -88,7 +88,12 @@ impl SessionState {
         let mut events = self.events.lock().await;
 
         // Submit the user message to the pacode daemon
-        self.client.ok(Request::UserMessage { text }).await?;
+        self.client
+            .ok(Request::UserMessage {
+                text,
+                images: Vec::new(),
+            })
+            .await?;
 
         let mut mapping_state = MappingState::new();
 

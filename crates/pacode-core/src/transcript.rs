@@ -167,7 +167,17 @@ pub fn history_to_items(
 
         match msg.role {
             Role::User => {
-                let text = msg.text();
+                let mut text = msg.text();
+                // Attached images get a placeholder line so a reloaded session
+                // still shows what the prompt carried.
+                for block in &msg.content {
+                    if let ContentBlock::Image { source } = block {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&source.placeholder());
+                    }
+                }
                 items.push(TranscriptItem {
                     seq: cur_seq,
                     agent: agent.clone(),
@@ -230,7 +240,7 @@ pub fn history_to_items(
                             tool_indices.insert(id.clone(), item_idx);
                             cur_seq += 1;
                         }
-                        ContentBlock::ToolResult { .. } => {}
+                        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
                     }
                 }
             }

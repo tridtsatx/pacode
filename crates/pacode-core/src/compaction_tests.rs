@@ -73,6 +73,8 @@ fn test_compaction_fallback_when_no_advertised_window() {
         display_name: "Small Model".to_string(),
         context_window: Some(16_000),
         supports_reasoning: false,
+        supports_vision: false,
+        supported_efforts: None,
         pricing: None,
     };
     let resolved = resolve_context_window(Some(&model_with_window), 128_000);
@@ -84,6 +86,8 @@ fn test_compaction_fallback_when_no_advertised_window() {
         display_name: "Custom Model".to_string(),
         context_window: None,
         supports_reasoning: false,
+        supports_vision: false,
+        supported_efforts: None,
         pricing: None,
     };
     let resolved_config = resolve_context_window(Some(&model_without_window), 64_000);

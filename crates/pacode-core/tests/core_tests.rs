@@ -288,6 +288,7 @@ async fn test_01_text_only_turn() {
         &session_id,
         Request::UserMessage {
             text: "Hello assistant".into(),
+            images: Vec::new(),
         },
     )
     .await;
@@ -363,6 +364,7 @@ async fn test_02_tool_turn_bypass_mode() {
         &session_id,
         Request::UserMessage {
             text: "run bash".into(),
+            images: Vec::new(),
         },
     )
     .await;
@@ -441,6 +443,7 @@ async fn test_03_permission_ask_in_build_mode() {
         &session_id,
         Request::UserMessage {
             text: "write out.txt".into(),
+            images: Vec::new(),
         },
     )
     .await;
@@ -517,6 +520,7 @@ async fn test_04_injection_at_point_d() {
         &session_id,
         Request::UserMessage {
             text: "start background task".into(),
+            images: Vec::new(),
         },
     )
     .await;
@@ -602,6 +606,7 @@ async fn test_05_subagent_spawn_and_finish() {
         &session_id,
         Request::UserMessage {
             text: "delegate work".into(),
+            images: Vec::new(),
         },
     )
     .await;
@@ -679,6 +684,7 @@ async fn test_06_interrupt_mid_stream() {
         &session_id,
         Request::UserMessage {
             text: "long request".into(),
+            images: Vec::new(),
         },
     )
     .await;

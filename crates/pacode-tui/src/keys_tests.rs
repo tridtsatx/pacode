@@ -239,6 +239,8 @@ fn test_overlay_model_picker_navigation_and_esc() {
             display_name: "Model 1".into(),
             context_window: Some(1000),
             supports_reasoning: true,
+            supports_vision: false,
+            supported_efforts: None,
             pricing: None,
         },
         pacode_types::ModelInfo {
@@ -246,6 +248,8 @@ fn test_overlay_model_picker_navigation_and_esc() {
             display_name: "Model 2".into(),
             context_window: Some(1000),
             supports_reasoning: true,
+            supports_vision: false,
+            supported_efforts: None,
             pricing: None,
         },
     ];
@@ -979,7 +983,8 @@ fn test_vim_disabled_behavior_is_identical() {
     assert_eq!(
         actions,
         vec![Action::Send(Request::UserMessage {
-            text: "wbdx".into()
+            text: "wbdx".into(),
+            images: Vec::new(),
         })]
     );
     assert!(state.input.is_empty());
@@ -1050,7 +1055,8 @@ fn test_vim_enabled_keys_routing() {
     assert_eq!(
         actions,
         vec![Action::Send(Request::UserMessage {
-            text: "hello !world".into()
+            text: "hello !world".into(),
+            images: Vec::new(),
         })]
     );
     assert!(state.input.is_empty());
@@ -1643,7 +1649,8 @@ fn test_enter_queues_when_turn_running_and_sends_when_idle() {
     assert_eq!(
         actions,
         vec![Action::Send(Request::UserMessage {
-            text: "idle prompt".into()
+            text: "idle prompt".into(),
+            images: Vec::new(),
         })]
     );
     assert!(state.input.is_empty());
@@ -1695,7 +1702,8 @@ fn test_queue_drains_in_order_on_turn_finished() {
     assert_eq!(
         req1,
         Some(Request::UserMessage {
-            text: "first".into()
+            text: "first".into(),
+            images: Vec::new(),
         })
     );
     assert_eq!(state.input.prompt_queue.len(), 1);
@@ -1720,7 +1728,8 @@ fn test_queue_drains_in_order_on_turn_finished() {
     assert_eq!(
         req2,
         Some(Request::UserMessage {
-            text: "second".into()
+            text: "second".into(),
+            images: Vec::new(),
         })
     );
     assert_eq!(state.input.prompt_queue.len(), 0);
@@ -1835,7 +1844,8 @@ fn test_ctrl_enter_submit_now_behavior() {
     assert_eq!(
         actions,
         vec![Action::Send(Request::UserMessage {
-            text: "send now when idle".into()
+            text: "send now when idle".into(),
+            images: Vec::new(),
         })]
     );
     assert!(state.input.is_empty());
@@ -1851,7 +1861,8 @@ fn test_ctrl_enter_submit_now_behavior() {
         vec![
             Action::Send(Request::DetachTurn),
             Action::Send(Request::UserMessage {
-                text: "send now while busy".into()
+                text: "send now while busy".into(),
+                images: Vec::new(),
             })
         ]
     );

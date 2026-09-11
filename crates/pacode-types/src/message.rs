@@ -42,6 +42,41 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    /// An image the user attached to a message. Provider adapters encode it
+    /// when the model supports vision; otherwise it degrades to a text
+    /// placeholder ([`ImageSource::placeholder`]).
+    Image {
+        source: ImageSource,
+    },
+}
+
+/// Where the bytes of a [`ContentBlock::Image`] live.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSource {
+    /// Path on disk (temp paste file, `@`-ref target, …).
+    Path(std::path::PathBuf),
+    /// Raw bytes for providers that want inline data.
+    Bytes { mime: String, data: Vec<u8> },
+}
+
+/// Chars an image block counts toward `Message::char_len`. A vision model
+/// charges roughly 1500 tokens per image regardless of file size; counting
+/// serialized bytes (or zero for `Path`) would wreck the window estimate.
+const IMAGE_ESTIMATE_CHARS: usize = 6_000;
+
+impl ImageSource {
+    /// Text stand-in for surfaces that cannot show images (transcript, search
+    /// index, non-vision degrade). Mirrors the `[image file: …]` shape that
+    /// `expand.rs` emits for `@`-referenced images.
+    pub fn placeholder(&self) -> String {
+        match self {
+            ImageSource::Path(path) => format!("[image file: {}]", path.display()),
+            ImageSource::Bytes { mime, data } => {
+                format!("[image: {mime}, {} bytes]", data.len())
+            }
+        }
+    }
 }
 
 /// Why a message exists. Drives UI visibility and compaction rules.
@@ -140,7 +175,8 @@ impl Message {
             ContentBlock::ToolUse { id, name, input } => Some((id, name.as_str(), input)),
             ContentBlock::Text { .. }
             | ContentBlock::Reasoning { .. }
-            | ContentBlock::ToolResult { .. } => None,
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. } => None,
         })
     }
 
@@ -157,6 +193,7 @@ impl Message {
                 ContentBlock::Reasoning { text, .. } => text.chars().count(),
                 ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
                 ContentBlock::ToolResult { content, .. } => content.chars().count(),
+                ContentBlock::Image { .. } => IMAGE_ESTIMATE_CHARS,
             })
             .sum()
     }
@@ -249,5 +286,61 @@ mod tests {
         assert_eq!(json["role"], "tool");
         assert_eq!(json["content"][0]["type"], "tool_result");
         assert_eq!(json["content"][0]["call_id"], "c1");
+    }
+
+    #[test]
+    fn image_block_serde_roundtrip() {
+        let block = ContentBlock::Image {
+            source: ImageSource::Path(std::path::PathBuf::from("/tmp/img-1.png")),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["source"]["path"], "/tmp/img-1.png");
+        let back: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(back, block);
+
+        let block = ContentBlock::Image {
+            source: ImageSource::Bytes {
+                mime: "image/png".into(),
+                data: vec![1, 2, 3],
+            },
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["source"]["bytes"]["mime"], "image/png");
+        let back: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(back, block);
+    }
+
+    #[test]
+    fn image_source_placeholder() {
+        assert_eq!(
+            ImageSource::Path(std::path::PathBuf::from("shots/a.png")).placeholder(),
+            "[image file: shots/a.png]"
+        );
+        assert_eq!(
+            ImageSource::Bytes {
+                mime: "image/png".into(),
+                data: vec![0; 42],
+            }
+            .placeholder(),
+            "[image: image/png, 42 bytes]"
+        );
+    }
+
+    #[test]
+    fn image_char_len_is_a_fixed_estimate() {
+        // A vision model charges ≈1500 tokens per image; the serialized byte
+        // length must not count against the window estimate.
+        let msg = Message::new(
+            Role::User,
+            vec![ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    mime: "image/png".into(),
+                    data: vec![0; 1_000_000],
+                },
+            }],
+        );
+        assert_eq!(msg.char_len(), IMAGE_ESTIMATE_CHARS);
+        assert_eq!(msg.estimate_tokens(), 1500);
     }
 }

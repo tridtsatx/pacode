@@ -140,6 +140,18 @@ impl Session {
     /// Start a turn on the main agent, or queue a steer injection when a turn is
     /// running. Persists the user message. Returns immediately.
     pub async fn submit_user_message(self: &Arc<Self>, text: String) -> Result<(), CoreError> {
+        self.submit_user_message_with_images(text, Vec::new()).await
+    }
+
+    /// [`submit_user_message`](Self::submit_user_message) plus image attachments:
+    /// each `ImageSource` is appended to the persisted user message as a
+    /// `ContentBlock::Image` so providers can encode it (or degrade it to a
+    /// placeholder when the model lacks vision).
+    pub async fn submit_user_message_with_images(
+        self: &Arc<Self>,
+        text: String,
+        images: Vec<pacode_types::ImageSource>,
+    ) -> Result<(), CoreError> {
         let main = self
             .main_agent()
             .ok_or_else(|| CoreError::AgentNotFound(AgentId::main()))?;
@@ -163,11 +175,17 @@ impl Session {
                 .unwrap_or_else(|p| p.into_inner()) = Some(hist_snapshot);
         }
 
-        let (seq, arc_msg) = main
-            .history
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(pacode_types::Message::user(&expanded_text));
+        let mut content = vec![pacode_types::ContentBlock::Text {
+            text: expanded_text,
+        }];
+        content.extend(
+            images
+                .into_iter()
+                .map(|source| pacode_types::ContentBlock::Image { source }),
+        );
+        let (seq, arc_msg) = main.history.lock().unwrap_or_else(|p| p.into_inner()).push(
+            pacode_types::Message::new(pacode_types::Role::User, content),
+        );
         self.store
             .append_message(&self.id, &main.id(), seq, &arc_msg)
             .await?;

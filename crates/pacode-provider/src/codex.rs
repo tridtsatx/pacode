@@ -377,6 +377,8 @@ impl Provider for Codex {
             display_name,
             context_window,
             supports_reasoning,
+            supports_vision: false,
+            supported_efforts: None,
             pricing,
         }
     }

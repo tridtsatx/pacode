@@ -430,6 +430,8 @@ impl Provider for FailingProvider {
             display_name: model.to_string(),
             context_window: None,
             supports_reasoning: false,
+            supports_vision: false,
+            supported_efforts: None,
             pricing: None,
         }
     }
@@ -454,6 +456,8 @@ impl Provider for SuccessProvider {
             display_name: "Good Model".to_string(),
             context_window: Some(64_000),
             supports_reasoning: true,
+            supports_vision: false,
+            supported_efforts: None,
             pricing: None,
         }
     }

@@ -16,11 +16,13 @@ pub(crate) fn role_to_str(role: Role) -> &'static str {
 }
 
 pub(crate) fn message_plain_text(msg: &Message) -> String {
-    let mut parts = Vec::new();
+    let mut parts: Vec<std::borrow::Cow<'_, str>> = Vec::new();
     for block in &msg.content {
         match block {
-            ContentBlock::Text { text } => parts.push(text.as_str()),
-            ContentBlock::ToolResult { content, .. } => parts.push(content.as_str()),
+            ContentBlock::Text { text } => parts.push(text.as_str().into()),
+            ContentBlock::ToolResult { content, .. } => parts.push(content.as_str().into()),
+            // Index the placeholder so an attached file name stays searchable.
+            ContentBlock::Image { source } => parts.push(source.placeholder().into()),
             ContentBlock::Reasoning { .. } | ContentBlock::ToolUse { .. } => {}
         }
     }
