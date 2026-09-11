@@ -97,3 +97,79 @@ fn test_trailing_space_cursor() {
     assert_eq!(state.cursor_position(80), (0, 2 + 7));
     assert_eq!(state.wrapped_lines(80), 1);
 }
+
+#[test]
+fn test_wrap_word_boundary() {
+    // Words wrap whole at the last boundary that fits; the separating space
+    // still occupies cells (non-trimming contract).
+    let lines = wrap_text_non_trimming("aaa bbb ccc", 7);
+    assert_eq!(lines, vec!["aaa bbb", " ccc"]);
+    assert_eq!(lines.concat(), "aaa bbb ccc");
+}
+
+#[test]
+fn test_wrap_long_word_hard_break() {
+    // A word longer than the line is split mid-word on grapheme boundaries.
+    assert_eq!(
+        wrap_text_non_trimming("averylongword", 5),
+        vec!["avery", "longw", "ord"]
+    );
+    // The boundary wrap happens first, then the oversized word is chunked.
+    assert_eq!(
+        wrap_text_non_trimming("hi averylongword bye", 5),
+        vec!["hi ", "avery", "longw", "ord ", "bye"]
+    );
+}
+
+#[test]
+fn test_wrap_cjk_no_spaces() {
+    // No whitespace at all: CJK (2 cells each) falls back to grapheme splits.
+    assert_eq!(
+        wrap_text_non_trimming("你好世界测试", 4),
+        vec!["你好", "世界", "测试"]
+    );
+}
+
+#[test]
+fn test_wrap_trailing_whitespace_preserved() {
+    // Spaces are real characters: they fill the line and overflow forward.
+    assert_eq!(wrap_text_non_trimming("abc  ", 4), vec!["abc ", " "]);
+    assert_eq!(wrap_text_non_trimming("ab   cd", 4), vec!["ab  ", " cd"]);
+}
+
+#[test]
+fn test_wrap_edge_cases() {
+    assert_eq!(wrap_text_non_trimming("", 10), vec![""]);
+    // width 0 is clamped to 1: hard break every grapheme.
+    assert_eq!(wrap_text_non_trimming("ab", 0), vec!["a", "b"]);
+    assert_eq!(wrap_text_non_trimming("ab", 1), vec!["a", "b"]);
+    assert_eq!(wrap_text_non_trimming("a\nb\n", 10), vec!["a", "b", ""]);
+    assert_eq!(wrap_text_non_trimming("ab\r\ncd", 10), vec!["ab", "cd"]);
+}
+
+#[test]
+fn test_wrap_url_hard_break_no_char_loss() {
+    let url = "see https://example.com/some/long/path ok";
+    let lines = wrap_text_non_trimming(url, 20);
+    // Nothing is dropped or reordered, and no line exceeds the width.
+    assert_eq!(lines.concat(), url);
+    assert!(lines.iter().all(|l| display_width(l) <= 20));
+    // The URL is longer than a line, so it must have been split.
+    assert!(lines.len() > 2);
+}
+
+#[test]
+fn test_wrap_cursor_consistency() {
+    let mut state = InputState::default();
+    state.insert_str("foo barbaz");
+    // Outer width 10 -> text width 8: "foo " stays, "barbaz" wraps to line 1.
+    assert_eq!(state.wrap_lines(10), vec!["foo ", "barbaz"]);
+    assert_eq!(state.cursor_position(10), (1, 8));
+
+    // Cursor right after "foo" sits at the end of line 0.
+    state.cursor = 3;
+    assert_eq!(state.cursor_position(10), (0, 5));
+    // After the separating space, still line 0 (the space trails the line).
+    state.cursor = 4;
+    assert_eq!(state.cursor_position(10), (0, 6));
+}

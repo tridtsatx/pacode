@@ -145,6 +145,14 @@ fn test_ctrl_c_hint_lifecycle() {
     let now = Instant::now();
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
+    // Nothing live: no main turn, subagent finished (its report already arrived).
+    for a in &mut state.rail.agents {
+        a.status = match a.kind {
+            AgentKind::Main => AgentStatus::Idle,
+            AgentKind::Sub => AgentStatus::Finished,
+        };
+    }
+
     // 1. If text is non-empty, ctrl+c clears text and does not set hint
     state.input.insert_str("some text");
     handle_key(&mut state, ctrl_c, now);
@@ -161,6 +169,110 @@ fn test_ctrl_c_hint_lifecycle() {
     let actions = handle_key(&mut state, ctrl_c, later);
     assert!(state.quit);
     assert_eq!(actions, vec![Action::Quit]);
+}
+
+#[test]
+fn test_ctrl_c_escalation_ladder() {
+    let mut state = make_test_state(); // main agent + live subagent (RunningTool)
+    let now = Instant::now();
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    // Main turn active: first press sends Interrupt and stops the spinner
+    // optimistically instead of waiting for the daemon's TurnEnded.
+    state.turn_active = true;
+    let actions = handle_key(&mut state, ctrl_c, now);
+    assert_eq!(actions, vec![Action::Send(Request::Interrupt)]);
+    assert!(!state.turn_active);
+    assert_eq!(state.ctrl_c_at, Some(now));
+    assert!(!state.quit);
+
+    // Second press inside the window while the subagent is still live:
+    // escalate to InterruptAll (idempotent — more presses keep sending it).
+    let later = now + Duration::from_millis(500);
+    let actions = handle_key(&mut state, ctrl_c, later);
+    assert_eq!(actions, vec![Action::Send(Request::InterruptAll)]);
+    assert!(!state.quit);
+
+    let later2 = later + Duration::from_millis(500);
+    let actions = handle_key(&mut state, ctrl_c, later2);
+    assert_eq!(actions, vec![Action::Send(Request::InterruptAll)]);
+    assert!(!state.quit);
+
+    // Once nothing is live any more, the next press inside the window exits.
+    for a in &mut state.rail.agents {
+        if a.kind == AgentKind::Sub {
+            a.status = AgentStatus::Stopped;
+        }
+    }
+    let later3 = later2 + Duration::from_millis(500);
+    let actions = handle_key(&mut state, ctrl_c, later3);
+    assert_eq!(actions, vec![Action::Quit]);
+    assert!(state.quit);
+}
+
+#[test]
+fn test_ctrl_c_interrupt_all_when_only_subs_live() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    // Main turn is not running but a subagent is: the first press already
+    // escalates to InterruptAll — there is nothing main-only to interrupt.
+    assert!(!state.turn_active);
+    let actions = handle_key(&mut state, ctrl_c, now);
+    assert_eq!(actions, vec![Action::Send(Request::InterruptAll)]);
+    assert_eq!(state.ctrl_c_at, Some(now));
+    assert!(!state.quit);
+}
+
+#[test]
+fn test_ctrl_c_window_expires() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    for a in &mut state.rail.agents {
+        a.status = AgentStatus::Finished;
+    }
+
+    // First press arms; a press after the 2 s window re-arms instead of quitting.
+    handle_key(&mut state, ctrl_c, now);
+    let stale = now + Duration::from_secs(3);
+    let actions = handle_key(&mut state, ctrl_c, stale);
+    assert!(actions.is_empty());
+    assert!(!state.quit);
+    assert_eq!(state.ctrl_c_at, Some(stale));
+}
+
+#[test]
+fn test_shift_up_down_scrolls_input() {
+    let mut state = make_test_state(); // 120x34: input shows up to 6 lines
+    let now = Instant::now();
+    state
+        .input
+        .insert_str("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10");
+
+    let shift_down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+    for _ in 0..10 {
+        let actions = handle_key(&mut state, shift_down, now);
+        assert!(actions.is_empty());
+    }
+    // 10 wrapped lines, 6 visible rows -> max scroll is 4.
+    assert_eq!(state.input.input_scroll, 4);
+
+    let shift_up = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+    handle_key(&mut state, shift_up, now);
+    assert_eq!(state.input.input_scroll, 3);
+
+    // Saturates at 0.
+    for _ in 0..10 {
+        handle_key(&mut state, shift_up, now);
+    }
+    assert_eq!(state.input.input_scroll, 0);
+
+    // Plain Down is history/completion navigation, not input scrolling.
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(state.input.input_scroll, 0);
 }
 
 #[test]

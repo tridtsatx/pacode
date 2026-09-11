@@ -86,9 +86,25 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             state.ctrl_c_at = None;
             return vec![];
         }
-        if state.turn_active {
-            state.ctrl_c_at = None;
-            return vec![Action::Send(Request::Interrupt)];
+        // Staged escalation (spec §2): while anything is still live, the first
+        // press interrupts — the main turn via Interrupt, subagent-only work via
+        // InterruptAll. A second press inside the 2 s window while something is
+        // still live escalates to InterruptAll (idempotent, safe to repeat).
+        // Double-tap exits only once nothing is running.
+        let subs_live = state.rail.live_agents().next().is_some();
+        if state.turn_active || subs_live {
+            let in_window = state
+                .ctrl_c_at
+                .is_some_and(|prev| now.saturating_duration_since(prev) <= Duration::from_secs(2));
+            let req = if in_window || !state.turn_active {
+                Request::InterruptAll
+            } else {
+                Request::Interrupt
+            };
+            state.ctrl_c_at = Some(now);
+            // Optimistic: the spinner stops now rather than when TurnEnded lands.
+            state.turn_active = false;
+            return vec![Action::Send(req)];
         }
         if let Some(prev) = state.ctrl_c_at
             && now.saturating_duration_since(prev) <= Duration::from_secs(2)
@@ -573,6 +589,23 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
+    // 10.9 Shift+Up/Down scroll the multi-line prompt itself (spec §4); plain
+    // arrows below still drive history and popups.
+    if state.focus == Focus::Normal && key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Up => {
+                state.input.input_scroll = state.input.input_scroll.saturating_sub(1);
+                return vec![];
+            }
+            KeyCode::Down => {
+                let max = input_max_scroll(state);
+                state.input.input_scroll = (state.input.input_scroll + 1).min(max);
+                return vec![];
+            }
+            _ => {}
+        }
+    }
+
     // 11. Up / Down arrows for history / slash popup / @ popup / bash completion
     if key.code == KeyCode::Up {
         let byte_cursor =
@@ -755,4 +788,30 @@ pub use crate::mouse::handle_mouse;
 /// Whether the rail is off screen, which below 80 columns it always is (spec §8).
 fn rail_is_hidden(state: &AppState) -> bool {
     crate::layout::WidthTier::for_width(state.cols).rail_width() == 0
+}
+
+/// (width, height) of the prompt input rect, recomputed from `state.cols`/`rows`
+/// the same way `layout::compute` derives it — key handling has no frame layout.
+fn input_view_size(state: &AppState) -> (u16, u16) {
+    let cols = state.cols;
+    let rows = state.rows;
+    let rail_w = crate::layout::WidthTier::for_width(cols).rail_width();
+    let input_w = if rail_w > 0 && cols > rail_w + 2 {
+        cols - rail_w - 2
+    } else {
+        cols
+    };
+    let footer_h = crate::layout::FOOTER_LINES.min(rows);
+    let footer_y = rows.saturating_sub(footer_h);
+    let input_bottom_h = u16::from(rows > footer_h);
+    let rem_for_input = footer_y.saturating_sub(input_bottom_h); // area.y == 0
+    let input_h = state.input.wrapped_lines(input_w).min(rem_for_input);
+    (input_w, input_h)
+}
+
+/// Max vertical scroll offset for a multi-line prompt (spec §4): total wrapped
+/// lines minus the rows actually visible in the input rect.
+fn input_max_scroll(state: &AppState) -> usize {
+    let (w, h) = input_view_size(state);
+    state.input.wrap_lines(w).len().saturating_sub(h as usize)
 }
