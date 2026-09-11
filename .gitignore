@@ -1,6 +1,7 @@
 /target
 /jcode/
 /codex/
+/oh-my-pi/
 *.db
 *.db-wal
 *.db-shm
