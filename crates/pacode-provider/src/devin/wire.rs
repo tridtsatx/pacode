@@ -362,21 +362,39 @@ pub struct ChatMessageDelta {
     pub model_name: Option<String>,
 }
 
+/// Hex dump of a frame, capped so a diagnostic line stays bounded.
+fn hex_preview(bytes: &[u8]) -> String {
+    const CAP: usize = 4096;
+    let shown = bytes.len().min(CAP);
+    let mut out = String::with_capacity(shown * 2 + 16);
+    for b in &bytes[..shown] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    if bytes.len() > CAP {
+        let rest = bytes.len() - CAP;
+        out.push_str(&format!("…(+{rest}B)"));
+    }
+    out
+}
+
 /// Decode a `GetChatMessageResponse` protobuf payload.
 pub fn decode_get_chat_message_response(bytes: &[u8]) -> Result<ChatMessageDelta, ProtoError> {
     let reader = proto::Reader::new(bytes);
     let mut resp = ChatMessageDelta::default();
 
+    let mut top_fields: Vec<(u32, u8)> = Vec::new();
     for res in reader {
         let (field_no, _wire_type, value) = res?;
+        top_fields.push((field_no, _wire_type.to_u8()));
         match field_no {
             1 => resp.message_id = Some(value.as_str()?.to_string()),
             3 => resp.delta_text = Some(value.as_str()?.to_string()),
             4 => resp.delta_tokens = Some(value.as_varint()?),
             5 => resp.stop_reason = Some(value.as_varint()?),
             6 => {
-                // The server may deliver a tool call structurally here instead of
-                // streaming it inside `delta_text`; both encodings occur in practice.
+                // A tool call arrives incrementally: one frame carries `call_id` and
+                // `name`, the frames after it carry chunks of the arguments JSON with
+                // both of those empty. Surface every such frame; `stream` stitches them.
                 let call_reader = value.as_message()?;
                 let mut call = ChatToolCall::default();
                 for call_res in call_reader {
@@ -388,9 +406,7 @@ pub fn decode_get_chat_message_response(bytes: &[u8]) -> Result<ChatMessageDelta
                         _ => {}
                     }
                 }
-                if !call.name.is_empty() {
-                    resp.tool_call = Some(call);
-                }
+                resp.tool_call = Some(call);
             }
             7 => {
                 let meta_reader = value.as_message()?;
@@ -414,6 +430,11 @@ pub fn decode_get_chat_message_response(bytes: &[u8]) -> Result<ChatMessageDelta
             _ => {}
         }
     }
+
+    log::trace!(
+        "devin response frame fields={top_fields:?} hex={}",
+        hex_preview(bytes)
+    );
 
     Ok(resp)
 }

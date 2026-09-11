@@ -29,6 +29,8 @@ pub fn create_devin_event_stream(
         stream_ended: bool,
         /// Tool calls the server delivered structurally, used to number them.
         structured_tool_calls: u32,
+        /// Index of the structured tool call whose arguments are still streaming.
+        active_structured_call: Option<u32>,
         thinking_kind: Option<String>,
     }
 
@@ -41,6 +43,7 @@ pub fn create_devin_event_stream(
         message_end_emitted: false,
         stream_ended: false,
         structured_tool_calls: 0,
+        active_structured_call: None,
         thinking_kind: None,
     };
 
@@ -115,19 +118,43 @@ pub fn create_devin_event_stream(
                             });
                             state.message_start_emitted = true;
                         }
-                        let index = state.structured_tool_calls;
-                        state.structured_tool_calls += 1;
-                        state.pending_events.push_back(StreamEvent::ToolCallStart {
-                            index,
-                            id: CallId::generate(),
-                            name: call.name,
-                        });
-                        state
-                            .pending_events
-                            .push_back(StreamEvent::ToolCallArgsDelta {
+                        // A frame naming a tool opens a call; the frames after it carry
+                        // the arguments JSON in chunks, with no name of their own.
+                        if !call.name.is_empty() {
+                            let index = state.structured_tool_calls;
+                            state.structured_tool_calls += 1;
+                            state.active_structured_call = Some(index);
+                            // The server matches tool results by the id it issued, so
+                            // keep it whenever it sends one.
+                            let id = if call.call_id.is_empty() {
+                                CallId::generate()
+                            } else {
+                                CallId::from(call.call_id.as_str())
+                            };
+                            state.pending_events.push_back(StreamEvent::ToolCallStart {
                                 index,
-                                delta: call.arguments_json,
+                                id,
+                                name: call.name,
                             });
+                        }
+                        if !call.arguments_json.is_empty() {
+                            match state.active_structured_call {
+                                Some(index) => {
+                                    state.pending_events.push_back(
+                                        StreamEvent::ToolCallArgsDelta {
+                                            index,
+                                            delta: call.arguments_json,
+                                        },
+                                    );
+                                }
+                                None => {
+                                    log::warn!(
+                                        "devin sent tool call arguments before any tool call started; dropping {} bytes",
+                                        call.arguments_json.len()
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     if let Some(text) = resp.delta_text

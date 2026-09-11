@@ -9,6 +9,7 @@
 //!    inline tool calls within `delta_text`.
 //! 3. Retries and idle timeouts reuse the crate's backoff and timeout machinery.
 
+pub mod catalog;
 pub mod connect;
 pub mod proto;
 pub mod stream;
@@ -21,9 +22,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_types::{
-    ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, Role, prettify_model_name,
+    Effort, ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, Role,
+    prettify_model_name,
 };
 
+pub use catalog::{Family, fold_families, parse_model_id};
 pub use connect::{
     CONNECT_FLAG_END_STREAM, ConnectClient, ConnectFrameDecoder, DecodedFrame, encode_connect_frame,
 };
@@ -78,6 +81,9 @@ pub struct Devin {
     pricing: BTreeMap<String, Pricing>,
     connect_client: ConnectClient,
     catalog_cache: Mutex<Option<Vec<ModelInfo>>>,
+    /// Families the catalog folded into, used to turn a family id plus the
+    /// request's effort back into a concrete catalog id.
+    families: Mutex<Vec<Family>>,
     backoff_base: Duration,
 }
 
@@ -142,8 +148,14 @@ impl Devin {
             pricing,
             connect_client,
             catalog_cache: Mutex::new(None),
+            families: Mutex::new(Vec::new()),
             backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_catalog_enabled(&mut self, enabled: bool) {
+        self.cfg.catalog = enabled;
     }
 
     #[cfg(test)]
@@ -171,6 +183,23 @@ impl Devin {
     pub fn clear_catalog_cache(&self) {
         if let Ok(mut guard) = self.catalog_cache.lock() {
             *guard = None;
+        }
+        if let Ok(mut guard) = self.families.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Turn a family id into the catalog id serving `effort`. Ids that are not a
+    /// known family — a concrete catalog id, a configured model, `adaptive` — are
+    /// left alone.
+    fn resolve_family(&self, model: &str, effort: Effort) -> Option<String> {
+        let guard = self.families.lock().ok()?;
+        let family = guard.iter().find(|f| f.id == model)?;
+        let resolved = family.resolve(effort)?;
+        if resolved == model {
+            None
+        } else {
+            Some(resolved.to_string())
         }
     }
 
@@ -231,23 +260,56 @@ impl Devin {
             }
         };
 
-        let mut all_models = configured_models;
+        // Catalog ids carry the effort as a suffix. Fold them into families so the
+        // picker lists each model once and `/effort` selects the tier.
+        let mut catalog_ids: Vec<String> = Vec::new();
+        let mut display_names: BTreeMap<String, String> = BTreeMap::new();
+        let mut context_windows: BTreeMap<String, u32> = BTreeMap::new();
         for model_cfg in response.models {
             if let Some(uid) = model_cfg.model_uid
                 && !uid.is_empty()
                 && seen.insert(uid.clone())
             {
-                let mut info = self.model_info(&uid);
                 if let Some(dn) = model_cfg.display_name
                     && !dn.is_empty()
                 {
-                    info.display_name = dn;
+                    display_names.insert(uid.clone(), dn);
                 }
                 if let Some(cw) = model_cfg.context_window {
-                    info.context_window = Some(cw as u32);
+                    context_windows.insert(uid.clone(), cw as u32);
                 }
-                all_models.push(info);
+                catalog_ids.push(uid);
             }
+        }
+
+        let families = fold_families(catalog_ids.iter().map(|id| {
+            (
+                id.as_str(),
+                display_names.get(id).map(String::as_str).unwrap_or(""),
+            )
+        }));
+
+        let mut all_models = configured_models;
+        for family in &families {
+            // Every member of a family is the same model at a different effort, so
+            // the display name and context window come from any of them.
+            let representative = family
+                .members
+                .last()
+                .map(|(_, id)| id.as_str())
+                .unwrap_or(family.id.as_str());
+            let mut info = self.model_info(&family.id);
+            if let Some(dn) = display_names.get(representative) {
+                info.display_name = catalog::family_display_name(dn);
+            }
+            if let Some(cw) = context_windows.get(representative) {
+                info.context_window = Some(*cw);
+            }
+            all_models.push(info);
+        }
+
+        if let Ok(mut guard) = self.families.lock() {
+            *guard = families;
         }
 
         if let Ok(mut guard) = self.catalog_cache.lock() {
@@ -266,6 +328,21 @@ impl Provider for Devin {
 
     async fn complete(&self, mut req: CompletionRequest) -> Result<EventStream, ProviderError> {
         let effort = req.effort.unwrap_or(self.defaults.effort);
+
+        // The picker offers families; the request has to name a concrete catalog id,
+        // which is the family at the session's effort. The catalog is needed to know
+        // the families at all, so fetch it once if nothing has yet.
+        if self.cfg.catalog && self.families.lock().is_ok_and(|f| f.is_empty()) {
+            let _ = self.fetch_models().await;
+        }
+        if let Some(resolved) = self.resolve_family(&req.model, effort) {
+            log::debug!(
+                "devin model {} at effort {} -> {resolved}",
+                req.model,
+                effort.as_str()
+            );
+            req.model = resolved;
+        }
 
         let assignment_jwt = if req.model.eq_ignore_ascii_case("adaptive") {
             // Must be the same id the chat request sends in field 16: the assignment

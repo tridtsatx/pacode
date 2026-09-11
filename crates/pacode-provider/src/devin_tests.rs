@@ -13,6 +13,20 @@ use crate::devin::proto::{self, WireType, Writer};
 use crate::devin::wire::encode_get_chat_message_request;
 use crate::{CompletionRequest, Provider, ProviderError};
 
+/// Provider whose fixture server answers `GetCliModelConfigs`, so the catalog —
+/// and with it the model families — is available.
+fn make_catalog_test_provider(
+    base_url: &str,
+    api_key: Option<&str>,
+    session_token: Option<&str>,
+) -> Devin {
+    let mut provider = make_test_provider(base_url, api_key, session_token);
+    provider.set_catalog_enabled(true);
+    provider
+}
+
+/// Provider for the chat fixtures: their server only serves `GetChatMessage`, so
+/// the catalog is off and no model family lookup is attempted.
 fn make_test_provider(base_url: &str, api_key: Option<&str>, session_token: Option<&str>) -> Devin {
     let cfg = ProviderConfig {
         kind: Default::default(),
@@ -20,7 +34,7 @@ fn make_test_provider(base_url: &str, api_key: Option<&str>, session_token: Opti
         api_key: None,
         api_key_env: None,
         models: vec![],
-        catalog: true,
+        catalog: false,
         context_window: Some(128_000),
         reasoning: Some(true),
         effort_map: BTreeMap::new(),
@@ -389,7 +403,7 @@ async fn test_auth_header_format() {
         socket.write_all(http_resp.as_bytes()).await.unwrap();
     });
 
-    let provider = make_test_provider(
+    let provider = make_catalog_test_provider(
         &format!("http://127.0.0.1:{port}"),
         Some("my-api-key"),
         Some("my-session-token"),
@@ -907,6 +921,97 @@ async fn test_list_models_mapping_and_merge() {
     assert_eq!(cached.len(), 3);
 }
 
+/// The catalog lists one id per effort (`swe-2-medium`, `swe-2-high`, `swe-2-max`).
+/// The picker gets a single `swe-2` entry, and the request sends the id serving the
+/// effort the session asked for.
+#[tokio::test]
+async fn test_catalog_efforts_fold_into_one_family_and_effort_picks_the_id() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        // Connection 1: the catalog.
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = socket.read(&mut buf).await.unwrap();
+
+        let mut resp = Writer::new();
+        for (display, uid) in [
+            ("SWE-2 Medium", "swe-2-medium"),
+            ("SWE-2 High", "swe-2-high"),
+            ("SWE-2 Max", "swe-2-max"),
+        ] {
+            let mut m = Writer::new();
+            m.write_string(1, display);
+            m.write_varint(18, 262_000);
+            m.write_string(22, uid);
+            resp.write_message(1, &m);
+        }
+        let resp_bytes = resp.into_bytes();
+        let http_resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/proto\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            resp_bytes.len()
+        );
+        socket.write_all(http_resp.as_bytes()).await.unwrap();
+        socket.write_all(&resp_bytes).await.unwrap();
+        drop(socket);
+
+        // Connection 2: the chat request, whose field 21 carries the model id.
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 16384];
+        let n = socket.read(&mut buf).await.unwrap();
+        let body = String::from_utf8_lossy(&buf[..n]).to_string();
+
+        let header = "HTTP/1.1 200 OK\r\ncontent-type: application/connect+proto\r\nconnection: close\r\n\r\n";
+        socket.write_all(header.as_bytes()).await.unwrap();
+        let mut stop = Writer::new();
+        stop.write_string(1, "bot-1");
+        stop.write_varint(5, 1);
+        socket
+            .write_all(&encode_connect_frame(0x00, stop.as_bytes()))
+            .await
+            .unwrap();
+        socket
+            .write_all(&encode_connect_frame(CONNECT_FLAG_END_STREAM, b"{}"))
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+        body
+    });
+
+    let provider = make_catalog_test_provider(
+        &format!("http://127.0.0.1:{port}"),
+        Some("my-api-key"),
+        Some("my-session-token"),
+    );
+
+    let models = provider.list_models().await.expect("list_models succeeds");
+    let ids: Vec<&str> = models.iter().map(|m| m.route.model.as_str()).collect();
+    assert_eq!(ids, vec!["swe-2"], "one entry per family, not per effort");
+    assert_eq!(
+        models[0].display_name, "SWE-2",
+        "effort dropped from the name"
+    );
+
+    let req = CompletionRequest {
+        model: "swe-2".to_string(),
+        system_static: "system".to_string(),
+        system_dynamic: String::new(),
+        messages: vec![Message::user("hi")],
+        tools: vec![],
+        effort: Some(Effort::High),
+        max_output_tokens: Some(1024),
+    };
+    let mut stream = provider.complete(req).await.expect("complete succeeds");
+    while stream.next().await.is_some() {}
+
+    let body = server.await.unwrap();
+    assert!(
+        body.contains("swe-2-high"),
+        "request carries the id serving the requested effort"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. Error Mapping: 401 Unauthenticated, 429 RateLimited, 500 Internal
 // ---------------------------------------------------------------------------
@@ -931,7 +1036,7 @@ async fn test_error_mapping_unauthenticated_unary() {
         socket.write_all(resp.as_bytes()).await.unwrap();
     });
 
-    let provider = make_test_provider(
+    let provider = make_catalog_test_provider(
         &format!("http://127.0.0.1:{port}"),
         Some("bad-key"),
         Some("bad-token"),
@@ -1194,6 +1299,114 @@ async fn test_structured_tool_call_field_and_stop_reason_ten() {
         Some(StopReason::ToolUse),
         "stop reason 10 is tool use"
     );
+}
+
+/// swe-2-max opens a structured tool call with a frame carrying only `call_id` and
+/// `name`, then streams the arguments JSON as chunks in later frames that carry neither.
+/// Captured from live traffic on 2026-09-11.
+#[tokio::test]
+async fn test_structured_tool_call_arguments_streamed_across_frames() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 8192];
+        let _ = socket.read(&mut buf).await.unwrap();
+
+        let header = "HTTP/1.1 200 OK\r\ncontent-type: application/connect+proto\r\nconnection: close\r\n\r\n";
+        socket.write_all(header.as_bytes()).await.unwrap();
+
+        // Frame naming the call, with no arguments of its own.
+        let mut open = Writer::new();
+        open.write_string(1, "ls_0");
+        open.write_string(2, "ls");
+        let mut frame = Writer::new();
+        frame.write_string(1, "bot-1");
+        frame.write_message(6, &open);
+        socket
+            .write_all(&encode_connect_frame(0x00, frame.as_bytes()))
+            .await
+            .unwrap();
+
+        // Argument chunks, each in its own frame, with neither call_id nor name.
+        for chunk in [r#"{"path""#, r#": ".", "#, r#""intent": "list"}"#] {
+            let mut part = Writer::new();
+            part.write_string(3, chunk);
+            let mut frame = Writer::new();
+            frame.write_string(1, "bot-1");
+            frame.write_message(6, &part);
+            socket
+                .write_all(&encode_connect_frame(0x00, frame.as_bytes()))
+                .await
+                .unwrap();
+        }
+
+        let mut stop = Writer::new();
+        stop.write_string(1, "bot-1");
+        stop.write_varint(5, 10);
+        socket
+            .write_all(&encode_connect_frame(0x00, stop.as_bytes()))
+            .await
+            .unwrap();
+
+        socket
+            .write_all(&encode_connect_frame(CONNECT_FLAG_END_STREAM, b"{}"))
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let provider = make_test_provider(
+        &format!("http://127.0.0.1:{port}"),
+        Some("my-api-key"),
+        Some("my-session-token"),
+    );
+    let req = CompletionRequest {
+        model: "swe-2-max".to_string(),
+        system_static: "system".to_string(),
+        system_dynamic: String::new(),
+        messages: vec![Message::user("list files")],
+        tools: vec![],
+        effort: None,
+        max_output_tokens: Some(1024),
+    };
+
+    let mut stream = provider.complete(req).await.expect("complete succeeds");
+    server.await.unwrap();
+
+    let mut events = Vec::new();
+    while let Some(res) = stream.next().await {
+        events.push(res.expect("stream event ok"));
+    }
+
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolCallStart { name, index, id } => {
+                Some((name.clone(), *index, id.as_str().to_string()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![("ls".to_string(), 0, "ls_0".to_string())],
+        "one call, opened once, keeping the id the server issued"
+    );
+
+    let args: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolCallArgsDelta { index, delta } => {
+                assert_eq!(*index, 0, "chunks belong to the open call");
+                Some(delta.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(args, r#"{"path": ".", "intent": "list"}"#);
+    serde_json::from_str::<serde_json::Value>(&args).expect("stitched arguments parse as JSON");
 }
 
 // ---------------------------------------------------------------------------
