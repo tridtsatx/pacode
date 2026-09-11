@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_types::{
-    ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, prettify_model_name,
+    ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, Role, prettify_model_name,
 };
 
 pub use connect::{
@@ -257,8 +257,41 @@ impl Provider for Devin {
         &self.id
     }
 
-    async fn complete(&self, req: CompletionRequest) -> Result<EventStream, ProviderError> {
+    async fn complete(&self, mut req: CompletionRequest) -> Result<EventStream, ProviderError> {
         let effort = req.effort.unwrap_or(self.defaults.effort);
+
+        let assignment_jwt = if req.model.eq_ignore_ascii_case("adaptive") {
+            // Must be the same id the chat request sends in field 16: the assignment
+            // token is bound to the conversation.
+            let conversation_id = crate::devin::wire::conversation_id(&req);
+            let latest_user_msg = req.messages.iter().rev().find(|m| m.role == Role::User);
+            let req_bytes = encode_assign_model_request(
+                &self.session_token,
+                "adaptive",
+                &conversation_id,
+                latest_user_msg,
+            );
+            let resp_bytes = self
+                .connect_client
+                .unary(
+                    "/exa.api_server_pb.ApiServerService/AssignModel",
+                    &req_bytes,
+                )
+                .await?;
+            let resp = decode_assign_model_response(&resp_bytes).map_err(|e| {
+                ProviderError::Malformed(format!("failed to parse AssignModel response: {e}"))
+            })?;
+            let assignment = resp.assignment.ok_or_else(|| {
+                ProviderError::Malformed(
+                    "AssignModel response missing assignment field".to_string(),
+                )
+            })?;
+            req.model = assignment.assigned_model_uid;
+            Some(assignment.assignment_jwt)
+        } else {
+            None
+        };
+
         let opener = DevinStreamOpener {
             connect_client: self.connect_client.clone(),
             session_token: self.session_token.clone(),
@@ -269,6 +302,7 @@ impl Provider for Devin {
             effort,
             max_retries: self.defaults.max_retries,
             backoff_base: self.backoff_base,
+            assignment_jwt,
         };
 
         let inner = opener.open().await?;

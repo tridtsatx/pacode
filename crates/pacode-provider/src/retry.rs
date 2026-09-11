@@ -149,6 +149,7 @@ fn is_committing(event: &StreamEvent) -> bool {
         event,
         StreamEvent::TextDelta { .. }
             | StreamEvent::ReasoningDelta { .. }
+            | StreamEvent::ReasoningSignature { .. }
             | StreamEvent::ToolCallStart { .. }
             | StreamEvent::ToolCallArgsDelta { .. }
             | StreamEvent::Usage(_)

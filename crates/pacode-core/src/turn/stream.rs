@@ -19,6 +19,7 @@ use crate::transcript::DeltaCoalescer;
 pub struct StreamOutcome {
     pub text: String,
     pub reasoning: String,
+    pub reasoning_signature: Option<String>,
     pub tool_calls: Vec<(CallId, String, serde_json::Value, Option<String>)>,
     pub usage: Usage,
     pub interrupted: bool,
@@ -36,6 +37,7 @@ pub async fn consume_stream(
     let mut reasoning_item_seq: Option<u64> = None;
     let mut text_acc = String::new();
     let mut reasoning_acc = String::new();
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_calls_building: BTreeMap<u32, (CallId, String, String)> = BTreeMap::new();
     let mut turn_usage = Usage::default();
 
@@ -142,6 +144,9 @@ pub async fn consume_stream(
                                     });
                                 }
                             }
+                            Ok(StreamEvent::ReasoningSignature { signature, kind: _ }) => {
+                                reasoning_signature = Some(signature);
+                            }
                             Ok(StreamEvent::ToolCallStart { index, id, name }) => {
                                 tool_calls_building.insert(index, (id, name, String::new()));
                             }
@@ -226,12 +231,12 @@ pub async fn consume_stream(
     }
 
     if stream_interrupted {
-        if !text_acc.is_empty() || !reasoning_acc.is_empty() {
+        if !text_acc.is_empty() || !reasoning_acc.is_empty() || reasoning_signature.is_some() {
             let mut blocks = Vec::new();
-            if !reasoning_acc.is_empty() {
+            if !reasoning_acc.is_empty() || reasoning_signature.is_some() {
                 blocks.push(ContentBlock::Reasoning {
                     text: reasoning_acc.clone(),
-                    signature: None,
+                    signature: reasoning_signature.clone(),
                 });
             }
             if !text_acc.is_empty() {
@@ -253,6 +258,7 @@ pub async fn consume_stream(
         return Ok(StreamOutcome {
             text: text_acc,
             reasoning: reasoning_acc,
+            reasoning_signature,
             tool_calls: Vec::new(),
             usage: turn_usage,
             interrupted: true,
@@ -271,6 +277,7 @@ pub async fn consume_stream(
     Ok(StreamOutcome {
         text: text_acc,
         reasoning: reasoning_acc,
+        reasoning_signature,
         tool_calls,
         usage: turn_usage,
         interrupted: false,

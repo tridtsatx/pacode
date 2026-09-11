@@ -36,6 +36,8 @@ fn test_devin_authorize_url_query_parameters() {
         params.get("code_challenge_method").map(String::as_str),
         Some("S256")
     );
+    // The official CLI marks its PKCE logins with this; captured 2026-09-11.
+    assert_eq!(params.get("cli_pkce_marker").map(String::as_str), Some("1"));
 
     // Verify raw query urlencoding
     let raw = parsed.query().expect("raw query");

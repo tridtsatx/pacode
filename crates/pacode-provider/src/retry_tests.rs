@@ -121,6 +121,7 @@ async fn test_mid_stream_rate_limit_reopens_request() {
             StreamEvent::TextDelta { text } => texts.push(text),
             StreamEvent::MessageStart { .. }
             | StreamEvent::ReasoningDelta { .. }
+            | StreamEvent::ReasoningSignature { .. }
             | StreamEvent::ToolCallStart { .. }
             | StreamEvent::ToolCallArgsDelta { .. }
             | StreamEvent::Usage(_)

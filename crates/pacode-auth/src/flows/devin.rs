@@ -18,7 +18,8 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// Build the Devin authorization URL for the browser.
 pub fn build_authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> String {
     format!(
-        "{AUTHORIZE_URL}?redirect_uri={}&state={state}&prompt=select_account&code_challenge={challenge}&code_challenge_method=S256",
+        "{AUTHORIZE_URL}?redirect_uri={}&state={state}&prompt=select_account\
+&code_challenge={challenge}&code_challenge_method=S256&cli_pkce_marker=1",
         urlencode(redirect_uri),
     )
 }

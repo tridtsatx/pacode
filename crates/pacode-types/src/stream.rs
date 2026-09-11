@@ -19,6 +19,11 @@ pub enum StreamEvent {
     ReasoningDelta {
         text: String,
     },
+    ReasoningSignature {
+        signature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+    },
     /// A tool call begins. `index` orders parallel calls inside one message.
     ToolCallStart {
         index: u32,

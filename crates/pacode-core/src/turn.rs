@@ -259,10 +259,10 @@ pub async fn run_turn(
         }
 
         let mut content_blocks = Vec::new();
-        if !outcome.reasoning.is_empty() {
+        if !outcome.reasoning.is_empty() || outcome.reasoning_signature.is_some() {
             content_blocks.push(ContentBlock::Reasoning {
                 text: outcome.reasoning,
-                signature: None,
+                signature: outcome.reasoning_signature,
             });
         }
         if !outcome.text.is_empty() {

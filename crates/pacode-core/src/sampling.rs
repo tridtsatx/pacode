@@ -115,7 +115,14 @@ impl SamplingHandler for CoreSamplingHandler {
                         StopReason::Other(s) => s,
                     });
                 }
-                Ok(_) => {}
+                Ok(
+                    StreamEvent::MessageStart { .. }
+                    | StreamEvent::ReasoningDelta { .. }
+                    | StreamEvent::ReasoningSignature { .. }
+                    | StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallArgsDelta { .. }
+                    | StreamEvent::Usage(_),
+                ) => {}
                 Err(e) => return Err(McpError::Protocol(e.to_string())),
             }
         }

@@ -216,7 +216,7 @@ fn test_exact_byte_layout_of_get_chat_message_request() {
     };
 
     let session_token = "sess-tok-xyz-987";
-    let encoded = encode_get_chat_message_request(session_token, &req, &cfg);
+    let encoded = encode_get_chat_message_request(session_token, &req, &cfg, None);
 
     let reader = proto::Reader::new(&encoded);
     let mut field_numbers = Vec::new();
@@ -1190,4 +1190,543 @@ async fn test_structured_tool_call_field_and_stop_reason_ten() {
         Some(StopReason::ToolUse),
         "stop reason 10 is tool use"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 11. Adaptive Model Routing (AssignModel -> GetChatMessage with JWT and assigned uid)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_adaptive_route_issues_exactly_one_assign_model_and_carries_jwt_and_assigned_uid() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        // Request 1: AssignModel
+        let (mut socket1, _) = listener.accept().await.unwrap();
+        let mut buf1 = [0u8; 4096];
+        let n1 = socket1.read(&mut buf1).await.unwrap();
+        let req_str1 = String::from_utf8_lossy(&buf1[..n1]);
+
+        assert!(
+            req_str1.contains("POST /exa.api_server_pb.ApiServerService/AssignModel"),
+            "First call must be AssignModel"
+        );
+        assert!(req_str1.contains("content-type: application/proto"));
+
+        let body_offset1 = req_str1.find("\r\n\r\n").unwrap() + 4;
+        let body1 = &buf1[body_offset1..n1];
+        let reader1 = proto::Reader::new(body1);
+
+        let mut assign_model_uid = String::new();
+        let mut assign_conv_id = String::new();
+        let mut assign_user_text = String::new();
+        let mut assign_user_role = 0u64;
+
+        for res in reader1 {
+            let (f, _, v) = res.unwrap();
+            match f {
+                2 => assign_model_uid = v.as_str().unwrap().to_string(),
+                3 => assign_conv_id = v.as_str().unwrap().to_string(),
+                5 => {
+                    let msg_reader = v.as_message().unwrap();
+                    for m_res in msg_reader {
+                        let (mf, _, mv) = m_res.unwrap();
+                        match mf {
+                            2 => assign_user_role = mv.as_varint().unwrap(),
+                            3 => assign_user_text = mv.as_str().unwrap().to_string(),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(assign_model_uid, "adaptive");
+        assert_eq!(assign_conv_id.len(), 36, "conversation_id must be a UUID");
+        assert_eq!(assign_user_role, 1);
+        assert_eq!(assign_user_text, "solve problem");
+
+        // 1 assignment { 1 assignment_jwt, 2 assigned_model_uid, 3 repeated harness_uid }
+        let mut assignment_w = Writer::new();
+        assignment_w.write_string(1, "test.assignment.jwt.token");
+        assignment_w.write_string(2, "gpt-5-6-sol-low");
+        assignment_w.write_string(3, "harness-default");
+
+        let mut assign_resp = Writer::new();
+        assign_resp.write_message(1, &assignment_w);
+        let resp_payload = assign_resp.into_bytes();
+
+        let http_resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/proto\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            resp_payload.len()
+        );
+        socket1.write_all(http_resp.as_bytes()).await.unwrap();
+        socket1.write_all(&resp_payload).await.unwrap();
+        socket1.shutdown().await.unwrap();
+
+        // Request 2: GetChatMessage
+        let (mut socket2, _) = listener.accept().await.unwrap();
+        let mut buf2 = [0u8; 8192];
+        let mut total_read = 0;
+        let mut header_len = 0;
+        let mut content_len = 0;
+        loop {
+            let n = socket2.read(&mut buf2[total_read..]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total_read += n;
+            let s = String::from_utf8_lossy(&buf2[..total_read]);
+            if let Some(pos) = s.find("\r\n\r\n") {
+                header_len = pos + 4;
+                for line in s[..pos].lines() {
+                    if let Some(val) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_len = val.trim().parse::<usize>().unwrap_or(0);
+                    }
+                }
+                if total_read >= header_len + content_len {
+                    break;
+                }
+            }
+        }
+
+        let req_str2 = String::from_utf8_lossy(&buf2[..header_len]);
+        assert!(
+            req_str2.contains("POST /exa.api_server_pb.ApiServerService/GetChatMessage"),
+            "Second call must be GetChatMessage"
+        );
+        assert!(req_str2.contains("content-type: application/connect+proto"));
+
+        let body2 = &buf2[header_len..header_len + content_len];
+        assert!(body2.len() >= 5);
+        let proto_body2 = &body2[5..];
+
+        let reader2 = proto::Reader::new(proto_body2);
+        let mut chat_model_uid = String::new();
+        let mut chat_assignment_jwt = String::new();
+
+        for res in reader2 {
+            let (f, _, v) = res.unwrap();
+            match f {
+                21 => chat_model_uid = v.as_str().unwrap().to_string(),
+                26 => chat_assignment_jwt = v.as_str().unwrap().to_string(),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            chat_model_uid, "gpt-5-6-sol-low",
+            "field 21 must be the assigned model uid"
+        );
+        assert_eq!(
+            chat_assignment_jwt, "test.assignment.jwt.token",
+            "field 26 must carry the assignment jwt"
+        );
+
+        let header = "HTTP/1.1 200 OK\r\ncontent-type: application/connect+proto\r\nconnection: close\r\n\r\n";
+        socket2.write_all(header.as_bytes()).await.unwrap();
+
+        let mut f1 = Writer::new();
+        f1.write_string(1, "bot-adaptive");
+        f1.write_string(3, "Adaptive solution");
+        socket2
+            .write_all(&encode_connect_frame(0x00, f1.as_bytes()))
+            .await
+            .unwrap();
+
+        let mut f2 = Writer::new();
+        f2.write_string(1, "bot-adaptive");
+        f2.write_varint(5, 2);
+        socket2
+            .write_all(&encode_connect_frame(0x00, f2.as_bytes()))
+            .await
+            .unwrap();
+
+        socket2
+            .write_all(&encode_connect_frame(CONNECT_FLAG_END_STREAM, b"{}"))
+            .await
+            .unwrap();
+        socket2.shutdown().await.unwrap();
+    });
+
+    let provider = make_test_provider(
+        &format!("http://127.0.0.1:{port}"),
+        Some("my-api-key"),
+        Some("my-session-token"),
+    );
+
+    let req = CompletionRequest {
+        model: "adaptive".to_string(),
+        system_static: "system".to_string(),
+        system_dynamic: "".to_string(),
+        messages: vec![Message::user("solve problem")],
+        tools: vec![],
+        effort: None,
+        max_output_tokens: None,
+    };
+
+    let mut stream = provider.complete(req).await.expect("complete succeeds");
+    server.await.unwrap();
+
+    let mut text = String::new();
+    while let Some(res) = stream.next().await {
+        let ev = res.expect("event ok");
+        if let StreamEvent::TextDelta { text: d } = ev {
+            text.push_str(&d);
+        }
+    }
+    assert_eq!(text, "Adaptive solution");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Non-Adaptive Route Issues No AssignModel Call
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_non_adaptive_route_issues_no_assign_model() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 8192];
+        let mut total_read = 0;
+        let mut header_len = 0;
+        let mut content_len = 0;
+        loop {
+            let n = socket.read(&mut buf[total_read..]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total_read += n;
+            let s = String::from_utf8_lossy(&buf[..total_read]);
+            if let Some(pos) = s.find("\r\n\r\n") {
+                header_len = pos + 4;
+                for line in s[..pos].lines() {
+                    if let Some(val) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_len = val.trim().parse::<usize>().unwrap_or(0);
+                    }
+                }
+                if total_read >= header_len + content_len {
+                    break;
+                }
+            }
+        }
+
+        let req_str = String::from_utf8_lossy(&buf[..header_len]);
+        assert!(
+            req_str.contains("POST /exa.api_server_pb.ApiServerService/GetChatMessage"),
+            "Must directly call GetChatMessage without AssignModel"
+        );
+        assert!(!req_str.contains("AssignModel"));
+
+        let body = &buf[header_len..header_len + content_len];
+        let proto_body = &body[5..];
+        let reader = proto::Reader::new(proto_body);
+
+        let mut model_uid = String::new();
+        let mut has_field_26 = false;
+
+        for res in reader {
+            let (f, _, v) = res.unwrap();
+            match f {
+                21 => model_uid = v.as_str().unwrap().to_string(),
+                26 => has_field_26 = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(model_uid, "swe-1-6-fast");
+        assert!(
+            !has_field_26,
+            "Field 26 must not be written when no assignment exists"
+        );
+
+        let header = "HTTP/1.1 200 OK\r\ncontent-type: application/connect+proto\r\nconnection: close\r\n\r\n";
+        socket.write_all(header.as_bytes()).await.unwrap();
+
+        let mut f1 = Writer::new();
+        f1.write_string(1, "bot-direct");
+        f1.write_string(3, "Direct output");
+        socket
+            .write_all(&encode_connect_frame(0x00, f1.as_bytes()))
+            .await
+            .unwrap();
+
+        let mut f2 = Writer::new();
+        f2.write_string(1, "bot-direct");
+        f2.write_varint(5, 2);
+        socket
+            .write_all(&encode_connect_frame(0x00, f2.as_bytes()))
+            .await
+            .unwrap();
+
+        socket
+            .write_all(&encode_connect_frame(CONNECT_FLAG_END_STREAM, b"{}"))
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let provider = make_test_provider(
+        &format!("http://127.0.0.1:{port}"),
+        Some("my-api-key"),
+        Some("my-session-token"),
+    );
+
+    let req = CompletionRequest {
+        model: "swe-1-6-fast".to_string(),
+        system_static: "".to_string(),
+        system_dynamic: "".to_string(),
+        messages: vec![Message::user("hi")],
+        tools: vec![],
+        effort: None,
+        max_output_tokens: None,
+    };
+
+    let mut stream = provider.complete(req).await.expect("complete succeeds");
+    server.await.unwrap();
+
+    let mut text = String::new();
+    while let Some(res) = stream.next().await {
+        if let StreamEvent::TextDelta { text: d } = res.expect("event ok") {
+            text.push_str(&d);
+        }
+    }
+    assert_eq!(text, "Direct output");
+}
+
+// ---------------------------------------------------------------------------
+// 13. Response Carrying Fields 10 and 21 Produces ReasoningSignature Event
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_response_carrying_fields_10_and_21_produces_reasoning_signature_event() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await.unwrap();
+
+        let header = "HTTP/1.1 200 OK\r\ncontent-type: application/connect+proto\r\nconnection: close\r\n\r\n";
+        socket.write_all(header.as_bytes()).await.unwrap();
+
+        // Frame 1 carries fields 9 (thinking), 10 (signature), 15 (msg id), 21 (signature kind)
+        let mut f1 = Writer::new();
+        f1.write_string(1, "bot-sig-1");
+        f1.write_string(9, "Thinking deeply about the problem...");
+        f1.write_string(10, "sealed.v1.e30.signature_test");
+        f1.write_string(15, "msg_devin_live_capture_123");
+        f1.write_string(21, "sealed");
+        socket
+            .write_all(&encode_connect_frame(0x00, f1.as_bytes()))
+            .await
+            .unwrap();
+
+        // Frame 2: text delta
+        let mut f2 = Writer::new();
+        f2.write_string(1, "bot-sig-1");
+        f2.write_string(3, "Here is the result");
+        socket
+            .write_all(&encode_connect_frame(0x00, f2.as_bytes()))
+            .await
+            .unwrap();
+
+        // Frame 3: stop
+        let mut f3 = Writer::new();
+        f3.write_string(1, "bot-sig-1");
+        f3.write_varint(5, 2);
+        socket
+            .write_all(&encode_connect_frame(0x00, f3.as_bytes()))
+            .await
+            .unwrap();
+
+        socket
+            .write_all(&encode_connect_frame(CONNECT_FLAG_END_STREAM, b"{}"))
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let provider = make_test_provider(
+        &format!("http://127.0.0.1:{port}"),
+        Some("key"),
+        Some("token"),
+    );
+
+    let req = CompletionRequest {
+        model: "swe-1-6-fast".to_string(),
+        system_static: "".to_string(),
+        system_dynamic: "".to_string(),
+        messages: vec![Message::user("do something")],
+        tools: vec![],
+        effort: None,
+        max_output_tokens: None,
+    };
+
+    let mut stream = provider.complete(req).await.expect("complete succeeds");
+    server.await.unwrap();
+
+    let mut events = Vec::new();
+    while let Some(res) = stream.next().await {
+        events.push(res.expect("event ok"));
+    }
+
+    let sig_event = events
+        .iter()
+        .find(|e| matches!(e, StreamEvent::ReasoningSignature { .. }));
+
+    assert_eq!(
+        sig_event,
+        Some(&StreamEvent::ReasoningSignature {
+            signature: "sealed.v1.e30.signature_test".to_string(),
+            kind: Some("sealed".to_string()),
+        })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. Assistant Message with Signature Re-Encoded as Fields 11, 12, 18
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_assistant_message_with_signature_re_encoded_as_11_12_18() {
+    let assistant_msg = Message::new(
+        pacode_types::Role::Assistant,
+        vec![
+            pacode_types::ContentBlock::Reasoning {
+                text: "My captured thoughts".to_string(),
+                signature: Some("sealed.v1.dGVzdF9zaWduYXR1cmU=".to_string()),
+            },
+            pacode_types::ContentBlock::Text {
+                text: "My final answer".to_string(),
+            },
+        ],
+    );
+
+    let req = CompletionRequest {
+        model: "swe-1-6-fast".to_string(),
+        system_static: "".to_string(),
+        system_dynamic: "".to_string(),
+        messages: vec![Message::user("Question"), assistant_msg],
+        tools: vec![],
+        effort: None,
+        max_output_tokens: None,
+    };
+
+    let cfg = ProviderConfig {
+        kind: Default::default(),
+        base_url: "https://server.codeium.com".to_string(),
+        api_key: None,
+        api_key_env: None,
+        models: vec![],
+        catalog: false,
+        context_window: None,
+        reasoning: Some(true),
+        effort_map: BTreeMap::new(),
+        extra_body: None,
+        headers: BTreeMap::new(),
+    };
+
+    let encoded = encode_get_chat_message_request("session-token", &req, &cfg, None);
+    let reader = proto::Reader::new(&encoded);
+
+    let mut found_assistant = false;
+    let mut assistant_role = 0u64;
+    let mut assistant_text = String::new();
+    let mut thinking_text = String::new();
+    let mut thinking_sig = String::new();
+    let mut thinking_kind = String::new();
+
+    for res in reader {
+        let (f, _, v) = res.unwrap();
+        if f == 3 {
+            let msg_reader = v.as_message().unwrap();
+            let mut role = 0u64;
+            let mut text = String::new();
+            let mut thinking = String::new();
+            let mut sig = String::new();
+            let mut kind = String::new();
+
+            for m_res in msg_reader {
+                let (mf, _, mv) = m_res.unwrap();
+                match mf {
+                    2 => role = mv.as_varint().unwrap(),
+                    3 => text = mv.as_str().unwrap().to_string(),
+                    11 => thinking = mv.as_str().unwrap().to_string(),
+                    12 => sig = mv.as_str().unwrap().to_string(),
+                    18 => kind = mv.as_str().unwrap().to_string(),
+                    _ => {}
+                }
+            }
+
+            if role == 2 {
+                found_assistant = true;
+                assistant_role = role;
+                assistant_text = text;
+                thinking_text = thinking;
+                thinking_sig = sig;
+                thinking_kind = kind;
+            }
+        }
+    }
+
+    assert!(found_assistant, "assistant message must be found");
+    assert_eq!(assistant_role, 2);
+    assert_eq!(assistant_text, "My final answer");
+    assert_eq!(
+        thinking_text, "My captured thoughts",
+        "field 11 is thinking text"
+    );
+    assert_eq!(
+        thinking_sig, "sealed.v1.dGVzdF9zaWduYXR1cmU=",
+        "field 12 is signature"
+    );
+    assert_eq!(thinking_kind, "sealed", "field 18 is signature kind");
+}
+
+/// Field 16 is the conversation id, not a fresh per-request uuid: the assignment token
+/// AssignModel hands out is bound to it, and sending a different one made the server
+/// answer invalid_argument. Caught against the live service on 2026-09-11.
+#[test]
+fn test_conversation_id_is_stable_across_turns_of_one_conversation() {
+    use crate::devin::wire::conversation_id;
+
+    let first = CompletionRequest {
+        model: "adaptive".to_string(),
+        system_static: "system".to_string(),
+        system_dynamic: String::new(),
+        messages: vec![Message::user("find gamma")],
+        tools: vec![],
+        effort: None,
+        max_output_tokens: Some(1024),
+    };
+    let mut later = first.clone();
+    later.messages.push(Message::assistant_text("looking"));
+    later.messages.push(Message::user("and now delta"));
+    later.system_dynamic = "changed between turns".to_string();
+
+    assert_eq!(
+        conversation_id(&first),
+        conversation_id(&later),
+        "appending turns must not change the conversation id"
+    );
+
+    let other = CompletionRequest {
+        messages: vec![Message::user("a different conversation")],
+        ..first.clone()
+    };
+    assert_ne!(
+        conversation_id(&first),
+        conversation_id(&other),
+        "separate conversations must not share an id"
+    );
+
+    let id = conversation_id(&first);
+    assert_eq!(id.len(), 36, "uuid shaped: {id}");
+    assert_eq!(id.as_bytes()[14], b'4', "version nibble: {id}");
 }

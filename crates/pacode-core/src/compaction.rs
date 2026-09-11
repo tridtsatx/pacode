@@ -140,7 +140,15 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
             Ok(pacode_types::StreamEvent::TextDelta { text }) => {
                 summary_text.push_str(&text);
             }
-            Ok(_) => {}
+            Ok(
+                pacode_types::StreamEvent::MessageStart { .. }
+                | pacode_types::StreamEvent::ReasoningDelta { .. }
+                | pacode_types::StreamEvent::ReasoningSignature { .. }
+                | pacode_types::StreamEvent::ToolCallStart { .. }
+                | pacode_types::StreamEvent::ToolCallArgsDelta { .. }
+                | pacode_types::StreamEvent::Usage(_)
+                | pacode_types::StreamEvent::MessageEnd { .. },
+            ) => {}
             Err(e) => return Err(CoreError::Provider(e)),
         }
     }

@@ -29,6 +29,7 @@ pub fn create_devin_event_stream(
         stream_ended: bool,
         /// Tool calls the server delivered structurally, used to number them.
         structured_tool_calls: u32,
+        thinking_kind: Option<String>,
     }
 
     let initial = StreamState {
@@ -40,6 +41,7 @@ pub fn create_devin_event_stream(
         message_end_emitted: false,
         stream_ended: false,
         structured_tool_calls: 0,
+        thinking_kind: None,
     };
 
     let stream = futures::stream::unfold(initial, |mut state| async move {
@@ -73,6 +75,10 @@ pub fn create_devin_event_stream(
                         state.model = m;
                     }
 
+                    if let Some(kind) = resp.thinking_kind {
+                        state.thinking_kind = Some(kind);
+                    }
+
                     if let Some(thinking) = resp.delta_thinking
                         && !thinking.is_empty()
                     {
@@ -85,6 +91,21 @@ pub fn create_devin_event_stream(
                         state
                             .pending_events
                             .push_back(StreamEvent::ReasoningDelta { text: thinking });
+                    }
+
+                    if let Some(sig) = resp.thinking_signature {
+                        if !state.message_start_emitted {
+                            state.pending_events.push_back(StreamEvent::MessageStart {
+                                model: Some(state.model.clone()),
+                            });
+                            state.message_start_emitted = true;
+                        }
+                        state
+                            .pending_events
+                            .push_back(StreamEvent::ReasoningSignature {
+                                signature: sig,
+                                kind: state.thinking_kind.clone(),
+                            });
                     }
 
                     if let Some(call) = resp.tool_call {
@@ -225,6 +246,7 @@ pub struct DevinStreamOpener {
     pub effort: Effort,
     pub max_retries: u32,
     pub backoff_base: Duration,
+    pub assignment_jwt: Option<String>,
 }
 
 impl DevinStreamOpener {
@@ -240,8 +262,12 @@ impl DevinStreamOpener {
         };
 
         loop {
-            let req_bytes =
-                encode_get_chat_message_request(&self.session_token, &self.req, &self.cfg);
+            let req_bytes = encode_get_chat_message_request(
+                &self.session_token,
+                &self.req,
+                &self.cfg,
+                self.assignment_jwt.as_deref(),
+            );
 
             let stream_result = self
                 .connect_client
@@ -276,6 +302,7 @@ fn is_committing(event: &StreamEvent) -> bool {
     match event {
         StreamEvent::TextDelta { .. }
         | StreamEvent::ReasoningDelta { .. }
+        | StreamEvent::ReasoningSignature { .. }
         | StreamEvent::ToolCallStart { .. }
         | StreamEvent::ToolCallArgsDelta { .. }
         | StreamEvent::Usage(_)

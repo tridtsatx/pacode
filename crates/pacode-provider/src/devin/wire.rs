@@ -10,6 +10,30 @@ use crate::CompletionRequest;
 pub const DEVIN_CLI_VERSION: &str = "3000.10.21";
 pub const DEVIN_PRODUCT: &str = "chisel";
 
+/// Identifier of the conversation, stable across every turn of it.
+///
+/// Field 16 of `GetChatMessage` is the conversation id, not a per-request id: the
+/// official client keeps one value for a whole session, and an assignment token from
+/// `AssignModel` is bound to it. `CompletionRequest` carries no session id, so the id
+/// is derived from the opening of the conversation, which does not change as turns are
+/// appended.
+pub fn conversation_id(req: &CompletionRequest) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let seed = req.messages.first().map(|m| m.text()).unwrap_or_default();
+    let mut bytes = [0u8; 16];
+    for (chunk, salt) in bytes.chunks_mut(8).zip([0x9e37_79b9u64, 0x85eb_ca6b]) {
+        let mut hasher = DefaultHasher::new();
+        salt.hash(&mut hasher);
+        req.system_static.hash(&mut hasher);
+        seed.hash(&mut hasher);
+        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid_string(&bytes)
+}
+
 /// Generate a compliant RFC 4122 version 4 UUID string.
 pub fn random_uuid() -> String {
     use rand::RngCore;
@@ -17,6 +41,10 @@ pub fn random_uuid() -> String {
     rand::rng().fill_bytes(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid_string(&bytes)
+}
+
+fn uuid_string(bytes: &[u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         bytes[0],
@@ -102,6 +130,7 @@ pub fn encode_pending() -> proto::Writer {
 }
 
 /// Encode messages from the conversation history into protobuf messages.
+// Field 10 { 1 base64_data, 2 mime_type } exists for image attachments in live traffic; unused because ContentBlock has no image variant.
 pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
     let mut encoded = Vec::new();
 
@@ -123,22 +152,23 @@ pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
                     w.write_string(3, &text);
                 }
                 for block in &msg.content {
-                    match block {
-                        ContentBlock::ToolUse { id, name, input } => {
-                            let mut tc = proto::Writer::new();
-                            tc.write_string(1, id.as_str());
-                            tc.write_string(2, name);
-                            tc.write_string(3, &input.to_string());
-                            w.write_message(6, &tc);
+                    if let ContentBlock::ToolUse { id, name, input } = block {
+                        let mut tc = proto::Writer::new();
+                        tc.write_string(1, id.as_str());
+                        tc.write_string(2, name);
+                        tc.write_string(3, &input.to_string());
+                        w.write_message(6, &tc);
+                    }
+                }
+                for block in &msg.content {
+                    if let ContentBlock::Reasoning { text, signature } = block {
+                        w.write_string(11, text);
+                        if let Some(sig) = signature {
+                            w.write_string(12, sig);
+                            // The signature kind is not kept on the content block; every
+                            // signature observed in live traffic was "sealed".
+                            w.write_string(18, "sealed");
                         }
-                        ContentBlock::Reasoning { text, signature } => {
-                            w.write_string(11, text);
-                            if let Some(sig) = signature {
-                                w.write_string(12, sig);
-                                w.write_string(18, "sealed");
-                            }
-                        }
-                        ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => {}
                     }
                 }
                 encoded.push(w);
@@ -169,6 +199,7 @@ pub fn encode_get_chat_message_request(
     session_token: &str,
     req: &CompletionRequest,
     cfg: &ProviderConfig,
+    assignment_jwt: Option<&str>,
 ) -> Vec<u8> {
     let mut w = proto::Writer::new();
 
@@ -210,8 +241,8 @@ pub fn encode_get_chat_message_request(
     let pending = encode_pending();
     w.write_message(15, &pending);
 
-    // 16: request_id
-    w.write_string(16, &random_uuid());
+    // 16: conversation id, stable for the whole conversation
+    w.write_string(16, &conversation_id(req));
 
     // 20: varint 1
     w.write_varint(20, 1);
@@ -219,7 +250,74 @@ pub fn encode_get_chat_message_request(
     // 21: model_uid
     w.write_string(21, &req.model);
 
+    // 26: assignment_jwt
+    if let Some(jwt) = assignment_jwt
+        && !jwt.is_empty()
+    {
+        w.write_string(26, jwt);
+    }
+
     w.into_bytes()
+}
+
+/// Encode `AssignModelRequest` into protobuf bytes.
+pub fn encode_assign_model_request(
+    session_token: &str,
+    model_uid: &str,
+    conversation_id: &str,
+    latest_user_message: Option<&Message>,
+) -> Vec<u8> {
+    let mut w = proto::Writer::new();
+    let metadata = encode_metadata(session_token);
+    w.write_message(1, &metadata);
+    w.write_string(2, model_uid);
+    w.write_string(3, conversation_id);
+    if let Some(user_msg) = latest_user_message {
+        let mut msg_w = proto::Writer::new();
+        msg_w.write_varint(2, 1);
+        let text = user_msg.text();
+        msg_w.write_string(3, &text);
+        w.write_message(5, &msg_w);
+    }
+    w.into_bytes()
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ModelAssignment {
+    pub assignment_jwt: String,
+    pub assigned_model_uid: String,
+    pub harness_uids: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct AssignModelResponse {
+    pub assignment: Option<ModelAssignment>,
+}
+
+/// Decode an `AssignModelResponse` protobuf payload.
+pub fn decode_assign_model_response(bytes: &[u8]) -> Result<AssignModelResponse, ProtoError> {
+    let reader = proto::Reader::new(bytes);
+    let mut resp = AssignModelResponse::default();
+
+    for res in reader {
+        let (field_no, wire_type, value) = res?;
+        if field_no == 1 && wire_type == WireType::LengthDelimited {
+            let a_reader = value.as_message()?;
+            let mut assignment = ModelAssignment::default();
+            for a_res in a_reader {
+                let (af, _, av) = a_res?;
+                match af {
+                    1 => assignment.assignment_jwt = av.as_str()?.to_string(),
+                    2 => assignment.assigned_model_uid = av.as_str()?.to_string(),
+                    3 => assignment.harness_uids.push(av.as_str()?.to_string()),
+                    _ => {}
+                }
+            }
+            resp.assignment = Some(assignment);
+        }
+    }
+
+    Ok(resp)
 }
 
 /// Encode `GetCliModelConfigsRequest` into protobuf bytes.
@@ -257,6 +355,9 @@ pub struct ChatMessageDelta {
     pub delta_tokens: Option<u64>,
     pub stop_reason: Option<u64>,
     pub delta_thinking: Option<String>,
+    pub thinking_signature: Option<String>,
+    pub thinking_kind: Option<String>,
+    pub provider_message_id: Option<String>,
     pub usage: Option<ChatUsage>,
     pub model_name: Option<String>,
 }
@@ -307,6 +408,9 @@ pub fn decode_get_chat_message_response(bytes: &[u8]) -> Result<ChatMessageDelta
                 resp.usage = Some(usage);
             }
             9 => resp.delta_thinking = Some(value.as_str()?.to_string()),
+            10 => resp.thinking_signature = Some(value.as_str()?.to_string()),
+            15 => resp.provider_message_id = Some(value.as_str()?.to_string()),
+            21 => resp.thinking_kind = Some(value.as_str()?.to_string()),
             _ => {}
         }
     }

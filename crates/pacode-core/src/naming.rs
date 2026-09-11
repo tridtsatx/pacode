@@ -43,7 +43,15 @@ pub async fn generate_title(
             Ok(StreamEvent::TextDelta { text }) => {
                 title_acc.push_str(&text);
             }
-            Ok(_) => {}
+            Ok(
+                StreamEvent::MessageStart { .. }
+                | StreamEvent::ReasoningDelta { .. }
+                | StreamEvent::ReasoningSignature { .. }
+                | StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgsDelta { .. }
+                | StreamEvent::Usage(_)
+                | StreamEvent::MessageEnd { .. },
+            ) => {}
             Err(e) => {
                 log::warn!("title generation stream failed: {e}");
                 return None;
