@@ -89,6 +89,14 @@ fn draw_effort(
         "xhigh: extra reasoning; sent as `high` unless the provider maps it",
         "max: maximum reasoning, slow and expensive",
     ];
+    // Greyed levels are unsupported by the current model and unselectable
+    // (spec §6); `None` means no restriction.
+    let supported = state.supported_efforts();
+    let allowed = |i: usize| {
+        pacode_types::Effort::ALL
+            .get(i)
+            .is_some_and(|e| supported.is_none_or(|l| l.contains(e)))
+    };
 
     let mut lines = Vec::new();
 
@@ -134,7 +142,9 @@ fn draw_effort(
             opt_spans.push(Span::raw(" ".repeat(label_start - cur_col)));
         }
         let is_sel = i == selected;
-        let style = if is_sel {
+        let style = if !allowed(i) {
+            opts.theme.faint
+        } else if is_sel {
             opts.theme.accent.patch(opts.theme.bold)
         } else {
             opts.theme.dim
@@ -145,7 +155,11 @@ fn draw_effort(
     lines.push(Line::from(opt_spans));
 
     // 3: Description
-    let desc = descriptions.get(selected).copied().unwrap_or("");
+    let desc = if allowed(selected) {
+        descriptions.get(selected).copied().unwrap_or("")
+    } else {
+        "not supported by the current model"
+    };
     lines.push(Line::from(Span::styled(desc, opts.theme.fg)));
 
     // 4: Blank

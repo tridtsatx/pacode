@@ -562,6 +562,15 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             Focus::Overlay(Overlay::EffortPicker { index }) => {
                 if let Some(effort) = pacode_types::model::Effort::ALL.get(*index) {
                     let eff = *effort;
+                    // Greyed levels are unselectable: refuse and keep the
+                    // picker open (spec §6).
+                    if !state.effort_supported(eff) {
+                        state.push_notice_with_level(
+                            pacode_types::ToastLevel::Warn,
+                            format!("effort {eff} is not supported by the current model"),
+                        );
+                        return vec![];
+                    }
                     log::debug!("close overlay: EffortPicker");
                     state.focus = Focus::Normal;
                     return vec![Action::Send(Request::SetEffort(eff))];

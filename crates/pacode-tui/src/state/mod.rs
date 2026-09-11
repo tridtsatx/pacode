@@ -60,6 +60,20 @@ pub fn zdr_active(config: &Config, meta: Option<&SessionMeta>) -> bool {
     }
 }
 
+/// Nearest supported level below `current`; when nothing lower is supported,
+/// falls back to the lowest supported entry (spec §6 downgrade chain —
+/// `Xhigh→High→Medium→Low`, then floor). `None` only when `supported` is
+/// empty.
+pub fn nearest_supported_effort(current: Effort, supported: &[Effort]) -> Option<Effort> {
+    let idx = Effort::ALL.iter().position(|e| *e == current)?;
+    Effort::ALL[..idx]
+        .iter()
+        .rev()
+        .find(|e| supported.contains(e))
+        .or_else(|| Effort::ALL.iter().find(|e| supported.contains(e)))
+        .copied()
+}
+
 /// Model-picker rows: `zdr_only` restricts to `zdr_capable` routes (ZDR active
 /// or the Alt+Z enable flow); favorites sort first, then display name, then
 /// route. Field-level args keep this callable while `state.focus` is borrowed.
@@ -754,6 +768,52 @@ impl AppState {
 
     pub fn model(&self) -> Option<&ModelRoute> {
         self.meta.as_ref().map(|m| &m.model)
+    }
+
+    /// `supported_efforts` of the current route; `None` — route unknown to
+    /// the model list or unrestricted — means every [`Effort`] is selectable
+    /// (spec §6).
+    pub fn supported_efforts(&self) -> Option<&[Effort]> {
+        let route = &self.meta.as_ref()?.model;
+        self.models
+            .iter()
+            .find(|m| &m.route == route)?
+            .supported_efforts
+            .as_deref()
+    }
+
+    /// Whether `effort` may be selected on the current route (spec §6).
+    pub fn effort_supported(&self, effort: Effort) -> bool {
+        self.supported_efforts().is_none_or(|l| l.contains(&effort))
+    }
+
+    /// After a route switch: when the session effort is outside `route`'s
+    /// supported set, downgrade to the nearest lower supported level, notice
+    /// the change, and return the `SetEffort` action to send (spec §6).
+    pub fn clamp_effort_actions(&mut self, route: &ModelRoute) -> Vec<crate::keys::Action> {
+        let Some(supported) = self
+            .models
+            .iter()
+            .find(|m| &m.route == route)
+            .and_then(|m| m.supported_efforts.as_deref())
+        else {
+            return Vec::new();
+        };
+        let cur = self.effort();
+        if supported.contains(&cur) {
+            return Vec::new();
+        }
+        let Some(next) = nearest_supported_effort(cur, supported) else {
+            return Vec::new();
+        };
+        self.save_pref_effort(next);
+        self.push_notice_with_level(
+            ToastLevel::Warn,
+            format!("effort {cur} → {next}: not supported by {route}"),
+        );
+        vec![crate::keys::Action::Send(pacode_types::Request::SetEffort(
+            next,
+        ))]
     }
 
     pub fn push_notice(&mut self, text: String) {

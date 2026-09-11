@@ -140,6 +140,15 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 }
                 KeyCode::Enter => {
                     let effort = pacode_types::Effort::ALL[*index];
+                    // Greyed levels are unselectable: refuse and keep the
+                    // picker open (spec §6).
+                    if !state.effort_supported(effort) {
+                        state.push_notice_with_level(
+                            pacode_types::ToastLevel::Warn,
+                            format!("effort {effort} is not supported by the current model"),
+                        );
+                        return vec![];
+                    }
                     state.focus = Focus::Normal;
                     state.save_pref_effort(effort);
                     return vec![Action::Send(Request::SetEffort(effort))];
@@ -204,7 +213,10 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     if let Some(route) = route {
                         state.focus = Focus::Normal;
                         state.save_pref_model(&route.to_string());
-                        let mut actions = vec![Action::Send(Request::SetModel(route))];
+                        let mut actions = vec![Action::Send(Request::SetModel(route.clone()))];
+                        // If the new route doesn't support the session effort,
+                        // downgrade to the nearest supported level (spec §6).
+                        actions.extend(state.clamp_effort_actions(&route));
                         // Alt+Z enable flow: the route switch must land before
                         // ZDR turns on, or `set_model` would hit the ZDR guard.
                         if for_zdr_flag {
@@ -217,11 +229,14 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     }
                 }
                 // `z`/`s` toggle per-model flags on the selected row and
-                // persist them; they never reach the query (spec §3).
+                // persist them (spec §3). Once a query is started the keys
+                // type into it instead, so searches like "mistral" work —
+                // the trade-off is a query can't begin with z/s.
                 KeyCode::Char(c @ ('z' | 's'))
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if query.is_empty()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     let route_key = {
                         let rows = crate::state::picker_models(
@@ -239,6 +254,23 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                             .copied()
                             .unwrap_or_default();
                         if c == 'z' {
+                            // The daemon refuses to unmark the active route
+                            // while ZDR is on; gate here so the local flags
+                            // don't diverge from what it enforces.
+                            let active_route = state
+                                .meta
+                                .as_ref()
+                                .is_some_and(|m| m.model.to_string() == route_key);
+                            if flags.zdr_capable
+                                && active_route
+                                && crate::state::zdr_active(&state.config, state.meta.as_ref())
+                            {
+                                state.push_notice_with_level(
+                                    pacode_types::ToastLevel::Warn,
+                                    "can't unmark the active route while ZDR is on".to_string(),
+                                );
+                                return vec![];
+                            }
                             flags.zdr_capable = !flags.zdr_capable;
                         } else {
                             flags.favorite = !flags.favorite;

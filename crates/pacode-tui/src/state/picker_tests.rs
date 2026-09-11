@@ -110,3 +110,28 @@ fn zdr_active_respects_mode() {
     config.zdr = ZdrMode::Off;
     assert!(!zdr_active(&config, Some(&meta)));
 }
+
+#[test]
+fn nearest_effort_picks_lower_supported() {
+    use pacode_types::Effort;
+
+    use super::nearest_supported_effort;
+
+    // xhigh unsupported chain lands on the nearest lower entry.
+    let s = [Effort::Low, Effort::Medium, Effort::Max];
+    assert_eq!(
+        nearest_supported_effort(Effort::XHigh, &s),
+        Some(Effort::Medium)
+    );
+    assert_eq!(
+        nearest_supported_effort(Effort::High, &[Effort::Low]),
+        Some(Effort::Low)
+    );
+    // Nothing lower supported -> lowest supported overall.
+    assert_eq!(
+        nearest_supported_effort(Effort::Low, &[Effort::High, Effort::Max]),
+        Some(Effort::High)
+    );
+    // Empty supported list -> no answer.
+    assert_eq!(nearest_supported_effort(Effort::High, &[]), None);
+}

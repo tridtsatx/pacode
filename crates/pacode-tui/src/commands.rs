@@ -274,7 +274,11 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                     ModelRoute::new("default", &arg)
                 };
                 state.save_pref_model(&route.to_string());
-                vec![Action::Send(Request::SetModel(route))]
+                let mut actions = vec![Action::Send(Request::SetModel(route.clone()))];
+                // Downgrade the session effort if the new route can't run it
+                // (spec §6).
+                actions.extend(state.clamp_effort_actions(&route));
+                actions
             }
         }
         "effort" => {
@@ -288,8 +292,17 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 state.dirty = true;
                 vec![]
             } else if let Some(eff) = Effort::parse(&arg) {
-                state.save_pref_effort(eff);
-                vec![Action::Send(Request::SetEffort(eff))]
+                if !state.effort_supported(eff) {
+                    push_notice(
+                        state,
+                        ToastLevel::Warn,
+                        format!("effort {eff} is not supported by the current model"),
+                    );
+                    vec![]
+                } else {
+                    state.save_pref_effort(eff);
+                    vec![Action::Send(Request::SetEffort(eff))]
+                }
             } else {
                 push_notice(
                     state,

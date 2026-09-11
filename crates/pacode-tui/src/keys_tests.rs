@@ -2730,3 +2730,134 @@ fn test_model_picker_for_zdr_enter_sends_setmodel_then_setzdr() {
     assert!(state.meta.as_ref().is_some_and(|m| m.zdr));
     assert_eq!(state.focus, Focus::Normal);
 }
+
+#[test]
+fn test_model_picker_z_s_type_into_nonempty_query() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", false));
+    state.models = vec![model_info("p", "m")];
+    // With a query already typed, 'z'/'s' are search text, not flag toggles.
+    state.focus = Focus::Overlay(Overlay::ModelPicker {
+        query: "mi".to_string(),
+        index: 0,
+        for_zdr: false,
+    });
+
+    let key_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_z, now);
+    assert!(
+        actions.is_empty() && state.model_flags.is_empty(),
+        "'z' inside a query must not toggle flags, got {actions:?}"
+    );
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModelPicker {
+            query: "miz".to_string(),
+            index: 0,
+            for_zdr: false,
+        })
+    );
+}
+
+#[test]
+fn test_model_picker_z_refuses_unmarking_active_route_under_zdr() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", true)); // ZDR on, route p/m
+    state.models = vec![model_info("p", "m")];
+    state.model_flags.insert(
+        "p/m".to_string(),
+        pacode_types::ModelFlags {
+            zdr_capable: true,
+            favorite: false,
+        },
+    );
+    state.focus = Focus::Overlay(Overlay::ModelPicker {
+        query: String::new(),
+        index: 0,
+        for_zdr: false,
+    });
+
+    // The daemon would reject stripping the active route's flag; the picker
+    // refuses locally so state can't diverge.
+    let key_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_z, now);
+    assert!(
+        actions.is_empty(),
+        "unmark must be refused, got {actions:?}"
+    );
+    assert!(
+        state.model_flags.get("p/m").is_some_and(|f| f.zdr_capable),
+        "flag must survive the refused toggle"
+    );
+}
+
+#[test]
+fn test_effort_picker_refuses_unsupported() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", false));
+    let mut mi = model_info("p", "m");
+    mi.supported_efforts = Some(vec![Effort::Low, Effort::Medium]);
+    state.models = vec![mi];
+
+    // index 2 = High, unsupported by p/m -> refused, picker stays open.
+    state.focus = Focus::Overlay(Overlay::EffortPicker { index: 2 });
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert!(actions.is_empty(), "unsupported effort must not send");
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::EffortPicker { index: 2 }),
+        "refused pick keeps the picker open"
+    );
+
+    // index 0 = Low, supported -> sends and closes.
+    state.focus = Focus::Overlay(Overlay::EffortPicker { index: 0 });
+    let actions = handle_key(&mut state, enter, now);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Send(Request::SetEffort(Effort::Low)))),
+        "expected SetEffort(Low), got {actions:?}"
+    );
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_model_switch_clamps_unsupported_effort() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    let mut meta = zdr_meta("m", false);
+    meta.effort = Effort::High;
+    state.meta = Some(meta);
+    let mut target = model_info("p", "n2");
+    target.supported_efforts = Some(vec![Effort::Low, Effort::Medium]);
+    state.models = vec![target];
+    state.focus = Focus::Overlay(Overlay::ModelPicker {
+        query: String::new(),
+        index: 0,
+        for_zdr: false,
+    });
+
+    // High isn't in p/n2's supported set -> nearest lower supported = Medium.
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(actions.len(), 2, "expected [SetModel, SetEffort]");
+    assert!(
+        matches!(&actions[0], Action::Send(Request::SetModel(r)) if r.to_string() == "p/n2"),
+        "first action must be SetModel, got {actions:?}"
+    );
+    assert!(
+        matches!(
+            &actions[1],
+            Action::Send(Request::SetEffort(Effort::Medium))
+        ),
+        "second action must be the downgrade to Medium, got {actions:?}"
+    );
+}
