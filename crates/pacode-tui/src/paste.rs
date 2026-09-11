@@ -268,22 +268,22 @@ pub fn handle_paste_image_with_runner(
 
     match result {
         ClipboardImageResult::Image(bytes) => match state.pasted_images.create_image_file(&bytes) {
-            Ok(path) => {
-                let token = format!("@{} ", path.display());
+            Ok(record) => {
+                let token = format!("{} ", record.token_label());
                 if state.config.ui.vim && state.focus == Focus::Normal {
                     apply_vim_paste(&mut state.vim, &mut state.input, &token);
                 } else {
                     state.input.insert_str(&token);
                 }
                 state.push_toast(
-                        ToastLevel::Info,
-                        "Image pasted".to_string(),
-                        Some(
-                            "Preview shown inline. Daemon attaches image as metadata (name & size), not pixels (v1 spec §18.5)."
-                                .to_string(),
-                        ),
-                        now,
-                    );
+                    ToastLevel::Info,
+                    format!("Image pasted as {}", record.token_label()),
+                    Some(
+                        "Sent as an image attachment with the prompt; remove the token to discard."
+                            .to_string(),
+                    ),
+                    now,
+                );
                 state.dirty = true;
             }
             Err(err) => {

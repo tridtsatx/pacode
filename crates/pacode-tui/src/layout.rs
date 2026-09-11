@@ -70,8 +70,11 @@ pub struct ScreenLayout {
     pub panel: Option<Rect>,
     /// The vertical separator between dialog and panel (1 col), if a panel is open.
     pub panel_separator: Option<Rect>,
-    /// Separator line above the input.
+    /// Separator line above the input block.
     pub input_top: Rect,
+    /// Pasted-image preview strip between the separator and the input;
+    /// zero-height when no `[Image N]` tokens are live (spec §1).
+    pub preview: Rect,
     pub input: Rect,
     /// Separator line below the input.
     pub input_bottom: Rect,
@@ -84,9 +87,9 @@ pub struct ScreenLayout {
     pub toast: Rect,
 }
 
-/// Compute the layout for a terminal of `area` with `input_lines` lines of input and
-/// `panel_open`.
-pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
+/// Compute the layout for a terminal of `area` with `input_lines` lines of input,
+/// `panel_open`, and `preview_lines` rows of image preview strip (0 = none).
+pub fn compute(area: Rect, input_lines: u16, panel_open: bool, preview_lines: u16) -> ScreenLayout {
     let tier = WidthTier::for_width(area.width);
     let rail_w = tier.rail_width();
 
@@ -122,9 +125,22 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
     let input_y = input_bottom_y.saturating_sub(input_h);
     let input = Rect::new(left_area.x, input_y, left_area.width, input_h);
 
+    // Above the input: one separator row, then the preview strip. The strip
+    // takes space from the dialog (which can scroll), never from the input.
     let input_top_h = if input_y > left_area.y { 1 } else { 0 };
-    let input_top_y = input_y.saturating_sub(input_top_h);
+    let above_input = input_y.saturating_sub(left_area.y);
+    let preview_h = preview_lines.min(above_input.saturating_sub(input_top_h));
+    let input_top_y = input_y
+        .saturating_sub(preview_h)
+        .saturating_sub(input_top_h);
     let input_top = Rect::new(left_area.x, input_top_y, left_area.width, input_top_h);
+    let preview_y = input_top_y + input_top_h;
+    let preview = Rect::new(
+        left_area.x,
+        preview_y,
+        left_area.width,
+        input_y.saturating_sub(preview_y),
+    );
 
     let dialog_h = input_top_y.saturating_sub(left_area.y);
     let dialog_y = left_area.y;
@@ -173,6 +189,7 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
         panel,
         panel_separator,
         input_top,
+        preview,
         input,
         input_bottom,
         footer,

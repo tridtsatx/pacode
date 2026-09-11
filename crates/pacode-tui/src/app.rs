@@ -121,6 +121,10 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     let mut last_draw = Instant::now() - frame_interval.unwrap_or(Duration::from_millis(33));
     let mut last_layout = ScreenLayout::default();
     let mut active_escape: Option<(ratatui::layout::Rect, std::path::PathBuf)> = None;
+    // Input image-strip escapes currently on screen (spec §1): tracked so the
+    // post-draw flush can diff and never re-send tens of MB of kitty/sixel
+    // payload per frame.
+    let mut active_image_escapes: Vec<(ratatui::layout::Rect, String)> = Vec::new();
 
     loop {
         let is_files_overlay = matches!(
@@ -133,6 +137,8 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
             if let Some((area, _path)) = active_escape.take() {
                 let _ = term_guard.clear_image_area(area);
+                // kitty d=a deletes every image, including the input strip.
+                active_image_escapes.clear();
             }
         }
 
@@ -160,14 +166,33 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                         && (*old_path != path || old_area != area)
                     {
                         let _ = term_guard.clear_image_area(old_area);
+                        active_image_escapes.clear();
                     }
                     let _ = term_guard.draw_image_escape(area, &esc);
                     active_escape = Some((area, path));
                 } else if let Some((old_area, _)) = active_escape.take() {
                     let _ = term_guard.clear_image_area(old_area);
+                    active_image_escapes.clear();
                 }
             } else if let Some((old_area, _)) = active_escape.take() {
                 let _ = term_guard.clear_image_area(old_area);
+                active_image_escapes.clear();
+            }
+
+            // Input image-strip escapes stashed by `ui::images::draw`. Emitted
+            // only on change; a files-overlay clear above emptied the tracker
+            // (kitty d=a is global), which forces a re-emit here. Clearing the
+            // strip in turn kills the files image for a frame — it re-emits
+            // unconditionally every drawn frame.
+            let next_escapes = std::mem::take(&mut state.pending_image_escapes);
+            if next_escapes != active_image_escapes {
+                for (old_area, _) in active_image_escapes.drain(..) {
+                    let _ = term_guard.clear_image_area(old_area);
+                }
+                for (area, esc) in &next_escapes {
+                    let _ = term_guard.draw_image_escape(*area, esc);
+                }
+                active_image_escapes = next_escapes;
             }
         }
 
@@ -350,6 +375,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     if let Some((area, _)) = active_escape.take() {
         let _ = term_guard.clear_image_area(area);
     }
+    for (area, _) in active_image_escapes.drain(..) {
+        let _ = term_guard.clear_image_area(area);
+    }
     drop(events);
     drop(bg_rx);
     if let Ok(c) = Arc::try_unwrap(client) {
@@ -369,6 +397,22 @@ fn dispatch_action(
             state.quit = true;
         }
         Action::Send(req) => {
+            // Resolve `[Image N]` paste tokens into `@<path>` text refs plus
+            // `ImageSource` entries (spec §1). This intercept covers every
+            // submit path: direct submit, `drain_prompt_queue`, plugin sends.
+            let req = match req {
+                Request::UserMessage { text, images } => {
+                    let (text, resolved) =
+                        crate::state::images::resolve_image_tokens(&state.pasted_images, &text);
+                    if !resolved.is_empty() {
+                        state.pasted_images.mark_submitted(&text);
+                    }
+                    let mut images = images;
+                    images.extend(resolved);
+                    Request::UserMessage { text, images }
+                }
+                other => other,
+            };
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {

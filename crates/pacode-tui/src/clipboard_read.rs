@@ -242,9 +242,28 @@ pub fn read_text_data(runner: &dyn CommandRunner, platform: ClipboardPlatform) -
 /// Metadata record for a temporary image file created from a paste.
 #[derive(Debug, Clone)]
 pub struct PastedImageRecord {
+    /// Stable token for the `[Image N]` placeholder in the prompt. Monotonic
+    /// per `PastedImages` instance and never reused after pruning, so a token
+    /// in a queued prompt can never point at a newer, different image.
+    pub token: usize,
     pub path: PathBuf,
     pub bytes_len: usize,
     pub submitted: bool,
+}
+
+impl PastedImageRecord {
+    /// Prompt placeholder for this image, e.g. `[Image 3]`.
+    pub fn token_label(&self) -> String {
+        format!("[Image {}]", self.token)
+    }
+
+    /// True when `prompt_text` still references this record — either by the
+    /// `[Image N]` token or, for texts composed before token inserts existed,
+    /// by the raw file path.
+    fn referenced_in(&self, prompt_text: &str) -> bool {
+        prompt_text.contains(self.token_label().as_str())
+            || prompt_text.contains(self.path.to_string_lossy().as_ref())
+    }
 }
 
 /// Owns temporary image files created during clipboard paste operations.
@@ -297,7 +316,8 @@ impl PastedImages {
     }
 
     /// Writes image bytes to a new temporary `.png` file, enforcing caps.
-    pub fn create_image_file(&mut self, bytes: &[u8]) -> Result<PathBuf, std::io::Error> {
+    /// Returns the new record (stable `token` + `path`).
+    pub fn create_image_file(&mut self, bytes: &[u8]) -> Result<PastedImageRecord, std::io::Error> {
         if bytes.len() > IMAGE_PASTE_MAX_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -325,23 +345,22 @@ impl PastedImages {
 
         std::fs::write(&file_path, bytes)?;
 
-        self.records.push(PastedImageRecord {
-            path: file_path.clone(),
+        let record = PastedImageRecord {
+            token: self.counter,
+            path: file_path,
             bytes_len: bytes.len(),
             submitted: false,
-        });
+        };
+        self.records.push(record.clone());
 
-        Ok(file_path)
+        Ok(record)
     }
 
-    /// Deletes any unsubmitted pasted image files that are no longer referenced in `prompt_text`.
+    /// Deletes any unsubmitted pasted image files that are no longer referenced
+    /// in `prompt_text` (matched by `[Image N]` token or raw path).
     pub fn cleanup_unreferenced(&mut self, prompt_text: &str) {
         self.records.retain(|record| {
-            if record.submitted {
-                return true;
-            }
-            let path_str = record.path.to_string_lossy();
-            if prompt_text.contains(path_str.as_ref()) {
+            if record.submitted || record.referenced_in(prompt_text) {
                 true
             } else {
                 let _ = std::fs::remove_file(&record.path);
@@ -354,8 +373,7 @@ impl PastedImages {
     /// after the prompt is cleared for submission to the daemon.
     pub fn mark_submitted(&mut self, prompt_text: &str) {
         for record in &mut self.records {
-            let path_str = record.path.to_string_lossy();
-            if prompt_text.contains(path_str.as_ref()) {
+            if record.referenced_in(prompt_text) {
                 record.submitted = true;
             }
         }

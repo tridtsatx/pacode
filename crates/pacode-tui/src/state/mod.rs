@@ -4,6 +4,7 @@
 pub mod activity;
 pub mod events;
 pub mod files;
+pub mod images;
 pub mod input;
 pub mod rail;
 pub mod selection;
@@ -269,6 +270,11 @@ pub struct AppState {
     pub running_bash: Option<tokio::sync::oneshot::Sender<()>>,
     /// Temporary files created for pasted images.
     pub pasted_images: crate::clipboard_read::PastedImages,
+    /// Thumbnail cache for the image preview strip above the input.
+    pub image_strip: images::ImageStripState,
+    /// Escape sequences stashed by `ui::images::draw` and flushed to the
+    /// terminal post-draw: (terminal area, escape payload).
+    pub pending_image_escapes: Vec<(ratatui::layout::Rect, String)>,
     /// Current activity phase and when it started. The activity line ages from
     /// this instant, so the thinking wording and its colour reset after every
     /// tool call instead of drifting with the whole turn.
@@ -374,6 +380,8 @@ impl AppState {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             running_bash: None,
             pasted_images: crate::clipboard_read::PastedImages::new(),
+            image_strip: images::ImageStripState::default(),
+            pending_image_escapes: Vec::new(),
             phase: None,
             phase_elapsed_ms: 0,
             started_at: Instant::now(),
@@ -477,6 +485,27 @@ impl AppState {
 
     pub fn cleanup_pasted_images(&mut self) {
         self.pasted_images.cleanup_unreferenced(&self.input.text);
+    }
+
+    /// Records whose `[Image N]` token is still referenced by the current
+    /// input. Submitted records are excluded: they stay on disk for the
+    /// daemon but the preview strip no longer shows them.
+    pub fn live_pasted_images(&self) -> Vec<&crate::clipboard_read::PastedImageRecord> {
+        self.pasted_images
+            .records()
+            .iter()
+            .filter(|r| !r.submitted && self.input.text.contains(r.token_label().as_str()))
+            .collect()
+    }
+
+    /// Preview strip height in terminal rows: 0 when images are disabled or
+    /// no live `[Image N]` token remains in the input.
+    pub fn image_strip_rows(&self) -> u16 {
+        if self.config.ui.images_enabled() && !self.live_pasted_images().is_empty() {
+            images::STRIP_ROWS.min(images::STRIP_MAX_ROWS)
+        } else {
+            0
+        }
     }
 
     /// Fold a client event into the state (spec §5 state table, §7 follow rules).

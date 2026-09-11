@@ -9,6 +9,7 @@ pub mod dialog;
 pub mod files;
 pub mod footer;
 pub mod header;
+pub mod images;
 pub mod import;
 pub mod input;
 pub mod keys_overlay;
@@ -112,9 +113,16 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     // no second column is laid out at all.
     let panel_open = (state.panel.target.is_some() || matches!(state.focus, Focus::Panel { .. }))
         && !state.agent_replaces_dialog();
-    let temp_layout = crate::layout::compute(frame.area(), 1, panel_open);
+    let is_picker = state.is_bottom_picker();
+    // The preview strip replaces input rows while a bottom picker owns that area.
+    let preview_lines = if is_picker {
+        0
+    } else {
+        state.image_strip_rows()
+    };
+    let temp_layout = crate::layout::compute(frame.area(), 1, panel_open, 0);
     let input_lines = state.input.wrapped_lines(temp_layout.input.width);
-    let layout = crate::layout::compute(frame.area(), input_lines, panel_open);
+    let layout = crate::layout::compute(frame.area(), input_lines, panel_open, preview_lines);
 
     let opts = RenderOptions::with_theme(
         frame.area().width,
@@ -137,7 +145,6 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         rail::draw(frame, layout.rail, state, &opts);
     }
 
-    let is_picker = state.is_bottom_picker();
     let picker_h = if is_picker {
         state.bottom_picker_height().min(frame.area().height)
     } else {
@@ -292,6 +299,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         picker::draw(frame, picker_area, state, &opts);
     } else {
         input::draw(frame, &layout, state, &opts);
+        images::draw(frame, layout.preview, state, &opts);
         footer::draw(frame, layout.footer, state, &opts);
     }
 

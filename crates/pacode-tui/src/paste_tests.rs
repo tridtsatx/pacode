@@ -158,7 +158,7 @@ fn test_paste_with_overlay_without_filter_is_ignored() {
 }
 
 #[test]
-fn test_image_paste_inserts_at_path_token_pointing_to_existing_file() {
+fn test_image_paste_inserts_image_token_pointing_to_existing_file() {
     let mut state = make_state();
     let tmp = TempDir::new().unwrap();
     state.pasted_images = PastedImages::new_in(tmp.path().to_path_buf());
@@ -181,23 +181,46 @@ fn test_image_paste_inserts_at_path_token_pointing_to_existing_file() {
     let now = Instant::now();
     handle_paste_image_with_runner(&mut state, true, &runner, ClipboardPlatform::Linux, now);
 
-    // Prompt contains @<path>
-    assert!(state.input.text.starts_with('@'));
-    assert!(state.input.text.ends_with(".png "));
+    // Prompt contains the [Image 1] token, and the record maps it to a file.
+    assert_eq!(state.input.text, "[Image 1] ");
+    let record = &state.pasted_images.records()[0];
+    assert_eq!(record.token, 1);
+    assert!(record.path.exists());
 
-    let token_path_str = state.input.text.trim_start_matches('@').trim();
-    let token_path = std::path::PathBuf::from(token_path_str);
-
-    // File exists on disk
-    assert!(token_path.exists());
-
-    // User-facing toast explains metadata v1 limitation
+    // User-facing toast names the token and explains removal discards it.
     assert!(!state.toasts.is_empty());
     let toast = state.toasts.back().unwrap();
     assert_eq!(toast.level, ToastLevel::Info);
-    assert_eq!(toast.title, "Image pasted");
-    assert!(toast.detail.as_ref().unwrap().contains("metadata"));
-    assert!(toast.detail.as_ref().unwrap().contains("pixels"));
+    assert!(toast.title.contains("[Image 1]"));
+    assert!(toast.detail.as_ref().unwrap().contains("remove the token"));
+}
+
+#[test]
+fn test_two_image_pastes_numbered_sequentially() {
+    let mut state = make_state();
+    let tmp = TempDir::new().unwrap();
+    state.pasted_images = PastedImages::new_in(tmp.path().to_path_buf());
+
+    let mut runner = MockCommandRunner::new();
+    runner.available.insert("wl-paste".to_string());
+    runner.responses.insert(
+        (
+            "wl-paste".to_string(),
+            vec![
+                "--type".to_string(),
+                "image/png".to_string(),
+                "--no-newline".to_string(),
+            ],
+        ),
+        Ok(b"png".to_vec()),
+    );
+
+    let now = Instant::now();
+    handle_paste_image_with_runner(&mut state, true, &runner, ClipboardPlatform::Linux, now);
+    handle_paste_image_with_runner(&mut state, true, &runner, ClipboardPlatform::Linux, now);
+
+    assert_eq!(state.input.text, "[Image 1] [Image 2] ");
+    assert_eq!(state.pasted_images.records().len(), 2);
 }
 
 #[test]
@@ -223,8 +246,7 @@ fn test_temp_file_removed_when_removed_from_prompt() {
     let now = Instant::now();
     handle_paste_image_with_runner(&mut state, true, &runner, ClipboardPlatform::Linux, now);
 
-    let token_path_str = state.input.text.trim_start_matches('@').trim();
-    let token_path = std::path::PathBuf::from(token_path_str);
+    let token_path = state.pasted_images.records()[0].path.clone();
     assert!(token_path.exists());
 
     // User removes token from prompt
@@ -265,8 +287,8 @@ fn test_empty_bracketed_paste_triggers_image_paste() {
         now,
     );
 
-    // Image clipboard was checked and inserted @path
-    assert!(state.input.text.starts_with('@'));
+    // Image clipboard was checked and inserted a [Image N] token
+    assert!(state.input.text.starts_with("[Image "));
 }
 
 #[test]
@@ -366,7 +388,7 @@ fn test_ctrl_v_prefers_an_image_over_text() {
     );
 
     assert!(
-        state.input.text.starts_with('@'),
+        state.input.text.starts_with("[Image "),
         "got {}",
         state.input.text
     );

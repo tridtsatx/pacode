@@ -200,15 +200,22 @@ fn test_pasted_images_lifecycle_and_cleanup() {
     let mut manager = PastedImages::new_in(tmp.path().to_path_buf());
 
     let image_bytes = b"fake_png_data".to_vec();
-    let file_path = manager.create_image_file(&image_bytes).unwrap();
+    let record = manager.create_image_file(&image_bytes).unwrap();
+    let file_path = record.path.clone();
 
     // File exists on disk
     assert!(file_path.exists());
     assert_eq!(manager.records().len(), 1);
 
-    // Prompt contains reference
-    let prompt_with_ref = format!("Look at @{} please", file_path.display());
+    // Prompt contains the [Image N] token
+    let prompt_with_ref = format!("Look at {} please", record.token_label());
     manager.cleanup_unreferenced(&prompt_with_ref);
+    assert!(file_path.exists());
+    assert_eq!(manager.records().len(), 1);
+
+    // A raw @path reference also counts (text composed before tokens existed)
+    let prompt_with_path = format!("Look at @{} please", file_path.display());
+    manager.cleanup_unreferenced(&prompt_with_path);
     assert!(file_path.exists());
     assert_eq!(manager.records().len(), 1);
 
@@ -220,15 +227,37 @@ fn test_pasted_images_lifecycle_and_cleanup() {
 }
 
 #[test]
+fn test_pasted_image_tokens_are_stable_and_monotonic() {
+    let tmp = TempDir::new().unwrap();
+    let mut manager = PastedImages::new_in(tmp.path().to_path_buf());
+
+    let first = manager.create_image_file(b"a").unwrap();
+    let second = manager.create_image_file(b"b").unwrap();
+    assert_eq!(first.token, 1);
+    assert_eq!(second.token, 2);
+    assert_eq!(first.token_label(), "[Image 1]");
+
+    // Remove the first record, then paste a third: the new token must not
+    // reuse 1 — a queued prompt holding [Image 1] must never resolve to it.
+    manager.cleanup_unreferenced(&second.token_label());
+    assert_eq!(manager.records().len(), 1);
+
+    let third = manager.create_image_file(b"c").unwrap();
+    assert_eq!(third.token, 3);
+    assert_eq!(third.token_label(), "[Image 3]");
+}
+
+#[test]
 fn test_pasted_images_submitted_are_not_deleted_by_prompt_clear() {
     let tmp = TempDir::new().unwrap();
     let mut manager = PastedImages::new_in(tmp.path().to_path_buf());
 
     let image_bytes = b"fake_png_data".to_vec();
-    let file_path = manager.create_image_file(&image_bytes).unwrap();
+    let record = manager.create_image_file(&image_bytes).unwrap();
+    let file_path = record.path.clone();
 
-    let prompt = format!("@{} ", file_path.display());
-    manager.mark_submitted(&prompt);
+    // mark_submitted matches the [Image N] token (prompt text pre-resolution)
+    manager.mark_submitted(&format!("{} ", record.token_label()));
 
     // Even if prompt is now empty (submitted), submitted image is preserved
     manager.cleanup_unreferenced("");

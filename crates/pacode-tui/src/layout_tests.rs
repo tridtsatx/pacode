@@ -22,7 +22,7 @@ fn test_width_tiers() {
 #[test]
 fn test_layout_wide_no_panel() {
     let area = Rect::new(0, 0, 140, 40);
-    let layout = compute(area, 1, false);
+    let layout = compute(area, 1, false, 0);
 
     assert_eq!(layout.tier, WidthTier::Wide);
     assert_eq!(layout.rail.width, 32);
@@ -41,7 +41,7 @@ fn test_layout_wide_no_panel() {
 #[test]
 fn test_layout_wide_with_panel() {
     let area = Rect::new(0, 0, 140, 40);
-    let layout = compute(area, 1, true);
+    let layout = compute(area, 1, true, 0);
 
     assert_eq!(layout.tier, WidthTier::Wide);
     assert!(layout.panel.is_some());
@@ -58,12 +58,40 @@ fn test_layout_wide_with_panel() {
 #[test]
 fn test_layout_tiny() {
     let area = Rect::new(0, 0, 60, 20);
-    let layout = compute(area, 1, false);
+    let layout = compute(area, 1, false, 0);
 
     assert_eq!(layout.tier, WidthTier::Tiny);
     assert_eq!(layout.rail.width, 0);
     assert_eq!(layout.rail_separator.width, 0);
     assert_eq!(layout.dialog.width, 60);
+}
+
+#[test]
+fn test_preview_strip_sits_between_separator_and_input() {
+    let area = Rect::new(0, 0, 140, 40);
+    let layout = compute(area, 1, false, 6);
+
+    // Strip borrows rows from the dialog; input/footer geometry is unchanged.
+    assert_eq!(layout.preview.height, 6);
+    assert_eq!(layout.preview.y, layout.input_top.y + 1);
+    assert_eq!(layout.preview.bottom(), layout.input.y);
+    assert_eq!(layout.preview.width, layout.input.width);
+    assert_eq!(layout.input.height, 1);
+    assert_eq!(layout.footer.height, 2);
+    assert_eq!(layout.dialog.height, 40 - 2 - 1 - 1 - 1 - 6);
+
+    // Zero lines -> zero-height strip, layout identical to no-strip.
+    let layout_zero = compute(area, 1, false, 0);
+    assert_eq!(layout_zero.preview.height, 0);
+    assert_eq!(layout_zero.dialog.height, 40 - 2 - 1 - 1 - 1);
+
+    // A strip taller than the space above the input is clamped; the input
+    // itself never shrinks.
+    let tiny = Rect::new(0, 0, 140, 10);
+    let layout_tiny = compute(tiny, 1, false, 6);
+    assert_eq!(layout_tiny.preview.bottom(), layout_tiny.input.y);
+    assert!(layout_tiny.preview.height <= 10 - 2 - 1 - 1);
+    assert_eq!(layout_tiny.input.height, 1);
 }
 
 #[test]
@@ -134,7 +162,7 @@ fn test_compute_rail_tight_space() {
 fn test_toast_rect_inside_dialog() {
     // 1. Without panel
     let area = Rect::new(0, 0, 140, 40);
-    let layout = compute(area, 1, false);
+    let layout = compute(area, 1, false, 0);
     // Dialog column: x = 0, width = 106, dialog_y = 0, input_top = y: 35
     assert_eq!(layout.dialog.width, 106);
     // Toast width = min(dialog.width - 2, 62) = 62
@@ -150,7 +178,7 @@ fn test_toast_rect_inside_dialog() {
     assert_eq!(layout.toast.y + layout.toast.height, layout.input_top.y);
 
     // 2. With panel (dialog is narrower)
-    let layout_panel = compute(area, 1, true);
+    let layout_panel = compute(area, 1, true, 0);
     assert_eq!(layout_panel.dialog.width, 52);
     // Toast width = min(52 - 2, 62) = 50
     assert_eq!(layout_panel.toast.width, 50);
@@ -169,7 +197,7 @@ fn test_toast_rect_inside_dialog() {
 #[test]
 fn test_anchor_rows() {
     let area = Rect::new(0, 0, 120, 34);
-    let layout = compute(area, 1, false);
+    let layout = compute(area, 1, false, 0);
     // input_bottom.y is row 31
     assert_eq!(layout.input_bottom.y, 31);
     let demand = RailDemand {
