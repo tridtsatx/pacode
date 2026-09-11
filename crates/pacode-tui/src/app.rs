@@ -47,16 +47,19 @@ enum BgResponse {
 }
 
 pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> {
+    let timing = crate::timing::enabled();
+    let t_start = Instant::now();
     log::info!("TUI starting up");
+
+    let t = Instant::now();
     let mut term_guard = TerminalGuard::enter(opts.config.ui.mouse)?;
+    crate::timing::mark(timing, "terminal_enter", t);
 
-    let client_paths = opts.client.paths.clone();
-    let (client, mut events) = Client::connect(opts.client).await?;
-    let snapshot = client.attach(opts.attach.clone()).await?;
-    let session_id = snapshot.meta.id.clone();
-    log::info!("TUI attached to session {session_id}");
-    let client = Arc::new(client);
-
+    // Progressive paint: build the state and draw the first frame before any
+    // daemon IO. The socket connect, a possible daemon spawn and the attach
+    // snapshot (first history page included) then resolve while the user
+    // already sees the chrome and a "connecting…" footer.
+    let t = Instant::now();
     let size = term_guard.terminal.size()?;
     let mut state = AppState::new(
         opts.config.clone(),
@@ -64,8 +67,28 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         size.width,
         size.height,
     );
-    state.paths = client_paths;
     state.cwd = opts.cwd.clone();
+    state.connection = crate::state::Connection::Connecting;
+    crate::timing::mark(timing, "app_state_new", t);
+
+    term_guard.terminal.draw(|f| {
+        ui::draw(f, &mut state);
+        crate::font::apply_weight_to_frame(f, &state.config.font);
+    })?;
+    crate::timing::mark(timing, "first_frame", t_start);
+
+    let client_paths = opts.client.paths.clone();
+    state.paths = client_paths;
+    let t = Instant::now();
+    let (client, mut events) = Client::connect(opts.client).await?;
+    crate::timing::mark(timing, "client_connect", t);
+    let t = Instant::now();
+    let snapshot = client.attach(opts.attach.clone()).await?;
+    crate::timing::mark(timing, "attach_snapshot", t);
+    let session_id = snapshot.meta.id.clone();
+    log::info!("TUI attached to session {session_id}");
+    let client = Arc::new(client);
+
     state.slots[0] = Some(crate::state::SessionSlot {
         id: snapshot.meta.id.clone(),
         title: snapshot.meta.title(),
@@ -74,9 +97,13 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         agents_count: snapshot.agents.len(),
         tasks_count: snapshot.tasks.len(),
     });
+    let t = Instant::now();
     state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+    crate::timing::mark(timing, "apply_snapshot", t);
 
+    let t = Instant::now();
     let font_outcome = term_guard.apply_font(&opts.config.font);
+    crate::timing::mark(timing, "apply_font", t);
     if !font_outcome.unsupported.is_empty() {
         let items = font_outcome.unsupported.join(", ");
         state.push_toast(
@@ -112,11 +139,27 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         });
     }
 
-    let detected_hz = match opts.config.ui.ups {
-        pacode_types::Ups::Auto => pacode_config::display::detect_refresh_hz(),
-        pacode_types::Ups::Fixed(_) | pacode_types::Ups::Dynamic => None,
+    // `ui.ups = "auto"` probes external tools (hyprctl/wlr-randr/xrandr —
+    // measured ~37 ms warm, up to 200 ms per miss). Run it off the critical
+    // path and adopt the result when it lands; until then draw uncapped —
+    // nothing animates during attach anyway, so no extra frames are spent.
+    // `_hz_keepalive` keeps one sender alive so `hz_rx.recv()` in the loop
+    // pends forever once the probe result is consumed (a closed channel would
+    // return `None` instantly and spin the select loop).
+    let t_probe = Instant::now();
+    let ups = opts.config.ui.ups;
+    let (hz_tx, mut hz_rx) = mpsc::unbounded_channel::<Option<u16>>();
+    let _hz_keepalive = hz_tx.clone();
+    let mut frame_interval = match ups {
+        pacode_types::Ups::Auto => {
+            std::thread::spawn(move || {
+                let _ = hz_tx.send(pacode_config::display::detect_refresh_hz());
+            });
+            None
+        }
+        pacode_types::Ups::Fixed(_) | pacode_types::Ups::Dynamic => ups.frame_interval(None),
     };
-    let frame_interval = opts.config.ui.ups.frame_interval(detected_hz);
+    crate::timing::mark(timing, "refresh_hz_spawn", t_probe);
 
     let mut last_draw = Instant::now() - frame_interval.unwrap_or(Duration::from_millis(33));
     let mut last_layout = ScreenLayout::default();
@@ -330,6 +373,12 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                     for act in actions {
                         dispatch_action(act, &mut state, &client, &bg_tx);
                     }
+                }
+            }
+            detected = hz_rx.recv() => {
+                if let Some(hz) = detected {
+                    crate::timing::mark(timing, "refresh_hz_detect", t_probe);
+                    frame_interval = ups.frame_interval(hz);
                 }
             }
             _ = stream_sleep => {

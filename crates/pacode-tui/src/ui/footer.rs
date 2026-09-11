@@ -186,6 +186,16 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
     });
 
     let (left_spans, show_context) = match &state.connection {
+        Connection::Connecting => (
+            vec![Span::styled(
+                format!(
+                    "connecting{}",
+                    crate::state::activity::trailing_dots(state.anim_frame, &opts.glyphs)
+                ),
+                opts.theme.dim,
+            )],
+            false,
+        ),
         Connection::Reconnecting { attempt } => (
             vec![Span::styled(
                 format!(

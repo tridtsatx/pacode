@@ -203,9 +203,16 @@ pub const IDLE_DEBOUNCE_MS: u64 = 2000;
 /// Connection state shown in the footer / as a notice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Connection {
+    /// First frame is already painted; socket connect / daemon spawn / attach
+    /// are still in flight.
+    Connecting,
     Connected,
-    Reconnecting { attempt: u32 },
-    Disconnected { reason: String },
+    Reconnecting {
+        attempt: u32,
+    },
+    Disconnected {
+        reason: String,
+    },
 }
 
 pub struct AppState {

@@ -348,6 +348,8 @@ pub fn parse_mode_override(raw: Option<&str>) -> anyhow::Result<Option<Mode>> {
 
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let timing = pacode_tui::timing::enabled();
+    let t_start = std::time::Instant::now();
 
     if let Some(ref dir) = cli.dir {
         let dir_display = dir.display();
@@ -355,12 +357,16 @@ pub fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to change directory to {dir_display}"))?;
     }
 
+    let t = std::time::Instant::now();
     let paths = Paths::discover();
     paths
         .ensure_dirs()
         .context("failed to create pacode directories")?;
+    pacode_tui::timing::mark(timing, "paths_discover+dirs", t);
 
+    let t = std::time::Instant::now();
     let config = pacode_config::load(&paths).context("failed to load config")?;
+    pacode_tui::timing::mark(timing, "config_load", t);
 
     let socket = cli
         .socket
@@ -483,6 +489,7 @@ pub fn main() -> anyhow::Result<()> {
             let cwd = std::env::current_dir().context("failed to get current working directory")?;
             // Remembered choices (/model, /effort, /mode) win over config defaults;
             // explicit flags win over both.
+            let t = std::time::Instant::now();
             let prefs = pacode_config::load_prefs(&paths);
             let model_route = parse_model_override(cli.model.as_deref(), &config)?.or_else(|| {
                 parse_model_override(prefs.model.as_deref(), &config)
@@ -498,6 +505,8 @@ pub fn main() -> anyhow::Result<()> {
                 effort_level,
                 mode_val,
             );
+            pacode_tui::timing::mark(timing, "prefs+attach_opts", t);
+            pacode_tui::timing::mark(timing, "pre_tui_total", t_start);
 
             let mut client_opts = ClientOptions::new(paths.clone(), pacode_config::APP_VERSION);
             client_opts.socket = Some(socket);

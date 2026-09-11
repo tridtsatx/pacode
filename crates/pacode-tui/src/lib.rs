@@ -27,6 +27,7 @@ pub mod nav;
 pub mod paste;
 pub mod state;
 pub mod terminal;
+pub mod timing;
 pub mod ui;
 
 #[cfg(test)]
