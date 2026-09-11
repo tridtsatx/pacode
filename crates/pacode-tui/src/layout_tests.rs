@@ -90,7 +90,7 @@ fn test_preview_strip_sits_between_separator_and_input() {
     let tiny = Rect::new(0, 0, 140, 10);
     let layout_tiny = compute(tiny, 1, false, 6);
     assert_eq!(layout_tiny.preview.bottom(), layout_tiny.input.y);
-    assert!(layout_tiny.preview.height <= 10 - 2 - 1 - 1);
+    assert!(layout_tiny.preview.height < 10 - 2 - 1);
     assert_eq!(layout_tiny.input.height, 1);
 }
 

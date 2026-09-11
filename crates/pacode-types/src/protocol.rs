@@ -14,7 +14,7 @@ use crate::ids::{
     AgentId, ClientId, CronJobId, MonitorId, PermissionId, QuestionId, SessionId, TaskId, TurnId,
 };
 use crate::message::ImageSource;
-use crate::model::{Effort, ModelInfo, ModelRoute};
+use crate::model::{Effort, ModelFlags, ModelInfo, ModelRoute};
 use crate::question::{Question, QuestionAnswer};
 use crate::schedule::{CronJob, CronSchedule, MonitorInfo};
 use crate::state::{
@@ -80,6 +80,14 @@ pub enum Request {
     SetModel(ModelRoute),
     SetEffort(Effort),
     SetMode(Mode),
+    /// Toggle zero-data-retention for the session (`zdr = "session"` config).
+    SetZdr(bool),
+    /// Update user flags for one model route (`provider/model` key); the session
+    /// keeps them in memory, the TUI persists them to `prefs.toml`.
+    SetModelFlag {
+        model: String,
+        flags: ModelFlags,
+    },
     StopAgent(AgentId),
     KillTask(TaskId),
     /// Mark a failed task as seen (clears the red counter).

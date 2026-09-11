@@ -24,8 +24,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         Focus::Overlay(Overlay::ModePicker { index }) => {
             draw_mode(frame, area, state, *index, opts);
         }
-        Focus::Overlay(Overlay::ModelPicker { query, index }) => {
-            draw_model(frame, area, state, query, *index, opts);
+        Focus::Overlay(Overlay::ModelPicker {
+            query,
+            index,
+            for_zdr,
+        }) => {
+            draw_model(frame, area, state, query, *index, *for_zdr, opts);
         }
         Focus::Overlay(Overlay::LoginPicker { query, index }) => {
             crate::ui::login_picker::draw(frame, area, state, query, *index, opts);
@@ -251,19 +255,25 @@ fn draw_mode(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_model(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
     query: &str,
     selected: usize,
+    for_zdr: bool,
     opts: &RenderOptions,
 ) {
     let mut lines = Vec::new();
 
     // 0: Title
     lines.push(Line::from(Span::styled(
-        "Switch Model",
+        if for_zdr {
+            "ZDR: pick a capable model"
+        } else {
+            "Switch Model"
+        },
         opts.theme.bold.patch(opts.theme.accent),
     )));
 
@@ -274,15 +284,11 @@ fn draw_model(
     ]));
 
     let query_lower = query.to_lowercase();
-    let filtered: Vec<_> = state
-        .models
-        .iter()
-        .filter(|m| {
-            query_lower.is_empty()
-                || m.route.to_string().to_lowercase().contains(&query_lower)
-                || m.display_name.to_lowercase().contains(&query_lower)
-        })
-        .collect();
+    // ZDR-active sessions restrict the picker to `zdr_capable` routes, same
+    // as an explicit for_zdr open (Alt+Z).
+    let zdr_only = for_zdr || crate::state::zdr_active(&state.config, state.meta.as_ref());
+    let filtered =
+        crate::state::picker_models(&state.models, &state.model_flags, &query_lower, zdr_only);
 
     let list_height = (area.height as usize).saturating_sub(3).min(8);
 
@@ -312,7 +318,12 @@ fn draw_model(
         for (i, m) in filtered.iter().enumerate().skip(start).take(list_height) {
             let is_sel = i == sel_idx;
             let route_str = m.route.to_string();
-            let line = Line::from(vec![
+            let flags = state
+                .model_flags
+                .get(&route_str)
+                .copied()
+                .unwrap_or_default();
+            let mut spans = vec![
                 Span::styled(
                     format!("{} ", if is_sel { opts.glyphs.pointer } else { " " }),
                     opts.theme.accent,
@@ -327,7 +338,19 @@ fn draw_model(
                 ),
                 Span::raw("  "),
                 Span::styled(m.display_name.clone(), opts.theme.dim),
-            ]);
+            ];
+            if flags.zdr_capable {
+                spans.push(Span::styled(" [ZDR]", opts.theme.green));
+            }
+            if flags.favorite {
+                let star = if state.config.ui.ascii_only {
+                    "*"
+                } else {
+                    "\u{2605}"
+                };
+                spans.push(Span::styled(format!(" {star}"), opts.theme.yellow));
+            }
+            let line = Line::from(spans);
             if is_sel {
                 lines.push(selected_row(line, area.width, opts));
             } else {
@@ -341,9 +364,9 @@ fn draw_model(
     }
 
     let hint = if state.config.ui.ascii_only {
-        "^/v select . enter confirm . esc cancel"
+        "^/v select . enter confirm . z zdr . s fav . esc cancel"
     } else {
-        "↑/↓ select · enter confirm · esc cancel"
+        "↑/↓ select · enter confirm · z zdr · s fav · esc cancel"
     };
     lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
 

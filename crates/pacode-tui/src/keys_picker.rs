@@ -167,17 +167,18 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
-        Focus::Overlay(Overlay::ModelPicker { query, index }) => {
+        Focus::Overlay(Overlay::ModelPicker {
+            query,
+            index,
+            for_zdr,
+        }) => {
             let q_lower = query.to_lowercase();
-            let filtered_count = state
-                .models
-                .iter()
-                .filter(|m| {
-                    q_lower.is_empty()
-                        || m.route.to_string().to_lowercase().contains(&q_lower)
-                        || m.display_name.to_lowercase().contains(&q_lower)
-                })
-                .count();
+            let for_zdr_flag = *for_zdr;
+            let zdr_only =
+                for_zdr_flag || crate::state::zdr_active(&state.config, state.meta.as_ref());
+            let filtered_count =
+                crate::state::picker_models(&state.models, &state.model_flags, &q_lower, zdr_only)
+                    .len();
 
             if is_prev(&key) && *index > 0 {
                 *index -= 1;
@@ -191,20 +192,67 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             match key.code {
                 KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Enter => {
-                    let filtered: Vec<_> = state
-                        .models
-                        .iter()
-                        .filter(|m| {
-                            q_lower.is_empty()
-                                || m.route.to_string().to_lowercase().contains(&q_lower)
-                                || m.display_name.to_lowercase().contains(&q_lower)
-                        })
-                        .collect();
-                    if let Some(m) = filtered.get(*index) {
-                        let route = m.route.clone();
+                    let route = {
+                        let rows = crate::state::picker_models(
+                            &state.models,
+                            &state.model_flags,
+                            &q_lower,
+                            zdr_only,
+                        );
+                        rows.get(*index).map(|m| m.route.clone())
+                    };
+                    if let Some(route) = route {
                         state.focus = Focus::Normal;
                         state.save_pref_model(&route.to_string());
-                        return vec![Action::Send(Request::SetModel(route))];
+                        let mut actions = vec![Action::Send(Request::SetModel(route))];
+                        // Alt+Z enable flow: the route switch must land before
+                        // ZDR turns on, or `set_model` would hit the ZDR guard.
+                        if for_zdr_flag {
+                            if let Some(m) = state.meta.as_mut() {
+                                m.zdr = true;
+                            }
+                            actions.push(Action::Send(Request::SetZdr(true)));
+                        }
+                        return actions;
+                    }
+                }
+                // `z`/`s` toggle per-model flags on the selected row and
+                // persist them; they never reach the query (spec §3).
+                KeyCode::Char(c @ ('z' | 's'))
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let route_key = {
+                        let rows = crate::state::picker_models(
+                            &state.models,
+                            &state.model_flags,
+                            &q_lower,
+                            zdr_only,
+                        );
+                        rows.get(*index).map(|m| m.route.to_string())
+                    };
+                    if let Some(route_key) = route_key {
+                        let mut flags = state
+                            .model_flags
+                            .get(&route_key)
+                            .copied()
+                            .unwrap_or_default();
+                        if c == 'z' {
+                            flags.zdr_capable = !flags.zdr_capable;
+                        } else {
+                            flags.favorite = !flags.favorite;
+                        }
+                        if flags == pacode_types::ModelFlags::default() {
+                            state.model_flags.remove(&route_key);
+                        } else {
+                            state.model_flags.insert(route_key.clone(), flags);
+                        }
+                        state.save_pref_model_flags();
+                        return vec![Action::Send(Request::SetModelFlag {
+                            model: route_key,
+                            flags,
+                        })];
                     }
                 }
                 KeyCode::Backspace => {

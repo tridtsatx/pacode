@@ -1,7 +1,7 @@
 //! Tests for `hooks`: matcher semantics, exit-code handling, timeout fail-open,
 //! env/stdin plumbing, and the detached lifecycle events.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use pacode_types::{AgentId, AgentInfo, Config, Event, HookRule, ModelRoute, TranscriptKind};
@@ -48,6 +48,7 @@ fn test_session(config: Config) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>)
         effort: pacode_types::Effort::Medium,
         mode: pacode_types::Mode::Build,
         first_prompt: None,
+        zdr: false,
     };
     let info = AgentInfo {
         id: AgentId::main(),
@@ -98,6 +99,7 @@ fn test_session(config: Config) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>)
         app_version: "test".to_string(),
         skills: Arc::new(pacode_skills::SkillRegistry::default()),
         scheduler: crate::schedule::Scheduler::new(),
+        model_flags: RwLock::new(HashMap::new()),
     });
     (temp, session, agent)
 }

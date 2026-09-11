@@ -435,7 +435,7 @@ fn test_keymap_find_conflict() {
 
     // Unbound key has no conflict
     let unbound = Binding {
-        code: KeyCode::Char('z'),
+        code: KeyCode::Char('y'),
         mods: KeyModifiers::ALT,
     };
     assert_eq!(keymap.find_conflict(&unbound, Action::FollowAgent), None);

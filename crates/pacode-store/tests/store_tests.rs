@@ -23,6 +23,7 @@ fn sample_meta(id: &str, cwd: &str, updated_at: u64) -> SessionMeta {
         effort: Effort::High,
         mode: Mode::Build,
         first_prompt: Some("Напиши архитектуру persistence слоя".to_string()),
+        zdr: false,
     }
 }
 

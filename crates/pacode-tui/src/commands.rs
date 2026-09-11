@@ -263,6 +263,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 state.focus = Focus::Overlay(Overlay::ModelPicker {
                     query: String::new(),
                     index: 0,
+                    for_zdr: false,
                 });
                 state.dirty = true;
                 vec![Action::Send(Request::ListModels)]

@@ -13,15 +13,18 @@ pub mod stats;
 pub mod transcript;
 pub mod vim;
 
-use std::collections::VecDeque;
+#[cfg(test)]
+mod picker_tests;
+
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use pacode_client::ClientEvent;
 use pacode_types::time::now_ms;
 use pacode_types::{
-    AgentId, Config, Effort, Event, McpServerInfo, Mode, ModelInfo, ModelRoute, PluginInfo,
-    SessionMeta, TaskId, ToastLevel, ToolStatus, TranscriptKind,
+    AgentId, Config, Effort, Event, McpServerInfo, Mode, ModelFlags, ModelInfo, ModelRoute,
+    PluginInfo, SessionMeta, TaskId, ToastLevel, ToolStatus, TranscriptKind, ZdrMode,
 };
 
 pub use files::FilesState;
@@ -44,6 +47,50 @@ pub fn background_worth_reporting(outcome: BackgroundOutcome, duration_ms: u64) 
         BackgroundOutcome::Completed => duration_ms >= BACKGROUND_NOTICE_MIN_MS,
         BackgroundOutcome::Failed | BackgroundOutcome::Killed => true,
     }
+}
+
+/// ZDR active = config-forced `always`, or `session` mode with the toggle on.
+/// Free function (not `&self`) so picker code can call it while `state.focus`
+/// is mutably borrowed.
+pub fn zdr_active(config: &Config, meta: Option<&SessionMeta>) -> bool {
+    match config.zdr {
+        ZdrMode::Always => true,
+        ZdrMode::Session => meta.is_some_and(|m| m.zdr),
+        ZdrMode::Off => false,
+    }
+}
+
+/// Model-picker rows: `zdr_only` restricts to `zdr_capable` routes (ZDR active
+/// or the Alt+Z enable flow); favorites sort first, then display name, then
+/// route. Field-level args keep this callable while `state.focus` is borrowed.
+pub fn picker_models<'a>(
+    models: &'a [ModelInfo],
+    flags: &HashMap<String, ModelFlags>,
+    query: &str,
+    zdr_only: bool,
+) -> Vec<&'a ModelInfo> {
+    let q = query.to_lowercase();
+    let mut rows: Vec<&ModelInfo> = models
+        .iter()
+        .filter(|m| {
+            (!zdr_only
+                || flags
+                    .get(&m.route.to_string())
+                    .is_some_and(|f| f.zdr_capable))
+                && (q.is_empty()
+                    || m.route.to_string().to_lowercase().contains(&q)
+                    || m.display_name.to_lowercase().contains(&q))
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let fa = flags.get(&a.route.to_string()).is_some_and(|f| f.favorite);
+        let fb = flags.get(&b.route.to_string()).is_some_and(|f| f.favorite);
+        fb.cmp(&fa)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+            .then_with(|| a.route.provider.cmp(&b.route.provider))
+            .then_with(|| a.route.model.cmp(&b.route.model))
+    });
+    rows
 }
 pub use vim::{VimEffect, VimMode, VimState};
 
@@ -104,6 +151,9 @@ pub enum Overlay {
     ModelPicker {
         query: String,
         index: usize,
+        /// Opened by the Alt+Z enable flow: Enter switches to the picked
+        /// ZDR-capable route and turns ZDR on; Esc keeps ZDR off.
+        for_zdr: bool,
     },
     LoginPicker {
         query: String,
@@ -240,6 +290,10 @@ pub struct AppState {
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
+    /// Per-route flags (`zdr_capable`, `favorite`) mirroring `prefs.toml`;
+    /// written through `save_pref_model_flags` and pushed to the daemon via
+    /// `Request::SetModelFlag`.
+    pub model_flags: HashMap<String, ModelFlags>,
     /// Providers with auth status for the login picker (filled by `ListAuth` or `AuthUpdated`).
     pub auth_providers: Vec<pacode_types::ProviderAuthInfo>,
     pub sessions: Vec<SessionMeta>,
@@ -340,6 +394,7 @@ impl AppState {
         let (palette, _) = pacode_config::theme::load_theme(&paths, &config.theme);
         let theme = pacode_render::Theme::from_palette(&palette, truecolor);
         let (keymap, keymap_warnings) = crate::binding::Keymap::from_config(&config.keys);
+        let model_flags = pacode_config::load_prefs(&paths).model_flags;
         Self {
             config,
             theme,
@@ -367,6 +422,7 @@ impl AppState {
             config_view: crate::ui::config_view::ConfigViewState::default(),
             toasts: VecDeque::new(),
             models: Vec::new(),
+            model_flags,
             auth_providers: Vec::new(),
             sessions: Vec::new(),
             plugins: Vec::new(),
@@ -870,6 +926,21 @@ impl AppState {
         if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
             log::warn!("failed to save prefs (mode): {e}");
         }
+    }
+
+    /// Persist the picker `z`/`s` toggles to `prefs.toml`.
+    pub fn save_pref_model_flags(&self) {
+        let mut prefs = pacode_config::load_prefs(&self.paths);
+        prefs.model_flags = self.model_flags.clone();
+        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
+            log::warn!("failed to save prefs (model_flags): {e}");
+        }
+    }
+
+    /// ZDR badge state: config-forced `always`, or `session` mode with the
+    /// toggle on (`meta.zdr` mirrors the daemon via `SessionUpdated`).
+    pub fn zdr_active(&self) -> bool {
+        zdr_active(&self.config, self.meta.as_ref())
     }
 
     pub fn is_bottom_picker(&self) -> bool {

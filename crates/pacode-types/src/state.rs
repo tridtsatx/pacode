@@ -91,6 +91,11 @@ pub struct SessionMeta {
     /// First user prompt, used as the title before the model names the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_prompt: Option<String>,
+    /// Zero-data-retention session toggle (`zdr = "session"`): blocks network
+    /// tools, MCP calls and subagent spawns, and restricts model switching to
+    /// routes flagged `zdr_capable`.
+    #[serde(default)]
+    pub zdr: bool,
 }
 
 impl SessionMeta {
@@ -544,6 +549,7 @@ mod tests {
             effort: Effort::High,
             mode: Mode::Build,
             first_prompt: Some("разбери layout.rs и раскидай по модулям, тесты параллельно".into()),
+            zdr: false,
         };
         // six words, exactly 40 chars: no truncation
         assert_eq!(meta.title(), "разбери layout.rs и раскидай по модулям,");

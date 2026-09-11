@@ -58,6 +58,8 @@ pub enum Action {
     PasteClipboard,
     /// Open the plan/agents overlay, which is where the rail lives below 80 columns.
     RailOverlay,
+    /// Toggle zero-data-retention for the session (only `zdr = "session"`).
+    ToggleZdr,
 }
 
 impl Action {
@@ -108,6 +110,7 @@ impl Action {
             Self::PasteImage => "paste_image",
             Self::PasteClipboard => "paste_clipboard",
             Self::RailOverlay => "rail_overlay",
+            Self::ToggleZdr => "toggle_zdr",
         }
     }
 
@@ -158,6 +161,7 @@ impl Action {
             Self::PasteImage => "Paste image from clipboard",
             Self::PasteClipboard => "Paste from clipboard (image or text)",
             Self::RailOverlay => "Show plan and agents",
+            Self::ToggleZdr => "Toggle ZDR mode",
         }
     }
 }
@@ -388,6 +392,7 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("paste_image", Action::PasteImage),
     ("paste_clipboard", Action::PasteClipboard),
     ("rail_overlay", Action::RailOverlay),
+    ("toggle_zdr", Action::ToggleZdr),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -641,6 +646,13 @@ impl Keymap {
             Action::RailOverlay,
             vec![Binding {
                 code: KeyCode::Char('r'),
+                mods: KeyModifiers::ALT,
+            }],
+        );
+        bindings.insert(
+            Action::ToggleZdr,
+            vec![Binding {
+                code: KeyCode::Char('z'),
                 mods: KeyModifiers::ALT,
             }],
         );

@@ -125,6 +125,19 @@ impl fmt::Display for ModelRoute {
     }
 }
 
+/// Per-model user flags persisted in `prefs.toml` under `[model_flags."provider/model"]`.
+///
+/// `zdr_capable` marks a route the user trusts for zero-data-retention traffic:
+/// while ZDR is active the session refuses to switch to a model without it and
+/// the picker filters to flagged entries. `favorite` sorts the model picker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFlags {
+    #[serde(default)]
+    pub zdr_capable: bool,
+    #[serde(default)]
+    pub favorite: bool,
+}
+
 /// `gemini-3.8-flash` → `Gemini 3.8 Flash`, `gpt-oss-120b` → `Gpt Oss 120b`,
 /// `qwen3.5:397b` → `Qwen3.5 397b`. Vendor prefixes (`z-ai/`) are dropped.
 pub fn prettify_model_name(model: &str) -> String {

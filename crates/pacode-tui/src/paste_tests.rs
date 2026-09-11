@@ -86,13 +86,14 @@ fn test_paste_with_model_picker_focused_goes_into_filter() {
     state.focus = Focus::Overlay(Overlay::ModelPicker {
         query: "claude".to_string(),
         index: 3,
+        for_zdr: false,
     });
     state.input.text = "prompt text".to_string();
 
     handle_paste(&mut state, "-3-opus".to_string(), now);
 
     match &state.focus {
-        Focus::Overlay(Overlay::ModelPicker { query, index }) => {
+        Focus::Overlay(Overlay::ModelPicker { query, index, .. }) => {
             assert_eq!(query, "claude-3-opus");
             assert_eq!(*index, 0); // index reset to top match
         }

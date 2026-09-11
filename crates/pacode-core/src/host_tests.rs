@@ -320,3 +320,179 @@ fn test_mcp_provided_tool_is_not_auto_allowed() {
         "MCP tool must be denied in Plan mode"
     );
 }
+
+// ---- ZDR isolation (spec §3): while ZDR is active the host must deny
+// network tools, MCP (`server__tool`) names and subagent spawning; local
+// read/fs tools still flow through the normal gate. ----
+
+mod zdr {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, RwLock};
+
+    use pacode_tools::host::PermissionDraft;
+    use pacode_tools::{ToolHost, ToolKind};
+    use pacode_types::{
+        AgentId, CallId, Mode, ModelRoute, PermissionDecision, SessionMeta, ZdrMode,
+    };
+
+    use crate::host::SessionHost;
+    use crate::session::Session;
+
+    /// Smallest live `Session` for host-level checks (in-memory store, temp cwd).
+    fn zdr_session(zdr_mode: ZdrMode) -> (tempfile::TempDir, Arc<Session>) {
+        let temp = tempfile::tempdir().unwrap();
+        let id = pacode_types::SessionId::generate();
+        let now = pacode_types::now_ms();
+        let route = ModelRoute {
+            provider: "mock".into(),
+            model: "mock-model".into(),
+        };
+        let meta = SessionMeta {
+            id: id.clone(),
+            name: None,
+            cwd: temp.path().to_path_buf(),
+            git_branch: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            model: route,
+            effort: pacode_types::Effort::Medium,
+            mode: Mode::Build,
+            first_prompt: None,
+            zdr: false,
+        };
+        let tools = pacode_tools::ToolRegistry::new();
+        let config = pacode_types::Config {
+            zdr: zdr_mode,
+            ..pacode_types::Config::default()
+        };
+        let session = Arc::new(Session {
+            id,
+            meta: RwLock::new(meta),
+            agents: RwLock::new(BTreeMap::new()),
+            plan: RwLock::new(pacode_types::Plan::default()),
+            usage: RwLock::new(pacode_types::UsageTotals::default()),
+            permissions: crate::permissions::PermissionState::default(),
+            questions: crate::questions::QuestionState::default(),
+            events: crate::transcript::EventSink::new(),
+            tasks: pacode_exec::TaskManager::new(
+                temp.path().join("spool"),
+                pacode_types::ExecConfig::default(),
+            ),
+            store: pacode_store::Store::open_in_memory().unwrap(),
+            config: Arc::new(config),
+            providers: Arc::new(pacode_provider::ProviderRegistry::empty()),
+            tools: RwLock::new(tools),
+            mcp: pacode_mcp::McpPool::new(Default::default(), None, None),
+            plugins: Arc::new(pacode_plugin::PluginHost::new()),
+            app_version: "test".to_string(),
+            skills: Arc::new(pacode_skills::SkillRegistry::default()),
+            scheduler: crate::schedule::Scheduler::new(),
+            model_flags: RwLock::new(HashMap::new()),
+        });
+        (temp, session)
+    }
+
+    fn draft(tool_name: &str, kind: ToolKind) -> PermissionDraft {
+        PermissionDraft {
+            agent: AgentId::main(),
+            agent_name: "main".to_string(),
+            call_id: CallId::generate(),
+            title: tool_name.to_string(),
+            detail: String::new(),
+            risk: None,
+            tool_name: Some(tool_name.to_string()),
+            tool_kind: Some(kind),
+        }
+    }
+
+    #[tokio::test]
+    async fn zdr_active_modes() {
+        let (_t, session) = zdr_session(ZdrMode::Session);
+        assert!(!session.zdr_active(), "session mode + zdr off = inactive");
+        session.set_zdr(true);
+        assert!(session.zdr_active(), "session mode + zdr on = active");
+
+        let (_t, always) = zdr_session(ZdrMode::Always);
+        assert!(
+            always.zdr_active(),
+            "always mode is active even with zdr off"
+        );
+
+        let (_t, off) = zdr_session(ZdrMode::Off);
+        off.set_zdr(true);
+        assert!(!off.zdr_active(), "off mode ignores the meta flag");
+    }
+
+    #[tokio::test]
+    async fn zdr_denies_network_and_mcp_tools() {
+        let (_t, session) = zdr_session(ZdrMode::Session);
+        session.set_zdr(true);
+        let host = SessionHost {
+            session,
+            agent: AgentId::main(),
+        };
+
+        let net = host
+            .request_permission(draft("webfetch", ToolKind::Network))
+            .await;
+        assert_eq!(net, PermissionDecision::Deny, "network tool must be denied");
+
+        let mcp = host
+            .request_permission(draft("remote__query", ToolKind::Exec))
+            .await;
+        assert_eq!(
+            mcp,
+            PermissionDecision::Deny,
+            "mcp server__tool must be denied"
+        );
+
+        // Local read-only tool still passes through the gate -> AllowOnce.
+        let fs = host
+            .request_permission(draft("read", ToolKind::ReadOnly))
+            .await;
+        assert_eq!(
+            fs,
+            PermissionDecision::AllowOnce,
+            "fs tool must stay allowed under ZDR"
+        );
+    }
+
+    #[tokio::test]
+    async fn zdr_denies_subagent_spawn() {
+        let (_t, session) = zdr_session(ZdrMode::Session);
+        session.set_zdr(true);
+        let host = SessionHost {
+            session,
+            agent: AgentId::main(),
+        };
+        let res = host
+            .spawn_agent(pacode_tools::AgentSpec {
+                prompt: "hi".to_string(),
+                name: None,
+                model: None,
+                effort: None,
+                fork: false,
+                tools: None,
+            })
+            .await;
+        match res {
+            Err(pacode_tools::ToolError::Denied(msg)) => {
+                assert!(msg.contains("zdr_blocked"), "deny reason: {msg}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn zdr_off_leaves_permission_gate_alone() {
+        let (_t, session) = zdr_session(ZdrMode::Session);
+        let host = SessionHost {
+            session,
+            agent: AgentId::main(),
+        };
+        let net = host
+            .request_permission(draft("webfetch", ToolKind::Network))
+            .await;
+        assert_eq!(net, PermissionDecision::AllowOnce);
+    }
+}

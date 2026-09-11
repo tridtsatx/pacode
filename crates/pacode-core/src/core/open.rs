@@ -59,6 +59,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 effort,
                 mode,
                 first_prompt: None,
+                zdr: false,
             };
             core.deps.store.upsert_session(&meta).await?;
 
@@ -117,6 +118,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 app_version: core.deps.app_version.clone(),
                 skills: core.deps.skills.clone(),
                 scheduler: crate::schedule::Scheduler::new(),
+                model_flags: RwLock::new(pacode_config::load_prefs(&core.deps.paths).model_flags),
             });
 
             start_scheduler(&session).await;
@@ -321,6 +323,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 app_version: core.deps.app_version.clone(),
                 skills: core.deps.skills.clone(),
                 scheduler: crate::schedule::Scheduler::new(),
+                model_flags: RwLock::new(pacode_config::load_prefs(&core.deps.paths).model_flags),
             });
 
             start_scheduler(&session).await;

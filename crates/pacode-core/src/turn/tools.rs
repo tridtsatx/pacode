@@ -146,6 +146,22 @@ async fn run_single_tool(
         .unwrap_or_else(|p| p.into_inner())
         .get(&call.name);
 
+    // ZDR hard isolation: network tools (webfetch/websearch bypass the
+    // permission gate) and every MCP call (`<server>__<tool>`, `__resource`)
+    // are denied before dispatch. Checked here, not in `gate`, because MCP
+    // tools reach the registry by name rather than by `ToolKind`.
+    let zdr_block = if session.zdr_active()
+        && (tool_opt.as_ref().map(|t| t.kind()) == Some(ToolKind::Network)
+            || call.name.contains("__"))
+    {
+        Some(format!(
+            "zdr_blocked: {} is disabled while zero-data-retention is active",
+            call.name
+        ))
+    } else {
+        None
+    };
+
     let host = Arc::new(crate::host::SessionHost {
         session: session.clone(),
         agent: agent.id(),
@@ -181,6 +197,15 @@ async fn run_single_tool(
             reason,
             true,
             "Blocked by hook".to_string(),
+            None,
+            None,
+            ToolStatus::Denied,
+        )
+    } else if let Some(reason) = zdr_block {
+        (
+            reason,
+            true,
+            "Denied".to_string(),
             None,
             None,
             ToolStatus::Denied,

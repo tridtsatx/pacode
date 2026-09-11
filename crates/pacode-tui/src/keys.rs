@@ -173,6 +173,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         let next_mode = state.mode().next();
         return vec![Action::Send(Request::SetMode(next_mode))];
     }
+
+    // Alt+Z: session ZDR toggle (no-op unless `zdr = "session"`).
+    if action == Some(KeyAction::ToggleZdr) {
+        return toggle_zdr(state);
+    }
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
         // First check @ completion
         let byte_cursor =
@@ -523,22 +528,35 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     return vec![Action::LoadPanel];
                 }
             }
-            Focus::Overlay(Overlay::ModelPicker { query, index }) => {
+            Focus::Overlay(Overlay::ModelPicker {
+                query,
+                index,
+                for_zdr,
+            }) => {
                 let q_lower = query.to_lowercase();
-                let filtered: Vec<_> = state
-                    .models
-                    .iter()
-                    .filter(|m| {
-                        q_lower.is_empty()
-                            || m.route.to_string().to_lowercase().contains(&q_lower)
-                            || m.display_name.to_lowercase().contains(&q_lower)
-                    })
-                    .collect();
-                if let Some(model) = filtered.get(*index) {
-                    let route = model.route.clone();
+                let for_zdr_flag = *for_zdr;
+                let zdr_only =
+                    for_zdr_flag || crate::state::zdr_active(&state.config, state.meta.as_ref());
+                let route = {
+                    let rows = crate::state::picker_models(
+                        &state.models,
+                        &state.model_flags,
+                        &q_lower,
+                        zdr_only,
+                    );
+                    rows.get(*index).map(|m| m.route.clone())
+                };
+                if let Some(route) = route {
                     log::debug!("close overlay: ModelPicker");
                     state.focus = Focus::Normal;
-                    return vec![Action::Send(Request::SetModel(route))];
+                    let mut actions = vec![Action::Send(Request::SetModel(route))];
+                    if for_zdr_flag {
+                        if let Some(m) = state.meta.as_mut() {
+                            m.zdr = true;
+                        }
+                        actions.push(Action::Send(Request::SetZdr(true)));
+                    }
+                    return actions;
                 }
             }
             Focus::Overlay(Overlay::EffortPicker { index }) => {
@@ -728,6 +746,42 @@ pub use crate::nav::{
     normalize_cyrillic_ctrl, select_agent_at_index, select_agent_by_id, selectable_agents,
     switch_to_session_slot,
 };
+
+/// Alt+Z. Only `zdr = "session"` toggles; `always`/`off` are config-forced.
+/// Enabling requires the current route to be `zdr_capable` — otherwise the
+/// model picker opens filtered to capable routes, and Enter there sends
+/// `SetModel` then `SetZdr(true)`; Esc keeps ZDR off.
+fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
+    if state.config.zdr != pacode_types::ZdrMode::Session {
+        return vec![];
+    }
+    let Some(meta) = state.meta.as_ref() else {
+        return vec![];
+    };
+    if meta.zdr {
+        if let Some(m) = state.meta.as_mut() {
+            m.zdr = false;
+        }
+        return vec![Action::Send(Request::SetZdr(false))];
+    }
+    let capable = state
+        .model_flags
+        .get(&meta.model.to_string())
+        .is_some_and(|f| f.zdr_capable);
+    if capable {
+        if let Some(m) = state.meta.as_mut() {
+            m.zdr = true;
+        }
+        vec![Action::Send(Request::SetZdr(true))]
+    } else {
+        state.focus = Focus::Overlay(Overlay::ModelPicker {
+            query: String::new(),
+            index: 0,
+            for_zdr: true,
+        });
+        vec![Action::Send(Request::ListModels)]
+    }
+}
 
 fn complete_slash_command(state: &mut AppState) -> bool {
     if state.input.text.starts_with('/') && !state.input.text.contains(' ') {

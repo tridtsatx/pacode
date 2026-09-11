@@ -68,6 +68,7 @@ fn make_base_snapshot() -> SessionSnapshot {
         effort: Effort::High,
         mode: Mode::Build,
         first_prompt: None,
+        zdr: false,
     };
 
     let plan = Plan {

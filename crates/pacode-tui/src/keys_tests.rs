@@ -375,6 +375,7 @@ fn test_overlay_model_picker_navigation_and_esc() {
         Focus::Overlay(Overlay::ModelPicker {
             query: String::new(),
             index: 0,
+            for_zdr: false,
         })
     );
 
@@ -386,6 +387,7 @@ fn test_overlay_model_picker_navigation_and_esc() {
         Focus::Overlay(Overlay::ModelPicker {
             query: String::new(),
             index: 1,
+            for_zdr: false,
         })
     );
 
@@ -460,6 +462,7 @@ fn test_overlay_session_picker_navigation_focus_and_esc() {
         updated_at_ms: 1000,
         name: Some("Session 1".into()),
         first_prompt: None,
+        zdr: false,
     };
     let meta2 = pacode_types::SessionMeta {
         id: pacode_types::SessionId::new("ses_2"),
@@ -472,6 +475,7 @@ fn test_overlay_session_picker_navigation_focus_and_esc() {
         updated_at_ms: 2000,
         name: Some("Session 2".into()),
         first_prompt: None,
+        zdr: false,
     };
     state.sessions = vec![meta1, meta2];
 
@@ -2510,4 +2514,219 @@ fn test_overlay_login_picker_a_key_types_when_single_or_no_accounts() {
             index: 0,
         })
     );
+}
+
+// ---- Alt+Z session ZDR toggle (spec §3) ----
+
+/// Point `state.paths` at a temp dir and drop any model flags the real
+/// `prefs.toml` loaded — picker toggles persist prefs, tests must stay hermetic.
+fn isolate_prefs(state: &mut AppState) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    state.paths = pacode_config::Paths::under(dir.path());
+    state.model_flags.clear();
+    dir
+}
+
+fn zdr_meta(model: &str, zdr: bool) -> pacode_types::SessionMeta {
+    pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_zdr"),
+        cwd: std::path::PathBuf::from("/tmp"),
+        git_branch: None,
+        model: ModelRoute::new("p", model),
+        effort: Effort::Medium,
+        mode: pacode_types::Mode::Build,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        name: None,
+        first_prompt: None,
+        zdr,
+    }
+}
+
+#[test]
+fn test_alt_z_toggles_zdr_when_model_capable() {
+    let mut state = make_test_state(); // Config::default() has zdr = "session"
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", false));
+    state.model_flags.insert(
+        "p/m".to_string(),
+        pacode_types::ModelFlags {
+            zdr_capable: true,
+            favorite: false,
+        },
+    );
+
+    let alt_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_z, now);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Send(Request::SetZdr(true)))),
+        "expected SetZdr(true), got {actions:?}"
+    );
+    assert!(state.meta.as_ref().is_some_and(|m| m.zdr));
+
+    // Second Alt+Z turns it back off.
+    let actions = handle_key(&mut state, alt_z, now);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Send(Request::SetZdr(false)))),
+        "expected SetZdr(false), got {actions:?}"
+    );
+    assert!(state.meta.as_ref().is_some_and(|m| !m.zdr));
+}
+
+#[test]
+fn test_alt_z_opens_picker_when_model_not_capable() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", false)); // no flag => not zdr_capable
+
+    let alt_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_z, now);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Send(Request::ListModels))),
+        "expected ListModels, got {actions:?}"
+    );
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModelPicker {
+            query: String::new(),
+            index: 0,
+            for_zdr: true,
+        })
+    );
+    assert!(
+        !state.meta.as_ref().is_some_and(|m| m.zdr),
+        "zdr stays off until a capable model is picked"
+    );
+}
+
+#[test]
+fn test_alt_z_noop_when_zdr_config_off() {
+    let mut state = make_test_state();
+    state.config.zdr = pacode_types::ZdrMode::Off;
+    let now = Instant::now();
+    state.meta = Some(zdr_meta("m", false));
+
+    let alt_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_z, now);
+    assert!(actions.is_empty(), "zdr=off must ignore Alt+Z");
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+fn model_info(provider: &str, model: &str) -> pacode_types::model::ModelInfo {
+    pacode_types::model::ModelInfo {
+        route: ModelRoute::new(provider, model),
+        display_name: model.to_string(),
+        context_window: None,
+        supports_reasoning: false,
+        supports_vision: false,
+        supported_efforts: None,
+        pricing: None,
+    }
+}
+
+#[test]
+fn test_model_picker_z_s_toggle_flags_not_query() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", false));
+    state.models = vec![model_info("p", "m")];
+    // Regular picker (zdr inactive): the full list is visible, so 'z' can
+    // bootstrap zdr_capable on a row — spec's marking flow.
+    state.focus = Focus::Overlay(Overlay::ModelPicker {
+        query: String::new(),
+        index: 0,
+        for_zdr: false,
+    });
+
+    let key_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_z, now);
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::Send(Request::SetModelFlag { model, flags })
+                if model == "p/m" && flags.zdr_capable
+        )),
+        "expected SetModelFlag zdr_capable, got {actions:?}"
+    );
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModelPicker {
+            query: String::new(),
+            index: 0,
+            for_zdr: false,
+        }),
+        "'z' must not leak into the query"
+    );
+    assert!(
+        state.model_flags.get("p/m").is_some_and(|f| f.zdr_capable),
+        "state.model_flags must reflect the toggle"
+    );
+
+    // 's' toggles favorite the same way.
+    let key_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_s, now);
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::Send(Request::SetModelFlag { model, flags })
+                if model == "p/m" && flags.favorite && flags.zdr_capable
+        )),
+        "expected SetModelFlag favorite, got {actions:?}"
+    );
+
+    // Enter picks the row: only SetModel (for_zdr is false).
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(actions.len(), 1, "expected just SetModel, got {actions:?}");
+    assert!(
+        matches!(&actions[0], Action::Send(Request::SetModel(r)) if r.to_string() == "p/m"),
+        "expected SetModel, got {actions:?}"
+    );
+    assert!(state.meta.as_ref().is_some_and(|m| !m.zdr));
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_model_picker_for_zdr_enter_sends_setmodel_then_setzdr() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", false));
+    state.models = vec![model_info("p", "m"), model_info("p", "other")];
+    // Only "p/m" is capable — the for_zdr list filters "p/other" out.
+    state.model_flags.insert(
+        "p/m".to_string(),
+        pacode_types::ModelFlags {
+            zdr_capable: true,
+            favorite: false,
+        },
+    );
+    state.focus = Focus::Overlay(Overlay::ModelPicker {
+        query: String::new(),
+        index: 0,
+        for_zdr: true,
+    });
+
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = handle_key(&mut state, enter, now);
+    assert_eq!(actions.len(), 2, "expected [SetModel, SetZdr]");
+    assert!(
+        matches!(&actions[0], Action::Send(Request::SetModel(r)) if r.to_string() == "p/m"),
+        "first action must be SetModel, got {actions:?}"
+    );
+    assert!(
+        matches!(&actions[1], Action::Send(Request::SetZdr(true))),
+        "second action must be SetZdr(true), got {actions:?}"
+    );
+    assert!(state.meta.as_ref().is_some_and(|m| m.zdr));
+    assert_eq!(state.focus, Focus::Normal);
 }

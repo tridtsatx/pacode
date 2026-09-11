@@ -68,6 +68,14 @@ impl ToolHost for SessionHost {
             (name, kind)
         };
 
+        // ZDR hard isolation for tools that do ask (network tools normally
+        // bypass this path; `run_single_tool` denies them before dispatch).
+        if self.session.zdr_active()
+            && (kind == pacode_tools::ToolKind::Network || tool_name.contains("__"))
+        {
+            return PermissionDecision::Deny;
+        }
+
         let mode = self.session.meta().mode;
         let allow_catastrophic = self.session.config.permissions.allow_catastrophic;
         let gate_decision = crate::permissions::gate(mode, kind, draft.risk, allow_catastrophic);
@@ -448,6 +456,12 @@ impl ToolHost for SessionHost {
     }
 
     async fn spawn_agent(&self, spec: AgentSpec) -> Result<AgentId, ToolError> {
+        if self.session.zdr_active() {
+            return Err(ToolError::Denied(
+                "zdr_blocked: subagent spawning is disabled while zero-data-retention is active"
+                    .to_string(),
+            ));
+        }
         self.session
             .spawn_agent(spec)
             .await

@@ -16,6 +16,7 @@ async fn store_with_session() -> (Store, SessionId) {
         effort: pacode_types::Effort::Medium,
         mode: pacode_types::Mode::Build,
         first_prompt: None,
+        zdr: false,
     };
     store.upsert_session(&meta).await.expect("session");
     (store, session)

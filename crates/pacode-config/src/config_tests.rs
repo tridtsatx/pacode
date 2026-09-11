@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use pacode_types::{Config, Effort, Mode, ProviderConfig};
+use pacode_types::{Config, Effort, Mode, ModelFlags, ProviderConfig};
 use tempfile::tempdir;
 
 use crate::logging::{FileLogger, default_level, default_level_for, level_from_env};
@@ -561,6 +561,13 @@ fn prefs_round_trip() {
         model: Some("anthropic/claude-3-7-sonnet".to_string()),
         effort: Some(Effort::Max),
         mode: Some(Mode::Bypass),
+        model_flags: std::collections::HashMap::from([(
+            "anthropic/claude-3-7-sonnet".to_string(),
+            ModelFlags {
+                zdr_capable: true,
+                favorite: true,
+            },
+        )]),
     };
     crate::save_prefs(&paths, &custom).expect("save_prefs must succeed");
 
@@ -573,6 +580,8 @@ fn prefs_round_trip() {
     assert!(text.contains("model = \"anthropic/claude-3-7-sonnet\""));
     assert!(text.contains("effort = \"max\""));
     assert!(text.contains("mode = \"bypass\""));
+    assert!(text.contains("zdr_capable = true"), "prefs.toml: {text}");
+    assert!(text.contains("favorite = true"), "prefs.toml: {text}");
 }
 
 #[test]

@@ -33,6 +33,7 @@ fn dummy_snapshot() -> SessionSnapshot {
             effort: Effort::Low,
             mode: Mode::Build,
             first_prompt: None,
+            zdr: false,
         },
         agents: vec![],
         plan: Plan::default(),

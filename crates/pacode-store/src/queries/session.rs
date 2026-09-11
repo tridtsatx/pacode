@@ -14,8 +14,8 @@ pub fn upsert_session(conn: &mut Connection, meta: &SessionMeta) -> Result<(), S
     let model_str = format!("{}/{}", meta.model.provider, meta.model.model);
     conn.execute(
         r#"
-        INSERT INTO sessions (id, name, cwd, git_branch, created_at, updated_at, model, effort, mode, first_prompt, meta_json)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        INSERT INTO sessions (id, name, cwd, git_branch, created_at, updated_at, model, effort, mode, first_prompt, meta_json, zdr)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             cwd = excluded.cwd,
@@ -26,7 +26,8 @@ pub fn upsert_session(conn: &mut Connection, meta: &SessionMeta) -> Result<(), S
             effort = excluded.effort,
             mode = excluded.mode,
             first_prompt = excluded.first_prompt,
-            meta_json = excluded.meta_json;
+            meta_json = excluded.meta_json,
+            zdr = excluded.zdr;
         "#,
         params![
             meta.id.as_str(),
@@ -40,6 +41,7 @@ pub fn upsert_session(conn: &mut Connection, meta: &SessionMeta) -> Result<(), S
             meta.mode.as_str(),
             meta.first_prompt.as_deref(),
             None::<&str>,
+            meta.zdr,
         ],
     )?;
     Ok(())
@@ -56,6 +58,7 @@ fn row_to_session_meta(row: &rusqlite::Row) -> Result<SessionMeta, rusqlite::Err
     let effort_str: String = row.get(7)?;
     let mode_str: String = row.get(8)?;
     let first_prompt: Option<String> = row.get(9)?;
+    let zdr: bool = row.get(10)?;
 
     let model = ModelRoute::parse_lossy(&model_str)
         .unwrap_or_else(|| ModelRoute::new("unknown", model_str));
@@ -73,13 +76,14 @@ fn row_to_session_meta(row: &rusqlite::Row) -> Result<SessionMeta, rusqlite::Err
         effort,
         mode,
         first_prompt,
+        zdr,
     })
 }
 
 pub fn get_session(conn: &Connection, id: &SessionId) -> Result<Option<SessionMeta>, StoreError> {
     let mut stmt = conn.prepare_cached(
         r#"
-        SELECT id, name, cwd, git_branch, created_at, updated_at, model, effort, mode, first_prompt
+        SELECT id, name, cwd, git_branch, created_at, updated_at, model, effort, mode, first_prompt, zdr
         FROM sessions
         WHERE id = ?1;
         "#,
@@ -103,7 +107,7 @@ pub fn list_sessions(
             let cwd_str = cwd.to_string_lossy().to_string();
             let mut stmt = conn.prepare_cached(
                 r#"
-                SELECT id, name, cwd, git_branch, created_at, updated_at, model, effort, mode, first_prompt
+                SELECT id, name, cwd, git_branch, created_at, updated_at, model, effort, mode, first_prompt, zdr
                 FROM sessions
                 WHERE cwd = ?1
                 ORDER BY updated_at DESC
@@ -118,7 +122,7 @@ pub fn list_sessions(
         None => {
             let mut stmt = conn.prepare_cached(
                 r#"
-                SELECT id, name, cwd, git_branch, created_at, updated_at, model, effort, mode, first_prompt
+                SELECT id, name, cwd, git_branch, created_at, updated_at, model, effort, mode, first_prompt, zdr
                 FROM sessions
                 ORDER BY updated_at DESC
                 LIMIT ?1;

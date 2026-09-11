@@ -219,6 +219,14 @@ impl Core {
                 session.set_mode(mode);
                 Reply::Ok
             }
+            Request::SetZdr(zdr) => {
+                session.set_zdr(zdr);
+                Reply::Ok
+            }
+            Request::SetModelFlag { model, flags } => {
+                session.set_model_flags(model, flags);
+                Reply::Ok
+            }
             Request::StopAgent(agent_id) => match session.stop_agent(&agent_id).await {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error {

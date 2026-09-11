@@ -1,6 +1,6 @@
 //! `Session`: one conversation with a main agent and its subagents.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use pacode_exec::TaskManager;
@@ -9,8 +9,8 @@ use pacode_provider::ProviderRegistry;
 use pacode_store::Store;
 use pacode_tools::{AgentSpec, ToolRegistry};
 use pacode_types::{
-    AgentId, AgentInfo, Config, Effort, Mode, ModelRoute, PermissionDecision, PermissionId, Plan,
-    SessionId, SessionMeta, SessionSnapshot, TaskInfo, UsageTotals,
+    AgentId, AgentInfo, Config, Effort, Mode, ModelFlags, ModelRoute, PermissionDecision,
+    PermissionId, Plan, SessionId, SessionMeta, SessionSnapshot, TaskInfo, UsageTotals, ZdrMode,
 };
 
 use crate::CoreError;
@@ -41,6 +41,9 @@ pub struct Session {
     pub skills: Arc<pacode_skills::SkillRegistry>,
     /// Cron jobs and monitors of this session. Dropping the session stops them.
     pub scheduler: Arc<crate::schedule::Scheduler>,
+    /// Per-route user flags (`zdr_capable`, `favorite`) loaded from `prefs.toml`
+    /// at session open; `SetModelFlag` updates this copy, the TUI persists it.
+    pub model_flags: RwLock<HashMap<String, ModelFlags>>,
 }
 
 impl Session {
@@ -152,6 +155,18 @@ impl Session {
         text: String,
         images: Vec<pacode_types::ImageSource>,
     ) -> Result<(), CoreError> {
+        // Hard isolation: while ZDR is active the chat endpoint must be a
+        // `zdr_capable` route. Normally the enable flow picks one first; this
+        // guards resumes and flag removals.
+        let meta = self.meta();
+        if self.zdr_active() && !self.model_flags(&meta.model.to_string()).zdr_capable {
+            return Err(CoreError::Invalid(format!(
+                "zdr_blocked: current model {} is not flagged zdr_capable; pick a ZDR model (Alt+Z picker) or disable ZDR",
+                meta.model
+            )));
+        }
+        drop(meta);
+
         let main = self
             .main_agent()
             .ok_or_else(|| CoreError::AgentNotFound(AgentId::main()))?;
@@ -281,6 +296,11 @@ impl Session {
     /// theirs. Each updated info is persisted and broadcast, so the next loop
     /// iteration of a running turn sees the new route too.
     pub async fn set_model(&self, route: ModelRoute) -> Result<(), CoreError> {
+        if self.zdr_active() && !self.model_flags(&route.to_string()).zdr_capable {
+            return Err(CoreError::Invalid(format!(
+                "zdr_blocked: {route} is not flagged zdr_capable; mark it in the model picker or disable ZDR"
+            )));
+        }
         self.providers.resolve(&route).await?;
 
         let old_model = {
@@ -328,6 +348,45 @@ impl Session {
             meta.mode = mode;
         }
         self.touch();
+    }
+
+    /// ZDR is active when the config forces it (`always`) or the session toggle
+    /// is on under `zdr = "session"`. While active, network tools, MCP calls
+    /// and subagent spawns are denied and model switching is restricted.
+    pub fn zdr_active(&self) -> bool {
+        match self.config.zdr {
+            ZdrMode::Always => true,
+            ZdrMode::Session => self.meta().zdr,
+            ZdrMode::Off => false,
+        }
+    }
+
+    /// Session ZDR toggle; persists through `meta` (touch upserts the row and
+    /// emits `SessionUpdated`, which the TUI snapshot carries).
+    pub fn set_zdr(&self, zdr: bool) {
+        {
+            let mut meta = self.meta.write().unwrap_or_else(|p| p.into_inner());
+            meta.zdr = zdr;
+        }
+        self.touch();
+    }
+
+    /// Flags for one `provider/model` key; absent entry means all-false.
+    pub fn model_flags(&self, key: &str) -> ModelFlags {
+        self.model_flags
+            .read()
+            .map(|f| f.get(key).copied().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Merge a flag update for one `provider/model` key.
+    pub fn set_model_flags(&self, key: String, flags: ModelFlags) {
+        let mut map = self.model_flags.write().unwrap_or_else(|p| p.into_inner());
+        if flags == ModelFlags::default() {
+            map.remove(&key);
+        } else {
+            map.insert(key, flags);
+        }
     }
 
     /// Run `update` against each agent's `AgentInfo`; where it returns `true`,
