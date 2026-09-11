@@ -129,9 +129,17 @@ pub fn encode_pending() -> proto::Writer {
     w
 }
 
+/// Whether the model takes the field-10 image payload. Every model Devin
+/// serves — the `swe-*` family and the relayed Claude/GPT/Gemini entries — is
+/// a multimodal frontier model, so this is unconditional.
+pub fn model_supports_vision(_model: &str) -> bool {
+    true
+}
+
 /// Encode messages from the conversation history into protobuf messages.
-// Field 10 { 1 base64_data, 2 mime_type } exists for image attachments in live traffic; unused because ContentBlock has no image variant.
-pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
+// Field 10 { 1 base64_data, 2 mime_type } of a message is the image attachment
+// convention observed in live traffic (spec §1).
+pub fn encode_messages(messages: &[Message], supports_vision: bool) -> Vec<proto::Writer> {
     let mut encoded = Vec::new();
 
     for msg in messages {
@@ -140,14 +148,38 @@ pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
                 let mut w = proto::Writer::new();
                 w.write_string(1, &random_uuid());
                 w.write_varint(2, 1);
-                w.write_string(3, &msg.text());
+                let mut text = msg.text();
+                for block in &msg.content {
+                    if let ContentBlock::Image { source } = block {
+                        let loaded = supports_vision.then(|| {
+                            crate::image::load_image_data(source, crate::image::MAX_IMAGE_BYTES)
+                        });
+                        match loaded.flatten() {
+                            Some((mime, b64)) => {
+                                let mut img = proto::Writer::new();
+                                img.write_string(1, &b64);
+                                img.write_string(2, &mime);
+                                w.write_message(10, &img);
+                            }
+                            None => {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(&crate::image::image_fallback_text(source));
+                            }
+                        }
+                    }
+                }
+                w.write_string(3, &text);
                 encoded.push(w);
             }
             Role::Assistant => {
                 let mut w = proto::Writer::new();
                 w.write_string(1, &random_uuid());
                 w.write_varint(2, 2);
-                let text = msg.text();
+                // Field 10 image attachments are user-side; images in
+                // assistant history degrade into the text field.
+                let text = crate::image::text_with_image_fallbacks(msg);
                 if !text.is_empty() {
                     w.write_string(3, &text);
                 }
@@ -220,7 +252,7 @@ pub fn encode_get_chat_message_request(
     }
 
     // 3: repeated message
-    for msg in encode_messages(&req.messages) {
+    for msg in encode_messages(&req.messages, model_supports_vision(&req.model)) {
         w.write_message(3, &msg);
     }
 

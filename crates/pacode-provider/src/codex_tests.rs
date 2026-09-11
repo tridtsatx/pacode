@@ -27,12 +27,14 @@ fn make_test_provider(auth: Option<CodexAuth>, base_url: Option<&str>) -> Codex 
                 display_name: None,
                 context_window: Some(128_000),
                 reasoning: Some(true),
+                efforts: None,
             },
             ModelConfig {
                 id: "custom-plain".to_string(),
                 display_name: None,
                 context_window: Some(64_000),
                 reasoning: Some(false),
+                efforts: None,
             },
         ],
         catalog: true,
@@ -361,6 +363,7 @@ fn test_build_body_reasoning_block() {
             display_name: None,
             context_window: Some(128_000),
             reasoning: Some(true),
+            efforts: None,
         }],
         catalog: false,
         context_window: None,
@@ -971,6 +974,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
             display_name: Some("GPT-5.1 Custom Name".to_string()),
             context_window: Some(128_000),
             reasoning: Some(true),
+            efforts: None,
         }],
         catalog: true,
         context_window: None,
@@ -1029,6 +1033,7 @@ fn test_model_info_pricing_and_reasoning() {
             display_name: Some("Custom Name".to_string()),
             context_window: Some(128_000),
             reasoning: Some(true),
+            efforts: None,
         }],
         catalog: false,
         context_window: Some(64_000),
@@ -1089,4 +1094,155 @@ fn test_codex_malformed_proxy_names_provider_and_offending_value() {
         msg.contains("invalid-url-value"),
         "error must name offending value: {msg}"
     );
+}
+
+fn codex_req(model: &str, messages: Vec<Message>) -> CompletionRequest {
+    CompletionRequest {
+        model: model.to_string(),
+        system_static: String::new(),
+        system_dynamic: "Instr".to_string(),
+        messages,
+        tools: vec![],
+        effort: None,
+        max_output_tokens: None,
+    }
+}
+
+#[test]
+fn test_build_body_input_image_parts_vision_model() {
+    let provider = make_test_provider(None, None);
+    let req = codex_req(
+        "gpt-5.1-codex",
+        vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "describe".to_string(),
+                },
+                ContentBlock::Image {
+                    source: pacode_types::ImageSource::Bytes {
+                        mime: "image/png".to_string(),
+                        data: vec![5, 6],
+                    },
+                },
+            ],
+            meta: pacode_types::MessageMeta::default(),
+        }],
+    );
+    let body = provider.build_body(&req);
+    let content = body["input"][0]["content"]
+        .as_array()
+        .expect("content parts");
+    assert_eq!(
+        content[0],
+        json!({"type": "input_text", "text": "describe"})
+    );
+    assert_eq!(content[1]["type"], "input_image");
+    let url = content[1]["image_url"].as_str().expect("image_url");
+    assert!(url.starts_with("data:image/png;base64,"), "data url: {url}");
+}
+
+#[test]
+fn test_build_body_image_degrades_non_vision() {
+    let provider = make_test_provider(None, None);
+    let req = codex_req(
+        "custom-plain",
+        vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "hi".to_string(),
+                },
+                ContentBlock::Image {
+                    source: pacode_types::ImageSource::Bytes {
+                        mime: "image/png".to_string(),
+                        data: vec![1],
+                    },
+                },
+            ],
+            meta: pacode_types::MessageMeta::default(),
+        }],
+    );
+    let body = provider.build_body(&req);
+    let content = body["input"][0]["content"]
+        .as_array()
+        .expect("content parts");
+    assert_eq!(
+        content,
+        &vec![json!({
+            "type": "input_text",
+            "text": "hi\n[image: image/png, 1 bytes]"
+        })],
+        "non-vision user image degrades into input_text"
+    );
+}
+
+#[test]
+fn test_build_body_assistant_image_degrades() {
+    let provider = make_test_provider(None, None);
+    let req = codex_req(
+        "gpt-5.1-codex",
+        vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "a".to_string(),
+                },
+                ContentBlock::Image {
+                    source: pacode_types::ImageSource::Bytes {
+                        mime: "image/gif".to_string(),
+                        data: vec![0, 0],
+                    },
+                },
+            ],
+            meta: pacode_types::MessageMeta::default(),
+        }],
+    );
+    let body = provider.build_body(&req);
+    assert_eq!(
+        body["input"][0]["content"][0],
+        json!({"type": "output_text", "text": "a\n[image: image/gif, 2 bytes]"})
+    );
+}
+
+#[test]
+fn test_codex_model_info_vision_and_efforts() {
+    let cfg = ProviderConfig {
+        kind: Default::default(),
+        base_url: "https://api.openai.com/v1".to_string(),
+        api_key: None,
+        api_key_env: None,
+        models: vec![ModelConfig {
+            id: "codex-cfg".to_string(),
+            display_name: None,
+            context_window: None,
+            reasoning: None,
+            efforts: Some(vec![Effort::Low, Effort::Max]),
+        }],
+        catalog: false,
+        context_window: Some(64_000),
+        reasoning: None,
+        effort_map: BTreeMap::new(),
+        extra_body: None,
+        headers: BTreeMap::new(),
+        proxy: None,
+    };
+    let provider = Codex::new(
+        "codex",
+        cfg,
+        ProviderDefaults::default(),
+        Some(CodexAuth::api_key("key")),
+        BTreeMap::new(),
+    )
+    .expect("valid");
+
+    assert!(provider.model_info("gpt-5.1-codex").supports_vision);
+    assert!(provider.model_info("o3").supports_vision);
+    assert!(!provider.model_info("o1-mini").supports_vision);
+    assert!(!provider.model_info("custom-plain").supports_vision);
+    assert_eq!(
+        provider.model_info("codex-cfg").supported_efforts,
+        Some(vec![Effort::Low, Effort::Max])
+    );
+    assert_eq!(provider.model_info("gpt-5.1-codex").supported_efforts, None);
 }

@@ -1,17 +1,21 @@
 //! Request body construction for the Anthropic Messages API.
 
-use pacode_types::{ContentBlock, Effort, Role};
+use pacode_types::{ContentBlock, Effort, ImageSource, Role};
 use serde_json::Value;
 
 use super::types::{CLAUDE_CODE_IDENTITY, DEFAULT_MAX_OUTPUT_TOKENS, map_tool_name_for_oauth};
 use crate::CompletionRequest;
 
 /// Build the JSON payload for an Anthropic Messages API request.
+///
+/// `supports_vision` decides whether `ContentBlock::Image` becomes a base64
+/// `image` block or degrades to the `[image file: …]` text placeholder.
 pub fn build_body(
     req: &CompletionRequest,
     is_oauth: bool,
     reasoning_enabled: bool,
     default_effort: Effort,
+    supports_vision: bool,
     extra_body: Option<&Value>,
 ) -> Value {
     let mut body = serde_json::Map::new();
@@ -44,7 +48,7 @@ pub fn build_body(
         body.insert("system".to_string(), Value::Array(system_blocks));
     }
 
-    let messages = build_messages(&req.messages, is_oauth);
+    let messages = build_messages(&req.messages, is_oauth, supports_vision);
     body.insert("messages".to_string(), Value::Array(messages));
 
     if !req.tools.is_empty() {
@@ -94,7 +98,11 @@ pub fn build_body(
     body_val
 }
 
-fn build_messages(messages: &[pacode_types::Message], is_oauth: bool) -> Vec<Value> {
+fn build_messages(
+    messages: &[pacode_types::Message],
+    is_oauth: bool,
+    supports_vision: bool,
+) -> Vec<Value> {
     let mut raw_messages: Vec<(&str, Vec<Value>)> = Vec::new();
     for msg in messages {
         match msg.role {
@@ -111,13 +119,8 @@ fn build_messages(messages: &[pacode_types::Message], is_oauth: bool) -> Vec<Val
                             }
                         }
                         ContentBlock::Reasoning { .. } => {}
-                        // Degrade to a text placeholder until the vision wire
-                        // format lands (spec §1 providers step).
                         ContentBlock::Image { source } => {
-                            content.push(serde_json::json!({
-                                "type": "text",
-                                "text": source.placeholder(),
-                            }));
+                            content.push(image_block(source, supports_vision));
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             let tool_name = if is_oauth {
@@ -171,11 +174,9 @@ fn build_messages(messages: &[pacode_types::Message], is_oauth: bool) -> Vec<Val
                                 }));
                             }
                         }
+                        // The API rejects image blocks on assistant turns.
                         ContentBlock::Image { source } => {
-                            content.push(serde_json::json!({
-                                "type": "text",
-                                "text": source.placeholder(),
-                            }));
+                            content.push(image_block(source, false));
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             let tool_name = if is_oauth {
@@ -233,11 +234,10 @@ fn build_messages(messages: &[pacode_types::Message], is_oauth: bool) -> Vec<Val
                             }
                         }
                         ContentBlock::Reasoning { .. } => {}
+                        // A bare Image in a tool-result message is not a
+                        // tool_result block; degrade it to text.
                         ContentBlock::Image { source } => {
-                            content.push(serde_json::json!({
-                                "type": "text",
-                                "text": source.placeholder(),
-                            }));
+                            content.push(image_block(source, false));
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             let tool_name = if is_oauth {
@@ -303,6 +303,29 @@ fn build_messages(messages: &[pacode_types::Message], is_oauth: bool) -> Vec<Val
             })
         })
         .collect()
+}
+
+/// `{type:"image", source:{type:"base64", …}}` when the model takes images and
+/// the source resolves under the cap; otherwise the `[image file: …]` text
+/// placeholder (spec §1).
+fn image_block(source: &ImageSource, supports_vision: bool) -> Value {
+    if supports_vision
+        && let Some((mime, b64)) =
+            crate::image::load_image_data(source, crate::image::MAX_IMAGE_BYTES)
+    {
+        return serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime,
+                "data": b64,
+            },
+        });
+    }
+    serde_json::json!({
+        "type": "text",
+        "text": crate::image::image_fallback_text(source),
+    })
 }
 
 pub fn deep_merge(target: &mut Value, source: &Value) {

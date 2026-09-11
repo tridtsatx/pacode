@@ -153,6 +153,9 @@ pub struct ModelConfig {
     pub display_name: Option<String>,
     pub context_window: Option<u32>,
     pub reasoning: Option<bool>,
+    /// Effort levels the model supports (`efforts = ["low", "high"]`). `None`
+    /// means every [`Effort`] is selectable (spec §6).
+    pub efforts: Option<Vec<Effort>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

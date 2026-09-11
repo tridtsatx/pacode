@@ -305,6 +305,19 @@ impl Devin {
             if let Some(cw) = context_windows.get(representative) {
                 info.context_window = Some(*cw);
             }
+            if info.supported_efforts.is_none() {
+                // The catalog is per-model effort metadata already: each member
+                // id encodes one effort tier (ranks `none`/`minimal`/absent have
+                // no `Effort` counterpart and are skipped).
+                let efforts: Vec<Effort> = family
+                    .members
+                    .iter()
+                    .filter_map(|(rank, _)| rank.and_then(rank_to_effort))
+                    .collect();
+                if !efforts.is_empty() {
+                    info.supported_efforts = Some(efforts);
+                }
+            }
             all_models.push(info);
         }
 
@@ -431,9 +444,22 @@ impl Provider for Devin {
             display_name,
             context_window,
             supports_reasoning,
-            supports_vision: false,
-            supported_efforts: None,
+            supports_vision: wire::model_supports_vision(model),
+            supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
             pricing,
         }
+    }
+}
+
+/// Map a family-member effort rank (see `catalog::EFFORT_TIERS`) back to an
+/// [`Effort`]; `none`/`minimal` have no counterpart.
+fn rank_to_effort(rank: u8) -> Option<Effort> {
+    match rank {
+        2 => Some(Effort::Low),
+        3 => Some(Effort::Medium),
+        4 => Some(Effort::High),
+        5 => Some(Effort::XHigh),
+        6 => Some(Effort::Max),
+        _ => None,
     }
 }

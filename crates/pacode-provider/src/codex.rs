@@ -377,8 +377,8 @@ impl Provider for Codex {
             display_name,
             context_window,
             supports_reasoning,
-            supports_vision: false,
-            supported_efforts: None,
+            supports_vision: request::model_supports_vision(model),
+            supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
             pricing,
         }
     }

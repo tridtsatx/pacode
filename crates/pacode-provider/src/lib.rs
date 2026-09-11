@@ -13,6 +13,7 @@ pub mod anthropic;
 pub mod catalog_cache;
 pub mod codex;
 pub mod devin;
+pub mod image;
 pub mod mock;
 pub mod openai_compat;
 pub mod registry;

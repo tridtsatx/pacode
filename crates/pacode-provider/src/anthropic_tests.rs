@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use base64::Engine;
 use futures::StreamExt;
 use pacode_types::{
-    CallId, ContentBlock, Effort, Message, ModelConfig, ProviderConfig, ProviderDefaults, Role,
-    StopReason, StreamEvent, ToolDefinition,
+    CallId, ContentBlock, Effort, ImageSource, Message, ModelConfig, ProviderConfig,
+    ProviderDefaults, Role, StopReason, StreamEvent, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -326,6 +327,7 @@ fn test_reasoning_effort_budget_mapping() {
             display_name: None,
             context_window: None,
             reasoning: Some(true),
+            efforts: None,
         }],
         None,
         None,
@@ -1021,6 +1023,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
             display_name: Some("Custom Sonnet".to_string()),
             context_window: Some(200_000),
             reasoning: Some(false),
+            efforts: None,
         }],
         catalog: true,
         context_window: None,
@@ -1074,5 +1077,164 @@ fn test_anthropic_malformed_proxy_names_provider_and_offending_value() {
     assert!(
         msg.contains("bad://invalid:99"),
         "error must name offending value: {msg}"
+    );
+}
+
+fn anthropic_req(model: &str, messages: Vec<Message>) -> CompletionRequest {
+    CompletionRequest {
+        model: model.to_string(),
+        system_static: "Sys".to_string(),
+        system_dynamic: String::new(),
+        messages,
+        tools: vec![],
+        effort: None,
+        max_output_tokens: Some(1024),
+    }
+}
+
+#[test]
+fn test_image_block_base64_on_user_turn_vision() {
+    let auth = AnthropicAuth::ApiKey("sk-ant-api-testkey123".to_string());
+    let provider = make_anthropic_provider(
+        "https://api.anthropic.com/v1".to_string(),
+        Some(auth),
+        vec![],
+        None,
+        None,
+    );
+    let req = anthropic_req(
+        "claude-3-5-sonnet-20241022",
+        vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is this".to_string(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Bytes {
+                        mime: "image/png".to_string(),
+                        data: vec![1, 2, 3, 4],
+                    },
+                },
+            ],
+            meta: pacode_types::MessageMeta::default(),
+        }],
+    );
+    let body = provider.build_body(&req);
+    let content = body["messages"][0]["content"]
+        .as_array()
+        .expect("content array");
+    assert_eq!(content[0], json!({"type": "text", "text": "what is this"}));
+    let expect_b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4]);
+    assert_eq!(
+        content[1],
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": expect_b64,
+            }
+        })
+    );
+}
+
+#[test]
+fn test_image_block_degrades_for_claude2_and_assistant() {
+    let auth = AnthropicAuth::ApiKey("sk-ant-api-testkey123".to_string());
+    let provider = make_anthropic_provider(
+        "https://api.anthropic.com/v1".to_string(),
+        Some(auth),
+        vec![],
+        None,
+        None,
+    );
+    let img = ContentBlock::Image {
+        source: ImageSource::Bytes {
+            mime: "image/png".to_string(),
+            data: vec![9, 9],
+        },
+    };
+
+    // Non-vision model: user image -> text placeholder.
+    let req = anthropic_req(
+        "claude-2.1",
+        vec![Message {
+            role: Role::User,
+            content: vec![img.clone()],
+            meta: pacode_types::MessageMeta::default(),
+        }],
+    );
+    let body = provider.build_body(&req);
+    assert_eq!(
+        body["messages"][0]["content"][0],
+        json!({"type": "text", "text": "[image: image/png, 2 bytes]"})
+    );
+
+    // Vision model but assistant turn: the API rejects images there, degrade.
+    let req2 = anthropic_req(
+        "claude-3-5-sonnet-20241022",
+        vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "q".to_string(),
+                }],
+                meta: pacode_types::MessageMeta::default(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![img],
+                meta: pacode_types::MessageMeta::default(),
+            },
+        ],
+    );
+    let body2 = provider.build_body(&req2);
+    let assistant = body2["messages"]
+        .as_array()
+        .expect("msgs")
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant msg")
+        .clone();
+    assert_eq!(
+        assistant["content"][0],
+        json!({"type": "text", "text": "[image: image/png, 2 bytes]"}),
+        "assistant image degrades to text"
+    );
+}
+
+#[test]
+fn test_anthropic_model_info_vision_and_efforts() {
+    let auth = AnthropicAuth::ApiKey("sk-ant-api-testkey123".to_string());
+    let provider = make_anthropic_provider(
+        "https://api.anthropic.com/v1".to_string(),
+        Some(auth),
+        vec![ModelConfig {
+            id: "claude-custom".to_string(),
+            display_name: None,
+            context_window: None,
+            reasoning: None,
+            efforts: Some(vec![Effort::Medium, Effort::XHigh]),
+        }],
+        None,
+        None,
+    );
+    assert!(
+        provider
+            .model_info("claude-3-5-sonnet-20241022")
+            .supports_vision
+    );
+    assert!(!provider.model_info("claude-2.1").supports_vision);
+    assert!(!provider.model_info("claude-instant-1.2").supports_vision);
+    assert_eq!(
+        provider.model_info("claude-custom").supported_efforts,
+        Some(vec![Effort::Medium, Effort::XHigh])
+    );
+    assert_eq!(
+        provider
+            .model_info("claude-3-5-sonnet-20241022")
+            .supported_efforts,
+        None
     );
 }

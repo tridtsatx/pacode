@@ -51,21 +51,60 @@ pub fn build_responses_body(
         }
     }
 
+    let vision = model_supports_vision(&req.model);
+
     let mut input = Vec::new();
     for msg in &req.messages {
         match msg.role {
             Role::User => {
+                let has_images = msg
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }));
+                if !vision || !has_images {
+                    input.push(serde_json::json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": crate::image::text_with_image_fallbacks(msg),
+                        }]
+                    }));
+                    continue;
+                }
+                let mut text = msg.text();
+                let mut content: Vec<Value> = Vec::new();
+                for block in &msg.content {
+                    if let ContentBlock::Image { source } = block {
+                        match crate::image::load_image_data(source, crate::image::MAX_IMAGE_BYTES) {
+                            Some((mime, b64)) => content.push(serde_json::json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{mime};base64,{b64}"),
+                            })),
+                            None => {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(&crate::image::image_fallback_text(source));
+                            }
+                        }
+                    }
+                }
+                let mut parts = Vec::with_capacity(content.len() + 1);
+                parts.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": text,
+                }));
+                parts.extend(content);
                 input.push(serde_json::json!({
                     "type": "message",
                     "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": msg.text(),
-                    }]
+                    "content": parts,
                 }));
             }
             Role::Assistant => {
-                let text = msg.text();
+                // `input_image` is only valid on user input; degrade to text.
+                let text = crate::image::text_with_image_fallbacks(msg);
                 if !text.is_empty() {
                     input.push(serde_json::json!({
                         "type": "message",
@@ -197,6 +236,19 @@ pub fn reasoning_enabled_for(cfg: &ProviderConfig, model: &str) -> bool {
 pub fn model_heuristic_reasoning(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     REASONING_KEYWORDS.iter().any(|&k| lower.contains(k))
+}
+
+/// Whether the model accepts `input_image` parts. The Responses API serves the
+/// gpt-5/codex/o-series families, all of which take image input; `o1-mini` and
+/// `o1-preview` are the exceptions.
+pub fn model_supports_vision(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("o1-mini") || lower.contains("o1-preview") {
+        return false;
+    }
+    ["codex", "gpt-5", "gpt-4o", "gpt-4.1", "o1", "o3", "o4"]
+        .iter()
+        .any(|&k| lower.contains(k))
 }
 
 pub fn deep_merge(target: &mut Value, source: &Value) {

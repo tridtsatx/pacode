@@ -59,6 +59,38 @@ const REASONING_KEYWORDS: &[&str] = &[
     "minimax",
 ];
 
+/// Model ids suggesting image input: OpenAI vision families, the VLM naming
+/// conventions (`*-vl`, `*4v`, llava/pixtral/…), and the multimodal frontier
+/// models gateways like OpenRouter relay verbatim.
+const VISION_KEYWORDS: &[&str] = &[
+    "vision",
+    "-vl",
+    "4v",
+    "llava",
+    "pixtral",
+    "moondream",
+    "internvl",
+    "minicpm-v",
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-5",
+    "o1",
+    "o3",
+    "o4",
+    "chatgpt",
+    "claude",
+    "gemini",
+    "llama-4",
+    "mistral-small-3",
+    "mistral-medium",
+    "grok-4",
+    "grok-2-vision",
+];
+
+/// Keyword hits that are known to lack image input; checked first so a false
+/// positive degrades to text instead of failing the request.
+const VISION_EXCLUDE: &[&str] = &["o1-mini", "o1-preview", "o3-mini", "claude-2", "instant"];
+
 pub struct OpenAiCompat {
     id: String,
     cfg: ProviderConfig,
@@ -135,22 +167,65 @@ impl OpenAiCompat {
             "content": system_content,
         }));
 
+        let vision = model_supports_vision(&req.model);
+
         for msg in &req.messages {
             match msg.role {
                 Role::User => {
+                    let has_images = msg
+                        .content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Image { .. }));
+                    if !vision || !has_images {
+                        // No vision (or no images): a plain string keeps the
+                        // wire shape unchanged; images degrade to placeholders.
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": crate::image::text_with_image_fallbacks(msg),
+                        }));
+                        continue;
+                    }
+                    let mut text = msg.text();
+                    let mut parts: Vec<Value> = Vec::new();
+                    for block in &msg.content {
+                        if let ContentBlock::Image { source } = block {
+                            match crate::image::load_image_data(
+                                source,
+                                crate::image::MAX_IMAGE_BYTES,
+                            ) {
+                                Some((mime, b64)) => parts.push(serde_json::json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{mime};base64,{b64}"),
+                                    },
+                                })),
+                                None => {
+                                    if !text.is_empty() {
+                                        text.push('\n');
+                                    }
+                                    text.push_str(&crate::image::image_fallback_text(source));
+                                }
+                            }
+                        }
+                    }
+                    let mut content = Vec::with_capacity(parts.len() + 1);
+                    content.push(serde_json::json!({ "type": "text", "text": text }));
+                    content.extend(parts);
                     messages.push(serde_json::json!({
                         "role": "user",
-                        "content": msg.text(),
+                        "content": content,
                     }));
                 }
                 Role::System => {
                     messages.push(serde_json::json!({
                         "role": "system",
-                        "content": msg.text(),
+                        "content": crate::image::text_with_image_fallbacks(msg),
                     }));
                 }
                 Role::Assistant => {
-                    let text = msg.text();
+                    // Images are only valid on user turns; degrade any that
+                    // ended up in assistant history.
+                    let text = crate::image::text_with_image_fallbacks(msg);
                     let mut tool_calls = Vec::new();
                     for block in &msg.content {
                         if let ContentBlock::ToolUse { id, name, input } = block {
@@ -376,6 +451,16 @@ impl OpenAiCompat {
 fn model_heuristic_reasoning(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     REASONING_KEYWORDS.iter().any(|&k| lower.contains(k))
+}
+
+/// Whether the model accepts `image_url` parts. Substring heuristic — a miss
+/// degrades images to text, so the list errs toward the well-known families.
+pub fn model_supports_vision(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    if VISION_EXCLUDE.iter().any(|&k| lower.contains(k)) {
+        return false;
+    }
+    VISION_KEYWORDS.iter().any(|&k| lower.contains(k))
 }
 
 fn deep_merge(target: &mut Value, source: &Value) {
@@ -735,8 +820,12 @@ impl Provider for OpenAiCompat {
             display_name,
             context_window,
             supports_reasoning,
-            supports_vision: false,
-            supported_efforts: None,
+            supports_vision: model_supports_vision(model),
+            // providers.toml `efforts` wins; `/models` responses (incl.
+            // OpenRouter `supported_parameters`) do not enumerate effort
+            // levels, so there is nothing else to merge yet.
+            // TODO(zdr-batch): api effort metadata
+            supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
             pricing,
         }
     }

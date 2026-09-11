@@ -94,3 +94,11 @@ pub fn model_heuristic_reasoning(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     REASONING_KEYWORDS.iter().any(|&k| lower.contains(k))
 }
+
+/// Whether the model accepts `image` blocks. Every model the Anthropic API
+/// serves today (claude-3 on, plus the short aliases) takes image input; only
+/// the retired claude-2/instant generation did not.
+pub fn model_supports_vision(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    !(lower.contains("claude-2") || lower.contains("instant"))
+}

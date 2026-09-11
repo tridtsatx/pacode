@@ -200,6 +200,7 @@ impl Anthropic {
             self.is_oauth(),
             self.reasoning_enabled_for(&req.model),
             self.defaults.effort,
+            types::model_supports_vision(&req.model),
             self.cfg.extra_body.as_ref(),
         )
     }
@@ -419,8 +420,8 @@ impl Provider for Anthropic {
             display_name,
             context_window: Some(context_window),
             supports_reasoning,
-            supports_vision: false,
-            supported_efforts: None,
+            supports_vision: types::model_supports_vision(model),
+            supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
             pricing,
         }
     }
