@@ -363,12 +363,25 @@ impl Session {
 
     /// Session ZDR toggle; persists through `meta` (touch upserts the row and
     /// emits `SessionUpdated`, which the TUI snapshot carries).
-    pub fn set_zdr(&self, zdr: bool) {
+    ///
+    /// Enabling requires the current route to be flagged `zdr_capable` —
+    /// otherwise the submit guard would just reject the next prompt anyway,
+    /// so the refusal happens here with an actionable error.
+    pub fn set_zdr(&self, zdr: bool) -> Result<(), CoreError> {
+        if zdr {
+            let route = self.meta().model;
+            if !self.model_flags(&route.to_string()).zdr_capable {
+                return Err(CoreError::Invalid(format!(
+                    "zdr_blocked: {route} is not flagged zdr_capable; mark it in the model picker first"
+                )));
+            }
+        }
         {
             let mut meta = self.meta.write().unwrap_or_else(|p| p.into_inner());
             meta.zdr = zdr;
         }
         self.touch();
+        Ok(())
     }
 
     /// Flags for one `provider/model` key; absent entry means all-false.
@@ -380,13 +393,27 @@ impl Session {
     }
 
     /// Merge a flag update for one `provider/model` key.
-    pub fn set_model_flags(&self, key: String, flags: ModelFlags) {
+    ///
+    /// While ZDR is active, `zdr_capable` cannot be stripped from the
+    /// currently routed model: the turn loop re-resolves that route on every
+    /// iteration, so unmarking it mid-turn would wedge the session.
+    pub fn set_model_flags(&self, key: String, flags: ModelFlags) -> Result<(), CoreError> {
+        if self.zdr_active()
+            && self.meta().model.to_string() == key
+            && self.model_flags(&key).zdr_capable
+            && !flags.zdr_capable
+        {
+            return Err(CoreError::Invalid(
+                "zdr_blocked: cannot unmark the active route while ZDR is on".into(),
+            ));
+        }
         let mut map = self.model_flags.write().unwrap_or_else(|p| p.into_inner());
         if flags == ModelFlags::default() {
             map.remove(&key);
         } else {
             map.insert(key, flags);
         }
+        Ok(())
     }
 
     /// Run `update` against each agent's `AgentInfo`; where it returns `true`,

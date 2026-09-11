@@ -164,7 +164,22 @@ pub async fn run_turn(
             max_output_tokens: None,
         };
 
-        let provider = match session.providers.resolve(&agent_info.model).await {
+        // Re-check the ZDR flag at the resolve point: `SetZdr`/`SetModel`/
+        // `SetModelFlag` guards cover the request path, but a turn re-driven
+        // by injections or `continue_agent` reaches here without them.
+        let provider = if session.zdr_active()
+            && !session
+                .model_flags(&agent_info.model.to_string())
+                .zdr_capable
+        {
+            Err(pacode_provider::ProviderError::Config(format!(
+                "zdr_blocked: {} is not flagged zdr_capable",
+                agent_info.model
+            )))
+        } else {
+            session.providers.resolve(&agent_info.model).await
+        };
+        let provider = match provider {
             Ok(p) => p,
             Err(e) => {
                 emit_failure_notice(&session, &agent, &e.to_string());

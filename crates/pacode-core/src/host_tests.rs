@@ -332,7 +332,7 @@ mod zdr {
     use pacode_tools::host::PermissionDraft;
     use pacode_tools::{ToolHost, ToolKind};
     use pacode_types::{
-        AgentId, CallId, Mode, ModelRoute, PermissionDecision, SessionMeta, ZdrMode,
+        AgentId, CallId, Mode, ModelFlags, ModelRoute, PermissionDecision, SessionMeta, ZdrMode,
     };
 
     use crate::host::SessionHost;
@@ -387,7 +387,15 @@ mod zdr {
             app_version: "test".to_string(),
             skills: Arc::new(pacode_skills::SkillRegistry::default()),
             scheduler: crate::schedule::Scheduler::new(),
-            model_flags: RwLock::new(HashMap::new()),
+            // The route starts flagged so `set_zdr(true)` passes the capable
+            // check; tests that need an unflagged route clear it explicitly.
+            model_flags: RwLock::new(HashMap::from([(
+                "mock/mock-model".to_string(),
+                ModelFlags {
+                    zdr_capable: true,
+                    ..ModelFlags::default()
+                },
+            )])),
         });
         (temp, session)
     }
@@ -409,7 +417,7 @@ mod zdr {
     async fn zdr_active_modes() {
         let (_t, session) = zdr_session(ZdrMode::Session);
         assert!(!session.zdr_active(), "session mode + zdr off = inactive");
-        session.set_zdr(true);
+        session.set_zdr(true).unwrap();
         assert!(session.zdr_active(), "session mode + zdr on = active");
 
         let (_t, always) = zdr_session(ZdrMode::Always);
@@ -419,14 +427,14 @@ mod zdr {
         );
 
         let (_t, off) = zdr_session(ZdrMode::Off);
-        off.set_zdr(true);
+        off.set_zdr(true).unwrap();
         assert!(!off.zdr_active(), "off mode ignores the meta flag");
     }
 
     #[tokio::test]
     async fn zdr_denies_network_and_mcp_tools() {
         let (_t, session) = zdr_session(ZdrMode::Session);
-        session.set_zdr(true);
+        session.set_zdr(true).unwrap();
         let host = SessionHost {
             session,
             agent: AgentId::main(),
@@ -458,9 +466,48 @@ mod zdr {
     }
 
     #[tokio::test]
+    async fn zdr_enable_rejects_unflagged_route() {
+        let (_t, session) = zdr_session(ZdrMode::Session);
+        session
+            .set_model_flags("mock/mock-model".into(), ModelFlags::default())
+            .unwrap();
+        let err = session.set_zdr(true).unwrap_err().to_string();
+        assert!(err.contains("zdr_blocked"), "unexpected error: {err}");
+        assert!(
+            !session.zdr_active(),
+            "rejected enable must not flip the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn zdr_blocks_unmarking_active_route() {
+        let (_t, session) = zdr_session(ZdrMode::Session);
+        session.set_zdr(true).unwrap();
+        let err = session
+            .set_model_flags("mock/mock-model".into(), ModelFlags::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zdr_blocked"), "unexpected error: {err}");
+        // Favoriting the active route stays allowed — only unmarking fails.
+        session
+            .set_model_flags(
+                "mock/mock-model".into(),
+                ModelFlags {
+                    zdr_capable: true,
+                    favorite: true,
+                },
+            )
+            .unwrap();
+        // Other routes are unaffected by the guard.
+        session
+            .set_model_flags("mock/other".into(), ModelFlags::default())
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn zdr_denies_subagent_spawn() {
         let (_t, session) = zdr_session(ZdrMode::Session);
-        session.set_zdr(true);
+        session.set_zdr(true).unwrap();
         let host = SessionHost {
             session,
             agent: AgentId::main(),
