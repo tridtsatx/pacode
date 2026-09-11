@@ -213,7 +213,11 @@ impl ToolHost for SessionHost {
                     .emit(pacode_types::Event::ItemUpdated(notice_item));
 
                 if let Some(agent) = &agent_opt {
-                    agent.set_status(prev_status, prev_activity);
+                    // A stop that landed during the permission wait wins over
+                    // restoring the pre-permission status.
+                    if !agent.stop_requested() {
+                        agent.set_status(prev_status, prev_activity);
+                    }
                     self.session
                         .events
                         .emit(pacode_types::Event::AgentUpdated(agent.info()));
@@ -517,6 +521,13 @@ impl ToolHost for SessionHost {
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         self.session
             .stop_agent(agent)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
+    }
+
+    async fn continue_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
+        self.session
+            .continue_agent(agent)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))
     }

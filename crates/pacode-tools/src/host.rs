@@ -497,6 +497,10 @@ pub trait ToolHost: Send + Sync {
     /// provider — against the session's provider registry.
     fn parse_model_route(&self, s: &str) -> Option<ModelRoute>;
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError>;
+    /// Re-drive a `Stopped` agent: appends a resume nudge to its retained
+    /// history and starts a fresh turn. Errors while the agent is still running
+    /// or already in a terminal state.
+    async fn continue_agent(&self, agent: &AgentId) -> Result<(), ToolError>;
     /// Orchestrator → subagent: ask for a brief status. Delivered to the subagent as a
     /// `<status_request>` injection at its next step; it answers with `report_status`.
     fn request_agent_status(&self, agent: &AgentId) -> Result<(), ToolError>;

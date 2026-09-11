@@ -472,10 +472,102 @@ impl Session {
         Ok(id)
     }
 
+    /// Cancel the main agent's turn and stop every live subagent
+    /// (`Request::InterruptAll`). The main agent keeps `Interrupt` semantics
+    /// (lands `Idle`); subagents land `Stopped` with their history retained.
+    pub async fn interrupt_all(&self) {
+        self.interrupt();
+        let sub_ids: Vec<AgentId> = self
+            .agents
+            .read()
+            .map(|a| {
+                a.values()
+                    .filter(|agent| !agent.id().is_main() && agent.status().is_live())
+                    .map(|agent| agent.id())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in sub_ids {
+            if let Err(e) = self.stop_agent(&id).await {
+                log::warn!(
+                    "interrupt_all: failed to stop agent {id} in {}: {e}",
+                    self.id
+                );
+            }
+        }
+    }
+
+    /// Re-drive a `Stopped` agent: append the orchestrator's resume nudge to
+    /// its retained history and start a fresh turn on a new cancel token — the
+    /// same path `spawn_agent` takes. Errors while the agent is still running
+    /// (let the stop land first) or already in a terminal state.
+    pub async fn continue_agent(self: &Arc<Self>, id: &AgentId) -> Result<(), CoreError> {
+        let agent = self
+            .agent(id)
+            .ok_or_else(|| CoreError::AgentNotFound(id.clone()))?;
+        if agent.is_running() {
+            return Err(CoreError::Invalid(format!("agent {id} is still running")));
+        }
+        if agent.status() != pacode_types::AgentStatus::Stopped {
+            return Err(CoreError::Invalid(format!(
+                "agent {id} is not stopped (status: {:?})",
+                agent.status()
+            )));
+        }
+
+        let (seq, arc_msg) = agent
+            .history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(pacode_types::Message::user(
+                "[resumed by orchestrator: continue your task]",
+            ));
+        self.store
+            .append_message(&self.id, &agent.id(), seq, &arc_msg)
+            .await?;
+
+        // A transcript notice so the resume is visible rather than a turn that
+        // appears out of nowhere.
+        let item = pacode_types::TranscriptItem {
+            seq: agent
+                .transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .next_seq(),
+            agent: id.clone(),
+            ts_ms: pacode_types::now_ms(),
+            kind: pacode_types::TranscriptKind::Notice {
+                level: pacode_types::ToastLevel::Info,
+                text: "resumed by orchestrator".to_string(),
+            },
+        };
+        agent
+            .transcript
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .upsert(item.clone());
+        self.events.emit(pacode_types::Event::ItemAdded(item));
+
+        // `start_turn` refuses agents with `stop_requested` set (a stop can
+        // land while a spawn is still wiring its token); clearing the flag is
+        // the resume opt-in.
+        agent.clear_stop_request();
+        agent.set_status(pacode_types::AgentStatus::Idle, None);
+        self.events
+            .emit(pacode_types::Event::AgentUpdated(agent.info()));
+        crate::turn::start_turn(self.clone(), agent);
+        Ok(())
+    }
+
     pub async fn stop_agent(&self, id: &AgentId) -> Result<(), CoreError> {
         let agent = self
             .agent(id)
             .ok_or_else(|| CoreError::AgentNotFound(id.clone()))?;
+        // Raise the flag and mark `Stopped` BEFORE cancelling the token: the
+        // unwinding turn must see the request, not overwrite it to `Finished`
+        // or drop the retained history.
+        agent.request_stop();
+        agent.set_status(pacode_types::AgentStatus::Stopped, None);
         if let Some(cancel) = agent
             .cancel
             .lock()
@@ -485,7 +577,6 @@ impl Session {
             cancel.cancel();
         }
         self.cancel_questions_for(id);
-        agent.set_status(pacode_types::AgentStatus::Stopped, None);
         let info = agent.info();
         let _ = self
             .store

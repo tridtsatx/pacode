@@ -254,6 +254,10 @@ impl ToolHost for StubToolHost {
         Err(ToolError::Failed("no agents in this test".to_string()))
     }
 
+    async fn continue_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
+        Err(ToolError::Failed("no agents in this test".to_string()))
+    }
+
     fn request_agent_status(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Err(ToolError::Failed("no agents in this test".to_string()))
     }

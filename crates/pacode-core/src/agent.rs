@@ -60,6 +60,11 @@ pub struct Agent {
     pub tools: RwLock<ToolRegistry>,
     /// Cancellation token of the running turn, if any.
     pub cancel: Mutex<Option<CancellationToken>>,
+    /// Set by `stop_agent`/`interrupt_all`/`close_session` BEFORE the token is
+    /// cancelled; the unwinding turn reads it to keep `Stopped` and skip the
+    /// finished-report path. Survives status flaps mid-unwind. Cleared by
+    /// `Session::continue_agent`.
+    pub stop_requested: std::sync::atomic::AtomicBool,
     /// One turn at a time.
     pub turn_lock: tokio::sync::Mutex<()>,
     pub transcript: Mutex<TranscriptState>,
@@ -89,6 +94,7 @@ impl Agent {
             injections: InjectionQueue::default(),
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
+            stop_requested: std::sync::atomic::AtomicBool::new(false),
             turn_lock: tokio::sync::Mutex::new(()),
             transcript: Mutex::new(TranscriptState::new(history_page as usize * 2)),
             prompt: RwLock::new(prompt),
@@ -113,6 +119,7 @@ impl Agent {
             injections: InjectionQueue::default(),
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
+            stop_requested: std::sync::atomic::AtomicBool::new(false),
             turn_lock: tokio::sync::Mutex::new(()),
             transcript: Mutex::new(transcript),
             prompt: RwLock::new(prompt),
@@ -176,12 +183,31 @@ impl Agent {
         self.cancel.lock().map(|c| c.is_some()).unwrap_or(false)
     }
 
+    pub fn request_stop(&self) {
+        self.stop_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn clear_stop_request(&self) {
+        self.stop_requested
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Update status/activity; the caller emits `AgentUpdated` through the session.
+    /// A live status clears the finish stamp (a `continue`d agent is running
+    /// again); a terminal one stamps it once.
     pub fn set_status(&self, status: AgentStatus, activity: Option<String>) {
         if let Ok(mut info) = self.info.write() {
             info.status = status;
             info.activity = activity;
-            if !status.is_live() && info.finished_at_ms.is_none() {
+            if status.is_live() {
+                info.finished_at_ms = None;
+            } else if info.finished_at_ms.is_none() {
                 info.finished_at_ms = Some(pacode_types::now_ms());
             }
         }

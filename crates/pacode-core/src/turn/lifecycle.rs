@@ -16,7 +16,16 @@ pub(crate) async fn handle_interrupted(
     start_instant: std::time::Instant,
     turn_usage: Usage,
 ) -> TurnStop {
-    agent.set_status(AgentStatus::Idle, None);
+    // `stop_agent`/`interrupt_all` raised `stop_requested` before cancelling;
+    // mid-unwind status writes (e.g. permission-restore) may flap the visible
+    // status, so the flag — not the status — decides: `Stopped` survives for
+    // `continue` to re-drive.
+    let status = if agent.stop_requested() {
+        AgentStatus::Stopped
+    } else {
+        AgentStatus::Idle
+    };
+    agent.set_status(status, None);
     session.events.emit(Event::AgentUpdated(agent.info()));
     let duration_ms = start_instant.elapsed().as_millis() as u64;
     let output_tokens = turn_usage.output_tokens;
@@ -73,6 +82,12 @@ pub(crate) fn emit_failure_notice(session: &Session, agent: &Agent, message: &st
 /// parent gets an `Injection::AgentFinished` and the agent's history is persisted
 /// and dropped from memory (info + summary stay).
 pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
+    // A stopped subagent stays stopped: `stop_agent` can land while a spawn is
+    // still wiring up the token, and a fresh token would outrun the stop. Only
+    // `Session::continue_agent` restarts one — it clears the request first.
+    if !agent.id().is_main() && agent.stop_requested() {
+        return;
+    }
     let cancel = CancellationToken::new();
     *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
 
@@ -110,7 +125,18 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
             return;
         }
 
-        if !agent.id().is_main() {
+        // A stopped subagent keeps `Stopped` and its history so `continue` can
+        // re-drive it later. No report is injected into the parent: it learned
+        // about the stop as a tool result (or was interrupted itself), and
+        // re-driving it here would defeat `InterruptAll`. The check is on this
+        // turn's stop reason, not only the flag: `continue_agent` clears
+        // `stop_requested` while an interrupted turn's post-block may still be
+        // running — keying on `stop` keeps that unwinding turn from clobbering
+        // the resumed agent (Finished status, parent injection, history drop).
+        if !agent.id().is_main()
+            && !matches!(stop, TurnStop::Interrupted)
+            && !agent.stop_requested()
+        {
             let last_assistant_text = {
                 let hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
                 hist.messages

@@ -235,6 +235,19 @@ impl ToolHost for StubHost {
         Ok(())
     }
 
+    async fn continue_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
+        if let Some(a) = self
+            .agents
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|a| a.id == *agent)
+        {
+            a.status = AgentStatus::Thinking;
+        }
+        Ok(())
+    }
+
     fn plan(&self) -> Plan {
         self.plan.lock().unwrap().clone()
     }

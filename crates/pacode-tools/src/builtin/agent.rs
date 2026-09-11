@@ -40,8 +40,9 @@ impl Tool for AgentTool {
          end your turn rather than polling. `spawn` takes an optional `kind`: a named \
          subagent type from `<cwd>/.pacode/agents/*.md` or the global config's \
          `agents/` dir whose file supplies the brief, tools, and model — `list` shows \
-         the available kinds. `stop` cancels, `ask_status` asks a running subagent for \
-         a brief status that arrives at your next step. Subagents cannot spawn agents."
+         the available kinds. `stop` cancels, `continue` resumes a stopped agent with \
+         its context intact, `ask_status` asks a running subagent for a brief status \
+         that arrives at your next step. Subagents cannot spawn agents."
     }
 
     fn schema(&self) -> Value {
@@ -49,7 +50,7 @@ impl Tool for AgentTool {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "stop", "list", "ask_status"]},
+                "action": {"type": "string", "enum": ["spawn", "stop", "continue", "list", "ask_status"]},
                 "prompt": {"type": "string", "description": "Full task description for the subagent (spawn)."},
                 "kind": {"type": "string", "description": "Named subagent type from `agents/*.md` files; `list` shows what is available."},
                 "name": {"type": "string", "description": "Short name shown in the UI, e.g. `tests`."},
@@ -158,6 +159,17 @@ impl Tool for AgentTool {
                 Ok(ToolOutput::text(content)
                     .with_title(format!("Agent stop {id}"))
                     .with_preview("stopped"))
+            }
+            "continue" => {
+                let agent_id_str = args
+                    .agent_id
+                    .ok_or_else(|| ToolError::invalid("agent_id is required for continue"))?;
+                let id = AgentId::new(agent_id_str);
+                ctx.host.continue_agent(&id).await?;
+                let content = format!("Agent {id} resumed.");
+                Ok(ToolOutput::text(content)
+                    .with_title(format!("Agent continue {id}"))
+                    .with_preview("resumed"))
             }
             "list" => {
                 let agents = ctx.host.list_agents();

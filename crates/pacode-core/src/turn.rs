@@ -81,8 +81,12 @@ pub async fn run_turn(
         agent: agent.id(),
         turn: turn_id.clone(),
     });
-    agent.set_status(AgentStatus::Thinking, Some("thinking".to_string()));
-    session.events.emit(Event::AgentUpdated(agent.info()));
+    // Don't flap Thinking over a stop that landed during turn setup;
+    // `handle_interrupted` keeps `Stopped` once the loop observes the cancel.
+    if !agent.stop_requested() {
+        agent.set_status(AgentStatus::Thinking, Some("thinking".to_string()));
+        session.events.emit(Event::AgentUpdated(agent.info()));
+    }
 
     // Turn start is the explicit invalidation point for prompt caching
     let meta = session.meta();
@@ -112,6 +116,13 @@ pub async fn run_turn(
             )
             .await;
         }
+
+        // Fold queued injections into history BEFORE building the request: a
+        // turn started by an injection (e.g. `AgentFinished` re-driving the
+        // parent) must see it in the first call — otherwise the provider gets
+        // a stale (or even empty) message list and the injection only lands
+        // after a wasted round-trip.
+        drain_injections(&session, &agent).await;
 
         let system_dynamic = {
             let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
@@ -334,25 +345,10 @@ pub async fn run_turn(
         }
 
         if outcome.tool_calls.is_empty() {
-            let drained = agent.injections.drain();
-            if drained.is_empty() {
-                break;
-            } else {
-                let injection_msg = crate::inject::render_injections(
-                    &drained,
-                    session.config.context.injection_cap_chars,
-                );
-                let (inj_seq, arc_inj) = agent
-                    .history
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(injection_msg);
-                let _ = session
-                    .store
-                    .append_message(&session.id, &agent.id(), inj_seq, &arc_inj)
-                    .await;
+            if drain_injections(&session, &agent).await {
                 continue;
             }
+            break;
         }
 
         let tool_interrupted =
@@ -369,22 +365,7 @@ pub async fn run_turn(
             .await;
         }
 
-        let drained = agent.injections.drain();
-        if !drained.is_empty() {
-            let injection_msg = crate::inject::render_injections(
-                &drained,
-                session.config.context.injection_cap_chars,
-            );
-            let (inj_seq, arc_inj) = agent
-                .history
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(injection_msg);
-            let _ = session
-                .store
-                .append_message(&session.id, &agent.id(), inj_seq, &arc_inj)
-                .await;
-        }
+        drain_injections(&session, &agent).await;
 
         let est_tokens = agent
             .history
@@ -481,4 +462,25 @@ pub async fn run_turn(
     *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     TurnStop::Completed
+}
+
+/// Drain queued injections into history (rendered as one user message,
+/// persisted) — returns `true` when anything was appended.
+async fn drain_injections(session: &Arc<Session>, agent: &Arc<Agent>) -> bool {
+    let drained = agent.injections.drain();
+    if drained.is_empty() {
+        return false;
+    }
+    let injection_msg =
+        crate::inject::render_injections(&drained, session.config.context.injection_cap_chars);
+    let (inj_seq, arc_inj) = agent
+        .history
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(injection_msg);
+    let _ = session
+        .store
+        .append_message(&session.id, &agent.id(), inj_seq, &arc_inj)
+        .await;
+    true
 }

@@ -153,6 +153,9 @@ impl ToolHost for DummyHost {
     async fn stop_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Ok(())
     }
+    async fn continue_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
+        Ok(())
+    }
     fn request_agent_status(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Ok(())
     }

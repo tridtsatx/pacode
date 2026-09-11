@@ -190,6 +190,10 @@ impl ToolHost for StubHost {
         Ok(())
     }
 
+    async fn continue_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     fn plan(&self) -> Plan {
         self.plan.lock().unwrap().clone()
     }

@@ -190,12 +190,7 @@ impl Core {
             }
             Request::InterruptAll => {
                 // Main agent's turn plus every live subagent.
-                session.interrupt();
-                for info in session.agent_infos() {
-                    if !info.id.is_main() && info.status.is_live() {
-                        let _ = session.stop_agent(&info.id).await;
-                    }
-                }
+                session.interrupt_all().await;
                 Reply::Ok
             }
             Request::PermissionReply {
@@ -674,6 +669,10 @@ impl Core {
                 .map(|a| a.values().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             for agent in agents {
+                // Stop request first: the unwinding turn must not take the
+                // Finished path (report injection, history drop, parent re-drive).
+                agent.request_stop();
+                agent.set_status(pacode_types::AgentStatus::Stopped, None);
                 if let Some(cancel) = agent
                     .cancel
                     .lock()
@@ -682,7 +681,6 @@ impl Core {
                 {
                     cancel.cancel();
                 }
-                agent.set_status(pacode_types::AgentStatus::Stopped, None);
                 let info = agent.info();
                 let _ = session
                     .store

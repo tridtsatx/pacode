@@ -734,6 +734,272 @@ async fn test_turn_after_set_model_uses_new_route() {
     assert_eq!(req.effort, Some(Effort::Max));
 }
 
+/// Poll `f` until it holds or 2 s elapse (turn unwinding is async).
+async fn wait_until(mut f: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition not met within 2s");
+}
+
+fn sub_spec(name: &str) -> pacode_tools::AgentSpec {
+    pacode_tools::AgentSpec {
+        name: Some(name.into()),
+        prompt: "work".into(),
+        tools: None,
+        fork: false,
+        model: None,
+        effort: None,
+    }
+}
+
+/// `submit_user_message` returns after enqueueing, not when the turn ends —
+/// otherwise `Request::Interrupt` could never arrive mid-turn (the ctrl+c
+/// delay). Proven by interrupting a turn that is still streaming.
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_returns_before_turn_end_and_interrupt_lands_mid_turn() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(400),
+        text: "slow answer".into(),
+    });
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    tokio::time::timeout(Duration::from_millis(200), async {
+        session.submit_user_message("go".into()).await.unwrap();
+    })
+    .await
+    .expect("submit must return long before the slow turn ends");
+
+    let reply = core.handle(&session_id, Request::Interrupt).await;
+    assert!(matches!(reply, Reply::Ok));
+
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for interrupted turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, stop, .. })) = res
+                    && agent.is_main()
+                {
+                    assert_eq!(stop, TurnStop::Interrupted);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// `InterruptAll` cancels the main agent's turn AND every live subagent, marking
+/// them `Stopped` with history retained — and a winding-down subagent must not
+/// re-drive the main turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_all_stops_main_and_subagents_without_restarting_main() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "subagent mid-work".into(),
+    });
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "main mid-work".into(),
+    });
+
+    let sub_id = session.spawn_agent(sub_spec("sub")).await.unwrap();
+    session.submit_user_message("go".into()).await.unwrap();
+
+    // Let both turns actually start before the interrupt lands.
+    let mut saw_main_start = false;
+    let mut saw_sub_start = false;
+    let start_timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(start_timeout);
+    loop {
+        tokio::select! {
+            _ = &mut start_timeout => panic!("timed out waiting for both turns to start"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnStarted { agent, .. })) = res {
+                    if agent.is_main() { saw_main_start = true; }
+                    if agent == sub_id { saw_sub_start = true; }
+                    if saw_main_start && saw_sub_start { break; }
+                }
+            }
+        }
+    }
+
+    let reply = core.handle(&session_id, Request::InterruptAll).await;
+    assert!(matches!(reply, Reply::Ok));
+
+    let mut saw_main_end = false;
+    let mut saw_sub_end = false;
+    let end_timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(end_timeout);
+    loop {
+        tokio::select! {
+            _ = &mut end_timeout => break,
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, .. })) = res {
+                    if agent.is_main() { saw_main_end = true; }
+                    if agent == sub_id { saw_sub_end = true; }
+                    if saw_main_end && saw_sub_end { break; }
+                }
+            }
+        }
+    }
+    assert!(saw_main_end && saw_sub_end, "both turns must end");
+
+    let sub = session.agent(&sub_id).unwrap();
+    wait_until(|| !sub.is_running()).await;
+    assert_eq!(sub.status(), AgentStatus::Stopped);
+    assert!(
+        !sub.history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .messages
+            .is_empty(),
+        "stopped agent keeps its history for `continue`"
+    );
+    let main = session.main_agent().unwrap();
+    assert_eq!(main.status(), AgentStatus::Idle);
+
+    // Give a hypothetical re-drive a window to happen: it must not.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !main.is_running(),
+        "InterruptAll must not restart the main turn"
+    );
+    assert_eq!(main.status(), AgentStatus::Idle);
+}
+
+/// `continue` on a stopped subagent re-drives its turn on a fresh token: the
+/// nudge lands in history, reaches the model as the last user message, and the
+/// agent finishes normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn continue_redrives_stopped_agent_with_nudge() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(200),
+        text: "subagent mid-work".into(),
+    });
+    // The resumed turn's response, then the parent turn that the finished
+    // subagent's report re-drives.
+    mock.push(MockResponse::Text("resumed report".into()));
+    mock.push(MockResponse::Text("noted".into()));
+
+    let sub_id = session.spawn_agent(sub_spec("sub")).await.unwrap();
+    session.stop_agent(&sub_id).await.unwrap();
+
+    let sub = session.agent(&sub_id).unwrap();
+    wait_until(|| !sub.is_running()).await;
+    assert_eq!(sub.status(), AgentStatus::Stopped);
+
+    session.continue_agent(&sub_id).await.unwrap();
+
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for resumed turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, .. })) = res
+                    && agent == sub_id
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    wait_until(|| !sub.is_running()).await;
+    assert_eq!(sub.status(), AgentStatus::Finished);
+
+    // The stopped turn may have been cancelled before its provider call, so
+    // locate the resumed request by its nudge rather than by index.
+    let reqs = mock.requests();
+    let resumed = reqs
+        .iter()
+        .find(|r| {
+            r.messages
+                .last()
+                .is_some_and(|m| m.text().contains("[resumed by orchestrator"))
+        })
+        .expect("resumed request among recorded requests");
+    let last = resumed.messages.last().expect("resumed request messages");
+    assert_eq!(last.role, Role::User);
+    assert!(
+        last.text().contains("[resumed by orchestrator"),
+        "resume nudge must be the last user message, got: {}",
+        last.text()
+    );
+
+    // A fresh finish time: Stopped's stamp was cleared by the live status.
+    assert!(sub.info().finished_at_ms.is_some());
+}
+
+/// `continue` refuses agents that are not stopped: unknown id, still running,
+/// or already finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn continue_errors_on_live_or_unknown_agent() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    let err = session
+        .continue_agent(&AgentId::new("agt_missing"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("agent not found"), "got: {err}");
+
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "working".into(),
+    });
+    let running_id = session.spawn_agent(sub_spec("running")).await.unwrap();
+    let err = session.continue_agent(&running_id).await.unwrap_err();
+    assert!(
+        err.to_string().contains("still running"),
+        "running agent must not be resumable, got: {err}"
+    );
+    session.stop_agent(&running_id).await.unwrap();
+
+    mock.push(MockResponse::Text("quick done".into()));
+    mock.push(MockResponse::Text("main auto".into()));
+    let done_id = session.spawn_agent(sub_spec("done")).await.unwrap();
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for sub turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, .. })) = res
+                    && agent == done_id
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let done = session.agent(&done_id).unwrap();
+    wait_until(|| !done.is_running()).await;
+    assert_eq!(done.status(), AgentStatus::Finished);
+    let err = session.continue_agent(&done_id).await.unwrap_err();
+    assert!(
+        err.to_string().contains("not stopped"),
+        "finished agent is not resumable, got: {err}"
+    );
+}
+
 /// Resuming keeps only the transcript tail, and the item counter continues past
 /// it: a new item must not land on the seq of a restored one.
 #[test]
