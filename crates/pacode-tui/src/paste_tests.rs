@@ -109,19 +109,24 @@ fn test_paste_with_session_picker_focused_goes_into_filter() {
     let mut state = make_state();
     let now = Instant::now();
 
-    state.focus = Focus::Overlay(Overlay::SessionPicker {
-        query: "sess".to_string(),
-        index: 2,
+    // The Sessions menu level carries a local filter — paste lands in it.
+    state.focus = Focus::Overlay(Overlay::Menu {
+        stack: crate::ui::menu::MenuStack::root(crate::ui::menu::MenuId::Sessions),
+        ui: crate::ui::menu::MenuUiState {
+            query: "sess".to_string(),
+            cursor: crate::ui::menu::RowId::new("ses_old"),
+            ..crate::ui::menu::MenuUiState::default()
+        },
     });
     state.input.text = "untouched".to_string();
 
     handle_paste(&mut state, "ion-1\nnewline".to_string(), now);
 
     match &state.focus {
-        Focus::Overlay(Overlay::SessionPicker { query, index }) => {
+        Focus::Overlay(Overlay::Menu { ui, .. }) => {
             // multi-line text flattened into single-line filter
-            assert_eq!(query, "session-1 newline");
-            assert_eq!(*index, 0);
+            assert_eq!(ui.query, "session-1 newline");
+            assert!(ui.cursor.is_empty()); // cursor reset to top match
         }
         _ => panic!("focus changed unexpectedly"),
     }
@@ -134,13 +139,22 @@ fn test_paste_with_config_picker_focused_goes_into_query() {
     let mut state = make_state();
     let now = Instant::now();
 
-    state.focus = Focus::Overlay(Overlay::ConfigPicker);
-    state.config_view.query = "the".to_string();
+    // The Settings menu level carries a local filter — paste lands in it.
+    state.focus = Focus::Overlay(Overlay::Menu {
+        stack: crate::ui::menu::MenuStack::root(crate::ui::menu::MenuId::Settings),
+        ui: crate::ui::menu::MenuUiState {
+            query: "the".to_string(),
+            ..crate::ui::menu::MenuUiState::default()
+        },
+    });
     state.input.text = "untouched".to_string();
 
     handle_paste(&mut state, "me".to_string(), now);
 
-    assert_eq!(state.config_view.query, "theme");
+    let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
+        panic!("focus changed unexpectedly");
+    };
+    assert_eq!(ui.query, "theme");
     assert_eq!(state.input.text, "untouched");
 }
 

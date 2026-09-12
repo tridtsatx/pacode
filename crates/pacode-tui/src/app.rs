@@ -59,14 +59,11 @@ enum BgResponse {
         key: crate::state::input::BashKey,
         candidates: Vec<crate::bash::complete::Candidate>,
     },
-    /// A files preview finished (§8.1: the render — file IO + decode +
-    /// encode, or read + lex for `PreviewKind::Text` — ran on a blocking
-    /// thread, never in draw). Exactly one of `preview`/`text` is set,
-    /// matching `key.kind`.
+    /// A files preview finished (§8.1: the read + lex ran on a blocking
+    /// thread, never in draw).
     FilePreviewReady {
         key: crate::state::files::PreviewKey,
         resolved: std::path::PathBuf,
-        preview: Option<pacode_image::Preview>,
         text: Option<crate::state::files::TextPreview>,
     },
     /// The Files level's deferred `git status` scan landed — the
@@ -276,7 +273,6 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     // (`frame_budget` then budgets for the 60 Hz floor).
     let mut detected_hz: Option<u16> = None;
     let mut last_layout = ScreenLayout::default();
-    let mut active_escape: Option<(ratatui::layout::Rect, std::path::PathBuf)> = None;
     // Input image-strip escapes currently on screen (spec §1): tracked so the
     // post-draw flush can diff and never re-send tens of MB of kitty/sixel
     // payload per frame.
@@ -291,11 +287,6 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             // Reopening rescans: `statused_at` records the rows_version the
             // labels describe — dropping it re-arms the deferred status job.
             state.files.statused_at = None;
-            if let Some((area, _path)) = active_escape.take() {
-                let _ = term_guard.clear_image_area(area);
-                // kitty d=a deletes every image, including the input strip.
-                active_image_escapes.clear();
-            }
         }
 
         // The Background level's output-tail cache lives only while the
@@ -329,30 +320,8 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             state.dirty = false;
             last_draw = Instant::now();
 
-            if files_view {
-                if let Some((area, esc, path)) = state.files.pending_escape.take() {
-                    if let Some((old_area, ref old_path)) = active_escape
-                        && (*old_path != path || old_area != area)
-                    {
-                        let _ = term_guard.clear_image_area(old_area);
-                        active_image_escapes.clear();
-                    }
-                    let _ = term_guard.draw_image_escape(area, &esc);
-                    active_escape = Some((area, path));
-                } else if let Some((old_area, _)) = active_escape.take() {
-                    let _ = term_guard.clear_image_area(old_area);
-                    active_image_escapes.clear();
-                }
-            } else if let Some((old_area, _)) = active_escape.take() {
-                let _ = term_guard.clear_image_area(old_area);
-                active_image_escapes.clear();
-            }
-
-            // Input image-strip escapes stashed by `ui::images::draw`. Emitted
-            // only on change; a files-overlay clear above emptied the tracker
-            // (kitty d=a is global), which forces a re-emit here. Clearing the
-            // strip in turn kills the files image for a frame — it re-emits
-            // unconditionally every drawn frame.
+            // Input image-strip escapes stashed by `ui::images::draw` —
+            // emitted only on change.
             let next_escapes = std::mem::take(&mut state.pending_image_escapes);
             if next_escapes != active_image_escapes {
                 for (old_area, _) in active_image_escapes.drain(..) {
@@ -575,9 +544,6 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         .map(|m| m.id.clone())
         .unwrap_or(session_id);
     log::info!("TUI loop ended, quitting session {attached_session}");
-    if let Some((area, _)) = active_escape.take() {
-        let _ = term_guard.clear_image_area(area);
-    }
     for (area, _) in active_image_escapes.drain(..) {
         let _ = term_guard.clear_image_area(area);
     }
@@ -812,9 +778,8 @@ fn dispatch_deferred(
         });
     }
 
-    // Files preview: resolve + render/lex off-thread. `Image` decodes for the
-    // legacy overlay's pane; `Text` reads the head and lexes it for the menu
-    // detail card (§8.1 — the draw only records `preview_want`).
+    // Files preview: resolve + read/lex off-thread for the menu detail card
+    // (§8.1 — the draw only records `preview_want`).
     if let Some(want) = state.files.preview_want.clone()
         && state.files.preview_in_flight.as_ref() != Some(&want)
         && state.files.cached_preview.as_ref().map(|c| &c.key) != Some(&want)
@@ -824,31 +789,12 @@ fn dispatch_deferred(
         let tx = bg_tx.clone();
         tokio::task::spawn_blocking(move || {
             let resolved = resolve_preview_path(&want.raw, &cwd);
-            match want.kind {
-                crate::state::files::PreviewKind::Image { cell_w, cell_h } => {
-                    let req = pacode_image::PreviewRequest {
-                        path: resolved.clone(),
-                        cell_w,
-                        cell_h,
-                    };
-                    let preview = pacode_image::render(&req, pacode_image::detect()).ok();
-                    let _ = tx.send(BgResponse::FilePreviewReady {
-                        key: want,
-                        resolved,
-                        preview,
-                        text: None,
-                    });
-                }
-                crate::state::files::PreviewKind::Text => {
-                    let text = crate::ui::menu::files::text_preview(&resolved);
-                    let _ = tx.send(BgResponse::FilePreviewReady {
-                        key: want,
-                        resolved,
-                        preview: None,
-                        text,
-                    });
-                }
-            }
+            let text = crate::ui::menu::files::text_preview(&resolved);
+            let _ = tx.send(BgResponse::FilePreviewReady {
+                key: want,
+                resolved,
+                text,
+            });
         });
     }
 
@@ -1018,21 +964,20 @@ fn git_view_on_screen(state: &AppState) -> bool {
     )
 }
 
-/// Whether a touched-files view is on screen: the legacy `Overlay::Files`
-/// (until T19) or the `Files` menu level on top of the stack (§5.5). Gates
-/// the preview cache's cleanup and the deferred `git status` scan.
+/// Whether the `Files` menu level is on screen (§5.5) — gates the preview
+/// cache's cleanup and the deferred `git status` scan.
 fn files_view_on_screen(state: &AppState) -> bool {
-    match &state.focus {
-        crate::state::Focus::Overlay(crate::state::Overlay::Files { .. }) => true,
-        crate::state::Focus::Overlay(crate::state::Overlay::Menu { stack, .. }) => stack
-            .current()
-            .is_some_and(|l| l.id == crate::ui::menu::MenuId::Files),
-        _ => false,
-    }
+    matches!(
+        &state.focus,
+        crate::state::Focus::Overlay(crate::state::Overlay::Menu { stack, .. })
+            if stack
+                .current()
+                .is_some_and(|l| l.id == crate::ui::menu::MenuId::Files)
+    )
 }
 
 /// Whether the `Background` menu level is on screen — gates the task-tail
-/// cache's cleanup (§5.9). The legacy `Focus::BgList` never armed one.
+/// cache's cleanup (§5.9).
 fn background_view_on_screen(state: &AppState) -> bool {
     matches!(
         &state.focus,
@@ -1091,14 +1036,12 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
         BgResponse::FilePreviewReady {
             key,
             resolved,
-            preview,
             text,
         } => {
             state.files.preview_in_flight = None;
             state.files.cached_preview = Some(crate::state::files::CachedPreview {
                 key,
                 resolved,
-                preview,
                 text,
             });
             state.dirty = true;
@@ -1333,19 +1276,10 @@ fn handle_reply(
             vec![]
         }
         Ok(Reply::McpServers { servers }) => {
-            state.mcp_servers = servers.clone();
+            state.mcp_servers = servers;
             // A server removal must drop its prompt commands — rebuild, not
             // merge (§8.2 wholesale replacement).
-            crate::commands::rebuild_dynamic_commands(&state.plugins, &servers);
-            if let crate::state::Focus::Overlay(crate::state::Overlay::McpPicker {
-                servers: ref mut s,
-                loading: ref mut l,
-                ..
-            }) = state.focus
-            {
-                *s = servers;
-                *l = false;
-            }
+            crate::commands::rebuild_dynamic_commands(&state.plugins, &state.mcp_servers);
             state.dirty = true;
             crate::cache::write_after_reply(state, ListKind::McpServers);
             vec![]
@@ -1355,24 +1289,12 @@ fn handle_reply(
             state.dirty = true;
             vec![]
         }
+        // The reply's `stale` flag belonged to the legacy overlay; the menu
+        // reads the `offline copy` badge from `state.lists` instead (§8.2).
         Ok(Reply::MarketplacePlugins {
-            plugins: listing,
-            stale: is_stale,
+            plugins: listing, ..
         }) => {
-            state.marketplace = listing.clone();
-            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
-                ref mut market,
-                ref mut loading,
-                ref mut stale,
-                ref mut index,
-                ..
-            }) = state.focus
-            {
-                *index = (*index).min(listing.len().saturating_sub(1));
-                *market = listing;
-                *loading = false;
-                *stale = is_stale;
-            }
+            state.marketplace = listing;
             state.dirty = true;
             crate::cache::write_after_reply(state, ListKind::Marketplace);
             vec![]
@@ -1406,14 +1328,7 @@ fn handle_reply(
         }
         Ok(Reply::Plugins { plugins }) => {
             crate::commands::rebuild_dynamic_commands(&plugins, &state.mcp_servers);
-            state.plugins = plugins.clone();
-            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
-                plugins: ref mut p,
-                ..
-            }) = state.focus
-            {
-                *p = plugins;
-            }
+            state.plugins = plugins;
             state.dirty = true;
             crate::cache::write_after_reply(state, ListKind::Plugins);
             vec![]

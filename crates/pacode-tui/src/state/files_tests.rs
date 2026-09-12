@@ -75,55 +75,24 @@ fn test_eviction_cap_at_500() {
 }
 
 #[test]
-fn test_sorted_rows_desc() {
-    let mut files = FilesState::new();
-    files.observe_tool_item("read", &json!({"path": "old.rs"}), 100);
-    files.observe_tool_item("read", &json!({"path": "newest.rs"}), 300);
-    files.observe_tool_item("read", &json!({"path": "mid.rs"}), 200);
-
-    let sorted = files.sorted_rows();
-    assert_eq!(sorted.len(), 3);
-    assert_eq!(sorted[0].path, "newest.rs");
-    assert_eq!(sorted[1].path, "mid.rs");
-    assert_eq!(sorted[2].path, "old.rs");
-}
-
-#[test]
 fn test_clear_preview() {
     let mut files = FilesState::new();
     assert!(files.cached_preview.is_none());
-    assert!(files.pending_escape.is_none());
 
-    let key = PreviewKey {
-        raw: "test.png".to_string(),
-        kind: PreviewKind::Image {
-            cell_w: 10,
-            cell_h: 10,
-        },
-    };
     files.cached_preview = Some(CachedPreview {
-        key,
-        resolved: std::path::PathBuf::from("test.png"),
-        preview: None,
+        key: PreviewKey {
+            raw: "test.rs".to_string(),
+        },
+        resolved: std::path::PathBuf::from("test.rs"),
         text: None,
     });
-    files.pending_escape = Some((
-        ratatui::layout::Rect::new(0, 0, 10, 10),
-        "esc".to_string(),
-        std::path::PathBuf::from("test.png"),
-    ));
     files.preview_want = Some(PreviewKey {
-        raw: "other.png".to_string(),
-        kind: PreviewKind::Image {
-            cell_w: 10,
-            cell_h: 10,
-        },
+        raw: "other.rs".to_string(),
     });
     files.preview_in_flight = files.preview_want.clone();
 
     files.clear_preview();
     assert!(files.cached_preview.is_none());
-    assert!(files.pending_escape.is_none());
     assert!(files.preview_want.is_none());
     assert!(files.preview_in_flight.is_none());
 }

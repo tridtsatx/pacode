@@ -6,8 +6,8 @@
 //!
 //! Entries: [`open`] — a direct route (`/plugins`, `ctrl+,`, double-Shift) —
 //! and [`handle_menu_key`], which `keys::handle_key` routes every key to while
-//! `Focus::Overlay(Overlay::Menu)` is up. Until T19 unported sections hand off
-//! to their legacy overlay through [`open_legacy`].
+//! `Focus::Overlay(Overlay::Menu)` is up. Every `MenuId` has a provider, so
+//! the base owns all central submenus end to end.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -34,20 +34,15 @@ mod keys_menu_tests;
 const QUERY_MAX_CHARS: usize = crate::paste::FILTER_MAX_CHARS;
 
 /// Open a menu directly — `/plugins`, `.`, `ctrl+,`, double-Shift, `?`.
-/// A provider-backed menu becomes a one-level stack (§3.5); an unported one
-/// opens its legacy overlay — the bridge dies with the old variants (TODO T19).
+/// A menu becomes a one-level stack (§3.5).
 pub fn open(state: &mut AppState, id: MenuId) -> Vec<Action> {
-    if menu::has_provider(id) {
-        log::debug!("open menu: {}", id.slug());
-        state.focus = Focus::Overlay(Overlay::Menu {
-            stack: MenuStack::root(id),
-            ui: MenuUiState::default(),
-        });
-        state.dirty = true;
-        on_open(state, id)
-    } else {
-        open_legacy(state, id)
-    }
+    log::debug!("open menu: {}", id.slug());
+    state.focus = Focus::Overlay(Overlay::Menu {
+        stack: MenuStack::root(id),
+        ui: MenuUiState::default(),
+    });
+    state.dirty = true;
+    on_open(state, id)
 }
 
 /// `keys::handle_key` routes here while a menu is open. `stack`/`ui` are the
@@ -79,32 +74,6 @@ pub fn handle_menu_key(
         MenuMode::Edit { .. } => edit_key(state, stack, ui, &view, key),
         MenuMode::Capture { action, .. } => capture_key(state, ui, view.id, action, key),
         MenuMode::List => list_key(state, stack, ui, &view, key),
-    }
-}
-
-/// The temporary bridge: a `MenuId` without a provider opens the overlay the
-/// section has today — the same bodies the slash commands and keymap actions
-/// used to run (TODO T19: this function dies with the legacy variants).
-fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
-    log::debug!("open menu→legacy: {}", id.slug());
-    state.dirty = true;
-    match id {
-        // Providers exist for all of these (`has_provider` is true) — the
-        // bridge never sees them; the arm keeps the match exhaustive. The
-        // legacy `Overlay::Import` it used to open stays compiled until T19.
-        MenuId::Root
-        | MenuId::Settings
-        | MenuId::Help
-        | MenuId::Skills
-        | MenuId::Git
-        | MenuId::GitBranches
-        | MenuId::Plugins
-        | MenuId::Mcp
-        | MenuId::Keys
-        | MenuId::Files
-        | MenuId::Background
-        | MenuId::Sessions
-        | MenuId::Import => vec![],
     }
 }
 
@@ -239,8 +208,7 @@ fn list_key_inner(
 }
 
 /// `enter` on a Submenu row or `?`: save the level's UI state and push the
-/// target — or hand off to the legacy overlay while the target has no
-/// provider (§3.5, TODO T19). `pub(crate)`: the Help palette jumps the same
+/// target (§3.5). `pub(crate)`: the Help palette jumps the same
 /// way (§5.8) and then points the fresh `ui` at a filter or a row.
 pub(crate) fn descend(
     state: &mut AppState,
@@ -248,9 +216,6 @@ pub(crate) fn descend(
     ui: &mut MenuUiState,
     target: MenuId,
 ) -> Vec<Action> {
-    if !menu::has_provider(target) {
-        return open_legacy(state, target);
-    }
     // A remote query still inside its debounce window would die with the
     // saved level's `ui` — send it now rather than lose the edit.
     let mut actions = flush_remote(state, stack, ui);

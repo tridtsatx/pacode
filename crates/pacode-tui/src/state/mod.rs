@@ -125,10 +125,6 @@ pub enum Focus {
         follow: bool,
         follow_paused: bool,
     },
-    /// `.` in an empty prompt: background task list overlay.
-    BgList {
-        index: usize,
-    },
     /// Slash pickers and other overlays.
     Overlay(Overlay),
 }
@@ -156,30 +152,6 @@ pub enum PanelTarget {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PluginsTab {
-    /// Plugins live in this session or installed from a marketplace.
-    Installed,
-    /// Plugins the configured marketplace offers.
-    Discover,
-}
-
-impl PluginsTab {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Installed => Self::Discover,
-            Self::Discover => Self::Installed,
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Installed => "Installed",
-            Self::Discover => "Discover",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Overlay {
     ModelPicker {
@@ -199,9 +171,6 @@ pub enum Overlay {
     ModePicker {
         index: usize,
     },
-    /// The settings view. Its state lives in `AppState::config_view`; the
-    /// variant only says which overlay is open.
-    ConfigPicker,
     /// A question the model asked. The turn is waiting on the answer, so this
     /// overlay owns the keyboard until it is answered or dismissed.
     QuestionPicker {
@@ -221,44 +190,11 @@ pub enum Overlay {
         step: ThemePickerStep,
         user_themes: Vec<String>,
     },
-    SessionPicker {
-        query: String,
-        index: usize,
-    },
-    Files {
-        index: usize,
-    },
-    McpPicker {
-        index: usize,
-        servers: Vec<McpServerInfo>,
-        loading: bool,
-    },
-    PluginsPicker {
-        index: usize,
-        plugins: Vec<PluginInfo>,
-        /// Which list is on screen.
-        tab: PluginsTab,
-        /// What the configured marketplace offers, once it has answered.
-        market: Vec<pacode_types::MarketplacePluginInfo>,
-        /// Filter typed in the Discover tab.
-        query: String,
-        /// A marketplace request is in flight.
-        loading: bool,
-        /// The listing came from a cached copy past its TTL.
-        stale: bool,
-    },
-    KeysPicker {
-        index: usize,
-        capturing: bool,
-    },
-    Import(crate::ui::import::ImportOverlayState),
     /// Plan + agents on the `Tiny` tier.
     RailOverlay,
-    Help,
     /// The menu base (§3): the stack of levels plus the UI state of the one on
     /// screen. An empty stack means closed — `keys` restores `Focus::Normal`.
-    /// Until T19 the unported sections live on the legacy variants above —
-    /// `keys_menu::open` hands off to them.
+    /// Every central submenu (`MenuId`) lives inside this variant.
     Menu {
         stack: crate::ui::menu::MenuStack,
         ui: crate::ui::menu::MenuUiState,
@@ -345,7 +281,6 @@ pub struct AppState {
     pub input: InputState,
     pub vim: VimState,
     pub focus: Focus,
-    pub config_view: crate::ui::config_view::ConfigViewState,
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
@@ -526,7 +461,6 @@ impl AppState {
             input: InputState::default(),
             vim: VimState::default(),
             focus: Focus::Normal,
-            config_view: crate::ui::config_view::ConfigViewState::default(),
             toasts: VecDeque::new(),
             models: Vec::new(),
             model_flags,

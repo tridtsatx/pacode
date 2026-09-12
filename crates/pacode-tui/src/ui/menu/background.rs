@@ -11,8 +11,8 @@
 //! The detail card's output tail is a §8.1 split: the draw records
 //! [`tail_want`], `dispatch_deferred` runs [`read_tail`] on a blocking
 //! thread, and `view` only paints the `rail.task_tail` cache. `enter` opens
-//! the task's output in the side panel (`PanelTarget::Task` — the same move
-//! the legacy `Focus::BgList` made); `k` sends `KillTask`.
+//! the task's output in the side panel (`PanelTarget::Task`); `k` sends
+//! `KillTask`.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -91,10 +91,10 @@ pub fn view(state: &AppState, ui: &MenuUiState) -> MenuView {
     view
 }
 
-/// `enter` — the task's output in the side panel, the same move the legacy
-/// `BgList` made (`PanelTarget::Task` + `Action::LoadPanel`; the daemon's
-/// `GetTaskOutput` fills `panel.task_lines`). The menu closes like a picker:
-/// `focus` moves to `Panel` and the stack dies with the overlay.
+/// `enter` — the task's output in the side panel (`PanelTarget::Task` +
+/// `Action::LoadPanel`; the daemon's `GetTaskOutput` fills
+/// `panel.task_lines`). The menu closes like a picker: `focus` moves to
+/// `Panel` and the stack dies with the overlay.
 pub fn on_row(
     state: &mut AppState,
     _stack: &mut MenuStack,
@@ -228,7 +228,7 @@ fn status_word(status: TaskStatus) -> &'static str {
 /// The right-hand cell (§5.9): while the task runs it is the progress
 /// mini-bar or its short label plus the duration; once terminal it is the
 /// outcome word plus the duration, with `N err` and a non-zero `exit N`
-/// riding along — the same facts the legacy `BgList` row ended on.
+/// riding along.
 fn right_tail(task: &TaskInfo, now: u64, glyphs: &pacode_render::Glyphs) -> String {
     let dur = format_duration_ms(task.duration_ms(now));
     let mut out = match task.status {

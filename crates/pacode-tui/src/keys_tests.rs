@@ -95,8 +95,7 @@ fn test_dot_only_on_empty_prompt() {
     let mut state = make_test_state();
     let now = Instant::now();
 
-    // Empty prompt: '.' opens the Background menu level (T11 — the legacy
-    // `Focus::BgList` survives until T19 but is no longer reachable here).
+    // Empty prompt: '.' opens the Background menu level.
     let dot = KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE);
     handle_key(&mut state, dot, now);
     assert!(matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })));
@@ -560,8 +559,7 @@ fn test_overlay_files_alt_f_navigation_enter_and_esc() {
         .files
         .observe_tool_item("write", &serde_json::json!({"path": "src/second.rs"}), 200);
 
-    // 1. alt+f opens the Files menu level — T7 routed the entry to the base;
-    //    the legacy `Overlay::Files` lives on until T19 but nothing opens it.
+    // 1. alt+f opens the Files menu level.
     let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
     handle_key(&mut state, alt_f, now);
     let Focus::Overlay(Overlay::Menu { stack, .. }) = &state.focus else {
@@ -603,10 +601,7 @@ fn test_overlay_files_alt_f_navigation_enter_and_esc() {
     // 6. Verify alt+b is follow (does not open files)
     let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
     handle_key(&mut state, alt_b, now);
-    assert!(!matches!(
-        state.focus,
-        Focus::Overlay(Overlay::Menu { .. } | Overlay::Files { .. })
-    ));
+    assert!(!matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })));
 }
 
 #[test]
@@ -678,8 +673,7 @@ fn test_alt_f_opens_files_overlay() {
     let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
     let actions = handle_key(&mut state, alt_f, now);
     assert!(actions.is_empty());
-    // The entry opens the Files menu level — `Overlay::Files` is the legacy
-    // variant kept for T19, no longer reachable by key.
+    // The entry opens the Files menu level.
     assert!(matches!(
         state.focus,
         Focus::Overlay(Overlay::Menu { ref stack, .. })
@@ -835,7 +829,7 @@ fn test_overlay_mcp_picker_keys() {
     let now = Instant::now();
 
     // 1. Open via slash command `/mcp` + Enter — the shared menu's MCP level
-    // answers it now (the legacy picker below still takes keys until T19).
+    // answers it.
     state.input.insert_str("/mcp");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let actions = handle_key(&mut state, enter, now);
@@ -848,7 +842,7 @@ fn test_overlay_mcp_picker_keys() {
         Some(crate::ui::menu::MenuId::Mcp)
     );
 
-    // 2. Populate servers
+    // 2. Populate servers — the menu view reads `state.mcp_servers` live.
     let server1 = pacode_types::McpServerInfo {
         name: "srv1".into(),
         status: "ready".into(),
@@ -867,35 +861,30 @@ fn test_overlay_mcp_picker_keys() {
         prompts: 0,
         prompt_names: vec![],
     };
-    state.focus = Focus::Overlay(Overlay::McpPicker {
-        index: 0,
-        servers: vec![server1, server2],
-        loading: false,
-    });
+    state.mcp_servers = vec![server1, server2];
 
-    // 3. Down moves index to 1
+    let menu_cursor = |state: &AppState| match &state.focus {
+        Focus::Overlay(Overlay::Menu { ui, .. }) => ui.cursor.clone(),
+        other => panic!("expected the MCP menu level, got {other:?}"),
+    };
+
+    // 3. Down moves the cursor to srv2
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     let actions = handle_key(&mut state, down, now);
     assert!(actions.is_empty());
-    assert!(matches!(
-        state.focus,
-        Focus::Overlay(Overlay::McpPicker { index: 1, .. })
-    ));
+    assert_eq!(menu_cursor(&state), crate::ui::menu::RowId::new("srv2"));
 
     // Typing letters doesn't leak into input
     let char_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
     handle_key(&mut state, char_z, now);
     assert!(state.input.is_empty());
 
-    // 4. Up moves index back to 0
+    // 4. Up moves the cursor back to srv1
     let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
     handle_key(&mut state, up, now);
-    assert!(matches!(
-        state.focus,
-        Focus::Overlay(Overlay::McpPicker { index: 0, .. })
-    ));
+    assert_eq!(menu_cursor(&state), crate::ui::menu::RowId::new("srv1"));
 
-    // 5. 'r' on index 0 (srv1) sends RestartMcpServer + ListMcpServers
+    // 5. 'r' on srv1 sends RestartMcpServer + ListMcpServers
     let char_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
     let actions = handle_key(&mut state, char_r, now);
     assert_eq!(
@@ -907,18 +896,8 @@ fn test_overlay_mcp_picker_keys() {
             Action::Send(Request::ListMcpServers),
         ]
     );
-    assert!(matches!(
-        state.focus,
-        Focus::Overlay(Overlay::McpPicker { loading: true, .. })
-    ));
 
-    // 6. Enter on index 0 (srv1, status "ready") toggles to disabled (enabled = false)
-    if let Focus::Overlay(Overlay::McpPicker {
-        ref mut loading, ..
-    }) = state.focus
-    {
-        *loading = false;
-    }
+    // 6. Enter on srv1 (status "ready") toggles to disabled (enabled = false)
     let actions = handle_key(&mut state, enter, now);
     assert_eq!(
         actions,
@@ -931,7 +910,7 @@ fn test_overlay_mcp_picker_keys() {
         ]
     );
 
-    // 7. Enter on index 1 (srv2, status "disabled") toggles to enabled (enabled = true)
+    // 7. Enter on srv2 (status "disabled") toggles to enabled (enabled = true)
     handle_key(&mut state, down, now);
     let actions = handle_key(&mut state, enter, now);
     assert_eq!(
@@ -945,7 +924,7 @@ fn test_overlay_mcp_picker_keys() {
         ]
     );
 
-    // 8. Esc closes picker
+    // 8. Esc closes the menu level
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     let actions = handle_key(&mut state, esc, now);
     assert!(actions.is_empty());
@@ -972,8 +951,7 @@ fn test_overlay_plugins_picker_keys() {
             }),
         ]
     );
-    // §5.2: `/plugins` opens the menu-base Plugins level, not the legacy
-    // picker (the picker below is driven directly for the rest of the test).
+    // §5.2: `/plugins` opens the menu-base Plugins level.
     assert_eq!(
         state.focus,
         Focus::Overlay(Overlay::Menu {
@@ -982,7 +960,7 @@ fn test_overlay_plugins_picker_keys() {
         })
     );
 
-    // 2. Populate plugins
+    // 2. Populate plugins — the menu view reads `state.plugins` live.
     let p1 = pacode_types::PluginInfo {
         name: "plug1".into(),
         version: "1.0.0".into(),
@@ -1003,38 +981,22 @@ fn test_overlay_plugins_picker_keys() {
         loaded: true,
         ..pacode_types::PluginInfo::default()
     };
-    state.focus = Focus::Overlay(Overlay::PluginsPicker {
-        tab: crate::state::PluginsTab::Installed,
-        market: Vec::new(),
-        query: String::new(),
-        loading: false,
-        stale: false,
-        index: 0,
-        plugins: vec![p1.clone(), p2.clone()],
-    });
+    state.plugins = vec![p1, p2];
 
-    // 3. Down moves index to 1
+    // 3. Down moves the cursor to the second Installed row
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     handle_key(&mut state, down, now);
-    assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::PluginsPicker {
-            tab: crate::state::PluginsTab::Installed,
-            market: Vec::new(),
-            query: String::new(),
-            loading: false,
-            stale: false,
-            index: 1,
-            plugins: vec![p1, p2],
-        })
-    );
+    let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
+        panic!("expected the Plugins menu level, got {:?}", state.focus);
+    };
+    assert_eq!(ui.cursor, crate::ui::menu::RowId::new("installed:plug2"));
 
     // Letters do not leak to input
     let char_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
     handle_key(&mut state, char_a, now);
     assert!(state.input.is_empty());
 
-    // 4. Esc closes picker
+    // 4. Esc closes the menu level
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
@@ -1062,14 +1024,10 @@ fn test_plugins_picker_x_uninstalls_only_installed_plugins() {
         installed_at_ms: 1_700_000_000_000,
         ..pacode_types::PluginInfo::default()
     };
-    state.focus = Focus::Overlay(Overlay::PluginsPicker {
-        tab: crate::state::PluginsTab::Installed,
-        market: Vec::new(),
-        query: String::new(),
-        loading: false,
-        stale: false,
-        index: 0,
-        plugins: vec![manual, installed],
+    state.plugins = vec![manual, installed];
+    state.focus = Focus::Overlay(Overlay::Menu {
+        stack: crate::ui::menu::MenuStack::root(crate::ui::menu::MenuId::Plugins),
+        ui: crate::ui::menu::MenuUiState::default(),
     });
 
     let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
@@ -1133,21 +1091,26 @@ fn test_overlay_intercepts_keys_before_vim_when_vim_enabled() {
     let now = Instant::now();
     state.config.ui.vim = true;
 
-    // Open Help overlay
-    state.focus = Focus::Overlay(Overlay::Help);
+    // Open the Help menu level
+    state.focus = Focus::Overlay(Overlay::Menu {
+        stack: crate::ui::menu::MenuStack::root(crate::ui::menu::MenuId::Help),
+        ui: crate::ui::menu::MenuUiState::default(),
+    });
 
-    // Pressing 'j' or 'x' in overlay does not go to vim mode and does not modify input
+    // Pressing 'j' or 'x' in the menu does not go to vim mode and does not
+    // modify input (Help's local filter owns printable keys — they land in
+    // the query, not the prompt).
     let char_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
     let actions = handle_key(&mut state, char_j, now);
     assert!(actions.is_empty());
     assert!(state.input.is_empty());
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Help));
+    assert!(matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })));
 
     let char_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
     let actions = handle_key(&mut state, char_x, now);
     assert!(actions.is_empty());
     assert!(state.input.is_empty());
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Help));
+    assert!(matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })));
 
     // Esc closes overlay first, returning to Normal prompt
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -1279,7 +1242,8 @@ fn test_default_binding_stop_agent_and_kill_task() {
     let actions = handle_key(&mut state, key_k, now);
     assert_eq!(actions, vec![Action::Send(Request::KillTask(task_id))]);
 
-    // 'k' when focused on BgList kills selected task
+    // 'k' on the Background menu level kills the selected task — the row id
+    // is the daemon TaskId (§5.9).
     let bg_task_id = pacode_types::TaskId::new("task_bg");
     let task = pacode_types::TaskInfo {
         id: bg_task_id.clone(),
@@ -1301,7 +1265,10 @@ fn test_default_binding_stop_agent_and_kill_task() {
         acked: false,
     };
     state.rail.tasks.push(task);
-    state.focus = Focus::BgList { index: 0 };
+    state.focus = Focus::Overlay(Overlay::Menu {
+        stack: crate::ui::menu::MenuStack::root(crate::ui::menu::MenuId::Background),
+        ui: crate::ui::menu::MenuUiState::default(),
+    });
     let actions = handle_key(&mut state, key_k, now);
     assert_eq!(actions, vec![Action::Send(Request::KillTask(bg_task_id))]);
 }

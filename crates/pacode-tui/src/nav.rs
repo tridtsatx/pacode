@@ -91,16 +91,8 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
         Overlay::ModePicker { .. } => "ModePicker",
         Overlay::ModelPicker { .. } => "ModelPicker",
         Overlay::LoginPicker { .. } => "LoginPicker",
-        Overlay::SessionPicker { .. } => "SessionPicker",
-        Overlay::Files { .. } => "Files",
         Overlay::RailOverlay => "RailOverlay",
-        Overlay::Help => "Help",
-        Overlay::Import(_) => "Import",
-        Overlay::McpPicker { .. } => "McpPicker",
-        Overlay::PluginsPicker { .. } => "PluginsPicker",
-        Overlay::KeysPicker { .. } => "KeysPicker",
         Overlay::ThemePicker { .. } => "ThemePicker",
-        Overlay::ConfigPicker => "ConfigPicker",
         Overlay::QuestionPicker { .. } => "QuestionPicker",
         // The level on screen names the menu in the log (§3.1).
         Overlay::Menu { stack, .. } => stack.current().map_or("Menu", |l| l.id.title()),
@@ -127,9 +119,6 @@ pub fn handle_esc(state: &mut AppState) -> Vec<Action> {
             state.panel.diff = None;
         }
         Focus::SelectAgent { .. } => {
-            state.focus = Focus::Normal;
-        }
-        Focus::BgList { .. } => {
             state.focus = Focus::Normal;
         }
         Focus::Overlay(ref overlay) => {
@@ -192,7 +181,6 @@ pub fn handle_follow(state: &mut AppState) -> Vec<Action> {
             ..
         }
         | Focus::Normal
-        | Focus::BgList { .. }
         | Focus::Overlay(_) => {}
     }
     vec![]
@@ -206,32 +194,18 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
                 *index = (*index + 1) % agents.len();
             }
         }
-        Focus::BgList { index } => {
-            let count = state.rail.tasks.len();
-            if count > 0 && *index + 1 < count {
-                *index += 1;
-            }
-        }
         Focus::Overlay(Overlay::ModelPicker { index, .. })
         | Focus::Overlay(Overlay::LoginPicker { index, .. })
-        | Focus::Overlay(Overlay::EffortPicker { index })
-        | Focus::Overlay(Overlay::SessionPicker { index, .. }) => {
+        | Focus::Overlay(Overlay::EffortPicker { index }) => {
             *index += 1;
         }
         Focus::Normal
         | Focus::Panel { .. }
         | Focus::Overlay(
-            Overlay::Files { .. }
-            | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker
+            Overlay::ModePicker { .. }
             | Overlay::QuestionPicker { .. }
-            | Overlay::McpPicker { .. }
-            | Overlay::PluginsPicker { .. }
-            | Overlay::Import(_)
             | Overlay::RailOverlay
-            | Overlay::Help
             | Overlay::ThemePicker { .. }
-            | Overlay::KeysPicker { .. }
             // Unreachable — an open menu intercepts keys before `nav` — but
             // the match stays exhaustive.
             | Overlay::Menu { .. },
@@ -253,15 +227,9 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
                 *index = (*index + agents.len() - 1) % agents.len();
             }
         }
-        Focus::BgList { index } => {
-            if *index > 0 {
-                *index -= 1;
-            }
-        }
         Focus::Overlay(Overlay::ModelPicker { index, .. })
         | Focus::Overlay(Overlay::LoginPicker { index, .. })
         | Focus::Overlay(Overlay::EffortPicker { index })
-        | Focus::Overlay(Overlay::SessionPicker { index, .. })
             if *index > 0 =>
         {
             *index -= 1;
@@ -272,18 +240,10 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
             Overlay::ModelPicker { .. }
             | Overlay::LoginPicker { .. }
             | Overlay::EffortPicker { .. }
-            | Overlay::SessionPicker { .. }
-            | Overlay::Files { .. }
             | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker
             | Overlay::QuestionPicker { .. }
-            | Overlay::McpPicker { .. }
-            | Overlay::PluginsPicker { .. }
-            | Overlay::Import(_)
             | Overlay::RailOverlay
-            | Overlay::Help
             | Overlay::ThemePicker { .. }
-            | Overlay::KeysPicker { .. }
             | Overlay::Menu { .. },
         ) => {}
     }

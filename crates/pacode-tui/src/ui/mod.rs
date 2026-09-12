@@ -4,25 +4,19 @@
 //! Widgets may mutate render caches inside the state but nothing else.
 
 pub mod anim;
-pub mod config_view;
 pub mod dialog;
-pub mod files;
 pub mod footer;
 pub mod header;
 pub mod images;
-pub mod import;
 pub mod input;
-pub mod keys_overlay;
 pub mod login_picker;
 pub mod mascot;
-pub mod mcp;
 pub mod menu;
 pub mod notice;
 pub mod overlays;
 pub mod panel;
 pub mod phrases;
 pub mod picker;
-pub mod plugins;
 pub mod popup;
 pub mod question_picker;
 pub mod rail;
@@ -50,22 +44,13 @@ pub fn focus_key(focus: &Focus) -> u8 {
         Focus::Normal => 0,
         Focus::SelectAgent { .. } => 1,
         Focus::Panel { .. } => 2,
-        Focus::BgList { .. } => 3,
         Focus::Overlay(overlay) => match overlay {
             Overlay::ModelPicker { .. } => 10,
             Overlay::EffortPicker { .. } => 11,
             Overlay::ModePicker { .. } => 12,
-            Overlay::ConfigPicker => 13,
             Overlay::QuestionPicker { .. } => 14,
             Overlay::ThemePicker { .. } => 15,
-            Overlay::SessionPicker { .. } => 16,
-            Overlay::Files { .. } => 17,
-            Overlay::McpPicker { .. } => 18,
-            Overlay::PluginsPicker { .. } => 19,
-            Overlay::KeysPicker { .. } => 20,
-            Overlay::Import(_) => 21,
             Overlay::RailOverlay => 22,
-            Overlay::Help => 23,
             Overlay::LoginPicker { .. } => 24,
             // Menu levels key off `MenuId` — the table lives in the menu base
             // (§3.1); 25..=36 here are the `focus_key` range it owns.
@@ -530,7 +515,10 @@ mod tests {
         assert_eq!(focus_key(&Focus::Normal), 0);
         assert_eq!(focus_key(&Focus::SelectAgent { index: 2 }), 1);
         assert_ne!(
-            focus_key(&Focus::Overlay(Overlay::Help)),
+            focus_key(&Focus::Overlay(Overlay::LoginPicker {
+                query: String::new(),
+                index: 0,
+            })),
             focus_key(&Focus::Overlay(Overlay::RailOverlay))
         );
         // Index changes inside one picker keep the key — no replayed unfold.
@@ -540,7 +528,7 @@ mod tests {
         );
         assert_ne!(
             focus_key(&Focus::Normal),
-            focus_key(&Focus::BgList { index: 0 })
+            focus_key(&Focus::Overlay(Overlay::RailOverlay))
         );
     }
 }

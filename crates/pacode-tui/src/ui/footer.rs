@@ -337,21 +337,6 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                             )
                         }
                     }
-                    Focus::BgList { .. } => {
-                        let running = state.rail.running_task_count();
-                        let failed = state.rail.failed_unacked_count();
-                        (
-                            vec![
-                                Span::styled(format!("{} ", opts.glyphs.chevrons), opts.theme.cyan),
-                                Span::styled(
-                                    format!("{running} bg running · {failed} failed · "),
-                                    opts.theme.bold,
-                                ),
-                                Span::styled("enter output · k kill · esc", opts.theme.dim),
-                            ],
-                            false,
-                        )
-                    }
                     _ => {
                         let mode = state.mode();
                         let perm_style = match mode {

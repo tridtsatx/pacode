@@ -282,9 +282,7 @@ pub fn on_edit(
 }
 
 /// Write `key = value` into the owning config file and apply it to the live
-/// `state.config` — the same write path the legacy settings view ran
-/// (`config_view::save_and_apply`, kept here so this menu does not hang off
-/// the overlay T19 deletes). A failed write toasts; the in-memory apply runs
+/// `state.config`. A failed write toasts; the in-memory apply runs
 /// regardless, matching the file the next successful save produces.
 fn apply_value(state: &mut AppState, key: &str, value: toml::Value) {
     if let Err(e) = pacode_config::update_config_value(&state.paths, key, value.clone()) {

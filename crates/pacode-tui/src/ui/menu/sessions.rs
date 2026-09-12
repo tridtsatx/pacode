@@ -1,7 +1,7 @@
 //! The `Sessions` level (§5.6 — variant A+B): the resumable session list
 //! grouped by recency — `today` / `this week` / `earlier` on the session's
 //! `updated_at` — with a detail card per row. `enter` resumes through
-//! `Attach::Resume`, exactly what the legacy `SessionPicker` sent.
+//! `Attach::Resume`.
 //!
 //! Spec gap: `SessionMeta` carries no turn count, context size, cost or
 //! last-reply text — the card shows what the protocol sends today (§5.6

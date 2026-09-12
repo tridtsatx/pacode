@@ -226,7 +226,6 @@ fn preview_want_follows_the_cursor() {
         preview_want(&v, &ui),
         Some(PreviewKey {
             raw: "a.rs".to_string(),
-            kind: PreviewKind::Text,
         })
     );
 
@@ -236,7 +235,6 @@ fn preview_want_follows_the_cursor() {
         preview_want(&v, &ui),
         Some(PreviewKey {
             raw: "src/b.rs".to_string(),
-            kind: PreviewKind::Text,
         })
     );
 }
@@ -261,10 +259,8 @@ fn detail_card_shows_the_cached_preview() {
     s.files.cached_preview = Some(crate::state::files::CachedPreview {
         key: PreviewKey {
             raw: "a.rs".to_string(),
-            kind: PreviewKind::Text,
         },
         resolved: PathBuf::from("/repo/a.rs"),
-        preview: None,
         text: Some(TextPreview {
             lines: vec![PreviewLine {
                 text: "fn main() {}".to_string(),
@@ -354,6 +350,23 @@ fn root_row_summarises_the_turn() {
         })
         .unwrap();
     assert_eq!(right, "2 files · +10 −7");
+}
+
+#[test]
+fn is_image_file_recognises_supported_extensions() {
+    assert!(is_image_file("photo.png"));
+    assert!(is_image_file("PHOTO.PNG"));
+    assert!(is_image_file("image.jpg"));
+    assert!(is_image_file("IMAGE.JPEG"));
+    assert!(is_image_file("animation.gif"));
+    assert!(is_image_file("pic.webp"));
+    assert!(is_image_file("bitmap.bmp"));
+
+    assert!(!is_image_file("code.rs"));
+    assert!(!is_image_file("document.pdf"));
+    assert!(!is_image_file("archive.tar.gz"));
+    assert!(!is_image_file("no_extension"));
+    assert!(!is_image_file(""));
 }
 
 #[test]

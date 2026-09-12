@@ -9,10 +9,9 @@
 //! [`MenuStack`] and [`MenuUiState`] live between frames; rows and views die
 //! with the frame (§3.6).
 //!
-//! Key routing lives in `keys_menu` (§3.4); the provider table below is the
-//! one place a [`MenuId`] meets its `view` — a port adds `ui/menu/<name>.rs`
-//! with `pub fn view(state: &AppState, ui: &MenuUiState) -> MenuView` and
-//! flips its [`has_provider`] arm (§3.1).
+//! Key routing lives in `keys_menu` (§3.4); the provider table in
+//! [`view_for`] is the one place a [`MenuId`] meets its `view` — every
+//! `MenuId` has a `ui/menu/<name>.rs` provider (§3.1).
 
 mod layout;
 mod model;
@@ -60,27 +59,6 @@ pub use view::{
     ActionChip, EmptyState, FilterMode, KeyBinding, MenuAction, MenuId, MenuMode, MenuUiState,
     MenuView, StatusKind, StatusLine, Tab, Tabs, is_base_key,
 };
-
-/// Whether `id` has a `ui/menu/<name>::view` provider. `false` entries are
-/// served by the legacy-overlay bridge in `keys_menu` (TODO T19); a port
-/// flips its arm to `true` the moment its provider lands.
-pub fn has_provider(id: MenuId) -> bool {
-    match id {
-        MenuId::Root
-        | MenuId::Settings
-        | MenuId::Help
-        | MenuId::Skills
-        | MenuId::Git
-        | MenuId::GitBranches
-        | MenuId::Plugins
-        | MenuId::Mcp
-        | MenuId::Keys
-        | MenuId::Files
-        | MenuId::Background
-        | MenuId::Sessions
-        | MenuId::Import => true,
-    }
-}
 
 /// The view of the stack's top level — the one place `MenuId` meets its
 /// provider (§3.1). The base then patches the breadcrumb from the parent

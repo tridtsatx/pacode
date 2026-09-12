@@ -163,19 +163,6 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     // 1.5 While an overlay is open, ALL keys go to it (fixes focus leak to input).
-    if matches!(state.focus, Focus::Overlay(Overlay::Import(_))) {
-        // The handler needs `&mut AppState` too, so take the overlay out and put
-        // it back unless it asked to close.
-        let taken = std::mem::replace(&mut state.focus, Focus::Normal);
-        let Focus::Overlay(Overlay::Import(mut overlay)) = taken else {
-            return vec![];
-        };
-        let actions = crate::ui::import::handle_key(state, &mut overlay, key, now);
-        if !overlay.closed {
-            state.focus = Focus::Overlay(Overlay::Import(overlay));
-        }
-        return actions;
-    }
     if let Focus::Overlay(_) = state.focus {
         return crate::keys_picker::handle_picker_key(state, key);
     }
@@ -210,9 +197,9 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return crate::keys_menu::open(state, crate::ui::menu::MenuId::Root);
     }
 
-    // 2. Session picker via ctrl+p
+    // 2. Sessions menu via ctrl+p
     if action == Some(KeyAction::SessionPicker) {
-        log::debug!("open overlay: SessionPicker");
+        log::debug!("open menu: sessions");
         return crate::keys_menu::open(state, crate::ui::menu::MenuId::Sessions);
     }
 
@@ -426,18 +413,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         {
             return vec![Action::Send(Request::StopAgent(id.clone()))];
         }
-        if action == Some(KeyAction::KillTask) {
-            if let Focus::Panel {
+        if action == Some(KeyAction::KillTask)
+            && let Focus::Panel {
                 target: PanelTarget::Task(ref id),
                 ..
             } = state.focus
-            {
-                return vec![Action::Send(Request::KillTask(id.clone()))];
-            } else if let Focus::BgList { index } = state.focus
-                && let Some(task) = state.rail.tasks.get(index)
-            {
-                return vec![Action::Send(Request::KillTask(task.id.clone()))];
-            }
+        {
+            return vec![Action::Send(Request::KillTask(id.clone()))];
         }
     }
 
@@ -558,17 +540,6 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     return select_agent_by_id(state, &id);
                 }
             }
-            Focus::BgList { index } => {
-                if let Some(task) = state.rail.tasks.get(*index) {
-                    state.focus = Focus::Panel {
-                        target: PanelTarget::Task(task.id.clone()),
-                        follow: false,
-                        follow_paused: false,
-                    };
-                    state.panel.target = Some(PanelTarget::Task(task.id.clone()));
-                    return vec![Action::LoadPanel];
-                }
-            }
             Focus::Overlay(Overlay::ModelPicker {
                 query,
                 index,
@@ -617,40 +588,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     return vec![Action::Send(Request::SetEffort(eff))];
                 }
             }
-            Focus::Overlay(Overlay::SessionPicker { query, index }) => {
-                let q_lower = query.to_lowercase();
-                let filtered: Vec<_> = state
-                    .sessions
-                    .iter()
-                    .filter(|s| {
-                        q_lower.is_empty()
-                            || s.title().to_lowercase().contains(&q_lower)
-                            || s.id.as_str().to_lowercase().contains(&q_lower)
-                    })
-                    .collect();
-                if let Some(session) = filtered.get(*index) {
-                    let id = session.id.clone();
-                    log::debug!("close overlay: SessionPicker");
-                    state.focus = Focus::Normal;
-                    return vec![Action::Send(Request::Attach(
-                        pacode_types::Attach::Resume { session: id },
-                    ))];
-                }
-            }
             Focus::Normal
             | Focus::Panel { .. }
             | Focus::Overlay(
-                Overlay::Files { .. }
-                | Overlay::ModePicker { .. }
-                | Overlay::ConfigPicker
+                Overlay::ModePicker { .. }
                 | Overlay::QuestionPicker { .. }
-                | Overlay::McpPicker { .. }
-                | Overlay::PluginsPicker { .. }
-                | Overlay::Import(_)
                 | Overlay::RailOverlay
-                | Overlay::Help
                 | Overlay::ThemePicker { .. }
-                | Overlay::KeysPicker { .. }
                 | Overlay::LoginPicker { .. }
                 // Unreachable — an open menu intercepts Enter earlier — but
                 // the match stays exhaustive.

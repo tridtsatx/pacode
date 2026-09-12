@@ -112,29 +112,6 @@ pub fn handle_paste_with_runner(
             state.dirty = true;
             vec![]
         }
-        Focus::Overlay(Overlay::SessionPicker { query, index }) => {
-            paste_into_filter(query, index, &text);
-            state.dirty = true;
-            vec![]
-        }
-        Focus::Overlay(Overlay::ConfigPicker) => {
-            if let Some(ref mut edit) = state.config_view.editing {
-                let flattened = flatten_single_line(&text);
-                let count = flattened.chars().count();
-                let byte_idx = char_to_byte_index(&edit.buffer, edit.cursor);
-                edit.buffer.insert_str(byte_idx, &flattened);
-                edit.cursor += count;
-                state.config_view.error = None;
-            } else {
-                let flattened = flatten_single_line(&text);
-                state.config_view.query.push_str(&flattened);
-                state.config_view.selected = 0;
-                state.config_view.scroll_offset = 0;
-                state.config_view.error = None;
-            }
-            state.dirty = true;
-            vec![]
-        }
         Focus::Overlay(Overlay::Menu { ui, .. }) if menu_takes_paste => {
             let flattened = flatten_single_line(&text);
             match &mut ui.mode {
@@ -162,15 +139,13 @@ pub fn handle_paste_with_runner(
             vec![]
         }
         Focus::Overlay(_) => {
-            // Overlays without a text/filter box (EffortPicker, ModePicker, Files, McpPicker, etc.)
-            // ignore pastes so text does not leak into the hidden prompt.
+            // Overlays without a text/filter box (EffortPicker, ModePicker,
+            // RailOverlay, a menu without a live filter) ignore pastes so text
+            // does not leak into the hidden prompt.
             vec![]
         }
-        Focus::Normal | Focus::Panel { .. } | Focus::SelectAgent { .. } | Focus::BgList { .. } => {
-            if matches!(
-                state.focus,
-                Focus::SelectAgent { .. } | Focus::BgList { .. }
-            ) {
+        Focus::Normal | Focus::Panel { .. } | Focus::SelectAgent { .. } => {
+            if matches!(state.focus, Focus::SelectAgent { .. }) {
                 state.focus = Focus::Normal;
             }
             paste_into_prompt(state, text, now);

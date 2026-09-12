@@ -19,8 +19,8 @@ use pacode_types::time::{format_duration_ms, now_ms};
 
 use crate::keys::Action;
 use crate::state::files::{
-    FileKinds, FileRow, FileStatus, PREVIEW_BYTES, PREVIEW_LINES, PreviewKey, PreviewKind,
-    PreviewLine, TextPreview,
+    FileKinds, FileRow, FileStatus, PREVIEW_BYTES, PREVIEW_LINES, PreviewKey, PreviewLine,
+    TextPreview,
 };
 use crate::state::{AppState, Focus, PanelTarget};
 
@@ -123,7 +123,6 @@ pub fn preview_want(view: &MenuView, ui: &MenuUiState) -> Option<PreviewKey> {
     let id = view.rows[sel].id()?;
     Some(PreviewKey {
         raw: id.as_str().to_string(),
-        kind: PreviewKind::Text,
     })
 }
 
@@ -134,7 +133,7 @@ pub fn preview_want(view: &MenuView, ui: &MenuUiState) -> Option<PreviewKey> {
 pub(crate) fn text_preview(path: &Path) -> Option<TextPreview> {
     use std::io::Read;
     let shown = path.to_string_lossy();
-    if crate::ui::files::is_image_file(&shown) {
+    if is_image_file(&shown) {
         return None;
     }
     let mut buf = Vec::new();
@@ -190,6 +189,19 @@ fn group_by_dir(rows: &[FileRow]) -> Vec<(String, Vec<&FileRow>)> {
         });
     }
     map.into_iter().collect()
+}
+
+/// Whether a path carries a supported image extension (case-insensitive) —
+/// the text probe skips those without opening the file.
+fn is_image_file(path_str: &str) -> bool {
+    let p = Path::new(path_str);
+    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    )
 }
 
 /// The row's parent directory; `""` for cwd-level files (labelled `.`).
@@ -369,7 +381,6 @@ fn ops_words(kinds: FileKinds) -> String {
 fn attach_preview(state: &AppState, path: &str, detail: &mut Detail) {
     let want = PreviewKey {
         raw: path.to_string(),
-        kind: PreviewKind::Text,
     };
     match &state.files.cached_preview {
         Some(c) if c.key == want => match &c.text {

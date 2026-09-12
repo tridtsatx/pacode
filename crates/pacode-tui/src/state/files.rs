@@ -20,25 +20,13 @@ pub const PREVIEW_BYTES: usize = 64 * 1024;
 /// Lines of the head kept after lexing — the card shows what fits.
 pub const PREVIEW_LINES: usize = 100;
 
-/// What the deferred preview job should produce for `raw` (§8.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PreviewKind {
-    /// A half-block / kitty render at these cell dimensions — the legacy
-    /// overlay's image pane.
-    Image { cell_w: u16, cell_h: u16 },
-    /// The lexed text head for the menu detail card — dimensions do not
-    /// apply to text, so the key is effectively the path.
-    Text,
-}
-
 /// Key identifying a cached preview by the *raw* path (as the files row lists
-/// it — possibly relative to the session cwd) and the kind of preview wanted.
-/// The background job resolves the raw path against the cwd; draw keys on the
-/// raw string so it never has to stat anything (§8.1).
+/// it — possibly relative to the session cwd). The background job resolves
+/// the raw path against the cwd; draw keys on the raw string so it never has
+/// to stat anything (§8.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviewKey {
     pub raw: String,
-    pub kind: PreviewKind,
 }
 
 /// One syntax-lexed line of a text preview.
@@ -62,17 +50,14 @@ pub struct TextPreview {
 /// Cache entry for at most one rendered preview.
 /// Owner: `FilesState`.
 /// Cap: exactly 1 entry.
-/// Invalidation rule: dropped when the files overlay closes or highlighted entry changes.
+/// Invalidation rule: dropped when the Files menu level closes or the
+/// highlighted entry changes.
 #[derive(Clone, Debug)]
 pub struct CachedPreview {
     pub key: PreviewKey,
-    /// The cwd-resolved path the preview was produced from — the kitty/sixel
-    /// escape diffing in `app` needs it (image identity, not the list label).
+    /// The cwd-resolved path the preview was produced from.
     pub resolved: PathBuf,
-    /// Set for `PreviewKind::Image`.
-    pub preview: Option<pacode_image::Preview>,
-    /// Set for `PreviewKind::Text` — `None` when the file is binary, an image,
-    /// unreadable, or absent.
+    /// `None` when the file is binary, an image, unreadable, or absent.
     pub text: Option<TextPreview>,
 }
 
@@ -150,8 +135,6 @@ pub struct FilesState {
     pub preview_want: Option<PreviewKey>,
     /// The key of the preview job currently running on a blocking thread.
     pub preview_in_flight: Option<PreviewKey>,
-    /// Pending escape sequence to write after frame flush: (area, escape_seq, path).
-    pub pending_escape: Option<(ratatui::layout::Rect, String, PathBuf)>,
     /// `git status` scan results keyed by the exact row path spelling (the
     /// scan maps git's root-relative output back to the input) — the
     /// `new`/`deleted`/`renamed` row labels (§5.5).
@@ -177,13 +160,11 @@ impl FilesState {
         Self::default()
     }
 
-    /// Clear cached preview, pending escape and outstanding wants (e.g. on
-    /// overlay close).
+    /// Clear cached preview and outstanding wants (e.g. on menu close).
     pub fn clear_preview(&mut self) {
         self.cached_preview = None;
         self.preview_want = None;
         self.preview_in_flight = None;
-        self.pending_escape = None;
     }
 
     pub fn len(&self) -> usize {
@@ -302,17 +283,6 @@ impl FilesState {
             }
             self.rows_version = self.rows_version.wrapping_add(1);
         }
-    }
-
-    /// Return references to all rows sorted by `last_ts_ms` descending.
-    pub fn sorted_rows(&self) -> Vec<&FileRow> {
-        let mut sorted: Vec<&FileRow> = self.rows.iter().collect();
-        sorted.sort_by(|a, b| {
-            b.last_ts_ms
-                .cmp(&a.last_ts_ms)
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        sorted
     }
 
     fn enforce_cap(&mut self) {

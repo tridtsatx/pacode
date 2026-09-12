@@ -439,7 +439,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Settings)
         }
         "sessions" => {
-            log::debug!("open overlay: SessionPicker");
+            log::debug!("open menu: sessions");
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Sessions)
         }
         "mcp" => {
@@ -447,7 +447,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Mcp)
         }
         "plugins" => {
-            log::debug!("open overlay: PluginsPicker");
+            log::debug!("open menu: plugins");
             // `/plugins <source>` points the Discover tab at a marketplace and
             // remembers it; `/plugins` alone uses the configured one.
             let source = arg.trim();
@@ -465,7 +465,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             actions
         }
         "keys" => {
-            log::debug!("open overlay: KeysPicker");
+            log::debug!("open menu: keys");
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Keys)
         }
         "editor" => {
@@ -473,7 +473,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![]
         }
         "import" => {
-            log::debug!("open overlay: Import");
+            log::debug!("open menu: import");
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Import)
         }
         "compact" => vec![Action::Send(Request::Compact)],
