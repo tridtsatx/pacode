@@ -130,16 +130,29 @@ impl TranscriptState {
     }
 }
 
-fn tool_title(name: &str, input: &serde_json::Value) -> String {
+/// `Bash cargo build`, `Edit src/tui/sidebar.rs` — the title is the first
+/// *meaningful* string field: preferred keys (`command`, `path`, `pattern`, …)
+/// win over field order, so `write {content, path}` still titles by the path.
+pub(crate) fn tool_title(name: &str, input: &serde_json::Value, preferred: &[&str]) -> String {
+    let with_arg = |s: &str| {
+        let truncated: String = s.trim().chars().take(60).collect();
+        format!("{name} {truncated}")
+    };
     if let Some(obj) = input.as_object() {
+        for key in preferred {
+            if let Some(s) = obj.get(*key).and_then(serde_json::Value::as_str)
+                && !s.trim().is_empty()
+            {
+                return with_arg(s);
+            }
+        }
         for (k, v) in obj {
             if k != "intent"
                 && k != "accept_large_output"
                 && let Some(s) = v.as_str()
+                && !s.trim().is_empty()
             {
-                let arg = s.trim();
-                let truncated: String = arg.chars().take(60).collect();
-                return format!("{name} {truncated}");
+                return with_arg(s);
             }
         }
     }
@@ -218,7 +231,7 @@ pub fn history_to_items(
                             }
                         }
                         ContentBlock::ToolUse { id, name, input } => {
-                            let title = tool_title(name, input);
+                            let title = tool_title(name, input, crate::turn::tools::TITLE_KEYS);
                             let intent = pacode_tools::intent_of(input);
                             let item_idx = items.len();
                             items.push(TranscriptItem {
@@ -263,7 +276,10 @@ pub fn history_to_items(
                         } else {
                             ToolStatus::Ok
                         };
-                        *preview = pacode_types::truncate_head_tail(content, 256);
+                        *preview = pacode_types::truncate_head_tail(
+                            content,
+                            pacode_types::PREVIEW_CAP_CHARS,
+                        );
                     }
                 }
             }
@@ -396,5 +412,54 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn tool_title_prefers_meaningful_keys_over_field_order() {
+        let keys = crate::turn::tools::TITLE_KEYS;
+        // `write` sends `content` first in JSON order — the title must still
+        // come from `path`, not the file body.
+        let input = serde_json::json!({
+            "content": "#!/usr/bin/env python3\nprint('x')\n",
+            "path": "tools/gen.py",
+        });
+        assert_eq!(tool_title("write", &input, keys), "write tools/gen.py");
+
+        let input = serde_json::json!({"command": "cargo test", "timeout_secs": 30});
+        assert_eq!(tool_title("bash", &input, keys), "bash cargo test");
+
+        let input = serde_json::json!({"pattern": "TODO", "path": "src/"});
+        assert_eq!(tool_title("grep", &input, keys), "grep TODO");
+    }
+
+    #[test]
+    fn tool_title_falls_back_and_skips_meta_keys() {
+        let keys = crate::turn::tools::TITLE_KEYS;
+        // No preferred key: first non-empty string wins; `intent` and
+        // `accept_large_output` never do.
+        let input = serde_json::json!({
+            "intent": "checking the build",
+            "action": "status",
+        });
+        assert_eq!(tool_title("bg", &input, keys), "bg status");
+
+        let input = serde_json::json!({"accept_large_output": true});
+        assert_eq!(tool_title("read", &input, keys), "read");
+
+        // A preferred key present but empty loses to the next preferred one.
+        let input = serde_json::json!({"command": " ", "url": "https://x.dev"});
+        assert_eq!(
+            tool_title("webfetch", &input, keys),
+            "webfetch https://x.dev"
+        );
+    }
+
+    #[test]
+    fn tool_title_truncates_long_args() {
+        let keys = crate::turn::tools::TITLE_KEYS;
+        let long = "x".repeat(200);
+        let input = serde_json::json!({"command": long});
+        let title = tool_title("bash", &input, keys);
+        assert_eq!(title, format!("bash {}", "x".repeat(60)));
     }
 }

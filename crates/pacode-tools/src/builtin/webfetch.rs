@@ -7,7 +7,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "webfetch";
@@ -126,8 +126,7 @@ impl Tool for WebFetchTool {
 
         let cap = args.max_chars.unwrap_or(ctx.output_cap_chars);
         let content = cap_output(&text, accept_large_output, cap);
-        let char_count = content.chars().count();
-        let preview = format!("{char_count} chars");
+        let preview = preview_body(&content);
 
         Ok(ToolOutput::text(content)
             .with_title(title)

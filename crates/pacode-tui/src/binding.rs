@@ -69,6 +69,9 @@ pub enum Action {
     ModelPickerFavorite,
     /// Toggle `zdr_capable` on the model picker's selected row (§9.1).
     ModelPickerZdr,
+    /// Expand or collapse the newest tool-call cell with hidden output (§6);
+    /// a click on a cell does the same for that specific cell.
+    ExpandOutput,
 }
 
 /// The part of the UI a rebindable action applies to — the Keys menu groups
@@ -185,6 +188,7 @@ impl Action {
             Self::Help => "help",
             Self::ModelPickerFavorite => "model_picker_favorite",
             Self::ModelPickerZdr => "model_picker_zdr",
+            Self::ExpandOutput => "expand_output",
         }
     }
 
@@ -240,6 +244,7 @@ impl Action {
             Self::Help => "Open help menu",
             Self::ModelPickerFavorite => "Model picker: mark model as favorite",
             Self::ModelPickerZdr => "Model picker: mark model ZDR-capable",
+            Self::ExpandOutput => "Expand/collapse the latest tool output",
         }
     }
 
@@ -259,7 +264,8 @@ impl Action {
             | Self::ScrollDown
             | Self::ScrollTop
             | Self::ScrollBottom
-            | Self::CopySelection => Scope::Global,
+            | Self::CopySelection
+            | Self::ExpandOutput => Scope::Global,
             Self::Submit
             | Self::Newline
             | Self::SubmitNow
@@ -536,6 +542,7 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("toggle_zdr", Action::ToggleZdr),
     ("menu", Action::Menu),
     ("help", Action::Help),
+    ("expand_output", Action::ExpandOutput),
     // Overlay-scoped actions sit last: `action_for` returns the first match,
     // and a chord spelled like a global one (`alt+f`, `alt+z`) must keep
     // resolving to its global owner in Normal focus (§9.1).
@@ -718,6 +725,14 @@ impl Keymap {
             vec![Binding {
                 code: KeyCode::Char('c'),
                 mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            }],
+        );
+        // §6: the fold marker advertises this chord.
+        bindings.insert(
+            Action::ExpandOutput,
+            vec![Binding {
+                code: KeyCode::Char('o'),
+                mods: KeyModifiers::CONTROL,
             }],
         );
         let digits = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];

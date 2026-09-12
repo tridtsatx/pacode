@@ -229,6 +229,10 @@ pub fn estimate_tokens_for_chars(chars: usize) -> u32 {
     chars.div_ceil(4) as u32
 }
 
+/// Size limit for a tool call's transcript preview — the body the TUI cell can
+/// show and expand. Display-only: the model-facing `content` has its own cap.
+pub const PREVIEW_CAP_CHARS: usize = 16_000;
+
 /// Cut `text` to at most `cap` characters keeping head and tail, with a marker
 /// describing how much was dropped. Used for tool outputs and injections.
 pub fn truncate_head_tail(text: &str, cap: usize) -> String {

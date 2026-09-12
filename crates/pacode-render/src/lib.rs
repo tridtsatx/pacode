@@ -13,7 +13,7 @@ pub mod theme;
 pub mod wrap;
 
 pub use cache::LineCache;
-pub use diff::{diff_stat, render_diff, render_diff_ex, unified_diff};
+pub use diff::{diff_hides_lines, diff_stat, render_diff, render_diff_ex, unified_diff};
 pub use markdown::render_markdown;
 pub use palettes::builtin_palettes;
 pub use stream::{StreamBuffer, StreamKind, StreamOp};
@@ -34,6 +34,10 @@ pub struct RenderOptions {
     pub color: ColorMode,
     /// Draw the model's reasoning line (`[ui] thinking`). Off by default.
     pub thinking: bool,
+    /// The chord that expands a folded tool call — shown in fold markers
+    /// (`… N more lines · ctrl+o to expand`). Falls back to "click" when the
+    /// action is unbound.
+    pub expand_hint: String,
 }
 
 impl RenderOptions {
@@ -44,6 +48,7 @@ impl RenderOptions {
             color: ColorMode::detect(),
             theme: Theme::default(),
             glyphs: Glyphs::new(ascii_only),
+            expand_hint: "ctrl+o".to_string(),
         }
     }
 
@@ -54,6 +59,7 @@ impl RenderOptions {
             glyphs: Glyphs::new(ascii_only),
             color: ColorMode::detect(),
             thinking: false,
+            expand_hint: "ctrl+o".to_string(),
         }
     }
 
@@ -67,6 +73,12 @@ impl RenderOptions {
     /// Draw the model's reasoning line, per `[ui] thinking`.
     pub fn thinking(mut self, thinking: bool) -> Self {
         self.thinking = thinking;
+        self
+    }
+
+    /// Name the expand chord in fold markers.
+    pub fn expand_hint(mut self, hint: impl Into<String>) -> Self {
+        self.expand_hint = hint.into();
         self
     }
 }

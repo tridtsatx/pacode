@@ -303,7 +303,9 @@ async fn test_read_offset_limit_and_binary() {
     assert!(out.content.contains("     6\tline 6"));
     assert!(!out.content.contains("line 2"));
     assert!(!out.content.contains("line 7"));
-    assert_eq!(out.preview, "4 lines");
+    // The cell body is the numbered output itself, expandable via ctrl+o.
+    assert!(out.preview.contains("     3\tline 3"));
+    assert!(out.preview.contains("     6\tline 6"));
 
     let bin_file = tmp.path().join("test.bin");
     tokio::fs::write(&bin_file, b"abc\0def").await.unwrap();

@@ -5,7 +5,7 @@ use pacode_types::TaskId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "bg";
@@ -92,7 +92,7 @@ impl Tool for BgTool {
                 }
                 let joined = lines.join("\n");
                 let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-                let preview = format!("{} tasks", tasks.len());
+                let preview = preview_body(&joined);
                 Ok(ToolOutput::text(content)
                     .with_title("bg list")
                     .with_preview(preview))
@@ -125,7 +125,7 @@ impl Tool for BgTool {
                     out.push_str(&format!("\nProgress: {l}"));
                 }
                 let content = cap_output(&out, accept_large_output, ctx.output_cap_chars);
-                let preview = format!("{:?}", info.status);
+                let preview = preview_body(&content);
                 Ok(ToolOutput::text(content)
                     .with_title(format!("bg status {id}"))
                     .with_preview(preview))
@@ -139,12 +139,7 @@ impl Tool for BgTool {
                 let tail_lines = ctx.host.task_tail(&id, lines).await?;
                 let joined = tail_lines.join("\n");
                 let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-                let preview = tail_lines
-                    .iter()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_default();
+                let preview = preview_body(&joined);
                 Ok(ToolOutput::text(content)
                     .with_title(format!("bg tail {id}"))
                     .with_preview(preview))

@@ -624,6 +624,37 @@ fn clicking_a_cell_toggles_its_expansion_and_an_unknown_cell_is_ignored() {
 }
 
 #[test]
+fn ctrl_o_expands_the_newest_foldable_cell_and_collapses_it_back() {
+    let mut t = Transcript::new(8);
+    let long: String = (1..=12)
+        .map(|i| format!("row {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    t.cells.push_back(tool_cell(1, "short"));
+    t.cells.push_back(tool_cell(2, &long));
+    t.cells.push_back(tool_cell(3, "tiny"));
+
+    // Skips the newest non-foldable cell, lands on the long one.
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(2));
+    assert!(!t.is_expanded(1));
+    assert!(!t.is_expanded(3));
+
+    // Second press toggles the same cell back.
+    assert!(t.toggle_last_expandable());
+    assert!(!t.is_expanded(2));
+}
+
+#[test]
+fn ctrl_o_ignores_cells_that_render_the_same_expanded() {
+    let mut t = Transcript::new(8);
+    t.cells.push_back(tool_cell(1, "only one line"));
+
+    assert!(!t.toggle_last_expandable());
+    assert!(!t.is_expanded(1));
+}
+
+#[test]
 fn an_evicted_cell_takes_its_expansion_with_it() {
     let mut t = Transcript::new(2);
     t.cells.push_back(tool_cell(1, "a"));

@@ -1,6 +1,4 @@
-//! Shared display strings. Russian text lives here on purpose: `pacode-tui`
-//! forbids Cyrillic inside string literals (`no_cyrillic_tests`), so callers
-//! compose lines from these pieces instead of writing the words inline.
+//! Shared display strings for the transcript and menus.
 
 use crate::RenderOptions;
 
@@ -8,58 +6,45 @@ use crate::RenderOptions;
 #[path = "text_tests.rs"]
 mod text_tests;
 
-/// Pick the Russian plural form for `n`: `plural(1, "строка", "строки", "строк")`.
-/// 11–14 always take `many`.
-pub fn plural(n: usize, one: &'static str, few: &'static str, many: &'static str) -> &'static str {
-    if (11..=14).contains(&(n % 100)) {
-        many
-    } else {
-        match n % 10 {
-            1 => one,
-            2..=4 => few,
-            _ => many,
-        }
-    }
-}
-
-/// `строка`/`строки`/`строк` for `n`.
+/// `line`/`lines` for `n`.
 pub fn lines_noun(n: usize) -> &'static str {
-    plural(n, "строка", "строки", "строк")
+    if n == 1 { "line" } else { "lines" }
 }
 
-/// `… ещё N строк · ctrl+o развернуть` — the fold marker under a capped
-/// tool-call body (spec §6).
+/// `… 12 more lines · ctrl+o to expand` — the fold marker under a capped
+/// tool-call body (spec §6). `opts.expand_hint` names the bound key.
 pub fn more_lines(n: usize, opts: &RenderOptions) -> String {
     format!(
-        "{} ещё {n} {}{}ctrl+o развернуть",
+        "{} {n} more {}{}{} to expand",
         opts.glyphs.ellipsis,
         lines_noun(n),
         opts.glyphs.dot_sep,
+        opts.expand_hint,
     )
 }
 
-/// The backgrounded outcome word (`◍ в фоне · 1m47s`).
+/// The backgrounded outcome word (`◍ background · 1m47s`).
 pub fn in_background() -> &'static str {
-    "в фоне"
+    "background"
 }
 
-/// The failed-count word in a hub summary (`4 · 1 упал`, `4 · 3 упали`).
-pub fn failed_word(n: usize) -> &'static str {
-    plural(n, "упал", "упали", "упали")
+/// The failed-count word in a hub summary (`4 · 1 failed`).
+pub fn failed_word(_n: usize) -> &'static str {
+    "failed"
 }
 
-/// Display label for a built-in tool (spec §6: `Команда`, `Чтение`, `Поиск`,
-/// `Запись`). `None` for tools without one — the caller falls back to the raw
+/// Display label for a built-in tool (spec §6: `Command`, `Read`, `Search`,
+/// `Write`). `None` for tools without one — the caller falls back to the raw
 /// name, capitalized.
 pub fn tool_label(name: &str) -> Option<&'static str> {
     Some(match name {
-        "bash" => "Команда",
-        "read" | "read_file" => "Чтение",
-        "grep" | "glob" | "search" => "Поиск",
-        "ls" => "Список",
-        "write" | "write_file" => "Запись",
-        "edit" | "multi_edit" | "edit_file" | "apply_patch" => "Правка",
-        "agent" => "Агент",
+        "bash" => "Command",
+        "read" | "read_file" => "Read",
+        "grep" | "glob" | "search" => "Search",
+        "ls" => "List",
+        "write" | "write_file" => "Write",
+        "edit" | "multi_edit" | "edit_file" | "apply_patch" => "Edit",
+        "agent" => "Agent",
         _ => return None,
     })
 }

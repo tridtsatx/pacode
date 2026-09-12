@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const WRITE_NAME: &str = "memory_write";
@@ -263,8 +263,7 @@ impl Tool for MemoryReadTool {
         };
 
         let content = cap_output(&raw, accept_large_output, ctx.output_cap_chars);
-        let line_count = content.lines().count();
-        let preview = format!("{line_count} lines");
+        let preview = preview_body(&content);
 
         Ok(ToolOutput::text(content)
             .with_title(READ_NAME)

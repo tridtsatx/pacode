@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "grep";
@@ -57,7 +57,7 @@ impl Tool for GrepTool {
     /// `ignore::WalkBuilder` (hidden files skipped, .gitignore honoured, binary files
     /// skipped by `grep_searcher`'s binary detection), `grep_regex::RegexMatcher`,
     /// `Searcher` with line numbers; runs in `tokio::task::spawn_blocking`; stops at
-    /// `max_results`; output capped; title `Grep "<pattern>"`, preview `<n> hits`.
+    /// `max_results`; output capped; title `Grep "<pattern>"`, preview = the hits.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<GrepInput>(input)?;
         if args.pattern.is_empty() {
@@ -217,7 +217,11 @@ impl Tool for GrepTool {
 
         let joined = output_lines.join("\n");
         let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-        let preview = format!("{hits_count} hits");
+        let preview = if hits_count == 0 {
+            "no hits".to_string()
+        } else {
+            preview_body(&joined)
+        };
         let title = format!("Grep \"{}\"", args.pattern);
 
         Ok(ToolOutput::text(content)

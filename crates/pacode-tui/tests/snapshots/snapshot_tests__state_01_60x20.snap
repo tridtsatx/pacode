@@ -13,7 +13,7 @@ expression: view
 "I'll help you organize the TUI crate with a persistent rail "
 "and separate dialog column.                                 "
 "                                                            "
-"▣ Чтение · crates/pacode-tui/src/layout.rs           ✓ 120ms"
+"▣ Read · crates/pacode-tui/src/layout.rs             ✓ 120ms"
 "│ pub fn compute(area: Rect) -> ScreenLayout...             "
 "                                                            "
 "[  C • • • • • • • • • ] thinking.                        0s"

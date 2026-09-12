@@ -7,7 +7,7 @@
 //!   `pacode_types::truncate_head_tail`; when a result is withheld for size the tool
 //!   returns an error result naming the size and the `accept_large_output` flag;
 //! - paths are resolved with `ctx.resolve`; symlinks are followed; writes outside
-//!   `ctx.cwd` require permission even in Auto mode (spec §6.3 "запись только внутри cwd").
+//!   `ctx.cwd` require permission even in Auto mode (spec §6.3 "writes stay inside cwd").
 
 pub mod agent;
 pub mod ask_question;

@@ -42,7 +42,7 @@ const KILL_KEY: KeyBinding = KeyBinding {
     mods: KeyModifiers::NONE,
 };
 
-/// Bytes of spool output the detail card's tail holds — §5.9's 2 КБ cap,
+/// Bytes of spool output the detail card's tail holds — §5.9's 2 KiB cap,
 /// always the file's end, never its head.
 pub(crate) const TAIL_CAP_BYTES: u64 = 2 * 1024;
 /// Tail lines the card keeps at most — the detail panel has no scroll, so a

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WaitOutcome};
 
 #[path = "ssh_multiplex.rs"]
@@ -157,18 +157,12 @@ pub(crate) async fn run_authorized(
             let tail_lines = ctx.host.task_tail(&id, 400).await?;
             let joined = tail_lines.join("\n");
             let capped = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
+            let preview = preview_body(&joined);
             let mut content = capped;
             if !content.ends_with('\n') {
                 content.push('\n');
             }
             content.push_str(&format!("[exit code {exit_code}]"));
-
-            let preview = tail_lines
-                .iter()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .cloned()
-                .unwrap_or_default();
 
             let mut out = ToolOutput::text(content)
                 .with_title(tool_title)
@@ -189,12 +183,11 @@ pub(crate) async fn run_authorized(
             let content = format!(
                 "Command still running after {secs}; moved to background as task {id}. Latest output:\n{tail_joined}"
             );
-            let preview = tail_lines
-                .iter()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| format!("task {id} moved to background"));
+            let preview = if tail_joined.trim().is_empty() {
+                format!("task {id} moved to background")
+            } else {
+                preview_body(&tail_joined)
+            };
 
             Ok(ToolOutput::text(content)
                 .with_title(tool_title)

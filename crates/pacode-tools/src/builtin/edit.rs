@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{first_changed_line, is_outside_workspace, parse_input};
+use super::helpers::{is_outside_workspace, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "edit";
@@ -88,7 +88,7 @@ impl Tool for EditTool {
     }
 
     /// Permission title `Edit <path>`, detail = unified diff (context 3); atomic write;
-    /// output `Edited <path>: N replacement(s)`, diff stat; preview = first changed line.
+    /// output `Edited <path>: N replacement(s)`, diff stat; preview = the diff.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _accept_large_output) = parse_input::<EditInput>(input)?;
         if args.path.is_empty() {
@@ -146,7 +146,7 @@ impl Tool for EditTool {
         tokio::fs::rename(&tmp_path, &full_path).await?;
         crate::walk::invalidate_path(&full_path);
 
-        let preview = first_changed_line(&diff);
+        let preview = preview_body(&diff);
         let title = format!("Edit {rel_path}");
         let text = format!("Edited {rel_path}: {count} replacement(s)");
 

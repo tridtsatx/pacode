@@ -5,7 +5,7 @@ use pacode_skills::SkillRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "skill";
@@ -80,7 +80,7 @@ impl Tool for SkillTool {
 
         let content = cap_output(&body, accept_large_output, ctx.output_cap_chars);
         let title = format!("Skill {name}");
-        let preview = format!("{} bytes", body.len());
+        let preview = preview_body(&content);
 
         Ok(ToolOutput::text(content)
             .with_title(title)

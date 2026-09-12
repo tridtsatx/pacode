@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::edit;
-use super::helpers::{first_changed_line, is_outside_workspace, parse_input};
+use super::helpers::{is_outside_workspace, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "multi_edit";
@@ -138,7 +138,7 @@ impl Tool for MultiEditTool {
         tokio::fs::rename(&tmp_path, &full_path).await?;
         crate::walk::invalidate_path(&full_path);
 
-        let preview = first_changed_line(&diff);
+        let preview = preview_body(&diff);
         let title = format!("Multi-edit {rel_path}");
 
         let mut lines = Vec::new();

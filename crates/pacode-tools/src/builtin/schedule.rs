@@ -9,7 +9,7 @@ use pacode_types::{CronJobId, CronSchedule, MonitorCondition, MonitorId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::parse_input;
+use super::helpers::{parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 #[cfg(test)]
@@ -120,9 +120,10 @@ impl Tool for CronTool {
                     job.name,
                     job.schedule.display()
                 );
+                let preview = preview_body(&content);
                 Ok(ToolOutput::text(content)
                     .with_title(format!("cron add {}", job.name))
-                    .with_preview(format!("{} runs {}", job.name, job.schedule.display())))
+                    .with_preview(preview))
             }
             "list" => {
                 let jobs = ctx.host.list_cron_jobs();
@@ -132,8 +133,9 @@ impl Tool for CronTool {
                         .with_preview("no cron jobs"));
                 }
                 let lines: Vec<String> = jobs.iter().map(|j| j.summary_line()).collect();
-                let preview = format!("{} cron jobs", jobs.len());
-                Ok(ToolOutput::text(lines.join("\n"))
+                let joined = lines.join("\n");
+                let preview = preview_body(&joined);
+                Ok(ToolOutput::text(joined)
                     .with_title("cron list")
                     .with_preview(preview))
             }
@@ -231,9 +233,10 @@ impl Tool for MonitorTool {
                     info.condition.describe(),
                     info.poll_interval_secs
                 );
+                let preview = preview_body(&content);
                 Ok(ToolOutput::text(content)
                     .with_title(format!("monitor {}", info.label))
-                    .with_preview(format!("watching {}", info.condition.describe())))
+                    .with_preview(preview))
             }
             "list" => {
                 let monitors = ctx.host.list_monitors();
@@ -243,8 +246,9 @@ impl Tool for MonitorTool {
                         .with_preview("no monitors"));
                 }
                 let lines: Vec<String> = monitors.iter().map(|m| m.summary_line()).collect();
-                let preview = format!("{} monitors", monitors.len());
-                Ok(ToolOutput::text(lines.join("\n"))
+                let joined = lines.join("\n");
+                let preview = preview_body(&joined);
+                Ok(ToolOutput::text(joined)
                     .with_title("monitor list")
                     .with_preview(preview))
             }

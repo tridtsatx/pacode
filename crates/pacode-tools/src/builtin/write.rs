@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{is_outside_workspace, parse_input};
+use super::helpers::{is_outside_workspace, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "write";
@@ -83,17 +83,20 @@ impl Tool for WriteTool {
             .to_string_lossy()
             .to_string();
 
-        let (detail, diff_stat) = match &old_content {
+        let (detail, preview, diff_stat) = match &old_content {
             Some(old) => {
                 let diff = pacode_render::unified_diff(old, &args.content, &rel_path, 3);
                 let stat = pacode_render::diff_stat(old, &args.content);
-                (diff, Some(stat))
+                (diff.clone(), diff, Some(stat))
             }
             None => {
                 let line_count = args.content.lines().count();
-                let detail = format!("new file, {line_count} lines");
                 let stat = pacode_render::diff_stat("", &args.content);
-                (detail, Some(stat))
+                // The all-added diff doubles as the cell body (the written
+                // content itself) and shows the reviewer what lands on disk.
+                let diff = pacode_render::unified_diff("", &args.content, &rel_path, 3);
+                let detail = format!("new file, {line_count} lines\n{diff}");
+                (detail, diff, Some(stat))
             }
         };
 
@@ -115,9 +118,8 @@ impl Tool for WriteTool {
         tokio::fs::rename(&tmp_path, &full_path).await?;
         crate::walk::invalidate_path(&full_path);
 
-        let line_count = args.content.lines().count();
         let content_msg = format!("Wrote {} bytes to {rel_path}", args.content.len());
-        let preview = format!("{line_count} lines");
+        let preview = preview_body(&preview);
         let title = format!("Write {rel_path}");
 
         let mut out = ToolOutput::text(content_msg)

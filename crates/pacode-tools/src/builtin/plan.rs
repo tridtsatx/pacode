@@ -5,7 +5,7 @@ use pacode_types::{Plan, PlanItem, PlanStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::parse_input;
+use super::helpers::{parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "plan";
@@ -143,7 +143,7 @@ impl Tool for PlanTool {
                 plan.items = new_items;
                 ctx.host.set_plan(plan.clone());
                 let rendered = render_plan(&plan);
-                let preview = format!("{} items", plan.items.len());
+                let preview = preview_body(&rendered);
                 Ok(ToolOutput::text(rendered)
                     .with_title("Plan")
                     .with_preview(preview))
@@ -173,7 +173,7 @@ impl Tool for PlanTool {
                 plan.version += 1;
                 ctx.host.set_plan(plan.clone());
                 let rendered = render_plan(&plan);
-                let preview = format!("updated {item_id}");
+                let preview = preview_body(&rendered);
                 Ok(ToolOutput::text(rendered)
                     .with_title("Plan update")
                     .with_preview(preview))
@@ -181,7 +181,7 @@ impl Tool for PlanTool {
             "get" => {
                 let plan = ctx.host.plan();
                 let rendered = render_plan(&plan);
-                let preview = format!("{} items", plan.items.len());
+                let preview = preview_body(&rendered);
                 Ok(ToolOutput::text(rendered)
                     .with_title("Plan")
                     .with_preview(preview))

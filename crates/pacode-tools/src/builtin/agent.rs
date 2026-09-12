@@ -5,7 +5,7 @@ use pacode_types::AgentId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::host::{AgentKindDef, AgentSpec};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
@@ -197,7 +197,7 @@ impl Tool for AgentTool {
                 }
                 let joined = lines.join("\n");
                 let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-                let preview = format!("{} agents, {} kinds", agents.len(), kinds.len());
+                let preview = preview_body(&content);
                 Ok(ToolOutput::text(content)
                     .with_title("agent list")
                     .with_preview(preview))

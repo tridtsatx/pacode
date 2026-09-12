@@ -543,7 +543,8 @@ async fn test_websearch_tool_success_and_formatting() {
         .expect("tool call succeeds");
 
     assert_eq!(out.title, "Search \"rust programming\"");
-    assert_eq!(out.preview, "2 results");
+    assert!(out.preview.contains("Search results for: rust programming"));
+    assert!(out.preview.contains("Rust Official"));
     assert!(out.content.contains("Search results for: rust programming"));
     assert!(out.content.contains("1. **Rust Official**"));
     assert!(out.content.contains("https://www.rust-lang.org/"));

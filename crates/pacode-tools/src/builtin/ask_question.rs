@@ -5,7 +5,7 @@ use pacode_types::QuestionOption;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::parse_input;
+use super::helpers::{parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 #[cfg(test)]
@@ -109,7 +109,7 @@ impl Tool for AskQuestionTool {
             .await?;
 
         let content = answer_text(&answer, &labels, &question_text);
-        let preview = content.lines().next().unwrap_or_default().to_string();
+        let preview = preview_body(&content);
         Ok(ToolOutput::text(content)
             .with_title(format!("ask {}", short(&question_text)))
             .with_preview(preview))

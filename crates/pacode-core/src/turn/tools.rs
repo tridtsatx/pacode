@@ -38,20 +38,21 @@ enum ToolChunk {
     Sequential(ToolCallInfo),
 }
 
+/// Input keys that name what the tool acts on, in priority order — `path`
+/// beats `content` for `write`, `pattern` beats `path` for `grep`.
+pub(crate) const TITLE_KEYS: &[&str] = &[
+    "command",
+    "pattern",
+    "query",
+    "path",
+    "file_path",
+    "file",
+    "url",
+    "uri",
+];
+
 fn tool_title(name: &str, input: &serde_json::Value) -> String {
-    if let Some(obj) = input.as_object() {
-        for (k, v) in obj {
-            if k != "intent"
-                && k != "accept_large_output"
-                && let Some(s) = v.as_str()
-            {
-                let arg = s.trim();
-                let truncated: String = arg.chars().take(60).collect();
-                return format!("{name} {truncated}");
-            }
-        }
-    }
-    name.to_string()
+    crate::transcript::tool_title(name, input, TITLE_KEYS)
 }
 
 async fn run_single_tool(
@@ -244,10 +245,20 @@ async fn run_single_tool(
                         } else {
                             ToolStatus::Ok
                         };
+                        // A tool that did not set a preview still gets a cell
+                        // body: the bounded content itself.
+                        let preview = if output.preview.is_empty() {
+                            pacode_types::truncate_head_tail(
+                                &output.content,
+                                pacode_types::PREVIEW_CAP_CHARS,
+                            )
+                        } else {
+                            output.preview
+                        };
                         (
                             output.content,
                             output.is_error,
-                            output.preview,
+                            preview,
                             output.diff,
                             output.task,
                             status,

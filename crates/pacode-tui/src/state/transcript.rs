@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use pacode_render::{LineCache, StreamBuffer, StreamKind, StreamOp};
+use pacode_types::transcript::ToolStatus;
 use pacode_types::{TranscriptItem, TranscriptKind};
 
 #[cfg(test)]
@@ -449,6 +450,53 @@ impl Transcript {
             .iter()
             .find(|(_, start, end)| line >= *start && line < *end)
             .map(|(id, _, _)| *id)
+    }
+
+    /// Whether the cell's body hides lines in its collapsed form — the
+    /// keyboard expand (`ctrl+o`) skips cells that would render identically
+    /// either way. Mirrors `ui::toolcell` exactly: diff previews ask the diff
+    /// renderer whether `fold_context` would emit a fold; plain bodies drop
+    /// the `[exit code N]` line the same way the cell does and compare
+    /// against the 6+3 / tail-8 caps.
+    fn body_is_foldable(preview: &str, status: ToolStatus) -> bool {
+        let preview = crate::ui::toolcell::strip_ansi(preview);
+        if crate::ui::toolcell::is_diff_preview(&preview) {
+            return pacode_render::diff_hides_lines(&preview);
+        }
+        let drop_exit = status == ToolStatus::Error
+            || matches!(status, ToolStatus::Ok | ToolStatus::Error)
+                && preview.lines().any(|l| {
+                    let t = l.trim();
+                    t.starts_with("[exit code ") && t.ends_with(']')
+                });
+        let cap = if status == ToolStatus::Error {
+            crate::ui::toolcell::ERROR_TAIL_LINES
+        } else {
+            crate::ui::toolcell::COLLAPSED_HEAD_LINES + crate::ui::toolcell::COLLAPSED_TAIL_LINES
+        };
+        preview
+            .lines()
+            .filter(|l| {
+                !(drop_exit && {
+                    let t = l.trim();
+                    t.starts_with("[exit code ") && t.ends_with(']')
+                })
+            })
+            .count()
+            > cap
+    }
+
+    /// `ctrl+o`: expand the newest cell whose body hides lines when collapsed,
+    /// or collapse it back when it is already expanded. Returns true on change.
+    pub fn toggle_last_expandable(&mut self) -> bool {
+        let id = self.cells.iter().rev().find_map(|c| match &c.kind {
+            CellKind::Item(TranscriptKind::ToolCall {
+                preview, status, ..
+            }) if Self::body_is_foldable(preview, *status) => Some(c.id),
+            _ => None,
+        });
+        let Some(id) = id else { return false };
+        self.toggle_expanded(id)
     }
 
     /// Show or hide a cell's full output. Returns true when something changed.

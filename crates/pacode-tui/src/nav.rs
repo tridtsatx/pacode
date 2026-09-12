@@ -338,6 +338,7 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ToggleZdr
             | KeyAction::Menu
             | KeyAction::Help
+            | KeyAction::ExpandOutput
             // Picker-scoped (§9.1): never reach the shared ladder — an open
             // picker overlay swallows its keys before this dispatch.
             | KeyAction::ModelPickerFavorite
@@ -392,6 +393,7 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ToggleZdr
             | KeyAction::Menu
             | KeyAction::Help
+            | KeyAction::ExpandOutput
             | KeyAction::ModelPickerFavorite
             | KeyAction::ModelPickerZdr => {}
         }

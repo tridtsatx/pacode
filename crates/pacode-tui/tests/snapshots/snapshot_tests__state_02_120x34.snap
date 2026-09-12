@@ -14,7 +14,7 @@ expression: view
 "I'll help you organize the TUI crate with a persistent rail and separate dialog        │▸ ✓ parser                      "
 "column.                                                                                │    parsed syntax trees         "
 "                                                                                       │    400ms · ↓ 8.5k              "
-"▣ Чтение · crates/pacode-tui/src/layout.rs                                     ✓ 120ms │                                "
+"▣ Read · crates/pacode-tui/src/layout.rs                                       ✓ 120ms │                                "
 "│ pub fn compute(area: Rect) -> ScreenLayout...                                        │                                "
 "                                                                                       │                                "
 "                                                                                       │                                "

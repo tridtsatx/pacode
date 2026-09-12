@@ -30,6 +30,13 @@ pub fn cap_output(text: &str, accept_large: bool, cap: usize) -> String {
     }
 }
 
+/// The transcript-cell body: real output, head+tail-capped at
+/// `PREVIEW_CAP_CHARS` — enough for the cell's collapsed view and for
+/// `ctrl+o` expansion, bounded so the transcript stays light.
+pub fn preview_body(text: &str) -> String {
+    pacode_types::truncate_head_tail(text, pacode_types::PREVIEW_CAP_CHARS)
+}
+
 /// Check if a path is outside the workspace directory `cwd`.
 pub fn is_outside_workspace(path: &Path, cwd: &Path) -> bool {
     let canonical_cwd = match cwd.canonicalize() {
@@ -63,16 +70,4 @@ pub(crate) fn canonicalize_best_effort(path: &Path) -> PathBuf {
         base.push(segment);
     }
     base
-}
-
-/// Extract the first changed line from a unified diff for transcript preview.
-pub fn first_changed_line(diff: &str) -> String {
-    for line in diff.lines() {
-        if (line.starts_with('+') && !line.starts_with("+++"))
-            || (line.starts_with('-') && !line.starts_with("---"))
-        {
-            return line.to_string();
-        }
-    }
-    String::new()
 }

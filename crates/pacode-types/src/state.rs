@@ -548,10 +548,12 @@ mod tests {
             model: ModelRoute::new("p", "m"),
             effort: Effort::High,
             mode: Mode::Build,
-            first_prompt: Some("разбери layout.rs и раскидай по модулям, тесты параллельно".into()),
+            first_prompt: Some(
+                "review layout.rs and split into modules, run tests in parallel".into(),
+            ),
             zdr: false,
         };
         // six words, exactly 40 chars: no truncation
-        assert_eq!(meta.title(), "разбери layout.rs и раскидай по модулям,");
+        assert_eq!(meta.title(), "review layout.rs and split into modules,");
     }
 }

@@ -132,11 +132,11 @@ fn long_context_runs_fold() {
     let lines = render_diff(&diff, &opts);
     let text: Vec<String> = lines.iter().map(line_text).collect();
     // 10 ctx lines → 3 kept + a fold marker of 7.
-    assert!(text.iter().any(|l| l.contains("7 строк свёрнуто")));
-    assert!(text.iter().any(|l| l.contains("ctrl+o развернуть")));
+    assert!(text.iter().any(|l| l.contains("7 lines collapsed")));
+    assert!(text.iter().any(|l| l.contains("ctrl+o to expand")));
     // …and expanded mode shows them all.
     let all = render_diff_ex(&diff, &opts, true);
-    assert!(!all.iter().map(line_text).any(|l| l.contains("свёрнут")));
+    assert!(!all.iter().map(line_text).any(|l| l.contains("collapsed")));
 }
 
 #[test]

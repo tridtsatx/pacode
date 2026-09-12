@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "ls";
@@ -138,7 +138,11 @@ impl Tool for LsTool {
         } else {
             format!("ls {rel_display}")
         };
-        let preview = format!("{total_entries} entries");
+        let preview = if total_entries == 0 {
+            "empty".to_string()
+        } else {
+            preview_body(&joined)
+        };
 
         Ok(ToolOutput::text(content)
             .with_title(title)

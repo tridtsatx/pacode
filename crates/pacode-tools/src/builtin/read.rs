@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "read";
@@ -51,7 +51,8 @@ impl Tool for ReadTool {
 
     /// Reads the file (tokio::fs), rejects files with a NUL byte in the first 8 KiB,
     /// applies offset/limit, formats `{:>6}\t{line}`, caps to `ctx.output_cap_chars`
-    /// (unless `accept_large_output`), title `Read <path>`, preview = line count.
+    /// (unless `accept_large_output`), title `Read <path>`, preview = the
+    /// numbered lines (bounded) so the transcript cell can show and expand them.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<ReadInput>(input)?;
         if args.path.is_empty() {
@@ -81,7 +82,7 @@ impl Tool for ReadTool {
 
         let raw = lines_out.join("\n");
         let content = cap_output(&raw, accept_large_output, ctx.output_cap_chars);
-        let preview = format!("{} lines", lines_out.len());
+        let preview = preview_body(&content);
         let title = format!("Read {}", args.path);
 
         Ok(ToolOutput::text(content)

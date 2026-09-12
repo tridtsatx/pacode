@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::bash::{BashInput, run_authorized};
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::host::PermissionDraft;
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 use pacode_types::PermissionDecision;
@@ -157,7 +157,10 @@ impl Tool for BatchTool {
         let content = cap_output(&body, accept_large, ctx.output_cap_chars);
         let mut out = ToolOutput::text(content)
             .with_title(format!("Batch {total} ops"))
-            .with_preview(format!("{succeeded}/{total} ops ok"));
+            .with_preview(format!(
+                "{succeeded}/{total} ops ok\n{}",
+                preview_body(&body)
+            ));
         // Only a fully failed batch is an error; partial failures keep their
         // successful sections readable.
         out.is_error = failed == total;

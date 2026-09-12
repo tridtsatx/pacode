@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "glob";
@@ -114,7 +114,11 @@ impl Tool for GlobTool {
         let count = matched_paths.len();
         let joined = matched_paths.join("\n");
         let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-        let preview = format!("{count} files");
+        let preview = if count == 0 {
+            "no files".to_string()
+        } else {
+            preview_body(&joined)
+        };
         let title = format!("Glob \"{}\"", args.pattern);
 
         Ok(ToolOutput::text(content)

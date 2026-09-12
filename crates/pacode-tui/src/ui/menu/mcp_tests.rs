@@ -298,7 +298,7 @@ fn hub_summary_counts_failures() {
     let MenuRow::Submenu { right, .. } = row else {
         panic!("mcp is a Submenu row");
     };
-    // `4 · 2 <упали>` — the word comes from pacode_render::text.
+    // `4 · 2 <failed>` — the word comes from pacode_render::text.
     let want = format!("4 · 2 {}", pacode_render::text::failed_word(2));
     assert_eq!(right.as_deref(), Some(want.as_str()));
 

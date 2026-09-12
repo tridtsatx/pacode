@@ -370,6 +370,20 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return handle_scroll(state, scroll_act);
     }
 
+    // 7.5 ctrl+o — expand the newest tool cell whose body hides lines, or
+    // collapse it back. A click does the same for the cell under the pointer.
+    if action == Some(KeyAction::ExpandOutput) {
+        let transcript = if state.agent_replaces_dialog() {
+            &mut state.panel.agent_transcript
+        } else {
+            &mut state.transcript
+        };
+        if transcript.toggle_last_expandable() {
+            state.dirty = true;
+        }
+        return vec![];
+    }
+
     // 8. Interactive permission prompt when input is empty: y / a / n
     if state.input.is_empty()
         && let Some(pending_req) = find_pending_permission(state)

@@ -127,12 +127,22 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     let input_lines = state.input.wrapped_lines(temp_layout.input.width);
     let layout = crate::layout::compute(frame.area(), input_lines, panel_open, preview_lines);
 
+    // Fold markers name the chord actually bound to ExpandOutput — "click"
+    // when it is unbound (a click on the cell still toggles it).
+    let expand_hint = state
+        .keymap
+        .bindings_for(crate::binding::Action::ExpandOutput)
+        .first()
+        .map(crate::binding::format_binding)
+        .unwrap_or_else(|| "click".to_string());
+
     let opts = RenderOptions::with_theme(
         frame.area().width,
         state.config.ui.ascii_only,
         state.theme.clone(),
     )
-    .thinking(state.config.ui.thinking);
+    .thinking(state.config.ui.thinking)
+    .expand_hint(expand_hint.clone());
 
     if layout.rail.width > 0 {
         if layout.rail_separator.width > 0 {
@@ -167,7 +177,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             state.config.ui.ascii_only,
             state.theme.clone(),
         )
-        .thinking(state.config.ui.thinking);
+        .thinking(state.config.ui.thinking)
+        .expand_hint(expand_hint.clone());
         // The activity line is drawn whenever there is something to report, which
         // includes waiting on a subagent or a background task with the turn over.
         // Whose conversation is on screen must be visible: the column looks the
@@ -286,7 +297,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             state.config.ui.ascii_only,
             state.theme.clone(),
         )
-        .thinking(state.config.ui.thinking);
+        .thinking(state.config.ui.thinking)
+        .expand_hint(expand_hint.clone());
         panel::draw(frame, panel_rect, state, &panel_opts);
     }
 
@@ -353,7 +365,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             state.config.ui.ascii_only,
             state.theme.clone(),
         )
-        .thinking(state.config.ui.thinking);
+        .thinking(state.config.ui.thinking)
+        .expand_hint(expand_hint.clone());
         let anim_frame = state.anim_frame;
         let lines = if state.agent_replaces_dialog() {
             dialog::plain_lines(

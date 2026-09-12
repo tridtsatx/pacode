@@ -22,7 +22,7 @@ use pacode_types::WebConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "websearch";
@@ -292,10 +292,14 @@ impl Tool for WebSearchTool {
         let cap = ctx.output_cap_chars;
         let content = cap_output(&formatted, accept_large_output, cap);
         let count = results.len();
-        let preview = if count == 0 && note.is_some() {
-            "0 results (markup may have changed)".to_string()
+        let preview = if count == 0 {
+            if note.is_some() {
+                "0 results (markup may have changed)".to_string()
+            } else {
+                "0 results".to_string()
+            }
         } else {
-            format!("{count} results")
+            preview_body(&formatted)
         };
         let title = format!("Search \"{query}\"");
 

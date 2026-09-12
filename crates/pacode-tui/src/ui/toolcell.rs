@@ -10,8 +10,8 @@
 //! The header answers "what and with what" and carries the outcome flush right.
 //! The body hangs on the `│` gutter coloured by outcome while output lines
 //! themselves stay `dim`. ANSI escapes in the program's own output are stripped
-//! before render so they can never restyle the gutter. Russian UI strings come
-//! from `pacode_render::text` — this crate forbids Cyrillic literals.
+//! before render so they can never restyle the gutter. Shared strings come
+//! from `pacode_render::text` so this crate keeps no display literals of its own.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -67,7 +67,7 @@ pub fn render(
 
     out.push(header(call, exit_code, width, opts, anim_frame));
 
-    if preview.starts_with("--- ") || preview.contains("\n+++ ") {
+    if is_diff_preview(&preview) {
         // A diff preview goes through the diff renderer at body width so its
         // background bands end exactly at the cell edge.
         let mut diff_opts = opts.clone();
@@ -188,12 +188,14 @@ fn short_arg(call: &ToolCallView<'_>) -> String {
 }
 
 /// `title` is `<name> <arg>` — the arg part, or the whole title when it does
-/// not start with the name (snapshot rows differ).
+/// not start with the name. The name prefix matches case-insensitively:
+/// tools emit `Edit <path>` while the call is named `edit`.
 fn title_arg<'a>(call: &ToolCallView<'a>) -> &'a str {
+    let prefix_len = call.name.len();
+    if call.title.len() >= prefix_len && call.title[..prefix_len].eq_ignore_ascii_case(call.name) {
+        return call.title[prefix_len..].trim_start();
+    }
     call.title
-        .strip_prefix(call.name)
-        .map(str::trim_start)
-        .unwrap_or(call.title)
 }
 
 /// `│ $ <command>` — the bash command in the theme's bash-role highlighting.
@@ -234,7 +236,7 @@ fn body_line(
     ])
 }
 
-/// The fold marker: `│ … ещё N строк · ctrl+o развернуть` — what the cap hides.
+/// The fold marker: `│ … N more lines · ctrl+o to expand` — what the cap hides.
 fn marker_line(hidden: usize, gutter_style: Style, opts: &RenderOptions) -> Line<'static> {
     Line::from(vec![
         gutter(opts, gutter_style),
@@ -303,7 +305,7 @@ fn push_expanded(
     }
 }
 
-/// `✓ exit 0 · 0.4s`, `✗ exit 1 · 12s`, `◍ в фоне`, `<spinner> running`, `denied`.
+/// `✓ exit 0 · 0.4s`, `✗ exit 1 · 12s`, `◍ background`, `<spinner> running`, `denied`.
 fn outcome_spans(
     call: &ToolCallView<'_>,
     exit_code: Option<i32>,
@@ -388,6 +390,17 @@ fn diff_stat_spans(diff: &DiffStat, opts: &RenderOptions) -> Vec<Span<'static>> 
         Span::raw(" "),
         Span::styled(format!("{minus}{}", diff.removed), opts.theme.red),
     ]
+}
+
+/// Whether a preview is a unified diff and goes through the diff renderer.
+/// `--- a/` and `--- /dev/null` are the headers `unified_diff` emits; a bare
+/// `--- ` prefix alone is not enough (`batch` section headers look alike).
+/// `pub(crate)`: `state::transcript` reuses it to decide whether a cell's
+/// collapsed body actually hides lines.
+pub(crate) fn is_diff_preview(preview: &str) -> bool {
+    preview.starts_with("--- a/")
+        || preview.starts_with("--- /dev/null")
+        || preview.contains("\n+++ ")
 }
 
 /// The `[exit code N]` marker the exec layer appends — the header shows the code.

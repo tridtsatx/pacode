@@ -44,17 +44,16 @@ pub fn unified_diff(old: &str, new: &str, path: &str, context: usize) -> String 
 }
 
 /// Context lines kept on each side of a change; longer runs fold into
-/// `… N строк свёрнуто · ctrl+o развернуть`.
+/// `… N lines collapsed · ctrl+o to expand`.
 const CONTEXT: usize = 3;
 
-/// `… N строк свёрнуто · ctrl+o развернуть` — plural forms come from
-/// `crate::text` (the same rules the tool cell's `ещё N строк` marker uses).
+/// `… N lines collapsed · <key> to expand` — the same marker idiom the tool
+/// cell uses for its `more lines` fold.
 fn folded_text(n: usize, opts: &RenderOptions) -> String {
     let noun = crate::text::lines_noun(n);
-    let verb = crate::text::plural(n, "свёрнута", "свёрнуто", "свёрнуто");
     format!(
-        "{} {n} {noun} {verb}{}ctrl+o развернуть",
-        opts.glyphs.ellipsis, opts.glyphs.dot_sep,
+        "{} {n} {noun} collapsed{}{} to expand",
+        opts.glyphs.ellipsis, opts.glyphs.dot_sep, opts.expand_hint,
     )
 }
 
@@ -66,7 +65,7 @@ enum RowKind {
     Hunk,
     /// `\ No newline at end of file` — faint, no number.
     Meta,
-    /// `… N строк свёрнуто · ctrl+o развернуть` placeholder.
+    /// `… N lines collapsed · ctrl+o to expand` placeholder.
     Fold(usize),
     Add,
     Del,
@@ -390,7 +389,16 @@ pub fn render_diff(diff: &str, opts: &RenderOptions) -> Vec<Line<'static>> {
     render_diff_ex(diff, opts, false)
 }
 
-/// `expanded` keeps every context line instead of the `… N строк` marker.
+/// Whether collapsed rendering would hide lines — true when `fold_context`
+/// emits a `Fold` row, i.e. expanding actually reveals more. The TUI uses
+/// this to keep `ctrl+o` pointed only at cells that have something to show.
+pub fn diff_hides_lines(diff: &str) -> bool {
+    fold_context(parse_rows(diff, false))
+        .iter()
+        .any(|r| matches!(r.kind, RowKind::Fold(_)))
+}
+
+/// `expanded` keeps every context line instead of the `… N lines` marker.
 pub fn render_diff_ex(diff: &str, opts: &RenderOptions, expanded: bool) -> Vec<Line<'static>> {
     let rows = parse_rows(diff, opts.color != ColorMode::Mono);
     let nw = num_width(&rows);
