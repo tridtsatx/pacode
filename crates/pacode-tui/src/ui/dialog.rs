@@ -7,7 +7,7 @@ use ratatui::widgets::Paragraph;
 
 use pacode_render::cache::CacheKey;
 use pacode_render::markdown::split_stable_tail;
-use pacode_render::{RenderOptions, render_diff, render_markdown, truncate_to_width, wrap_text};
+use pacode_render::{RenderOptions, render_diff_ex, render_markdown, truncate_to_width, wrap_text};
 use pacode_types::transcript::{DiffStat, ToolStatus};
 use pacode_types::{ToastLevel, TranscriptKind};
 
@@ -513,7 +513,11 @@ fn render_item_inner(
 
             if !preview.is_empty() {
                 if preview.starts_with("--- ") || preview.contains("\n+++ ") {
-                    let diff_lines = render_diff(preview, opts);
+                    // The cell gutter eats 4 cells; the diff renders at
+                    // width - 4 so its background bands end at the cell edge.
+                    let mut diff_opts = opts.clone();
+                    diff_opts.width = width.saturating_sub(4);
+                    let diff_lines = render_diff_ex(preview, &diff_opts, expanded);
                     for dl in diff_lines {
                         let mut spans = vec![Span::styled("  │ ", opts.theme.dim)];
                         spans.extend(dl.spans);

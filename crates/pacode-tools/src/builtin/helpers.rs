@@ -40,7 +40,9 @@ pub fn is_outside_workspace(path: &Path, cwd: &Path) -> bool {
     !canonical_path.starts_with(&canonical_cwd)
 }
 
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
+/// Canonical path when it exists; otherwise canonicalizes the deepest existing
+/// ancestor and re-appends the missing tail.
+pub(crate) fn canonicalize_best_effort(path: &Path) -> PathBuf {
     if let Ok(c) = path.canonicalize() {
         return c;
     }

@@ -36,6 +36,11 @@ pub struct Config {
     pub hooks: HooksConfig,
     /// Zero-data-retention routing (`zdr = "always" | "session" | "off"`).
     pub zdr: ZdrMode,
+    /// `[tools.<name>]`: per-tool toggles. `enabled = false` removes the tool
+    /// from the schema sent to the model — built-in names as well as plugin,
+    /// skill and MCP `<server>__<tool>` names. Applied when the daemon wires
+    /// its registries, so changes need a restart.
+    pub tools: BTreeMap<String, ToolToggle>,
 }
 
 impl Config {
@@ -49,6 +54,32 @@ impl Config {
 
     pub fn pricing_for(&self, model: &str) -> Option<Pricing> {
         self.pricing.get(model).copied()
+    }
+
+    /// Whether `name` is exposed to the model; tools without an entry are enabled.
+    pub fn tool_enabled(&self, name: &str) -> bool {
+        self.tools.get(name).map(|t| t.enabled).unwrap_or(true)
+    }
+
+    /// Names disabled via `[tools.<name>] enabled = false`.
+    pub fn disabled_tool_names(&self) -> impl Iterator<Item = &str> {
+        self.tools
+            .iter()
+            .filter(|(_, toggle)| !toggle.enabled)
+            .map(|(name, _)| name.as_str())
+    }
+}
+
+/// `[tools.<name>]` entry; a present-but-empty table means enabled.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolToggle {
+    pub enabled: bool,
+}
+
+impl Default for ToolToggle {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -662,6 +693,28 @@ mod tests {
         assert!(cfg.hooks.session_start.is_empty());
         assert!(cfg.hooks.session_end.is_empty());
         assert!(cfg.hooks.notification.is_empty());
+        assert!(cfg.tools.is_empty());
+    }
+
+    #[test]
+    fn tool_toggles_parse_and_query() {
+        // Same shape as `[tools.bash] enabled = false` in config.toml.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "tools": {
+                "bash": { "enabled": false },
+                "github__get_pr": { "enabled": false },
+                "read": {},
+            }
+        }))
+        .unwrap();
+        assert!(!cfg.tool_enabled("bash"));
+        assert!(!cfg.tool_enabled("github__get_pr"));
+        // A present-but-empty table means enabled; absent tools are enabled.
+        assert!(cfg.tool_enabled("read"));
+        assert!(cfg.tool_enabled("grep"));
+        let mut disabled: Vec<&str> = cfg.disabled_tool_names().collect();
+        disabled.sort();
+        assert_eq!(disabled, ["bash", "github__get_pr"]);
     }
 
     #[test]

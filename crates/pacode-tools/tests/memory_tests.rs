@@ -222,6 +222,7 @@ fn make_ctx(cwd: PathBuf, host: Arc<dyn ToolHost>) -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: pacode_tools::ToolRegistry::new(),
     }
 }
 

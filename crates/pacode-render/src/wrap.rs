@@ -68,6 +68,55 @@ pub fn truncate_to_width(s: &str, width: usize, ellipsis: bool) -> String {
     out
 }
 
+/// Cut a list of styled spans to `width` cells, preserving styles. When the text
+/// does not fit, `ellipsis` (`"…"` or `"..."`) replaces the tail of the last
+/// visible span. Used where lines must be cut, not wrapped (diffs, code blocks).
+pub fn truncate_spans(spans: &[Span<'static>], width: usize, ellipsis: &str) -> Vec<Span<'static>> {
+    let ell_w = display_width(ellipsis).max(1);
+    let total: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+    if total <= width {
+        return spans.to_vec();
+    }
+    if width < ell_w {
+        // Not even the ellipsis fits — emit nothing rather than overflow.
+        return Vec::new();
+    }
+    let budget = width - ell_w;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut tail_style = Style::default();
+    for span in spans {
+        if used >= budget {
+            break;
+        }
+        let span_w = display_width(&span.content);
+        if used + span_w <= budget {
+            tail_style = span.style;
+            out.push(span.clone());
+            used += span_w;
+            continue;
+        }
+        // Partial span: keep as many whole graphemes as fit.
+        let mut kept = String::new();
+        let mut kept_w = 0usize;
+        for g in span.content.graphemes(true) {
+            let gw = display_width(g);
+            if used + kept_w + gw > budget {
+                break;
+            }
+            kept.push_str(g);
+            kept_w += gw;
+        }
+        tail_style = span.style;
+        if !kept.is_empty() {
+            out.push(Span::styled(kept, span.style));
+        }
+        break;
+    }
+    out.push(Span::styled(ellipsis.to_string(), tail_style));
+    out
+}
+
 /// Word-wrap plain text to `width` cells. Words longer than the width are split by
 /// grapheme. Existing newlines are respected. Never returns an empty vec.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {

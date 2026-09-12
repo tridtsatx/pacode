@@ -167,37 +167,37 @@ impl Tool for GrepTool {
                     return Ok((results, total_hits));
                 }
 
-                let walker = ignore::WalkBuilder::new(&search_root)
-                    .hidden(true)
-                    .git_ignore(true)
-                    .require_git(false)
-                    .build();
+                let entries = crate::walk::shared().collect(
+                    &search_root,
+                    crate::walk::WalkOptions {
+                        include_hidden: false,
+                        max_depth: None,
+                    },
+                    &cancel,
+                )?;
 
-                for entry in walker {
+                for entry in entries.iter() {
                     if cancel.is_cancelled() {
                         return Err(ToolError::Cancelled);
                     }
                     if total_hits >= max_results {
                         break;
                     }
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    if !entry.is_file {
                         continue;
                     }
-                    let path = entry.path();
+                    // Join onto the non-canonical root so `display_path` strips
+                    // against `cwd` exactly like a fresh walk would.
+                    let path = search_root.join(&entry.rel);
                     if let Some(ref gm) = glob_matcher {
-                        let filename = path.file_name().unwrap_or_default();
-                        let rel = path.strip_prefix(&search_root).unwrap_or(path);
-                        if !gm.is_match(filename) && !gm.is_match(rel) {
+                        let filename = entry.rel.file_name().unwrap_or_default();
+                        if !gm.is_match(filename) && !gm.is_match(&entry.rel) {
                             continue;
                         }
                     }
                     let display_path = path
                         .strip_prefix(&cwd)
-                        .unwrap_or(path)
+                        .unwrap_or(&path)
                         .to_string_lossy()
                         .to_string();
 
@@ -207,7 +207,7 @@ impl Tool for GrepTool {
                         total_hits: &mut total_hits,
                         max_results,
                     };
-                    let _ = searcher.search_path(&matcher, path, &mut sink);
+                    let _ = searcher.search_path(&matcher, &path, &mut sink);
                 }
 
                 Ok((results, total_hits))

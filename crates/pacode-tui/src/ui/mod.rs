@@ -16,6 +16,7 @@ pub mod keys_overlay;
 pub mod login_picker;
 pub mod mascot;
 pub mod mcp;
+pub mod menu;
 pub mod overlays;
 pub mod panel;
 pub mod phrases;

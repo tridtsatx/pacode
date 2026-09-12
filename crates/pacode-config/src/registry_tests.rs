@@ -348,6 +348,50 @@ fn test_web_config_settings() {
 }
 
 #[test]
+fn test_tool_toggles() {
+    let mut cfg = Config::default();
+    // Static entries exist for built-in tools.
+    let entry = find_entry("tools.bash.enabled").unwrap();
+    assert_eq!(entry.section, "tools");
+    assert_eq!(entry.kind, SettingKind::Bool);
+    assert_eq!(entry.apply, ApplyMode::Restart);
+
+    // read_value: everything is enabled by default.
+    assert_eq!(
+        read_value(&cfg, "tools.bash.enabled"),
+        Some("true".to_string())
+    );
+
+    // validate/apply round-trip — static name and a dynamic MCP-style name.
+    let parsed = validate("tools.bash.enabled", "false").unwrap();
+    apply_to_config(&mut cfg, "tools.bash.enabled", &parsed);
+    assert!(!cfg.tool_enabled("bash"));
+    assert_eq!(
+        read_value(&cfg, "tools.bash.enabled"),
+        Some("false".to_string())
+    );
+
+    let parsed = validate("tools.github__get_pr.enabled", "false").unwrap();
+    apply_to_config(&mut cfg, "tools.github__get_pr.enabled", &parsed);
+    assert!(!cfg.tool_enabled("github__get_pr"));
+
+    // Bad names/values fail closed.
+    assert!(validate("tools.bash.enabled", "maybe").is_err());
+    assert!(matches!(
+        validate("tools.a.b.enabled", "false"),
+        Err(ValidationError::UnknownKey { .. })
+    ));
+    assert!(find_entry("tools.nonexistent.enabled").is_none());
+
+    // is_modified tracks the disabled state.
+    assert!(is_modified(&cfg, find_entry("tools.bash.enabled").unwrap()));
+    assert!(!is_modified(
+        &cfg,
+        find_entry("tools.read.enabled").unwrap()
+    ));
+}
+
+#[test]
 fn test_live_restart_classification_present_for_every_entry() {
     for entry in SETTINGS {
         match entry.apply {

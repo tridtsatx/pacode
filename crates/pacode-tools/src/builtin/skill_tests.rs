@@ -185,6 +185,7 @@ fn make_ctx(cwd: PathBuf) -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: crate::registry::ToolRegistry::new(),
     }
 }
 

@@ -140,11 +140,14 @@ async fn run_single_tool(
         }
     }
 
-    let tool_opt = agent
+    // One snapshot serves both the dispatch lookup and `ctx.tools`, which
+    // `batch` uses to resolve its ops.
+    let registry_snapshot = agent
         .tools
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .get(&call.name);
+        .clone();
+    let tool_opt = registry_snapshot.get(&call.name);
 
     // ZDR hard isolation: network tools (webfetch/websearch bypass the
     // permission gate) and every MCP call (`<server>__<tool>`, `__resource`)
@@ -180,6 +183,7 @@ async fn run_single_tool(
         exec_default_timeout: Duration::from_secs(session.config.exec.default_timeout_secs),
         tool_name: Some(call.name.clone()),
         tool_kind: tool_opt.as_ref().map(|t| t.kind()),
+        tools: registry_snapshot,
     };
 
     let start = Instant::now();

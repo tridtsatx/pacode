@@ -113,6 +113,7 @@ impl Tool for WriteTool {
         let tmp_path = format!("{}.pacode-tmp", full_path.to_string_lossy());
         tokio::fs::write(&tmp_path, args.content.as_bytes()).await?;
         tokio::fs::rename(&tmp_path, &full_path).await?;
+        crate::walk::invalidate_path(&full_path);
 
         let line_count = args.content.lines().count();
         let content_msg = format!("Wrote {} bytes to {rel_path}", args.content.len());

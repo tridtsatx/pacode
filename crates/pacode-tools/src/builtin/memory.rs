@@ -181,6 +181,9 @@ impl Tool for MemoryWriteTool {
         };
 
         tokio::fs::write(&target_file, new_content.as_bytes()).await?;
+        // Project memory lives inside the walked tree; global is outside every
+        // root and the call is a no-op there.
+        crate::walk::invalidate_path(&target_file);
 
         Ok(ToolOutput::text("stored")
             .with_title(format!("{WRITE_NAME} ({})", scope.as_str()))

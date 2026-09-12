@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod ask_question;
 pub mod bash;
+pub mod batch;
 pub mod bg;
 pub mod edit;
 pub mod glob;
@@ -62,6 +63,7 @@ pub fn builtin_tools(web: &WebConfig) -> ToolRegistry {
         .with(Arc::new(report_status::ReportStatusTool))
         .with(Arc::new(memory::MemoryWriteTool))
         .with(Arc::new(memory::MemoryReadTool))
+        .with(Arc::new(batch::BatchTool))
 }
 
 /// Tool names a subagent gets by default: everything except `agent` (depth 1).
