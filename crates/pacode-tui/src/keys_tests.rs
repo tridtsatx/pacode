@@ -489,45 +489,39 @@ fn test_overlay_session_picker_navigation_focus_and_esc() {
     };
     state.sessions = vec![meta1, meta2];
 
-    // Open via slash command `/sessions` + Enter
+    // Open via slash command `/sessions` + Enter — the menu level now (T8).
     state.input.insert_str("/sessions");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     handle_key(&mut state, enter, now);
+    let Focus::Overlay(Overlay::Menu { stack, .. }) = &state.focus else {
+        panic!("expected the menu overlay, got {:?}", state.focus);
+    };
     assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::SessionPicker {
-            query: String::new(),
-            index: 0,
-        })
+        stack.current().map(|l| l.id),
+        Some(crate::ui::menu::MenuId::Sessions)
     );
 
     // Keys do NOT leak to input!
     let char_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
     handle_key(&mut state, char_a, now);
     assert!(state.input.is_empty());
-    // 'a' went to query
-    assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::SessionPicker {
-            query: "a".into(),
-            index: 0,
-        })
-    );
+    // 'a' went to the menu's local filter query
+    let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
+        panic!("expected the menu overlay, got {:?}", state.focus);
+    };
+    assert_eq!(ui.query, "a");
 
     // Backspace clears query
     let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
     handle_key(&mut state, backspace, now);
 
-    // Down key changes index to 1
+    // Down key moves the cursor to the second session row
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     handle_key(&mut state, down, now);
-    assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::SessionPicker {
-            query: String::new(),
-            index: 1,
-        })
-    );
+    let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
+        panic!("expected the menu overlay, got {:?}", state.focus);
+    };
+    assert_eq!(ui.cursor, crate::ui::menu::RowId::new("ses_1"));
 
     // Esc closes it
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -537,21 +531,18 @@ fn test_overlay_session_picker_navigation_focus_and_esc() {
     // Open via ctrl+p
     let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
     handle_key(&mut state, ctrl_p, now);
+    let Focus::Overlay(Overlay::Menu { stack, .. }) = &state.focus else {
+        panic!("expected the menu overlay, got {:?}", state.focus);
+    };
     assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::SessionPicker {
-            query: String::new(),
-            index: 0,
-        })
+        stack.current().map(|l| l.id),
+        Some(crate::ui::menu::MenuId::Sessions)
     );
     handle_key(&mut state, down, now);
-    assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::SessionPicker {
-            query: String::new(),
-            index: 1,
-        })
-    );
+    let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
+        panic!("expected the menu overlay, got {:?}", state.focus);
+    };
+    assert_eq!(ui.cursor, crate::ui::menu::RowId::new("ses_1"));
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
 }
@@ -568,43 +559,53 @@ fn test_overlay_files_alt_f_navigation_enter_and_esc() {
         .files
         .observe_tool_item("write", &serde_json::json!({"path": "src/second.rs"}), 200);
 
-    // 1. alt+f opens Overlay::Files
+    // 1. alt+f opens the Files menu level — T7 routed the entry to the base;
+    //    the legacy `Overlay::Files` lives on until T19 but nothing opens it.
     let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
     handle_key(&mut state, alt_f, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+    let Focus::Overlay(Overlay::Menu { stack, .. }) = &state.focus else {
+        panic!("alt+f did not open the menu: {:?}", state.focus);
+    };
+    assert_eq!(stack.current().unwrap().id, crate::ui::menu::MenuId::Files);
 
-    // 2. Down key increments index
+    // 2. Down moves the cursor past the "src" section to the second file.
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     handle_key(&mut state, down, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 1 }));
+    let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
+        panic!("menu closed on Down");
+    };
+    assert_eq!(ui.cursor, crate::ui::menu::RowId::new("src/second.rs"));
 
     // 3. Typing letters does NOT leak to input
     let char_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
     handle_key(&mut state, char_z, now);
     assert!(state.input.is_empty());
 
-    // 4. Up key decrements index
-    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-    handle_key(&mut state, up, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
-
-    // 5. Enter copies selected path (second.rs has newer ts 200, so sorted index 0 is second.rs)
+    // 4. Enter opens the selected file's worktree diff in the panel (§5.5).
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     handle_key(&mut state, enter, now);
-    assert_eq!(state.focus, Focus::Normal);
-    assert_eq!(state.input.text, "src/second.rs");
+    assert!(matches!(
+        state.focus,
+        Focus::Panel {
+            target: PanelTarget::FileDiff { ref path },
+            ..
+        } if path == "src/second.rs"
+    ));
+    assert_eq!(state.files.diff_want.as_deref(), Some("src/second.rs"));
 
-    // 6. Reopen with alt+f and press Esc to close
-    handle_key(&mut state, alt_f, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+    // 5. Esc on the panel returns to Normal and drops the diff target.
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
+    assert_eq!(state.panel.target, None);
 
-    // 7. Verify alt+b is follow (does not open files)
+    // 6. Verify alt+b is follow (does not open files)
     let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
     handle_key(&mut state, alt_b, now);
-    assert_ne!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+    assert!(!matches!(
+        state.focus,
+        Focus::Overlay(Overlay::Menu { .. } | Overlay::Files { .. })
+    ));
 }
 
 #[test]
@@ -676,7 +677,13 @@ fn test_alt_f_opens_files_overlay() {
     let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
     let actions = handle_key(&mut state, alt_f, now);
     assert!(actions.is_empty());
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Files { index: 0 }));
+    // The entry opens the Files menu level — `Overlay::Files` is the legacy
+    // variant kept for T19, no longer reachable by key.
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::Menu { ref stack, .. })
+            if stack.current().is_some_and(|l| l.id == crate::ui::menu::MenuId::Files)
+    ));
 }
 
 #[test]

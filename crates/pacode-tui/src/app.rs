@@ -59,12 +59,28 @@ enum BgResponse {
         key: crate::state::input::BashKey,
         candidates: Vec<crate::bash::complete::Candidate>,
     },
-    /// A files-overlay image preview finished rendering (§8.1: the render —
-    /// file IO + decode + encode — ran on a blocking thread, never in draw).
+    /// A files preview finished (§8.1: the render — file IO + decode +
+    /// encode, or read + lex for `PreviewKind::Text` — ran on a blocking
+    /// thread, never in draw). Exactly one of `preview`/`text` is set,
+    /// matching `key.kind`.
     FilePreviewReady {
-        key: crate::state::files::ImageCacheKey,
+        key: crate::state::files::PreviewKey,
         resolved: std::path::PathBuf,
         preview: Option<pacode_image::Preview>,
+        text: Option<crate::state::files::TextPreview>,
+    },
+    /// The Files level's deferred `git status` scan landed — the
+    /// `new`/`deleted`/`renamed` labels (§5.5). `at_version` is the
+    /// `files.rows_version` the scan described; a later row change rescans.
+    FileStatusesReady {
+        statuses: std::collections::BTreeMap<String, pacode_vcs::FileStatus>,
+        at_version: u64,
+    },
+    /// The Files level's `enter` probe landed — applies only while its path
+    /// is still the panel's `FileDiff` target (a stale one drops).
+    FileDiffReady {
+        path: String,
+        diff: pacode_vcs::FileDiff,
     },
     /// A pasted-image strip thumbnail finished rendering.
     ThumbReady {
@@ -247,14 +263,14 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     let mut active_image_escapes: Vec<(ratatui::layout::Rect, String)> = Vec::new();
 
     loop {
-        let is_files_overlay = matches!(
-            state.focus,
-            crate::state::Focus::Overlay(crate::state::Overlay::Files { .. })
-        );
-        if !is_files_overlay {
+        let files_view = files_view_on_screen(&state);
+        if !files_view {
             if state.files.cached_preview.is_some() {
                 state.files.clear_preview();
             }
+            // Reopening rescans: `statused_at` records the rows_version the
+            // labels describe — dropping it re-arms the deferred status job.
+            state.files.statused_at = None;
             if let Some((area, _path)) = active_escape.take() {
                 let _ = term_guard.clear_image_area(area);
                 // kitty d=a deletes every image, including the input strip.
@@ -287,7 +303,7 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             state.dirty = false;
             last_draw = Instant::now();
 
-            if is_files_overlay {
+            if files_view {
                 if let Some((area, esc, path)) = state.files.pending_escape.take() {
                     if let Some((old_area, ref old_path)) = active_escape
                         && (*old_path != path || old_area != area)
@@ -697,7 +713,9 @@ fn dispatch_action(
                         task: id.clone(),
                         tail_lines: 300,
                     }),
-                    PanelTarget::McpServer(_) => None,
+                    // The MCP log and the file diff are produced locally —
+                    // no daemon request stands behind either target.
+                    PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. } => None,
                 };
                 if let Some(request) = request {
                     let cl = Arc::clone(client);
@@ -757,7 +775,9 @@ fn dispatch_deferred(state: &mut AppState, bg_tx: &mpsc::UnboundedSender<BgRespo
         });
     }
 
-    // Files-overlay image preview: resolve + render off-thread.
+    // Files preview: resolve + render/lex off-thread. `Image` decodes for the
+    // legacy overlay's pane; `Text` reads the head and lexes it for the menu
+    // detail card (§8.1 — the draw only records `preview_want`).
     if let Some(want) = state.files.preview_want.clone()
         && state.files.preview_in_flight.as_ref() != Some(&want)
         && state.files.cached_preview.as_ref().map(|c| &c.key) != Some(&want)
@@ -767,18 +787,79 @@ fn dispatch_deferred(state: &mut AppState, bg_tx: &mpsc::UnboundedSender<BgRespo
         let tx = bg_tx.clone();
         tokio::task::spawn_blocking(move || {
             let resolved = resolve_preview_path(&want.raw, &cwd);
-            let req = pacode_image::PreviewRequest {
-                path: resolved.clone(),
-                cell_w: want.cell_w,
-                cell_h: want.cell_h,
-            };
-            let preview = pacode_image::render(&req, pacode_image::detect()).ok();
-            let _ = tx.send(BgResponse::FilePreviewReady {
-                key: want,
-                resolved,
-                preview,
+            match want.kind {
+                crate::state::files::PreviewKind::Image { cell_w, cell_h } => {
+                    let req = pacode_image::PreviewRequest {
+                        path: resolved.clone(),
+                        cell_w,
+                        cell_h,
+                    };
+                    let preview = pacode_image::render(&req, pacode_image::detect()).ok();
+                    let _ = tx.send(BgResponse::FilePreviewReady {
+                        key: want,
+                        resolved,
+                        preview,
+                        text: None,
+                    });
+                }
+                crate::state::files::PreviewKind::Text => {
+                    let text = crate::ui::menu::files::text_preview(&resolved);
+                    let _ = tx.send(BgResponse::FilePreviewReady {
+                        key: want,
+                        resolved,
+                        preview: None,
+                        text,
+                    });
+                }
+            }
+        });
+    }
+
+    // Files level: refresh the `git status` labels once the row set changed
+    // and no scan runs. `at_version` rides along so the reply marks which
+    // `rows_version` it described.
+    if files_view_on_screen(state)
+        && state.files.statused_at != Some(state.files.rows_version)
+        && !state.files.statuses_in_flight
+    {
+        state.files.statuses_in_flight = true;
+        let at_version = state.files.rows_version;
+        let cwd = state.cwd();
+        let paths: Vec<String> = state.files.rows.iter().map(|r| r.path.clone()).collect();
+        let tx = bg_tx.clone();
+        tokio::spawn(async move {
+            // A failed scan applies as an empty map — the labels simply stay
+            // off until the next row change (git missing / not a repo /
+            // timeout all look the same to the rows).
+            let statuses = pacode_vcs::worktree_statuses(&cwd, &paths)
+                .await
+                .unwrap_or_default();
+            let _ = tx.send(BgResponse::FileStatusesReady {
+                statuses,
+                at_version,
             });
         });
+    }
+
+    // Files level `enter`: the worktree diff for the panel. The want dies
+    // when the panel's target moved on; an in-flight probe defers a re-arm.
+    if let Some(path) = state.files.diff_want.clone() {
+        let still_target = matches!(
+            &state.panel.target,
+            Some(PanelTarget::FileDiff { path: p }) if *p == path
+        );
+        if !still_target {
+            state.files.diff_want = None;
+        } else if state.files.diff_in_flight.is_none() {
+            state.files.diff_want = None;
+            state.files.diff_in_flight = Some(path.clone());
+            let cwd = state.cwd();
+            let tx = bg_tx.clone();
+            tokio::spawn(async move {
+                let diff = pacode_vcs::file_diff(&cwd, &path).await;
+                let _ = tx.send(BgResponse::FileDiffReady { path, diff });
+            });
+        }
     }
 
     // Pasted-image strip thumbnails: one job per missing/mismatched slot.
@@ -825,6 +906,19 @@ fn dispatch_deferred(state: &mut AppState, bg_tx: &mpsc::UnboundedSender<BgRespo
     }
 }
 
+/// Whether a touched-files view is on screen: the legacy `Overlay::Files`
+/// (until T19) or the `Files` menu level on top of the stack (§5.5). Gates
+/// the preview cache's cleanup and the deferred `git status` scan.
+fn files_view_on_screen(state: &AppState) -> bool {
+    match &state.focus {
+        crate::state::Focus::Overlay(crate::state::Overlay::Files { .. }) => true,
+        crate::state::Focus::Overlay(crate::state::Overlay::Menu { stack, .. }) => stack
+            .current()
+            .is_some_and(|l| l.id == crate::ui::menu::MenuId::Files),
+        _ => false,
+    }
+}
+
 /// The preview pane's path resolution — `raw` relative to the session cwd
 /// when that joined path exists. Runs inside `spawn_blocking`: `exists()` is
 /// a filesystem stat and must never run inside `ui::draw` (§8.1).
@@ -867,13 +961,43 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             key,
             resolved,
             preview,
+            text,
         } => {
             state.files.preview_in_flight = None;
-            state.files.cached_preview = Some(crate::state::files::CachedImagePreview {
+            state.files.cached_preview = Some(crate::state::files::CachedPreview {
                 key,
                 resolved,
                 preview,
+                text,
             });
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::FileStatusesReady {
+            statuses,
+            at_version,
+        } => {
+            state.files.apply_statuses(statuses, at_version);
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::FileDiffReady { path, diff } => {
+            state.files.diff_in_flight = None;
+            // Applies only while the panel still targets this file — a
+            // response for a since-unselected path drops (§5.5).
+            if matches!(
+                &state.panel.target,
+                Some(PanelTarget::FileDiff { path: p }) if *p == path
+            ) {
+                state.panel.diff = Some(crate::state::PanelDiff {
+                    path,
+                    patch: diff.patch,
+                    status: diff.status,
+                    truncated: diff.truncated,
+                    note: diff.note,
+                    rendered: None,
+                });
+            }
             state.dirty = true;
             vec![]
         }

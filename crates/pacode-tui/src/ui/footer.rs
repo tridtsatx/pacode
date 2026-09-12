@@ -281,12 +281,15 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                 .map(|t| t.label.as_str())
                                 .unwrap_or("task"),
                             PanelTarget::McpServer(name) => name.as_str(),
+                            PanelTarget::FileDiff { path } => path.as_str(),
                         };
                         if *follow {
                             let main_id = pacode_types::AgentId::main();
                             let agent_id = match target {
                                 PanelTarget::Agent(id) => id,
-                                _ => &main_id,
+                                PanelTarget::Task(_)
+                                | PanelTarget::McpServer(_)
+                                | PanelTarget::FileDiff { .. } => &main_id,
                             };
                             let dur = state
                                 .rail
@@ -306,7 +309,9 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                             // A log view has no agent to follow or stop —
                             // it only scrolls.
                             let hints = match target {
-                                PanelTarget::McpServer(_) => "esc back · scroll pages",
+                                PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. } => {
+                                    "esc back · scroll pages"
+                                }
                                 PanelTarget::Agent(_) | PanelTarget::Task(_) => {
                                     "esc back · alt+b follow · s stop"
                                 }

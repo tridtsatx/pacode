@@ -6,11 +6,14 @@ use crate::keys::{Action, handle_navigate_down, handle_navigate_up};
 use crate::layout::ScreenLayout;
 use crate::state::{AppState, PanelTarget};
 
-/// Wheel over the panel column: the MCP log target scrolls `panel.scroll`
-/// (its offset from the tail, ui::panel); the transcript targets scroll their
-/// transcript, same as the key path (nav::handle_scroll).
+/// Wheel over the panel column: the MCP log and file-diff targets scroll
+/// `panel.scroll` (their offset from the tail, ui::panel); the transcript
+/// targets scroll their transcript, same as the key path (nav::handle_scroll).
 fn scroll_panel(state: &mut AppState, delta: i32) {
-    if matches!(state.panel.target, Some(PanelTarget::McpServer(_))) {
+    if matches!(
+        state.panel.target,
+        Some(PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. })
+    ) {
         state.panel.scroll = if delta > 0 {
             state.panel.scroll.saturating_add(delta as usize)
         } else {

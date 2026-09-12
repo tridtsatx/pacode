@@ -118,6 +118,7 @@ fn a_huge_error_is_capped_not_sprawled() {
         .map(|l| match l {
             DetailLine::Text(t) => t.len(),
             DetailLine::Field { label, value } => label.len() + value.len(),
+            DetailLine::Code { text, .. } => text.len(),
         })
         .sum();
     assert!(total_bytes <= ERROR_CAP_BYTES + 512, "got {total_bytes}");

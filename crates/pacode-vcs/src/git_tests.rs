@@ -182,3 +182,136 @@ async fn invalid_hash_is_refused() {
         .unwrap_err();
     assert!(matches!(err, VcsError::InvalidHash(_)));
 }
+
+#[test]
+fn status_z_parses_xy_and_rename_pairs() {
+    // `M ` staged-modified, ` M` worktree-modified, `??` untracked,
+    // `R ` rename (new name first under -z, then the source record).
+    let out = b"M  staged.rs\0 M dirty.rs\0?? loose.rs\0R  new.rs\0old.rs\0 D gone.rs\0";
+    let map = parse_status_z(out);
+    assert_eq!(map["staged.rs"], FileStatus::Modified);
+    assert_eq!(map["dirty.rs"], FileStatus::Modified);
+    assert_eq!(map["loose.rs"], FileStatus::New);
+    assert_eq!(map["new.rs"], FileStatus::Renamed);
+    assert_eq!(map["gone.rs"], FileStatus::Deleted);
+    // The rename's source record is consumed, not keyed.
+    assert!(!map.contains_key("old.rs"));
+}
+
+#[test]
+fn status_z_gone_beats_renamed() {
+    let map = parse_status_z(b"RD gone.rs\0old.rs\0");
+    assert_eq!(map["gone.rs"], FileStatus::Deleted);
+}
+
+#[tokio::test]
+async fn worktree_statuses_labels_new_modified_deleted() {
+    let fx = fixture();
+    // a.txt: tracked, now modified. b.txt: tracked, deleted. u.txt: untracked.
+    std::fs::write(fx.dir.join("a.txt"), "a changed\n").unwrap();
+    std::fs::remove_file(fx.dir.join("b.txt")).unwrap();
+    std::fs::write(fx.dir.join("u.txt"), "u\n").unwrap();
+    let paths = vec![
+        "a.txt".to_string(),
+        "b.txt".to_string(),
+        "u.txt".to_string(),
+        "c.txt".to_string(),         // clean tracked — no entry expected
+        "../escape.txt".to_string(), // outside the worktree — skipped
+    ];
+    let map = worktree_statuses(&fx.dir, &paths).await.unwrap();
+    assert_eq!(map["a.txt"], FileStatus::Modified);
+    assert_eq!(map["b.txt"], FileStatus::Deleted);
+    assert_eq!(map["u.txt"], FileStatus::New);
+    assert!(!map.contains_key("c.txt"));
+    assert!(!map.contains_key("../escape.txt"));
+}
+
+#[tokio::test]
+async fn worktree_statuses_from_a_subdir_key_on_the_input_spelling() {
+    let fx = fixture();
+    // Session cwd is a repo subdirectory: git reports root-relative paths,
+    // the map still answers to the spellings it was asked about.
+    let sub = fx.dir.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("s.txt"), "s\n").unwrap();
+    std::fs::write(fx.dir.join("a.txt"), "a changed\n").unwrap();
+    let abs = fx.dir.join("u2.rs");
+    std::fs::write(&abs, "u2\n").unwrap();
+    let paths = vec![
+        "s.txt".to_string(),                // sub/u2.rs's sibling, untracked
+        "../a.txt".to_string(),             // climbs back into the worktree
+        abs.to_string_lossy().into_owned(), // absolute spelling
+        "/etc/passwd".to_string(),          // outside — skipped
+    ];
+    let map = worktree_statuses(&sub, &paths).await.unwrap();
+    assert_eq!(map["s.txt"], FileStatus::New);
+    assert_eq!(map["../a.txt"], FileStatus::Modified);
+    assert_eq!(map[abs.to_string_lossy().as_ref()], FileStatus::New);
+    assert!(!map.contains_key("/etc/passwd"));
+}
+
+#[tokio::test]
+async fn file_diff_modified_shows_worktree_patch() {
+    let fx = fixture();
+    // Replace the line — a pure append produces no `-` row to assert on.
+    std::fs::write(fx.dir.join("a.txt"), "a changed\n").unwrap();
+    let d = file_diff(&fx.dir, "a.txt").await;
+    assert_eq!(d.status, Some(FileStatus::Modified));
+    let patch = d.patch.unwrap();
+    assert!(patch.contains("-a"));
+    assert!(patch.contains("+a changed"));
+    assert!(!d.truncated);
+}
+
+#[tokio::test]
+async fn file_diff_from_a_subdir_diffs_against_head() {
+    let fx = fixture();
+    // cwd inside the repo but not at its root: the path is still tracked, so
+    // the patch is the real worktree diff, not a synthetic add-all.
+    let sub = fx.dir.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(fx.dir.join("a.txt"), "a changed\n").unwrap();
+    let d = file_diff(&sub, "../a.txt").await;
+    assert_eq!(d.status, Some(FileStatus::Modified));
+    let patch = d.patch.unwrap();
+    assert!(patch.contains("-a"), "patch: {patch}");
+    assert!(patch.contains("+a changed"), "patch: {patch}");
+}
+
+#[tokio::test]
+async fn file_diff_untracked_gets_add_all_patch() {
+    let fx = fixture();
+    std::fs::write(fx.dir.join("fresh.rs"), "fn main() {}\n").unwrap();
+    let d = file_diff(&fx.dir, "fresh.rs").await;
+    assert_eq!(d.status, Some(FileStatus::New));
+    let patch = d.patch.unwrap();
+    assert!(patch.contains("+fn main() {}"), "patch: {patch}");
+}
+
+#[tokio::test]
+async fn file_diff_deleted_shows_removal() {
+    let fx = fixture();
+    std::fs::remove_file(fx.dir.join("a.txt")).unwrap();
+    let d = file_diff(&fx.dir, "a.txt").await;
+    assert_eq!(d.status, Some(FileStatus::Deleted));
+    let patch = d.patch.unwrap();
+    assert!(patch.contains("-a"), "patch: {patch}");
+}
+
+#[tokio::test]
+async fn file_diff_clean_file_has_no_patch() {
+    let fx = fixture();
+    let d = file_diff(&fx.dir, "a.txt").await;
+    assert_eq!(d.patch, None);
+    assert_eq!(d.note, None);
+}
+
+#[tokio::test]
+async fn file_diff_not_a_repo_still_patches_existing_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("x.rs"), "let x = 1;\n").unwrap();
+    let d = file_diff(tmp.path(), "x.rs").await;
+    // No repo: the --no-index fallback still produces the add-all patch.
+    assert_eq!(d.status, None);
+    assert!(d.patch.is_some(), "expected synthetic patch, got {d:?}");
+}

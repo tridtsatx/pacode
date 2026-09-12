@@ -38,6 +38,14 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
     if let Focus::Overlay(Overlay::Menu { stack, ui }) = &state.focus {
         if !stack.is_empty() {
             let view = crate::ui::menu::view_for(stack, state, ui);
+            // §8.1: the Files detail card's file read runs on the deferred
+            // preview job — the draw only records what it wants. Any other
+            // level on top arms nothing.
+            state.files.preview_want = if view.id == crate::ui::menu::MenuId::Files {
+                crate::ui::menu::files::preview_want(&view, ui)
+            } else {
+                None
+            };
             crate::ui::menu::draw(frame, dialog_area, &view, ui, opts);
         }
         return;
@@ -306,7 +314,8 @@ pub(crate) fn age_ago(ts_ms: u64, now: u64) -> String {
 }
 
 /// `~/rel/path` when under HOME, else the path as written.
-fn short_path(path: &std::path::Path) -> String {
+/// `pub(crate)`: the Sessions menu's detail card shows the same shape.
+pub(crate) fn short_path(path: &std::path::Path) -> String {
     let raw = path.to_string_lossy();
     if let Ok(home) = std::env::var("HOME") {
         let home_path = std::path::Path::new(&home);

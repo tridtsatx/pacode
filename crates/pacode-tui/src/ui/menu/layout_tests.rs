@@ -137,6 +137,7 @@ fn inner_height_counts_capture_as_two_lines() {
     let ui = MenuUiState {
         mode: MenuMode::Capture {
             action: "scroll_up",
+            pending: None,
         },
         ..MenuUiState::default()
     };

@@ -3209,6 +3209,7 @@ dependencies = [
  "pacode-import",
  "pacode-render",
  "pacode-types",
+ "pacode-vcs",
  "pretty_assertions",
  "rand 0.9.5",
  "ratatui",

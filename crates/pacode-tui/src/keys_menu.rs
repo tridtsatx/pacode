@@ -10,7 +10,6 @@
 //! to their legacy overlay through [`open_legacy`].
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use pacode_types::Request;
 use ratatui::layout::Rect;
 
 use crate::binding::matches_key;
@@ -78,7 +77,7 @@ pub fn handle_menu_key(
     let view = menu::view_for(stack, state, ui);
     match ui.mode {
         MenuMode::Edit { .. } => edit_key(state, stack, ui, &view, key),
-        MenuMode::Capture { .. } => capture_key(ui, key),
+        MenuMode::Capture { action, .. } => capture_key(state, ui, view.id, action, key),
         MenuMode::List => list_key(state, stack, ui, &view, key),
     }
 }
@@ -90,24 +89,6 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
     log::debug!("open menu→legacy: {}", id.slug());
     state.dirty = true;
     match id {
-        MenuId::Keys => {
-            state.focus = Focus::Overlay(Overlay::KeysPicker {
-                index: 0,
-                capturing: false,
-            });
-            vec![]
-        }
-        MenuId::Files => {
-            state.focus = Focus::Overlay(Overlay::Files { index: 0 });
-            vec![]
-        }
-        MenuId::Sessions => {
-            state.focus = Focus::Overlay(Overlay::SessionPicker {
-                query: String::new(),
-                index: 0,
-            });
-            vec![Action::Send(Request::ListSessions { limit: 50 })]
-        }
         MenuId::Import => {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
@@ -130,7 +111,10 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
         | MenuId::Skills
         | MenuId::Git
         | MenuId::Plugins
-        | MenuId::Mcp => vec![],
+        | MenuId::Mcp
+        | MenuId::Keys
+        | MenuId::Files
+        | MenuId::Sessions => vec![],
     }
 }
 
@@ -336,13 +320,10 @@ fn row_enter(
         MenuId::Plugins => menu::plugins::on_row(state, stack, ui, row),
         MenuId::Mcp => menu::mcp::on_row(state, stack, ui, row),
         MenuId::Settings => menu::settings::on_row(state, stack, ui, row),
-        MenuId::Keys
-        | MenuId::Files
-        | MenuId::Sessions
-        | MenuId::Import
-        | MenuId::Background
-        | MenuId::Skills
-        | MenuId::Git => vec![],
+        MenuId::Keys => menu::keys::on_row(state, stack, ui, row),
+        MenuId::Sessions => menu::sessions::on_row(state, stack, ui, row),
+        MenuId::Files => menu::files::on_row(state, stack, ui, row),
+        MenuId::Import | MenuId::Background | MenuId::Skills | MenuId::Git => vec![],
     }
 }
 
@@ -387,10 +368,10 @@ fn menu_action(
         MenuId::Plugins => menu::plugins::on_action(state, ui, action, row),
         MenuId::Mcp => menu::mcp::on_action(state, ui, action, row),
         MenuId::Settings => menu::settings::on_action(state, ui, action, row),
+        MenuId::Keys => menu::keys::on_action(state, ui, action, row),
+        MenuId::Files => menu::files::on_action(state, ui, action, row),
         MenuId::Root
         | MenuId::Help
-        | MenuId::Keys
-        | MenuId::Files
         | MenuId::Sessions
         | MenuId::Import
         | MenuId::Background
@@ -504,13 +485,36 @@ fn edit_commit(
     }
 }
 
-/// Key capture (§5.4): `esc` cancels; every other key is the capturing menu's
-/// business — Keys (T6) is the only menu that enters this mode.
-fn capture_key(ui: &mut MenuUiState, key: KeyEvent) -> Vec<Action> {
+/// Key capture (§5.4): `esc` backs out to the list (and retires a parked
+/// conflict status); every other key is the capturing menu's business — Keys
+/// is the only menu that enters this mode.
+fn capture_key(
+    state: &mut AppState,
+    ui: &mut MenuUiState,
+    menu: MenuId,
+    action: &'static str,
+    key: KeyEvent,
+) -> Vec<Action> {
     if key.code == KeyCode::Esc {
         ui.mode = MenuMode::List;
+        ui.status = None;
+        return vec![];
     }
-    vec![]
+    match menu {
+        MenuId::Keys => menu::keys::on_capture(state, ui, action, key),
+        // No other menu enters Capture — the miss arm is defensive plumbing.
+        MenuId::Root
+        | MenuId::Settings
+        | MenuId::Plugins
+        | MenuId::Mcp
+        | MenuId::Files
+        | MenuId::Sessions
+        | MenuId::Import
+        | MenuId::Help
+        | MenuId::Background
+        | MenuId::Skills
+        | MenuId::Git => vec![],
+    }
 }
 
 // ─── Movement / geometry ────────────────────────────────────────────────────

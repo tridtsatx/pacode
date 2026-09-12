@@ -91,13 +91,21 @@ pub enum ValueKind {
     Text,
 }
 
-/// One line of a detail card: a field–value pair or free text (§3.1).
+/// One line of a detail card: a field–value pair, free text, or a syntax-
+/// highlighted code line (§3.1).
 #[derive(Clone, Debug, PartialEq)]
 pub enum DetailLine {
     /// Rendered as `label: value` — the label dim, the value plain.
     Field { label: String, value: String },
     /// A free line of text.
     Text(String),
+    /// A lexed code line: `toks` are `syntax::Token` byte ranges into `text`,
+    /// produced ahead of time by the provider or a deferred job — the
+    /// renderer only paints them (§7.2, §8.1). Empty `toks` render plain.
+    Code {
+        text: String,
+        toks: Vec<pacode_render::syntax::Token>,
+    },
 }
 
 /// The detail card of a row: a title, lines and the chips available for

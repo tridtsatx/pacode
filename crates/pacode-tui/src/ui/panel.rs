@@ -9,6 +9,7 @@ use pacode_render::{RenderOptions, truncate_to_width};
 use pacode_types::state::TaskStatus;
 use pacode_types::time::{format_duration_ms, format_tokens, now_ms};
 
+use crate::state::files::FileStatus;
 use crate::state::{AppState, Focus, PanelTarget};
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOptions) {
@@ -134,6 +135,90 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                     .collect();
 
                 frame.render_widget(Paragraph::new(visible), output_area);
+            }
+        }
+        PanelTarget::FileDiff { ref path } => {
+            // The Files level's `enter` (§5.5): the worktree diff the
+            // deferred `file_diff` job produced — `panel.diff` — painted by
+            // `render_diff_ex` and cached per width so a frame never re-does
+            // the render (§8.1). A payload describing a *different* path is
+            // stale — the panel reads as "loading", never as the wrong file.
+            let scroll = state.panel.scroll;
+            let (status_word, truncated) = match &state.panel.diff {
+                Some(d) if d.path == *path => (
+                    match d.status {
+                        Some(FileStatus::New) => "new file",
+                        Some(FileStatus::Deleted) => "deleted",
+                        Some(FileStatus::Renamed) => "renamed",
+                        Some(FileStatus::Modified) | None => "worktree",
+                    },
+                    d.truncated,
+                ),
+                _ => ("worktree", false),
+            };
+
+            let mut head = vec![
+                Span::styled(format!("{} ", opts.glyphs.pointer), opts.theme.accent),
+                Span::styled(path.clone(), opts.theme.bold),
+                Span::styled(format!(" · {status_word}"), opts.theme.faint),
+            ];
+            if truncated {
+                head.push(Span::styled(" · truncated", opts.theme.red));
+            }
+            let header_lines = vec![Line::from(head), Line::default()];
+            let header_area = Rect::new(area.x, area.y, area.width, 2.min(area.height));
+            frame.render_widget(Paragraph::new(header_lines), header_area);
+
+            if area.height > 2 {
+                let body = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
+                let current = matches!(&state.panel.diff, Some(d) if d.path == *path);
+                match if current {
+                    state.panel.diff.as_mut()
+                } else {
+                    None
+                } {
+                    Some(d) if d.patch.is_some() => {
+                        if !matches!(&d.rendered, Some((w, _)) if *w == body.width)
+                            && let Some(patch) = d.patch.as_deref()
+                        {
+                            let mut dopts = opts.clone();
+                            dopts.width = body.width;
+                            d.rendered = Some((
+                                body.width,
+                                pacode_render::render_diff_ex(patch, &dopts, false),
+                            ));
+                        }
+                        if let Some((_, lines)) = &d.rendered {
+                            // `panel.scroll` counts back from the tail like
+                            // the log targets — `usize::MAX` (armed on open)
+                            // pins the head, where a diff reads from.
+                            let max_start = lines.len().saturating_sub(body.height as usize);
+                            let start = max_start.saturating_sub(scroll.min(max_start));
+                            let visible: Vec<Line<'static>> = lines
+                                .iter()
+                                .skip(start)
+                                .take(body.height as usize)
+                                .cloned()
+                                .collect();
+                            frame.render_widget(Paragraph::new(visible), body);
+                        }
+                    }
+                    Some(d) => {
+                        // No patch: `note` names why (not a repo, unreadable);
+                        // bare `None`/`None` means the file is clean.
+                        let msg = d
+                            .note
+                            .clone()
+                            .unwrap_or_else(|| "no changes in the worktree".to_string());
+                        let lines = vec![Line::from(Span::styled(msg, opts.theme.faint))];
+                        frame.render_widget(Paragraph::new(lines), body);
+                    }
+                    None => {
+                        let lines =
+                            vec![Line::from(Span::styled("loading diff…", opts.theme.faint))];
+                        frame.render_widget(Paragraph::new(lines), body);
+                    }
+                }
             }
         }
         PanelTarget::Task(ref task_id) => {

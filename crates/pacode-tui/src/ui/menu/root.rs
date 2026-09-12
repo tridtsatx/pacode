@@ -49,6 +49,7 @@ pub fn view(state: &AppState, _ui: &MenuUiState) -> MenuView {
             sessions_summary(state),
             MenuId::Sessions,
         ),
+        submenu("files", "Files", files_summary(state), MenuId::Files),
         submenu(
             "background",
             "Background",
@@ -173,6 +174,19 @@ fn model_summary(state: &AppState) -> String {
 fn sessions_summary(state: &AppState) -> Option<String> {
     let n = state.sessions.len();
     (n > 0).then(|| format!("{n} saved"))
+}
+
+/// "5 files · +120 −30" (§5.5's aggregate on the hub row) — plain `N files`
+/// while no tool call carried a `DiffStat` yet.
+fn files_summary(state: &AppState) -> Option<String> {
+    let (n, added, removed) = state.files.totals();
+    if n == 0 {
+        None
+    } else if added + removed == 0 {
+        Some(format!("{n} files"))
+    } else {
+        Some(format!("{n} files · +{added} −{removed}"))
+    }
 }
 
 fn background_summary(state: &AppState) -> Option<String> {

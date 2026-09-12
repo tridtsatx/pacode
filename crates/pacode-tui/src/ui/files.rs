@@ -11,7 +11,7 @@ use pacode_render::RenderOptions;
 use pacode_types::time::{format_duration_ms, now_ms};
 
 use crate::state::AppState;
-use crate::state::files::{FileRow, ImageCacheKey};
+use crate::state::files::{FileRow, PreviewKey, PreviewKind};
 
 #[cfg(test)]
 #[path = "files_tests.rs"]
@@ -195,10 +195,12 @@ fn render_image_preview(
     // §8.1: no `Path::exists` and no `pacode_image::render` here — the key
     // holds the *raw* path, and the event loop resolves + renders on a
     // blocking thread. A miss draws a placeholder this frame.
-    let want = ImageCacheKey {
+    let want = PreviewKey {
         raw: path_str.to_string(),
-        cell_w: p_inner.width,
-        cell_h: p_inner.height,
+        kind: PreviewKind::Image {
+            cell_w: p_inner.width,
+            cell_h: p_inner.height,
+        },
     };
     state.files.preview_want = Some(want.clone());
 

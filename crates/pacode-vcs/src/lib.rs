@@ -16,8 +16,9 @@ mod parse;
 
 pub use error::VcsError;
 pub use git::{
-    DIFF_CAP_BYTES, GIT_TIMEOUT, LOG_CAP_BYTES, LOG_PAGE_SIZE, LogPage, REVLIST_CAP_BYTES,
-    STAT_CAP_BYTES, commit_diff, log, show_stat,
+    DIFF_CAP_BYTES, FileDiff, FileStatus, GIT_TIMEOUT, LOG_CAP_BYTES, LOG_PAGE_SIZE, LogPage,
+    REVLIST_CAP_BYTES, STAT_CAP_BYTES, STATUS_CAP_BYTES, commit_diff, file_diff, log, show_stat,
+    worktree_statuses,
 };
 pub use lanes::{LaneCell, LaneMark, MAX_LANES, lanes};
 pub use pacode_types::vcs::{CommitRow, GitStatus, RefBadge};

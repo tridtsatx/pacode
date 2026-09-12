@@ -141,6 +141,13 @@ pub enum PanelTarget {
     /// lines are read locally off `paths.daemon_log()`; there is no daemon
     /// request behind this target, so `Action::LoadPanel` skips it.
     McpServer(String),
+    /// The Files level's `enter` (§5.5): the worktree diff of one touched
+    /// file. The patch is produced by a deferred `git` job
+    /// (`files.diff_want` → `BgResponse::FileDiffReady` → [`PanelDiff`]) —
+    /// there is no daemon request, so `Action::LoadPanel` skips it.
+    FileDiff {
+        path: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,6 +432,31 @@ pub struct PanelState {
     pub task_lines: Vec<String>,
     pub task_total_lines: u64,
     pub scroll: usize,
+    /// The `PanelTarget::FileDiff` payload — written by
+    /// `BgResponse::FileDiffReady`, `None` while the probe runs.
+    pub diff: Option<PanelDiff>,
+}
+
+/// The file-diff payload the panel renders for `PanelTarget::FileDiff`.
+/// Owner: `PanelState`.
+/// Cap: one patch ≤ `pacode_vcs::DIFF_CAP_BYTES` plus its rendered lines.
+/// Invalidation: replaced when the target re-arms or the diff job lands.
+pub struct PanelDiff {
+    /// The path this diff is for — a response applies only while it is still
+    /// the panel's target.
+    pub path: String,
+    /// `git diff` output — `None` for a clean worktree, a missing file, or a
+    /// repo-less path (`note` says which).
+    pub patch: Option<String>,
+    /// What the probe's `git status` said — feeds the header label.
+    pub status: Option<crate::state::files::FileStatus>,
+    /// The patch hit the capture cap.
+    pub truncated: bool,
+    /// Why the patch is missing, or where a synthetic one came from.
+    pub note: Option<String>,
+    /// `render_diff_ex` output at the width it was rendered for — rebuilt on
+    /// resize, never per frame (§8.1: no repeat renders).
+    pub rendered: Option<(u16, Vec<ratatui::text::Line<'static>>)>,
 }
 
 impl AppState {
@@ -474,6 +506,7 @@ impl AppState {
                 task_lines: Vec::new(),
                 task_total_lines: 0,
                 scroll: 0,
+                diff: None,
             },
             files: FilesState::default(),
             git: GitState::default(),
@@ -703,18 +736,22 @@ impl AppState {
                 };
                 self.transcript.set_header(header);
                 for item in &snapshot.transcript {
-                    if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
-                        let arg = title
-                            .strip_prefix(name.as_str())
-                            .map(str::trim_start)
-                            .unwrap_or_else(|| {
-                                title
-                                    .split_once(' ')
-                                    .map(|(_, r)| r.trim())
-                                    .unwrap_or(title.as_str())
-                            });
+                    if let TranscriptKind::ToolCall {
+                        name,
+                        title,
+                        call_id,
+                        diff,
+                        ..
+                    } = &item.kind
+                    {
+                        let arg = crate::state::files::title_path_arg(name, title);
                         let input = serde_json::json!({ "path": arg });
                         self.files.observe_tool_item(name, &input, item.ts_ms);
+                        // Snapshot items arrive finished — the `DiffStat` is
+                        // already on the item, no `ItemUpdated` follows.
+                        if let Some(d) = diff {
+                            self.files.apply_diff(name, &input, call_id, *d, item.ts_ms);
+                        }
                     }
                 }
                 self.turn_active = snapshot.turn_active;
@@ -1167,7 +1204,9 @@ impl AppState {
                 .as_ref()
                 .and_then(|t| match t {
                     PanelTarget::Agent(id) => self.rail.agent(id),
-                    _ => None,
+                    PanelTarget::Task(_)
+                    | PanelTarget::McpServer(_)
+                    | PanelTarget::FileDiff { .. } => None,
                 })
                 .is_some_and(|a| a.status.is_active()),
         }

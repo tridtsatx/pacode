@@ -86,7 +86,7 @@ pub fn draw(
     let mut edit_cursor = None;
     if !list_area.is_empty() {
         match &ui.mode {
-            MenuMode::Capture { action } => {
+            MenuMode::Capture { action, .. } => {
                 frame.render_widget(Paragraph::new(capture_lines(action, opts)), list_area);
             }
             MenuMode::List | MenuMode::Edit { .. } => {

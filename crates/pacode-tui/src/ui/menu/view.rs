@@ -239,8 +239,13 @@ pub enum MenuMode {
     /// (a char index into `buffer`).
     Edit { buffer: String, cursor: usize },
     /// Key capture (Keys menu): the whole list hides behind a "press a key"
-    /// prompt; `action` is the action being rebound.
-    Capture { action: &'static str },
+    /// prompt; `action` is the action being rebound. `pending` holds a
+    /// captured chord that hit a conflict — pressing the same chord again
+    /// confirms the takeover (§5.4).
+    Capture {
+        action: &'static str,
+        pending: Option<Binding>,
+    },
 }
 
 /// The per-level UI state that lives between frames — cursor by [`RowId`],

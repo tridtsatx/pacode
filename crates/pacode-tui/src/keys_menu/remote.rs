@@ -22,12 +22,12 @@ pub(super) fn on_open(state: &AppState, id: MenuId) -> Vec<Action> {
     match id {
         MenuId::Plugins => menu::plugins::on_open(state),
         MenuId::Mcp => menu::mcp::on_open(state),
+        MenuId::Sessions => menu::sessions::on_open(state),
         MenuId::Root
         | MenuId::Help
         | MenuId::Settings
         | MenuId::Keys
         | MenuId::Files
-        | MenuId::Sessions
         | MenuId::Import
         | MenuId::Background
         | MenuId::Skills

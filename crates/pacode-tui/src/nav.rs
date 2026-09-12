@@ -124,6 +124,7 @@ pub fn handle_esc(state: &mut AppState) -> Vec<Action> {
         Focus::Panel { .. } => {
             state.focus = Focus::Normal;
             state.panel.target = None;
+            state.panel.diff = None;
         }
         Focus::SelectAgent { .. } => {
             state.focus = Focus::Normal;
@@ -183,7 +184,7 @@ pub fn handle_follow(state: &mut AppState) -> Vec<Action> {
             };
         }
         Focus::Panel {
-            target: PanelTarget::Task(_) | PanelTarget::McpServer(_),
+            target: PanelTarget::Task(_) | PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. },
             ..
         }
         | Focus::Normal
@@ -288,12 +289,13 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
 pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
     let in_panel = matches!(state.focus, Focus::Panel { .. });
     if in_panel {
-        // The MCP log panel has no transcript — `panel.scroll` is its offset
-        // from the tail (ui::panel), 0 pinning the newest lines to the bottom.
+        // The MCP log and file-diff panels have no transcript —
+        // `panel.scroll` is the offset from the tail (ui::panel); a diff
+        // opens at `usize::MAX`, pinning its head.
         if matches!(
             state.focus,
             Focus::Panel {
-                target: PanelTarget::McpServer(_),
+                target: PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. },
                 ..
             }
         ) {

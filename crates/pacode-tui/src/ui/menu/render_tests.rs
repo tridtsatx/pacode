@@ -294,6 +294,7 @@ fn capture_mode_hides_the_list() {
     let ui = MenuUiState {
         mode: MenuMode::Capture {
             action: "scroll_up",
+            pending: None,
         },
         ..MenuUiState::default()
     };

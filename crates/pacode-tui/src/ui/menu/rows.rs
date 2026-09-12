@@ -347,11 +347,12 @@ fn collapsed_lines(row: &MenuRow, width: u16, opts: &RenderOptions) -> Vec<Line<
     out
 }
 
-/// A `DetailLine` as plain text: `label: value` or the free line itself.
+/// A `DetailLine` as plain text: `label: value`, the free line, or the code
+/// line stripped of its tokens.
 fn detail_text(line: &DetailLine) -> String {
     match line {
         DetailLine::Field { label, value } => format!("{label}: {value}"),
-        DetailLine::Text(t) => t.clone(),
+        DetailLine::Text(t) | DetailLine::Code { text: t, .. } => t.clone(),
     }
 }
 
@@ -390,6 +391,9 @@ fn detail_lines(
                     opts.theme.fg,
                 )));
             }
+            DetailLine::Code { text, toks } => {
+                lines.push(Line::from(code_spans(text, toks, width, ascii, opts)));
+            }
         }
     }
     let chips = chip_spans(&detail.actions, opts);
@@ -400,6 +404,64 @@ fn detail_lines(
         lines.push(Line::from(chips));
     }
     lines
+}
+
+/// A lexed code line as spans: one `Span` per token, colours from
+/// `token_style`, cut at `width` on a char boundary (`…` marks the cut).
+fn code_spans(
+    text: &str,
+    toks: &[pacode_render::syntax::Token],
+    width: usize,
+    ascii: bool,
+    opts: &RenderOptions,
+) -> Vec<Span<'static>> {
+    if toks.is_empty() || opts.color == pacode_render::ColorMode::Mono {
+        return vec![Span::styled(
+            truncate_to_width(text, width, ascii),
+            opts.theme.fg,
+        )];
+    }
+    let mut spans = Vec::with_capacity(toks.len());
+    let mut used = 0usize;
+    for tok in toks {
+        // Lexer ranges index `text` byte-wise; `get` keeps a malformed one
+        // from panicking mid-draw instead of trusting it blindly.
+        let Some(piece) = text.get(tok.range.clone()) else {
+            continue;
+        };
+        let w = display_width(piece);
+        if used + w > width {
+            // Cut inside the token: keep what fits minus the ellipsis cell —
+            // `truncate_to_width`'s own mark stays off so the tail below is
+            // the only one.
+            let budget = width.saturating_sub(used).saturating_sub(1);
+            if budget > 0 {
+                let head = truncate_to_width(piece, budget, false);
+                spans.push(Span::styled(head, token_style_or_fg(tok.kind, opts)));
+            }
+            if used < width {
+                spans.push(Span::styled(
+                    if ascii { "..." } else { "…" },
+                    opts.theme.faint,
+                ));
+            }
+            return spans;
+        }
+        spans.push(Span::styled(
+            piece.to_string(),
+            token_style_or_fg(tok.kind, opts),
+        ));
+        used += w;
+    }
+    spans
+}
+
+fn token_style_or_fg(
+    kind: Option<pacode_render::syntax::TokenKind>,
+    opts: &RenderOptions,
+) -> Style {
+    kind.map(|k| pacode_render::syntax::token_style(&opts.theme, k))
+        .unwrap_or(opts.theme.fg)
 }
 
 /// `key label · key label` spans for a row's action chips. Disabled chips and
