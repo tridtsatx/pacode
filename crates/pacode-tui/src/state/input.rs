@@ -1,6 +1,14 @@
 //! Prompt input: text with a cursor, history, slash-command popup.
+//!
+//! Completion state for the `@` and `!` popups lives here as *data*, not
+//! calls: the draw path records which candidates it wants (`want`), the event
+//! loop runs the filesystem scan on a blocking thread, and the reply lands in
+//! `ready`. Draw and key handlers only ever read `ready` — a miss shows no
+//! popup for a frame instead of blocking the frame on a directory walk
+//! (§8.1 clean-frame audit).
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use pacode_render::display_width;
 use unicode_segmentation::UnicodeSegmentation;
@@ -14,6 +22,103 @@ mod input_tests;
 mod input_delete_tests;
 
 pub const PROMPT_QUEUE_CAP: usize = 16;
+
+/// What an `@` scan was requested for — the candidates are only meaningful
+/// for exactly this (query, cursor, cwd).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtKey {
+    /// The partially typed path after `@`.
+    pub query: String,
+    /// Byte cursor into `InputState::text`.
+    pub cursor_byte: usize,
+    /// Session cwd the scan ran against.
+    pub cwd: PathBuf,
+}
+
+/// What a `!` scan was requested for — input, cursor, cwd and how much
+/// history it consulted (a new recorded command invalidates candidates).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BashKey {
+    /// `InputState::text` without the leading `!`.
+    pub text: String,
+    /// Char cursor minus the `!`.
+    pub cursor: usize,
+    pub cwd: PathBuf,
+    /// `bash_history.len()` at scan time.
+    pub history_len: usize,
+}
+
+/// Candidates a popup can draw from, plus which scan produced them and which
+/// scan is outstanding. `K` is the full scan context; `C` one candidate row.
+///
+/// Cap: `ready`/`want`/`in_flight` hold one key each, and every scan result
+/// overwrites `ready` wholesale — the previous generation is dropped.
+/// Owner: `InputState`. Freed with `AppState`.
+///
+/// `Default` is hand-implemented: the derive would demand `K: Default` +
+/// `C: Default`, which the key/candidate types have no business satisfying.
+#[derive(Debug)]
+pub struct CompletionState<K, C> {
+    /// The context of the scan in `ready` — `None` means nothing completed yet.
+    pub ready_key: Option<K>,
+    /// The last completed scan's candidates (may be legitimately empty).
+    pub ready: Vec<C>,
+    /// What the draw path needs — drained by the event loop into `in_flight`.
+    pub want: Option<K>,
+    /// The context of the scan running on a blocking thread.
+    pub in_flight: Option<K>,
+}
+
+impl<K, C> Default for CompletionState<K, C> {
+    fn default() -> Self {
+        Self {
+            ready_key: None,
+            ready: Vec::new(),
+            want: None,
+            in_flight: None,
+        }
+    }
+}
+
+impl<K: PartialEq + Clone, C> CompletionState<K, C> {
+    /// Candidates for `key` when the last completed scan covered exactly it.
+    pub fn candidates_for(&self, key: &K) -> Option<&[C]> {
+        if self.ready_key.as_ref() == Some(key) {
+            Some(&self.ready)
+        } else {
+            None
+        }
+    }
+
+    /// Record what the popup wants now. Called from draw — it only mutates
+    /// this cache, never runs the scan.
+    pub fn set_want(&mut self, want: Option<K>) {
+        self.want = want;
+    }
+
+    /// Claim `want` for a background scan: returns the key to scan when it is
+    /// neither already answered nor already in flight. The caller dispatches
+    /// the job and reports back through [`Self::finish_scan`].
+    pub fn claim_want(&mut self) -> Option<K> {
+        let want = self.want.clone()?;
+        if self.in_flight.as_ref() == Some(&want) || self.ready_key.as_ref() == Some(&want) {
+            return None;
+        }
+        self.in_flight = Some(want.clone());
+        Some(want)
+    }
+
+    /// Fold a finished scan in. `key` is the context it ran for — a stale
+    /// reply simply becomes the new `ready`; `candidates_for` keeps it from
+    /// being misused for a different context.
+    pub fn finish_scan(&mut self, key: K, candidates: Vec<C>) {
+        if self.in_flight.as_ref() == Some(&key) {
+            self.in_flight = None;
+        }
+        self.ready_key = Some(key);
+        self.ready = candidates;
+    }
+}
 
 #[derive(Default)]
 pub struct InputState {
@@ -47,6 +152,10 @@ pub struct InputState {
     pub bash_complete_closed: bool,
     /// Queued prompts submitted while a turn was running (cap `PROMPT_QUEUE_CAP`).
     pub prompt_queue: VecDeque<String>,
+    /// `@` path-completion cache — filled by the event loop, read by draw/keys.
+    pub at_comp: CompletionState<AtKey, crate::at_complete::AtCandidate>,
+    /// `!` bash-completion cache — same contract.
+    pub bash_comp: CompletionState<BashKey, crate::bash::complete::Candidate>,
 }
 
 pub fn char_to_byte_index(text: &str, char_idx: usize) -> usize {

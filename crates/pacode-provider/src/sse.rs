@@ -440,7 +440,8 @@ pub(crate) fn create_event_stream(
                             Err(e) => {
                                 state.stream_ended = true;
                                 state.pending_error = Some(ProviderError::Malformed(format!(
-                                    "invalid SSE JSON: {e}"
+                                    "invalid SSE JSON: {e}: {}",
+                                    crate::error_body_message(&payload)
                                 )));
                                 break;
                             }

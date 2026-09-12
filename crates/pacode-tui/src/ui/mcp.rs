@@ -11,13 +11,16 @@ use pacode_types::McpServerInfo;
 
 use crate::ui::overlays::{empty_lines, menu_block, selected_row, window_groups};
 
-/// Draw the MCP servers overlay.
+/// Draw the MCP servers overlay. `badge` is the §8.2 cache-health of the
+/// list — `loading…` while a refresh is outstanding, `offline copy` when the
+/// rows on screen came from a past-TTL disk file.
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
     selected: usize,
     servers: &[McpServerInfo],
     loading: bool,
+    badge: Option<crate::cache::Badge>,
     opts: &RenderOptions,
 ) {
     let block = menu_block(
@@ -31,6 +34,13 @@ pub fn draw(
     if inner.height == 0 {
         return;
     }
+
+    let badge_line = badge.map(|b| {
+        Line::from(match b {
+            crate::cache::Badge::Loading => Span::styled("loading…", opts.theme.faint),
+            crate::cache::Badge::OfflineCopy => Span::styled("offline copy", opts.theme.yellow),
+        })
+    });
 
     if servers.is_empty() {
         let lines = if loading {
@@ -50,10 +60,14 @@ pub fn draw(
     // Each server is two rows: the name, then counts or the failure reason.
     let heights: Vec<usize> = servers.iter().map(|_| 2).collect();
     let sel_idx = selected.min(servers.len() - 1);
-    let budget = inner.height as usize;
+    let budget = (inner.height as usize).saturating_sub(usize::from(badge_line.is_some()));
     let start = window_groups(&heights, sel_idx, budget);
 
     let mut lines = Vec::new();
+    if let Some(badge_line) = badge_line {
+        lines.push(badge_line);
+    }
+
     for (i, s) in servers.iter().enumerate().skip(start) {
         if lines.len() + 2 > budget {
             break;

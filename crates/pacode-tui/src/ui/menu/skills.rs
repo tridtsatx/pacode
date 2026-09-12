@@ -5,11 +5,17 @@
 use crate::state::AppState;
 
 use super::model::{Detail, Mark, MenuRow, RowId};
-use super::view::{EmptyState, MenuId, MenuUiState, MenuView};
+use super::view::{EmptyState, MenuId, MenuUiState, MenuView, StatusLine};
 
 /// One row per plugin carrying `skills/` dirs.
 pub fn view(state: &AppState, _ui: &MenuUiState) -> MenuView {
     let mut view = MenuView::new(MenuId::Skills);
+    // §8.2: the skills list rides on the plugins list's cache health.
+    view.status = match state.lists.badge(crate::cache::ListKind::Plugins) {
+        Some(crate::cache::Badge::Loading) => Some(StatusLine::loading()),
+        Some(crate::cache::Badge::OfflineCopy) => Some(StatusLine::offline_copy()),
+        None => None,
+    };
     view.rows = state
         .plugins
         .iter()

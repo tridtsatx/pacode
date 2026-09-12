@@ -227,14 +227,14 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return toggle_zdr(state);
     }
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
-        // First check @ completion
+        // First check @ completion — read the scan the draw path ordered and
+        // the event loop ran on a blocking thread (§8.1).
         let byte_cursor =
             crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
         if !state.input.at_closed
             && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
         {
-            let cwd = state.cwd();
-            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            let candidates = at_candidates(state, &q.query, byte_cursor);
             if !candidates.is_empty() {
                 let sel = state.input.at_index % candidates.len();
                 let cand = candidates[sel].clone();
@@ -257,14 +257,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
         // Second check bash mode Tab completion
         if state.input.text.starts_with('!') {
-            let cwd = state.cwd();
-            let char_cursor = state.input.cursor.saturating_sub(1);
-            let candidates = crate::bash::complete::complete(
-                &state.input.text[1..],
-                char_cursor,
-                &state.input.bash_history,
-                &cwd,
-            );
+            let candidates = bash_candidates(state);
             if !candidates.is_empty() {
                 let sel = state.input.bash_complete_index % candidates.len();
                 let cand = &candidates[sel];
@@ -495,8 +488,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         if !state.input.at_closed
             && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
         {
-            let cwd = state.cwd();
-            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            let candidates = at_candidates(state, &q.query, byte_cursor);
             if !candidates.is_empty() {
                 let sel = state.input.at_index % candidates.len();
                 let cand = candidates[sel].clone();
@@ -692,8 +684,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         if !state.input.at_closed
             && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
         {
-            let cwd = state.cwd();
-            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            let candidates = at_candidates(state, &q.query, byte_cursor);
             if !candidates.is_empty() {
                 let n = candidates.len();
                 state.input.at_index = (state.input.at_index + n - 1) % n;
@@ -701,14 +692,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         }
         if state.input.text.starts_with('!') {
-            let cwd = state.cwd();
-            let char_cursor = state.input.cursor.saturating_sub(1);
-            let candidates = crate::bash::complete::complete(
-                &state.input.text[1..],
-                char_cursor,
-                &state.input.bash_history,
-                &cwd,
-            );
+            let candidates = bash_candidates(state);
             if !state.input.bash_complete_closed && !candidates.is_empty() {
                 let n = candidates.len();
                 state.input.bash_complete_index = (state.input.bash_complete_index + n - 1) % n;
@@ -734,8 +718,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         if !state.input.at_closed
             && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
         {
-            let cwd = state.cwd();
-            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            let candidates = at_candidates(state, &q.query, byte_cursor);
             if !candidates.is_empty() {
                 let n = candidates.len();
                 state.input.at_index = (state.input.at_index + 1) % n;
@@ -743,14 +726,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         }
         if state.input.text.starts_with('!') {
-            let cwd = state.cwd();
-            let char_cursor = state.input.cursor.saturating_sub(1);
-            let candidates = crate::bash::complete::complete(
-                &state.input.text[1..],
-                char_cursor,
-                &state.input.bash_history,
-                &cwd,
-            );
+            let candidates = bash_candidates(state);
             if !state.input.bash_complete_closed && !candidates.is_empty() {
                 let n = candidates.len();
                 state.input.bash_complete_index = (state.input.bash_complete_index + 1) % n;
@@ -842,6 +818,46 @@ fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
         });
         vec![Action::Send(Request::ListModels)]
     }
+}
+
+/// `@` candidates for the exact current popup context, cloned out of the
+/// scan cache (≤ `MAX_AT_CANDIDATES` small rows, once per keypress). Empty
+/// while the scan the draw path ordered is still running on a blocking
+/// thread — §8.1: the filesystem walk never happens in a key handler.
+fn at_candidates(
+    state: &AppState,
+    query: &str,
+    byte_cursor: usize,
+) -> Vec<crate::at_complete::AtCandidate> {
+    let key = crate::state::input::AtKey {
+        query: query.to_string(),
+        cursor_byte: byte_cursor,
+        cwd: state.cwd(),
+    };
+    state
+        .input
+        .at_comp
+        .candidates_for(&key)
+        .map(<[crate::at_complete::AtCandidate]>::to_vec)
+        .unwrap_or_default()
+}
+
+/// `!` candidates for the exact current input/cursor/history context —
+/// same deferred-scan contract as [`at_candidates`]. Callers must only
+/// invoke it when `state.input.text` starts with `!`.
+fn bash_candidates(state: &AppState) -> Vec<crate::bash::complete::Candidate> {
+    let key = crate::state::input::BashKey {
+        text: state.input.text[1..].to_string(),
+        cursor: state.input.cursor.saturating_sub(1),
+        cwd: state.cwd(),
+        history_len: state.input.bash_history.len(),
+    };
+    state
+        .input
+        .bash_comp
+        .candidates_for(&key)
+        .map(<[crate::bash::complete::Candidate]>::to_vec)
+        .unwrap_or_default()
 }
 
 fn complete_slash_command(state: &mut AppState) -> bool {

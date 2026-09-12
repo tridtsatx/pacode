@@ -283,6 +283,18 @@ fn save_and_apply(state: &mut AppState, key: &str, val: pacode_config::toml::Val
         );
     }
     registry::apply_to_config(&mut state.config, key, &val);
+    // §8.2: MCP config keys feed the server list and prompt-command cache;
+    // the plugins marketplace key feeds the marketplace cache. Drop the files
+    // so the next run cannot apply a copy written for the old config.
+    if key.starts_with("mcp") {
+        state.invalidate_cache(crate::cache::ListKind::McpServers);
+        state.invalidate_cache(crate::cache::ListKind::Commands);
+    }
+    if key.starts_with("plugins.") {
+        state.invalidate_cache(crate::cache::ListKind::Plugins);
+        state.invalidate_cache(crate::cache::ListKind::Marketplace);
+        state.invalidate_cache(crate::cache::ListKind::Commands);
+    }
     state.dirty = true;
 }
 

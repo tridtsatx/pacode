@@ -87,20 +87,30 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     })];
                 }
                 KeyCode::Up | KeyCode::Char('k') => *index = index.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    *index = (*index + 1).min(count.saturating_sub(1));
-                }
+                // The free-text plaque sits at `index == count` — one row past
+                // the last option.
+                KeyCode::Down | KeyCode::Char('j') => *index = (*index + 1).min(count),
                 KeyCode::Char('t') => *typing = true,
-                KeyCode::Char(' ') if multi => {
-                    if let Some(pos) = selected.iter().position(|i| i == index) {
-                        selected.remove(pos);
-                    } else {
-                        selected.push(*index);
+                KeyCode::Char(' ') => {
+                    if *index == count {
+                        // Space on the plaque means "type here" (in typing mode
+                        // the Char arm above already appends it to `typed`).
+                        *typing = true;
+                    } else if multi {
+                        if let Some(pos) = selected.iter().position(|i| i == index) {
+                            selected.remove(pos);
+                        } else {
+                            selected.push(*index);
+                        }
                     }
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                     let picked = (c as usize) - ('0' as usize) - 1;
-                    if picked < count {
+                    if picked == count {
+                        // `N+1` jumps to the free-text plaque rather than
+                        // answering — typing there starts with enter.
+                        *index = count;
+                    } else if picked < count {
                         state.focus = Focus::Normal;
                         return vec![Action::Send(pacode_types::Request::AnswerQuestion {
                             question: id,
@@ -109,21 +119,27 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     }
                 }
                 KeyCode::Enter => {
-                    let answer = if multi && !selected.is_empty() {
-                        pacode_types::QuestionAnswer {
-                            selected: selected.clone(),
-                            free_text: None,
-                            cancelled: false,
-                        }
+                    if *index == count {
+                        *typing = true;
                     } else {
-                        pacode_types::QuestionAnswer::choice(*index)
-                    };
-                    state.focus = Focus::Normal;
-                    return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                        question: id,
-                        answer,
-                    })];
+                        let answer = if multi && !selected.is_empty() {
+                            pacode_types::QuestionAnswer {
+                                selected: selected.clone(),
+                                free_text: None,
+                                cancelled: false,
+                            }
+                        } else {
+                            pacode_types::QuestionAnswer::choice(*index)
+                        };
+                        state.focus = Focus::Normal;
+                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
+                            question: id,
+                            answer,
+                        })];
+                    }
                 }
+                // Any other printable key is ignored: the question is a closed
+                // list — free text lives only on the plaque.
                 _ => {}
             }
             state.dirty = true;

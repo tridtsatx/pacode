@@ -17,12 +17,14 @@ pub mod login_picker;
 pub mod mascot;
 pub mod mcp;
 pub mod menu;
+pub mod notice;
 pub mod overlays;
 pub mod panel;
 pub mod phrases;
 pub mod picker;
 pub mod plugins;
 pub mod popup;
+pub mod question_picker;
 pub mod rail;
 pub mod rail_session;
 pub mod theme_picker;
@@ -383,38 +385,14 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         };
         let text = extract_selection_text(&lines, &state.selection, dialog_area.width);
         if !text.is_empty() {
-            let count = text.chars().count();
-            if let Err(e) = crate::clipboard::copy(&text) {
-                log::warn!("clipboard copy failed ({count} chars): {e}");
-            }
-            let detail = match copy_req {
-                crate::state::selection::CopyRequest::Auto => {
-                    Some("disable autocopy in /config".to_string())
-                }
-                crate::state::selection::CopyRequest::Explicit
-                | crate::state::selection::CopyRequest::None => None,
-            };
-            state.push_toast(
-                pacode_types::ToastLevel::Info,
-                format!("copied {count} chars"),
-                detail,
-                std::time::Instant::now(),
-            );
-            if crate::clipboard::remote_hint().is_some() && !state.clipboard_warned {
-                state.clipboard_warned = true;
-                let now = std::time::Instant::now();
-                let shown_at = now
-                    .checked_sub(std::time::Duration::from_secs(
-                        crate::state::TOAST_TTL_SECS.saturating_sub(4),
-                    ))
-                    .unwrap_or(now);
-                state.toasts.push_back(crate::state::Toast {
-                    level: pacode_types::ToastLevel::Warn,
-                    title: popup::POPUP_TOAST_TITLE.to_string(),
-                    detail: Some(crate::clipboard::REMOTE_HINT_TEXT.to_string()),
-                    shown_at,
-                });
-            }
+            // §8.1: `clipboard::copy` writes OSC 52 to stdout and opens the
+            // platform clipboard — IO that must not run inside draw. Stash it;
+            // the event loop performs it on a blocking thread and posts the
+            // toast from `CopyDone`.
+            state.pending_copy = Some(crate::state::PendingCopy {
+                text,
+                auto: matches!(copy_req, crate::state::selection::CopyRequest::Auto),
+            });
         }
     }
 

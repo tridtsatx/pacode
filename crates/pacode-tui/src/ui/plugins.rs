@@ -31,6 +31,8 @@ pub struct PluginsView<'a> {
     pub stale: bool,
     /// The configured marketplace, empty when there is none.
     pub source: &'a str,
+    /// §8.2 cache-health of the installed list — `loading…`/`offline copy`.
+    pub installed_badge: Option<crate::cache::Badge>,
 }
 
 /// Draw the plugins overlay.
@@ -82,7 +84,12 @@ fn tab_bar(view: &PluginsView<'_>, opts: &RenderOptions) -> Line<'static> {
 /// The line under the tabs: the search box, or why a tab is empty.
 fn status_line(view: &PluginsView<'_>, opts: &RenderOptions) -> Option<Line<'static>> {
     match view.tab {
-        PluginsTab::Installed => None,
+        PluginsTab::Installed => view.installed_badge.map(|badge| {
+            Line::from(match badge {
+                crate::cache::Badge::Loading => Span::styled("loading…", opts.theme.faint),
+                crate::cache::Badge::OfflineCopy => Span::styled("offline copy", opts.theme.yellow),
+            })
+        }),
         PluginsTab::Discover => {
             if view.source.is_empty() {
                 return None;
@@ -227,6 +234,9 @@ fn installed_rows(
     opts: &RenderOptions,
 ) -> Vec<Line<'static>> {
     if view.plugins.is_empty() {
+        if matches!(view.installed_badge, Some(crate::cache::Badge::Loading)) {
+            return vec![Line::from(Span::styled("loading…", opts.theme.faint))];
+        }
         let dash = if opts.glyphs.ascii { "-" } else { "—" };
         return empty_lines(
             "No plugins installed",

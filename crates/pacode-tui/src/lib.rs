@@ -14,6 +14,7 @@ pub mod app;
 pub mod at_complete;
 pub mod bash;
 pub mod binding;
+pub mod cache;
 pub mod clipboard;
 pub mod clipboard_read;
 pub mod commands;

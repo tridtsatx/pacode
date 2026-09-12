@@ -169,6 +169,11 @@ pub fn handle_key(
             if let Ok(new_cfg) = pacode_config::load(&state.paths) {
                 state.config = new_cfg;
             }
+            // §8.2: the import rewrote `[mcp_servers]` — the cached server
+            // list and the prompt-command registry it feeds are now wrong;
+            // drop both files (the next `ListMcpServers` reply rewrites them).
+            state.invalidate_cache(crate::cache::ListKind::McpServers);
+            state.invalidate_cache(crate::cache::ListKind::Commands);
             import_state.closed = true;
         }
         _ => {}

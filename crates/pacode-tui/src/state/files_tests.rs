@@ -95,18 +95,30 @@ fn test_clear_preview() {
     assert!(files.pending_escape.is_none());
 
     let key = ImageCacheKey {
-        path: std::path::PathBuf::from("test.png"),
+        raw: "test.png".to_string(),
         cell_w: 10,
         cell_h: 10,
     };
-    files.cached_preview = Some(CachedImagePreview { key, preview: None });
+    files.cached_preview = Some(CachedImagePreview {
+        key,
+        resolved: std::path::PathBuf::from("test.png"),
+        preview: None,
+    });
     files.pending_escape = Some((
         ratatui::layout::Rect::new(0, 0, 10, 10),
         "esc".to_string(),
         std::path::PathBuf::from("test.png"),
     ));
+    files.preview_want = Some(ImageCacheKey {
+        raw: "other.png".to_string(),
+        cell_w: 10,
+        cell_h: 10,
+    });
+    files.preview_in_flight = files.preview_want.clone();
 
     files.clear_preview();
     assert!(files.cached_preview.is_none());
     assert!(files.pending_escape.is_none());
+    assert!(files.preview_want.is_none());
+    assert!(files.preview_in_flight.is_none());
 }

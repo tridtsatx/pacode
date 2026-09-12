@@ -11,7 +11,7 @@ use pacode_render::RenderOptions;
 use pacode_types::time::{format_duration_ms, now_ms};
 
 use crate::state::AppState;
-use crate::state::files::{CachedImagePreview, FileRow, ImageCacheKey};
+use crate::state::files::{FileRow, ImageCacheKey};
 
 #[cfg(test)]
 #[path = "files_tests.rs"]
@@ -188,50 +188,40 @@ fn render_image_preview(
     frame.render_widget(preview_block, area);
 
     if p_inner.width == 0 || p_inner.height == 0 {
+        state.files.preview_want = None;
         return;
     }
 
-    let p = Path::new(path_str);
-    // Files are listed relative to the session cwd reported by the daemon.
-    let cwd = state
-        .meta
-        .as_ref()
-        .map(|m| m.cwd.clone())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let resolved_path = if p.is_absolute() {
-        p.to_path_buf()
-    } else if cwd.join(p).exists() {
-        cwd.join(p)
-    } else {
-        p.to_path_buf()
-    };
-
-    let key = ImageCacheKey {
-        path: resolved_path.clone(),
+    // §8.1: no `Path::exists` and no `pacode_image::render` here — the key
+    // holds the *raw* path, and the event loop resolves + renders on a
+    // blocking thread. A miss draws a placeholder this frame.
+    let want = ImageCacheKey {
+        raw: path_str.to_string(),
         cell_w: p_inner.width,
         cell_h: p_inner.height,
     };
+    state.files.preview_want = Some(want.clone());
 
-    let cached_hit = state.files.cached_preview.as_ref().filter(|c| c.key == key);
-
-    let preview_result = if let Some(cached) = cached_hit {
-        cached.preview.clone()
-    } else {
-        let proto = pacode_image::detect();
-        let req = pacode_image::PreviewRequest {
-            path: resolved_path.clone(),
-            cell_w: p_inner.width,
-            cell_h: p_inner.height,
-        };
-        let val = pacode_image::render(&req, proto).ok();
-        state.files.cached_preview = Some(CachedImagePreview {
-            key,
-            preview: val.clone(),
-        });
-        val
+    let Some(cached) = state
+        .files
+        .cached_preview
+        .as_ref()
+        .filter(|c| c.key == want)
+    else {
+        state.files.pending_escape = None;
+        let filename = Path::new(path_str)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(path_str);
+        let placeholder = vec![
+            Line::from(Span::styled("Rendering preview…", opts.theme.dim)),
+            Line::from(Span::styled(filename.to_string(), opts.theme.faint)),
+        ];
+        frame.render_widget(Paragraph::new(placeholder), p_inner);
+        return;
     };
 
-    match preview_result {
+    match &cached.preview {
         Some(pacode_image::Preview::Cells(grid)) => {
             state.files.pending_escape = None;
             let mut lines = Vec::new();
@@ -255,14 +245,18 @@ fn render_image_preview(
         }
         Some(pacode_image::Preview::Escape(esc)) => {
             frame.render_widget(ratatui::widgets::Clear, p_inner);
-            state.files.pending_escape = Some((p_inner, esc, resolved_path));
+            state.files.pending_escape = Some((p_inner, esc.clone(), cached.resolved.clone()));
         }
         None => {
             state.files.pending_escape = None;
-            let filename = p.file_name().and_then(|f| f.to_str()).unwrap_or(path_str);
+            let filename = Path::new(&cached.resolved)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| path_str.to_string());
             let placeholder = vec![
                 Line::from(Span::styled("Image preview unavailable", opts.theme.dim)),
-                Line::from(Span::styled(filename.to_string(), opts.theme.faint)),
+                Line::from(Span::styled(filename, opts.theme.faint)),
             ];
             frame.render_widget(Paragraph::new(placeholder), p_inner);
         }

@@ -93,14 +93,19 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
         MenuId::Plugins => {
             let market_source = state.config.plugins.marketplace.clone();
             let has_market = !market_source.is_empty();
+            // §8.2: open on the cached copies — `lists` carries the refresh's
+            // progress; `stale` mirrors the daemon-reported flag on the reply.
             state.focus = Focus::Overlay(Overlay::PluginsPicker {
                 index: 0,
                 plugins: state.plugins.clone(),
                 tab: crate::state::PluginsTab::Installed,
-                market: Vec::new(),
+                market: state.marketplace.clone(),
                 query: String::new(),
                 loading: has_market,
-                stale: false,
+                stale: matches!(
+                    state.lists.badge(crate::cache::ListKind::Marketplace),
+                    Some(crate::cache::Badge::OfflineCopy)
+                ),
             });
             let mut actions = vec![Action::Send(Request::ListPlugins)];
             if has_market {
@@ -112,9 +117,11 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
             actions
         }
         MenuId::Mcp => {
+            // §8.2: the cached server list is on screen immediately; the
+            // `loading…`/`offline copy` badge comes from `lists`.
             state.focus = Focus::Overlay(Overlay::McpPicker {
                 index: 0,
-                servers: Vec::new(),
+                servers: state.mcp_servers.clone(),
                 loading: true,
             });
             vec![Action::Send(Request::ListMcpServers)]

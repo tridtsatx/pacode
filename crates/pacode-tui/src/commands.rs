@@ -27,6 +27,41 @@ pub struct SlashCommand {
     pub arg_hint: Cow<'static, str>,
 }
 
+/// The cache file stores owned strings; `Cow<'static>` cannot derive
+/// `Deserialize` for non-`'static` inputs, so a shadow struct does the
+/// translation (every restored field lands as `Cow::Owned`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SlashCommandSerde {
+    name: String,
+    usage: String,
+    help: String,
+    arg_hint: String,
+}
+
+impl serde::Serialize for SlashCommand {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        SlashCommandSerde {
+            name: self.name.to_string(),
+            usage: self.usage.to_string(),
+            help: self.help.to_string(),
+            arg_hint: self.arg_hint.to_string(),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SlashCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let r = SlashCommandSerde::deserialize(d)?;
+        Ok(SlashCommand {
+            name: Cow::Owned(r.name),
+            usage: Cow::Owned(r.usage),
+            help: Cow::Owned(r.help),
+            arg_hint: Cow::Owned(r.arg_hint),
+        })
+    }
+}
+
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: Cow::Borrowed("model"),
@@ -224,6 +259,32 @@ pub fn clear_dynamic_commands() {
     if let Ok(mut guard) = DYNAMIC_COMMANDS.write() {
         guard.clear();
     }
+}
+
+/// The current dynamic registry — written to the `commands` cache file so the
+/// next run completes `/x` before the daemon answers (§8.2).
+pub fn dynamic_commands() -> Vec<SlashCommand> {
+    DYNAMIC_COMMANDS
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// Load the registry from the disk snapshot, wholesale — the file is the
+/// registry, not a merge source.
+pub fn restore_dynamic_commands(cmds: Vec<SlashCommand>) {
+    if let Ok(mut guard) = DYNAMIC_COMMANDS.write() {
+        *guard = cmds;
+    }
+}
+
+/// Rebuild the registry from fresh lists. Replacing (not merging) is what
+/// makes a removed plugin's commands disappear (§8.2: fresh data replaces
+/// cached state wholesale).
+pub fn rebuild_dynamic_commands(plugins: &[PluginInfo], servers: &[McpServerInfo]) {
+    clear_dynamic_commands();
+    register_plugins(plugins);
+    register_mcp_servers(servers);
 }
 
 /// Check if a command name is a registered plugin command.

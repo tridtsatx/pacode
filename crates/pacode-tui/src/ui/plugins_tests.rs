@@ -68,6 +68,7 @@ fn the_installed_tab_lists_loaded_plugins() {
         loading: false,
         stale: false,
         source: "owner/repo",
+        installed_badge: None,
     };
     let text = render(&view);
     assert!(text.contains("Installed"), "{text}");
@@ -88,6 +89,7 @@ fn the_installed_tab_shows_marketplace_plugins() {
         loading: false,
         stale: false,
         source: "owner/repo",
+        installed_badge: None,
     };
     let text = render(&view);
     assert!(text.contains("playwright"), "{text}");
@@ -111,6 +113,7 @@ fn an_empty_installed_tab_says_so() {
         loading: false,
         stale: false,
         source: "",
+        installed_badge: None,
     };
     let text = render(&view);
     assert!(text.contains("No plugins installed"), "{text}");
@@ -128,6 +131,7 @@ fn discover_without_a_marketplace_says_how_to_add_one() {
         loading: false,
         stale: false,
         source: "",
+        installed_badge: None,
     };
     let text = render(&view);
     assert!(text.contains("No marketplace configured"), "{text}");
@@ -149,6 +153,7 @@ fn discover_shows_the_search_box_installed_marks_and_updates() {
         loading: false,
         stale: false,
         source: "owner/repo",
+        installed_badge: None,
     };
     let text = render(&view);
     assert!(text.contains("> cre"), "{text}");
@@ -172,6 +177,7 @@ fn a_stale_listing_says_it_is_an_offline_copy() {
         loading: false,
         stale: true,
         source: "owner/repo",
+        installed_badge: None,
     };
     assert!(render(&view).contains("offline copy"));
 
@@ -187,6 +193,7 @@ fn a_stale_listing_says_it_is_an_offline_copy() {
             loading: true,
             stale: false,
             source: "owner/repo",
+            installed_badge: None,
         }
     };
     assert!(render(&loading).contains("loading"));

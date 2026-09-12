@@ -2311,6 +2311,160 @@ fn test_multi_select_toggles_with_space() {
 }
 
 #[test]
+fn test_the_free_text_plaque_is_a_pseudo_option_past_the_last() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    // j past the last option lands on the plaque (index == count).
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        now,
+    );
+    match &state.focus {
+        Focus::Overlay(Overlay::QuestionPicker { index, .. }) => assert_eq!(*index, 2),
+        other => panic!("expected the question picker, got {other:?}"),
+    }
+    // …and stays there on another j.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        now,
+    );
+    match &state.focus {
+        Focus::Overlay(Overlay::QuestionPicker { index, .. }) => assert_eq!(*index, 2),
+        other => panic!("expected the question picker, got {other:?}"),
+    }
+
+    // Enter on the plaque does not answer — it starts typing.
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    assert!(actions.is_empty());
+    match &state.focus {
+        Focus::Overlay(Overlay::QuestionPicker { typing, .. }) => assert!(*typing),
+        other => panic!("expected the question picker, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_digit_past_the_options_jumps_to_the_plaque() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    // `3` is N+1 for two options: it moves to the plaque, it does not answer.
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+        now,
+    );
+    assert!(actions.is_empty());
+    match &state.focus {
+        Focus::Overlay(Overlay::QuestionPicker { index, .. }) => assert_eq!(*index, 2),
+        other => panic!("expected the question picker, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_esc_from_typing_returns_to_the_list() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        now,
+    );
+    for c in "half".chars() {
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            now,
+        );
+    }
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        now,
+    );
+    assert!(actions.is_empty());
+    match &state.focus {
+        Focus::Overlay(Overlay::QuestionPicker { typing, typed, .. }) => {
+            assert!(!*typing);
+            assert!(typed.is_empty());
+        }
+        other => panic!("expected the question picker, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_space_on_the_plaque_starts_typing_even_in_multi_select() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let mut q = test_question();
+    q.multi_select = true;
+    ask(&mut state, q, now);
+
+    // Cursor starts on the recommended option; move to the plaque, then space.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        now,
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        now,
+    );
+    match &state.focus {
+        Focus::Overlay(Overlay::QuestionPicker {
+            typing, selected, ..
+        }) => {
+            assert!(*typing);
+            assert!(selected.is_empty());
+        }
+        other => panic!("expected the question picker, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_question_picker_height_tracks_options_descriptions_and_cap() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    // cols = 120 → dialog column 86 wide: chip + question + blank + 2×2
+    // option rows + plaque block + hint = 12.
+    assert_eq!(state.bottom_picker_height(), 12);
+
+    // Six options with descriptions overflow the cap.
+    let mut state = make_test_state();
+    let big = pacode_types::Question::new(
+        pacode_types::QuestionId::new("qst_big"),
+        pacode_types::QuestionOrigin::new(
+            AgentId::main(),
+            "main",
+            pacode_types::CallId::new("call_2"),
+        ),
+        "Pick",
+        "Which six?",
+        (0..6)
+            .map(|i| pacode_types::QuestionOption::new(format!("Option {i}"), format!("d{i}")))
+            .collect(),
+        false,
+        0,
+    )
+    .expect("question");
+    ask(&mut state, big, now);
+    assert_eq!(state.bottom_picker_height(), 18);
+}
+
+#[test]
 fn test_resolving_the_question_elsewhere_closes_the_picker() {
     let mut state = make_test_state();
     let now = Instant::now();

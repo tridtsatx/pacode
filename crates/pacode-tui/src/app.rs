@@ -35,7 +35,12 @@ use crate::ui;
 use crate::{TuiError, TuiOptions};
 
 enum BgResponse {
-    Reply(Result<Reply, pacode_client::ClientError>),
+    Reply {
+        /// Which cached list the request refreshed — `None` for non-list
+        /// requests. Drives `state.lists` freshness/in-flight tracking (§8.2).
+        kind: Option<crate::cache::ListKind>,
+        res: Result<Reply, pacode_client::ClientError>,
+    },
     LoadPanelReply {
         target: PanelTarget,
         result: Result<Reply, pacode_client::ClientError>,
@@ -44,6 +49,35 @@ enum BgResponse {
         result: Result<Reply, pacode_client::ClientError>,
     },
     BashCompleted(Result<crate::bash::BashOutput, String>),
+    /// An `@` path-completion scan finished — the popup reads `ready`.
+    AtCompleted {
+        key: crate::state::input::AtKey,
+        candidates: Vec<crate::at_complete::AtCandidate>,
+    },
+    /// A `!` bash-completion scan finished.
+    BashCompletionDone {
+        key: crate::state::input::BashKey,
+        candidates: Vec<crate::bash::complete::Candidate>,
+    },
+    /// A files-overlay image preview finished rendering (§8.1: the render —
+    /// file IO + decode + encode — ran on a blocking thread, never in draw).
+    FilePreviewReady {
+        key: crate::state::files::ImageCacheKey,
+        resolved: std::path::PathBuf,
+        preview: Option<pacode_image::Preview>,
+    },
+    /// A pasted-image strip thumbnail finished rendering.
+    ThumbReady {
+        token: usize,
+        cell_w: u16,
+        cell_h: u16,
+        preview: Option<pacode_image::Preview>,
+    },
+    /// The clipboard copy `ui::draw` stashed in `state.pending_copy` ran.
+    CopyDone {
+        auto: bool,
+        chars: usize,
+    },
 }
 
 pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> {
@@ -55,10 +89,11 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     let mut term_guard = TerminalGuard::enter(opts.config.ui.mouse)?;
     crate::timing::mark(timing, "terminal_enter", t);
 
-    // Progressive paint: build the state and draw the first frame before any
-    // daemon IO. The socket connect, a possible daemon spawn and the attach
-    // snapshot (first history page included) then resolve while the user
-    // already sees the chrome and a "connecting…" footer.
+    // Progressive paint, now cache-first (§8.2): build the state, run the one
+    // allowed blocking cache read on `spawn_blocking`, apply whatever came
+    // back, then draw the first frame — all before any daemon IO. The socket
+    // connect, a possible daemon spawn and the attach snapshot then resolve
+    // while the user already sees the chrome and a "connecting…" footer.
     let t = Instant::now();
     let size = term_guard.terminal.size()?;
     let mut state = AppState::new(
@@ -68,8 +103,33 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         size.height,
     );
     state.cwd = opts.cwd.clone();
+    state.paths = opts.client.paths.clone();
+    state.cache = crate::cache::DiskCache::new(state.paths.cache_dir.clone());
     state.connection = crate::state::Connection::Connecting;
     crate::timing::mark(timing, "app_state_new", t);
+
+    let t = Instant::now();
+    let load = {
+        let cache = state.cache.clone();
+        let ctx = crate::cache::LoadCtx {
+            cwd: opts.cwd.clone(),
+            mcp_sig: crate::cache::mcp_sig(&opts.config),
+            marketplace_source: opts.config.plugins.marketplace.clone(),
+        };
+        tokio::task::spawn_blocking(move || crate::cache::startup_load(&cache, &ctx))
+            .await
+            .unwrap_or_default()
+    };
+    if load.caps.evicted > 0 {
+        log::info!(
+            "cache: evicted {} file(s), {} B freed",
+            load.caps.evicted,
+            load.caps.freed_bytes
+        );
+    }
+    let session_start = state.session_start_ms;
+    crate::cache::apply_snapshot(&mut state, load.snapshot, session_start);
+    crate::timing::mark(timing, "cache_load", t);
 
     term_guard.terminal.draw(|f| {
         ui::draw(f, &mut state);
@@ -77,8 +137,6 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     })?;
     crate::timing::mark(timing, "first_frame", t_start);
 
-    let client_paths = opts.client.paths.clone();
-    state.paths = client_paths;
     let t = Instant::now();
     let (client, mut events) = Client::connect(opts.client).await?;
     crate::timing::mark(timing, "client_connect", t);
@@ -129,14 +187,30 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     let mut term_events = EventStream::new();
     let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgResponse>();
 
-    // On start (after attach), send ListPlugins and register commands
-    {
-        let cl = Arc::clone(&client);
-        let tx = bg_tx.clone();
-        tokio::spawn(async move {
-            let res = cl.request(Request::ListPlugins).await;
-            let _ = tx.send(BgResponse::Reply(res));
-        });
+    // §8.2: every post-attach list refresh runs in parallel — none may block
+    // a frame. Each reply folds in independently, replaces its state section
+    // wholesale and rewrites its cache file. (`ListSkills` does not exist in
+    // the protocol: skills ride inside `PluginInfo.skill_dirs`.)
+    for act in [
+        Action::Send(Request::ListPlugins),
+        Action::Send(Request::ListMcpServers),
+        Action::Send(Request::ListSessions { limit: 50 }),
+        Action::Send(Request::ListModels),
+        Action::GitLog { after: None },
+    ] {
+        dispatch_action(act, &mut state, &client, &bg_tx);
+    }
+    if !state.config.plugins.marketplace.is_empty() {
+        let source = state.config.plugins.marketplace.clone();
+        dispatch_action(
+            Action::Send(Request::BrowseMarketplace {
+                source,
+                query: String::new(),
+            }),
+            &mut state,
+            &client,
+            &bg_tx,
+        );
     }
 
     // `ui.ups = "auto"` probes external tools (hyprctl/wlr-randr/xrandr —
@@ -162,6 +236,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     crate::timing::mark(timing, "refresh_hz_spawn", t_probe);
 
     let mut last_draw = Instant::now() - frame_interval.unwrap_or(Duration::from_millis(33));
+    // The refresh rate the auto-probe reported — `None` until it lands
+    // (`frame_budget` then budgets for the 60 Hz floor).
+    let mut detected_hz: Option<u16> = None;
     let mut last_layout = ScreenLayout::default();
     let mut active_escape: Option<(ratatui::layout::Rect, std::path::PathBuf)> = None;
     // Input image-strip escapes currently on screen (spec §1): tracked so the
@@ -196,10 +273,17 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             None => true,
         };
         if state.dirty && can_draw {
+            let t_frame = Instant::now();
             term_guard.terminal.draw(|f| {
                 last_layout = ui::draw(f, &mut state);
                 crate::font::apply_weight_to_frame(f, &state.config.font);
             })?;
+            // §8.3: warn when a frame ran over its refresh budget.
+            crate::timing::warn_frame_over_budget(
+                timing,
+                t_frame.elapsed(),
+                crate::timing::frame_budget(detected_hz),
+            );
             state.dirty = false;
             last_draw = Instant::now();
 
@@ -238,6 +322,11 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                 active_image_escapes = next_escapes;
             }
         }
+
+        // Deferred work the draw path recorded: completion scans, image
+        // renders, the stashed clipboard copy — all of it runs on blocking
+        // threads, replies land back through `bg_rx` (§8.1).
+        dispatch_deferred(&mut state, &bg_tx);
 
         if state.quit {
             break;
@@ -378,6 +467,7 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             detected = hz_rx.recv() => {
                 if let Some(hz) = detected {
                     crate::timing::mark(timing, "refresh_hz_detect", t_probe);
+                    detected_hz = hz;
                     frame_interval = ups.frame_interval(hz);
                 }
             }
@@ -462,11 +552,30 @@ fn dispatch_action(
                 }
                 other => other,
             };
+            // §8.2: a list request marks its section in-flight (the pickers
+            // show `loading…` until the reply clears it).
+            let kind = crate::cache::ListKind::for_request(&req);
+            if let Some(kind) = kind {
+                state.lists.mark_sent(kind);
+            }
+            // §8.2 invalidation: a mutation drops the affected list's file
+            // now; the follow-up `ListX` reply rewrites it.
+            match &req {
+                Request::InstallPlugin { .. } | Request::UninstallPlugin { .. } => {
+                    state.invalidate_cache(crate::cache::ListKind::Plugins);
+                    state.invalidate_cache(crate::cache::ListKind::Commands);
+                }
+                Request::SetMcpServerEnabled { .. } | Request::RestartMcpServer { .. } => {
+                    state.invalidate_cache(crate::cache::ListKind::McpServers);
+                    state.invalidate_cache(crate::cache::ListKind::Commands);
+                }
+                _ => {}
+            }
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
                 let res = cl.request(req).await;
-                let _ = tx.send(BgResponse::Reply(res));
+                let _ = tx.send(BgResponse::Reply { kind, res });
             });
         }
         Action::RunBashInteractive { command } => {
@@ -526,12 +635,16 @@ fn dispatch_action(
         }
         Action::GitLog { after } => {
             state.git.begin_log(after.as_deref());
+            state.lists.mark_sent(crate::cache::ListKind::GitLog);
             state.dirty = true;
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
                 let res = cl.request(Request::GitLog { after }).await;
-                let _ = tx.send(BgResponse::Reply(res));
+                let _ = tx.send(BgResponse::Reply {
+                    kind: Some(crate::cache::ListKind::GitLog),
+                    res,
+                });
             });
         }
         Action::GitShow { hash } => {
@@ -539,7 +652,7 @@ fn dispatch_action(
             let tx = bg_tx.clone();
             tokio::spawn(async move {
                 let res = cl.request(Request::GitShow { hash }).await;
-                let _ = tx.send(BgResponse::Reply(res));
+                let _ = tx.send(BgResponse::Reply { kind: None, res });
             });
         }
         Action::GitDiff { hash } => {
@@ -547,7 +660,7 @@ fn dispatch_action(
             let tx = bg_tx.clone();
             tokio::spawn(async move {
                 let res = cl.request(Request::GitDiff { hash }).await;
-                let _ = tx.send(BgResponse::Reply(res));
+                let _ = tx.send(BgResponse::Reply { kind: None, res });
             });
         }
         Action::LoadPanel => {
@@ -601,167 +714,170 @@ fn dispatch_action(
     }
 }
 
+/// Service the work items the draw path recorded this pass: completion scans,
+/// image preview/thumbnail renders, the stashed clipboard copy. Everything
+/// lands on `spawn_blocking` — the frame path itself stays clean (§8.1).
+fn dispatch_deferred(state: &mut AppState, bg_tx: &mpsc::UnboundedSender<BgResponse>) {
+    if let Some(key) = state.input.at_comp.claim_want() {
+        let tx = bg_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let candidates = crate::at_complete::complete_at_path(&key.query, &key.cwd);
+            let _ = tx.send(BgResponse::AtCompleted { key, candidates });
+        });
+    }
+
+    if let Some(key) = state.input.bash_comp.claim_want() {
+        // The history snapshot rides along — the scan must not see the deque
+        // grow mid-read, and the key's `history_len` invalidates anyway.
+        let history = state.input.bash_history.clone();
+        let tx = bg_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let candidates =
+                crate::bash::complete::complete(&key.text, key.cursor, &history, &key.cwd);
+            let _ = tx.send(BgResponse::BashCompletionDone { key, candidates });
+        });
+    }
+
+    // Files-overlay image preview: resolve + render off-thread.
+    if let Some(want) = state.files.preview_want.clone()
+        && state.files.preview_in_flight.as_ref() != Some(&want)
+        && state.files.cached_preview.as_ref().map(|c| &c.key) != Some(&want)
+    {
+        state.files.preview_in_flight = Some(want.clone());
+        let cwd = state.cwd();
+        let tx = bg_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let resolved = resolve_preview_path(&want.raw, &cwd);
+            let req = pacode_image::PreviewRequest {
+                path: resolved.clone(),
+                cell_w: want.cell_w,
+                cell_h: want.cell_h,
+            };
+            let preview = pacode_image::render(&req, pacode_image::detect()).ok();
+            let _ = tx.send(BgResponse::FilePreviewReady {
+                key: want,
+                resolved,
+                preview,
+            });
+        });
+    }
+
+    // Pasted-image strip thumbnails: one job per missing/mismatched slot.
+    for (token, path, cell_w, cell_h) in std::mem::take(&mut state.image_strip.want) {
+        let k = (token, cell_w, cell_h);
+        let already = state
+            .image_strip
+            .thumbs
+            .get(&token)
+            .is_some_and(|t| t.cell_w == cell_w && t.cell_h == cell_h);
+        if already || state.image_strip.in_flight.contains(&k) {
+            continue;
+        }
+        state.image_strip.in_flight.insert(k);
+        let tx = bg_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let req = pacode_image::PreviewRequest {
+                path,
+                cell_w,
+                cell_h,
+            };
+            let preview = pacode_image::render(&req, pacode_image::detect()).ok();
+            let _ = tx.send(BgResponse::ThumbReady {
+                token,
+                cell_w,
+                cell_h,
+                preview,
+            });
+        });
+    }
+
+    // The selection copy `ui::draw` prepared — OSC 52 + arboard, off-thread.
+    if let Some(copy) = state.pending_copy.take() {
+        let tx = bg_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::clipboard::copy(&copy.text) {
+                log::warn!("clipboard copy failed: {e}");
+            }
+            let _ = tx.send(BgResponse::CopyDone {
+                auto: copy.auto,
+                chars: copy.text.chars().count(),
+            });
+        });
+    }
+}
+
+/// The preview pane's path resolution — `raw` relative to the session cwd
+/// when that joined path exists. Runs inside `spawn_blocking`: `exists()` is
+/// a filesystem stat and must never run inside `ui::draw` (§8.1).
+fn resolve_preview_path(raw: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let joined = cwd.join(p);
+    if joined.exists() {
+        joined
+    } else {
+        p.to_path_buf()
+    }
+}
+
 fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
     match res {
-        BgResponse::Reply(Ok(Reply::Error { message })) => {
-            let now = now_ms();
-            state.transcript.cells.push_back(Cell {
-                id: now,
-                kind: CellKind::Item(TranscriptKind::Notice {
-                    level: ToastLevel::Error,
-                    text: message,
-                }),
-                version: 0,
-                ts_ms: now,
-                stats: None,
+        BgResponse::Reply { kind, res } => {
+            // §8.2: the reply ends the in-flight mark; a successful one
+            // promotes the section to `Fresh`, a failed one leaves the cached
+            // copy — and its `offline copy` badge — alone.
+            if let Some(kind) = kind {
+                let ok = matches!(&res, Ok(r) if !matches!(r, Reply::Error { .. }));
+                state.lists.on_reply(kind, ok);
+            }
+            handle_reply(res, state)
+        }
+        BgResponse::AtCompleted { key, candidates } => {
+            state.input.at_comp.finish_scan(key, candidates);
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::BashCompletionDone { key, candidates } => {
+            state.input.bash_comp.finish_scan(key, candidates);
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::FilePreviewReady {
+            key,
+            resolved,
+            preview,
+        } => {
+            state.files.preview_in_flight = None;
+            state.files.cached_preview = Some(crate::state::files::CachedImagePreview {
+                key,
+                resolved,
+                preview,
             });
             state.dirty = true;
             vec![]
         }
-        BgResponse::Reply(Ok(Reply::Models { models })) => {
-            state.models = models;
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::AuthStatus { providers })) => {
-            state.auth_providers = providers;
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::Sessions { sessions })) => {
-            state.sessions = sessions;
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::McpServers { servers })) => {
-            crate::commands::register_mcp_servers(&servers);
-            if let crate::state::Focus::Overlay(crate::state::Overlay::McpPicker {
-                servers: ref mut s,
-                loading: ref mut l,
-                ..
-            }) = state.focus
-            {
-                *s = servers;
-                *l = false;
-                state.dirty = true;
-            }
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::McpPrompt { text })) => {
-            state.input.insert_str(&text);
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::MarketplacePlugins {
-            plugins: listing,
-            stale: is_stale,
-        })) => {
-            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
-                ref mut market,
-                ref mut loading,
-                ref mut stale,
-                ref mut index,
-                ..
-            }) = state.focus
-            {
-                *index = (*index).min(listing.len().saturating_sub(1));
-                *market = listing;
-                *loading = false;
-                *stale = is_stale;
-                state.dirty = true;
-            }
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::GitLog {
-            commits,
-            has_more,
-            status,
-        })) => {
-            state.git.apply_log(commits, has_more, status);
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::GitShow { hash, stat })) => {
-            state.git.apply_show(hash, stat);
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::GitDiff {
-            hash,
-            patch,
-            truncated,
-        })) => {
-            state.git.apply_diff(hash, patch, truncated);
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::Plugins { plugins })) => {
-            crate::commands::register_plugins(&plugins);
-            state.plugins = plugins.clone();
-            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
-                plugins: ref mut p,
-                ..
-            }) = state.focus
-            {
-                *p = plugins;
-                state.dirty = true;
-            }
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::PluginCommand(outcome))) => match outcome {
-            PluginCommandOutcome::InsertText { text } => {
-                state.input.insert_str(&text);
-                state.dirty = true;
-                vec![]
-            }
-            PluginCommandOutcome::SendPrompt { text } => {
-                vec![Action::Send(Request::UserMessage {
-                    text,
-                    images: Vec::new(),
-                })]
-            }
-            PluginCommandOutcome::Nothing => vec![],
-        },
-        BgResponse::Reply(Ok(Reply::Attached(snapshot))) => {
-            let slot_idx = state.active_slot;
-            state.record_slot(
-                slot_idx,
-                &snapshot.meta,
-                &snapshot.usage,
-                snapshot.agents.len(),
-                snapshot.tasks.len(),
+        BgResponse::ThumbReady {
+            token,
+            cell_w,
+            cell_h,
+            preview,
+        } => {
+            state.image_strip.in_flight.remove(&(token, cell_w, cell_h));
+            state.image_strip.thumbs.insert(
+                token,
+                crate::state::images::CachedThumb {
+                    cell_w,
+                    cell_h,
+                    preview,
+                },
             );
-            state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
             state.dirty = true;
             vec![]
         }
-        BgResponse::Reply(Ok(Reply::Snapshot(snapshot))) => {
-            let slot_idx = state.active_slot;
-            state.record_slot(
-                slot_idx,
-                &snapshot.meta,
-                &snapshot.usage,
-                snapshot.agents.len(),
-                snapshot.tasks.len(),
-            );
-            state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(_)) => vec![],
-        BgResponse::Reply(Err(err)) => {
-            let now = now_ms();
-            state.transcript.cells.push_back(Cell {
-                id: now,
-                kind: CellKind::Item(TranscriptKind::Notice {
-                    level: ToastLevel::Error,
-                    text: err.to_string(),
-                }),
-                version: 0,
-                ts_ms: now,
-                stats: None,
-            });
-            state.dirty = true;
+        BgResponse::CopyDone { auto, chars } => {
+            state.on_copy_done(auto, chars);
             vec![]
         }
         BgResponse::LoadPanelReply { target, result } => {
@@ -863,6 +979,190 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                     state.transcript.scroll_to_bottom();
                 }
             }
+            vec![]
+        }
+    }
+}
+
+/// Fold one daemon reply into state. List replies replace their section
+/// wholesale (§8.2) and — once state moved — rewrite their cache file.
+fn handle_reply(
+    res: Result<Reply, pacode_client::ClientError>,
+    state: &mut AppState,
+) -> Vec<Action> {
+    use crate::cache::ListKind;
+    match res {
+        Ok(Reply::Error { message }) => {
+            let now = now_ms();
+            state.transcript.cells.push_back(Cell {
+                id: now,
+                kind: CellKind::Item(TranscriptKind::Notice {
+                    level: ToastLevel::Error,
+                    text: message,
+                }),
+                version: 0,
+                ts_ms: now,
+                stats: None,
+            });
+            state.dirty = true;
+            vec![]
+        }
+        Ok(Reply::Models { models }) => {
+            state.models = models;
+            state.dirty = true;
+            crate::cache::write_after_reply(state, ListKind::Models);
+            vec![]
+        }
+        Ok(Reply::AuthStatus { providers }) => {
+            state.auth_providers = providers;
+            state.dirty = true;
+            vec![]
+        }
+        Ok(Reply::Sessions { sessions }) => {
+            state.sessions = sessions;
+            state.dirty = true;
+            crate::cache::write_after_reply(state, ListKind::Sessions);
+            vec![]
+        }
+        Ok(Reply::McpServers { servers }) => {
+            state.mcp_servers = servers.clone();
+            // A server removal must drop its prompt commands — rebuild, not
+            // merge (§8.2 wholesale replacement).
+            crate::commands::rebuild_dynamic_commands(&state.plugins, &servers);
+            if let crate::state::Focus::Overlay(crate::state::Overlay::McpPicker {
+                servers: ref mut s,
+                loading: ref mut l,
+                ..
+            }) = state.focus
+            {
+                *s = servers;
+                *l = false;
+            }
+            state.dirty = true;
+            crate::cache::write_after_reply(state, ListKind::McpServers);
+            vec![]
+        }
+        Ok(Reply::McpPrompt { text }) => {
+            state.input.insert_str(&text);
+            state.dirty = true;
+            vec![]
+        }
+        Ok(Reply::MarketplacePlugins {
+            plugins: listing,
+            stale: is_stale,
+        }) => {
+            state.marketplace = listing.clone();
+            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
+                ref mut market,
+                ref mut loading,
+                ref mut stale,
+                ref mut index,
+                ..
+            }) = state.focus
+            {
+                *index = (*index).min(listing.len().saturating_sub(1));
+                *market = listing;
+                *loading = false;
+                *stale = is_stale;
+            }
+            state.dirty = true;
+            crate::cache::write_after_reply(state, ListKind::Marketplace);
+            vec![]
+        }
+        Ok(Reply::GitLog {
+            commits,
+            has_more,
+            status,
+        }) => {
+            let first_page = !state.git.loading_more;
+            state.git.apply_log(commits, has_more, status);
+            state.dirty = true;
+            if first_page {
+                crate::cache::write_after_reply(state, ListKind::GitLog);
+            }
+            vec![]
+        }
+        Ok(Reply::GitShow { hash, stat }) => {
+            state.git.apply_show(hash, stat);
+            state.dirty = true;
+            vec![]
+        }
+        Ok(Reply::GitDiff {
+            hash,
+            patch,
+            truncated,
+        }) => {
+            state.git.apply_diff(hash, patch, truncated);
+            state.dirty = true;
+            vec![]
+        }
+        Ok(Reply::Plugins { plugins }) => {
+            crate::commands::rebuild_dynamic_commands(&plugins, &state.mcp_servers);
+            state.plugins = plugins.clone();
+            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
+                plugins: ref mut p,
+                ..
+            }) = state.focus
+            {
+                *p = plugins;
+            }
+            state.dirty = true;
+            crate::cache::write_after_reply(state, ListKind::Plugins);
+            vec![]
+        }
+        Ok(Reply::PluginCommand(outcome)) => match outcome {
+            PluginCommandOutcome::InsertText { text } => {
+                state.input.insert_str(&text);
+                state.dirty = true;
+                vec![]
+            }
+            PluginCommandOutcome::SendPrompt { text } => {
+                vec![Action::Send(Request::UserMessage {
+                    text,
+                    images: Vec::new(),
+                })]
+            }
+            PluginCommandOutcome::Nothing => vec![],
+        },
+        Ok(Reply::Attached(snapshot)) | Ok(Reply::Snapshot(snapshot)) => {
+            // §8.2 project switch: a new cwd means the old project's git list
+            // must not linger — `apply_client_event` resets the state and the
+            // per-project cache key does the file side. Re-fetch for the new
+            // project so the submenu is populated when opened.
+            let project_changed = state
+                .meta
+                .as_ref()
+                .is_some_and(|m| m.cwd != snapshot.meta.cwd);
+            let slot_idx = state.active_slot;
+            state.record_slot(
+                slot_idx,
+                &snapshot.meta,
+                &snapshot.usage,
+                snapshot.agents.len(),
+                snapshot.tasks.len(),
+            );
+            state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+            state.dirty = true;
+            if project_changed {
+                vec![Action::GitLog { after: None }]
+            } else {
+                vec![]
+            }
+        }
+        Ok(_) => vec![],
+        Err(err) => {
+            let now = now_ms();
+            state.transcript.cells.push_back(Cell {
+                id: now,
+                kind: CellKind::Item(TranscriptKind::Notice {
+                    level: ToastLevel::Error,
+                    text: err.to_string(),
+                }),
+                version: 0,
+                ts_ms: now,
+                stats: None,
+            });
+            state.dirty = true;
             vec![]
         }
     }

@@ -252,7 +252,7 @@ impl Codex {
             log::warn!("request failed ({status}): {redacted_text}");
             return Err(ProviderError::Http {
                 status,
-                message: text,
+                message: crate::error_body_message(&text),
             });
         }
 
@@ -268,7 +268,10 @@ impl Codex {
                     }
                     return Ok(configured_models);
                 }
-                return Err(ProviderError::Malformed(err.to_string()));
+                return Err(ProviderError::Malformed(format!(
+                    "{err}: {}",
+                    crate::error_body_message(&json_text)
+                )));
             }
         };
 

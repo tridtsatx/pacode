@@ -37,8 +37,10 @@ pub struct GitState {
     pub status: Option<GitStatus>,
     /// A `GitLog` request is in flight.
     pub loading: bool,
-    /// The in-flight `GitLog` continues an existing list (append, not replace).
-    loading_more: bool,
+    /// The in-flight `GitLog` continues an existing list (append, not
+    /// replace). `app.rs` reads it to tell a first-page reply (which rewrites
+    /// the cache file) from a page append (which must not).
+    pub loading_more: bool,
     /// Last fetched `show --stat`, keyed by hash so a stale reply is ignored.
     pub detail: Option<GitShowInfo>,
     /// Last fetched patch, keyed by hash.
@@ -51,6 +53,16 @@ impl GitState {
     pub fn begin_log(&mut self, after: Option<&str>) {
         self.loading = true;
         self.loading_more = after.is_some();
+    }
+
+    /// Fill from the disk snapshot before the first frame (§8.2 cache-first).
+    /// Unlike `apply_log` this touches no loading flags — the refresh badge is
+    /// owned by `state.lists.git`, and the next real reply still lands through
+    /// `apply_log` and replaces `commits` wholesale.
+    pub fn apply_cached(&mut self, commits: Vec<CommitRow>, has_more: bool, status: GitStatus) {
+        self.commits = commits;
+        self.has_more = has_more;
+        self.status = Some(status);
     }
 
     /// Fold a `Reply::GitLog` into the list.

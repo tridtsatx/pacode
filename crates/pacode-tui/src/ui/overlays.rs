@@ -69,7 +69,11 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
                 servers,
                 loading,
             } => {
-                crate::ui::mcp::draw(frame, area, *index, servers, *loading, opts);
+                // The overlay's own `loading` covers the window between open
+                // and dispatch; `lists` carries everything after (§8.2).
+                let badge = state.lists.badge(crate::cache::ListKind::McpServers);
+                let loading = *loading || matches!(badge, Some(crate::cache::Badge::Loading));
+                crate::ui::mcp::draw(frame, area, *index, servers, loading, badge, opts);
             }
             Overlay::PluginsPicker {
                 index,
@@ -89,6 +93,7 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
                     loading: *loading,
                     stale: *stale,
                     source: &state.config.plugins.marketplace,
+                    installed_badge: state.lists.badge(crate::cache::ListKind::Plugins),
                 };
                 crate::ui::plugins::draw(frame, area, &view, opts);
             }
@@ -144,7 +149,16 @@ fn wanted_height(state: &AppState, dialog: Rect) -> u16 {
                 2 + capped(filtered_sessions(&state.sessions, query).len(), 2, 2, 5)
             }
             Overlay::Files { .. } => capped(state.files.len(), 1, 2, 12),
-            Overlay::McpPicker { servers, .. } => capped(servers.len(), 2, 2, 6),
+            Overlay::McpPicker { servers, .. } => {
+                // A `loading…`/`offline copy` badge line above the rows (§8.2).
+                let badge = u16::from(
+                    state
+                        .lists
+                        .badge(crate::cache::ListKind::McpServers)
+                        .is_some(),
+                );
+                capped(servers.len(), 2, 2, 6) + badge
+            }
             Overlay::PluginsPicker {
                 tab,
                 plugins,
@@ -159,7 +173,11 @@ fn wanted_height(state: &AppState, dialog: Rect) -> u16 {
                 };
                 let rows = if items == 0 { 2 } else { items.min(cap) * per };
                 let status = match tab {
-                    PluginsTab::Installed => 0,
+                    // A `loading…`/`offline copy` line appears when the cache
+                    // health asks for one (§8.2).
+                    PluginsTab::Installed => {
+                        u16::from(state.lists.badge(crate::cache::ListKind::Plugins).is_some())
+                    }
                     PluginsTab::Discover => 1,
                 };
                 2 + 1 + status + rows as u16
@@ -418,6 +436,16 @@ fn draw_bg_list(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The `… — loading…` / `… — offline copy` title suffix a picker gets from
+/// its list's cache health (§8.2).
+pub(crate) fn title_with_badge(title: &str, badge: Option<crate::cache::Badge>) -> String {
+    match badge {
+        Some(crate::cache::Badge::Loading) => format!("{title} — loading…"),
+        Some(crate::cache::Badge::OfflineCopy) => format!("{title} — offline copy"),
+        None => title.to_string(),
+    }
+}
+
 fn draw_session_picker(
     frame: &mut Frame,
     area: Rect,
@@ -426,7 +454,11 @@ fn draw_session_picker(
     state: &AppState,
     opts: &RenderOptions,
 ) {
-    let block = menu_block("Pick Session", " enter resume · esc cancel ", opts);
+    let title = title_with_badge(
+        "Pick Session",
+        state.lists.badge(crate::cache::ListKind::Sessions),
+    );
+    let block = menu_block(&title, " enter resume · esc cancel ", opts);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -445,7 +477,13 @@ fn draw_session_picker(
 
     let budget = (inner.height as usize).saturating_sub(2);
     if filtered.is_empty() {
-        let empty = if state.sessions.is_empty() {
+        let empty = if state.sessions.is_empty()
+            && matches!(
+                state.lists.badge(crate::cache::ListKind::Sessions),
+                Some(crate::cache::Badge::Loading)
+            ) {
+            vec![Line::from(Span::styled("loading…", opts.theme.faint))]
+        } else if state.sessions.is_empty() {
             empty_lines("No sessions yet", "this is the first one", opts)
         } else {
             empty_lines(

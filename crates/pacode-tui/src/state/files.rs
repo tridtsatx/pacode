@@ -8,10 +8,13 @@ mod files_tests;
 
 pub const MAX_FILES: usize = 500;
 
-/// Key identifying a cached image preview by path and cell dimensions.
+/// Key identifying a cached image preview by the *raw* path (as the files row
+/// lists it — possibly relative to the session cwd) and the cell dimensions.
+/// The background render job resolves the raw path against the cwd; draw keys
+/// on the raw string so it never has to stat anything (§8.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageCacheKey {
-    pub path: PathBuf,
+    pub raw: String,
     pub cell_w: u16,
     pub cell_h: u16,
 }
@@ -23,6 +26,9 @@ pub struct ImageCacheKey {
 #[derive(Clone, Debug)]
 pub struct CachedImagePreview {
     pub key: ImageCacheKey,
+    /// The cwd-resolved path the preview was rendered from — the kitty/sixel
+    /// escape diffing in `app` needs it (image identity, not the list label).
+    pub resolved: PathBuf,
     pub preview: Option<pacode_image::Preview>,
 }
 
@@ -80,22 +86,28 @@ pub struct FilesState {
     pub rows: Vec<FileRow>,
     /// At most one cached image preview.
     pub cached_preview: Option<CachedImagePreview>,
+    /// What the preview pane needs — draw records it, the event loop turns it
+    /// into `preview_in_flight` and a blocking-thread render. Rendering inside
+    /// draw was the §8.1 violation: `pacode_image::render` does file IO and
+    /// decode/encode work synchronous to the frame.
+    pub preview_want: Option<ImageCacheKey>,
+    /// The key of the render currently running on a blocking thread.
+    pub preview_in_flight: Option<ImageCacheKey>,
     /// Pending escape sequence to write after frame flush: (area, escape_seq, path).
     pub pending_escape: Option<(ratatui::layout::Rect, String, PathBuf)>,
 }
 
 impl FilesState {
     pub fn new() -> Self {
-        Self {
-            rows: Vec::new(),
-            cached_preview: None,
-            pending_escape: None,
-        }
+        Self::default()
     }
 
-    /// Clear cached preview and pending escape sequence (e.g. on overlay close).
+    /// Clear cached preview, pending escape and outstanding wants (e.g. on
+    /// overlay close).
     pub fn clear_preview(&mut self) {
         self.cached_preview = None;
+        self.preview_want = None;
+        self.preview_in_flight = None;
         self.pending_escape = None;
     }
 
