@@ -198,6 +198,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 Some(crate::state::PanelTarget::Task(_))
                 | Some(crate::state::PanelTarget::McpServer(_))
                 | Some(crate::state::PanelTarget::FileDiff { .. })
+                | Some(crate::state::PanelTarget::CommitDiff { .. })
                 | None => String::new(),
             };
             let banner = Line::from(vec![

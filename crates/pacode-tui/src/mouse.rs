@@ -12,7 +12,11 @@ use crate::state::{AppState, PanelTarget};
 fn scroll_panel(state: &mut AppState, delta: i32) {
     if matches!(
         state.panel.target,
-        Some(PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. })
+        Some(
+            PanelTarget::McpServer(_)
+                | PanelTarget::FileDiff { .. }
+                | PanelTarget::CommitDiff { .. }
+        )
     ) {
         state.panel.scroll = if delta > 0 {
             state.panel.scroll.saturating_add(delta as usize)

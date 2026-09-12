@@ -4,6 +4,11 @@
 //! renderer (T17) reads it. `commits` pages in 200-row chunks keyed by the
 //! last row's hash; appended pages are deduped so a shifted history cannot
 //! double a row.
+//!
+//! The detail stat and the next page are want-driven (§8.1): the draw records
+//! [`GitState::show_want`] / [`GitState::more_want`], `dispatch_deferred` turns
+//! them into `Action::GitShow` / `Action::GitLog` — never a fetch inside the
+//! key handler or the draw.
 
 use pacode_types::vcs::{CommitRow, GitStatus};
 
@@ -11,19 +16,28 @@ use pacode_types::vcs::{CommitRow, GitStatus};
 /// keeping memory bounded for long browsing sessions.
 pub const GIT_COMMITS_CAP: usize = 1000;
 
-/// `git show --stat` result for the detail pane.
+/// `git show --stat` result for the detail pane. `stat: None` means the
+/// daemon could not produce it — `error` says why; an empty `Some` means the
+/// commit touched no files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitShowInfo {
     pub hash: String,
-    pub stat: String,
+    pub stat: Option<String>,
+    pub error: Option<String>,
 }
 
 /// `git diff` result for the diff panel.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct GitDiffInfo {
     pub hash: String,
-    pub patch: String,
+    /// `None` when the request failed — `note` carries the reason the panel
+    /// shows instead of an eternal "loading".
+    pub patch: Option<String>,
     pub truncated: bool,
+    pub note: Option<String>,
+    /// `render_diff_ex` output at the width it was rendered for — rebuilt on
+    /// resize, never per frame (§8.1, same contract as `PanelDiff::rendered`).
+    pub rendered: Option<(u16, Vec<ratatui::text::Line<'static>>)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,6 +59,26 @@ pub struct GitState {
     pub detail: Option<GitShowInfo>,
     /// Last fetched patch, keyed by hash.
     pub diff: Option<GitDiffInfo>,
+    /// The selected commit the Git level's draw recorded — the detail-stat
+    /// want `dispatch_deferred` turns into `Action::GitShow`. `None` while
+    /// another level (or no menu) is on screen.
+    pub show_want: Option<String>,
+    /// A `GitShow` request is in flight for this hash. The gate in
+    /// `dispatch_deferred` allows at most one outstanding request: the want
+    /// moves with the cursor, the request follows once the previous lands.
+    pub show_in_flight: Option<String>,
+    /// The cursor rests on the last loaded commit — `dispatch_deferred`
+    /// turns it into `Action::GitLog { after }` once `has_more` and no
+    /// in-flight page confirm it.
+    pub more_want: Option<String>,
+    /// The `after` of an append that already failed once. While the want
+    /// still names it the gate does not refire — a dead daemon would
+    /// otherwise busy-retry every frame; moving the cursor off the last row
+    /// (or a successful `apply_log`) clears it, so coming back retries.
+    pub more_failed: Option<String>,
+    /// The `after` the in-flight `GitLog` was sent with — `fail_log` records
+    /// it as `more_failed`, because the reply itself names no cursor key.
+    pub log_after: Option<String>,
 }
 
 impl GitState {
@@ -53,6 +87,7 @@ impl GitState {
     pub fn begin_log(&mut self, after: Option<&str>) {
         self.loading = true;
         self.loading_more = after.is_some();
+        self.log_after = after.map(str::to_string);
     }
 
     /// Fill from the disk snapshot before the first frame (§8.2 cache-first).
@@ -94,20 +129,77 @@ impl GitState {
             self.commits.truncate(GIT_COMMITS_CAP);
             self.has_more = false;
         }
+        // A landed reply proves the channel is alive — a page that failed
+        // once is allowed to be wanted again.
+        self.more_failed = None;
+    }
+
+    /// The `GitLog` request failed (transport error or `Reply::Error`) —
+    /// release the loading flags so the badge does not stick. An append also
+    /// records the `after` it failed on: the want-gate must not busy-retry
+    /// the same page while the cursor rests on the last row (§5.10's
+    /// "exactly once").
+    pub fn fail_log(&mut self) {
+        if self.loading_more {
+            // The failed request's `after`, not the current want — the cursor
+            // may have moved while it was in flight.
+            self.more_failed = self.log_after.clone();
+        }
+        self.loading = false;
+        self.loading_more = false;
+        self.log_after = None;
     }
 
     /// Fold a `Reply::GitShow` into the detail slot.
     pub fn apply_show(&mut self, hash: String, stat: String) {
-        self.detail = Some(GitShowInfo { hash, stat });
+        self.end_show(&hash);
+        self.detail = Some(GitShowInfo {
+            hash,
+            stat: Some(stat),
+            error: None,
+        });
+    }
+
+    /// The `GitShow` request failed (daemon `Reply::Error` or a transport
+    /// error) — record it so the detail pane stops saying "loading" and the
+    /// want-gate stops refiring for this hash while it stays selected.
+    pub fn fail_show(&mut self, hash: String, error: String) {
+        self.end_show(&hash);
+        self.detail = Some(GitShowInfo {
+            hash,
+            stat: None,
+            error: Some(error),
+        });
     }
 
     /// Fold a `Reply::GitDiff` into the diff slot.
     pub fn apply_diff(&mut self, hash: String, patch: String, truncated: bool) {
         self.diff = Some(GitDiffInfo {
             hash,
-            patch,
+            patch: Some(patch),
             truncated,
+            note: None,
+            rendered: None,
         });
+    }
+
+    /// The `GitDiff` request failed — same contract as [`Self::fail_show`].
+    pub fn fail_diff(&mut self, hash: String, error: String) {
+        self.diff = Some(GitDiffInfo {
+            hash,
+            patch: None,
+            truncated: false,
+            note: Some(error),
+            rendered: None,
+        });
+    }
+
+    /// Release `show_in_flight` when it names this hash — keyed, so a late
+    /// reply for a previous want cannot unblock a fetch already replaced.
+    fn end_show(&mut self, hash: &str) {
+        if self.show_in_flight.as_deref() == Some(hash) {
+            self.show_in_flight = None;
+        }
     }
 }
 

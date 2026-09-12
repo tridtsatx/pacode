@@ -221,6 +221,84 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                 }
             }
         }
+        PanelTarget::CommitDiff { ref hash } => {
+            // The Git level's `enter` (§5.10): the commit's patch lives in
+            // `state.git.diff`, keyed by hash — a payload for a different
+            // commit reads as "loading", never as the wrong diff. Painted by
+            // `render_diff_ex` and cached per width on the payload itself,
+            // so a frame never re-renders (§8.1).
+            let commit = state.git.commits.iter().find(|c| c.hash == *hash);
+            let title = commit
+                .map(|c| format!("{} {}", c.short, c.subject))
+                .unwrap_or_else(|| hash.chars().take(12).collect());
+            let current = matches!(&state.git.diff, Some(d) if d.hash == *hash);
+            let truncated = current && state.git.diff.as_ref().is_some_and(|d| d.truncated);
+
+            let mut head = vec![
+                Span::styled(format!("{} ", opts.glyphs.pointer), opts.theme.accent),
+                Span::styled(title, opts.theme.bold),
+                Span::styled(" · commit".to_string(), opts.theme.faint),
+            ];
+            if truncated {
+                head.push(Span::styled(" · truncated", opts.theme.red));
+            }
+            let header_lines = vec![Line::from(head), Line::default()];
+            let header_area = Rect::new(area.x, area.y, area.width, 2.min(area.height));
+            frame.render_widget(Paragraph::new(header_lines), header_area);
+
+            if area.height > 2 {
+                let body = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
+                let scroll = state.panel.scroll;
+                let slot = if current {
+                    state.git.diff.as_mut()
+                } else {
+                    None
+                };
+                match slot {
+                    Some(d) if d.patch.is_some() => {
+                        if !matches!(&d.rendered, Some((w, _)) if *w == body.width)
+                            && let Some(patch) = d.patch.as_deref()
+                        {
+                            let mut dopts = opts.clone();
+                            dopts.width = body.width;
+                            d.rendered = Some((
+                                body.width,
+                                pacode_render::render_diff_ex(patch, &dopts, false),
+                            ));
+                        }
+                        if let Some((_, lines)) = &d.rendered {
+                            // `panel.scroll` counts back from the tail like
+                            // the log targets — `usize::MAX` (armed on open)
+                            // pins the head, where a diff reads from.
+                            let max_start = lines.len().saturating_sub(body.height as usize);
+                            let start = max_start.saturating_sub(scroll.min(max_start));
+                            let visible: Vec<Line<'static>> = lines
+                                .iter()
+                                .skip(start)
+                                .take(body.height as usize)
+                                .cloned()
+                                .collect();
+                            frame.render_widget(Paragraph::new(visible), body);
+                        }
+                    }
+                    Some(d) => {
+                        // `note` names the failure (timeout, vanished ref); a
+                        // bare `None` patch means the commit changed no files.
+                        let msg = d
+                            .note
+                            .clone()
+                            .unwrap_or_else(|| "no changes in this commit".to_string());
+                        let lines = vec![Line::from(Span::styled(msg, opts.theme.faint))];
+                        frame.render_widget(Paragraph::new(lines), body);
+                    }
+                    None => {
+                        let lines =
+                            vec![Line::from(Span::styled("loading diff…", opts.theme.faint))];
+                        frame.render_widget(Paragraph::new(lines), body);
+                    }
+                }
+            }
+        }
         PanelTarget::Task(ref task_id) => {
             let now = now_ms();
             let task = state.rail.task(task_id);

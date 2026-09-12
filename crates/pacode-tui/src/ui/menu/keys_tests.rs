@@ -58,7 +58,10 @@ fn scope_sections_cover_every_action_in_order() {
         })
         .collect();
     // `menu` has no rebindable actions — its section is not drawn.
-    assert_eq!(sections, ["[global]", "[prompt]", "[rail]", "[panel]"]);
+    assert_eq!(
+        sections,
+        ["[global]", "[prompt]", "[rail]", "[panel]", "[picker]"]
+    );
 
     // Every action produces exactly one selectable row under its scope.
     let seen: Vec<String> = view

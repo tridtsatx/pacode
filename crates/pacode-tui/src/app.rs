@@ -82,6 +82,20 @@ enum BgResponse {
         path: String,
         diff: pacode_vcs::FileDiff,
     },
+    /// `Request::GitShow` finished (§5.10). Carries the request's hash so a
+    /// `Reply::Error` — which names no commit — still lands on the right row:
+    /// a hover-driven fetch must not spam the transcript, it folds into the
+    /// detail slot instead.
+    GitShowReady {
+        hash: String,
+        res: Result<Reply, pacode_client::ClientError>,
+    },
+    /// `Request::GitDiff` finished — the commit-diff panel's payload, keyed
+    /// by the request's hash for the same reason as [`Self::GitShowReady`].
+    GitDiffReady {
+        hash: String,
+        res: Result<Reply, pacode_client::ClientError>,
+    },
     /// The Background level's output-tail read finished (§5.9): the last ≤
     /// `ui::menu::background::TAIL_CAP_BYTES` of the task's spool file, read
     /// on a blocking thread — never in the draw path (§8.1).
@@ -353,8 +367,11 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
 
         // Deferred work the draw path recorded: completion scans, image
         // renders, the stashed clipboard copy — all of it runs on blocking
-        // threads, replies land back through `bg_rx` (§8.1).
-        dispatch_deferred(&mut state, &bg_tx);
+        // threads, replies land back through `bg_rx` (§8.1). Daemon-bound
+        // wants come back as actions and go through `dispatch_action`.
+        for act in dispatch_deferred(&mut state, &bg_tx) {
+            dispatch_action(act, &mut state, &client, &bg_tx);
+        }
 
         if state.quit {
             break;
@@ -698,16 +715,16 @@ fn dispatch_action(
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
-                let res = cl.request(Request::GitShow { hash }).await;
-                let _ = tx.send(BgResponse::Reply { kind: None, res });
+                let res = cl.request(Request::GitShow { hash: hash.clone() }).await;
+                let _ = tx.send(BgResponse::GitShowReady { hash, res });
             });
         }
         Action::GitDiff { hash } => {
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
-                let res = cl.request(Request::GitDiff { hash }).await;
-                let _ = tx.send(BgResponse::Reply { kind: None, res });
+                let res = cl.request(Request::GitDiff { hash: hash.clone() }).await;
+                let _ = tx.send(BgResponse::GitDiffReady { hash, res });
             });
         }
         Action::LoadPanel => {
@@ -725,9 +742,12 @@ fn dispatch_action(
                         task: id.clone(),
                         tail_lines: 300,
                     }),
-                    // The MCP log and the file diff are produced locally —
-                    // no daemon request stands behind either target.
-                    PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. } => None,
+                    // The MCP log and the file diff are produced locally; the
+                    // commit diff was already requested by the Git level's
+                    // `enter` — `LoadPanel` fires for neither.
+                    PanelTarget::McpServer(_)
+                    | PanelTarget::FileDiff { .. }
+                    | PanelTarget::CommitDiff { .. } => None,
                 };
                 if let Some(request) = request {
                     let cl = Arc::clone(client);
@@ -766,7 +786,12 @@ fn dispatch_action(
 /// Service the work items the draw path recorded this pass: completion scans,
 /// image preview/thumbnail renders, the stashed clipboard copy. Everything
 /// lands on `spawn_blocking` — the frame path itself stays clean (§8.1).
-fn dispatch_deferred(state: &mut AppState, bg_tx: &mpsc::UnboundedSender<BgResponse>) {
+/// Daemon-bound wants return as actions for `dispatch_action` instead — they
+/// share the request's bookkeeping (`begin_log`, `mark_sent`).
+fn dispatch_deferred(
+    state: &mut AppState,
+    bg_tx: &mpsc::UnboundedSender<BgResponse>,
+) -> Vec<Action> {
     if let Some(key) = state.input.at_comp.claim_want() {
         let tx = bg_tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -944,6 +969,53 @@ fn dispatch_deferred(state: &mut AppState, bg_tx: &mpsc::UnboundedSender<BgRespo
             });
         });
     }
+
+    // Git level (§5.10): the draw records what the cursor wants — the
+    // selected commit's `--stat` for the detail pane, and the next history
+    // page when the cursor sits on the last loaded row. Both go out as
+    // actions so `Action::GitLog`'s `begin_log`/`mark_sent` bookkeeping
+    // applies. A stale want (menu closed, another level on top) dies here
+    // rather than firing a fetch nobody sees.
+    let mut actions = Vec::new();
+    if git_view_on_screen(state) {
+        if let Some(hash) = state.git.show_want.clone()
+            && state.git.detail.as_ref().map(|d| &d.hash) != Some(&hash)
+            && state.git.show_in_flight.is_none()
+        {
+            state.git.show_in_flight = Some(hash.clone());
+            actions.push(Action::GitShow { hash });
+        }
+        // A page that already failed on this `after` stays blocked while
+        // the want still names it — the cursor moving off (or a landed
+        // `apply_log`, which clears `more_failed`) is what re-arms it.
+        if state.git.more_want != state.git.more_failed {
+            state.git.more_failed = None;
+        }
+        if let Some(after) = state.git.more_want.clone()
+            && state.git.has_more
+            && !state.git.loading
+            && state.git.more_failed.as_deref() != Some(after.as_str())
+        {
+            actions.push(Action::GitLog { after: Some(after) });
+        }
+    } else {
+        state.git.show_want = None;
+        state.git.more_want = None;
+        state.git.more_failed = None;
+    }
+    actions
+}
+
+/// Whether the `Git` menu level is on screen — gates the detail-stat and
+/// next-page wants (§5.10), like [`files_view_on_screen`] does for Files.
+fn git_view_on_screen(state: &AppState) -> bool {
+    matches!(
+        &state.focus,
+        crate::state::Focus::Overlay(crate::state::Overlay::Menu { stack, .. })
+            if stack
+                .current()
+                .is_some_and(|l| l.id == crate::ui::menu::MenuId::Git)
+    )
 }
 
 /// Whether a touched-files view is on screen: the legacy `Overlay::Files`
@@ -996,6 +1068,13 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             if let Some(kind) = kind {
                 let ok = matches!(&res, Ok(r) if !matches!(r, Reply::Error { .. }));
                 state.lists.on_reply(kind, ok);
+                // A failed `GitLog` never reaches `apply_log`, so its
+                // loading flags would stick — the menu would badge "loading"
+                // forever and the page want would never refire (§5.10).
+                if !ok && matches!(kind, crate::cache::ListKind::GitLog) {
+                    state.git.fail_log();
+                    state.dirty = true;
+                }
             }
             handle_reply(res, state)
         }
@@ -1030,6 +1109,31 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             at_version,
         } => {
             state.files.apply_statuses(statuses, at_version);
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::GitShowReady { hash, res } => {
+            match res {
+                Ok(Reply::GitShow { hash: h, stat }) => state.git.apply_show(h, stat),
+                // `Reply::Error` names no commit — the request's hash keys it.
+                Ok(Reply::Error { message }) => state.git.fail_show(hash, message),
+                Ok(_) => state.git.fail_show(hash, "unexpected reply".to_string()),
+                Err(e) => state.git.fail_show(hash, e.to_string()),
+            }
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::GitDiffReady { hash, res } => {
+            match res {
+                Ok(Reply::GitDiff {
+                    hash: h,
+                    patch,
+                    truncated,
+                }) => state.git.apply_diff(h, patch, truncated),
+                Ok(Reply::Error { message }) => state.git.fail_diff(hash, message),
+                Ok(_) => state.git.fail_diff(hash, "unexpected reply".to_string()),
+                Err(e) => state.git.fail_diff(hash, e.to_string()),
+            }
             state.dirty = true;
             vec![]
         }

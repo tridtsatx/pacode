@@ -97,6 +97,7 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
         | MenuId::Help
         | MenuId::Skills
         | MenuId::Git
+        | MenuId::GitBranches
         | MenuId::Plugins
         | MenuId::Mcp
         | MenuId::Keys
@@ -291,9 +292,10 @@ fn enter_row(
                 vec![]
             }
         },
-        MenuRow::Item { id, .. } | MenuRow::Toggle { id, .. } | MenuRow::Check { id, .. } => {
-            row_enter(state, stack, ui, view.id, id)
-        }
+        MenuRow::Item { id, .. }
+        | MenuRow::Toggle { id, .. }
+        | MenuRow::Check { id, .. }
+        | MenuRow::Rich { id, .. } => row_enter(state, stack, ui, view.id, id),
     }
 }
 
@@ -319,7 +321,9 @@ fn row_enter(
         MenuId::Background => menu::background::on_row(state, stack, ui, row),
         // `enter` here is the apply — the marked set, not the row (§5.7).
         MenuId::Import => menu::import::on_row(state, stack, ui, row),
-        MenuId::Skills | MenuId::Git => vec![],
+        MenuId::Git => menu::git::on_row(state, stack, ui, row),
+        MenuId::GitBranches => menu::git_branches::on_row(state, stack, ui, row),
+        MenuId::Skills => vec![],
     }
 }
 
@@ -363,7 +367,7 @@ fn declared_action<'a>(
 /// `ui/menu/<name>::on_action` decides what its `MenuAction`s do.
 fn menu_action(
     state: &mut AppState,
-    _stack: &mut MenuStack,
+    stack: &mut MenuStack,
     ui: &mut MenuUiState,
     menu: MenuId,
     action: &MenuAction,
@@ -377,7 +381,11 @@ fn menu_action(
         MenuId::Files => menu::files::on_action(state, ui, action, row),
         MenuId::Background => menu::background::on_action(state, ui, action, row),
         MenuId::Import => menu::import::on_action(state, ui, action, row),
-        MenuId::Root | MenuId::Help | MenuId::Sessions | MenuId::Skills | MenuId::Git => vec![],
+        // `ctrl+b` pushes a level — the stack is this hook's business (§5.10).
+        MenuId::Git => menu::git::on_action(state, stack, ui, action, row),
+        MenuId::Root | MenuId::Help | MenuId::Sessions | MenuId::Skills | MenuId::GitBranches => {
+            vec![]
+        }
     }
 }
 
@@ -482,7 +490,8 @@ fn edit_commit(
         | MenuId::Import
         | MenuId::Background
         | MenuId::Skills
-        | MenuId::Git => vec![],
+        | MenuId::Git
+        | MenuId::GitBranches => vec![],
     }
 }
 
@@ -514,7 +523,8 @@ fn capture_key(
         | MenuId::Help
         | MenuId::Background
         | MenuId::Skills
-        | MenuId::Git => vec![],
+        | MenuId::Git
+        | MenuId::GitBranches => vec![],
     }
 }
 

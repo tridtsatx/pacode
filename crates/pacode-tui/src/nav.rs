@@ -184,7 +184,11 @@ pub fn handle_follow(state: &mut AppState) -> Vec<Action> {
             };
         }
         Focus::Panel {
-            target: PanelTarget::Task(_) | PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. },
+            target:
+                PanelTarget::Task(_)
+                | PanelTarget::McpServer(_)
+                | PanelTarget::FileDiff { .. }
+                | PanelTarget::CommitDiff { .. },
             ..
         }
         | Focus::Normal
@@ -295,7 +299,9 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
         if matches!(
             state.focus,
             Focus::Panel {
-                target: PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. },
+                target: PanelTarget::McpServer(_)
+                    | PanelTarget::FileDiff { .. }
+                    | PanelTarget::CommitDiff { .. },
                 ..
             }
         ) {
@@ -371,7 +377,11 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::RailOverlay
             | KeyAction::ToggleZdr
             | KeyAction::Menu
-            | KeyAction::Help => {}
+            | KeyAction::Help
+            // Picker-scoped (§9.1): never reach the shared ladder — an open
+            // picker overlay swallows its keys before this dispatch.
+            | KeyAction::ModelPickerFavorite
+            | KeyAction::ModelPickerZdr => {}
         }
     } else {
         match action {
@@ -421,7 +431,9 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::RailOverlay
             | KeyAction::ToggleZdr
             | KeyAction::Menu
-            | KeyAction::Help => {}
+            | KeyAction::Help
+            | KeyAction::ModelPickerFavorite
+            | KeyAction::ModelPickerZdr => {}
         }
         if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
             && state.transcript.is_at_top()

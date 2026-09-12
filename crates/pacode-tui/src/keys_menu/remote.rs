@@ -25,6 +25,8 @@ pub(super) fn on_open(state: &mut AppState, id: MenuId) -> Vec<Action> {
         MenuId::Mcp => menu::mcp::on_open(state),
         MenuId::Sessions => menu::sessions::on_open(state),
         MenuId::Import => menu::import::on_open(state),
+        // Refresh-on-open: a `GitLog` that never landed refires here (§5.10).
+        MenuId::Git => menu::git::on_open(state),
         MenuId::Root
         | MenuId::Help
         | MenuId::Settings
@@ -32,7 +34,7 @@ pub(super) fn on_open(state: &mut AppState, id: MenuId) -> Vec<Action> {
         | MenuId::Files
         | MenuId::Background
         | MenuId::Skills
-        | MenuId::Git => vec![],
+        | MenuId::GitBranches => vec![],
     }
 }
 
@@ -52,7 +54,8 @@ fn remote_query(state: &AppState, id: MenuId, query: &str) -> Vec<Action> {
         | MenuId::Import
         | MenuId::Background
         | MenuId::Skills
-        | MenuId::Git => vec![],
+        | MenuId::Git
+        | MenuId::GitBranches => vec![],
     }
 }
 

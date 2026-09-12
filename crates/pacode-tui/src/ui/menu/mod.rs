@@ -14,7 +14,6 @@
 //! with `pub fn view(state: &AppState, ui: &MenuUiState) -> MenuView` and
 //! flips its [`has_provider`] arm (§3.1).
 
-mod git;
 mod layout;
 mod model;
 mod render;
@@ -27,6 +26,10 @@ mod view;
 // draw (preview want / tail want).
 pub(crate) mod background;
 pub(crate) mod files;
+// `pub(crate)`: `overlays`' draw records the level's wants and `keys_menu`
+// calls its `on_row`/`on_action`/`on_open` hooks — same contract as `files`.
+pub(crate) mod git;
+pub(crate) mod git_branches;
 pub(crate) mod help;
 pub(crate) mod import;
 pub(crate) mod keys;
@@ -44,7 +47,10 @@ pub use layout::{
     WIDTH_PERCENT, detail_panel_width, inner_height, overlay_area, overlay_width, resolve_window,
     row_height, shows_filter, shows_tabs, window_rows,
 };
-pub use model::{Detail, DetailLine, Mark, MenuRow, RowId, ValueKind, resolve_cursor, selectable};
+pub use model::{
+    Detail, DetailLine, LabelSpan, LabelTone, Mark, MenuRow, RowId, ValueKind, resolve_cursor,
+    selectable,
+};
 pub use render::{draw, hint_line};
 // `pub(crate)`: the MCP log panel's header reuses the row glyph table so a
 // server reads the same in the menu and in its log view.
@@ -65,6 +71,7 @@ pub fn has_provider(id: MenuId) -> bool {
         | MenuId::Help
         | MenuId::Skills
         | MenuId::Git
+        | MenuId::GitBranches
         | MenuId::Plugins
         | MenuId::Mcp
         | MenuId::Keys
@@ -88,6 +95,7 @@ pub fn view_for(stack: &MenuStack, state: &AppState, ui: &MenuUiState) -> MenuVi
         MenuId::Help => help::view(state, ui),
         MenuId::Skills => skills::view(state, ui),
         MenuId::Git => git::view(state, ui),
+        MenuId::GitBranches => git_branches::view(state, ui),
         MenuId::Plugins => plugins::view(state, ui),
         MenuId::Mcp => mcp::view(state, ui),
         MenuId::Keys => keys::view(state, ui),

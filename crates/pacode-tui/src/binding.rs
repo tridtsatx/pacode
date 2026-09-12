@@ -65,6 +65,10 @@ pub enum Action {
     Menu,
     /// Open the help menu — the `?` key on an empty prompt.
     Help,
+    /// Toggle `favorite` on the model picker's selected row (§9.1).
+    ModelPickerFavorite,
+    /// Toggle `zdr_capable` on the model picker's selected row (§9.1).
+    ModelPickerZdr,
 }
 
 /// The part of the UI a rebindable action applies to — the Keys menu groups
@@ -82,16 +86,21 @@ pub enum Scope {
     Rail,
     /// The bottom panel — agent transcript and task output.
     Panel,
+    /// The bottom pickers (model, theme, login…): their keys resolve only
+    /// while the picker overlay owns the keyboard, so a chord spelled like
+    /// a global one (`alt+f`) is not a conflict (§9.1).
+    Picker,
 }
 
 impl Scope {
     /// Display order for the Keys menu's section headers.
-    pub const ALL: [Scope; 5] = [
+    pub const ALL: [Scope; 6] = [
         Self::Global,
         Self::Prompt,
         Self::Menu,
         Self::Rail,
         Self::Panel,
+        Self::Picker,
     ];
 
     /// The section label — rendered `[global]`-style by the menu.
@@ -102,7 +111,24 @@ impl Scope {
             Self::Menu => "menu",
             Self::Rail => "rail",
             Self::Panel => "panel",
+            Self::Picker => "picker",
         }
+    }
+
+    /// Keys for this scope resolve through the shared `action_for` ladder in
+    /// `handle_key` (Normal/Panel focus) — everything but the overlay-local
+    /// scopes, whose keys live behind the overlay routing and never reach it.
+    fn on_global_ladder(self) -> bool {
+        matches!(self, Self::Global | Self::Prompt | Self::Rail | Self::Panel)
+    }
+
+    /// Whether two actions can compete for the same chord: identical scopes
+    /// always race, and any two scopes on the shared ladder shadow each
+    /// other regardless of their post-resolution gating. A picker chord and
+    /// a global chord spelled alike never meet — exactly one context is
+    /// live at a time.
+    pub fn overlaps(self, other: Scope) -> bool {
+        self == other || (self.on_global_ladder() && other.on_global_ladder())
     }
 }
 
@@ -157,6 +183,8 @@ impl Action {
             Self::ToggleZdr => "toggle_zdr",
             Self::Menu => "menu",
             Self::Help => "help",
+            Self::ModelPickerFavorite => "model_picker_favorite",
+            Self::ModelPickerZdr => "model_picker_zdr",
         }
     }
 
@@ -210,6 +238,8 @@ impl Action {
             Self::ToggleZdr => "Toggle ZDR mode",
             Self::Menu => "Open the menu hub",
             Self::Help => "Open help menu",
+            Self::ModelPickerFavorite => "Model picker: mark model as favorite",
+            Self::ModelPickerZdr => "Model picker: mark model ZDR-capable",
         }
     }
 
@@ -264,6 +294,7 @@ impl Action {
             | Self::SelectSession8
             | Self::SelectSession9 => Scope::Rail,
             Self::StopAgent | Self::KillTask => Scope::Panel,
+            Self::ModelPickerFavorite | Self::ModelPickerZdr => Scope::Picker,
         }
     }
 
@@ -505,6 +536,11 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("toggle_zdr", Action::ToggleZdr),
     ("menu", Action::Menu),
     ("help", Action::Help),
+    // Overlay-scoped actions sit last: `action_for` returns the first match,
+    // and a chord spelled like a global one (`alt+f`, `alt+z`) must keep
+    // resolving to its global owner in Normal focus (§9.1).
+    ("model_picker_favorite", Action::ModelPickerFavorite),
+    ("model_picker_zdr", Action::ModelPickerZdr),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -810,6 +846,35 @@ impl Keymap {
                 },
             ],
         );
+        // §9.1: the model picker's per-model marks live on modifier chords so
+        // letters always reach the query. alt is the primary spelling; the
+        // ctrl chords are the fallback for terminals that eat alt.
+        bindings.insert(
+            Action::ModelPickerFavorite,
+            vec![
+                Binding {
+                    code: KeyCode::Char('f'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('g'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        bindings.insert(
+            Action::ModelPickerZdr,
+            vec![
+                Binding {
+                    code: KeyCode::Char('z'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('y'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
 
         Self {
             bindings,
@@ -936,13 +1001,16 @@ impl Keymap {
     }
 
     /// Check if a proposed binding conflicts with another action's binding.
+    /// Only scopes that can resolve the same key event compete (§5.4): a
+    /// picker-local chord never races a global one, so `alt+f` on
+    /// `model_picker_favorite` does not collide with `files_overlay`.
     pub fn find_conflict(
         &self,
         candidate: &Binding,
         for_action: Action,
     ) -> Option<(&'static str, Action)> {
         for &(name, act) in Self::action_names() {
-            if act == for_action {
+            if act == for_action || !act.scope().overlaps(for_action.scope()) {
                 continue;
             }
             if let Some(bindings) = self.bindings.get(&act) {

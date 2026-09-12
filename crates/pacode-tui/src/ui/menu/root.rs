@@ -194,10 +194,15 @@ fn background_summary(state: &AppState) -> Option<String> {
     (n > 0).then(|| format!("{n} running"))
 }
 
+/// `N commits · branch` once history is loaded (§5.10); the bare branch
+/// while nothing is loaded yet, `None` outside a repo.
 fn git_summary(state: &AppState) -> Option<String> {
-    state
-        .meta
-        .as_ref()
-        .and_then(|m| m.git_branch.as_deref())
-        .map(str::to_string)
+    let n = state.git.commits.len();
+    let branch = state.meta.as_ref().and_then(|m| m.git_branch.as_deref());
+    match (n, branch) {
+        (0, None) => None,
+        (0, Some(b)) => Some(b.to_string()),
+        (n, Some(b)) => Some(format!("{n} commits · {b}")),
+        (n, None) => Some(format!("{n} commits")),
+    }
 }

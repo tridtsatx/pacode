@@ -60,13 +60,16 @@ pub enum MenuId {
     Help,
     Background,
     Git,
+    /// The refs collected from the loaded history — `ctrl+b` on the Git
+    /// level pushes it (§5.10); it never sits on the hub.
+    GitBranches,
     /// Plugin-shipped skill dirs — a hub section without a legacy overlay.
     Skills,
 }
 
 impl MenuId {
     /// All variants — the completeness check for derived tables.
-    pub const ALL: [MenuId; 12] = [
+    pub const ALL: [MenuId; 13] = [
         Self::Root,
         Self::Settings,
         Self::Plugins,
@@ -78,6 +81,7 @@ impl MenuId {
         Self::Help,
         Self::Background,
         Self::Git,
+        Self::GitBranches,
         Self::Skills,
     ];
 
@@ -95,6 +99,7 @@ impl MenuId {
             Self::Help => "Help",
             Self::Background => "Background",
             Self::Git => "Git",
+            Self::GitBranches => "Branches",
             Self::Skills => "Skills",
         }
     }
@@ -114,6 +119,7 @@ impl MenuId {
             Self::Help => "help",
             Self::Background => "background",
             Self::Git => "git",
+            Self::GitBranches => "gitbranches",
             Self::Skills => "skills",
         }
     }
@@ -134,6 +140,7 @@ impl MenuId {
             Self::Help => 33,
             Self::Background => 34,
             Self::Git => 35,
+            Self::GitBranches => 37,
             Self::Skills => 36,
         }
     }

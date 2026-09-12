@@ -2808,22 +2808,63 @@ fn model_info(provider: &str, model: &str) -> pacode_types::model::ModelInfo {
 }
 
 #[test]
-fn test_model_picker_z_s_toggle_flags_not_query() {
+fn test_model_picker_query_can_start_with_s() {
+    // §9.1: letters always reach the query — "sonnet" types out whole.
     let mut state = make_test_state();
     let now = Instant::now();
     let _tmp = isolate_prefs(&mut state);
     state.meta = Some(zdr_meta("m", false));
-    state.models = vec![model_info("p", "m")];
-    // Regular picker (zdr inactive): the full list is visible, so 'z' can
-    // bootstrap zdr_capable on a row — spec's marking flow.
+    state.models = vec![model_info("p", "sonnet"), model_info("p", "m")];
     state.focus = Focus::Overlay(Overlay::ModelPicker {
         query: String::new(),
         index: 0,
         for_zdr: false,
     });
 
-    let key_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
-    let actions = handle_key(&mut state, key_z, now);
+    for (i, c) in "sonnet".chars().enumerate() {
+        let actions = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            now,
+        );
+        assert!(
+            actions.is_empty(),
+            "letter '{c}' must type, not toggle: {actions:?}"
+        );
+        let typed: String = "sonnet".chars().take(i + 1).collect();
+        assert_eq!(
+            state.focus,
+            Focus::Overlay(Overlay::ModelPicker {
+                query: typed.clone(),
+                index: 0,
+                for_zdr: false,
+            }),
+            "after '{typed}'"
+        );
+    }
+    assert!(
+        state.model_flags.is_empty(),
+        "plain letters never touch the marks"
+    );
+}
+
+#[test]
+fn test_model_picker_mark_chords_toggle_flags() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", false));
+    state.models = vec![model_info("p", "m")];
+    // Regular picker (zdr inactive): the full list is visible, so the ZDR
+    // chord can bootstrap zdr_capable on a row — spec's marking flow.
+    state.focus = Focus::Overlay(Overlay::ModelPicker {
+        query: String::new(),
+        index: 0,
+        for_zdr: false,
+    });
+
+    let alt_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_z, now);
     assert!(
         actions.iter().any(|a| matches!(
             a,
@@ -2839,16 +2880,16 @@ fn test_model_picker_z_s_toggle_flags_not_query() {
             index: 0,
             for_zdr: false,
         }),
-        "'z' must not leak into the query"
+        "alt+z must not leak into the query"
     );
     assert!(
         state.model_flags.get("p/m").is_some_and(|f| f.zdr_capable),
         "state.model_flags must reflect the toggle"
     );
 
-    // 's' toggles favorite the same way.
-    let key_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
-    let actions = handle_key(&mut state, key_s, now);
+    // alt+f toggles favorite the same way.
+    let alt_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_f, now);
     assert!(
         actions.iter().any(|a| matches!(
             a,
@@ -2856,6 +2897,28 @@ fn test_model_picker_z_s_toggle_flags_not_query() {
                 if model == "p/m" && flags.favorite && flags.zdr_capable
         )),
         "expected SetModelFlag favorite, got {actions:?}"
+    );
+
+    // The ctrl fallbacks hit the same flags (alt-eating terminals).
+    let ctrl_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_y, now);
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::Send(Request::SetModelFlag { model, flags })
+                if model == "p/m" && !flags.zdr_capable && flags.favorite
+        )),
+        "ctrl+y must toggle zdr_capable back off, got {actions:?}"
+    );
+    let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_g, now);
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::Send(Request::SetModelFlag { model, flags })
+                if model == "p/m" && !flags.favorite
+        )),
+        "ctrl+g must toggle favorite back off, got {actions:?}"
     );
 
     // Enter picks the row: only SetModel (for_zdr is false).
@@ -2868,6 +2931,66 @@ fn test_model_picker_z_s_toggle_flags_not_query() {
     );
     assert!(state.meta.as_ref().is_some_and(|m| !m.zdr));
     assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_model_picker_mark_chords_work_mid_query_and_rebind() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let _tmp = isolate_prefs(&mut state);
+    state.meta = Some(zdr_meta("m", false));
+    state.models = vec![model_info("p", "sonnet")];
+    state.focus = Focus::Overlay(Overlay::ModelPicker {
+        query: "son".to_string(),
+        index: 0,
+        for_zdr: false,
+    });
+
+    // Marks fire on the filtered row even after typing (§9.1).
+    let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_g, now);
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::Send(Request::SetModelFlag { model, flags })
+                if model == "p/sonnet" && flags.favorite
+        )),
+        "expected SetModelFlag favorite on the filtered row, got {actions:?}"
+    );
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModelPicker {
+            query: "son".to_string(),
+            index: 0,
+            for_zdr: false,
+        }),
+        "the mark chord must not touch the query"
+    );
+
+    // A rebind through the keymap moves the mark: the new chord toggles,
+    // the old factory chords stop firing for this action.
+    state.keymap.set_bindings(
+        crate::binding::Action::ModelPickerFavorite,
+        vec![crate::binding::Binding {
+            code: KeyCode::Char('m'),
+            mods: KeyModifiers::CONTROL,
+        }],
+    );
+    let actions = handle_key(&mut state, ctrl_g, now);
+    assert!(
+        actions.is_empty(),
+        "the unbound fallback must go quiet, got {actions:?}"
+    );
+    let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_m, now);
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::Send(Request::SetModelFlag { model, flags })
+                if model == "p/sonnet" && !flags.favorite
+        )),
+        "the rebound chord must toggle, got {actions:?}"
+    );
 }
 
 #[test]
@@ -2907,13 +3030,13 @@ fn test_model_picker_for_zdr_enter_sends_setmodel_then_setzdr() {
 }
 
 #[test]
-fn test_model_picker_z_s_type_into_nonempty_query() {
+fn test_model_picker_z_s_always_type_into_query() {
+    // §9.1: 'z'/'s' are search text in every query state, not flag toggles.
     let mut state = make_test_state();
     let now = Instant::now();
     let _tmp = isolate_prefs(&mut state);
     state.meta = Some(zdr_meta("m", false));
     state.models = vec![model_info("p", "m")];
-    // With a query already typed, 'z'/'s' are search text, not flag toggles.
     state.focus = Focus::Overlay(Overlay::ModelPicker {
         query: "mi".to_string(),
         index: 0,
@@ -2930,6 +3053,18 @@ fn test_model_picker_z_s_type_into_nonempty_query() {
         state.focus,
         Focus::Overlay(Overlay::ModelPicker {
             query: "miz".to_string(),
+            index: 0,
+            for_zdr: false,
+        })
+    );
+
+    let key_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, key_s, now);
+    assert!(actions.is_empty() && state.model_flags.is_empty());
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::ModelPicker {
+            query: "mizs".to_string(),
             index: 0,
             for_zdr: false,
         })
@@ -2957,13 +3092,17 @@ fn test_model_picker_z_refuses_unmarking_active_route_under_zdr() {
     });
 
     // The daemon would reject stripping the active route's flag; the picker
-    // refuses locally so state can't diverge.
-    let key_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
-    let actions = handle_key(&mut state, key_z, now);
-    assert!(
-        actions.is_empty(),
-        "unmark must be refused, got {actions:?}"
-    );
+    // refuses locally so state can't diverge. Both spellings of the mark.
+    for key in [
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+    ] {
+        let actions = handle_key(&mut state, key, now);
+        assert!(
+            actions.is_empty(),
+            "unmark must be refused for {key:?}, got {actions:?}"
+        );
+    }
     assert!(
         state.model_flags.get("p/m").is_some_and(|f| f.zdr_capable),
         "flag must survive the refused toggle"

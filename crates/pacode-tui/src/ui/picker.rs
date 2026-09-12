@@ -383,12 +383,32 @@ fn draw_model(
         lines.push(Line::default());
     }
 
-    let hint = if state.config.ui.ascii_only {
-        "^/v select . enter confirm . z zdr . s fav . esc cancel"
-    } else {
-        "↑/↓ select · enter confirm · z zdr · s fav · esc cancel"
-    };
-    lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
+    // §9.1: the mark chips are generated from the live keymap — a rebound
+    // chord shows its own spelling, an unbound action drops out entirely.
+    let sep = opts.glyphs.dot_sep;
+    let arrows = if opts.glyphs.ascii { "^/v" } else { "↑/↓" };
+    let mut items = vec![format!("{arrows} select"), "enter confirm".to_string()];
+    for (action, label) in [
+        (crate::binding::Action::ModelPickerFavorite, "fav"),
+        (crate::binding::Action::ModelPickerZdr, "zdr"),
+    ] {
+        let chords = state
+            .keymap
+            .bindings_for(action)
+            .iter()
+            .map(crate::binding::format_binding)
+            .collect::<Vec<_>>()
+            .join("/");
+        if !chords.is_empty() {
+            items.push(format!("{chords} {label}"));
+        }
+    }
+    items.push("esc cancel".to_string());
+    let hint = items.join(sep);
+    lines.push(Line::from(Span::styled(
+        pacode_render::truncate_to_width(&hint, area.width as usize, true),
+        opts.theme.dim,
+    )));
 
     frame.render_widget(Paragraph::new(lines), area);
 

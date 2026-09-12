@@ -282,6 +282,13 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                 .unwrap_or("task"),
                             PanelTarget::McpServer(name) => name.as_str(),
                             PanelTarget::FileDiff { path } => path.as_str(),
+                            PanelTarget::CommitDiff { hash } => state
+                                .git
+                                .commits
+                                .iter()
+                                .find(|c| c.hash == *hash)
+                                .map(|c| c.short.as_str())
+                                .unwrap_or(hash.as_str()),
                         };
                         if *follow {
                             let main_id = pacode_types::AgentId::main();
@@ -289,7 +296,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                 PanelTarget::Agent(id) => id,
                                 PanelTarget::Task(_)
                                 | PanelTarget::McpServer(_)
-                                | PanelTarget::FileDiff { .. } => &main_id,
+                                | PanelTarget::FileDiff { .. }
+                                | PanelTarget::CommitDiff { .. } => &main_id,
                             };
                             let dur = state
                                 .rail
@@ -309,9 +317,9 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                             // A log view has no agent to follow or stop —
                             // it only scrolls.
                             let hints = match target {
-                                PanelTarget::McpServer(_) | PanelTarget::FileDiff { .. } => {
-                                    "esc back · scroll pages"
-                                }
+                                PanelTarget::McpServer(_)
+                                | PanelTarget::FileDiff { .. }
+                                | PanelTarget::CommitDiff { .. } => "esc back · scroll pages",
                                 PanelTarget::Agent(_) | PanelTarget::Task(_) => {
                                     "esc back · alt+b follow · s stop"
                                 }

@@ -45,7 +45,8 @@ fn section_labels(view: &MenuView) -> Vec<String> {
             | MenuRow::Toggle { .. }
             | MenuRow::Value { .. }
             | MenuRow::Submenu { .. }
-            | MenuRow::Check { .. } => None,
+            | MenuRow::Check { .. }
+            | MenuRow::Rich { .. } => None,
         })
         .collect()
 }

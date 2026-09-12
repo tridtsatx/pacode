@@ -54,6 +54,21 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             } else {
                 None
             };
+            // Git level (§5.10): the selected commit's `--stat` want (only
+            // where the detail pane is wide enough to show it) and the
+            // end-of-list page trigger. `dispatch_deferred` turns them into
+            // `Action::GitShow` / `Action::GitLog`.
+            let (show_want, more_want) = if view.id == crate::ui::menu::MenuId::Git {
+                let inner_w = crate::ui::menu::overlay_area(dialog_area, &view, ui)
+                    .width
+                    .saturating_sub(2);
+                let detail_wide = crate::ui::menu::detail_panel_width(inner_w).is_some();
+                crate::ui::menu::git::wants(state, &view, ui, detail_wide)
+            } else {
+                (None, None)
+            };
+            state.git.show_want = show_want;
+            state.git.more_want = more_want;
             crate::ui::menu::draw(frame, dialog_area, &view, ui, opts);
         }
         return;

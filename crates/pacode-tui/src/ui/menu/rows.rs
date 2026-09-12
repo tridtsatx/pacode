@@ -9,13 +9,13 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use pacode_render::{RenderOptions, display_width, truncate_to_width};
+use pacode_render::{RenderOptions, display_width, truncate_spans, truncate_to_width};
 
 use crate::binding::format_binding;
 use crate::ui::overlays::selected_row;
 
 use super::layout::{COLLAPSED_DETAIL_LINES, detail_panel_width, resolve_window, row_height};
-use super::model::{Detail, DetailLine, Mark, MenuRow, resolve_cursor};
+use super::model::{Detail, DetailLine, LabelTone, Mark, MenuRow, resolve_cursor};
 use super::view::{MenuAction, MenuMode, MenuUiState, MenuView, is_base_key};
 
 /// The list zone — with the detail panel split off to the right once the inner
@@ -169,7 +169,7 @@ fn main_line(
     let pointer_span = || Span::styled(format!("{pointer} "), opts.theme.accent);
 
     let mut prefix: Vec<Span<'static>> = Vec::new();
-    let label: (String, Style);
+    let label: Vec<Span<'static>>;
     let right: Option<(String, Style)>;
     match row {
         MenuRow::Section {
@@ -178,7 +178,10 @@ fn main_line(
         } => {
             // No pointer column: a section is a header, not a row.
             prefix.push(Span::raw("  "));
-            label = (text.clone(), opts.theme.accent.patch(opts.theme.bold));
+            label = vec![Span::styled(
+                text.clone(),
+                opts.theme.accent.patch(opts.theme.bold),
+            )];
             right = tail.clone().map(|t| (t, opts.theme.faint));
         }
         MenuRow::Item {
@@ -191,7 +194,23 @@ fn main_line(
             if let Some((glyph, style)) = mark_glyph(*mark, opts) {
                 prefix.push(Span::styled(format!("{glyph} "), style));
             }
-            label = (text.clone(), label_style);
+            label = vec![Span::styled(text.clone(), label_style)];
+            right = tail.clone().map(|t| (t, opts.theme.dim));
+        }
+        MenuRow::Rich {
+            mark,
+            spans,
+            right: tail,
+            ..
+        } => {
+            prefix.push(pointer_span());
+            if let Some((glyph, style)) = mark_glyph(*mark, opts) {
+                prefix.push(Span::styled(format!("{glyph} "), style));
+            }
+            label = spans
+                .iter()
+                .map(|s| Span::styled(s.text.clone(), tone_style(s.tone, is_sel, opts)))
+                .collect();
             right = tail.clone().map(|t| (t, opts.theme.dim));
         }
         MenuRow::Toggle {
@@ -201,7 +220,7 @@ fn main_line(
             ..
         } => {
             prefix.push(pointer_span());
-            label = (text.clone(), label_style);
+            label = vec![Span::styled(text.clone(), label_style)];
             let word = if *on { "on" } else { "off" };
             let text = if *modified {
                 format!("{word} *")
@@ -222,7 +241,7 @@ fn main_line(
             ..
         } => {
             prefix.push(pointer_span());
-            label = (text.clone(), label_style);
+            label = vec![Span::styled(text.clone(), label_style)];
             right = Some(match edit {
                 Some(buf) => (
                     format!("[ {buf} ]"),
@@ -249,7 +268,7 @@ fn main_line(
             ..
         } => {
             prefix.push(pointer_span());
-            label = (text.clone(), label_style);
+            label = vec![Span::styled(text.clone(), label_style)];
             // The `›` tail marks a row that descends into another menu.
             let marker = if opts.glyphs.ascii { ">" } else { "›" };
             let text = match tail {
@@ -271,7 +290,7 @@ fn main_line(
                 (opts.glyphs.check_pending, opts.theme.dim)
             };
             prefix.push(Span::styled(format!("{glyph} "), style));
-            label = (text.clone(), label_style);
+            label = vec![Span::styled(text.clone(), label_style)];
             right = warn.clone().map(|t| {
                 let sign = if opts.glyphs.ascii { "!" } else { "⚠" };
                 (format!("{sign} {t}"), opts.theme.yellow)
@@ -280,21 +299,48 @@ fn main_line(
     }
 
     // Fit: truncate the label so the right tail keeps its flush-right edge.
+    // `truncate_spans` cuts across styled pieces — a `Rich` row keeps its
+    // per-span colours right up to the `…` mark.
     let prefix_w: usize = prefix.iter().map(|s| display_width(&s.content)).sum();
     let right_w = right.as_ref().map_or(0, |(t, _)| display_width(t));
     let gap = usize::from(right.is_some());
     let label_budget = w.saturating_sub(prefix_w + right_w + gap);
-    let label_shown = truncate_to_width(&label.0, label_budget, opts.glyphs.ascii);
-    let label_w = display_width(&label_shown);
+    let ellipsis = if opts.glyphs.ascii { "..." } else { "…" };
+    let label_shown = truncate_spans(&label, label_budget, ellipsis);
+    let label_w: usize = label_shown.iter().map(|s| display_width(&s.content)).sum();
 
     let mut spans = prefix;
-    spans.push(Span::styled(label_shown, label.1));
+    spans.extend(label_shown);
     if let Some((text, style)) = right {
         let pad = w.saturating_sub(prefix_w + label_w + right_w);
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(text, style));
     }
     Line::from(spans)
+}
+
+/// Theme style for a [`super::model::LabelSpan`] tone: `Text` follows the
+/// row's own label rule (bold while selected), the rest are fixed slots.
+fn tone_style(tone: LabelTone, is_sel: bool, opts: &RenderOptions) -> Style {
+    match tone {
+        LabelTone::Text => row_label_style(is_sel, opts),
+        LabelTone::Dim => opts.theme.dim,
+        LabelTone::Faint => opts.theme.faint,
+        LabelTone::Accent => opts.theme.accent,
+        LabelTone::Green => opts.theme.green,
+        LabelTone::Cyan => opts.theme.cyan,
+        LabelTone::Violet => opts.theme.violet,
+        LabelTone::Yellow => opts.theme.yellow,
+        LabelTone::Red => opts.theme.red,
+    }
+}
+
+fn row_label_style(is_sel: bool, opts: &RenderOptions) -> Style {
+    if is_sel {
+        opts.theme.bold
+    } else {
+        opts.theme.fg
+    }
 }
 
 /// Glyph + style for a row mark; `Mark::None` renders nothing at all.

@@ -79,6 +79,41 @@ pub enum Mark {
     Stopped,
 }
 
+/// A piece of a [`MenuRow::Rich`] label: text plus a semantic tone the
+/// renderer resolves against the theme. Providers never see `RenderOptions`,
+/// so colour intent travels as data (§5.10's per-kind ref badges).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelSpan {
+    pub text: String,
+    pub tone: LabelTone,
+}
+
+impl LabelSpan {
+    pub fn new(text: impl Into<String>, tone: LabelTone) -> Self {
+        Self {
+            text: text.into(),
+            tone,
+        }
+    }
+}
+
+/// Semantic colour of a [`LabelSpan`]; `rows::main_line` maps it onto
+/// `opts.theme` — `Text` is the row's own label style (bold while selected),
+/// the rest are fixed theme slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LabelTone {
+    #[default]
+    Text,
+    Dim,
+    Faint,
+    Accent,
+    Green,
+    Cyan,
+    Violet,
+    Yellow,
+    Red,
+}
+
 /// The editing contract of a `Value` row (§3.1: enum/int/float/string).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValueKind {
@@ -184,6 +219,17 @@ pub enum MenuRow {
         warn: Option<String>,
         detail: Detail,
     },
+    /// An `Item` whose label is pre-segmented [`LabelSpan`]s — the Git
+    /// history row paints its lane graph, ref badges and subject in their
+    /// own tones (§5.10). Filtering matches each span's text plus the right
+    /// tail and the detail's `search` terms.
+    Rich {
+        id: RowId,
+        mark: Mark,
+        spans: Vec<LabelSpan>,
+        right: Option<String>,
+        detail: Detail,
+    },
 }
 
 impl MenuRow {
@@ -203,7 +249,8 @@ impl MenuRow {
             | Self::Toggle { id, .. }
             | Self::Value { id, .. }
             | Self::Submenu { id, .. }
-            | Self::Check { id, .. } => Some(id),
+            | Self::Check { id, .. }
+            | Self::Rich { id, .. } => Some(id),
         }
     }
 
@@ -214,7 +261,8 @@ impl MenuRow {
             Self::Item { detail, .. }
             | Self::Toggle { detail, .. }
             | Self::Value { detail, .. }
-            | Self::Check { detail, .. } => Some(detail),
+            | Self::Check { detail, .. }
+            | Self::Rich { detail, .. } => Some(detail),
             Self::Section { .. } | Self::Submenu { .. } => None,
         }
     }
@@ -232,14 +280,23 @@ impl MenuRow {
         let (label, right) = match self {
             Self::Section { .. } => return false,
             Self::Item { label, right, .. } | Self::Submenu { label, right, .. } => {
-                (label, right.as_deref())
+                (Some(label.as_str()), right.as_deref())
             }
-            Self::Toggle { label, .. } => (label, None),
-            Self::Value { label, value, .. } => (label, Some(value.as_str())),
-            Self::Check { label, .. } => (label, None),
+            Self::Toggle { label, .. } => (Some(label.as_str()), None),
+            Self::Value { label, value, .. } => (Some(label.as_str()), Some(value.as_str())),
+            Self::Check { label, .. } => (Some(label.as_str()), None),
+            // The spans are the label — a hit inside any piece counts. A
+            // query spanning a span boundary misses; the `search` terms
+            // cover the fields that are not on the row at all (full hash).
+            Self::Rich { right, .. } => (None, right.as_deref()),
         };
         let hit = |s: &str| s.to_lowercase().contains(query_lower);
-        hit(label)
+        let span_hit = match self {
+            Self::Rich { spans, .. } => spans.iter().any(|s| hit(&s.text)),
+            _ => false,
+        };
+        label.is_some_and(hit)
+            || span_hit
             || right.is_some_and(hit)
             || self
                 .detail()

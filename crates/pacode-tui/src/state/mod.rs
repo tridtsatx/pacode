@@ -148,6 +148,12 @@ pub enum PanelTarget {
     FileDiff {
         path: String,
     },
+    /// The Git level's `enter` (§5.10): one commit's patch. `Request::GitDiff`
+    /// flies the moment the row opens (not via `LoadPanel`); the reply lands
+    /// in `state.git.diff`, keyed by hash.
+    CommitDiff {
+        hash: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1212,7 +1218,8 @@ impl AppState {
                     PanelTarget::Agent(id) => self.rail.agent(id),
                     PanelTarget::Task(_)
                     | PanelTarget::McpServer(_)
-                    | PanelTarget::FileDiff { .. } => None,
+                    | PanelTarget::FileDiff { .. }
+                    | PanelTarget::CommitDiff { .. } => None,
                 })
                 .is_some_and(|a| a.status.is_active()),
         }

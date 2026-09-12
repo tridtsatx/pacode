@@ -25,6 +25,89 @@ fn is_overlay_down(key: &KeyEvent) -> bool {
     is_next(key) || key.code == KeyCode::Char('j')
 }
 
+/// Whether `key` matches any chord currently bound to `action`. The pickers
+/// look their own actions up directly instead of `Keymap::action_for`:
+/// that resolver scans every scope and a global action spelled with the
+/// same chord (`files_overlay` on `alt+f`) would win the shared entry (§9.1).
+fn keymap_has(
+    keymap: &crate::binding::Keymap,
+    action: crate::binding::Action,
+    key: KeyEvent,
+) -> bool {
+    keymap
+        .bindings_for(action)
+        .iter()
+        .any(|b| crate::binding::matches_key(b, key))
+}
+
+/// The per-model flag a mark key toggles in the model picker (§9.1).
+#[derive(Clone, Copy)]
+enum ModelMark {
+    Zdr,
+    Favorite,
+}
+
+/// Toggle `mark` on the filtered row at `index`, persist it, and send
+/// `SetModelFlag` so the daemon enforces the same flag server-side. The ZDR
+/// gate mirrors the daemon's: the active route cannot lose its mark while
+/// ZDR is on.
+fn toggle_model_mark(
+    state: &mut AppState,
+    index: usize,
+    q_lower: &str,
+    zdr_only: bool,
+    mark: ModelMark,
+) -> Vec<Action> {
+    let route_key = {
+        let rows =
+            crate::state::picker_models(&state.models, &state.model_flags, q_lower, zdr_only);
+        rows.get(index).map(|m| m.route.to_string())
+    };
+    let Some(route_key) = route_key else {
+        return vec![];
+    };
+    let mut flags = state
+        .model_flags
+        .get(&route_key)
+        .copied()
+        .unwrap_or_default();
+    match mark {
+        ModelMark::Zdr => {
+            // The daemon refuses to unmark the active route while ZDR is
+            // on; gate here so the local flags don't diverge from what it
+            // enforces.
+            let active_route = state
+                .meta
+                .as_ref()
+                .is_some_and(|m| m.model.to_string() == route_key);
+            if flags.zdr_capable
+                && active_route
+                && crate::state::zdr_active(&state.config, state.meta.as_ref())
+            {
+                state.push_notice_with_level(
+                    pacode_types::ToastLevel::Warn,
+                    "can't unmark the active route while ZDR is on".to_string(),
+                );
+                return vec![];
+            }
+            flags.zdr_capable = !flags.zdr_capable;
+        }
+        ModelMark::Favorite => {
+            flags.favorite = !flags.favorite;
+        }
+    }
+    if flags == pacode_types::ModelFlags::default() {
+        state.model_flags.remove(&route_key);
+    } else {
+        state.model_flags.insert(route_key.clone(), flags);
+    }
+    state.save_pref_model_flags();
+    vec![Action::Send(Request::SetModelFlag {
+        model: route_key,
+        flags,
+    })]
+}
+
 pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     let prev_overlay = match &state.focus {
         Focus::Overlay(o) => Some(crate::nav::overlay_name(o)),
@@ -214,6 +297,26 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 return vec![];
             }
 
+            // §9.1: the per-model marks live on modifier chords from the key
+            // registry — `alt+f` favorite / `alt+z` ZDR, with `ctrl+g` /
+            // `ctrl+y` as the fallback for terminals that eat alt. Letters
+            // always reach the query, so a search can start with `s`.
+            let mark = if keymap_has(&state.keymap, crate::binding::Action::ModelPickerZdr, key) {
+                Some(ModelMark::Zdr)
+            } else if keymap_has(
+                &state.keymap,
+                crate::binding::Action::ModelPickerFavorite,
+                key,
+            ) {
+                Some(ModelMark::Favorite)
+            } else {
+                None
+            };
+            if let Some(mark) = mark {
+                let row = *index;
+                return toggle_model_mark(state, row, &q_lower, zdr_only, mark);
+            }
+
             match key.code {
                 KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Enter => {
@@ -242,65 +345,6 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                             actions.push(Action::Send(Request::SetZdr(true)));
                         }
                         return actions;
-                    }
-                }
-                // `z`/`s` toggle per-model flags on the selected row and
-                // persist them (spec §3). Once a query is started the keys
-                // type into it instead, so searches like "mistral" work —
-                // the trade-off is a query can't begin with z/s.
-                KeyCode::Char(c @ ('z' | 's'))
-                    if query.is_empty()
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    let route_key = {
-                        let rows = crate::state::picker_models(
-                            &state.models,
-                            &state.model_flags,
-                            &q_lower,
-                            zdr_only,
-                        );
-                        rows.get(*index).map(|m| m.route.to_string())
-                    };
-                    if let Some(route_key) = route_key {
-                        let mut flags = state
-                            .model_flags
-                            .get(&route_key)
-                            .copied()
-                            .unwrap_or_default();
-                        if c == 'z' {
-                            // The daemon refuses to unmark the active route
-                            // while ZDR is on; gate here so the local flags
-                            // don't diverge from what it enforces.
-                            let active_route = state
-                                .meta
-                                .as_ref()
-                                .is_some_and(|m| m.model.to_string() == route_key);
-                            if flags.zdr_capable
-                                && active_route
-                                && crate::state::zdr_active(&state.config, state.meta.as_ref())
-                            {
-                                state.push_notice_with_level(
-                                    pacode_types::ToastLevel::Warn,
-                                    "can't unmark the active route while ZDR is on".to_string(),
-                                );
-                                return vec![];
-                            }
-                            flags.zdr_capable = !flags.zdr_capable;
-                        } else {
-                            flags.favorite = !flags.favorite;
-                        }
-                        if flags == pacode_types::ModelFlags::default() {
-                            state.model_flags.remove(&route_key);
-                        } else {
-                            state.model_flags.insert(route_key.clone(), flags);
-                        }
-                        state.save_pref_model_flags();
-                        return vec![Action::Send(Request::SetModelFlag {
-                            model: route_key,
-                            flags,
-                        })];
                     }
                 }
                 KeyCode::Backspace => {
