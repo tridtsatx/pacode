@@ -468,3 +468,43 @@ fn test_live_restart_classification_spot_checks() {
         ApplyMode::NextTurn
     );
 }
+
+#[test]
+fn value_origin_covers_default_global_and_env() {
+    let cfg = Config::default();
+
+    // Nothing overrides `ui.mouse` — the registry default is in effect.
+    let mouse = find_entry("ui.mouse").unwrap();
+    assert_eq!(value_origin(&cfg, mouse), Origin::Default);
+    assert_eq!(value_origin(&cfg, mouse).as_str(), "default");
+
+    // A value differing from the default came from the user config — the only
+    // settings file pacode has.
+    let mut overridden = cfg.clone();
+    overridden.ui.mouse = false;
+    assert_eq!(value_origin(&overridden, mouse), Origin::Global);
+
+    // An env-overridable key reports Env the moment its var is set — even
+    // when the file or the in-memory value agrees with the default.
+    let effort = find_entry("provider.effort").unwrap();
+    assert_eq!(
+        value_origin_with(&cfg, effort, |var| var == "PACODE_EFFORT"),
+        Origin::Env
+    );
+    // A var mapped to another key does not leak onto this one.
+    assert_eq!(
+        value_origin_with(&cfg, effort, |var| var == "PACODE_MODEL"),
+        Origin::Default
+    );
+    // Env wins over a file-set value.
+    let mut file_set = cfg.clone();
+    file_set.provider.effort = Effort::Max;
+    assert_eq!(
+        value_origin_with(&file_set, effort, |var| var == "PACODE_EFFORT"),
+        Origin::Env
+    );
+
+    // `Project` is reserved for a layer that does not exist yet — the variant
+    // is part of the contract even though nothing returns it.
+    assert_eq!(Origin::Project.as_str(), "project");
+}

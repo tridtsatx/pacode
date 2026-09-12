@@ -393,6 +393,68 @@ pub fn is_modified(config: &Config, entry: &SettingEntry) -> bool {
     read_value(config, entry.dotted_key).as_deref() != Some(entry.default_value)
 }
 
+/// Where a setting's effective value came from — the `origin` line of the
+/// Settings detail card (§5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Nothing overrides it — the registry `default_value` is in effect.
+    Default,
+    /// Set in the user config (`config.toml` or a split sibling).
+    Global,
+    /// Set by a project-level config. Reserved: pacode has no project config
+    /// layer yet, so nothing returns this today.
+    Project,
+    /// Forced by an environment variable (`PACODE_MODEL`, `PACODE_EFFORT`,
+    /// `PACODE_MODE`) — env wins over every file.
+    Env,
+}
+
+impl Origin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Env => "env",
+        }
+    }
+}
+
+/// The env var owning a dotted key, when the key is env-overridable — the same
+/// mapping `apply_env_overrides` applies on load.
+fn env_key(dotted_key: &str) -> Option<&'static str> {
+    match dotted_key {
+        "provider.default" => Some("PACODE_MODEL"),
+        "provider.effort" => Some("PACODE_EFFORT"),
+        "permissions.default_mode" => Some("PACODE_MODE"),
+        _ => None,
+    }
+}
+
+/// Where `entry`'s effective value came from (§5.1). A live env override wins
+/// over files; short of that, a value differing from the registry default must
+/// have come from the user config — the only settings file pacode has today.
+pub fn value_origin(config: &Config, entry: &SettingEntry) -> Origin {
+    value_origin_with(config, entry, |var| std::env::var_os(var).is_some())
+}
+
+/// [`value_origin`] with the environment injected — tests pass a lookup
+/// instead of touching the real process environment.
+fn value_origin_with(
+    config: &Config,
+    entry: &SettingEntry,
+    env_set: impl Fn(&str) -> bool,
+) -> Origin {
+    if env_key(entry.dotted_key).is_some_and(&env_set) {
+        return Origin::Env;
+    }
+    if is_modified(config, entry) {
+        Origin::Global
+    } else {
+        Origin::Default
+    }
+}
+
 pub fn validate_candidate(
     entry: &SettingEntry,
     candidate: &str,

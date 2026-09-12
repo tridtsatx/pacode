@@ -87,12 +87,18 @@ pub fn handle_paste_with_runner(
     // A menu accepts pasted text only where text input is live: an Edit-mode
     // buffer or a filter line (§3.2). It is checked before the match —
     // `view_for` needs a shared `&state`, which the `&mut` arm borrow blocks.
+    let mut menu_remote_ms = None;
     let menu_takes_paste = if let Focus::Overlay(Overlay::Menu { stack, ui }) = &state.focus {
         match &ui.mode {
             crate::ui::menu::MenuMode::Edit { .. } => true,
             _ => {
-                stack.current().is_some()
-                    && crate::ui::menu::shows_filter(&crate::ui::menu::view_for(stack, state, ui))
+                stack.current().is_some() && {
+                    let view = crate::ui::menu::view_for(stack, state, ui);
+                    if let Some(crate::ui::menu::FilterMode::Remote { debounce_ms }) = view.filter {
+                        menu_remote_ms = Some(debounce_ms);
+                    }
+                    crate::ui::menu::shows_filter(&view)
+                }
             }
         }
     } else {
@@ -143,6 +149,13 @@ pub fn handle_paste_with_runner(
                     let to_insert: String = flattened.chars().take(available).collect();
                     ui.query.push_str(&to_insert);
                     ui.cursor = crate::ui::menu::RowId::default();
+                    // A remote filter owes the daemon the pasted query — the
+                    // same debounce keystrokes arm (§3.2).
+                    if !to_insert.is_empty()
+                        && let Some(ms) = menu_remote_ms
+                    {
+                        ui.remote_at = Some(now + std::time::Duration::from_millis(ms));
+                    }
                 }
             }
             state.dirty = true;

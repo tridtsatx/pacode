@@ -60,6 +60,7 @@ fn conflicts_are_reported_for_actions_and_chips() {
         title: String::new(),
         lines: Vec::new(),
         actions: vec![MenuAction::new(plain(KeyCode::Esc), "close")],
+        search: Vec::new(),
     };
     let rows = vec![MenuRow::Check {
         id: RowId::from("c"),

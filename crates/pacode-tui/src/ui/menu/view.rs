@@ -257,6 +257,15 @@ pub struct MenuUiState {
     /// Active tab index.
     pub tab: usize,
     pub mode: MenuMode,
+    /// `FilterMode::Remote` debounce: while `Some`, the current level owes
+    /// the daemon a query send at this instant (§3.2). The event loop arms a
+    /// sleep on it; `keys_menu::remote_filter_due` is the fire.
+    pub remote_at: Option<std::time::Instant>,
+    /// The status line a key handler parked for the next frame (§3.2) — the
+    /// view is rebuilt every frame, so a commit failure's validation error
+    /// has to live here to reach the renderer. It disappears with its cause:
+    /// the next edit keystroke, `esc`, a successful commit or an action.
+    pub status: Option<StatusLine>,
 }
 
 /// What a submenu hands the base on every frame (§3.1). The provider is a

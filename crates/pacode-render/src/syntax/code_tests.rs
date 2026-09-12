@@ -1,4 +1,3 @@
-use super::*;
 use crate::syntax::{Lexer, TokenKind};
 
 fn parts(lang: crate::syntax::Lang, line: &str) -> Vec<(Option<TokenKind>, &str)> {
@@ -87,7 +86,7 @@ fn tsjs_sample() {
 #[test]
 fn tsjs_template_string_spans_lines() {
     let mut lx = Lexer::for_lang(crate::syntax::Lang::TypeScript);
-    let toks = lx.lex_line("let s = `start ${x}");
+    let _toks = lx.lex_line("let s = `start ${x}");
     assert!(lx.in_block());
     let toks = lx.lex_line("end` + y");
     assert!(!lx.in_block());

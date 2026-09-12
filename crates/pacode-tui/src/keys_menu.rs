@@ -21,6 +21,11 @@ use crate::ui::menu::{
     ValueKind, resolve_cursor, selectable, shows_filter, shows_tabs,
 };
 
+mod remote;
+
+use remote::{arm_remote, flush_remote, on_open, tab_follow_up};
+pub(crate) use remote::{remote_deadline, remote_filter_due};
+
 #[cfg(test)]
 #[path = "keys_menu_tests.rs"]
 mod keys_menu_tests;
@@ -40,7 +45,7 @@ pub fn open(state: &mut AppState, id: MenuId) -> Vec<Action> {
             ui: MenuUiState::default(),
         });
         state.dirty = true;
-        vec![]
+        on_open(state, id)
     } else {
         open_legacy(state, id)
     }
@@ -85,47 +90,6 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
     log::debug!("open menu→legacy: {}", id.slug());
     state.dirty = true;
     match id {
-        MenuId::Settings => {
-            state.config_view = crate::ui::config_view::ConfigViewState::new(&state.config);
-            state.focus = Focus::Overlay(Overlay::ConfigPicker);
-            vec![]
-        }
-        MenuId::Plugins => {
-            let market_source = state.config.plugins.marketplace.clone();
-            let has_market = !market_source.is_empty();
-            // §8.2: open on the cached copies — `lists` carries the refresh's
-            // progress; `stale` mirrors the daemon-reported flag on the reply.
-            state.focus = Focus::Overlay(Overlay::PluginsPicker {
-                index: 0,
-                plugins: state.plugins.clone(),
-                tab: crate::state::PluginsTab::Installed,
-                market: state.marketplace.clone(),
-                query: String::new(),
-                loading: has_market,
-                stale: matches!(
-                    state.lists.badge(crate::cache::ListKind::Marketplace),
-                    Some(crate::cache::Badge::OfflineCopy)
-                ),
-            });
-            let mut actions = vec![Action::Send(Request::ListPlugins)];
-            if has_market {
-                actions.push(Action::Send(Request::BrowseMarketplace {
-                    source: market_source,
-                    query: String::new(),
-                }));
-            }
-            actions
-        }
-        MenuId::Mcp => {
-            // §8.2: the cached server list is on screen immediately; the
-            // `loading…`/`offline copy` badge comes from `lists`.
-            state.focus = Focus::Overlay(Overlay::McpPicker {
-                index: 0,
-                servers: state.mcp_servers.clone(),
-                loading: true,
-            });
-            vec![Action::Send(Request::ListMcpServers)]
-        }
         MenuId::Keys => {
             state.focus = Focus::Overlay(Overlay::KeysPicker {
                 index: 0,
@@ -160,7 +124,13 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
         }
         // Providers exist for these (`has_provider` is true) — the bridge
         // never sees them; the arm keeps the match exhaustive.
-        MenuId::Root | MenuId::Help | MenuId::Skills | MenuId::Git => vec![],
+        MenuId::Root
+        | MenuId::Settings
+        | MenuId::Help
+        | MenuId::Skills
+        | MenuId::Git
+        | MenuId::Plugins
+        | MenuId::Mcp => vec![],
     }
 }
 
@@ -262,24 +232,27 @@ fn list_key_inner(
         // `Tab`+SHIFT).
         KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             tab_step(ui, view, 1);
-            vec![]
+            tab_follow_up(state, stack, ui)
         }
         KeyCode::BackTab | KeyCode::Tab => {
             tab_step(ui, view, -1);
-            vec![]
+            tab_follow_up(state, stack, ui)
         }
         KeyCode::Enter => enter_row(state, stack, ui, view),
         KeyCode::Backspace if filtering => {
-            ui.query.pop();
+            let changed = ui.query.pop().is_some();
             ui.cursor = RowId::default();
+            arm_remote(ui, view, changed);
             vec![]
         }
         KeyCode::Char(c) if bare => {
             if filtering {
-                if ui.query.chars().count() < QUERY_MAX_CHARS {
+                let changed = ui.query.chars().count() < QUERY_MAX_CHARS;
+                if changed {
                     ui.query.push(c);
                 }
                 ui.cursor = RowId::default();
+                arm_remote(ui, view, changed);
                 return vec![];
             }
             run_action(state, stack, ui, view, key)
@@ -300,13 +273,17 @@ fn descend(
     if !menu::has_provider(target) {
         return open_legacy(state, target);
     }
+    // A remote query still inside its debounce window would die with the
+    // saved level's `ui` — send it now rather than lose the edit.
+    let mut actions = flush_remote(state, stack, ui);
     if let Some(level) = stack.current_mut() {
         level.save(ui);
     }
     if stack.push(MenuLevel::new(target)) {
         *ui = MenuUiState::default();
     }
-    vec![]
+    actions.extend(on_open(state, target));
+    actions
 }
 
 /// `enter` by row kind (§3.4): Submenu descends, Value rows either cycle
@@ -356,10 +333,10 @@ fn row_enter(
     match menu {
         MenuId::Root => menu::root::on_row(state, stack, ui, row),
         MenuId::Help => menu::help::on_row(state, stack, ui, row),
-        MenuId::Settings
-        | MenuId::Plugins
-        | MenuId::Mcp
-        | MenuId::Keys
+        MenuId::Plugins => menu::plugins::on_row(state, stack, ui, row),
+        MenuId::Mcp => menu::mcp::on_row(state, stack, ui, row),
+        MenuId::Settings => menu::settings::on_row(state, stack, ui, row),
+        MenuId::Keys
         | MenuId::Files
         | MenuId::Sessions
         | MenuId::Import
@@ -397,17 +374,29 @@ fn run_action(
 }
 
 /// Declared-action dispatch (§3.4): one arm per menu, filled by its port —
-/// `ui/menu/<name>::on_action` decides what its `MenuAction`s do. No T2 menu
-/// declares actions, so every arm is a no-op placeholder for now.
+/// `ui/menu/<name>::on_action` decides what its `MenuAction`s do.
 fn menu_action(
-    _state: &mut AppState,
+    state: &mut AppState,
     _stack: &mut MenuStack,
-    _ui: &mut MenuUiState,
-    _menu: MenuId,
-    _action: &MenuAction,
-    _row: Option<&RowId>,
+    ui: &mut MenuUiState,
+    menu: MenuId,
+    action: &MenuAction,
+    row: Option<&RowId>,
 ) -> Vec<Action> {
-    vec![]
+    match menu {
+        MenuId::Plugins => menu::plugins::on_action(state, ui, action, row),
+        MenuId::Mcp => menu::mcp::on_action(state, ui, action, row),
+        MenuId::Settings => menu::settings::on_action(state, ui, action, row),
+        MenuId::Root
+        | MenuId::Help
+        | MenuId::Keys
+        | MenuId::Files
+        | MenuId::Sessions
+        | MenuId::Import
+        | MenuId::Background
+        | MenuId::Skills
+        | MenuId::Git => vec![],
+    }
 }
 
 // ─── Edit / capture modes ───────────────────────────────────────────────────
@@ -424,22 +413,27 @@ fn edit_key(
     match key.code {
         KeyCode::Esc => {
             ui.mode = MenuMode::List;
+            // A parked status (a failed commit's validation error) dies with
+            // the edit that caused it.
+            ui.status = None;
             vec![]
         }
         KeyCode::Enter => {
-            let MenuMode::Edit { buffer, .. } = std::mem::replace(&mut ui.mode, MenuMode::List)
+            let MenuMode::Edit { buffer, cursor } = std::mem::replace(&mut ui.mode, MenuMode::List)
             else {
                 return vec![];
             };
             let row =
                 resolve_cursor(&view.rows, &ui.cursor).and_then(|i| view.rows[i].id().cloned());
             match row {
-                Some(id) => edit_commit(state, stack, ui, view.id, &id, buffer),
+                Some(id) => edit_commit(state, stack, ui, view.id, &id, buffer, cursor),
                 None => vec![],
             }
         }
         _ => {
             edit_buffer(&mut ui.mode, key);
+            // Editing on retires the previous validation error (§5.1).
+            ui.status = None;
             vec![]
         }
     }
@@ -483,17 +477,31 @@ fn edit_buffer(mode: &mut MenuMode, key: KeyEvent) {
 }
 
 /// `enter` in Edit mode — the port turns the buffer into a config write
-/// (§3.4). No T2 menu produces `Value` rows, so every arm is a placeholder
-/// until its port lands.
+/// (§3.4). `cursor` is handed through so a menu whose commit fails can put
+/// the editor back exactly as it was.
 fn edit_commit(
-    _state: &mut AppState,
+    state: &mut AppState,
     _stack: &mut MenuStack,
-    _ui: &mut MenuUiState,
-    _menu: MenuId,
-    _row: &RowId,
-    _buffer: String,
+    ui: &mut MenuUiState,
+    menu: MenuId,
+    row: &RowId,
+    buffer: String,
+    cursor: usize,
 ) -> Vec<Action> {
-    vec![]
+    match menu {
+        MenuId::Settings => menu::settings::on_edit(state, ui, row, buffer, cursor),
+        MenuId::Root
+        | MenuId::Help
+        | MenuId::Plugins
+        | MenuId::Mcp
+        | MenuId::Keys
+        | MenuId::Files
+        | MenuId::Sessions
+        | MenuId::Import
+        | MenuId::Background
+        | MenuId::Skills
+        | MenuId::Git => vec![],
+    }
 }
 
 /// Key capture (§5.4): `esc` cancels; every other key is the capturing menu's

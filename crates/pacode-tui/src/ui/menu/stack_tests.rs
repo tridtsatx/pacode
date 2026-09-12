@@ -45,6 +45,8 @@ fn a_level_saves_and_restores_its_ui_state() {
         query: "fix".to_string(),
         tab: 1,
         mode: MenuMode::List,
+        remote_at: None,
+        status: None,
     };
     stack.current_mut().unwrap().save(&ui);
 

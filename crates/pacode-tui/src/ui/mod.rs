@@ -195,7 +195,9 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                     .agent(&id)
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| id.to_string()),
-                Some(crate::state::PanelTarget::Task(_)) | None => String::new(),
+                Some(crate::state::PanelTarget::Task(_))
+                | Some(crate::state::PanelTarget::McpServer(_))
+                | None => String::new(),
             };
             let banner = Line::from(vec![
                 Span::styled(

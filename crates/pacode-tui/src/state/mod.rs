@@ -137,6 +137,10 @@ pub enum Focus {
 pub enum PanelTarget {
     Agent(AgentId),
     Task(TaskId),
+    /// An MCP server's daemon-log tail — the menu's `l` action (§5.3). The
+    /// lines are read locally off `paths.daemon_log()`; there is no daemon
+    /// request behind this target, so `Action::LoadPanel` skips it.
+    McpServer(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -280,6 +280,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                 .task(id)
                                 .map(|t| t.label.as_str())
                                 .unwrap_or("task"),
+                            PanelTarget::McpServer(name) => name.as_str(),
                         };
                         if *follow {
                             let main_id = pacode_types::AgentId::main();
@@ -302,6 +303,14 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                 false,
                             )
                         } else {
+                            // A log view has no agent to follow or stop —
+                            // it only scrolls.
+                            let hints = match target {
+                                PanelTarget::McpServer(_) => "esc back · scroll pages",
+                                PanelTarget::Agent(_) | PanelTarget::Task(_) => {
+                                    "esc back · alt+b follow · s stop"
+                                }
+                            };
                             (
                                 vec![
                                     Span::styled(
@@ -309,10 +318,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                         opts.theme.cyan,
                                     ),
                                     Span::styled(format!("{name} · "), opts.theme.bold),
-                                    Span::styled(
-                                        "esc back · alt+b follow · s stop",
-                                        opts.theme.dim,
-                                    ),
+                                    Span::styled(hints, opts.theme.dim),
                                 ],
                                 false,
                             )

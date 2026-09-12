@@ -24,7 +24,10 @@ mod view;
 // `pub(crate)`: `keys_menu` calls each menu's `on_row`/`on_action`/`on_edit`
 // hooks directly — the `view` providers stay behind `view_for`.
 pub(crate) mod help;
+pub(crate) mod mcp;
+pub(crate) mod plugins;
 pub(crate) mod root;
+pub(crate) mod settings;
 mod skills;
 
 use crate::state::AppState;
@@ -36,6 +39,9 @@ pub use layout::{
 };
 pub use model::{Detail, DetailLine, Mark, MenuRow, RowId, ValueKind, resolve_cursor, selectable};
 pub use render::{draw, hint_line};
+// `pub(crate)`: the MCP log panel's header reuses the row glyph table so a
+// server reads the same in the menu and in its log view.
+pub(crate) use rows::mark_glyph;
 pub use stack::{MAX_DEPTH, MenuLevel, MenuStack};
 pub use view::{
     ActionChip, EmptyState, FilterMode, KeyBinding, MenuAction, MenuId, MenuMode, MenuUiState,
@@ -47,15 +53,16 @@ pub use view::{
 /// flips its arm to `true` the moment its provider lands.
 pub fn has_provider(id: MenuId) -> bool {
     match id {
-        MenuId::Root | MenuId::Help | MenuId::Skills | MenuId::Git => true,
-        MenuId::Settings
+        MenuId::Root
+        | MenuId::Settings
+        | MenuId::Help
+        | MenuId::Skills
+        | MenuId::Git
         | MenuId::Plugins
-        | MenuId::Mcp
-        | MenuId::Keys
-        | MenuId::Files
-        | MenuId::Sessions
-        | MenuId::Import
-        | MenuId::Background => false,
+        | MenuId::Mcp => true,
+        MenuId::Keys | MenuId::Files | MenuId::Sessions | MenuId::Import | MenuId::Background => {
+            false
+        }
     }
 }
 
@@ -72,16 +79,14 @@ pub fn view_for(stack: &MenuStack, state: &AppState, ui: &MenuUiState) -> MenuVi
         MenuId::Help => help::view(state, ui),
         MenuId::Skills => skills::view(state, ui),
         MenuId::Git => git::view(state, ui),
+        MenuId::Plugins => plugins::view(state, ui),
+        MenuId::Mcp => mcp::view(state, ui),
+        MenuId::Settings => settings::view(state, ui),
         // No provider yet — `has_provider` keeps these out of the stack, so
         // the arm is a defensive stub, not a real path (TODO T19).
-        MenuId::Settings
-        | MenuId::Plugins
-        | MenuId::Mcp
-        | MenuId::Keys
-        | MenuId::Files
-        | MenuId::Sessions
-        | MenuId::Import
-        | MenuId::Background => MenuView::new(level.id),
+        MenuId::Keys | MenuId::Files | MenuId::Sessions | MenuId::Import | MenuId::Background => {
+            MenuView::new(level.id)
+        }
     };
     // The breadcrumb between `Menu` and this level is the parents' titles
     // (§3.2): `Root › X` needs nothing, `Root › X › Y` names `X`.

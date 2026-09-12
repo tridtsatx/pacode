@@ -298,7 +298,8 @@ fn main_line(
 }
 
 /// Glyph + style for a row mark; `Mark::None` renders nothing at all.
-fn mark_glyph(mark: Mark, opts: &RenderOptions) -> Option<(&'static str, Style)> {
+/// `pub(crate)`: the MCP log panel header draws the same status glyph.
+pub(crate) fn mark_glyph(mark: Mark, opts: &RenderOptions) -> Option<(&'static str, Style)> {
     let pair = match mark {
         Mark::None => return None,
         Mark::Active => (opts.glyphs.main_dot, opts.theme.green),

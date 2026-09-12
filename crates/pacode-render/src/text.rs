@@ -43,6 +43,11 @@ pub fn in_background() -> &'static str {
     "в фоне"
 }
 
+/// The failed-count word in a hub summary (`4 · 1 упал`, `4 · 3 упали`).
+pub fn failed_word(n: usize) -> &'static str {
+    plural(n, "упал", "упали", "упали")
+}
+
 /// Display label for a built-in tool (spec §6: `Команда`, `Чтение`, `Поиск`,
 /// `Запись`). `None` for tools without one — the caller falls back to the raw
 /// name, capitalized.

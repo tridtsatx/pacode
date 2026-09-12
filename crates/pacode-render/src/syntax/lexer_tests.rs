@@ -79,7 +79,7 @@ fn multibyte_cap_counts_chars_not_bytes() {
     // 1500 cyrillic chars = 3000 bytes — under the char cap, still tokenized.
     let line = "\u{044f}".repeat(1500);
     let toks = lx.lex_line(&line);
-    assert!(toks.len() >= 1);
+    assert!(!toks.is_empty());
     assert_eq!(toks.last().map(|t| t.range.end), Some(line.len()));
 }
 

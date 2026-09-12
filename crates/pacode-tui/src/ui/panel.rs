@@ -83,6 +83,59 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                 );
             }
         }
+        PanelTarget::McpServer(ref name) => {
+            // The menu's `l` view (§5.3): a snapshot of the daemon log's tail
+            // filtered to this server, already in `panel.task_lines`.
+            let status = state
+                .mcp_servers
+                .iter()
+                .find(|s| s.name == *name)
+                .map(|s| s.status.as_str())
+                .unwrap_or("stopped");
+            let mark = crate::ui::menu::mcp::status_mark(status);
+            let (sym, sym_style) = crate::ui::menu::mark_glyph(mark, opts)
+                .unwrap_or((opts.glyphs.stopped, opts.theme.dim));
+
+            let total = state.panel.task_total_lines;
+            let line1 = Line::from(vec![
+                Span::styled(sym, sym_style),
+                Span::raw(" "),
+                Span::styled(name.clone(), opts.theme.bold),
+                Span::styled(format!(" · {status} · {total} log lines"), opts.theme.faint),
+            ]);
+
+            let header_lines = vec![line1, Line::default()];
+            let header_area = Rect::new(area.x, area.y, area.width, 2.min(area.height));
+            frame.render_widget(Paragraph::new(header_lines), header_area);
+
+            if area.height > 2 {
+                let output_area = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
+                let lines_count = state.panel.task_lines.len();
+                let v_height = output_area.height as usize;
+
+                // For this target `panel.scroll` is an offset from the tail
+                // (nav::handle_scroll) — 0 pins the newest lines to the
+                // bottom edge, like a task that is still running.
+                let max_start = lines_count.saturating_sub(v_height);
+                let start_line = max_start.saturating_sub(state.panel.scroll.min(max_start));
+
+                let visible: Vec<Line<'static>> = state
+                    .panel
+                    .task_lines
+                    .iter()
+                    .skip(start_line)
+                    .take(v_height)
+                    .map(|l| {
+                        Line::from(Span::styled(
+                            truncate_to_width(l, output_area.width as usize, true),
+                            opts.theme.fg,
+                        ))
+                    })
+                    .collect();
+
+                frame.render_widget(Paragraph::new(visible), output_area);
+            }
+        }
         PanelTarget::Task(ref task_id) => {
             let now = now_ms();
             let task = state.rail.task(task_id);

@@ -100,6 +100,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
+        name: Cow::Borrowed("settings"),
+        usage: Cow::Borrowed("/settings"),
+        help: Cow::Borrowed("settings — alias of /config"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
         name: Cow::Borrowed("sessions"),
         usage: Cow::Borrowed("/sessions"),
         help: Cow::Borrowed("pick a session"),
@@ -428,8 +434,8 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             log::debug!("open overlay: menu hub");
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Root)
         }
-        "config" => {
-            log::debug!("open overlay: ConfigPicker");
+        "config" | "settings" => {
+            log::debug!("open overlay: Settings menu");
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Settings)
         }
         "sessions" => {
@@ -437,7 +443,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Sessions)
         }
         "mcp" => {
-            log::debug!("open overlay: McpPicker");
+            log::debug!("open menu: mcp");
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Mcp)
         }
         "plugins" => {
@@ -450,13 +456,11 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 state.save_pref_marketplace(source);
             }
             let actions = crate::keys_menu::open(state, crate::ui::menu::MenuId::Plugins);
-            // A non-empty source lands on Discover; the bridge opens the
-            // legacy picker on Installed — retarget the tab (TODO T4: the
-            // ported level takes the tab as a parameter instead).
+            // A non-empty source lands on Discover.
             if !source.is_empty()
-                && let Focus::Overlay(Overlay::PluginsPicker { tab, .. }) = &mut state.focus
+                && let Focus::Overlay(Overlay::Menu { ui, .. }) = &mut state.focus
             {
-                *tab = crate::state::PluginsTab::Discover;
+                ui.tab = crate::ui::menu::plugins::TAB_DISCOVER;
             }
             actions
         }

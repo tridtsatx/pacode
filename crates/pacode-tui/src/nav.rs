@@ -183,7 +183,7 @@ pub fn handle_follow(state: &mut AppState) -> Vec<Action> {
             };
         }
         Focus::Panel {
-            target: PanelTarget::Task(_),
+            target: PanelTarget::Task(_) | PanelTarget::McpServer(_),
             ..
         }
         | Focus::Normal
@@ -288,6 +288,26 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
 pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
     let in_panel = matches!(state.focus, Focus::Panel { .. });
     if in_panel {
+        // The MCP log panel has no transcript — `panel.scroll` is its offset
+        // from the tail (ui::panel), 0 pinning the newest lines to the bottom.
+        if matches!(
+            state.focus,
+            Focus::Panel {
+                target: PanelTarget::McpServer(_),
+                ..
+            }
+        ) {
+            if action == KeyAction::ScrollUp {
+                state.panel.scroll = state.panel.scroll.saturating_add(10);
+            } else if action == KeyAction::ScrollDown {
+                state.panel.scroll = state.panel.scroll.saturating_sub(10);
+            } else if action == KeyAction::ScrollTop {
+                state.panel.scroll = usize::MAX;
+            } else if action == KeyAction::ScrollBottom {
+                state.panel.scroll = 0;
+            }
+            return vec![];
+        }
         if let Focus::Panel {
             ref mut follow_paused,
             follow: true,

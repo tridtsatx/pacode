@@ -107,6 +107,10 @@ pub struct Detail {
     pub title: String,
     pub lines: Vec<DetailLine>,
     pub actions: Vec<ActionChip>,
+    /// Extra search terms [`MenuRow::matches`] checks after the label and the
+    /// right-hand tail — text the row can be found by without showing it (a
+    /// setting's dotted key, its description). Never rendered.
+    pub search: Vec<String>,
 }
 
 impl Detail {
@@ -212,9 +216,10 @@ impl MenuRow {
         self.id().is_some()
     }
 
-    /// The row's searchable text — label plus the right-hand tail — checked
-    /// against `query_lower` (already lowercased) by `MenuView::apply_filter`.
-    /// Sections are headers, not match targets (§3.2).
+    /// The row's searchable text — label plus the right-hand tail, plus the
+    /// detail's opt-in `search` terms — checked against `query_lower`
+    /// (already lowercased) by `MenuView::apply_filter`. Sections are headers,
+    /// not match targets (§3.2).
     pub fn matches(&self, query_lower: &str) -> bool {
         let (label, right) = match self {
             Self::Section { .. } => return false,
@@ -226,7 +231,11 @@ impl MenuRow {
             Self::Check { label, .. } => (label, None),
         };
         let hit = |s: &str| s.to_lowercase().contains(query_lower);
-        hit(label) || right.is_some_and(hit)
+        hit(label)
+            || right.is_some_and(hit)
+            || self
+                .detail()
+                .is_some_and(|d| d.search.iter().any(|s| hit(s)))
     }
 }
 

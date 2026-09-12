@@ -430,16 +430,26 @@ fn test_overlay_config_picker_navigation_and_esc() {
     let mut state = make_test_state();
     let now = Instant::now();
 
-    // Open via slash command `/config` + Enter
+    // Open via slash command `/config` + Enter — the shared menu's Settings
+    // level now answers it (§5.1; the legacy overlay lives on until T19).
     state.input.insert_str("/config");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     handle_key(&mut state, enter, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::ConfigPicker));
+    let Focus::Overlay(Overlay::Menu { stack, .. }) = &state.focus else {
+        panic!("expected the Settings menu level, got {:?}", state.focus);
+    };
+    assert_eq!(
+        stack.current().map(|l| l.id),
+        Some(crate::ui::menu::MenuId::Settings)
+    );
 
-    // Down key changes index to 1
+    // Down key moves the cursor off the first setting.
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     handle_key(&mut state, down, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::ConfigPicker));
+    let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
+        panic!("expected the menu overlay, got {:?}", state.focus);
+    };
+    assert_eq!(ui.cursor, crate::ui::menu::RowId::new("provider.effort"));
 
     // Esc closes it
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -816,18 +826,18 @@ fn test_overlay_mcp_picker_keys() {
     let mut state = make_test_state();
     let now = Instant::now();
 
-    // 1. Open via slash command `/mcp` + Enter
+    // 1. Open via slash command `/mcp` + Enter — the shared menu's MCP level
+    // answers it now (the legacy picker below still takes keys until T19).
     state.input.insert_str("/mcp");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let actions = handle_key(&mut state, enter, now);
     assert_eq!(actions, vec![Action::Send(Request::ListMcpServers)]);
+    let Focus::Overlay(Overlay::Menu { stack, .. }) = &state.focus else {
+        panic!("expected the MCP menu level, got {:?}", state.focus);
+    };
     assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::McpPicker {
-            index: 0,
-            servers: Vec::new(),
-            loading: true,
-        })
+        stack.current().map(|l| l.id),
+        Some(crate::ui::menu::MenuId::Mcp)
     );
 
     // 2. Populate servers
@@ -954,17 +964,13 @@ fn test_overlay_plugins_picker_keys() {
             }),
         ]
     );
+    // §5.2: `/plugins` opens the menu-base Plugins level, not the legacy
+    // picker (the picker below is driven directly for the rest of the test).
     assert_eq!(
         state.focus,
-        Focus::Overlay(Overlay::PluginsPicker {
-            tab: crate::state::PluginsTab::Installed,
-            market: Vec::new(),
-            query: String::new(),
-            // The marketplace request is in flight until it answers.
-            loading: true,
-            stale: false,
-            index: 0,
-            plugins: Vec::new(),
+        Focus::Overlay(Overlay::Menu {
+            stack: crate::ui::menu::MenuStack::root(crate::ui::menu::MenuId::Plugins),
+            ui: crate::ui::menu::MenuUiState::default(),
         })
     );
 

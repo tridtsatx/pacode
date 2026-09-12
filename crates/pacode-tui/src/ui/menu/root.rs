@@ -120,12 +120,37 @@ fn settings_summary(state: &AppState) -> Option<String> {
 
 fn plugins_summary(state: &AppState) -> Option<String> {
     let n = state.plugins.len();
-    (n > 0).then(|| format!("{n} loaded"))
+    let m = state.marketplace.len();
+    if n == 0 && m == 0 {
+        None
+    } else if m == 0 {
+        Some(format!("{n} installed"))
+    } else {
+        Some(format!("{n} installed · {m} available"))
+    }
 }
 
+/// "4 · 1 failed" (§4.1) — the daemon's server list when it has landed, else
+/// the configured count while the first `ListMcpServers` is in flight; the
+/// failed tail shows only when there is something to report.
 fn mcp_summary(state: &AppState) -> Option<String> {
-    let n = state.config.mcp.servers.len();
-    (n > 0).then(|| format!("{n} configured"))
+    let n = state.mcp_servers.len().max(state.config.mcp.servers.len());
+    if n == 0 {
+        return None;
+    }
+    let failed = state
+        .mcp_servers
+        .iter()
+        .filter(|s| s.status == "failed")
+        .count();
+    if failed == 0 {
+        Some(format!("{n}"))
+    } else {
+        Some(format!(
+            "{n} · {failed} {}",
+            pacode_render::text::failed_word(failed)
+        ))
+    }
 }
 
 fn skills_summary(state: &AppState) -> Option<String> {

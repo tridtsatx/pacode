@@ -129,21 +129,24 @@ fn ctrl_c_closes_the_whole_stack() {
 #[test]
 fn an_unported_section_bridges_to_its_legacy_overlay() {
     let mut state = make_test_state();
-    // `enter` on the hub's Settings row — no provider yet → ConfigPicker.
+    // `enter` on the hub's Sessions row — no provider yet → SessionPicker.
     let mut stack = MenuStack::root(MenuId::Root);
     let mut ui = MenuUiState {
-        cursor: RowId::new("settings"),
+        cursor: RowId::new("sessions"),
         ..MenuUiState::default()
     };
     handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Enter));
-    assert_eq!(state.focus, Focus::Overlay(Overlay::ConfigPicker));
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::SessionPicker { .. })
+    ));
 
     // Direct entry to an unported section lands on the legacy overlay too.
     state.focus = Focus::Normal;
-    open(&mut state, MenuId::Mcp);
+    open(&mut state, MenuId::Keys);
     assert!(matches!(
         state.focus,
-        Focus::Overlay(Overlay::McpPicker { .. })
+        Focus::Overlay(Overlay::KeysPicker { .. })
     ));
 }
 
@@ -189,12 +192,12 @@ fn a_filtered_menu_types_into_the_query_and_enters_the_match() {
             .iter()
             .all(|r| !r.is_selectable() || r.matches("mcp"))
     );
-    // Enter runs the matched command row — `/mcp` opens the legacy picker.
+    // Enter runs the matched command row — `/mcp` opens the MCP submenu
+    // (provider-backed since T5, not the legacy picker).
     handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Enter));
-    assert!(matches!(
-        state.focus,
-        Focus::Overlay(Overlay::McpPicker { .. })
-    ));
+    let (new_stack, _) = menu_parts(&state);
+    assert_eq!(new_stack.current().map(|l| l.id), Some(MenuId::Mcp));
+    assert_eq!(new_stack.depth(), 1);
 }
 
 #[test]

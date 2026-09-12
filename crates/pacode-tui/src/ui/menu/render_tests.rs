@@ -40,7 +40,7 @@ fn detailed_item(id: &str) -> MenuRow {
                 },
                 DetailLine::Text("free text".to_string()),
             ],
-            actions: Vec::new(),
+            ..Default::default()
         },
     }
 }

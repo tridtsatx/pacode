@@ -41,7 +41,9 @@ impl MenuLevel {
     }
 
     /// Restore the level into a UI state. A level always comes back in `List`
-    /// mode: a half-finished edit or capture never survives a descent.
+    /// mode: a half-finished edit or capture never survives a descent, and
+    /// neither does an armed remote-filter send — `keys_menu::descend`
+    /// flushes it before the snapshot is taken — nor a parked status.
     pub fn ui(&self) -> MenuUiState {
         MenuUiState {
             cursor: self.cursor.clone(),
@@ -49,6 +51,8 @@ impl MenuLevel {
             query: self.query.clone(),
             tab: self.tab,
             mode: MenuMode::List,
+            remote_at: None,
+            status: None,
         }
     }
 }

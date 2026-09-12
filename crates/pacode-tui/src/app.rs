@@ -421,6 +421,18 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
         };
 
+        // The remote-filter debounce of the open menu (§3.2): armed only
+        // while a level owes the daemon a query — no timer runs otherwise.
+        let menu_remote_sleep = async {
+            match crate::keys_menu::remote_deadline(&state) {
+                Some(at) => {
+                    let remaining = at.saturating_duration_since(Instant::now());
+                    tokio::time::sleep(remaining).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
             client_ev = events.recv() => {
                 match client_ev {
@@ -501,6 +513,13 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
             _ = deferred_draw_sleep => {
                 // Loop iteration triggers draw
+            }
+            _ = menu_remote_sleep => {
+                let now = Instant::now();
+                let actions = crate::keys_menu::remote_filter_due(&mut state, now);
+                for act in actions {
+                    dispatch_action(act, &mut state, &client, &bg_tx);
+                }
             }
         }
     }
@@ -664,33 +683,33 @@ fn dispatch_action(
             });
         }
         Action::LoadPanel => {
-            let cl = Arc::clone(client);
-            let tx = bg_tx.clone();
             if let Some(ref target) = state.panel.target {
                 let target = target.clone();
-                tokio::spawn(async move {
-                    let res = match &target {
-                        PanelTarget::Agent(id) => {
-                            cl.request(Request::GetHistory {
-                                agent: id.clone(),
-                                before_seq: None,
-                                limit: 300,
-                            })
-                            .await
-                        }
-                        PanelTarget::Task(id) => {
-                            cl.request(Request::GetTaskOutput {
-                                task: id.clone(),
-                                tail_lines: 300,
-                            })
-                            .await
-                        }
-                    };
-                    let _ = tx.send(BgResponse::LoadPanelReply {
-                        target,
-                        result: res,
+                // The MCP log is read locally off the daemon log file by
+                // `menu::mcp` — there is no daemon request behind the target.
+                let request = match &target {
+                    PanelTarget::Agent(id) => Some(Request::GetHistory {
+                        agent: id.clone(),
+                        before_seq: None,
+                        limit: 300,
+                    }),
+                    PanelTarget::Task(id) => Some(Request::GetTaskOutput {
+                        task: id.clone(),
+                        tail_lines: 300,
+                    }),
+                    PanelTarget::McpServer(_) => None,
+                };
+                if let Some(request) = request {
+                    let cl = Arc::clone(client);
+                    let tx = bg_tx.clone();
+                    tokio::spawn(async move {
+                        let res = cl.request(request).await;
+                        let _ = tx.send(BgResponse::LoadPanelReply {
+                            target,
+                            result: res,
+                        });
                     });
-                });
+                }
             }
         }
         Action::LoadHistory => {

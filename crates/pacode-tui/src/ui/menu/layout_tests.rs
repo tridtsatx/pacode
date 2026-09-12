@@ -25,7 +25,7 @@ fn detailed_item(id: &str, lines: usize) -> MenuRow {
             lines: (0..lines)
                 .map(|i| DetailLine::Text(format!("line {i}")))
                 .collect(),
-            actions: Vec::new(),
+            ..Default::default()
         },
     }
 }
