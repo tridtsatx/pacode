@@ -37,6 +37,10 @@ pub struct ToolCtx {
     pub tool_name: Option<String>,
     /// Explicit tool kind when called through the runtime.
     pub tool_kind: Option<crate::ToolKind>,
+    /// Snapshot of the agent's registry for this call — `batch` resolves its
+    /// ops through it, so a disabled or unavailable tool fails inside a batch
+    /// exactly as it would standalone.
+    pub tools: crate::registry::ToolRegistry,
 }
 
 impl ToolCtx {

@@ -1,5 +1,45 @@
 use super::*;
-use crate::RenderOptions;
+use crate::{ColorMode, RenderOptions};
+
+#[test]
+fn fenced_code_highlights_known_language() {
+    let md = "```rust\nfn main() {}\n```";
+    let opts = RenderOptions::new(40, false).color_mode(ColorMode::Truecolor);
+    let lines = render_markdown(md, &opts);
+    assert_eq!(lines.len(), 1);
+    // `fn` carries the keyword colour inside the `│ ` gutter line.
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref() == "fn" && s.style.fg == opts.theme.violet.fg)
+    );
+}
+
+#[test]
+fn fenced_code_unknown_language_and_mono_stay_plain() {
+    for md in ["```cobol\nIDENT DIV.\n```", "```rust\nlet x = 1\n```"] {
+        let mono = RenderOptions::new(40, false).color_mode(ColorMode::Mono);
+        let lines = render_markdown(md, &mono);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .skip(1)
+                .all(|s| s.style == mono.theme.fg)
+        );
+    }
+    // Unknown language is plain even in truecolor.
+    let opts = RenderOptions::new(40, false).color_mode(ColorMode::Truecolor);
+    let lines = render_markdown("```cobol\nIDENT DIV.\n```", &opts);
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .skip(1)
+            .all(|s| s.style == opts.theme.fg)
+    );
+}
 
 #[test]
 fn paragraph_list_code_block_at_width_40() {

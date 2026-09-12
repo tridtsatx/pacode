@@ -4,6 +4,7 @@
 pub mod activity;
 pub mod events;
 pub mod files;
+pub mod git;
 pub mod images;
 pub mod input;
 pub mod rail;
@@ -18,16 +19,18 @@ mod picker_tests;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pacode_client::ClientEvent;
 use pacode_types::time::now_ms;
 use pacode_types::{
-    AgentId, Config, Effort, Event, McpServerInfo, Mode, ModelFlags, ModelInfo, ModelRoute,
-    PluginInfo, SessionMeta, TaskId, ToastLevel, ToolStatus, TranscriptKind, ZdrMode,
+    AgentId, Config, Effort, Event, MarketplacePluginInfo, McpServerInfo, Mode, ModelFlags,
+    ModelInfo, ModelRoute, PluginInfo, SessionMeta, TaskId, ToastLevel, ToolStatus, TranscriptKind,
+    ZdrMode,
 };
 
 pub use files::FilesState;
+pub use git::GitState;
 pub use input::InputState;
 pub use rail::RailState;
 pub use selection::Selection;
@@ -122,10 +125,6 @@ pub enum Focus {
         follow: bool,
         follow_paused: bool,
     },
-    /// `.` in an empty prompt: background task list overlay.
-    BgList {
-        index: usize,
-    },
     /// Slash pickers and other overlays.
     Overlay(Overlay),
 }
@@ -134,30 +133,23 @@ pub enum Focus {
 pub enum PanelTarget {
     Agent(AgentId),
     Task(TaskId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PluginsTab {
-    /// Plugins live in this session or installed from a marketplace.
-    Installed,
-    /// Plugins the configured marketplace offers.
-    Discover,
-}
-
-impl PluginsTab {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Installed => Self::Discover,
-            Self::Discover => Self::Installed,
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Installed => "Installed",
-            Self::Discover => "Discover",
-        }
-    }
+    /// An MCP server's daemon-log tail — the menu's `l` action (§5.3). The
+    /// lines are read locally off `paths.daemon_log()`; there is no daemon
+    /// request behind this target, so `Action::LoadPanel` skips it.
+    McpServer(String),
+    /// The Files level's `enter` (§5.5): the worktree diff of one touched
+    /// file. The patch is produced by a deferred `git` job
+    /// (`files.diff_want` → `BgResponse::FileDiffReady` → [`PanelDiff`]) —
+    /// there is no daemon request, so `Action::LoadPanel` skips it.
+    FileDiff {
+        path: String,
+    },
+    /// The Git level's `enter` (§5.10): one commit's patch. `Request::GitDiff`
+    /// flies the moment the row opens (not via `LoadPanel`); the reply lands
+    /// in `state.git.diff`, keyed by hash.
+    CommitDiff {
+        hash: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -179,9 +171,6 @@ pub enum Overlay {
     ModePicker {
         index: usize,
     },
-    /// The settings view. Its state lives in `AppState::config_view`; the
-    /// variant only says which overlay is open.
-    ConfigPicker,
     /// A question the model asked. The turn is waiting on the answer, so this
     /// overlay owns the keyboard until it is answered or dismissed.
     QuestionPicker {
@@ -201,40 +190,15 @@ pub enum Overlay {
         step: ThemePickerStep,
         user_themes: Vec<String>,
     },
-    SessionPicker {
-        query: String,
-        index: usize,
-    },
-    Files {
-        index: usize,
-    },
-    McpPicker {
-        index: usize,
-        servers: Vec<McpServerInfo>,
-        loading: bool,
-    },
-    PluginsPicker {
-        index: usize,
-        plugins: Vec<PluginInfo>,
-        /// Which list is on screen.
-        tab: PluginsTab,
-        /// What the configured marketplace offers, once it has answered.
-        market: Vec<pacode_types::MarketplacePluginInfo>,
-        /// Filter typed in the Discover tab.
-        query: String,
-        /// A marketplace request is in flight.
-        loading: bool,
-        /// The listing came from a cached copy past its TTL.
-        stale: bool,
-    },
-    KeysPicker {
-        index: usize,
-        capturing: bool,
-    },
-    Import(crate::ui::import::ImportOverlayState),
     /// Plan + agents on the `Tiny` tier.
     RailOverlay,
-    Help,
+    /// The menu base (§3): the stack of levels plus the UI state of the one on
+    /// screen. An empty stack means closed — `keys` restores `Focus::Normal`.
+    /// Every central submenu (`MenuId`) lives inside this variant.
+    Menu {
+        stack: crate::ui::menu::MenuStack,
+        ui: crate::ui::menu::MenuUiState,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,6 +227,16 @@ pub const OVERLAY_GROW_MS: u64 = 140;
 pub const WELCOME_ANIM_MS: u64 = 400;
 /// AGENTS ⇄ SESSION switch debounce (spec §5).
 pub const IDLE_DEBOUNCE_MS: u64 = 2000;
+
+/// A selection copy the draw path prepared for the event loop. `clipboard::copy`
+/// writes OSC 52 to stdout and may touch `arboard` — that IO must not run inside
+/// `ui::draw` (§8.1), so draw stashes the text here and the loop performs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCopy {
+    pub text: String,
+    /// Auto-copied selections report how to turn the feature off.
+    pub auto: bool,
+}
 
 /// Connection state shown in the footer / as a notice.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,14 +270,35 @@ pub struct AppState {
     /// Panel transcript (agent) or task output lines.
     pub panel: PanelState,
     pub files: FilesState,
+    /// Git history for the VCS submenu (filled by `Reply::GitLog`; T17 renders).
+    pub git: GitState,
+    /// The scan behind the Import submenu (§5.7): what `pacode-import`
+    /// discovered plus each entry's conflict status and the apply target.
+    /// Filled by `menu::import::on_open`, rebuilt on every open, cleared by a
+    /// successful apply; `None` while the menu has never been opened.
+    pub import: Option<crate::ui::menu::import::ImportScan>,
     pub rail: RailState,
     pub input: InputState,
     pub vim: VimState,
     pub focus: Focus,
-    pub config_view: crate::ui::config_view::ConfigViewState,
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
+    /// MCP servers for the picker (filled by `ListMcpServers`, seeded from the
+    /// disk cache at startup).
+    pub mcp_servers: Vec<McpServerInfo>,
+    /// The configured marketplace's listing (filled by `BrowseMarketplace`,
+    /// seeded from the disk cache at startup).
+    pub marketplace: Vec<MarketplacePluginInfo>,
+    /// Per-list cache health — which sections came from disk, which refreshed,
+    /// which are still in flight. Drives `loading…`/`offline copy` (§8.2).
+    pub lists: crate::cache::Lists,
+    /// The on-disk list cache. `run` points it at `paths.cache_dir` before the
+    /// first frame; until then it is a benign no-op directory.
+    pub cache: crate::cache::DiskCache,
+    /// When this client run started — the TTL baseline for session-scoped
+    /// cache entries (anything written before this is `offline copy` material).
+    pub session_start_ms: u64,
     /// Per-route flags (`zdr_capable`, `favorite`) mirroring `prefs.toml`;
     /// written through `save_pref_model_flags` and pushed to the daemon via
     /// `Request::SetModelFlag`.
@@ -335,6 +330,8 @@ pub struct AppState {
     pub truecolor: bool,
     /// Pending readline key chord (e.g. `ctrl+x` waiting for `ctrl+e`).
     pub pending_chord: Option<crossterm::event::KeyEvent>,
+    /// Double-Shift detector state for the menu hub (§4.2).
+    pub double_shift: crate::double_shift::DoubleShift,
     /// Session slot table (1..=9).
     pub slots: [Option<SessionSlot>; NUM_SLOTS],
     /// Currently active slot index (0..8).
@@ -369,6 +366,9 @@ pub struct AppState {
     /// When the current overlay/picker focus layer opened (render-side clock
     /// for the ~140 ms unfold); `None` while the focus layer is not a popup.
     pub overlay_since: Option<Instant>,
+    /// A copy the draw path prepared for the event loop to perform (§8.1 —
+    /// `clipboard::copy` does IO and must not run inside `ui::draw`).
+    pub pending_copy: Option<PendingCopy>,
 }
 
 /// What the panel shows.
@@ -378,6 +378,31 @@ pub struct PanelState {
     pub task_lines: Vec<String>,
     pub task_total_lines: u64,
     pub scroll: usize,
+    /// The `PanelTarget::FileDiff` payload — written by
+    /// `BgResponse::FileDiffReady`, `None` while the probe runs.
+    pub diff: Option<PanelDiff>,
+}
+
+/// The file-diff payload the panel renders for `PanelTarget::FileDiff`.
+/// Owner: `PanelState`.
+/// Cap: one patch ≤ `pacode_vcs::DIFF_CAP_BYTES` plus its rendered lines.
+/// Invalidation: replaced when the target re-arms or the diff job lands.
+pub struct PanelDiff {
+    /// The path this diff is for — a response applies only while it is still
+    /// the panel's target.
+    pub path: String,
+    /// `git diff` output — `None` for a clean worktree, a missing file, or a
+    /// repo-less path (`note` says which).
+    pub patch: Option<String>,
+    /// What the probe's `git status` said — feeds the header label.
+    pub status: Option<crate::state::files::FileStatus>,
+    /// The patch hit the capture cap.
+    pub truncated: bool,
+    /// Why the patch is missing, or where a synthetic one came from.
+    pub note: Option<String>,
+    /// `render_diff_ex` output at the width it was rendered for — rebuilt on
+    /// resize, never per frame (§8.1: no repeat renders).
+    pub rendered: Option<(u16, Vec<ratatui::text::Line<'static>>)>,
 }
 
 impl AppState {
@@ -427,19 +452,26 @@ impl AppState {
                 task_lines: Vec::new(),
                 task_total_lines: 0,
                 scroll: 0,
+                diff: None,
             },
             files: FilesState::default(),
+            git: GitState::default(),
+            import: None,
             rail: RailState::default(),
             input: InputState::default(),
             vim: VimState::default(),
             focus: Focus::Normal,
-            config_view: crate::ui::config_view::ConfigViewState::default(),
             toasts: VecDeque::new(),
             models: Vec::new(),
             model_flags,
             auth_providers: Vec::new(),
             sessions: Vec::new(),
             plugins: Vec::new(),
+            mcp_servers: Vec::new(),
+            marketplace: Vec::new(),
+            lists: crate::cache::Lists::default(),
+            cache: crate::cache::DiskCache::default(),
+            session_start_ms: now_ms(),
             dirty: true,
             cols,
             rows,
@@ -452,6 +484,7 @@ impl AppState {
             mascot: crate::ui::mascot::MascotKind::random(),
             truecolor,
             pending_chord: None,
+            double_shift: crate::double_shift::DoubleShift::default(),
             slots: Default::default(),
             active_slot: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -465,6 +498,7 @@ impl AppState {
             second_parity: false,
             last_focus_key: 0,
             overlay_since: None,
+            pending_copy: None,
         }
     }
 
@@ -612,6 +646,21 @@ impl AppState {
                 if let Some(msg) = pacode_config::take_migration_notice(&self.paths) {
                     self.push_toast(ToastLevel::Info, msg, None, now);
                 }
+                // Project switch (§8.2): git history, file previews and path
+                // completions are all keyed to the session cwd — a different
+                // one invalidates them. `self.cwd()` already falls back to the
+                // startup cwd before `meta` exists, so this also catches
+                // attaching straight into a session living elsewhere.
+                // The cache file side needs nothing: the git key carries a
+                // cwd fingerprint, so a new project is simply a different file.
+                let project_changed = self.cwd() != snapshot.meta.cwd;
+                if project_changed {
+                    self.git = GitState::default();
+                    self.lists.git = crate::cache::ListHealth::default();
+                    self.files.clear_preview();
+                    self.input.at_comp = Default::default();
+                    self.input.bash_comp = Default::default();
+                }
                 // The header banner is (re)installed below, so the welcome
                 // cascade re-arms here: a re-attach replays it.
                 self.started_at = now;
@@ -633,18 +682,22 @@ impl AppState {
                 };
                 self.transcript.set_header(header);
                 for item in &snapshot.transcript {
-                    if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
-                        let arg = title
-                            .strip_prefix(name.as_str())
-                            .map(str::trim_start)
-                            .unwrap_or_else(|| {
-                                title
-                                    .split_once(' ')
-                                    .map(|(_, r)| r.trim())
-                                    .unwrap_or(title.as_str())
-                            });
+                    if let TranscriptKind::ToolCall {
+                        name,
+                        title,
+                        call_id,
+                        diff,
+                        ..
+                    } = &item.kind
+                    {
+                        let arg = crate::state::files::title_path_arg(name, title);
                         let input = serde_json::json!({ "path": arg });
                         self.files.observe_tool_item(name, &input, item.ts_ms);
+                        // Snapshot items arrive finished — the `DiffStat` is
+                        // already on the item, no `ItemUpdated` follows.
+                        if let Some(d) = diff {
+                            self.files.apply_diff(name, &input, call_id, *d, item.ts_ms);
+                        }
                     }
                 }
                 self.turn_active = snapshot.turn_active;
@@ -1028,11 +1081,33 @@ impl AppState {
             Focus::Overlay(Overlay::ModelPicker { .. })
             | Focus::Overlay(Overlay::ThemePicker { .. }) => 12,
             Focus::Overlay(Overlay::LoginPicker { .. }) => 13,
-            // Header, question, one row per option, and the hint line.
+            // Header chip + wrapped question + two rows per option + the
+            // free-text plaque + hint, capped — the options window scrolls.
             Focus::Overlay(Overlay::QuestionPicker { question, .. }) => {
-                (question.options.len() as u16).saturating_add(5).min(16)
+                crate::ui::question_picker::height(question, self.picker_width()).min(18) as u16
             }
             _ => 0,
+        }
+    }
+
+    /// Width the bottom picker will occupy: the dialog column, or the full
+    /// screen row when an open panel owns the column (mirrors `ui::draw`).
+    fn picker_width(&self) -> usize {
+        let tier = crate::layout::WidthTier::for_width(self.cols);
+        let rail_w = tier.rail_width();
+        let left_w = if rail_w > 0 && self.cols > rail_w + 2 {
+            self.cols - rail_w - 2
+        } else {
+            self.cols
+        };
+        let panel_open = (self.panel.target.is_some() || matches!(self.focus, Focus::Panel { .. }))
+            && !self.agent_replaces_dialog();
+        if !panel_open {
+            return left_w as usize;
+        }
+        match tier.dialog_share_with_panel() {
+            0 => self.cols as usize,
+            share => (left_w.saturating_sub(1) as usize * share as usize / 100).max(1),
         }
     }
 
@@ -1075,7 +1150,10 @@ impl AppState {
                 .as_ref()
                 .and_then(|t| match t {
                     PanelTarget::Agent(id) => self.rail.agent(id),
-                    _ => None,
+                    PanelTarget::Task(_)
+                    | PanelTarget::McpServer(_)
+                    | PanelTarget::FileDiff { .. }
+                    | PanelTarget::CommitDiff { .. } => None,
                 })
                 .is_some_and(|a| a.status.is_active()),
         }
@@ -1157,9 +1235,52 @@ impl AppState {
 
         self.focus = Focus::Normal;
         self.meta = None;
+        // The git list belongs to the session's project — leaving the slot
+        // must not show it under another session (§8.2).
+        self.git = GitState::default();
+        self.lists.git = crate::cache::ListHealth::default();
+        self.files.clear_preview();
         self.rail.agents.clear();
         self.rail.tasks.clear();
         self.rail.plan = pacode_types::state::Plan::default();
         self.rail.usage = pacode_types::state::UsageTotals::default();
+    }
+
+    /// Drop a cache file (§8.2 invalidation points: plugin install/remove,
+    /// MCP config change). Best-effort on a blocking thread — the next list
+    /// reply rewrites the file anyway.
+    pub fn invalidate_cache(&self, kind: crate::cache::ListKind) {
+        let cache = self.cache.clone();
+        let stem = kind.stem(&self.cwd()).into_owned();
+        let schema = kind.schema();
+        tokio::task::spawn_blocking(move || {
+            cache.invalidate(&stem, schema);
+        });
+    }
+
+    /// The deferred clipboard copy finished — post the toasts draw used to
+    /// post inline (§8.1 moved the IO off the frame; the reporting follows it).
+    pub fn on_copy_done(&mut self, auto: bool, chars: usize) {
+        let detail = auto.then(|| "disable autocopy in /config".to_string());
+        self.push_toast(
+            ToastLevel::Info,
+            format!("copied {chars} chars"),
+            detail,
+            Instant::now(),
+        );
+        if crate::clipboard::remote_hint().is_some() && !self.clipboard_warned {
+            self.clipboard_warned = true;
+            let now = Instant::now();
+            let shown_at = now
+                .checked_sub(Duration::from_secs(TOAST_TTL_SECS.saturating_sub(4)))
+                .unwrap_or(now);
+            self.toasts.push_back(Toast {
+                level: ToastLevel::Warn,
+                title: crate::ui::popup::POPUP_TOAST_TITLE.to_string(),
+                detail: Some(crate::clipboard::REMOTE_HINT_TEXT.to_string()),
+                shown_at,
+            });
+            self.dirty = true;
+        }
     }
 }

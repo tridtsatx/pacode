@@ -37,8 +37,14 @@ impl TerminalGuard {
         // reply, which is the whole first-frame budget. Terminals that do not
         // support the kitty protocol ignore the push sequence, so on unix we push
         // unconditionally (same choice as codex).
+        // REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESCAPE_CODES: Press/Repeat/
+        // Release arrive distinctly and a bare Shift press is an event — the
+        // double-Shift menu gesture needs both (§4.2). `keys::handle_key`
+        // drops non-Press events before any action runs.
         let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
         #[cfg(unix)]
         let push = true;
         #[cfg(not(unix))]
@@ -147,8 +153,11 @@ pub fn resume(mouse: bool) -> std::io::Result<()> {
     if mouse {
         let _ = execute!(stdout, EnableMouseCapture);
     }
+    // Same flag set as `TerminalGuard::new` — keep them in lockstep.
     let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
     #[cfg(unix)]
     let push = true;
     #[cfg(not(unix))]

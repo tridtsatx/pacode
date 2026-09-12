@@ -11,6 +11,7 @@
 
 pub mod buffer;
 pub mod manager;
+pub mod oneshot;
 pub mod progress;
 pub mod spec;
 mod state;
@@ -18,4 +19,5 @@ mod supervisor;
 
 pub use buffer::HeadTailBuffer;
 pub use manager::{ExecError, TaskEvent, TaskManager, WaitResult};
+pub use oneshot::{CapturedOutput, run_capture};
 pub use spec::TaskSpec;

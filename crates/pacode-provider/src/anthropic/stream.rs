@@ -279,7 +279,8 @@ pub(crate) fn create_anthropic_event_stream(
                             Err(e) => {
                                 ctx.state.stream_ended = true;
                                 ctx.pending_error = Some(ProviderError::Malformed(format!(
-                                    "invalid Anthropic SSE JSON: {e}"
+                                    "invalid Anthropic SSE JSON: {e}: {}",
+                                    crate::error_body_message(&payload)
                                 )));
                                 break;
                             }

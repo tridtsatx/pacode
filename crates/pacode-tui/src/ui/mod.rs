@@ -4,28 +4,26 @@
 //! Widgets may mutate render caches inside the state but nothing else.
 
 pub mod anim;
-pub mod config_view;
 pub mod dialog;
-pub mod files;
 pub mod footer;
 pub mod header;
 pub mod images;
-pub mod import;
 pub mod input;
-pub mod keys_overlay;
 pub mod login_picker;
 pub mod mascot;
-pub mod mcp;
+pub mod menu;
+pub mod notice;
 pub mod overlays;
 pub mod panel;
 pub mod phrases;
 pub mod picker;
-pub mod plugins;
 pub mod popup;
+pub mod question_picker;
 pub mod rail;
 pub mod rail_session;
 pub mod theme_picker;
 pub mod toast;
+pub mod toolcell;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -46,23 +44,21 @@ pub fn focus_key(focus: &Focus) -> u8 {
         Focus::Normal => 0,
         Focus::SelectAgent { .. } => 1,
         Focus::Panel { .. } => 2,
-        Focus::BgList { .. } => 3,
         Focus::Overlay(overlay) => match overlay {
             Overlay::ModelPicker { .. } => 10,
             Overlay::EffortPicker { .. } => 11,
             Overlay::ModePicker { .. } => 12,
-            Overlay::ConfigPicker => 13,
             Overlay::QuestionPicker { .. } => 14,
             Overlay::ThemePicker { .. } => 15,
-            Overlay::SessionPicker { .. } => 16,
-            Overlay::Files { .. } => 17,
-            Overlay::McpPicker { .. } => 18,
-            Overlay::PluginsPicker { .. } => 19,
-            Overlay::KeysPicker { .. } => 20,
-            Overlay::Import(_) => 21,
             Overlay::RailOverlay => 22,
-            Overlay::Help => 23,
             Overlay::LoginPicker { .. } => 24,
+            // Menu levels key off `MenuId` — the table lives in the menu base
+            // (§3.1); 25..=36 here are the `focus_key` range it owns.
+            Overlay::Menu { stack, .. } => stack
+                .current()
+                .map_or(crate::ui::menu::MenuId::Root.focus_key(), |l| {
+                    l.id.focus_key()
+                }),
         },
     }
 }
@@ -102,8 +98,15 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     // and unfolds for ~140 ms; anything else clears it.
     let fkey = focus_key(&state.focus);
     if fkey != state.last_focus_key {
+        // §3.3: a menu-level change moves to a different focus key but must
+        // not replay the unfold — menu keys (≥ `MenuId::Root`'s) share the
+        // running one.
+        let menu_min = crate::ui::menu::MenuId::Root.focus_key();
+        let within_menu = fkey >= menu_min && state.last_focus_key >= menu_min;
         state.last_focus_key = fkey;
-        state.overlay_since = (fkey >= 3).then_some(now);
+        if !within_menu {
+            state.overlay_since = (fkey >= 3).then_some(now);
+        }
     }
     let grow_ms = state
         .overlay_since
@@ -177,7 +180,11 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                     .agent(&id)
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| id.to_string()),
-                Some(crate::state::PanelTarget::Task(_)) | None => String::new(),
+                Some(crate::state::PanelTarget::Task(_))
+                | Some(crate::state::PanelTarget::McpServer(_))
+                | Some(crate::state::PanelTarget::FileDiff { .. })
+                | Some(crate::state::PanelTarget::CommitDiff { .. })
+                | None => String::new(),
             };
             let banner = Line::from(vec![
                 Span::styled(
@@ -367,38 +374,14 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         };
         let text = extract_selection_text(&lines, &state.selection, dialog_area.width);
         if !text.is_empty() {
-            let count = text.chars().count();
-            if let Err(e) = crate::clipboard::copy(&text) {
-                log::warn!("clipboard copy failed ({count} chars): {e}");
-            }
-            let detail = match copy_req {
-                crate::state::selection::CopyRequest::Auto => {
-                    Some("disable autocopy in /config".to_string())
-                }
-                crate::state::selection::CopyRequest::Explicit
-                | crate::state::selection::CopyRequest::None => None,
-            };
-            state.push_toast(
-                pacode_types::ToastLevel::Info,
-                format!("copied {count} chars"),
-                detail,
-                std::time::Instant::now(),
-            );
-            if crate::clipboard::remote_hint().is_some() && !state.clipboard_warned {
-                state.clipboard_warned = true;
-                let now = std::time::Instant::now();
-                let shown_at = now
-                    .checked_sub(std::time::Duration::from_secs(
-                        crate::state::TOAST_TTL_SECS.saturating_sub(4),
-                    ))
-                    .unwrap_or(now);
-                state.toasts.push_back(crate::state::Toast {
-                    level: pacode_types::ToastLevel::Warn,
-                    title: popup::POPUP_TOAST_TITLE.to_string(),
-                    detail: Some(crate::clipboard::REMOTE_HINT_TEXT.to_string()),
-                    shown_at,
-                });
-            }
+            // §8.1: `clipboard::copy` writes OSC 52 to stdout and opens the
+            // platform clipboard — IO that must not run inside draw. Stash it;
+            // the event loop performs it on a blocking thread and posts the
+            // toast from `CopyDone`.
+            state.pending_copy = Some(crate::state::PendingCopy {
+                text,
+                auto: matches!(copy_req, crate::state::selection::CopyRequest::Auto),
+            });
         }
     }
 
@@ -532,7 +515,10 @@ mod tests {
         assert_eq!(focus_key(&Focus::Normal), 0);
         assert_eq!(focus_key(&Focus::SelectAgent { index: 2 }), 1);
         assert_ne!(
-            focus_key(&Focus::Overlay(Overlay::Help)),
+            focus_key(&Focus::Overlay(Overlay::LoginPicker {
+                query: String::new(),
+                index: 0,
+            })),
             focus_key(&Focus::Overlay(Overlay::RailOverlay))
         );
         // Index changes inside one picker keep the key — no replayed unfold.
@@ -542,7 +528,7 @@ mod tests {
         );
         assert_ne!(
             focus_key(&Focus::Normal),
-            focus_key(&Focus::BgList { index: 0 })
+            focus_key(&Focus::Overlay(Overlay::RailOverlay))
         );
     }
 }

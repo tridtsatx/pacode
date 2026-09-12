@@ -241,6 +241,15 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
         })
         .unwrap();
 
+    // §8.1: draw stashes the copy in `pending_copy`; the event loop performs
+    // it and `on_copy_done` posts the toast. Simulate that reply here.
+    let copy = state
+        .pending_copy
+        .take()
+        .expect("draw must stash the autocopy");
+    assert!(copy.auto, "CopyRequest::Auto marks the pending copy auto");
+    state.on_copy_done(copy.auto, copy.text.chars().count());
+
     let auto_toast = state
         .toasts
         .back()
@@ -279,6 +288,13 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
             crate::ui::draw(f, &mut state);
         })
         .unwrap();
+
+    let copy = state
+        .pending_copy
+        .take()
+        .expect("draw must stash the explicit copy");
+    assert!(!copy.auto, "CopyRequest::Explicit must not mark it auto");
+    state.on_copy_done(copy.auto, copy.text.chars().count());
 
     let explicit_toast = state
         .toasts

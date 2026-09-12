@@ -65,6 +65,34 @@ pub fn detect_truecolor() -> bool {
     }
 }
 
+/// How much colour the terminal can show; renderers degrade in steps: RGB +
+/// background bands under `Truecolor` → ANSI-16 foregrounds → glyphs only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorMode {
+    /// `COLORTERM`/`PACODE_COLOR` = `truecolor`/`24bit`.
+    #[default]
+    Truecolor,
+    /// ANSI-16 only (`ui.color = ansi`, `PACODE_COLOR=ansi`, no truecolor).
+    Ansi,
+    /// No colour (`PACODE_COLOR=mono` or a non-empty `NO_COLOR`).
+    Mono,
+}
+
+impl ColorMode {
+    /// `PACODE_COLOR` (written from `[ui] color` at startup) wins over
+    /// `NO_COLOR`, which wins over `COLORTERM` autodetection.
+    pub fn detect() -> Self {
+        match std::env::var("PACODE_COLOR").ok().as_deref() {
+            Some("mono") => Self::Mono,
+            Some("ansi") => Self::Ansi,
+            Some("truecolor") | Some("24bit") => Self::Truecolor,
+            _ if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) => Self::Mono,
+            _ if detect_truecolor() => Self::Truecolor,
+            _ => Self::Ansi,
+        }
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         if detect_truecolor() {

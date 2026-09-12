@@ -31,8 +31,7 @@ pub const REMOTE_HINT_TEXT: &str = "Copied via OSC52. In tmux run: set -g set-cl
 pub fn base64_encode(bytes: &[u8]) -> String {
     const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let chunks = bytes.chunks_exact(3);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = bytes.as_chunks::<3>();
 
     for chunk in chunks {
         let b0 = chunk[0] as usize;

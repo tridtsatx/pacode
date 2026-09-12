@@ -75,38 +75,156 @@ fn test_eviction_cap_at_500() {
 }
 
 #[test]
-fn test_sorted_rows_desc() {
-    let mut files = FilesState::new();
-    files.observe_tool_item("read", &json!({"path": "old.rs"}), 100);
-    files.observe_tool_item("read", &json!({"path": "newest.rs"}), 300);
-    files.observe_tool_item("read", &json!({"path": "mid.rs"}), 200);
-
-    let sorted = files.sorted_rows();
-    assert_eq!(sorted.len(), 3);
-    assert_eq!(sorted[0].path, "newest.rs");
-    assert_eq!(sorted[1].path, "mid.rs");
-    assert_eq!(sorted[2].path, "old.rs");
-}
-
-#[test]
 fn test_clear_preview() {
     let mut files = FilesState::new();
     assert!(files.cached_preview.is_none());
-    assert!(files.pending_escape.is_none());
 
-    let key = ImageCacheKey {
-        path: std::path::PathBuf::from("test.png"),
-        cell_w: 10,
-        cell_h: 10,
-    };
-    files.cached_preview = Some(CachedImagePreview { key, preview: None });
-    files.pending_escape = Some((
-        ratatui::layout::Rect::new(0, 0, 10, 10),
-        "esc".to_string(),
-        std::path::PathBuf::from("test.png"),
-    ));
+    files.cached_preview = Some(CachedPreview {
+        key: PreviewKey {
+            raw: "test.rs".to_string(),
+        },
+        resolved: std::path::PathBuf::from("test.rs"),
+        text: None,
+    });
+    files.preview_want = Some(PreviewKey {
+        raw: "other.rs".to_string(),
+    });
+    files.preview_in_flight = files.preview_want.clone();
 
     files.clear_preview();
     assert!(files.cached_preview.is_none());
-    assert!(files.pending_escape.is_none());
+    assert!(files.preview_want.is_none());
+    assert!(files.preview_in_flight.is_none());
+}
+
+#[test]
+fn test_apply_diff_folds_stats_once_per_call() {
+    let mut files = FilesState::new();
+    files.observe_tool_item("write", &json!({"path": "src/new.rs"}), 100);
+    let call = CallId::new("call_1");
+
+    files.apply_diff(
+        "write",
+        &json!({"path": "src/new.rs"}),
+        &call,
+        DiffStat {
+            added: 12,
+            removed: 0,
+        },
+        150,
+    );
+    let row = &files.rows[0];
+    assert_eq!((row.added, row.removed), (12, 0));
+    assert!(row.has_diff);
+    assert!(row.created, "an all-add first diff means the file is new");
+
+    // The same completed item arriving again must not double-count.
+    files.apply_diff(
+        "write",
+        &json!({"path": "src/new.rs"}),
+        &call,
+        DiffStat {
+            added: 12,
+            removed: 0,
+        },
+        160,
+    );
+    assert_eq!(files.rows[0].added, 12);
+}
+
+#[test]
+fn test_apply_diff_accumulates_and_marks_existing() {
+    let mut files = FilesState::new();
+    files.observe_tool_item("edit", &json!({"path": "src/main.rs"}), 100);
+    files.apply_diff(
+        "edit",
+        &json!({"path": "src/main.rs"}),
+        &CallId::new("call_1"),
+        DiffStat {
+            added: 4,
+            removed: 2,
+        },
+        150,
+    );
+    files.apply_diff(
+        "edit",
+        &json!({"path": "src/main.rs"}),
+        &CallId::new("call_2"),
+        DiffStat {
+            added: 1,
+            removed: 3,
+        },
+        200,
+    );
+    let row = &files.rows[0];
+    assert_eq!((row.added, row.removed), (5, 5));
+    assert!(row.has_diff);
+    assert!(!row.created);
+    assert_eq!(row.last_ts_ms, 200);
+}
+
+#[test]
+fn test_apply_diff_ignores_reads_and_missing_rows() {
+    let mut files = FilesState::new();
+    files.observe_tool_item("read", &json!({"path": "src/main.rs"}), 100);
+    files.apply_diff(
+        "read",
+        &json!({"path": "src/main.rs"}),
+        &CallId::new("call_1"),
+        DiffStat {
+            added: 1,
+            removed: 0,
+        },
+        150,
+    );
+    assert!(!files.rows[0].has_diff, "a read call carries no diff");
+
+    // A diff for a row the ItemAdded path never made is dropped.
+    files.apply_diff(
+        "edit",
+        &json!({"path": "ghost.rs"}),
+        &CallId::new("call_2"),
+        DiffStat {
+            added: 3,
+            removed: 1,
+        },
+        160,
+    );
+    assert_eq!(files.len(), 1);
+}
+
+#[test]
+fn test_status_of_looks_up_the_row_spelling() {
+    // `statuses` is keyed by the exact string the scan was asked about (the
+    // row's own path) — `worktree_statuses` already mapped git's
+    // root-relative output back to it, so the lookup is literal.
+    let mut files = FilesState::new();
+    files
+        .statuses
+        .insert("./src/main.rs".to_string(), FileStatus::Modified);
+    assert_eq!(files.status_of("./src/main.rs"), Some(FileStatus::Modified));
+    // No normalization at read time: a different spelling is a different row.
+    assert_eq!(files.status_of("src/main.rs"), None);
+}
+
+#[test]
+fn test_rows_version_tracks_staleness() {
+    let mut files = FilesState::new();
+    assert_eq!(files.statused_at, None);
+    let v0 = files.rows_version;
+    files.observe_tool_item("read", &json!({"path": "a.rs"}), 100);
+    assert!(files.rows_version > v0);
+    let v1 = files.rows_version;
+    files.apply_statuses(BTreeMap::new(), v1);
+    assert_eq!(files.statused_at, Some(v1));
+    assert!(!files.statuses_in_flight);
+}
+
+#[test]
+fn test_title_path_arg() {
+    assert_eq!(title_path_arg("write", "Write src/x.rs"), "src/x.rs");
+    assert_eq!(title_path_arg("edit", "Edit a/b.rs"), "a/b.rs");
+    assert_eq!(title_path_arg("read", "Read top.rs"), "top.rs");
+    // A title that is just the verb stays whole.
+    assert_eq!(title_path_arg("write", "Write"), "Write");
 }

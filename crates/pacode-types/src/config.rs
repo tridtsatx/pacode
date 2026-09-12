@@ -36,6 +36,11 @@ pub struct Config {
     pub hooks: HooksConfig,
     /// Zero-data-retention routing (`zdr = "always" | "session" | "off"`).
     pub zdr: ZdrMode,
+    /// `[tools.<name>]`: per-tool toggles. `enabled = false` removes the tool
+    /// from the schema sent to the model — built-in names as well as plugin,
+    /// skill and MCP `<server>__<tool>` names. Applied when the daemon wires
+    /// its registries, so changes need a restart.
+    pub tools: BTreeMap<String, ToolToggle>,
 }
 
 impl Config {
@@ -49,6 +54,32 @@ impl Config {
 
     pub fn pricing_for(&self, model: &str) -> Option<Pricing> {
         self.pricing.get(model).copied()
+    }
+
+    /// Whether `name` is exposed to the model; tools without an entry are enabled.
+    pub fn tool_enabled(&self, name: &str) -> bool {
+        self.tools.get(name).map(|t| t.enabled).unwrap_or(true)
+    }
+
+    /// Names disabled via `[tools.<name>] enabled = false`.
+    pub fn disabled_tool_names(&self) -> impl Iterator<Item = &str> {
+        self.tools
+            .iter()
+            .filter(|(_, toggle)| !toggle.enabled)
+            .map(|(name, _)| name.as_str())
+    }
+}
+
+/// `[tools.<name>]` entry; a present-but-empty table means enabled.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolToggle {
+    pub enabled: bool,
+}
+
+impl Default for ToolToggle {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -662,6 +693,28 @@ mod tests {
         assert!(cfg.hooks.session_start.is_empty());
         assert!(cfg.hooks.session_end.is_empty());
         assert!(cfg.hooks.notification.is_empty());
+        assert!(cfg.tools.is_empty());
+    }
+
+    #[test]
+    fn tool_toggles_parse_and_query() {
+        // Same shape as `[tools.bash] enabled = false` in config.toml.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "tools": {
+                "bash": { "enabled": false },
+                "github__get_pr": { "enabled": false },
+                "read": {},
+            }
+        }))
+        .unwrap();
+        assert!(!cfg.tool_enabled("bash"));
+        assert!(!cfg.tool_enabled("github__get_pr"));
+        // A present-but-empty table means enabled; absent tools are enabled.
+        assert!(cfg.tool_enabled("read"));
+        assert!(cfg.tool_enabled("grep"));
+        let mut disabled: Vec<&str> = cfg.disabled_tool_names().collect();
+        disabled.sort();
+        assert_eq!(disabled, ["bash", "github__get_pr"]);
     }
 
     #[test]
@@ -826,11 +879,31 @@ pub struct FontConfig {
     pub weight: Option<String>,
 }
 
-/// `[keys]`: action name to key binding, e.g. `follow_agent = "alt+f"`.
-/// Unset actions keep their built-in binding.
+/// `[keys]`: action name to key binding, e.g. `follow_agent = "alt+f"`, plus
+/// the double-Shift hub settings. Unset actions keep their built-in binding.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeysConfig {
+    /// Double-tap Shift opens the menu hub (default true; §4.2 of the menu
+    /// spec). Named field — not a binding — so `Keymap::from_config` never
+    /// sees it as an unknown action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub double_shift: Option<bool>,
+    /// Max milliseconds between the two Shift taps (default 400).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub double_shift_ms: Option<u64>,
     #[serde(flatten)]
     pub bindings: BTreeMap<String, String>,
+}
+
+impl KeysConfig {
+    /// Whether the double-Shift gesture opens the menu hub.
+    pub fn double_shift_enabled(&self) -> bool {
+        self.double_shift.unwrap_or(true)
+    }
+
+    /// The pair window in milliseconds.
+    pub fn double_shift_threshold_ms(&self) -> u64 {
+        self.double_shift_ms.unwrap_or(400)
+    }
 }

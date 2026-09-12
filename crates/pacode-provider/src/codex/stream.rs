@@ -96,7 +96,8 @@ pub fn create_responses_event_stream(
                             Err(e) => {
                                 state.stream_ended = true;
                                 state.pending_error = Some(ProviderError::Malformed(format!(
-                                    "invalid SSE JSON: {e}"
+                                    "invalid SSE JSON: {e}: {}",
+                                    crate::error_body_message(&payload)
                                 )));
                                 break;
                             }
@@ -214,7 +215,10 @@ impl CodexStreamOpener {
                     log::warn!("codex request failed ({status_u16}): {redacted_body}");
 
                     if status_u16 == 401 || status_u16 == 403 {
-                        return Err(ProviderError::Auth(format!("{status_u16}: {text}")));
+                        return Err(ProviderError::Auth(format!(
+                            "{status_u16}: {}",
+                            crate::error_body_message(&text)
+                        )));
                     }
 
                     let is_retryable = status_u16 == 429 || status_u16 >= 500;
@@ -225,11 +229,11 @@ impl CodexStreamOpener {
                     }
 
                     if status_u16 == 429 {
-                        return Err(ProviderError::RateLimited(text));
+                        return Err(ProviderError::RateLimited(crate::error_body_message(&text)));
                     }
                     return Err(ProviderError::Http {
                         status: status_u16,
-                        message: text,
+                        message: crate::error_body_message(&text),
                     });
                 }
                 Err(err) => {

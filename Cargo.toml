@@ -22,6 +22,7 @@ members = [
     "crates/pacode-acp",
     "crates/pacode-auth",
     "crates/pacode-net",
+    "crates/pacode-vcs",
 ]
 
 [workspace.package]
@@ -56,6 +57,7 @@ pacode-skills = { path = "crates/pacode-skills", version = "1.0.0" }
 pacode-acp = { path = "crates/pacode-acp", version = "1.0.0" }
 pacode-auth = { path = "crates/pacode-auth", version = "1.0.0" }
 pacode-net = { path = "crates/pacode-net", version = "1.0.0" }
+pacode-vcs = { path = "crates/pacode-vcs", version = "1.0.0" }
 
 # async
 tokio = { version = "1", default-features = false }

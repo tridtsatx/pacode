@@ -41,7 +41,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
             typed,
             typing,
         }) => {
-            draw_question(
+            crate::ui::question_picker::draw(
                 frame, area, question, *index, selected, typed, *typing, opts,
             );
         }
@@ -281,13 +281,19 @@ fn draw_model(
 ) {
     let mut lines = Vec::new();
 
-    // 0: Title
+    // 0: Title — with the §8.2 cache badge when the model list on screen is a
+    // stale disk copy or still loading.
+    let base_title = if for_zdr {
+        "ZDR: pick a capable model"
+    } else {
+        "Switch Model"
+    };
+    let title = crate::ui::overlays::title_with_badge(
+        base_title,
+        state.lists.badge(crate::cache::ListKind::Models),
+    );
     lines.push(Line::from(Span::styled(
-        if for_zdr {
-            "ZDR: pick a capable model"
-        } else {
-            "Switch Model"
-        },
+        title,
         opts.theme.bold.patch(opts.theme.accent),
     )));
 
@@ -377,105 +383,38 @@ fn draw_model(
         lines.push(Line::default());
     }
 
-    let hint = if state.config.ui.ascii_only {
-        "^/v select . enter confirm . z zdr . s fav . esc cancel"
-    } else {
-        "↑/↓ select · enter confirm · z zdr · s fav · esc cancel"
-    };
-    lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
+    // §9.1: the mark chips are generated from the live keymap — a rebound
+    // chord shows its own spelling, an unbound action drops out entirely.
+    let sep = opts.glyphs.dot_sep;
+    let arrows = if opts.glyphs.ascii { "^/v" } else { "↑/↓" };
+    let mut items = vec![format!("{arrows} select"), "enter confirm".to_string()];
+    for (action, label) in [
+        (crate::binding::Action::ModelPickerFavorite, "fav"),
+        (crate::binding::Action::ModelPickerZdr, "zdr"),
+    ] {
+        let chords = state
+            .keymap
+            .bindings_for(action)
+            .iter()
+            .map(crate::binding::format_binding)
+            .collect::<Vec<_>>()
+            .join("/");
+        if !chords.is_empty() {
+            items.push(format!("{chords} {label}"));
+        }
+    }
+    items.push("esc cancel".to_string());
+    let hint = items.join(sep);
+    lines.push(Line::from(Span::styled(
+        pacode_render::truncate_to_width(&hint, area.width as usize, true),
+        opts.theme.dim,
+    )));
 
     frame.render_widget(Paragraph::new(lines), area);
 
     // Set cursor on query input
     let cursor_x = area.x + 2 + (query.len() as u16).min(area.width.saturating_sub(3));
     frame.set_cursor_position((cursor_x, area.y + 1));
-}
-
-/// The question the model asked, as a bottom picker: the header chip, the
-/// question, one row per option with its description, and the key hints.
-#[allow(clippy::too_many_arguments)]
-fn draw_question(
-    frame: &mut Frame,
-    area: Rect,
-    question: &pacode_types::Question,
-    index: usize,
-    selected: &[usize],
-    typed: &str,
-    typing: bool,
-    opts: &RenderOptions,
-) {
-    let width = area.width as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    if !question.header.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(" {} ", question.header),
-            opts.theme.selected_bg,
-        )));
-    }
-    for line in pacode_render::wrap_text(&question.question, width) {
-        lines.push(Line::from(Span::styled(line, opts.theme.bold)));
-    }
-
-    for (i, option) in question.options.iter().enumerate() {
-        let is_cursor = i == index;
-        let is_selected = selected.contains(&i);
-        let marker = if is_selected {
-            opts.glyphs.ok
-        } else if is_cursor {
-            opts.glyphs.pointer
-        } else {
-            " "
-        };
-        let marker_style = if is_selected {
-            opts.theme.green
-        } else {
-            opts.theme.accent
-        };
-        let mut spans = vec![
-            Span::styled(format!("{marker} "), marker_style),
-            Span::styled(
-                format!("{}. {}", i + 1, option.label),
-                if is_cursor {
-                    opts.theme.bold
-                } else {
-                    opts.theme.fg
-                },
-            ),
-        ];
-        if option.recommended {
-            spans.push(Span::styled(" (recommended)", opts.theme.faint));
-        }
-        let line = Line::from(spans);
-        if is_cursor {
-            lines.push(selected_row(line, width as u16, opts));
-        } else {
-            lines.push(line);
-        }
-        if is_cursor && !option.description.is_empty() {
-            for dl in pacode_render::wrap_text(&option.description, width.saturating_sub(4)) {
-                lines.push(selected_row(
-                    Line::from(Span::styled(format!("    {dl}"), opts.theme.dim)),
-                    width as u16,
-                    opts,
-                ));
-            }
-        }
-    }
-
-    let hint = if typing {
-        format!("type an answer · enter send · esc back    {typed}")
-    } else if question.multi_select {
-        "space toggle · enter send · 1-9 pick one · t type · esc dismiss".to_string()
-    } else {
-        "enter select · 1-9 pick · t type an answer · esc dismiss".to_string()
-    };
-    lines.push(Line::from(Span::styled(
-        pacode_render::truncate_to_width(&hint, width, true),
-        opts.theme.dim,
-    )));
-
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]

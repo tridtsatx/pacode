@@ -4,7 +4,8 @@
 //! cached per token — escape payloads (kitty/sixel) can be tens of MB, so they
 //! are never re-encoded while the layout is unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use pacode_types::ImageSource;
 
@@ -40,12 +41,23 @@ pub struct CachedThumb {
 #[derive(Debug, Default)]
 pub struct ImageStripState {
     pub thumbs: HashMap<usize, CachedThumb>,
+    /// `(token, cell_w, cell_h)` renders running on blocking threads — draw
+    /// shows a placeholder for these and never renders inline (§8.1).
+    pub in_flight: HashSet<(usize, u16, u16)>,
+    /// Thumbnails draw asked for — `(token, path, cell_w, cell_h)`. The event
+    /// loop drains this into `in_flight` jobs; each entry arrives at most once
+    /// per frame pass.
+    pub want: Vec<(usize, PathBuf, u16, u16)>,
 }
 
 impl ImageStripState {
-    /// Drop cached thumbs for tokens that are no longer referenced by the input.
+    /// Drop cached thumbs for tokens that are no longer referenced by the
+    /// input. In-flight renders for dead tokens are dropped too — their
+    /// replies land in `thumbs` and get evicted on the next `retain`.
     pub fn retain(&mut self, live: &[usize]) {
         self.thumbs.retain(|token, _| live.contains(token));
+        self.in_flight.retain(|(token, _, _)| live.contains(token));
+        self.want.retain(|(token, ..)| live.contains(token));
     }
 }
 

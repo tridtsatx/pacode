@@ -195,7 +195,9 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
         }
     }
 
-    // @ file reference popup (drawn ABOVE the input box)
+    // @ file reference popup (drawn ABOVE the input box). §8.1: the directory
+    // scan must never run inside draw — the popup records `want`, the event
+    // loop scans on a blocking thread and the next frame reads `ready`.
     let byte_cursor =
         crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
     let at_query = if !state.input.at_closed {
@@ -203,91 +205,105 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
     } else {
         None
     };
-    if let Some(ref q) = at_query {
-        let cwd = state.cwd();
-        let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
-        if !candidates.is_empty() {
-            let max_visible = 6;
-            let count = candidates.len().min(max_visible);
-            let popup_h = count as u16;
-            let popup_y = layout.input_top.y.saturating_sub(popup_h);
-            let popup_w = layout.input.width.min(50);
-            let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
+    let at_key = at_query.as_ref().map(|q| crate::state::input::AtKey {
+        query: q.query.clone(),
+        cursor_byte: byte_cursor,
+        cwd: state.cwd(),
+    });
+    state.input.at_comp.set_want(at_key.clone());
+    let at_candidates = at_key
+        .as_ref()
+        .and_then(|k| state.input.at_comp.candidates_for(k));
+    if let Some(candidates) = at_candidates
+        && !candidates.is_empty()
+    {
+        let max_visible = 6;
+        let count = candidates.len().min(max_visible);
+        let popup_h = count as u16;
+        let popup_y = layout.input_top.y.saturating_sub(popup_h);
+        let popup_w = layout.input.width.min(50);
+        let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
 
-            frame.render_widget(Clear, popup_area);
+        frame.render_widget(Clear, popup_area);
 
-            let selected = state.input.at_index % candidates.len();
-            let start = if selected >= max_visible {
-                selected + 1 - max_visible
+        let selected = state.input.at_index % candidates.len();
+        let start = if selected >= max_visible {
+            selected + 1 - max_visible
+        } else {
+            0
+        };
+
+        let mut popup_lines = Vec::new();
+        for (i, cand) in candidates.iter().enumerate().skip(start).take(count) {
+            let is_sel = i == selected;
+            let padded = format!("{:<width$}", cand.path, width = popup_w as usize);
+            let style = if is_sel {
+                opts.theme
+                    .selected_bg
+                    .patch(opts.theme.cyan)
+                    .patch(opts.theme.bold)
+            } else if cand.is_dir {
+                opts.theme.cyan
             } else {
-                0
+                opts.theme.fg
             };
-
-            let mut popup_lines = Vec::new();
-            for (i, cand) in candidates.iter().enumerate().skip(start).take(count) {
-                let is_sel = i == selected;
-                let padded = format!("{:<width$}", cand.path, width = popup_w as usize);
-                let style = if is_sel {
-                    opts.theme
-                        .selected_bg
-                        .patch(opts.theme.cyan)
-                        .patch(opts.theme.bold)
-                } else if cand.is_dir {
-                    opts.theme.cyan
-                } else {
-                    opts.theme.fg
-                };
-                popup_lines.push(Line::from(Span::styled(padded, style)));
-            }
-
-            frame.render_widget(Paragraph::new(popup_lines), popup_area);
+            popup_lines.push(Line::from(Span::styled(padded, style)));
         }
+
+        frame.render_widget(Paragraph::new(popup_lines), popup_area);
     }
 
-    // Bash completion popup (drawn ABOVE the input box)
-    if state.input.text.starts_with('!') && !state.input.bash_complete_closed {
-        let cwd = state.cwd();
-        let char_cursor = state.input.cursor.saturating_sub(1);
-        let candidates = crate::bash::complete::complete(
-            &state.input.text[1..],
-            char_cursor,
-            &state.input.bash_history,
-            &cwd,
-        );
-        if !candidates.is_empty() {
-            let max_visible = 6;
-            let count = candidates.len().min(max_visible);
-            let popup_h = count as u16;
-            let popup_y = layout.input_top.y.saturating_sub(popup_h);
-            let popup_w = layout.input.width.min(50);
-            let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
+    // Bash completion popup (drawn ABOVE the input box) — same deferred-scan
+    // contract as `@` above.
+    let bash_key = if state.input.text.starts_with('!') && !state.input.bash_complete_closed {
+        Some(crate::state::input::BashKey {
+            text: state.input.text[1..].to_string(),
+            cursor: state.input.cursor.saturating_sub(1),
+            cwd: state.cwd(),
+            history_len: state.input.bash_history.len(),
+        })
+    } else {
+        None
+    };
+    state.input.bash_comp.set_want(bash_key.clone());
+    let bash_candidates = bash_key
+        .as_ref()
+        .and_then(|k| state.input.bash_comp.candidates_for(k));
+    if let Some(candidates) = bash_candidates
+        && !candidates.is_empty()
+    {
+        let max_visible = 6;
+        let count = candidates.len().min(max_visible);
+        let popup_h = count as u16;
+        let popup_y = layout.input_top.y.saturating_sub(popup_h);
+        let popup_w = layout.input.width.min(50);
+        let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
 
-            frame.render_widget(Clear, popup_area);
+        frame.render_widget(Clear, popup_area);
 
-            let selected = state.input.bash_complete_index % candidates.len();
-            let start = if selected >= max_visible {
-                selected + 1 - max_visible
+        let selected = state.input.bash_complete_index % candidates.len();
+        let start = if selected >= max_visible {
+            selected + 1 - max_visible
+        } else {
+            0
+        };
+
+        let mut popup_lines = Vec::new();
+        for (i, cand) in candidates.iter().enumerate().skip(start).take(count) {
+            let is_sel = i == selected;
+            let padded = format!("{:<width$}", cand.display, width = popup_w as usize);
+            let style = if is_sel {
+                opts.theme
+                    .selected_bg
+                    .patch(opts.theme.cyan)
+                    .patch(opts.theme.bold)
             } else {
-                0
+                opts.theme.fg
             };
-
-            let mut popup_lines = Vec::new();
-            for (i, cand) in candidates.iter().enumerate().skip(start).take(count) {
-                let is_sel = i == selected;
-                let padded = format!("{:<width$}", cand.display, width = popup_w as usize);
-                let style = if is_sel {
-                    opts.theme
-                        .selected_bg
-                        .patch(opts.theme.cyan)
-                        .patch(opts.theme.bold)
-                } else {
-                    opts.theme.fg
-                };
-                popup_lines.push(Line::from(Span::styled(padded, style)));
-            }
-
-            frame.render_widget(Paragraph::new(popup_lines), popup_area);
+            popup_lines.push(Line::from(Span::styled(padded, style)));
         }
+
+        frame.render_widget(Paragraph::new(popup_lines), popup_area);
     }
 
     // Prompt queue popup (drawn ABOVE the input box when no other popup is active)

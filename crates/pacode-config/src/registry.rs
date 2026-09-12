@@ -103,11 +103,29 @@ pub const SECTIONS: &[&str] = &[
     "session",
     "plugins",
     "skills",
+    "tools",
     "theme",
     "font",
     "keys",
     "web",
 ];
+
+/// `tools.<name>.enabled` rows for the built-in tools; plugin/MCP names like
+/// `tools.github__get_pr.enabled` are handled dynamically in
+/// `read_value`/`apply_to_config`/`validate`.
+macro_rules! tool_toggle {
+    ($name:literal) => {
+        SettingEntry {
+            dotted_key: concat!("tools.", $name, ".enabled"),
+            label: concat!("Tool: ", $name),
+            description: concat!("Enable the `", $name, "` tool"),
+            section: "tools",
+            default_value: "true",
+            kind: SettingKind::Bool,
+            apply: ApplyMode::Restart,
+        }
+    };
+}
 
 const EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const SUBAGENT_EFFORT_OPTIONS: &[&str] = &["", "low", "medium", "high", "xhigh", "max"];
@@ -208,6 +226,32 @@ pub static SETTINGS: &[SettingEntry] = &[
 
     // keys
     SettingEntry { dotted_key: "keys", label: "Keybindings", description: "Action keybindings (customize with /keys)", section: "keys", default_value: "/keys", kind: SettingKind::Action { command: "/keys" }, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "keys.double_shift", label: "Double-Shift Menu", description: "Double-tap Shift opens the menu hub", section: "keys", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "keys.double_shift_ms", label: "Double-Shift Interval", description: "Max milliseconds between the two Shift taps", section: "keys", default_value: "400", kind: SettingKind::Integer { min: 50, max: 2000 }, apply: ApplyMode::Immediate },
+
+    // tools — `tools.<name>.enabled = false` removes the tool from the model
+    // schema entirely (registry drops it; dispatch reports "unknown tool").
+    tool_toggle!("read"),
+    tool_toggle!("write"),
+    tool_toggle!("edit"),
+    tool_toggle!("multi_edit"),
+    tool_toggle!("bash"),
+    tool_toggle!("batch"),
+    tool_toggle!("ask_question"),
+    tool_toggle!("bg"),
+    tool_toggle!("cron"),
+    tool_toggle!("monitor"),
+    tool_toggle!("grep"),
+    tool_toggle!("glob"),
+    tool_toggle!("ls"),
+    tool_toggle!("plan"),
+    tool_toggle!("agent"),
+    tool_toggle!("webfetch"),
+    tool_toggle!("websearch"),
+    tool_toggle!("report_status"),
+    tool_toggle!("memory_write"),
+    tool_toggle!("memory_read"),
+    tool_toggle!("skill"),
 
     // web
     SettingEntry { dotted_key: "web.default_num_results", label: "Default Search Results", description: "Default number of search results to return", section: "web", default_value: "8", kind: SettingKind::Integer { min: 1, max: 50 }, apply: ApplyMode::Restart },
@@ -222,7 +266,32 @@ pub fn find_entry(dotted_key: &str) -> Option<&'static SettingEntry> {
     SETTINGS.iter().find(|e| e.dotted_key == dotted_key)
 }
 
+/// `tools.<name>.enabled` → the tool name. Names never contain dots, so a key
+/// like `tools.a.b.enabled` is not a tool toggle.
+fn tool_toggle_key(dotted_key: &str) -> Option<&str> {
+    dotted_key
+        .strip_prefix("tools.")
+        .and_then(|rest| rest.strip_suffix(".enabled"))
+        .filter(|name| !name.is_empty() && !name.contains('.'))
+}
+
+fn validate_bool(candidate: &str) -> Result<toml::Value, ValidationError> {
+    let trimmed = candidate.trim();
+    if trimmed == "true" {
+        Ok(toml::Value::Boolean(true))
+    } else if trimmed == "false" {
+        Ok(toml::Value::Boolean(false))
+    } else {
+        Err(ValidationError::InvalidBool {
+            value: candidate.to_string(),
+        })
+    }
+}
+
 pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
+    if let Some(name) = tool_toggle_key(dotted_key) {
+        return Some(config.tool_enabled(name).to_string());
+    }
     match dotted_key {
         "provider.default" => Some(config.provider.default.clone().unwrap_or_default()),
         "provider.effort" => Some(config.provider.effort.as_str().to_string()),
@@ -312,6 +381,8 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             "{} custom bindings (/keys)",
             config.keys.bindings.len()
         )),
+        "keys.double_shift" => Some(config.keys.double_shift_enabled().to_string()),
+        "keys.double_shift_ms" => Some(config.keys.double_shift_threshold_ms().to_string()),
         "web.default_num_results" => Some(config.web.default_num_results.to_string()),
         "web.request_timeout_secs" => Some(config.web.request_timeout_secs.to_string()),
         _ => None,
@@ -322,23 +393,75 @@ pub fn is_modified(config: &Config, entry: &SettingEntry) -> bool {
     read_value(config, entry.dotted_key).as_deref() != Some(entry.default_value)
 }
 
+/// Where a setting's effective value came from — the `origin` line of the
+/// Settings detail card (§5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Nothing overrides it — the registry `default_value` is in effect.
+    Default,
+    /// Set in the user config (`config.toml` or a split sibling).
+    Global,
+    /// Set by a project-level config. Reserved: pacode has no project config
+    /// layer yet, so nothing returns this today.
+    Project,
+    /// Forced by an environment variable (`PACODE_MODEL`, `PACODE_EFFORT`,
+    /// `PACODE_MODE`) — env wins over every file.
+    Env,
+}
+
+impl Origin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Env => "env",
+        }
+    }
+}
+
+/// The env var owning a dotted key, when the key is env-overridable — the same
+/// mapping `apply_env_overrides` applies on load.
+fn env_key(dotted_key: &str) -> Option<&'static str> {
+    match dotted_key {
+        "provider.default" => Some("PACODE_MODEL"),
+        "provider.effort" => Some("PACODE_EFFORT"),
+        "permissions.default_mode" => Some("PACODE_MODE"),
+        _ => None,
+    }
+}
+
+/// Where `entry`'s effective value came from (§5.1). A live env override wins
+/// over files; short of that, a value differing from the registry default must
+/// have come from the user config — the only settings file pacode has today.
+pub fn value_origin(config: &Config, entry: &SettingEntry) -> Origin {
+    value_origin_with(config, entry, |var| std::env::var_os(var).is_some())
+}
+
+/// [`value_origin`] with the environment injected — tests pass a lookup
+/// instead of touching the real process environment.
+fn value_origin_with(
+    config: &Config,
+    entry: &SettingEntry,
+    env_set: impl Fn(&str) -> bool,
+) -> Origin {
+    if env_key(entry.dotted_key).is_some_and(&env_set) {
+        return Origin::Env;
+    }
+    if is_modified(config, entry) {
+        Origin::Global
+    } else {
+        Origin::Default
+    }
+}
+
 pub fn validate_candidate(
     entry: &SettingEntry,
     candidate: &str,
 ) -> Result<toml::Value, ValidationError> {
     let trimmed = candidate.trim();
     match entry.kind {
-        SettingKind::Bool => {
-            if trimmed == "true" {
-                Ok(toml::Value::Boolean(true))
-            } else if trimmed == "false" {
-                Ok(toml::Value::Boolean(false))
-            } else {
-                Err(ValidationError::InvalidBool {
-                    value: candidate.to_string(),
-                })
-            }
-        }
+        SettingKind::Bool => validate_bool(candidate),
         SettingKind::Integer { min, max } => {
             if trimmed.is_empty() && entry.dotted_key == "font.size" {
                 Ok(toml::Value::String(String::new()))
@@ -418,6 +541,9 @@ pub fn validate_candidate(
 }
 
 pub fn validate(dotted_key: &str, candidate: &str) -> Result<toml::Value, ValidationError> {
+    if tool_toggle_key(dotted_key).is_some() {
+        return validate_bool(candidate);
+    }
     let entry = find_entry(dotted_key).ok_or_else(|| ValidationError::UnknownKey {
         key: dotted_key.to_string(),
     })?;
@@ -425,6 +551,12 @@ pub fn validate(dotted_key: &str, candidate: &str) -> Result<toml::Value, Valida
 }
 
 pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Value) {
+    if let Some(name) = tool_toggle_key(dotted_key) {
+        if let toml::Value::Boolean(enabled) = value {
+            config.tools.entry(name.to_string()).or_default().enabled = *enabled;
+        }
+        return;
+    }
     match dotted_key {
         "provider.default" => {
             if let toml::Value::String(s) = value {
@@ -512,6 +644,16 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "plugins.marketplace" => {
             if let toml::Value::String(v) = value {
                 config.plugins.marketplace = v.clone();
+            }
+        }
+        "keys.double_shift" => {
+            if let toml::Value::Boolean(b) = value {
+                config.keys.double_shift = Some(*b);
+            }
+        }
+        "keys.double_shift_ms" => {
+            if let toml::Value::Integer(n) = value {
+                config.keys.double_shift_ms = Some(*n as u64);
             }
         }
         "ui.agent_view" => {

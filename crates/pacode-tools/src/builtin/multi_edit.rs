@@ -136,6 +136,7 @@ impl Tool for MultiEditTool {
         let tmp_path = format!("{}.pacode-tmp", full_path.to_string_lossy());
         tokio::fs::write(&tmp_path, current.as_bytes()).await?;
         tokio::fs::rename(&tmp_path, &full_path).await?;
+        crate::walk::invalidate_path(&full_path);
 
         let preview = first_changed_line(&diff);
         let title = format!("Multi-edit {rel_path}");

@@ -249,7 +249,8 @@ impl ConnectFrameDecoder {
                         }
                         Err(e) => {
                             return Err(ProviderError::Malformed(format!(
-                                "invalid Connect trailer JSON: {e}"
+                                "invalid Connect trailer JSON: {e}: {}",
+                                crate::error_body_message(&String::from_utf8_lossy(&payload))
                             )));
                         }
                     }
@@ -378,17 +379,17 @@ pub fn parse_connect_error(body: &str, status: u16) -> ProviderError {
     if let Ok(err) = serde_json::from_str::<ConnectErrorPayload>(body)
         && let Some(code) = err.code
     {
-        let message = err.message.unwrap_or_else(|| body.to_string());
+        let message = err
+            .message
+            .unwrap_or_else(|| crate::error_body_message(body));
         return map_connect_error_code(&code, message, status);
     }
 
+    let message = crate::error_body_message(body);
     match status {
-        401 | 403 => ProviderError::Auth(format!("{status}: {body}")),
-        429 => ProviderError::RateLimited(body.to_string()),
-        _ => ProviderError::Http {
-            status,
-            message: body.to_string(),
-        },
+        401 | 403 => ProviderError::Auth(format!("{status}: {message}")),
+        429 => ProviderError::RateLimited(message),
+        _ => ProviderError::Http { status, message },
     }
 }
 

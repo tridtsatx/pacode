@@ -51,7 +51,13 @@ impl Phase {
     pub fn label(&self, elapsed_ms: u64, frame: u64, glyphs: &Glyphs) -> String {
         match self {
             Self::Thinking => thinking_label(elapsed_ms, frame, glyphs),
-            Self::Responding => "responding…".to_string(),
+            Self::Responding => {
+                if glyphs.ascii {
+                    "responding...".to_string()
+                } else {
+                    "responding…".to_string()
+                }
+            }
             Self::Tool(title) => title.clone(),
             Self::WaitingAgent(name) => format!("waiting for agent {name}"),
             Self::WaitingTask(n) => {
@@ -65,13 +71,15 @@ impl Phase {
     }
 }
 
-/// Trailing dots for an in-progress label: `.`, `..`, `…` picked by
-/// `frame % 3` (`...` for the last step under ASCII).
-pub fn trailing_dots(frame: u64, glyphs: &Glyphs) -> &'static str {
+/// Trailing dots for an in-progress label: `".  "`, `".. "`, `"..."` picked
+/// by `frame % 3` — always 3 display cells wide so everything to the right
+/// of the label stays put between frames (§9.2). `…` is never used in the
+/// animation: it is one cell wide and would shrink the suffix.
+pub fn trailing_dots(frame: u64, _glyphs: &Glyphs) -> &'static str {
     match frame % 3 {
-        0 => ".",
-        1 => "..",
-        _ => glyphs.ellipsis,
+        0 => ".  ",
+        1 => ".. ",
+        _ => "...",
     }
 }
 

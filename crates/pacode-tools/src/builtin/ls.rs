@@ -80,35 +80,23 @@ impl Tool for LsTool {
                     size: u64,
                 }
 
-                let mut items = Vec::new();
+                let entries = crate::walk::shared().collect(
+                    &dir_target,
+                    crate::walk::WalkOptions {
+                        include_hidden: show_all,
+                        max_depth: Some(1),
+                    },
+                    &cancel,
+                )?;
 
-                let walker = ignore::WalkBuilder::new(&dir_target)
-                    .max_depth(Some(1))
-                    .hidden(!show_all)
-                    .git_ignore(true)
-                    .require_git(false)
-                    .build();
-
-                for entry_res in walker {
-                    if cancel.is_cancelled() {
-                        return Err(ToolError::Cancelled);
-                    }
-                    let entry = match entry_res {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    if entry.depth() == 0 {
-                        continue;
-                    }
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                    let size = if is_dir {
-                        0
-                    } else {
-                        entry.metadata().map(|m| m.len()).unwrap_or(0)
-                    };
-                    items.push(Item { name, is_dir, size });
-                }
+                let mut items: Vec<Item> = entries
+                    .iter()
+                    .map(|entry| Item {
+                        name: entry.rel.to_string_lossy().to_string(),
+                        is_dir: entry.is_dir,
+                        size: if entry.is_dir { 0 } else { entry.size },
+                    })
+                    .collect();
 
                 items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
                     (true, false) => std::cmp::Ordering::Less,

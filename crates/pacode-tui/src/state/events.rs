@@ -119,15 +119,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
         }
         Event::ItemAdded(item) => {
             if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
-                let arg = title
-                    .strip_prefix(name.as_str())
-                    .map(str::trim_start)
-                    .unwrap_or_else(|| {
-                        title
-                            .split_once(' ')
-                            .map(|(_, r)| r.trim())
-                            .unwrap_or(title.as_str())
-                    });
+                let arg = crate::state::files::title_path_arg(name, title);
                 let input = serde_json::json!({ "path": arg });
                 state.files.observe_tool_item(name, &input, item.ts_ms);
             }
@@ -143,6 +135,22 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             }
         }
         Event::ItemUpdated(item) => {
+            // The finished call's `DiffStat` lands here — fold it into the
+            // row `ItemAdded` created (§5.5's `+A −R` column).
+            if let TranscriptKind::ToolCall {
+                name,
+                title,
+                call_id,
+                diff: Some(diff),
+                ..
+            } = &item.kind
+            {
+                let arg = crate::state::files::title_path_arg(name, title);
+                let input = serde_json::json!({ "path": arg });
+                state
+                    .files
+                    .apply_diff(name, &input, call_id, *diff, item.ts_ms);
+            }
             if item.agent.is_main() {
                 state.transcript.upsert(item, now);
             } else if let Focus::Panel {

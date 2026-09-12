@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use pacode_types::state::PermissionDecision;
 use pacode_types::{PermissionRequest, Request, TranscriptKind};
 
@@ -31,10 +31,37 @@ pub enum Action {
     RunBashInteractive {
         command: String,
     },
+    /// Page of git history: `after` is the last held commit hash, `None` asks
+    /// for the first page. Marks `state.git` as loading before the request
+    /// flies, which a bare `Send` cannot do.
+    GitLog {
+        after: Option<String>,
+    },
+    /// `git show --stat` of one commit for the submenu's detail pane.
+    GitShow {
+        hash: String,
+    },
+    /// Patch of one commit for the submenu's diff panel.
+    GitDiff {
+        hash: String,
+    },
     Quit,
 }
 
 pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Action> {
+    // Feed the double-Shift detector on the raw stream — a kitty tap arrives
+    // as Press + Release, and the drop below removes the Release (§4.2). The
+    // gate folds `Focus::Normal` and the `keys.double_shift` switch in.
+    let armed = state.focus == Focus::Normal && state.config.keys.double_shift_enabled();
+    let threshold = state.config.keys.double_shift_threshold_ms();
+    let hub_fired = state.double_shift.observe(key, now, threshold, armed);
+
+    // REPORT_EVENT_TYPES reports Release/Repeat alongside Press — without this
+    // drop every keypress would run its action twice (§4.2).
+    if matches!(key.kind, KeyEventKind::Release | KeyEventKind::Repeat) {
+        return vec![];
+    }
+
     let was_dirty = state.dirty;
     state.dirty = true;
 
@@ -45,6 +72,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 1. ctrl+c / ctrl+d (Cyrillic layout letters are mapped to their Latin key).
     let key = normalize_cyrillic_ctrl(key);
+
+    // The second Shift tap — opens the menu hub (§4.2).
+    if hub_fired {
+        return crate::keys_menu::open(state, crate::ui::menu::MenuId::Root);
+    }
 
     // Any key clears pending chord.
     let pending = state.pending_chord.take();
@@ -72,6 +104,20 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     {
         state.quit = true;
         return vec![Action::Quit];
+    }
+    // The menu base owns the keyboard while open (§3.4): `esc` peels a level
+    // and `ctrl+c` closes the whole stack — it must not reach the interrupt
+    // ladder below. `ctrl+d` above still quits, same as in legacy overlays.
+    if matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })) {
+        let taken = std::mem::replace(&mut state.focus, Focus::Normal);
+        let Focus::Overlay(Overlay::Menu { mut stack, mut ui }) = taken else {
+            return vec![];
+        };
+        let actions = crate::keys_menu::handle_menu_key(state, &mut stack, &mut ui, key);
+        if matches!(state.focus, Focus::Normal) && !stack.is_empty() {
+            state.focus = Focus::Overlay(Overlay::Menu { stack, ui });
+        }
+        return actions;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         if let Some(cancel_tx) = state.running_bash.take() {
@@ -117,19 +163,6 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     // 1.5 While an overlay is open, ALL keys go to it (fixes focus leak to input).
-    if matches!(state.focus, Focus::Overlay(Overlay::Import(_))) {
-        // The handler needs `&mut AppState` too, so take the overlay out and put
-        // it back unless it asked to close.
-        let taken = std::mem::replace(&mut state.focus, Focus::Normal);
-        let Focus::Overlay(Overlay::Import(mut overlay)) = taken else {
-            return vec![];
-        };
-        let actions = crate::ui::import::handle_key(state, &mut overlay, key, now);
-        if !overlay.closed {
-            state.focus = Focus::Overlay(Overlay::Import(overlay));
-        }
-        return actions;
-    }
     if let Focus::Overlay(_) = state.focus {
         return crate::keys_picker::handle_picker_key(state, key);
     }
@@ -158,14 +191,16 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return crate::paste::handle_paste_clipboard(state, now);
     }
 
-    // 2. Session picker via ctrl+p
+    // 1.9 The menu hub via ctrl+, — double-Shift is the other entry (§4.2).
+    if action == Some(KeyAction::Menu) {
+        log::debug!("open overlay: menu hub");
+        return crate::keys_menu::open(state, crate::ui::menu::MenuId::Root);
+    }
+
+    // 2. Sessions menu via ctrl+p
     if action == Some(KeyAction::SessionPicker) {
-        log::debug!("open overlay: SessionPicker");
-        state.focus = Focus::Overlay(Overlay::SessionPicker {
-            query: String::new(),
-            index: 0,
-        });
-        return vec![Action::Send(Request::ListSessions { limit: 50 })];
+        log::debug!("open menu: sessions");
+        return crate::keys_menu::open(state, crate::ui::menu::MenuId::Sessions);
     }
 
     // 3. Shift+Tab: cycle permission mode; plain Tab: autocomplete slash command / @ / bash
@@ -179,14 +214,14 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return toggle_zdr(state);
     }
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
-        // First check @ completion
+        // First check @ completion — read the scan the draw path ordered and
+        // the event loop ran on a blocking thread (§8.1).
         let byte_cursor =
             crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
         if !state.input.at_closed
             && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
         {
-            let cwd = state.cwd();
-            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            let candidates = at_candidates(state, &q.query, byte_cursor);
             if !candidates.is_empty() {
                 let sel = state.input.at_index % candidates.len();
                 let cand = candidates[sel].clone();
@@ -209,14 +244,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
         // Second check bash mode Tab completion
         if state.input.text.starts_with('!') {
-            let cwd = state.cwd();
-            let char_cursor = state.input.cursor.saturating_sub(1);
-            let candidates = crate::bash::complete::complete(
-                &state.input.text[1..],
-                char_cursor,
-                &state.input.bash_history,
-                &cwd,
-            );
+            let candidates = bash_candidates(state);
             if !candidates.is_empty() {
                 let sel = state.input.bash_complete_index % candidates.len();
                 let cand = &candidates[sel];
@@ -299,8 +327,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     // 5.5 Files overlay: alt+f
     if action == Some(KeyAction::FilesOverlay) {
         log::debug!("open overlay: Files");
-        state.focus = Focus::Overlay(Overlay::Files { index: 0 });
-        return vec![];
+        return crate::keys_menu::open(state, crate::ui::menu::MenuId::Files);
     }
 
     // 5.6 Plan & agents overlay. Below 80 columns the rail is not drawn at all
@@ -373,8 +400,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     // 9. Single keys in empty prompt: '.', 's', 'k'
     if state.input.is_empty() && (!state.config.ui.vim || state.focus != Focus::Normal) {
         if action == Some(KeyAction::BgList) {
-            state.focus = Focus::BgList { index: 0 };
-            return vec![];
+            return crate::keys_menu::open(state, crate::ui::menu::MenuId::Background);
+        }
+        if action == Some(KeyAction::Help) {
+            return crate::keys_menu::open(state, crate::ui::menu::MenuId::Help);
         }
         if action == Some(KeyAction::StopAgent)
             && let Focus::Panel {
@@ -384,18 +413,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         {
             return vec![Action::Send(Request::StopAgent(id.clone()))];
         }
-        if action == Some(KeyAction::KillTask) {
-            if let Focus::Panel {
+        if action == Some(KeyAction::KillTask)
+            && let Focus::Panel {
                 target: PanelTarget::Task(ref id),
                 ..
             } = state.focus
-            {
-                return vec![Action::Send(Request::KillTask(id.clone()))];
-            } else if let Focus::BgList { index } = state.focus
-                && let Some(task) = state.rail.tasks.get(index)
-            {
-                return vec![Action::Send(Request::KillTask(task.id.clone()))];
-            }
+        {
+            return vec![Action::Send(Request::KillTask(id.clone()))];
         }
     }
 
@@ -446,8 +470,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         if !state.input.at_closed
             && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
         {
-            let cwd = state.cwd();
-            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            let candidates = at_candidates(state, &q.query, byte_cursor);
             if !candidates.is_empty() {
                 let sel = state.input.at_index % candidates.len();
                 let cand = candidates[sel].clone();
@@ -517,17 +540,6 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     return select_agent_by_id(state, &id);
                 }
             }
-            Focus::BgList { index } => {
-                if let Some(task) = state.rail.tasks.get(*index) {
-                    state.focus = Focus::Panel {
-                        target: PanelTarget::Task(task.id.clone()),
-                        follow: false,
-                        follow_paused: false,
-                    };
-                    state.panel.target = Some(PanelTarget::Task(task.id.clone()));
-                    return vec![Action::LoadPanel];
-                }
-            }
             Focus::Overlay(Overlay::ModelPicker {
                 query,
                 index,
@@ -576,41 +588,17 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     return vec![Action::Send(Request::SetEffort(eff))];
                 }
             }
-            Focus::Overlay(Overlay::SessionPicker { query, index }) => {
-                let q_lower = query.to_lowercase();
-                let filtered: Vec<_> = state
-                    .sessions
-                    .iter()
-                    .filter(|s| {
-                        q_lower.is_empty()
-                            || s.title().to_lowercase().contains(&q_lower)
-                            || s.id.as_str().to_lowercase().contains(&q_lower)
-                    })
-                    .collect();
-                if let Some(session) = filtered.get(*index) {
-                    let id = session.id.clone();
-                    log::debug!("close overlay: SessionPicker");
-                    state.focus = Focus::Normal;
-                    return vec![Action::Send(Request::Attach(
-                        pacode_types::Attach::Resume { session: id },
-                    ))];
-                }
-            }
             Focus::Normal
             | Focus::Panel { .. }
             | Focus::Overlay(
-                Overlay::Files { .. }
-                | Overlay::ModePicker { .. }
-                | Overlay::ConfigPicker
+                Overlay::ModePicker { .. }
                 | Overlay::QuestionPicker { .. }
-                | Overlay::McpPicker { .. }
-                | Overlay::PluginsPicker { .. }
-                | Overlay::Import(_)
                 | Overlay::RailOverlay
-                | Overlay::Help
                 | Overlay::ThemePicker { .. }
-                | Overlay::KeysPicker { .. }
-                | Overlay::LoginPicker { .. },
+                | Overlay::LoginPicker { .. }
+                // Unreachable — an open menu intercepts Enter earlier — but
+                // the match stays exhaustive.
+                | Overlay::Menu { .. },
             ) => {}
         }
         return vec![];
@@ -640,8 +628,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         if !state.input.at_closed
             && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
         {
-            let cwd = state.cwd();
-            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            let candidates = at_candidates(state, &q.query, byte_cursor);
             if !candidates.is_empty() {
                 let n = candidates.len();
                 state.input.at_index = (state.input.at_index + n - 1) % n;
@@ -649,14 +636,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         }
         if state.input.text.starts_with('!') {
-            let cwd = state.cwd();
-            let char_cursor = state.input.cursor.saturating_sub(1);
-            let candidates = crate::bash::complete::complete(
-                &state.input.text[1..],
-                char_cursor,
-                &state.input.bash_history,
-                &cwd,
-            );
+            let candidates = bash_candidates(state);
             if !state.input.bash_complete_closed && !candidates.is_empty() {
                 let n = candidates.len();
                 state.input.bash_complete_index = (state.input.bash_complete_index + n - 1) % n;
@@ -682,8 +662,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         if !state.input.at_closed
             && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
         {
-            let cwd = state.cwd();
-            let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
+            let candidates = at_candidates(state, &q.query, byte_cursor);
             if !candidates.is_empty() {
                 let n = candidates.len();
                 state.input.at_index = (state.input.at_index + 1) % n;
@@ -691,14 +670,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         }
         if state.input.text.starts_with('!') {
-            let cwd = state.cwd();
-            let char_cursor = state.input.cursor.saturating_sub(1);
-            let candidates = crate::bash::complete::complete(
-                &state.input.text[1..],
-                char_cursor,
-                &state.input.bash_history,
-                &cwd,
-            );
+            let candidates = bash_candidates(state);
             if !state.input.bash_complete_closed && !candidates.is_empty() {
                 let n = candidates.len();
                 state.input.bash_complete_index = (state.input.bash_complete_index + 1) % n;
@@ -790,6 +762,46 @@ fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
         });
         vec![Action::Send(Request::ListModels)]
     }
+}
+
+/// `@` candidates for the exact current popup context, cloned out of the
+/// scan cache (≤ `MAX_AT_CANDIDATES` small rows, once per keypress). Empty
+/// while the scan the draw path ordered is still running on a blocking
+/// thread — §8.1: the filesystem walk never happens in a key handler.
+fn at_candidates(
+    state: &AppState,
+    query: &str,
+    byte_cursor: usize,
+) -> Vec<crate::at_complete::AtCandidate> {
+    let key = crate::state::input::AtKey {
+        query: query.to_string(),
+        cursor_byte: byte_cursor,
+        cwd: state.cwd(),
+    };
+    state
+        .input
+        .at_comp
+        .candidates_for(&key)
+        .map(<[crate::at_complete::AtCandidate]>::to_vec)
+        .unwrap_or_default()
+}
+
+/// `!` candidates for the exact current input/cursor/history context —
+/// same deferred-scan contract as [`at_candidates`]. Callers must only
+/// invoke it when `state.input.text` starts with `!`.
+fn bash_candidates(state: &AppState) -> Vec<crate::bash::complete::Candidate> {
+    let key = crate::state::input::BashKey {
+        text: state.input.text[1..].to_string(),
+        cursor: state.input.cursor.saturating_sub(1),
+        cwd: state.cwd(),
+        history_len: state.input.bash_history.len(),
+    };
+    state
+        .input
+        .bash_comp
+        .candidates_for(&key)
+        .map(<[crate::bash::complete::Candidate]>::to_vec)
+        .unwrap_or_default()
 }
 
 fn complete_slash_command(state: &mut AppState) -> bool {

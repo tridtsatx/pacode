@@ -118,6 +118,9 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
     };
 
     let mut tools = builtin_tools(&opts.config.web);
+    // `[tools.<name>] enabled = false` drops the tool from the model schema and
+    // refuses later registrations (plugins, skill, per-session MCP tools).
+    tools.apply_disabled(opts.config.disabled_tool_names().map(str::to_string));
     for tool in pacode_tools::builtin::plugin::plugin_tools(plugin_host.clone()) {
         tools.register(tool);
     }

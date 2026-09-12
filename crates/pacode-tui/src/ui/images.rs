@@ -13,7 +13,7 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 use pacode_render::RenderOptions;
 
 use crate::state::AppState;
-use crate::state::images::{CachedThumb, THUMB_SLOT_W};
+use crate::state::images::THUMB_SLOT_W;
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOptions) {
     state.pending_image_escapes.clear();
@@ -28,8 +28,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
         live.iter().map(|r| (r.token, r.path.clone())).collect();
     let tokens: Vec<usize> = live.iter().map(|(t, _)| *t).collect();
     state.image_strip.retain(&tokens);
-
-    let protocol = pacode_image::detect();
 
     for (i, (token, path)) in live.iter().enumerate() {
         let x = area.x + (i as u16) * THUMB_SLOT_W;
@@ -46,28 +44,20 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
             .thumbs
             .get(token)
             .filter(|t| t.cell_w == slot.width && t.cell_h == slot.height);
-        let preview = match cached {
-            Some(t) => t.preview.clone(),
-            None => {
-                let req = pacode_image::PreviewRequest {
-                    path: path.clone(),
-                    cell_w: slot.width,
-                    cell_h: slot.height,
-                };
-                let preview = pacode_image::render(&req, protocol).ok();
-                state.image_strip.thumbs.insert(
-                    *token,
-                    CachedThumb {
-                        cell_w: slot.width,
-                        cell_h: slot.height,
-                        preview: preview.clone(),
-                    },
-                );
-                preview
-            }
+        let Some(thumb) = cached else {
+            // §8.1: `pacode_image::render` does file IO + decode/encode — it
+            // runs on a blocking thread. Record the want and draw a
+            // placeholder until `ThumbReady` lands in `thumbs`.
+            state
+                .image_strip
+                .want
+                .push((*token, path.clone(), slot.width, slot.height));
+            let label = Line::from(Span::styled(format!("[image {token} …]"), opts.theme.faint));
+            frame.render_widget(Paragraph::new(label), slot);
+            continue;
         };
 
-        match preview {
+        match &thumb.preview {
             Some(pacode_image::Preview::Cells(grid)) => {
                 let mut lines = Vec::new();
                 for row in grid.iter().take(slot.height as usize) {
@@ -84,7 +74,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
             }
             Some(pacode_image::Preview::Escape(esc)) => {
                 frame.render_widget(Clear, slot);
-                state.pending_image_escapes.push((slot, esc));
+                state.pending_image_escapes.push((slot, esc.clone()));
             }
             None => {
                 let label = Line::from(Span::styled(

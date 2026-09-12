@@ -378,6 +378,9 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::ListAuth
         | Request::Login { .. }
         | Request::Logout { .. }
-        | Request::SetAuthAccount { .. } => panic!("expected Request::Interrupt"),
+        | Request::SetAuthAccount { .. }
+        | Request::GitLog { .. }
+        | Request::GitShow { .. }
+        | Request::GitDiff { .. } => panic!("expected Request::Interrupt"),
     }
 }

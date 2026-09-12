@@ -57,7 +57,10 @@ impl AnthropicStreamOpener {
                     log::warn!("anthropic request failed ({status_u16}): {redacted_body}");
 
                     if status_u16 == 401 || status_u16 == 403 {
-                        return Err(ProviderError::Auth(format!("{status_u16}: {text}")));
+                        return Err(ProviderError::Auth(format!(
+                            "{status_u16}: {}",
+                            crate::error_body_message(&text)
+                        )));
                     }
 
                     let is_retryable = status_u16 == 429 || status_u16 >= 500;
@@ -68,14 +71,17 @@ impl AnthropicStreamOpener {
                     }
 
                     if status_u16 == 429 {
-                        return Err(ProviderError::RateLimited(text));
+                        return Err(ProviderError::RateLimited(crate::error_body_message(&text)));
                     }
                     if status_u16 == 529 {
-                        return Err(ProviderError::RateLimited(format!("overloaded: {text}")));
+                        return Err(ProviderError::RateLimited(format!(
+                            "overloaded: {}",
+                            crate::error_body_message(&text)
+                        )));
                     }
                     return Err(ProviderError::Http {
                         status: status_u16,
-                        message: text,
+                        message: crate::error_body_message(&text),
                     });
                 }
                 Err(err) => {

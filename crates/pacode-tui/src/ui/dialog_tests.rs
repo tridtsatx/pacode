@@ -1,281 +1,4 @@
 use super::*;
-use pacode_render::RenderOptions;
-use pacode_types::TranscriptKind;
-use pacode_types::transcript::ToolStatus;
-
-#[test]
-fn test_failed_tool_call_shows_exit_code_on_header() {
-    let opts = RenderOptions::new(80, false);
-    let kind = TranscriptKind::ToolCall {
-        call_id: "call_fail".into(),
-        name: "bash".into(),
-        title: "bash cargo test".into(),
-        intent: None,
-        status: ToolStatus::Error,
-        preview: "[exit code 2]".into(),
-        diff: None,
-        duration_ms: Some(56),
-        task: None,
-    };
-    let lines = render_item(&kind, None, 80, &opts, 0);
-    // Header row is line 0
-    let header_text = lines[0]
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect::<String>();
-    assert!(
-        header_text.contains("exit 2"),
-        "header row must contain 'exit 2', got: '{header_text}'"
-    );
-    assert!(
-        header_text.contains("fail 56ms · exit 2"),
-        "header row must format duration and exit code, got: '{header_text}'"
-    );
-    // No gutter row containing │ since preview only had exit code
-    assert!(
-        !lines
-            .iter()
-            .any(|l| { l.spans.iter().any(|s| s.content.contains('│')) }),
-        "gutter must not render for preview that only has exit code"
-    );
-}
-
-#[test]
-fn test_failed_tool_call_with_empty_preview_renders_one_line_and_no_gutter() {
-    let opts = RenderOptions::new(80, false);
-    let kind = TranscriptKind::ToolCall {
-        call_id: "call_empty".into(),
-        name: "bash".into(),
-        title: "bash exit 1".into(),
-        intent: None,
-        status: ToolStatus::Error,
-        preview: "".into(),
-        diff: None,
-        duration_ms: None,
-        task: None,
-    };
-    let lines = render_item(&kind, None, 80, &opts, 0);
-
-    // Filter out the trailing blank separator line (spans is empty)
-    let content_lines: Vec<&Line> = lines.iter().filter(|l| !l.spans.is_empty()).collect();
-    assert_eq!(
-        content_lines.len(),
-        1,
-        "empty preview must render exactly one line of content"
-    );
-
-    let header_text = content_lines[0]
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect::<String>();
-    assert!(header_text.contains("fail"));
-    assert!(
-        !lines
-            .iter()
-            .any(|l| { l.spans.iter().any(|s| s.content.contains('│')) }),
-        "empty preview must produce no gutter row"
-    );
-
-    // Also test with whitespace preview
-    let kind_ws = TranscriptKind::ToolCall {
-        call_id: "call_ws".into(),
-        name: "bash".into(),
-        title: "bash true".into(),
-        intent: None,
-        status: ToolStatus::Error,
-        preview: "   \n\n  \n".into(),
-        diff: None,
-        duration_ms: None,
-        task: None,
-    };
-    let lines_ws = render_item(&kind_ws, None, 80, &opts, 0);
-    let content_lines_ws: Vec<&Line> = lines_ws.iter().filter(|l| !l.spans.is_empty()).collect();
-    assert_eq!(
-        content_lines_ws.len(),
-        1,
-        "whitespace preview must render exactly one line of content"
-    );
-    assert!(
-        !lines_ws
-            .iter()
-            .any(|l| { l.spans.iter().any(|s| s.content.contains('│')) }),
-        "whitespace preview must produce no gutter row"
-    );
-}
-
-#[test]
-fn test_successful_call_is_unchanged() {
-    let opts = RenderOptions::new(80, false);
-    let kind = TranscriptKind::ToolCall {
-        call_id: "call_ok".into(),
-        name: "read_file".into(),
-        title: "read_file foo.rs".into(),
-        intent: None,
-        status: ToolStatus::Ok,
-        preview: "fn main() {}".into(),
-        diff: None,
-        duration_ms: Some(40),
-        task: None,
-    };
-    let lines = render_item(&kind, None, 80, &opts, 0);
-    let header_text = lines[0]
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect::<String>();
-    assert!(header_text.contains("ok 40ms"));
-    // Gutter row must be present for non-empty preview
-    assert!(
-        lines
-            .iter()
-            .any(|l| { l.spans.iter().any(|s| s.content.contains('│')) }),
-        "successful tool call with content must render gutter row"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| { l.spans.iter().any(|s| s.content.contains("fn main() {}")) }),
-        "preview text must be rendered in gutter"
-    );
-}
-
-fn long_output_call(lines: usize) -> TranscriptKind {
-    let preview = (0..lines)
-        .map(|i| format!("output line {i} that is long enough to be cut at a narrow width"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    TranscriptKind::ToolCall {
-        call_id: pacode_types::CallId::new("call_1"),
-        name: "bash".into(),
-        title: "bash python3 -c ...".into(),
-        intent: None,
-        status: pacode_types::ToolStatus::Ok,
-        preview,
-        diff: None,
-        duration_ms: Some(237),
-        task: None,
-    }
-}
-
-fn text_of(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
-    lines
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
-}
-
-#[test]
-fn a_collapsed_tool_call_shows_a_few_lines_and_says_how_many_are_hidden() {
-    let opts = pacode_render::RenderOptions::new(60, false);
-    let lines = super::render_item_inner(&long_output_call(20), None, 60, &opts, 0, false);
-    let text = text_of(&lines);
-
-    let body: Vec<&String> = text.iter().filter(|l| l.starts_with("  │")).collect();
-    assert_eq!(body.len(), super::COLLAPSED_MAX_LINES + 1, "{body:?}");
-    assert!(
-        body.last().expect("last").contains("+14 more lines"),
-        "{body:?}"
-    );
-    assert!(body.last().expect("last").contains("click to expand"));
-    // Collapsed rows are cut to the width rather than wrapped.
-    assert!(body[0].contains('…'), "{:?}", body[0]);
-}
-
-#[test]
-fn an_expanded_tool_call_shows_every_line_wrapped() {
-    let opts = pacode_render::RenderOptions::new(60, false);
-    let lines = super::render_item_inner(&long_output_call(20), None, 60, &opts, 0, true);
-    let text = text_of(&lines);
-
-    let body: Vec<&String> = text.iter().filter(|l| l.starts_with("  │")).collect();
-    // Every source line is there, and long ones took more than one row.
-    assert!(
-        body.len() > 20,
-        "expanded output must show it all: {}",
-        body.len()
-    );
-    assert!(body.iter().any(|l| l.contains("output line 19")));
-    assert!(
-        body.iter().all(|l| !l.contains('…')),
-        "expanded rows wrap instead of being cut"
-    );
-    assert!(body.iter().all(|l| !l.contains("click to expand")));
-}
-
-#[test]
-fn an_expanded_tool_call_is_still_bounded() {
-    let opts = pacode_render::RenderOptions::new(60, false);
-    let lines = super::render_item_inner(&long_output_call(5000), None, 60, &opts, 0, true);
-    let text = text_of(&lines);
-
-    let body: Vec<&String> = text.iter().filter(|l| l.starts_with("  │")).collect();
-    assert!(
-        body.len() <= super::EXPANDED_MAX_LINES + 1,
-        "an enormous output must stay bounded: {}",
-        body.len()
-    );
-    assert!(
-        body.last().expect("last").contains("output truncated"),
-        "{:?}",
-        body.last()
-    );
-}
-
-#[test]
-fn a_short_output_needs_no_expansion_hint() {
-    let opts = pacode_render::RenderOptions::new(60, false);
-    let lines = super::render_item_inner(&long_output_call(2), None, 60, &opts, 0, false);
-    let text = text_of(&lines);
-    assert!(
-        text.iter().all(|l| !l.contains("click to expand")),
-        "{text:?}"
-    );
-}
-
-#[test]
-fn a_running_tool_call_spins_on_the_anim_frame() {
-    let opts = RenderOptions::new(80, false);
-    let kind = TranscriptKind::ToolCall {
-        call_id: "call_run".into(),
-        name: "bash".into(),
-        title: "bash cargo test".into(),
-        intent: None,
-        status: ToolStatus::Running,
-        preview: "".into(),
-        diff: None,
-        duration_ms: Some(12_000),
-        task: None,
-    };
-    let text = |frame: u64| {
-        super::render_item_inner(&kind, None, 80, &opts, frame, false)[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>()
-    };
-    assert!(text(0).contains("⠋ running 12s"), "{}", text(0));
-    assert!(text(1).contains("⠙ running 12s"), "{}", text(1));
-    assert!(text(10).contains("⠋ running 12s"), "{}", text(10));
-
-    let ascii = RenderOptions::new(80, true);
-    let text_ascii = |frame: u64| {
-        super::render_item_inner(&kind, None, 80, &ascii, frame, false)[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>()
-    };
-    assert!(text_ascii(0).contains("- running 12s"), "{}", text_ascii(0));
-    assert!(
-        text_ascii(1).contains("\\ running 12s"),
-        "{}",
-        text_ascii(1)
-    );
-    assert!(text_ascii(2).contains("| running 12s"), "{}", text_ascii(2));
-    assert!(text_ascii(3).contains("/ running 12s"), "{}", text_ascii(3));
-}
 
 fn question_cell(answer: Option<pacode_types::QuestionAnswer>) -> TranscriptKind {
     let question = pacode_types::Question::new(
@@ -342,4 +65,158 @@ fn an_answered_question_shows_what_was_chosen() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(joined.contains("dismissed"), "{joined}");
+}
+
+#[test]
+fn an_answered_question_keeps_the_description_and_the_typed_text() {
+    let opts = pacode_render::RenderOptions::new(80, false);
+    let mut answer = pacode_types::QuestionAnswer::choice(1);
+    answer.free_text = Some("with a twist".to_string());
+    let answered = question_cell(Some(answer));
+    let lines = super::render_item_inner(&answered, None, 80, &opts, 0, false);
+    let joined: String = lines
+        .iter()
+        .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The chosen option shows its description; the unchosen one does not.
+    assert!(joined.contains("native chat"), "{joined}");
+    assert!(!joined.contains("everything at once"), "{joined}");
+    // Free text renders as the `> ` line, not a `typed:` label.
+    assert!(joined.contains("> with a twist"), "{joined}");
+    assert!(!joined.contains("typed:"), "{joined}");
+}
+
+fn notice_text(level: ToastLevel, text: &str, width: u16) -> String {
+    let opts = pacode_render::RenderOptions::new(width, false);
+    let kind = TranscriptKind::Notice {
+        level,
+        text: text.to_string(),
+    };
+    super::render_item_inner(&kind, None, width, &opts, 0, false)
+        .iter()
+        .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn an_error_notice_is_a_classified_block() {
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: authentication failed: Invalid x-api-key",
+        80,
+    );
+    assert!(joined.contains("✗ turn failed · auth"), "{joined}");
+    assert!(joined.contains("│ Invalid x-api-key"), "{joined}");
+    assert!(!joined.contains("authentication failed:"), "{joined}");
+
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: rate limited: slow down",
+        80,
+    );
+    assert!(joined.contains("turn failed · rate limit"), "{joined}");
+
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: request failed (429): too many requests",
+        80,
+    );
+    assert!(joined.contains("turn failed · http 429"), "{joined}");
+    assert!(joined.contains("│ too many requests"), "{joined}");
+
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: transport: connection reset by peer",
+        80,
+    );
+    assert!(joined.contains("turn failed · network"), "{joined}");
+
+    let joined = notice_text(ToastLevel::Error, "turn failed: stream idle for 30s", 80);
+    assert!(joined.contains("turn failed · timeout"), "{joined}");
+    assert!(joined.contains("for 30s"), "{joined}");
+
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: malformed response: missing field `type`",
+        80,
+    );
+    assert!(joined.contains("turn failed · malformed"), "{joined}");
+
+    // An unknown inner prefix keeps the wrapper as the title and the rest as
+    // the body — nothing is dropped.
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: provider exploded: details here",
+        80,
+    );
+    assert!(joined.contains("Turn failed"), "{joined}");
+    assert!(
+        joined.contains("provider exploded: details here"),
+        "{joined}"
+    );
+}
+
+#[test]
+fn an_error_notice_pulls_the_message_out_of_a_json_body() {
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: request failed (400): {\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Invalid model specified: foo\"}}",
+        80,
+    );
+    assert!(joined.contains("turn failed · http 400"), "{joined}");
+    assert!(joined.contains("Invalid model specified: foo"), "{joined}");
+    assert!(!joined.contains("invalid_request_error"), "{joined}");
+
+    // Unparseable JSON stays raw rather than vanishing.
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: request failed (500): {not json",
+        80,
+    );
+    assert!(joined.contains("{not json"), "{joined}");
+}
+
+#[test]
+fn an_error_notice_without_the_turn_wrapper_uses_its_own_prefix() {
+    let joined = notice_text(ToastLevel::Error, "Export failed: disk is full", 80);
+    assert!(joined.contains("Export failed"), "{joined}");
+    assert!(joined.contains("disk is full"), "{joined}");
+
+    // A single line with no label prefix is its own title.
+    let joined = notice_text(ToastLevel::Error, "the daemon is gone", 80);
+    assert!(joined.contains("The daemon is gone"), "{joined}");
+
+    // A URL does not count as a label prefix.
+    let joined = notice_text(ToastLevel::Error, "see http://x/y for details", 80);
+    assert!(joined.contains("See http://x/y for details"), "{joined}");
+    assert!(!joined.contains("│ "), "{joined}");
+}
+
+#[test]
+fn a_long_error_body_wraps_onto_the_gutter() {
+    let body = "word ".repeat(40);
+    let text = format!("turn failed: transport: {}", body.trim());
+    let joined = notice_text(ToastLevel::Error, &text, 40);
+    let gutter_lines = joined.lines().filter(|l| l.starts_with("│ ")).count();
+    assert!(gutter_lines > 1, "{joined}");
+
+    // A multi-line body keeps every line on the gutter.
+    let joined = notice_text(
+        ToastLevel::Error,
+        "turn failed: transport: first\nsecond",
+        80,
+    );
+    assert!(joined.contains("│ first"), "{joined}");
+    assert!(joined.contains("│ second"), "{joined}");
+}
+
+#[test]
+fn non_error_notices_stay_plain_but_wrap() {
+    let joined = notice_text(ToastLevel::Info, &"x".repeat(200), 60);
+    let lines: Vec<&str> = joined.lines().filter(|l| !l.is_empty()).collect();
+    assert!(lines.len() > 1, "{joined}");
+    assert!(!joined.contains('✗'), "{joined}");
 }

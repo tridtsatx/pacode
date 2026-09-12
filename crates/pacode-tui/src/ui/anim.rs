@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::state::activity::{Phase, displayed_secs, format_activity_secs, thinking_color};
-use pacode_render::{Glyphs, RenderOptions, Theme, truncate_to_width};
+use pacode_render::{Glyphs, RenderOptions, Theme, display_width, truncate_to_width};
 
 /// Display width of the activity bar, including its brackets.
 const PACMAN_WIDTH: usize = 24;
@@ -135,6 +135,24 @@ pub fn pacman_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
     out
 }
 
+/// `{lead}{label}` on the left, `{right}` flush against `width` on the
+/// right, at least one cell between them. The counters keep a fixed right
+/// edge, so a wording change ("thinking" → "thinking a bit more") never
+/// moves them (§9.2).
+fn spread_tail(lead: &str, label: &str, right: &str, width: usize) -> String {
+    let lead_w = display_width(lead);
+    let right_w = display_width(right);
+    if width <= lead_w + right_w {
+        // No room for the label at all — keep the counters, they are the
+        // stable part.
+        return truncate_to_width(&format!("{lead}{right}"), width, true);
+    }
+    let budget = width - lead_w - right_w - 1;
+    let label = truncate_to_width(label, budget, true);
+    let fill = width - lead_w - display_width(&label) - right_w;
+    format!("{lead}{label}{}{right}", " ".repeat(fill))
+}
+
 /// Renders the activity line for `phase`.
 ///
 /// The pacman bar is drawn only while the model itself is working; waiting on a
@@ -158,14 +176,13 @@ pub fn render_activity_line(
         Phase::Responding | Phase::Tool(_) => opts.theme.fg,
         Phase::WaitingAgent(_) | Phase::WaitingTask(_) => opts.theme.faint,
     };
+    let label = phase.label(elapsed_ms, frame, &opts.glyphs);
 
     if !phase.shows_pacman() {
-        let tail = format!(
-            "{} · {dur_str}",
-            phase.label(elapsed_ms, frame, &opts.glyphs)
-        );
-        let trunc = truncate_to_width(&tail, max_line_width, true);
-        return Line::from(Span::styled(trunc, text_style));
+        return Line::from(Span::styled(
+            spread_tail("", &label, &dur_str, max_line_width),
+            text_style,
+        ));
     }
 
     let mut spans = if candy_enabled(std::env::var(CANDY_VAR).ok().as_deref()) {
@@ -176,14 +193,9 @@ pub fn render_activity_line(
             opts.theme.dim,
         )]
     };
-    let used_w = PACMAN_WIDTH;
-    let tail = format!(
-        " {} · {dur_str}",
-        phase.label(elapsed_ms, frame, &opts.glyphs)
-    );
-    let avail = max_line_width.saturating_sub(used_w);
+    let avail = max_line_width.saturating_sub(PACMAN_WIDTH);
     spans.push(Span::styled(
-        truncate_to_width(&tail, avail, true),
+        spread_tail(" ", &label, &dur_str, avail),
         text_style,
     ));
     Line::from(spans)
@@ -328,10 +340,66 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect::<String>()
         };
-        assert!(text(0).contains("thinking."), "{}", text(0));
-        assert!(text(1).contains("thinking.."), "{}", text(1));
-        assert!(text(2).contains("thinking…"), "{}", text(2));
-        assert!(text(3).contains("thinking."), "{}", text(3));
+        assert!(text(0).contains("thinking.  "), "{}", text(0));
+        assert!(text(1).contains("thinking.. "), "{}", text(1));
+        assert!(text(2).contains("thinking..."), "{}", text(2));
+        assert!(text(3).contains("thinking.  "), "{}", text(3));
+    }
+
+    #[test]
+    fn the_duration_is_pinned_to_the_right_edge() {
+        // §9.2: the counters never move — a wording change on the left must
+        // not shift the duration at the right edge.
+        let opts = RenderOptions::new(80, false);
+        let phase = Phase::Thinking;
+        let text = |elapsed: u64, frame: u64| {
+            render_activity_line(frame, &opts, &phase, elapsed, 80)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        for (elapsed, dur) in [
+            (0_u64, "0s"),
+            (15_000, "15s"),
+            (25_000, "25s"),
+            (45_000, "45s"),
+        ] {
+            for frame in [0_u64, 1, 2] {
+                let line = text(elapsed, frame);
+                assert_eq!(display_width(&line), 80, "{line:?}");
+                assert!(line.ends_with(dur), "{line:?}");
+            }
+        }
+
+        // No pacman while waiting on someone else — the duration still sits
+        // at the right edge.
+        let waiting = Phase::WaitingTask(2);
+        let line = render_activity_line(0, &opts, &waiting, 5_000, 80)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert_eq!(display_width(&line), 80, "{line:?}");
+        assert!(
+            line.starts_with("waiting for 2 background tasks"),
+            "{line:?}"
+        );
+        assert!(line.ends_with("5s"), "{line:?}");
+    }
+
+    #[test]
+    fn a_narrow_line_drops_the_label_before_the_duration() {
+        let opts = RenderOptions::new(40, false);
+        let phase = Phase::Tool("a very long tool title that will not fit".to_string());
+        let line = render_activity_line(0, &opts, &phase, 3_000, 32)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        // 24 cells of bar + the tail squeezed to the remaining 8.
+        assert_eq!(display_width(&line), 32, "{line:?}");
+        assert!(line.ends_with("3s"), "{line:?}");
     }
 
     #[test]

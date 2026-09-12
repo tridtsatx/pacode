@@ -13,6 +13,7 @@ pub mod anthropic;
 pub mod catalog_cache;
 pub mod codex;
 pub mod devin;
+pub mod error_body;
 pub mod image;
 pub mod mock;
 pub mod openai_compat;
@@ -29,6 +30,7 @@ use pacode_types::{Effort, Message, ModelInfo, StreamEvent, ToolDefinition};
 pub use catalog_cache::{
     CATALOG_CACHE_VERSION, CatalogCache, DEFAULT_CATALOG_TTL_SECS, DEFAULT_MAX_MODELS_PER_PROVIDER,
 };
+pub use error_body::error_body_message;
 pub use mock::MockProvider;
 pub use openai_compat::{OpenAiCompat, redact};
 pub use registry::ProviderRegistry;

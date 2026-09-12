@@ -4,6 +4,45 @@ use std::time::Instant;
 
 use pacode_types::{AgentId, AgentInfo, Plan, TaskId, TaskInfo, UsageTotals};
 
+/// What the Background level's detail card needs for its selected row —
+/// recorded by the draw path, read by `dispatch_deferred`. `output_bytes`
+/// doubles as the version: a `TaskUpdated` carrying more output re-keys the
+/// want and re-arms the read by itself — the daemon's task events drive the
+/// refresh, so no event-side invalidation or timer is needed (§5.9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskTailKey {
+    pub task: TaskId,
+    /// The daemon-reported output size the want was recorded at.
+    pub output_bytes: u64,
+}
+
+/// The tail of one task's spool output — the last ≤
+/// `ui::menu::background::TAIL_CAP_BYTES`, ANSI-stripped — produced by a
+/// deferred blocking read (`BgResponse::TaskTailReady`), never in the draw
+/// path (§8.1).
+#[derive(Clone, Debug)]
+pub struct TaskTail {
+    pub task: TaskId,
+    /// The `output_bytes` the tail was read at — part of the cache key.
+    pub output_bytes: u64,
+    /// `None` when the spool file was missing or unreadable; `Some("")` when
+    /// it simply had nothing yet.
+    pub text: Option<String>,
+    /// The file continues before what `text` shows — the card's cut marker.
+    pub truncated: bool,
+}
+
+impl TaskTail {
+    /// The want this tail answers — `dispatch_deferred` compares it against
+    /// `task_tail_want` to decide whether another read is owed.
+    pub fn key(&self) -> TaskTailKey {
+        TaskTailKey {
+            task: self.task.clone(),
+            output_bytes: self.output_bytes,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RailState {
     pub plan: Plan,
@@ -25,6 +64,14 @@ pub struct RailState {
     /// draw time from the available height; this remembers the first visible index in
     /// select mode so the highlighted agent stays on screen.
     pub agents_scroll: usize,
+    /// The Background level's deferred output-tail read (§5.9): the selected
+    /// task's key recorded by the draw path (`overlays`), the key of the read
+    /// currently on a blocking thread, and the landed tail — the only copy,
+    /// at most one task's ≤ `ui::menu::background::TAIL_CAP_BYTES` of text.
+    /// `clear_task_tail` drops all three when the level leaves the screen.
+    pub task_tail_want: Option<TaskTailKey>,
+    pub task_tail_in_flight: Option<TaskTailKey>,
+    pub task_tail: Option<TaskTail>,
 }
 
 impl RailState {
@@ -105,6 +152,14 @@ impl RailState {
 
     pub fn task(&self, id: &TaskId) -> Option<&TaskInfo> {
         self.tasks.iter().find(|t| &t.id == id)
+    }
+
+    /// Drop the output-tail cache and its outstanding wants — the Background
+    /// level left the screen; reopening re-arms from scratch (§5.9).
+    pub fn clear_task_tail(&mut self) {
+        self.task_tail_want = None;
+        self.task_tail_in_flight = None;
+        self.task_tail = None;
     }
 
     pub fn live_agents(&self) -> impl Iterator<Item = &AgentInfo> {

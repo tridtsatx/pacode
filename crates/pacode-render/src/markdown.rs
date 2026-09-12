@@ -15,7 +15,9 @@ use markdown_parse::{Block, parse_to_blocks};
 use ratatui::text::{Line, Span};
 
 use crate::RenderOptions;
-use crate::wrap::{display_width, truncate_to_width, wrap_line};
+use crate::syntax::{Lexer, token_style};
+use crate::theme::ColorMode;
+use crate::wrap::{display_width, truncate_spans, truncate_to_width, wrap_line};
 
 #[cfg(test)]
 #[path = "markdown_tests.rs"]
@@ -61,19 +63,36 @@ fn render_block(block: Block, opts: &RenderOptions) -> Vec<Line<'static>> {
     match block {
         Block::Paragraph(line) => wrap_line(line, width, 0),
         Block::Heading { line } => wrap_line(line, width, 0),
-        Block::Code { lines } => {
+        Block::Code { lang, lines } => {
             let vline = opts.glyphs.vline;
             let gutter = format!("{vline} ");
             let gutter_width = display_width(&gutter);
             let available_width = width.saturating_sub(gutter_width);
+            let mut lexer = if opts.color == ColorMode::Mono {
+                None
+            } else {
+                lang.map(Lexer::for_lang)
+            };
             lines
                 .into_iter()
                 .map(|code_line| {
-                    let truncated = truncate_to_width(&code_line, available_width, true);
-                    Line::from(vec![
-                        Span::styled(gutter.clone(), opts.theme.dim),
-                        Span::styled(truncated, opts.theme.fg),
-                    ])
+                    let mut spans = vec![Span::styled(gutter.clone(), opts.theme.dim)];
+                    let code: Vec<Span<'static>> = match lexer.as_mut() {
+                        Some(lx) => lx
+                            .lex_line(&code_line)
+                            .into_iter()
+                            .map(|t| {
+                                let style = t
+                                    .kind
+                                    .map(|k| token_style(&opts.theme, k))
+                                    .unwrap_or(opts.theme.fg);
+                                Span::styled(code_line[t.range].to_string(), style)
+                            })
+                            .collect(),
+                        None => vec![Span::styled(code_line, opts.theme.fg)],
+                    };
+                    spans.extend(truncate_spans(&code, available_width, opts.glyphs.ellipsis));
+                    Line::from(spans)
                 })
                 .collect()
         }

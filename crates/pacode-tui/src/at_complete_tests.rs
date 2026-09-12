@@ -69,6 +69,16 @@ fn test_accepting_directory_keeps_popup_open() {
     state.input.text = "read @sub".to_string();
     state.input.cursor = 9;
 
+    // §8.1: Tab reads the scan cache — the event loop is what runs
+    // `complete_at_path`. Feed the cache the scan it would have produced.
+    let key = crate::state::input::AtKey {
+        query: "sub".to_string(),
+        cursor_byte: 9,
+        cwd: root.to_path_buf(),
+    };
+    let cands = complete_at_path(&key.query, &key.cwd);
+    state.input.at_comp.finish_scan(key, cands);
+
     // Press Tab to accept candidate 'subdir/'
     let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
     let actions = crate::keys::handle_key(&mut state, key, std::time::Instant::now());

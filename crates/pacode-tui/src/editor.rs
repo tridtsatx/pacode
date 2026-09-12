@@ -134,6 +134,44 @@ pub fn edit_prompt(mouse: bool, initial_text: &str) -> Result<String, EditorErro
         .map_err(EditorError::Terminal)?
 }
 
+/// Opens `path` in the resolved editor while the TUI is suspended — the Files
+/// level's `o` action (§5.5). Unlike `edit_prompt` there is no temp file and
+/// nothing is read back; a missing path opens a fresh buffer there.
+pub fn open_path(state: &mut AppState, path: &std::path::Path) {
+    let mouse = state.config.ui.mouse;
+    let (program, args) = resolve_editor();
+    let result: Result<std::process::ExitStatus, EditorError> =
+        terminal::run_suspended(mouse, || {
+            let mut cmd = std::process::Command::new(&program);
+            cmd.args(&args).arg(path);
+            log::debug!("opening editor '{program}' on {}", path.display());
+            cmd.status().map_err(|e| {
+                log::warn!("failed to spawn editor '{program}': {e}");
+                EditorError::Spawn {
+                    cmd: program.clone(),
+                    source: e,
+                }
+            })
+        })
+        .unwrap_or_else(|e| Err(EditorError::Terminal(e)));
+    match result {
+        Ok(status) => {
+            // A non-zero editor exit is the user's business (`:cq` and friends)
+            // — log, don't toast.
+            log::debug!("editor '{program}' exited with status {status}");
+            state.dirty = true;
+        }
+        Err(err) => {
+            state.push_toast(
+                ToastLevel::Error,
+                "Editor error".to_string(),
+                Some(err.to_string()),
+                Instant::now(),
+            );
+        }
+    }
+}
+
 /// Opens the editor to edit `state.input.text`. Updates state on success, shows toast on error.
 pub fn open_editor(state: &mut AppState) {
     let mouse = state.config.ui.mouse;

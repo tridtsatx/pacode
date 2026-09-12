@@ -21,6 +21,7 @@ pacode-exec = { workspace = true }
 pacode-mcp = { workspace = true }
 pacode-plugin = { workspace = true }
 pacode-store = { workspace = true }
+pacode-vcs = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "fs", "process", "io-util"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }

@@ -19,13 +19,14 @@ pub const NAME: &str = "bash";
 
 pub struct BashTool;
 
+/// `pub(crate)` so `batch` can reuse the validated shape for its bash ops.
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct BashInput {
-    command: String,
-    background: bool,
-    timeout_secs: Option<u64>,
-    label: Option<String>,
+pub(crate) struct BashInput {
+    pub(crate) command: String,
+    pub(crate) background: bool,
+    pub(crate) timeout_secs: Option<u64>,
+    pub(crate) label: Option<String>,
 }
 
 #[async_trait]
@@ -95,99 +96,111 @@ impl Tool for BashTool {
         ctx.require_permission(perm_title, detail, Some(assessment.level))
             .await?;
 
-        ssh_multiplex::check_and_warn(&args.command, ctx.host.as_ref()).await;
+        run_authorized(args, accept_large_output, ctx).await
+    }
+}
 
-        let label = args
-            .label
-            .clone()
-            .unwrap_or_else(|| pacode_types::task_label_from_command(&args.command));
-        let tool_title = format!("Bash {label}");
+/// Spawn/wait/output — everything `call` does after classification and the
+/// permission gate. `batch` reaches this for ops it has already checked with
+/// `pacode_risk::is_read_only` and covered with its combined permission request,
+/// so the command must already be authorized.
+pub(crate) async fn run_authorized(
+    args: BashInput,
+    accept_large_output: bool,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput, ToolError> {
+    ssh_multiplex::check_and_warn(&args.command, ctx.host.as_ref()).await;
 
-        let timeout = if args.background {
-            None
-        } else {
-            args.timeout_secs
-                .map(Duration::from_secs)
-                .or(Some(ctx.exec_default_timeout))
-        };
+    let label = args
+        .label
+        .clone()
+        .unwrap_or_else(|| pacode_types::task_label_from_command(&args.command));
+    let tool_title = format!("Bash {label}");
 
-        let mut spec = pacode_exec::TaskSpec::new(
-            ctx.session.clone(),
-            ctx.agent.clone(),
-            args.command.clone(),
-            ctx.cwd.clone(),
-        );
-        spec.label = args.label.clone();
-        spec.background = args.background;
-        spec.timeout = timeout;
+    let timeout = if args.background {
+        None
+    } else {
+        args.timeout_secs
+            .map(Duration::from_secs)
+            .or(Some(ctx.exec_default_timeout))
+    };
 
-        let id = ctx.host.spawn_task(spec).await?;
+    let mut spec = pacode_exec::TaskSpec::new(
+        ctx.session.clone(),
+        ctx.agent.clone(),
+        args.command.clone(),
+        ctx.cwd.clone(),
+    );
+    spec.label = args.label.clone();
+    spec.background = args.background;
+    spec.timeout = timeout;
 
-        if args.background {
-            let content = format!("task_id: {id}\nstatus: running\nTask started in background.");
-            let preview = format!("task {id} running in background");
-            return Ok(ToolOutput::text(content)
+    let id = ctx.host.spawn_task(spec).await?;
+
+    if args.background {
+        let content = format!("task_id: {id}\nstatus: running\nTask started in background.");
+        let preview = format!("task {id} running in background");
+        return Ok(ToolOutput::text(content)
+            .with_title(tool_title)
+            .with_preview(preview)
+            .with_task(id));
+    }
+
+    let outcome = ctx.host.wait_task(&id, ctx.exec_yield_after, false).await;
+    match outcome {
+        WaitOutcome::Finished => {
+            let exit_code = ctx
+                .host
+                .task_info(&id)
+                .and_then(|i| i.exit_code)
+                .unwrap_or(0);
+            let tail_lines = ctx.host.task_tail(&id, 400).await?;
+            let joined = tail_lines.join("\n");
+            let capped = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
+            let mut content = capped;
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&format!("[exit code {exit_code}]"));
+
+            let preview = tail_lines
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .cloned()
+                .unwrap_or_default();
+
+            let mut out = ToolOutput::text(content)
+                .with_title(tool_title)
+                .with_preview(preview);
+            if exit_code != 0 {
+                out.is_error = true;
+            }
+            Ok(out)
+        }
+        WaitOutcome::Timeout | WaitOutcome::Progress => {
+            let tail_lines = ctx.host.task_tail(&id, 40).await.unwrap_or_default();
+            let tail_joined = tail_lines.join("\n");
+            let secs = if ctx.exec_yield_after.subsec_millis() == 0 {
+                format!("{}s", ctx.exec_yield_after.as_secs())
+            } else {
+                format!("{:.1}s", ctx.exec_yield_after.as_secs_f32())
+            };
+            let content = format!(
+                "Command still running after {secs}; moved to background as task {id}. Latest output:\n{tail_joined}"
+            );
+            let preview = tail_lines
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("task {id} moved to background"));
+
+            Ok(ToolOutput::text(content)
                 .with_title(tool_title)
                 .with_preview(preview)
-                .with_task(id));
+                .with_task(id))
         }
-
-        let outcome = ctx.host.wait_task(&id, ctx.exec_yield_after, false).await;
-        match outcome {
-            WaitOutcome::Finished => {
-                let exit_code = ctx
-                    .host
-                    .task_info(&id)
-                    .and_then(|i| i.exit_code)
-                    .unwrap_or(0);
-                let tail_lines = ctx.host.task_tail(&id, 400).await?;
-                let joined = tail_lines.join("\n");
-                let capped = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-                let mut content = capped;
-                if !content.ends_with('\n') {
-                    content.push('\n');
-                }
-                content.push_str(&format!("[exit code {exit_code}]"));
-
-                let preview = tail_lines
-                    .iter()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_default();
-
-                let mut out = ToolOutput::text(content)
-                    .with_title(tool_title)
-                    .with_preview(preview);
-                if exit_code != 0 {
-                    out.is_error = true;
-                }
-                Ok(out)
-            }
-            WaitOutcome::Timeout | WaitOutcome::Progress => {
-                let tail_lines = ctx.host.task_tail(&id, 40).await.unwrap_or_default();
-                let tail_joined = tail_lines.join("\n");
-                let secs = if ctx.exec_yield_after.subsec_millis() == 0 {
-                    format!("{}s", ctx.exec_yield_after.as_secs())
-                } else {
-                    format!("{:.1}s", ctx.exec_yield_after.as_secs_f32())
-                };
-                let content = format!(
-                    "Command still running after {secs}; moved to background as task {id}. Latest output:\n{tail_joined}"
-                );
-                let preview = tail_lines
-                    .iter()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| format!("task {id} moved to background"));
-
-                Ok(ToolOutput::text(content)
-                    .with_title(tool_title)
-                    .with_preview(preview)
-                    .with_task(id))
-            }
-            WaitOutcome::Cancelled => Err(ToolError::Cancelled),
-        }
+        WaitOutcome::Cancelled => Err(ToolError::Cancelled),
     }
 }

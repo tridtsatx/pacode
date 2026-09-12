@@ -25,6 +25,89 @@ fn is_overlay_down(key: &KeyEvent) -> bool {
     is_next(key) || key.code == KeyCode::Char('j')
 }
 
+/// Whether `key` matches any chord currently bound to `action`. The pickers
+/// look their own actions up directly instead of `Keymap::action_for`:
+/// that resolver scans every scope and a global action spelled with the
+/// same chord (`files_overlay` on `alt+f`) would win the shared entry (§9.1).
+fn keymap_has(
+    keymap: &crate::binding::Keymap,
+    action: crate::binding::Action,
+    key: KeyEvent,
+) -> bool {
+    keymap
+        .bindings_for(action)
+        .iter()
+        .any(|b| crate::binding::matches_key(b, key))
+}
+
+/// The per-model flag a mark key toggles in the model picker (§9.1).
+#[derive(Clone, Copy)]
+enum ModelMark {
+    Zdr,
+    Favorite,
+}
+
+/// Toggle `mark` on the filtered row at `index`, persist it, and send
+/// `SetModelFlag` so the daemon enforces the same flag server-side. The ZDR
+/// gate mirrors the daemon's: the active route cannot lose its mark while
+/// ZDR is on.
+fn toggle_model_mark(
+    state: &mut AppState,
+    index: usize,
+    q_lower: &str,
+    zdr_only: bool,
+    mark: ModelMark,
+) -> Vec<Action> {
+    let route_key = {
+        let rows =
+            crate::state::picker_models(&state.models, &state.model_flags, q_lower, zdr_only);
+        rows.get(index).map(|m| m.route.to_string())
+    };
+    let Some(route_key) = route_key else {
+        return vec![];
+    };
+    let mut flags = state
+        .model_flags
+        .get(&route_key)
+        .copied()
+        .unwrap_or_default();
+    match mark {
+        ModelMark::Zdr => {
+            // The daemon refuses to unmark the active route while ZDR is
+            // on; gate here so the local flags don't diverge from what it
+            // enforces.
+            let active_route = state
+                .meta
+                .as_ref()
+                .is_some_and(|m| m.model.to_string() == route_key);
+            if flags.zdr_capable
+                && active_route
+                && crate::state::zdr_active(&state.config, state.meta.as_ref())
+            {
+                state.push_notice_with_level(
+                    pacode_types::ToastLevel::Warn,
+                    "can't unmark the active route while ZDR is on".to_string(),
+                );
+                return vec![];
+            }
+            flags.zdr_capable = !flags.zdr_capable;
+        }
+        ModelMark::Favorite => {
+            flags.favorite = !flags.favorite;
+        }
+    }
+    if flags == pacode_types::ModelFlags::default() {
+        state.model_flags.remove(&route_key);
+    } else {
+        state.model_flags.insert(route_key.clone(), flags);
+    }
+    state.save_pref_model_flags();
+    vec![Action::Send(Request::SetModelFlag {
+        model: route_key,
+        flags,
+    })]
+}
+
 pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     let prev_overlay = match &state.focus {
         Focus::Overlay(o) => Some(crate::nav::overlay_name(o)),
@@ -87,20 +170,30 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     })];
                 }
                 KeyCode::Up | KeyCode::Char('k') => *index = index.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    *index = (*index + 1).min(count.saturating_sub(1));
-                }
+                // The free-text plaque sits at `index == count` — one row past
+                // the last option.
+                KeyCode::Down | KeyCode::Char('j') => *index = (*index + 1).min(count),
                 KeyCode::Char('t') => *typing = true,
-                KeyCode::Char(' ') if multi => {
-                    if let Some(pos) = selected.iter().position(|i| i == index) {
-                        selected.remove(pos);
-                    } else {
-                        selected.push(*index);
+                KeyCode::Char(' ') => {
+                    if *index == count {
+                        // Space on the plaque means "type here" (in typing mode
+                        // the Char arm above already appends it to `typed`).
+                        *typing = true;
+                    } else if multi {
+                        if let Some(pos) = selected.iter().position(|i| i == index) {
+                            selected.remove(pos);
+                        } else {
+                            selected.push(*index);
+                        }
                     }
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                     let picked = (c as usize) - ('0' as usize) - 1;
-                    if picked < count {
+                    if picked == count {
+                        // `N+1` jumps to the free-text plaque rather than
+                        // answering — typing there starts with enter.
+                        *index = count;
+                    } else if picked < count {
                         state.focus = Focus::Normal;
                         return vec![Action::Send(pacode_types::Request::AnswerQuestion {
                             question: id,
@@ -109,21 +202,27 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     }
                 }
                 KeyCode::Enter => {
-                    let answer = if multi && !selected.is_empty() {
-                        pacode_types::QuestionAnswer {
-                            selected: selected.clone(),
-                            free_text: None,
-                            cancelled: false,
-                        }
+                    if *index == count {
+                        *typing = true;
                     } else {
-                        pacode_types::QuestionAnswer::choice(*index)
-                    };
-                    state.focus = Focus::Normal;
-                    return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                        question: id,
-                        answer,
-                    })];
+                        let answer = if multi && !selected.is_empty() {
+                            pacode_types::QuestionAnswer {
+                                selected: selected.clone(),
+                                free_text: None,
+                                cancelled: false,
+                            }
+                        } else {
+                            pacode_types::QuestionAnswer::choice(*index)
+                        };
+                        state.focus = Focus::Normal;
+                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
+                            question: id,
+                            answer,
+                        })];
+                    }
                 }
+                // Any other printable key is ignored: the question is a closed
+                // list — free text lives only on the plaque.
                 _ => {}
             }
             state.dirty = true;
@@ -198,6 +297,26 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 return vec![];
             }
 
+            // §9.1: the per-model marks live on modifier chords from the key
+            // registry — `alt+f` favorite / `alt+z` ZDR, with `ctrl+g` /
+            // `ctrl+y` as the fallback for terminals that eat alt. Letters
+            // always reach the query, so a search can start with `s`.
+            let mark = if keymap_has(&state.keymap, crate::binding::Action::ModelPickerZdr, key) {
+                Some(ModelMark::Zdr)
+            } else if keymap_has(
+                &state.keymap,
+                crate::binding::Action::ModelPickerFavorite,
+                key,
+            ) {
+                Some(ModelMark::Favorite)
+            } else {
+                None
+            };
+            if let Some(mark) = mark {
+                let row = *index;
+                return toggle_model_mark(state, row, &q_lower, zdr_only, mark);
+            }
+
             match key.code {
                 KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Enter => {
@@ -226,65 +345,6 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                             actions.push(Action::Send(Request::SetZdr(true)));
                         }
                         return actions;
-                    }
-                }
-                // `z`/`s` toggle per-model flags on the selected row and
-                // persist them (spec §3). Once a query is started the keys
-                // type into it instead, so searches like "mistral" work —
-                // the trade-off is a query can't begin with z/s.
-                KeyCode::Char(c @ ('z' | 's'))
-                    if query.is_empty()
-                        && !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    let route_key = {
-                        let rows = crate::state::picker_models(
-                            &state.models,
-                            &state.model_flags,
-                            &q_lower,
-                            zdr_only,
-                        );
-                        rows.get(*index).map(|m| m.route.to_string())
-                    };
-                    if let Some(route_key) = route_key {
-                        let mut flags = state
-                            .model_flags
-                            .get(&route_key)
-                            .copied()
-                            .unwrap_or_default();
-                        if c == 'z' {
-                            // The daemon refuses to unmark the active route
-                            // while ZDR is on; gate here so the local flags
-                            // don't diverge from what it enforces.
-                            let active_route = state
-                                .meta
-                                .as_ref()
-                                .is_some_and(|m| m.model.to_string() == route_key);
-                            if flags.zdr_capable
-                                && active_route
-                                && crate::state::zdr_active(&state.config, state.meta.as_ref())
-                            {
-                                state.push_notice_with_level(
-                                    pacode_types::ToastLevel::Warn,
-                                    "can't unmark the active route while ZDR is on".to_string(),
-                                );
-                                return vec![];
-                            }
-                            flags.zdr_capable = !flags.zdr_capable;
-                        } else {
-                            flags.favorite = !flags.favorite;
-                        }
-                        if flags == pacode_types::ModelFlags::default() {
-                            state.model_flags.remove(&route_key);
-                        } else {
-                            state.model_flags.insert(route_key.clone(), flags);
-                        }
-                        state.save_pref_model_flags();
-                        return vec![Action::Send(Request::SetModelFlag {
-                            model: route_key,
-                            flags,
-                        })];
                     }
                 }
                 KeyCode::Backspace => {
@@ -422,340 +482,15 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
-        Focus::Overlay(Overlay::SessionPicker { query, index }) => {
-            let q_lower = query.to_lowercase();
-            let filtered_count = state
-                .sessions
-                .iter()
-                .filter(|s| {
-                    q_lower.is_empty()
-                        || s.title().to_lowercase().contains(&q_lower)
-                        || s.id.as_str().to_lowercase().contains(&q_lower)
-                })
-                .count();
-
-            if is_prev(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
-            }
-            if is_next(&key) && filtered_count > 0 && *index + 1 < filtered_count {
-                *index += 1;
-                return vec![];
-            }
-
-            match key.code {
-                KeyCode::Esc => state.focus = Focus::Normal,
-                KeyCode::Enter => {
-                    let filtered: Vec<_> = state
-                        .sessions
-                        .iter()
-                        .filter(|s| {
-                            q_lower.is_empty()
-                                || s.title().to_lowercase().contains(&q_lower)
-                                || s.id.as_str().to_lowercase().contains(&q_lower)
-                        })
-                        .collect();
-                    if let Some(session) = filtered.get(*index) {
-                        let id = session.id.clone();
-                        state.focus = Focus::Normal;
-                        return vec![Action::Send(Request::Attach(
-                            pacode_types::Attach::Resume { session: id },
-                        ))];
-                    }
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                    *index = 0;
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    query.push(c);
-                    *index = 0;
-                }
-                _ => {}
-            }
-            vec![]
-        }
-        Focus::Overlay(Overlay::Files { index }) => {
-            let count = state.files.len();
-            if is_overlay_up(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
-            }
-            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
-                *index += 1;
-                return vec![];
-            }
-            match key.code {
-                KeyCode::Esc => state.focus = Focus::Normal,
-                KeyCode::Enter => {
-                    let sorted = state.files.sorted_rows();
-                    if let Some(row) = sorted.get(*index) {
-                        state.input.insert_str(&row.path);
-                    }
-                    state.focus = Focus::Normal;
-                }
-                _ => {}
-            }
-            vec![]
-        }
-        Focus::Overlay(Overlay::RailOverlay) | Focus::Overlay(Overlay::Help) => {
+        Focus::Overlay(Overlay::RailOverlay) => {
             if key.code == KeyCode::Esc {
                 state.focus = Focus::Normal;
             }
             vec![]
         }
-        Focus::Overlay(Overlay::Import(_)) => vec![],
-        Focus::Overlay(Overlay::McpPicker {
-            index,
-            servers,
-            loading,
-        }) => {
-            let count = servers.len();
-            if is_overlay_up(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
-            }
-            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
-                *index += 1;
-                return vec![];
-            }
-            match key.code {
-                KeyCode::Esc => state.focus = Focus::Normal,
-                KeyCode::Char('r') => {
-                    if let Some(s) = servers.get(*index) {
-                        let server_name = s.name.clone();
-                        *loading = true;
-                        return vec![
-                            Action::Send(Request::RestartMcpServer {
-                                server: server_name,
-                            }),
-                            Action::Send(Request::ListMcpServers),
-                        ];
-                    }
-                }
-                KeyCode::Enter => {
-                    if let Some(s) = servers.get(*index) {
-                        let server_name = s.name.clone();
-                        let enabled = s.status == "disabled";
-                        *loading = true;
-                        return vec![
-                            Action::Send(Request::SetMcpServerEnabled {
-                                server: server_name,
-                                enabled,
-                            }),
-                            Action::Send(Request::ListMcpServers),
-                        ];
-                    }
-                }
-                _ => {}
-            }
-            vec![]
-        }
-        Focus::Overlay(Overlay::PluginsPicker {
-            index,
-            plugins,
-            tab,
-            market,
-            query,
-            loading,
-            stale,
-        }) => {
-            use crate::state::PluginsTab;
-
-            let count = match tab {
-                PluginsTab::Installed => plugins.len(),
-                PluginsTab::Discover => market.len(),
-            };
-            let source = state.config.plugins.marketplace.clone();
-
-            if is_overlay_up(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
-            }
-            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
-                *index += 1;
-                return vec![];
-            }
-
-            match key.code {
-                KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                    state.dirty = true;
-                    return vec![];
-                }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    *tab = tab.next();
-                    *index = 0;
-                    state.dirty = true;
-                    // The Discover tab is empty until the marketplace answers.
-                    if *tab == PluginsTab::Discover && market.is_empty() && !source.is_empty() {
-                        *loading = true;
-                        let query = query.clone();
-                        return vec![Action::Send(Request::BrowseMarketplace { source, query })];
-                    }
-                }
-                // Typing filters Discover; the request goes out on every keystroke
-                // but the index is served from cache, so it costs no network.
-                KeyCode::Char(c) if *tab == PluginsTab::Discover && !source.is_empty() => match c {
-                    'i' if !market.is_empty() => {
-                        let name = market[(*index).min(market.len() - 1)].name.clone();
-                        *loading = true;
-                        state.dirty = true;
-                        // The install reply refreshes Discover; ListPlugins
-                        // makes the new plugin show up under Installed.
-                        return vec![
-                            Action::Send(Request::InstallPlugin { source, name }),
-                            Action::Send(Request::ListPlugins),
-                        ];
-                    }
-                    _ => {
-                        query.push(c);
-                        *index = 0;
-                        *loading = true;
-                        state.dirty = true;
-                        let query = query.clone();
-                        return vec![Action::Send(Request::BrowseMarketplace { source, query })];
-                    }
-                },
-                KeyCode::Backspace if *tab == PluginsTab::Discover && !source.is_empty() => {
-                    query.pop();
-                    *index = 0;
-                    *loading = true;
-                    state.dirty = true;
-                    let query = query.clone();
-                    return vec![Action::Send(Request::BrowseMarketplace { source, query })];
-                }
-                KeyCode::Char('x') if *tab == PluginsTab::Installed && !plugins.is_empty() => {
-                    let p = &plugins[(*index).min(plugins.len() - 1)];
-                    // Uninstall removes exactly what an install record tracks, so
-                    // only marketplace-installed plugins are removable here.
-                    if p.is_installed() {
-                        let name = p.name.clone();
-                        state.dirty = true;
-                        // ListPlugins refreshes the Installed tab; the uninstall
-                        // reply itself refreshes the Discover tab.
-                        return vec![
-                            Action::Send(Request::UninstallPlugin { name }),
-                            Action::Send(Request::ListPlugins),
-                        ];
-                    }
-                }
-                _ => {}
-            }
-            let _ = stale;
-            vec![]
-        }
-        Focus::Overlay(Overlay::KeysPicker { index, capturing }) => {
-            let count = crate::binding::Keymap::action_names().len();
-            if *capturing {
-                if key.code == KeyCode::Esc {
-                    *capturing = false;
-                    return vec![];
-                }
-
-                let mut mods = key.modifiers
-                    & (KeyModifiers::CONTROL
-                        | KeyModifiers::ALT
-                        | KeyModifiers::SHIFT
-                        | KeyModifiers::SUPER);
-                let code = match key.code {
-                    KeyCode::Char(c) if c.is_ascii_uppercase() => {
-                        mods.insert(KeyModifiers::SHIFT);
-                        KeyCode::Char(c.to_ascii_lowercase())
-                    }
-                    KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
-                    other => other,
-                };
-                let binding = crate::binding::Binding { code, mods };
-                let formatted = crate::binding::format_binding(&binding);
-                if formatted.ends_with("unknown") {
-                    *capturing = false;
-                    state.push_toast(
-                        pacode_types::ToastLevel::Warn,
-                        "Cannot bind key".to_string(),
-                        Some("Key cannot be represented".to_string()),
-                        std::time::Instant::now(),
-                    );
-                    return vec![];
-                }
-
-                let Some(&(_, action)) = crate::binding::Keymap::action_names().get(*index) else {
-                    *capturing = false;
-                    return vec![];
-                };
-
-                if let Some((_, conflict_action)) = state.keymap.find_conflict(&binding, action) {
-                    *capturing = false;
-                    state.push_toast(
-                        pacode_types::ToastLevel::Warn,
-                        "Keybinding conflict".to_string(),
-                        Some(conflict_action.description().to_string()),
-                        std::time::Instant::now(),
-                    );
-                    return vec![];
-                }
-
-                state.keymap.set_binding(action, binding);
-                *capturing = false;
-
-                let act_name = action.name();
-                let dotted = format!("keys.{act_name}");
-                if let Err(err) = pacode_config::update_config_value(
-                    &state.paths,
-                    &dotted,
-                    pacode_config::toml::Value::String(formatted),
-                ) {
-                    log::warn!("failed to update config value '{dotted}': {err}");
-                    state.push_toast(
-                        pacode_types::ToastLevel::Error,
-                        "Failed to update config".to_string(),
-                        Some(err.to_string()),
-                        std::time::Instant::now(),
-                    );
-                }
-            } else {
-                if is_overlay_up(&key) && *index > 0 {
-                    *index -= 1;
-                    return vec![];
-                }
-                if is_overlay_down(&key) && count > 0 && *index + 1 < count {
-                    *index += 1;
-                    return vec![];
-                }
-                match key.code {
-                    KeyCode::Esc => state.focus = Focus::Normal,
-                    KeyCode::Enter => {
-                        *capturing = true;
-                    }
-                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(&(_, action)) =
-                            crate::binding::Keymap::action_names().get(*index)
-                        {
-                            state.keymap.reset_default(action);
-                            let act_name = action.name();
-                            let dotted = format!("keys.{act_name}");
-                            if let Err(err) =
-                                pacode_config::remove_config_value(&state.paths, &dotted)
-                            {
-                                log::warn!("failed to remove config value '{dotted}': {err}");
-                                state.push_toast(
-                                    pacode_types::ToastLevel::Error,
-                                    "Failed to update config".to_string(),
-                                    Some(err.to_string()),
-                                    std::time::Instant::now(),
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            vec![]
-        }
+        // Unreachable — `keys::handle_key` routes a menu to `keys_menu` before
+        // the overlay dispatch — but the match stays exhaustive.
+        Focus::Overlay(Overlay::Menu { .. }) => vec![],
         Focus::Overlay(Overlay::ThemePicker {
             index,
             original_theme,
@@ -919,9 +654,6 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
-        Focus::Overlay(Overlay::ConfigPicker) => crate::ui::config_view::handle_key(state, key),
-        Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } | Focus::BgList { .. } => {
-            vec![]
-        }
+        Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } => vec![],
     }
 }

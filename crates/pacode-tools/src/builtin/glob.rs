@@ -75,41 +75,34 @@ impl Tool for GlobTool {
                     .map_err(|e| ToolError::invalid(format!("invalid glob pattern: {e}")))?
                     .compile_matcher();
 
-                let walker = ignore::WalkBuilder::new(&root)
-                    .hidden(true)
-                    .git_ignore(true)
-                    .require_git(false)
-                    .build();
+                let entries = crate::walk::shared().collect(
+                    &root,
+                    crate::walk::WalkOptions {
+                        include_hidden: false,
+                        max_depth: None,
+                    },
+                    &cancel,
+                )?;
 
-                let mut entries = Vec::new();
+                let mut matched: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+                    .iter()
+                    .filter(|entry| entry.is_file)
+                    .filter(|entry| {
+                        glob.is_match(&entry.rel)
+                            || glob.is_match(entry.rel.file_name().unwrap_or_default())
+                    })
+                    .map(|entry| {
+                        (
+                            entry.mtime.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                            entry.rel.clone(),
+                        )
+                    })
+                    .collect();
 
-                for entry in walker {
-                    if cancel.is_cancelled() {
-                        return Err(ToolError::Cancelled);
-                    }
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                        continue;
-                    }
-                    let path = entry.path();
-                    let rel = path.strip_prefix(&root).unwrap_or(path);
-                    if glob.is_match(rel) || glob.is_match(path.file_name().unwrap_or_default()) {
-                        let mtime = entry
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        entries.push((mtime, rel.to_path_buf()));
-                    }
-                }
+                matched.sort_by_key(|b| std::cmp::Reverse(b.0));
+                matched.truncate(max_results);
 
-                entries.sort_by_key(|b| std::cmp::Reverse(b.0));
-                entries.truncate(max_results);
-
-                let lines = entries
+                let lines = matched
                     .into_iter()
                     .map(|(_, p)| p.to_string_lossy().to_string())
                     .collect();

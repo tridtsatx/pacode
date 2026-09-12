@@ -494,6 +494,85 @@ fn test_rebind_select_agent_2_takes_effect() {
 }
 
 #[test]
+fn test_picker_mark_actions_defaults_and_scope() {
+    // §9.1: alt is the primary spelling, ctrl the fallback for terminals
+    // that eat alt; both live in the registry, changeable from Keys.
+    let keymap = Keymap::defaults();
+    assert_eq!(
+        keymap.bindings_for(Action::ModelPickerFavorite),
+        &[
+            Binding {
+                code: KeyCode::Char('f'),
+                mods: KeyModifiers::ALT,
+            },
+            Binding {
+                code: KeyCode::Char('g'),
+                mods: KeyModifiers::CONTROL,
+            },
+        ]
+    );
+    assert_eq!(
+        keymap.bindings_for(Action::ModelPickerZdr),
+        &[
+            Binding {
+                code: KeyCode::Char('z'),
+                mods: KeyModifiers::ALT,
+            },
+            Binding {
+                code: KeyCode::Char('y'),
+                mods: KeyModifiers::CONTROL,
+            },
+        ]
+    );
+    assert_eq!(Action::ModelPickerFavorite.scope(), Scope::Picker);
+    assert_eq!(Action::ModelPickerZdr.scope(), Scope::Picker);
+    assert_eq!(Action::ModelPickerFavorite.name(), "model_picker_favorite");
+    assert_eq!(Action::ModelPickerZdr.name(), "model_picker_zdr");
+}
+
+#[test]
+fn test_shared_chords_resolve_to_their_global_owner() {
+    // The picker duplicates alt+f/alt+z under its own scope — in Normal
+    // focus the global actions must still win the shared ladder.
+    let keymap = Keymap::defaults();
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)),
+        Some(Action::FilesOverlay)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+        Some(Action::ToggleZdr)
+    );
+}
+
+#[test]
+fn test_find_conflict_is_scope_aware() {
+    let keymap = Keymap::defaults();
+    let alt_f = Binding {
+        code: KeyCode::Char('f'),
+        mods: KeyModifiers::ALT,
+    };
+
+    // alt+f is held by files_overlay — but the picker scope never meets the
+    // global ladder, so binding it on a picker action is not a conflict.
+    assert_eq!(
+        keymap.find_conflict(&alt_f, Action::ModelPickerFavorite),
+        None
+    );
+
+    // Inside the picker scope the same chord does collide: alt+z is
+    // model_picker_zdr's chord, so favorite cannot also claim it.
+    let alt_z = Binding {
+        code: KeyCode::Char('z'),
+        mods: KeyModifiers::ALT,
+    };
+    assert_eq!(
+        keymap.find_conflict(&alt_z, Action::ModelPickerFavorite),
+        Some(("model_picker_zdr", Action::ModelPickerZdr))
+    );
+}
+
+#[test]
 fn test_queue_actions_present_in_defaults() {
     let keymap = Keymap::defaults();
     let submit_now_bindings = keymap.bindings_for(Action::SubmitNow);

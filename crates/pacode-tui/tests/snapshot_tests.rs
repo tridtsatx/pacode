@@ -550,7 +550,10 @@ fn test_mockup_state_05_bglist() {
     ];
 
     let mut state = create_state(120, 34, snapshot);
-    state.focus = Focus::BgList { index: 0 };
+    state.focus = Focus::Overlay(pacode_tui::state::Overlay::Menu {
+        stack: pacode_tui::ui::menu::MenuStack::root(pacode_tui::ui::menu::MenuId::Background),
+        ui: pacode_tui::ui::menu::MenuUiState::default(),
+    });
     settle_focus(&mut state);
 
     let backend = TestBackend::new(120, 34);

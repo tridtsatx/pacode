@@ -113,15 +113,36 @@ impl ScheduleStub {
 
 /// A host that only has to answer the scheduling calls; everything else a tool
 /// might reach for is refused loudly rather than pretending to work.
-#[derive(Default)]
+///
+/// Permission drafts are recorded in `drafts` and answered with `decision`
+/// (default `AllowOnce`). When `tasks` is set, task calls delegate to a real
+/// `TaskManager`, so tests can run actual commands.
 pub struct StubToolHost {
     pub schedule: ScheduleStub,
+    pub drafts: Mutex<Vec<PermissionDraft>>,
+    pub decision: Mutex<PermissionDecision>,
+    pub tasks: Option<Arc<pacode_exec::TaskManager>>,
+}
+
+impl Default for StubToolHost {
+    fn default() -> Self {
+        Self {
+            schedule: ScheduleStub::default(),
+            drafts: Mutex::new(Vec::new()),
+            decision: Mutex::new(PermissionDecision::AllowOnce),
+            tasks: None,
+        }
+    }
 }
 
 #[async_trait]
 impl ToolHost for StubToolHost {
-    async fn request_permission(&self, _draft: PermissionDraft) -> PermissionDecision {
-        PermissionDecision::AllowOnce
+    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
+        self.drafts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(draft);
+        *self.decision.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     async fn ask_question(
@@ -188,46 +209,82 @@ impl ToolHost for StubToolHost {
 
     async fn spawn_task(
         &self,
-        _spec: pacode_exec::TaskSpec,
+        spec: pacode_exec::TaskSpec,
     ) -> Result<pacode_types::TaskId, ToolError> {
-        Err(ToolError::Failed("no tasks in this test".to_string()))
+        match &self.tasks {
+            Some(tasks) => tasks
+                .spawn(spec)
+                .await
+                .map(|info| info.id)
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Err(ToolError::Failed("no tasks in this test".to_string())),
+        }
     }
 
-    fn task_info(&self, _task: &pacode_types::TaskId) -> Option<pacode_types::TaskInfo> {
-        None
+    fn task_info(&self, task: &pacode_types::TaskId) -> Option<pacode_types::TaskInfo> {
+        self.tasks.as_ref().and_then(|t| t.info(task))
     }
 
     fn list_tasks(&self) -> Vec<pacode_types::TaskInfo> {
-        Vec::new()
+        self.tasks
+            .as_ref()
+            .map(|t| t.list(None))
+            .unwrap_or_default()
     }
 
     async fn wait_task(
         &self,
-        _task: &pacode_types::TaskId,
-        _timeout: Duration,
-        _return_on_progress: bool,
+        task: &pacode_types::TaskId,
+        timeout: Duration,
+        return_on_progress: bool,
     ) -> WaitOutcome {
-        WaitOutcome::Timeout
+        match &self.tasks {
+            Some(tasks) => match tasks.wait(task, timeout, return_on_progress).await {
+                pacode_exec::WaitResult::Ended(_) | pacode_exec::WaitResult::NotFound => {
+                    WaitOutcome::Finished
+                }
+                pacode_exec::WaitResult::Progress(_) => WaitOutcome::Progress,
+                pacode_exec::WaitResult::Timeout(_) => WaitOutcome::Timeout,
+            },
+            None => WaitOutcome::Timeout,
+        }
     }
 
-    async fn kill_task(&self, _task: &pacode_types::TaskId) -> Result<(), ToolError> {
-        Err(ToolError::Failed("no tasks in this test".to_string()))
+    async fn kill_task(&self, task: &pacode_types::TaskId) -> Result<(), ToolError> {
+        match &self.tasks {
+            Some(tasks) => tasks
+                .kill(task)
+                .await
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Err(ToolError::Failed("no tasks in this test".to_string())),
+        }
     }
 
     async fn task_tail(
         &self,
-        _task: &pacode_types::TaskId,
-        _lines: usize,
+        task: &pacode_types::TaskId,
+        lines: usize,
     ) -> Result<Vec<String>, ToolError> {
-        Ok(Vec::new())
+        match &self.tasks {
+            Some(tasks) => tasks
+                .tail(task, lines)
+                .await
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn report_task_progress(
         &self,
-        _task: &pacode_types::TaskId,
-        _progress: pacode_types::TaskProgress,
+        task: &pacode_types::TaskId,
+        progress: pacode_types::TaskProgress,
     ) -> Result<(), ToolError> {
-        Ok(())
+        match &self.tasks {
+            Some(tasks) => tasks
+                .report_progress(task, progress)
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Ok(()),
+        }
     }
 
     async fn spawn_agent(&self, _spec: AgentSpec) -> Result<AgentId, ToolError> {
@@ -292,5 +349,6 @@ pub fn stub_ctx(host: Arc<StubToolHost>) -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: crate::registry::ToolRegistry::new(),
     }
 }

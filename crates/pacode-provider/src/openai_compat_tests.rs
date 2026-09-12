@@ -560,7 +560,7 @@ fn test_redact_no_sensitive_data() {
 }
 
 #[tokio::test]
-async fn test_complete_non_2xx_carries_full_error_body() {
+async fn test_complete_non_2xx_extracts_error_message() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -620,11 +620,12 @@ async fn test_complete_non_2xx_carries_full_error_body() {
     let result = provider.complete(req).await;
     server.await.unwrap();
 
-    let expected_body = "{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Invalid model specified: foo\"}}";
+    // The surfaced message is the extracted human-readable text, not raw JSON.
+    let expected_message = "invalid_request_error: Invalid model specified: foo";
     match result {
         Err(ProviderError::Http { status, message }) => {
             assert_eq!(status, 400);
-            assert_eq!(message, expected_body);
+            assert_eq!(message, expected_message);
         }
         Err(other) => panic!("expected ProviderError::Http, got: {other}"),
         Ok(_) => panic!("expected ProviderError::Http, got a successful stream"),
@@ -632,12 +633,12 @@ async fn test_complete_non_2xx_carries_full_error_body() {
 
     let err: ProviderError = ProviderError::Http {
         status: 400,
-        message: expected_body.to_string(),
+        message: expected_message.to_string(),
     };
     let err_str = format!("{err}");
     assert_eq!(
         err_str,
-        "request failed (400): {\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Invalid model specified: foo\"}}"
+        "request failed (400): invalid_request_error: Invalid model specified: foo"
     );
 }
 

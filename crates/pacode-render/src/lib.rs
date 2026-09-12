@@ -7,16 +7,21 @@ pub mod diff;
 pub mod markdown;
 pub mod palettes;
 pub mod stream;
+pub mod syntax;
+pub mod text;
 pub mod theme;
 pub mod wrap;
 
 pub use cache::LineCache;
-pub use diff::{diff_stat, render_diff, unified_diff};
+pub use diff::{diff_stat, render_diff, render_diff_ex, unified_diff};
 pub use markdown::render_markdown;
 pub use palettes::builtin_palettes;
 pub use stream::{StreamBuffer, StreamKind, StreamOp};
-pub use theme::{BashRole, Glyphs, Palette, Theme, detect_truecolor, parse_color, rgb_to_ansi16};
-pub use wrap::{display_width, truncate_to_width, wrap_line, wrap_text};
+pub use syntax::{Lang, Lexer, Token, TokenKind, detect_lang, token_style};
+pub use theme::{
+    BashRole, ColorMode, Glyphs, Palette, Theme, detect_truecolor, parse_color, rgb_to_ansi16,
+};
+pub use wrap::{display_width, truncate_spans, truncate_to_width, wrap_line, wrap_text};
 
 /// Rendering parameters shared by all renderers.
 #[derive(Clone, Debug, PartialEq)]
@@ -24,6 +29,9 @@ pub struct RenderOptions {
     pub width: u16,
     pub theme: Theme,
     pub glyphs: Glyphs,
+    /// Terminal colour fidelity (`[ui] color` / `COLORTERM` / `NO_COLOR`).
+    /// Controls degradation steps such as diff background bands.
+    pub color: ColorMode,
     /// Draw the model's reasoning line (`[ui] thinking`). Off by default.
     pub thinking: bool,
 }
@@ -33,6 +41,7 @@ impl RenderOptions {
         Self {
             width,
             thinking: false,
+            color: ColorMode::detect(),
             theme: Theme::default(),
             glyphs: Glyphs::new(ascii_only),
         }
@@ -43,8 +52,16 @@ impl RenderOptions {
             width,
             theme,
             glyphs: Glyphs::new(ascii_only),
+            color: ColorMode::detect(),
             thinking: false,
         }
+    }
+
+    /// Force a colour mode (the `ui.color` setting flows in through
+    /// `PACODE_COLOR`; tests set it explicitly).
+    pub fn color_mode(mut self, color: ColorMode) -> Self {
+        self.color = color;
+        self
     }
 
     /// Draw the model's reasoning line, per `[ui] thinking`.

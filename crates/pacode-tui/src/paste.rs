@@ -84,6 +84,27 @@ pub fn handle_paste_with_runner(
         return handle_paste_image_with_runner(state, false, runner, platform, now);
     }
 
+    // A menu accepts pasted text only where text input is live: an Edit-mode
+    // buffer or a filter line (§3.2). It is checked before the match —
+    // `view_for` needs a shared `&state`, which the `&mut` arm borrow blocks.
+    let mut menu_remote_ms = None;
+    let menu_takes_paste = if let Focus::Overlay(Overlay::Menu { stack, ui }) = &state.focus {
+        match &ui.mode {
+            crate::ui::menu::MenuMode::Edit { .. } => true,
+            _ => {
+                stack.current().is_some() && {
+                    let view = crate::ui::menu::view_for(stack, state, ui);
+                    if let Some(crate::ui::menu::FilterMode::Remote { debounce_ms }) = view.filter {
+                        menu_remote_ms = Some(debounce_ms);
+                    }
+                    crate::ui::menu::shows_filter(&view)
+                }
+            }
+        }
+    } else {
+        false
+    };
+
     match &mut state.focus {
         Focus::Overlay(Overlay::ModelPicker { query, index, .. })
         | Focus::Overlay(Overlay::LoginPicker { query, index }) => {
@@ -91,39 +112,40 @@ pub fn handle_paste_with_runner(
             state.dirty = true;
             vec![]
         }
-        Focus::Overlay(Overlay::SessionPicker { query, index }) => {
-            paste_into_filter(query, index, &text);
-            state.dirty = true;
-            vec![]
-        }
-        Focus::Overlay(Overlay::ConfigPicker) => {
-            if let Some(ref mut edit) = state.config_view.editing {
-                let flattened = flatten_single_line(&text);
-                let count = flattened.chars().count();
-                let byte_idx = char_to_byte_index(&edit.buffer, edit.cursor);
-                edit.buffer.insert_str(byte_idx, &flattened);
-                edit.cursor += count;
-                state.config_view.error = None;
-            } else {
-                let flattened = flatten_single_line(&text);
-                state.config_view.query.push_str(&flattened);
-                state.config_view.selected = 0;
-                state.config_view.scroll_offset = 0;
-                state.config_view.error = None;
+        Focus::Overlay(Overlay::Menu { ui, .. }) if menu_takes_paste => {
+            let flattened = flatten_single_line(&text);
+            match &mut ui.mode {
+                crate::ui::menu::MenuMode::Edit { buffer, cursor } => {
+                    let count = flattened.chars().count();
+                    let byte_idx = char_to_byte_index(buffer, *cursor);
+                    buffer.insert_str(byte_idx, &flattened);
+                    *cursor += count;
+                }
+                _ => {
+                    let available = FILTER_MAX_CHARS.saturating_sub(ui.query.chars().count());
+                    let to_insert: String = flattened.chars().take(available).collect();
+                    ui.query.push_str(&to_insert);
+                    ui.cursor = crate::ui::menu::RowId::default();
+                    // A remote filter owes the daemon the pasted query — the
+                    // same debounce keystrokes arm (§3.2).
+                    if !to_insert.is_empty()
+                        && let Some(ms) = menu_remote_ms
+                    {
+                        ui.remote_at = Some(now + std::time::Duration::from_millis(ms));
+                    }
+                }
             }
             state.dirty = true;
             vec![]
         }
         Focus::Overlay(_) => {
-            // Overlays without a text/filter box (EffortPicker, ModePicker, Files, McpPicker, etc.)
-            // ignore pastes so text does not leak into the hidden prompt.
+            // Overlays without a text/filter box (EffortPicker, ModePicker,
+            // RailOverlay, a menu without a live filter) ignore pastes so text
+            // does not leak into the hidden prompt.
             vec![]
         }
-        Focus::Normal | Focus::Panel { .. } | Focus::SelectAgent { .. } | Focus::BgList { .. } => {
-            if matches!(
-                state.focus,
-                Focus::SelectAgent { .. } | Focus::BgList { .. }
-            ) {
+        Focus::Normal | Focus::Panel { .. } | Focus::SelectAgent { .. } => {
+            if matches!(state.focus, Focus::SelectAgent { .. }) {
                 state.focus = Focus::Normal;
             }
             paste_into_prompt(state, text, now);

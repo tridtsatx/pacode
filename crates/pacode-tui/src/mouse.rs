@@ -4,7 +4,29 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use crate::keys::{Action, handle_navigate_down, handle_navigate_up};
 use crate::layout::ScreenLayout;
-use crate::state::AppState;
+use crate::state::{AppState, PanelTarget};
+
+/// Wheel over the panel column: the MCP log and file-diff targets scroll
+/// `panel.scroll` (their offset from the tail, ui::panel); the transcript
+/// targets scroll their transcript, same as the key path (nav::handle_scroll).
+fn scroll_panel(state: &mut AppState, delta: i32) {
+    if matches!(
+        state.panel.target,
+        Some(
+            PanelTarget::McpServer(_)
+                | PanelTarget::FileDiff { .. }
+                | PanelTarget::CommitDiff { .. }
+        )
+    ) {
+        state.panel.scroll = if delta > 0 {
+            state.panel.scroll.saturating_add(delta as usize)
+        } else {
+            state.panel.scroll.saturating_sub((-delta) as usize)
+        };
+    } else {
+        state.panel.agent_transcript.scroll_by(delta);
+    }
+}
 
 /// Show or hide the full output of the cell under a clicked row.
 fn toggle_cell_under(state: &mut AppState, row: u16, dialog: ratatui::layout::Rect) {
@@ -109,7 +131,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
                 state.input.input_scroll = (state.input.input_scroll + 1).min(max_scroll);
             } else if let Some(panel) = layout.panel {
                 if panel.contains((col, row).into()) {
-                    state.panel.agent_transcript.scroll_by(delta);
+                    scroll_panel(state, delta);
                 }
             } else if layout.rail.contains((col, row).into()) {
                 handle_navigate_down(state);
@@ -134,7 +156,7 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayo
                 state.input.input_scroll = state.input.input_scroll.saturating_sub(1);
             } else if let Some(panel) = layout.panel {
                 if panel.contains((col, row).into()) {
-                    state.panel.agent_transcript.scroll_by(delta);
+                    scroll_panel(state, delta);
                 }
             } else if layout.rail.contains((col, row).into()) {
                 handle_navigate_up(state);
