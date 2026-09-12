@@ -1,5 +1,5 @@
-//! Tool-cell tests (spec §6). Expected Russian strings are built through
-//! `pacode_render::text` — Cyrillic literals are forbidden in this crate.
+//! Tool-cell tests (spec §6). Expected strings are built through
+//! `pacode_render::text` — no display literals inline.
 
 use super::*;
 
@@ -59,23 +59,30 @@ fn header_is_label_arg_and_the_outcome_sits_flush_right() {
     let label = rtext::tool_label("bash").unwrap_or("bash");
     let tool = opts.glyphs.tool;
     let sep = opts.glyphs.dot_sep;
-    let expected_left = format!("{tool} {label}{sep}docker ps");
+    let dur = format_duration_ms(400);
+    // `▣ Command · docker ps · 400ms` — the duration hugs the title.
+    let expected_left = format!("{tool} {label}{sep}docker ps{sep}{dur}");
     assert!(header.starts_with(&expected_left), "{header}");
 
-    // Genuinely flush right: the row is exactly `width` wide and ends with it.
-    let dur = format_duration_ms(400);
+    // Genuinely flush right: the row is exactly `width` wide and ends with the
+    // bare status glyph — the exit code moved into the `└` footer.
     let ok = opts.glyphs.ok;
     assert_eq!(display_width(header), 80, "{header}");
-    assert!(
-        header.ends_with(&format!("{ok} exit 0{sep}{dur}")),
-        "{header}"
-    );
+    assert!(header.ends_with(ok), "{header}");
 
     // `│ $ docker ps`, then the output; the exit-code line stays out of the body.
     let body = body_rows(&text, &opts);
     assert_eq!(body.len(), 2, "{body:?}");
     assert!(body[0].contains("$ docker ps"), "{}", body[0]);
     assert!(body[1].contains("container-a"), "{}", body[1]);
+
+    // `└ Exited with code 0` closes the gutter.
+    let corner = format!("{} ", opts.glyphs.vcorner);
+    let footer = text
+        .iter()
+        .find(|l| l.starts_with(&corner))
+        .expect("a footer row on the └ elbow");
+    assert!(footer.contains("Exited with code 0"), "{footer}");
 }
 
 #[test]
@@ -92,7 +99,8 @@ fn the_outcome_stays_on_the_right_edge_even_when_narrow() {
     let text = text_of(&lines);
     let header = &text[0];
     assert_eq!(display_width(header), 30, "{header}");
-    assert!(header.ends_with("40ms"), "{header}");
+    // Too narrow for the duration — the bare glyph still pins the right edge.
+    assert!(header.ends_with(opts.glyphs.ok), "{header}");
 }
 
 #[test]
@@ -147,17 +155,19 @@ fn collapsed_failure_keeps_only_the_tail() {
     assert!(body[1].contains("output line 12 "), "{}", body[1]);
     assert!(body[8].contains("output line 19 "), "{}", body[8]);
 
-    let sep = opts.glyphs.dot_sep;
     let fail = opts.glyphs.fail;
     let dur = format_duration_ms(12_000);
+    // `✗` flush right; the duration sits next to the title.
+    assert!(text[0].ends_with(fail), "{}", text[0]);
+    assert!(text[0].contains(&dur), "{}", text[0]);
+    let joined = text.join("\n");
     assert!(
-        text[0].ends_with(&format!("{fail} exit 1{sep}{dur}")),
-        "{}",
-        text[0]
+        joined.contains("Exited with code 1"),
+        "the `└` footer carries the code: {joined}"
     );
     assert!(
-        !text.join("\n").contains("[exit code"),
-        "the exit marker is consumed by the header, not the body"
+        !joined.contains("[exit code"),
+        "the exit marker is consumed by the footer, not the body"
     );
 }
 
@@ -180,7 +190,7 @@ fn an_empty_or_whitespace_preview_is_a_single_line() {
         let content: Vec<&String> = text.iter().filter(|l| !l.is_empty()).collect();
         assert_eq!(content.len(), 1, "preview {preview:?} must render one row");
         assert!(body_rows(&text, &opts).is_empty(), "{text:?}");
-        assert!(content[0].contains("fail"), "{}", content[0]);
+        assert!(content[0].contains(opts.glyphs.fail), "{}", content[0]);
     }
 }
 
@@ -217,9 +227,16 @@ fn ascii_mode_falls_back_on_plain_glyphs() {
     c.duration_ms = Some(40);
     let text = text_of(&render(&c, 60, &opts, 0, false));
     assert!(text[0].starts_with("# "), "{}", text[0]);
-    assert!(text[0].ends_with("+ exit 0 . 40ms"), "{}", text[0]);
+    assert!(text[0].contains(". cargo test . 40ms"), "{}", text[0]);
+    assert!(text[0].ends_with("+"), "{}", text[0]);
     let body = body_rows(&text, &opts);
     assert!(body.iter().all(|l| l.starts_with("| ")), "{body:?}");
+    let corner = format!("{} ", opts.glyphs.vcorner);
+    assert!(
+        text.iter()
+            .any(|l| l.starts_with(&corner) && l.contains("Exited with code 0")),
+        "{text:?}"
+    );
 }
 
 #[test]
@@ -249,14 +266,10 @@ fn backgrounded_calls_show_the_background_outcome() {
     let lines = render(&c, 80, &opts, 0, false);
     let text = text_of(&lines);
     let running = opts.glyphs.running;
-    let sep = opts.glyphs.dot_sep;
     let bg = rtext::in_background();
     let dur = format_duration_ms(107_000);
-    assert!(
-        text[0].ends_with(&format!("{running} {bg}{sep}{dur}")),
-        "{}",
-        text[0]
-    );
+    assert!(text[0].ends_with(&format!("{running} {bg}")), "{}", text[0]);
+    assert!(text[0].contains(&dur), "{}", text[0]);
     assert_eq!(lines[1].spans[0].style, opts.theme.violet);
     let body = body_rows(&text, &opts);
     assert!(
@@ -274,39 +287,45 @@ fn running_calls_spin_on_the_anim_frame() {
     let header_at =
         |frame: u64, o: &RenderOptions| text_of(&render(&c, 80, o, frame, false))[0].clone();
     assert!(
-        header_at(0, &opts).contains("⠋ running 12s"),
+        header_at(0, &opts).contains("⠋ running"),
         "{}",
         header_at(0, &opts)
     );
     assert!(
-        header_at(1, &opts).contains("⠙ running 12s"),
+        header_at(1, &opts).contains("⠙ running"),
         "{}",
         header_at(1, &opts)
     );
     assert!(
-        header_at(10, &opts).contains("⠋ running 12s"),
+        header_at(10, &opts).contains("⠋ running"),
         "{}",
         header_at(10, &opts)
+    );
+    // The elapsed time sits next to the title, not at the right edge.
+    assert!(
+        header_at(0, &opts).contains("12s"),
+        "{}",
+        header_at(0, &opts)
     );
 
     let ascii = RenderOptions::new(80, true);
     assert!(
-        header_at(0, &ascii).contains("- running 12s"),
+        header_at(0, &ascii).contains("- running"),
         "{}",
         header_at(0, &ascii)
     );
     assert!(
-        header_at(1, &ascii).contains("\\ running 12s"),
+        header_at(1, &ascii).contains("\\ running"),
         "{}",
         header_at(1, &ascii)
     );
     assert!(
-        header_at(2, &ascii).contains("| running 12s"),
+        header_at(2, &ascii).contains("| running"),
         "{}",
         header_at(2, &ascii)
     );
     assert!(
-        header_at(3, &ascii).contains("/ running 12s"),
+        header_at(3, &ascii).contains("/ running"),
         "{}",
         header_at(3, &ascii)
     );

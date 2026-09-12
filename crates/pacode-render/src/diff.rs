@@ -355,9 +355,9 @@ fn band_style(opts: &RenderOptions, kind: RowKind) -> Option<Style> {
         .bg
         .and_then(color_rgb)
         .unwrap_or((0x1e, 0x24, 0x1c)); // pacode-dark selected_bg
-    // 75 % base + 25 % tint — a wash of colour that keeps foregrounds readable
-    // on both dark and light palettes.
-    let mix = |b: u8, t: u8| ((b as u16 * 3 + t as u16) / 4) as u8;
+    // 87.5 % base + 12.5 % tint — a faint wash of colour that keeps
+    // foregrounds readable on both dark and light palettes.
+    let mix = |b: u8, t: u8| ((b as u16 * 7 + t as u16) / 8) as u8;
     Some(Style::default().bg(Color::Rgb(mix(br, tr), mix(bg, tg), mix(bb, tb))))
 }
 

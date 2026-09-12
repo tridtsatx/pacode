@@ -14,7 +14,7 @@ expression: view
 "I'll help you organize the TUI crate with a persistent rail and separate dialog        │AGENTS                       5 ●"
 "column.                                                                                │● main  thinking.   · 0s        "
 "                                                                                       │○ codegen                       "
-"▣ Read · crates/pacode-tui/src/layout.rs                                       ✓ 120ms │  writing ui/rail.rs            "
+"▣ Read · crates/pacode-tui/src/layout.rs · 120ms                                     ✓ │  writing ui/rail.rs            "
 "│ pub fn compute(area: Rect) -> ScreenLayout...                                        │  1m47s · ↓ 9.1k                "
 "                                                                                       │○ tester                        "
 "                                                                                       │  cargo test -p pacode-tui      "

@@ -1,10 +1,11 @@
 //! The tool-call cell — one frame for every invocation (spec §6):
 //!
 //! ```text
-//! ▣ Command · docker                          ✓ exit 0 · 0.4s
+//! ▣ Command · docker · 0.4s                                ✓
 //! │ $ docker ps --format "table {{.Names}}\t{{.Status}}"
 //! │ NAMES              STATUS
 //! │ … more lines · ctrl+o
+//! └ Exited with code 0
 //! ```
 //!
 //! The header answers "what and with what" and carries the outcome flush right.
@@ -65,7 +66,7 @@ pub fn render(
         ToolStatus::Running | ToolStatus::Backgrounded | ToolStatus::Denied => None,
     };
 
-    out.push(header(call, exit_code, width, opts, anim_frame));
+    out.push(header(call, width, opts, anim_frame));
 
     if is_diff_preview(&preview) {
         // A diff preview goes through the diff renderer at body width so its
@@ -104,6 +105,15 @@ pub fn render(
         }
     }
 
+    // `└ Exited with code N` — the footer's elbow ends the gutter, the header
+    // stays clean of it.
+    if let Some(code) = exit_code {
+        out.push(Line::from(vec![
+            Span::styled(format!("{} ", opts.glyphs.vcorner), gutter_style),
+            Span::styled(format!("Exited with code {code}"), opts.theme.faint),
+        ]));
+    }
+
     out.push(Line::default());
     out
 }
@@ -123,15 +133,15 @@ fn outcome_style(status: ToolStatus, opts: &RenderOptions) -> Style {
     }
 }
 
-/// `▣ <tool> · <arg>` left, outcome at the right edge — the arg is elastic.
+/// `▣ <tool> · <arg> · <duration>` left, outcome glyph at the right edge —
+/// the arg is elastic, the duration hugs the title instead of the far edge.
 fn header(
     call: &ToolCallView<'_>,
-    exit_code: Option<i32>,
     width: usize,
     opts: &RenderOptions,
     anim_frame: u64,
 ) -> Line<'static> {
-    let right = outcome_spans(call, exit_code, opts, anim_frame);
+    let right = outcome_spans(call, opts, anim_frame);
     let right_w: usize = right.iter().map(|s| display_width(&s.content)).sum();
     // At least one cell between title and outcome.
     let avail_left = width.saturating_sub(right_w + 1);
@@ -152,16 +162,24 @@ fn header(
         spans.push(Span::styled(lead, opts.theme.cyan));
     }
 
-    let arg = short_arg(call);
     let sep_w = display_width(opts.glyphs.dot_sep);
-    if !arg.is_empty() && left_w + sep_w < avail_left {
-        let arg = truncate_to_width(&arg, avail_left - left_w - sep_w, true);
+    let push_tail = |spans: &mut Vec<Span<'static>>, text: &str, left_w: &mut usize| {
+        if text.is_empty() || *left_w + sep_w >= avail_left {
+            return;
+        }
+        let shown = truncate_to_width(text, avail_left - *left_w - sep_w, true);
         spans.push(Span::styled(
             opts.glyphs.dot_sep.to_string(),
             opts.theme.dim,
         ));
-        left_w += sep_w + display_width(&arg);
-        spans.push(Span::styled(arg, opts.theme.dim));
+        *left_w += sep_w + display_width(&shown);
+        spans.push(Span::styled(shown, opts.theme.dim));
+    };
+
+    let arg = short_arg(call);
+    push_tail(&mut spans, &arg, &mut left_w);
+    if let Some(ms) = call.duration_ms {
+        push_tail(&mut spans, &format_duration_ms(ms), &mut left_w);
     }
 
     let pad = width.saturating_sub(left_w + right_w);
@@ -305,10 +323,11 @@ fn push_expanded(
     }
 }
 
-/// `✓ exit 0 · 0.4s`, `✗ exit 1 · 12s`, `◍ background`, `<spinner> running`, `denied`.
+/// `✓`, `✗`, `◍ background`, `<spinner> running`, `denied` — the status glyph
+/// plus a diff stat for edits. The exit code lives in the body's `└` footer
+/// and the duration hugs the title, so the right edge stays a bare glyph.
 fn outcome_spans(
     call: &ToolCallView<'_>,
-    exit_code: Option<i32>,
     opts: &RenderOptions,
     anim_frame: u64,
 ) -> Vec<Span<'static>> {
@@ -318,49 +337,28 @@ fn outcome_spans(
             // The running cell bypasses the line cache, so this spinner turns
             // on the anim frame alone.
             let spinner = opts.glyphs.spinner(anim_frame);
-            let label = match call.duration_ms {
-                Some(ms) => format!("{spinner} running {}", format_duration_ms(ms)),
-                None => format!("{spinner} running"),
-            };
-            vec![Span::styled(label, opts.theme.accent)]
+            vec![Span::styled(
+                format!("{spinner} running"),
+                opts.theme.accent,
+            )]
         }
         ToolStatus::Ok => {
             let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
-            if let Some(code) = exit_code {
-                groups.push(vec![Span::styled(format!("exit {code}"), opts.theme.green)]);
-            }
             if let Some(diff) = call.diff {
                 groups.push(diff_stat_spans(diff, opts));
             }
-            if let Some(ms) = call.duration_ms {
-                groups.push(vec![Span::styled(format_duration_ms(ms), opts.theme.green)]);
-            }
             join_outcome(opts.glyphs.ok, opts.theme.green, groups, sep)
         }
-        ToolStatus::Error => {
-            let head = match exit_code {
-                Some(code) => format!("exit {code}"),
-                None => "fail".to_string(),
-            };
-            let mut groups = vec![vec![Span::styled(head, opts.theme.red)]];
-            if let Some(ms) = call.duration_ms {
-                groups.push(vec![Span::styled(format_duration_ms(ms), opts.theme.red)]);
-            }
-            join_outcome(opts.glyphs.fail, opts.theme.red, groups, sep)
-        }
-        ToolStatus::Backgrounded => {
-            let mut groups = vec![vec![Span::styled(
+        ToolStatus::Error => join_outcome(opts.glyphs.fail, opts.theme.red, vec![], sep),
+        ToolStatus::Backgrounded => join_outcome(
+            opts.glyphs.running,
+            opts.theme.violet,
+            vec![vec![Span::styled(
                 rtext::in_background().to_string(),
                 opts.theme.violet,
-            )]];
-            if let Some(ms) = call.duration_ms {
-                groups.push(vec![Span::styled(
-                    format_duration_ms(ms),
-                    opts.theme.violet,
-                )]);
-            }
-            join_outcome(opts.glyphs.running, opts.theme.violet, groups, sep)
-        }
+            )]],
+            sep,
+        ),
         ToolStatus::Denied => vec![Span::styled("denied", opts.theme.red)],
     }
 }

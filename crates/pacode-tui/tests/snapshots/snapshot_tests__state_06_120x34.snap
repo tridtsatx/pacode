@@ -14,7 +14,7 @@ expression: view
 "I'll help you organize the TUI crate with a persistent rail and separate dialog        │in 214.0k  out 12.4k  think 8.1k"
 "column.                                                                                │cache hit 71.0%  r 152.0k / w 61"
 "                                                                                       │18 turns · $1.84                "
-"▣ Read · crates/pacode-tui/src/layout.rs                                       ✓ 120ms │ctx 10700 · 1% used             "
+"▣ Read · crates/pacode-tui/src/layout.rs · 120ms                                     ✓ │ctx 10700 · 1% used             "
 "│ pub fn compute(area: Rect) -> ScreenLayout...                                        │                                "
 "                                                                                       │AGENTS  4 done                  "
 "                                                                                       │✓ codegen 1m47s · 9.1k          "
