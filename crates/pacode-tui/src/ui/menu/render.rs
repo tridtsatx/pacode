@@ -115,6 +115,19 @@ pub fn draw(
 /// actions, then `esc back`. Actions drop from the end when the width runs
 /// out; `esc` always stays (§3.2).
 pub fn hint_line(actions: &[MenuAction], width: u16, opts: &RenderOptions) -> String {
+    hint_line_with_enter(None, actions, width, opts)
+}
+
+/// [`hint_line`] plus an optional `enter <verb>` lead item — a menu whose
+/// `enter` applies instead of opening (Import, §5.7) declares it through
+/// `MenuView::enter_label`. The lead item goes first so the level's primary
+/// verb is the last hint the width cut can take away.
+fn hint_line_with_enter(
+    enter_label: Option<&str>,
+    actions: &[MenuAction],
+    width: u16,
+    opts: &RenderOptions,
+) -> String {
     let sep = opts.glyphs.dot_sep;
     // One space of margin on each edge of the hint text.
     let budget = (width as usize).saturating_sub(2);
@@ -125,6 +138,14 @@ pub fn hint_line(actions: &[MenuAction], width: u16, opts: &RenderOptions) -> St
     let limit = budget - display_width(sep) - display_width(ESC_HINT);
     let mut items: Vec<String> = Vec::new();
     let mut used = 0usize;
+    if let Some(label) = enter_label {
+        let item = format!("enter {label}");
+        let need = display_width(&item);
+        if need <= limit {
+            used += need;
+            items.push(item);
+        }
+    }
     for action in actions.iter().filter(|a| a.enabled && !is_base_key(&a.key)) {
         let item = format!("{} {}", format_binding(&action.key), action.label);
         let need = display_width(&item)
@@ -256,7 +277,7 @@ fn capture_lines(action: &str, opts: &RenderOptions) -> Vec<Line<'static>> {
 /// declared actions.
 fn bottom_hint(view: &MenuView, ui: &MenuUiState, width: u16, opts: &RenderOptions) -> String {
     match &ui.mode {
-        MenuMode::List => hint_line(&view.actions, width, opts),
+        MenuMode::List => hint_line_with_enter(view.enter_label, &view.actions, width, opts),
         MenuMode::Edit { .. } => format!(" enter confirm{}esc cancel ", opts.glyphs.dot_sep),
         MenuMode::Capture { .. } => format!(" press a key{}esc cancel ", opts.glyphs.dot_sep),
     }

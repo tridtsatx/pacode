@@ -89,22 +89,9 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
     log::debug!("open menu→legacy: {}", id.slug());
     state.dirty = true;
     match id {
-        MenuId::Import => {
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let overlay_state =
-                crate::ui::import::ImportOverlayState::discover(&home, &cwd, &state.paths);
-            state.focus = Focus::Overlay(Overlay::Import(overlay_state));
-            vec![]
-        }
-        MenuId::Background => {
-            state.focus = Focus::BgList { index: 0 };
-            vec![]
-        }
-        // Providers exist for these (`has_provider` is true) — the bridge
-        // never sees them; the arm keeps the match exhaustive.
+        // Providers exist for all of these (`has_provider` is true) — the
+        // bridge never sees them; the arm keeps the match exhaustive. The
+        // legacy `Overlay::Import` it used to open stays compiled until T19.
         MenuId::Root
         | MenuId::Settings
         | MenuId::Help
@@ -114,7 +101,9 @@ fn open_legacy(state: &mut AppState, id: MenuId) -> Vec<Action> {
         | MenuId::Mcp
         | MenuId::Keys
         | MenuId::Files
-        | MenuId::Sessions => vec![],
+        | MenuId::Background
+        | MenuId::Sessions
+        | MenuId::Import => vec![],
     }
 }
 
@@ -171,19 +160,22 @@ fn list_key_inner(
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
 
     // Vertical movement — arrows and ctrl+p/ctrl+n always; j/k join when no
-    // filter line owns the printable keys (§3.4).
+    // filter line owns the printable keys (§3.4). An enabled declared action
+    // on the same bare char outranks the alias — the menu's contract wins
+    // (Background's `k` is "kill", not "up") — while arrows and ctrl+p/ctrl+n
+    // stay movement everywhere.
     let up = key.code == KeyCode::Up
         || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL))
         || (!filtering && key.code == KeyCode::Char('k') && bare);
     let down = key.code == KeyCode::Down
         || (key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL))
         || (!filtering && key.code == KeyCode::Char('j') && bare);
-    if up {
-        move_sel(state, ui, view, -1);
-        return vec![];
-    }
-    if down {
-        move_sel(state, ui, view, 1);
+    if up || down {
+        if bare && matches!(key.code, KeyCode::Char(_)) && declared_action(view, ui, key).is_some()
+        {
+            return run_action(state, stack, ui, view, key);
+        }
+        move_sel(state, ui, view, if up { -1 } else { 1 });
         return vec![];
     }
 
@@ -247,8 +239,9 @@ fn list_key_inner(
 
 /// `enter` on a Submenu row or `?`: save the level's UI state and push the
 /// target — or hand off to the legacy overlay while the target has no
-/// provider (§3.5, TODO T19).
-fn descend(
+/// provider (§3.5, TODO T19). `pub(crate)`: the Help palette jumps the same
+/// way (§5.8) and then points the fresh `ui` at a filter or a row.
+pub(crate) fn descend(
     state: &mut AppState,
     stack: &mut MenuStack,
     ui: &mut MenuUiState,
@@ -323,7 +316,10 @@ fn row_enter(
         MenuId::Keys => menu::keys::on_row(state, stack, ui, row),
         MenuId::Sessions => menu::sessions::on_row(state, stack, ui, row),
         MenuId::Files => menu::files::on_row(state, stack, ui, row),
-        MenuId::Import | MenuId::Background | MenuId::Skills | MenuId::Git => vec![],
+        MenuId::Background => menu::background::on_row(state, stack, ui, row),
+        // `enter` here is the apply — the marked set, not the row (§5.7).
+        MenuId::Import => menu::import::on_row(state, stack, ui, row),
+        MenuId::Skills | MenuId::Git => vec![],
     }
 }
 
@@ -337,21 +333,30 @@ fn run_action(
     view: &menu::MenuView,
     key: KeyEvent,
 ) -> Vec<Action> {
+    let row_id = resolve_cursor(&view.rows, &ui.cursor).and_then(|i| view.rows[i].id().cloned());
+    match declared_action(view, ui, key) {
+        Some(action) => menu_action(state, stack, ui, view.id, action, row_id.as_ref()),
+        None => vec![],
+    }
+}
+
+/// The enabled declared action `key` hits — menu-level `view.actions` first,
+/// then the selected row's chips (§3.4). Shared by `run_action` and the
+/// j/k-alias gate in `list_key_inner`.
+fn declared_action<'a>(
+    view: &'a menu::MenuView,
+    ui: &MenuUiState,
+    key: KeyEvent,
+) -> Option<&'a MenuAction> {
     let sel = resolve_cursor(&view.rows, &ui.cursor);
     let row_actions = sel
         .and_then(|i| view.rows[i].detail())
         .map(|d| d.actions.as_slice())
         .unwrap_or(&[]);
-    let row_id = sel.and_then(|i| view.rows[i].id().cloned());
-    let action = view
-        .actions
+    view.actions
         .iter()
         .chain(row_actions)
-        .find(|a| a.enabled && matches_key(&a.key, key));
-    match action {
-        Some(action) => menu_action(state, stack, ui, view.id, action, row_id.as_ref()),
-        None => vec![],
-    }
+        .find(|a| a.enabled && matches_key(&a.key, key))
 }
 
 /// Declared-action dispatch (§3.4): one arm per menu, filled by its port —
@@ -370,13 +375,9 @@ fn menu_action(
         MenuId::Settings => menu::settings::on_action(state, ui, action, row),
         MenuId::Keys => menu::keys::on_action(state, ui, action, row),
         MenuId::Files => menu::files::on_action(state, ui, action, row),
-        MenuId::Root
-        | MenuId::Help
-        | MenuId::Sessions
-        | MenuId::Import
-        | MenuId::Background
-        | MenuId::Skills
-        | MenuId::Git => vec![],
+        MenuId::Background => menu::background::on_action(state, ui, action, row),
+        MenuId::Import => menu::import::on_action(state, ui, action, row),
+        MenuId::Root | MenuId::Help | MenuId::Sessions | MenuId::Skills | MenuId::Git => vec![],
     }
 }
 

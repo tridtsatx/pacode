@@ -19,6 +19,9 @@ pub struct MenuLevel {
     pub scroll: usize,
     pub query: String,
     pub tab: usize,
+    /// `Check` rows the user marked — saved with the level so a `?`-Help
+    /// detour does not lose an Import selection (§5.7).
+    pub checks: std::collections::BTreeMap<RowId, bool>,
 }
 
 impl MenuLevel {
@@ -29,6 +32,7 @@ impl MenuLevel {
             scroll: 0,
             query: String::new(),
             tab: 0,
+            checks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -38,12 +42,15 @@ impl MenuLevel {
         self.scroll = ui.scroll;
         self.query.clone_from(&ui.query);
         self.tab = ui.tab;
+        self.checks.clone_from(&ui.checks);
     }
 
     /// Restore the level into a UI state. A level always comes back in `List`
     /// mode: a half-finished edit or capture never survives a descent, and
     /// neither does an armed remote-filter send — `keys_menu::descend`
-    /// flushes it before the snapshot is taken — nor a parked status.
+    /// flushes it before the snapshot is taken — nor a parked status. The
+    /// `checks` map does come back: marks are the level's state, not the
+    /// interaction's.
     pub fn ui(&self) -> MenuUiState {
         MenuUiState {
             cursor: self.cursor.clone(),
@@ -53,6 +60,7 @@ impl MenuLevel {
             mode: MenuMode::List,
             remote_at: None,
             status: None,
+            checks: self.checks.clone(),
         }
     }
 }

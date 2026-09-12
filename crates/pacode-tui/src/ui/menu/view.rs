@@ -271,6 +271,12 @@ pub struct MenuUiState {
     /// has to live here to reach the renderer. It disappears with its cause:
     /// the next edit keystroke, `esc`, a successful commit or an action.
     pub status: Option<StatusLine>,
+    /// Explicit check states for `MenuRow::Check` rows (§5.7), keyed by row
+    /// id. A row absent from the map keeps the `checked` state its provider
+    /// built; a `space`/`a` toggle writes the override here so the mark
+    /// survives the per-frame view rebuild. Saved and restored with the
+    /// level (§3.5).
+    pub checks: std::collections::BTreeMap<RowId, bool>,
 }
 
 /// What a submenu hands the base on every frame (§3.1). The provider is a
@@ -293,6 +299,10 @@ pub struct MenuView {
     pub status: Option<StatusLine>,
     /// Declared actions feeding the hint edge (§3.2).
     pub actions: Vec<MenuAction>,
+    /// The verb `enter` performs on this level, when it is not "open"
+    /// (§3.2): Import declares `import`, so the hint reads `enter import`.
+    /// `None` on every other menu — `enter` needs no hint.
+    pub enter_label: Option<&'static str>,
     /// "what is missing" + "what to do" when `rows` is empty.
     pub empty: EmptyState,
 }

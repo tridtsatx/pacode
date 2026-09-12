@@ -46,6 +46,14 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             } else {
                 None
             };
+            // Same split for the Background card's output tail (§5.9): the
+            // draw records the selected `(task, output_bytes)`; the blocking
+            // spool read runs in `dispatch_deferred`.
+            state.rail.task_tail_want = if view.id == crate::ui::menu::MenuId::Background {
+                crate::ui::menu::background::tail_want(state, &view, ui)
+            } else {
+                None
+            };
             crate::ui::menu::draw(frame, dialog_area, &view, ui, opts);
         }
         return;

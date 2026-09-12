@@ -95,10 +95,11 @@ fn test_dot_only_on_empty_prompt() {
     let mut state = make_test_state();
     let now = Instant::now();
 
-    // Empty prompt: '.' opens BgList
+    // Empty prompt: '.' opens the Background menu level (T11 — the legacy
+    // `Focus::BgList` survives until T19 but is no longer reachable here).
     let dot = KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE);
     handle_key(&mut state, dot, now);
-    assert_eq!(state.focus, Focus::BgList { index: 0 });
+    assert!(matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })));
 
     // Esc back to Normal
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);

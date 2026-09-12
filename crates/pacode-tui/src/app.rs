@@ -82,6 +82,12 @@ enum BgResponse {
         path: String,
         diff: pacode_vcs::FileDiff,
     },
+    /// The Background level's output-tail read finished (§5.9): the last ≤
+    /// `ui::menu::background::TAIL_CAP_BYTES` of the task's spool file, read
+    /// on a blocking thread — never in the draw path (§8.1).
+    TaskTailReady {
+        tail: crate::state::rail::TaskTail,
+    },
     /// A pasted-image strip thumbnail finished rendering.
     ThumbReady {
         token: usize,
@@ -276,6 +282,12 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                 // kitty d=a deletes every image, including the input strip.
                 active_image_escapes.clear();
             }
+        }
+
+        // The Background level's output-tail cache lives only while the
+        // level is on screen — reopening re-arms it from scratch (§5.9).
+        if !background_view_on_screen(&state) {
+            state.rail.clear_task_tail();
         }
 
         // Refresh the activity phase before drawing, so the draw path reads state
@@ -862,6 +874,34 @@ fn dispatch_deferred(state: &mut AppState, bg_tx: &mpsc::UnboundedSender<BgRespo
         }
     }
 
+    // Background level: the detail card's output tail — a blocking read of
+    // the selected task's spool file (§5.9). The want is keyed by (task,
+    // `output_bytes`): a `TaskUpdated` carrying more output re-keys it and
+    // the read re-arms by itself — the daemon's task events drive the
+    // refresh, no timer and no event-side invalidation.
+    if let Some(want) = state.rail.task_tail_want.clone()
+        && state.rail.task_tail_in_flight.as_ref() != Some(&want)
+        && state.rail.task_tail.as_ref().map(|t| t.key()).as_ref() != Some(&want)
+    {
+        // A task that vanished between draw and dispatch has no file to
+        // read — the want dies with the next draw's re-record.
+        if let Some(path) = state.rail.task(&want.task).map(|t| t.output_path.clone()) {
+            state.rail.task_tail_in_flight = Some(want.clone());
+            let tx = bg_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let (text, truncated) = crate::ui::menu::background::read_tail(&path);
+                let _ = tx.send(BgResponse::TaskTailReady {
+                    tail: crate::state::rail::TaskTail {
+                        task: want.task,
+                        output_bytes: want.output_bytes,
+                        text,
+                        truncated,
+                    },
+                });
+            });
+        }
+    }
+
     // Pasted-image strip thumbnails: one job per missing/mismatched slot.
     for (token, path, cell_w, cell_h) in std::mem::take(&mut state.image_strip.want) {
         let k = (token, cell_w, cell_h);
@@ -917,6 +957,18 @@ fn files_view_on_screen(state: &AppState) -> bool {
             .is_some_and(|l| l.id == crate::ui::menu::MenuId::Files),
         _ => false,
     }
+}
+
+/// Whether the `Background` menu level is on screen — gates the task-tail
+/// cache's cleanup (§5.9). The legacy `Focus::BgList` never armed one.
+fn background_view_on_screen(state: &AppState) -> bool {
+    matches!(
+        &state.focus,
+        crate::state::Focus::Overlay(crate::state::Overlay::Menu { stack, .. })
+            if stack
+                .current()
+                .is_some_and(|l| l.id == crate::ui::menu::MenuId::Background)
+    )
 }
 
 /// The preview pane's path resolution — `raw` relative to the session cwd
@@ -978,6 +1030,15 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             at_version,
         } => {
             state.files.apply_statuses(statuses, at_version);
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::TaskTailReady { tail } => {
+            state.rail.task_tail_in_flight = None;
+            // Applies while the level still wants this task at this size —
+            // a moved cursor or a `TaskUpdated` re-keys the want and the
+            // next `dispatch_deferred` pass re-arms the read.
+            state.rail.task_tail = Some(tail);
             state.dirty = true;
             vec![]
         }

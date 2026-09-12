@@ -330,6 +330,11 @@ pub struct AppState {
     pub files: FilesState,
     /// Git history for the VCS submenu (filled by `Reply::GitLog`; T17 renders).
     pub git: GitState,
+    /// The scan behind the Import submenu (§5.7): what `pacode-import`
+    /// discovered plus each entry's conflict status and the apply target.
+    /// Filled by `menu::import::on_open`, rebuilt on every open, cleared by a
+    /// successful apply; `None` while the menu has never been opened.
+    pub import: Option<crate::ui::menu::import::ImportScan>,
     pub rail: RailState,
     pub input: InputState,
     pub vim: VimState,
@@ -510,6 +515,7 @@ impl AppState {
             },
             files: FilesState::default(),
             git: GitState::default(),
+            import: None,
             rail: RailState::default(),
             input: InputState::default(),
             vim: VimState::default(),

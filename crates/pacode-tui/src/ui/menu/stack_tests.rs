@@ -47,6 +47,7 @@ fn a_level_saves_and_restores_its_ui_state() {
         mode: MenuMode::List,
         remote_at: None,
         status: None,
+        checks: std::collections::BTreeMap::from([(RowId::from("claude:mcp:x"), true)]),
     };
     stack.current_mut().unwrap().save(&ui);
 
@@ -66,5 +67,10 @@ fn a_level_saves_and_restores_its_ui_state() {
         restored.mode,
         MenuMode::List,
         "an edit never survives a descent"
+    );
+    // The Check marks are the level's state — a Help detour keeps them (§5.7).
+    assert_eq!(
+        restored.checks.get(&RowId::from("claude:mcp:x")),
+        Some(&true)
     );
 }

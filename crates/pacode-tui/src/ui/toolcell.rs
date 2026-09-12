@@ -430,7 +430,9 @@ fn capitalize(name: &str) -> String {
 
 /// Remove ANSI escapes before render: CSI (`ESC [ … final`), OSC (`ESC ] …`
 /// ended by BEL or ST), charset picks (`ESC ( X`), two-byte `ESC X`.
-fn strip_ansi(input: &str) -> String {
+/// `pub(crate)`: the Background menu's output tail strips spool files with
+/// the same table before they reach a detail card.
+pub(crate) fn strip_ansi(input: &str) -> String {
     if !input.contains('\u{1b}') {
         return input.to_string();
     }

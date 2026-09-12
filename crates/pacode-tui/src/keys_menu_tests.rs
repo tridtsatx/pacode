@@ -127,24 +127,6 @@ fn ctrl_c_closes_the_whole_stack() {
 }
 
 #[test]
-fn an_unported_section_bridges_to_its_legacy_overlay() {
-    let mut state = make_test_state();
-    // `enter` on the hub's Background row — no provider yet → BgList.
-    let mut stack = MenuStack::root(MenuId::Root);
-    let mut ui = MenuUiState {
-        cursor: RowId::new("background"),
-        ..MenuUiState::default()
-    };
-    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Enter));
-    assert!(matches!(state.focus, Focus::BgList { .. }));
-
-    // Direct entry to an unported section lands on the legacy overlay too.
-    state.focus = Focus::Normal;
-    open(&mut state, MenuId::Background);
-    assert!(matches!(state.focus, Focus::BgList { .. }));
-}
-
-#[test]
 fn arrows_move_the_cursor_over_selectable_rows() {
     let mut state = make_test_state();
     let mut stack = MenuStack::root(MenuId::Root);

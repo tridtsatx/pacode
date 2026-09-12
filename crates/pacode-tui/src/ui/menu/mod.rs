@@ -22,10 +22,13 @@ mod rows;
 mod stack;
 mod view;
 // `pub(crate)`: `keys_menu` calls each menu's `on_row`/`on_action`/`on_edit`
-// hooks directly — the `view` providers stay behind `view_for`. `files` is
-// also reached from `app`'s deferred jobs and `overlays`' draw (preview want).
+// hooks directly — the `view` providers stay behind `view_for`. `files` and
+// `background` are also reached from `app`'s deferred jobs and `overlays`'
+// draw (preview want / tail want).
+pub(crate) mod background;
 pub(crate) mod files;
 pub(crate) mod help;
+pub(crate) mod import;
 pub(crate) mod keys;
 pub(crate) mod mcp;
 pub(crate) mod plugins;
@@ -66,8 +69,9 @@ pub fn has_provider(id: MenuId) -> bool {
         | MenuId::Mcp
         | MenuId::Keys
         | MenuId::Files
-        | MenuId::Sessions => true,
-        MenuId::Import | MenuId::Background => false,
+        | MenuId::Background
+        | MenuId::Sessions
+        | MenuId::Import => true,
     }
 }
 
@@ -90,9 +94,8 @@ pub fn view_for(stack: &MenuStack, state: &AppState, ui: &MenuUiState) -> MenuVi
         MenuId::Sessions => sessions::view(state, ui),
         MenuId::Settings => settings::view(state, ui),
         MenuId::Files => files::view(state, ui),
-        // No provider yet — `has_provider` keeps these out of the stack, so
-        // the arm is a defensive stub, not a real path (TODO T19).
-        MenuId::Import | MenuId::Background => MenuView::new(level.id),
+        MenuId::Background => background::view(state, ui),
+        MenuId::Import => import::view(state, ui),
     };
     // The breadcrumb between `Menu` and this level is the parents' titles
     // (§3.2): `Root › X` needs nothing, `Root › X › Y` names `X`.

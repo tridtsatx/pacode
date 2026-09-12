@@ -15,20 +15,21 @@ use crate::keys::Action;
 use crate::state::{AppState, Focus, Overlay};
 use crate::ui::menu::{self, FilterMode, MenuId, MenuStack, MenuUiState, MenuView, selectable};
 
-/// Requests a freshly entered level sends — the refresh-on-open the legacy
-/// overlays issued (`ListPlugins`+`BrowseMarketplace`, `ListMcpServers`, …).
-/// Runs on the direct entry (`open`) and on a hub descent alike.
-pub(super) fn on_open(state: &AppState, id: MenuId) -> Vec<Action> {
+/// Hooks a freshly entered level runs — the refresh-on-open the legacy
+/// overlays issued (`ListPlugins`+`BrowseMarketplace`, `ListMcpServers`, …),
+/// or Import's filesystem scan. Runs on the direct entry (`open`) and on a
+/// hub descent alike. `&mut`: Import writes its scan into `state.import`.
+pub(super) fn on_open(state: &mut AppState, id: MenuId) -> Vec<Action> {
     match id {
         MenuId::Plugins => menu::plugins::on_open(state),
         MenuId::Mcp => menu::mcp::on_open(state),
         MenuId::Sessions => menu::sessions::on_open(state),
+        MenuId::Import => menu::import::on_open(state),
         MenuId::Root
         | MenuId::Help
         | MenuId::Settings
         | MenuId::Keys
         | MenuId::Files
-        | MenuId::Import
         | MenuId::Background
         | MenuId::Skills
         | MenuId::Git => vec![],
