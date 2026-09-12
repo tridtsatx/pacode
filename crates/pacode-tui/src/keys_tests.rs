@@ -791,15 +791,22 @@ fn test_overlay_rail_and_help_navigation_and_esc() {
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
 
-    // Help via slash command `/help` + Enter
+    // Help via slash command `/help` + Enter — a menu level now (§3.5).
     state.input.insert_str("/help");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     handle_key(&mut state, enter, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Help));
+    let Focus::Overlay(Overlay::Menu { stack, .. }) = &state.focus else {
+        panic!("expected the menu overlay, got {:?}", state.focus);
+    };
+    assert_eq!(stack.depth(), 1);
+    assert_eq!(
+        stack.current().map(|l| l.id),
+        Some(crate::ui::menu::MenuId::Help)
+    );
 
     handle_key(&mut state, down, now);
-    // Still focused
-    assert_eq!(state.focus, Focus::Overlay(Overlay::Help));
+    // Still focused — the menu owns the key.
+    assert!(matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })));
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
 }

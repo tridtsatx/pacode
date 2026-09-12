@@ -432,6 +432,51 @@ impl Core {
                     message: e.to_string(),
                 },
             },
+            Request::GitLog { after } => {
+                let cwd = session.meta().cwd;
+                match pacode_vcs::log(&cwd, after.as_deref(), pacode_vcs::LOG_PAGE_SIZE).await {
+                    Ok(page) => Reply::GitLog {
+                        commits: page.commits,
+                        has_more: page.has_more,
+                        status: pacode_types::GitStatus::Ready,
+                    },
+                    Err(pacode_vcs::VcsError::NotARepo) => Reply::GitLog {
+                        commits: Vec::new(),
+                        has_more: false,
+                        status: pacode_types::GitStatus::NotARepo,
+                    },
+                    Err(pacode_vcs::VcsError::GitMissing) => Reply::GitLog {
+                        commits: Vec::new(),
+                        has_more: false,
+                        status: pacode_types::GitStatus::GitMissing,
+                    },
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Request::GitShow { hash } => {
+                let cwd = session.meta().cwd;
+                match pacode_vcs::show_stat(&cwd, &hash).await {
+                    Ok(stat) => Reply::GitShow { hash, stat },
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Request::GitDiff { hash } => {
+                let cwd = session.meta().cwd;
+                match pacode_vcs::commit_diff(&cwd, &hash).await {
+                    Ok((patch, truncated)) => Reply::GitDiff {
+                        hash,
+                        patch,
+                        truncated,
+                    },
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
             Request::Compact => {
                 if let Some(main) = session.main_agent() {
                     match crate::compaction::compact(&session, &main).await {

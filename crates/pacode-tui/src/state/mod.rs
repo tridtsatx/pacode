@@ -4,6 +4,7 @@
 pub mod activity;
 pub mod events;
 pub mod files;
+pub mod git;
 pub mod images;
 pub mod input;
 pub mod rail;
@@ -28,6 +29,7 @@ use pacode_types::{
 };
 
 pub use files::FilesState;
+pub use git::GitState;
 pub use input::InputState;
 pub use rail::RailState;
 pub use selection::Selection;
@@ -235,6 +237,14 @@ pub enum Overlay {
     /// Plan + agents on the `Tiny` tier.
     RailOverlay,
     Help,
+    /// The menu base (§3): the stack of levels plus the UI state of the one on
+    /// screen. An empty stack means closed — `keys` restores `Focus::Normal`.
+    /// Until T19 the unported sections live on the legacy variants above —
+    /// `keys_menu::open` hands off to them.
+    Menu {
+        stack: crate::ui::menu::MenuStack,
+        ui: crate::ui::menu::MenuUiState,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +306,8 @@ pub struct AppState {
     /// Panel transcript (agent) or task output lines.
     pub panel: PanelState,
     pub files: FilesState,
+    /// Git history for the VCS submenu (filled by `Reply::GitLog`; T17 renders).
+    pub git: GitState,
     pub rail: RailState,
     pub input: InputState,
     pub vim: VimState,
@@ -335,6 +347,8 @@ pub struct AppState {
     pub truecolor: bool,
     /// Pending readline key chord (e.g. `ctrl+x` waiting for `ctrl+e`).
     pub pending_chord: Option<crossterm::event::KeyEvent>,
+    /// Double-Shift detector state for the menu hub (§4.2).
+    pub double_shift: crate::double_shift::DoubleShift,
     /// Session slot table (1..=9).
     pub slots: [Option<SessionSlot>; NUM_SLOTS],
     /// Currently active slot index (0..8).
@@ -429,6 +443,7 @@ impl AppState {
                 scroll: 0,
             },
             files: FilesState::default(),
+            git: GitState::default(),
             rail: RailState::default(),
             input: InputState::default(),
             vim: VimState::default(),
@@ -452,6 +467,7 @@ impl AppState {
             mascot: crate::ui::mascot::MascotKind::random(),
             truecolor,
             pending_chord: None,
+            double_shift: crate::double_shift::DoubleShift::default(),
             slots: Default::default(),
             active_slot: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),

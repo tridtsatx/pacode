@@ -84,6 +84,21 @@ pub fn handle_paste_with_runner(
         return handle_paste_image_with_runner(state, false, runner, platform, now);
     }
 
+    // A menu accepts pasted text only where text input is live: an Edit-mode
+    // buffer or a filter line (§3.2). It is checked before the match —
+    // `view_for` needs a shared `&state`, which the `&mut` arm borrow blocks.
+    let menu_takes_paste = if let Focus::Overlay(Overlay::Menu { stack, ui }) = &state.focus {
+        match &ui.mode {
+            crate::ui::menu::MenuMode::Edit { .. } => true,
+            _ => {
+                stack.current().is_some()
+                    && crate::ui::menu::shows_filter(&crate::ui::menu::view_for(stack, state, ui))
+            }
+        }
+    } else {
+        false
+    };
+
     match &mut state.focus {
         Focus::Overlay(Overlay::ModelPicker { query, index, .. })
         | Focus::Overlay(Overlay::LoginPicker { query, index }) => {
@@ -110,6 +125,25 @@ pub fn handle_paste_with_runner(
                 state.config_view.selected = 0;
                 state.config_view.scroll_offset = 0;
                 state.config_view.error = None;
+            }
+            state.dirty = true;
+            vec![]
+        }
+        Focus::Overlay(Overlay::Menu { ui, .. }) if menu_takes_paste => {
+            let flattened = flatten_single_line(&text);
+            match &mut ui.mode {
+                crate::ui::menu::MenuMode::Edit { buffer, cursor } => {
+                    let count = flattened.chars().count();
+                    let byte_idx = char_to_byte_index(buffer, *cursor);
+                    buffer.insert_str(byte_idx, &flattened);
+                    *cursor += count;
+                }
+                _ => {
+                    let available = FILTER_MAX_CHARS.saturating_sub(ui.query.chars().count());
+                    let to_insert: String = flattened.chars().take(available).collect();
+                    ui.query.push_str(&to_insert);
+                    ui.cursor = crate::ui::menu::RowId::default();
+                }
             }
             state.dirty = true;
             vec![]

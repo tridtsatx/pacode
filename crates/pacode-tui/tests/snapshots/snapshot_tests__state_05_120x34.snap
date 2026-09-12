@@ -1,6 +1,5 @@
 ---
 source: crates/pacode-tui/tests/snapshot_tests.rs
-assertion_line: 564
 expression: view
 ---
 "  ▄▄▀▀▀▀▀▀▄▄                                                                           │Refactor TUI layout             "
@@ -15,8 +14,8 @@ expression: view
 "I'll help│  ◍ cargo test --all                                             │log        │AGENTS                       5 ●"
 "column.  │    running · 3m34s · 214/380                                    │           │● main  thinking. · 0s          "
 "         ╰ enter open · k kill · esc close ────────────────────────────────╯           │○ codegen                       "
-"▣ Read_file crates/pacode-tui/src/layout.rs ok 120ms                                   │  writing ui/rail.rs            "
-"  │ pub fn compute(area: Rect) -> ScreenLayout...                                      │  1m47s · ↓ 9.1k                "
+"▣ Чтение · crates/pacode-tui/src/layout.rs                                     ✓ 120ms │  writing ui/rail.rs            "
+"│ pub fn compute(area: Rect) -> ScreenLayout...                                        │  1m47s · ↓ 9.1k                "
 "                                                                                       │○ tester                        "
 "                                                                                       │  cargo test -p pacode-tui      "
 "                                                                                       │  23s · ↓ 4.2k                  "

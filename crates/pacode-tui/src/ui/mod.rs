@@ -27,6 +27,7 @@ pub mod rail;
 pub mod rail_session;
 pub mod theme_picker;
 pub mod toast;
+pub mod toolcell;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -64,6 +65,13 @@ pub fn focus_key(focus: &Focus) -> u8 {
             Overlay::RailOverlay => 22,
             Overlay::Help => 23,
             Overlay::LoginPicker { .. } => 24,
+            // Menu levels key off `MenuId` — the table lives in the menu base
+            // (§3.1); 25..=36 here are the `focus_key` range it owns.
+            Overlay::Menu { stack, .. } => stack
+                .current()
+                .map_or(crate::ui::menu::MenuId::Root.focus_key(), |l| {
+                    l.id.focus_key()
+                }),
         },
     }
 }
@@ -103,8 +111,15 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     // and unfolds for ~140 ms; anything else clears it.
     let fkey = focus_key(&state.focus);
     if fkey != state.last_focus_key {
+        // §3.3: a menu-level change moves to a different focus key but must
+        // not replay the unfold — menu keys (≥ `MenuId::Root`'s) share the
+        // running one.
+        let menu_min = crate::ui::menu::MenuId::Root.focus_key();
+        let within_menu = fkey >= menu_min && state.last_focus_key >= menu_min;
         state.last_focus_key = fkey;
-        state.overlay_since = (fkey >= 3).then_some(now);
+        if !within_menu {
+            state.overlay_since = (fkey >= 3).then_some(now);
+        }
     }
     let grow_ms = state
         .overlay_since

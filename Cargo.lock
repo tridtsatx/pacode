@@ -2970,6 +2970,7 @@ dependencies = [
  "pacode-store",
  "pacode-tools",
  "pacode-types",
+ "pacode-vcs",
  "pretty_assertions",
  "regex",
  "serde_json",
@@ -3227,6 +3228,18 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pacode-vcs"
+version = "1.0.0"
+dependencies = [
+ "pacode-exec",
+ "pacode-types",
+ "pretty_assertions",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

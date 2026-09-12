@@ -60,11 +60,13 @@ pub enum MenuId {
     Help,
     Background,
     Git,
+    /// Plugin-shipped skill dirs — a hub section without a legacy overlay.
+    Skills,
 }
 
 impl MenuId {
     /// All variants — the completeness check for derived tables.
-    pub const ALL: [MenuId; 11] = [
+    pub const ALL: [MenuId; 12] = [
         Self::Root,
         Self::Settings,
         Self::Plugins,
@@ -76,6 +78,7 @@ impl MenuId {
         Self::Help,
         Self::Background,
         Self::Git,
+        Self::Skills,
     ];
 
     /// The human name — the breadcrumb segment and the title (§3.2).
@@ -92,6 +95,7 @@ impl MenuId {
             Self::Help => "Help",
             Self::Background => "Background",
             Self::Git => "Git",
+            Self::Skills => "Skills",
         }
     }
 
@@ -110,6 +114,7 @@ impl MenuId {
             Self::Help => "help",
             Self::Background => "background",
             Self::Git => "git",
+            Self::Skills => "skills",
         }
     }
 
@@ -129,6 +134,7 @@ impl MenuId {
             Self::Help => 33,
             Self::Background => 34,
             Self::Git => 35,
+            Self::Skills => 36,
         }
     }
 }
@@ -307,6 +313,40 @@ impl MenuView {
             .filter(|a| !is_base_key(&a.key))
             .collect();
         self
+    }
+
+    /// `FilterMode::Local` matching (§3.2): keep selectable rows whose label
+    /// or right-hand text contains `query` case-insensitively; a `Section`
+    /// survives only while a kept row sits under it. `filter_total` becomes
+    /// the pre-filter count — the `M` of the `N of M` counter.
+    pub fn apply_filter(&mut self, query: &str) {
+        if query.is_empty() {
+            return;
+        }
+        let total = super::model::selectable(&self.rows).count();
+        let q = query.to_lowercase();
+        let mut kept: Vec<MenuRow> = Vec::with_capacity(self.rows.len());
+        for row in self.rows.drain(..) {
+            if matches!(row, MenuRow::Section { .. }) || row.matches(&q) {
+                kept.push(row);
+            }
+        }
+        // Reap the headers nothing survived under.
+        let mut out = Vec::with_capacity(kept.len());
+        for (i, row) in kept.iter().enumerate() {
+            if matches!(row, MenuRow::Section { .. })
+                && kept[i + 1..]
+                    .iter()
+                    .take_while(|r| !matches!(r, MenuRow::Section { .. }))
+                    .next()
+                    .is_none()
+            {
+                continue;
+            }
+            out.push(row.clone());
+        }
+        self.rows = out;
+        self.filter_total = Some(total);
     }
 
     /// Descriptions of declared actions — menu-level and row chips — sitting

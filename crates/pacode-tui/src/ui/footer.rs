@@ -343,7 +343,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
 
                         let tok_str = format_tokens_upper(state.rail.usage.context_tokens as u64);
                         let slots_str = format_slots_summary(state);
-                        let right_text = format!("{slots_str} · {tok_str} · ctrl+p");
+                        let right_text =
+                            format!("{slots_str} · {tok_str} · ctrl+p · {}", menu_hint(state));
                         let right_len = display_width(&right_text);
 
                         let perm_base =
@@ -477,6 +478,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
             spans.push(Span::styled(" · ", opts.theme.faint));
         }
         spans.push(Span::styled("ctrl+p", opts.theme.faint));
+        spans.push(Span::styled(" · ", opts.theme.faint));
+        spans.push(Span::styled(menu_hint(state), opts.theme.faint));
         spans
     } else {
         Vec::new()
@@ -497,5 +500,16 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         let plain: String = left_spans.iter().map(|s| s.content.as_ref()).collect();
         let trunc = truncate_to_width(&plain, width, true);
         Line::from(Span::styled(trunc, opts.theme.dim))
+    }
+}
+
+/// The hub entry hint (§4.2): `shift shift` once the terminal has proven it
+/// reports the gesture, `ctrl+,` while it has not (or while the detector is
+/// switched off).
+fn menu_hint(state: &AppState) -> &'static str {
+    if state.config.keys.double_shift_enabled() && state.double_shift.available() {
+        "shift shift"
+    } else {
+        "ctrl+,"
     }
 }

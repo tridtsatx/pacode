@@ -18,6 +18,7 @@ pub mod state;
 pub mod stream;
 pub mod time;
 pub mod transcript;
+pub mod vcs;
 
 pub use at_ref::*;
 pub use config::*;
@@ -31,3 +32,4 @@ pub use state::*;
 pub use stream::*;
 pub use time::now_ms;
 pub use transcript::*;
+pub use vcs::*;

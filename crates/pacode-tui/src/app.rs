@@ -524,6 +524,32 @@ fn dispatch_action(
                 let _ = tx.send(BgResponse::BashCompleted(res));
             });
         }
+        Action::GitLog { after } => {
+            state.git.begin_log(after.as_deref());
+            state.dirty = true;
+            let cl = Arc::clone(client);
+            let tx = bg_tx.clone();
+            tokio::spawn(async move {
+                let res = cl.request(Request::GitLog { after }).await;
+                let _ = tx.send(BgResponse::Reply(res));
+            });
+        }
+        Action::GitShow { hash } => {
+            let cl = Arc::clone(client);
+            let tx = bg_tx.clone();
+            tokio::spawn(async move {
+                let res = cl.request(Request::GitShow { hash }).await;
+                let _ = tx.send(BgResponse::Reply(res));
+            });
+        }
+        Action::GitDiff { hash } => {
+            let cl = Arc::clone(client);
+            let tx = bg_tx.clone();
+            tokio::spawn(async move {
+                let res = cl.request(Request::GitDiff { hash }).await;
+                let _ = tx.send(BgResponse::Reply(res));
+            });
+        }
         Action::LoadPanel => {
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
@@ -644,6 +670,29 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                 *stale = is_stale;
                 state.dirty = true;
             }
+            vec![]
+        }
+        BgResponse::Reply(Ok(Reply::GitLog {
+            commits,
+            has_more,
+            status,
+        })) => {
+            state.git.apply_log(commits, has_more, status);
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::Reply(Ok(Reply::GitShow { hash, stat })) => {
+            state.git.apply_show(hash, stat);
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::Reply(Ok(Reply::GitDiff {
+            hash,
+            patch,
+            truncated,
+        })) => {
+            state.git.apply_diff(hash, patch, truncated);
+            state.dirty = true;
             vec![]
         }
         BgResponse::Reply(Ok(Reply::Plugins { plugins })) => {

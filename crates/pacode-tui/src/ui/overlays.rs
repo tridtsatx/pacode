@@ -33,10 +33,20 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
         return;
     }
 
+    // The menu base owns its geometry (§3.3): 80 % wide, height from the
+    // `MenuView` — the per-variant table in `wanted_height` is not it.
+    if let Focus::Overlay(Overlay::Menu { stack, ui }) = &state.focus {
+        if !stack.is_empty() {
+            let view = crate::ui::menu::view_for(stack, state, ui);
+            crate::ui::menu::draw(frame, dialog_area, &view, ui, opts);
+        }
+        return;
+    }
+
     let w = ((dialog_area.width as u32 * 78) / 100).max(20) as u16;
     let max_h = dialog_area.height.saturating_sub(4).max(6);
     // Cap at the content: an empty picker should not draw a tall bordered void.
-    let h = wanted_height(state).min(max_h);
+    let h = wanted_height(state, dialog_area).min(max_h);
     let x = dialog_area.x + (dialog_area.width.saturating_sub(w)) / 2;
     let y = dialog_area.y + 2;
     let area = Rect::new(x, y, w, h);
@@ -104,6 +114,9 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
             | Overlay::ThemePicker { .. } => {}
+            // Handled above — the menu base draws itself; the arm keeps the
+            // match exhaustive.
+            Overlay::Menu { .. } => {}
         },
         Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } => {}
     }
@@ -111,7 +124,7 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
 
 /// Rows the overlay wants, borders included. Lists cap at a handful of rows so
 /// a short picker stays small; help, settings and the rail keep the full height.
-fn wanted_height(state: &AppState) -> u16 {
+fn wanted_height(state: &AppState, dialog: Rect) -> u16 {
     // `items` rows of `per` lines each, capped at `cap` items, or `empty` lines
     // for the empty state; plus the two border rows.
     fn capped(items: usize, per: usize, empty: usize, cap: usize) -> u16 {
@@ -170,6 +183,15 @@ fn wanted_height(state: &AppState) -> u16 {
             }
             // Settings, the rail and help fill the space they are given.
             Overlay::ConfigPicker | Overlay::RailOverlay | Overlay::Help => u16::MAX,
+            // `draw` hands menus to the base before this runs — the arm is
+            // honest anyway: the menu's own rect height is the answer.
+            Overlay::Menu { stack, ui } => {
+                if stack.is_empty() {
+                    return 0;
+                }
+                let view = crate::ui::menu::view_for(stack, state, ui);
+                crate::ui::menu::overlay_area(dialog, &view, ui).height
+            }
             Overlay::QuestionPicker { .. }
             | Overlay::ModelPicker { .. }
             | Overlay::LoginPicker { .. }

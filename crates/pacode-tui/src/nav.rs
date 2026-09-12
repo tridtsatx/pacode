@@ -102,6 +102,8 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
         Overlay::ThemePicker { .. } => "ThemePicker",
         Overlay::ConfigPicker => "ConfigPicker",
         Overlay::QuestionPicker { .. } => "QuestionPicker",
+        // The level on screen names the menu in the log (§3.1).
+        Overlay::Menu { stack, .. } => stack.current().map_or("Menu", |l| l.id.title()),
     }
 }
 
@@ -224,7 +226,10 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
             | Overlay::RailOverlay
             | Overlay::Help
             | Overlay::ThemePicker { .. }
-            | Overlay::KeysPicker { .. },
+            | Overlay::KeysPicker { .. }
+            // Unreachable — an open menu intercepts keys before `nav` — but
+            // the match stays exhaustive.
+            | Overlay::Menu { .. },
         ) => {
             // Anywhere -> select first agent
             if !agents.is_empty() {
@@ -273,7 +278,8 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
             | Overlay::RailOverlay
             | Overlay::Help
             | Overlay::ThemePicker { .. }
-            | Overlay::KeysPicker { .. },
+            | Overlay::KeysPicker { .. }
+            | Overlay::Menu { .. },
         ) => {}
     }
     vec![]
@@ -341,7 +347,9 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::PasteImage
             | KeyAction::PasteClipboard
             | KeyAction::RailOverlay
-            | KeyAction::ToggleZdr => {}
+            | KeyAction::ToggleZdr
+            | KeyAction::Menu
+            | KeyAction::Help => {}
         }
     } else {
         match action {
@@ -389,7 +397,9 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::PasteImage
             | KeyAction::PasteClipboard
             | KeyAction::RailOverlay
-            | KeyAction::ToggleZdr => {}
+            | KeyAction::ToggleZdr
+            | KeyAction::Menu
+            | KeyAction::Help => {}
         }
         if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
             && state.transcript.is_at_top()

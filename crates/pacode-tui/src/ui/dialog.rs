@@ -7,8 +7,8 @@ use ratatui::widgets::Paragraph;
 
 use pacode_render::cache::CacheKey;
 use pacode_render::markdown::split_stable_tail;
-use pacode_render::{RenderOptions, render_diff_ex, render_markdown, truncate_to_width, wrap_text};
-use pacode_types::transcript::{DiffStat, ToolStatus};
+use pacode_render::{RenderOptions, render_markdown, truncate_to_width, wrap_text};
+use pacode_types::transcript::ToolStatus;
 use pacode_types::{ToastLevel, TranscriptKind};
 
 use crate::state::transcript::{CellKind, Transcript};
@@ -343,11 +343,6 @@ pub(crate) fn render_item(
     render_item_inner(kind, stats, width, opts, anim_frame, false)
 }
 
-/// Output lines shown on a collapsed tool call, and the ceiling on an expanded
-/// one: an expansion is a reading aid, not a reason to render a 200 MB log.
-pub const COLLAPSED_MAX_LINES: usize = 6;
-pub const EXPANDED_MAX_LINES: usize = 400;
-
 /// `expanded` shows a tool call's whole output, wrapped, instead of its first
 /// few lines cut to the width.
 fn render_item_inner(
@@ -425,162 +420,20 @@ fn render_item_inner(
             diff,
             duration_ms,
             task: _,
-        } => {
-            let mut out = Vec::new();
-            let sym = opts.glyphs.tool;
-            // The core builds titles as `<name> <arg>`; show `▣ Name arg` (mockup).
-            let rest = title
-                .strip_prefix(name.as_str())
-                .map(str::trim_start)
-                .unwrap_or(title.as_str());
-            let mut display_name = String::new();
-            let mut chars = name.chars();
-            if let Some(first) = chars.next() {
-                display_name.extend(first.to_uppercase());
-                display_name.push_str(chars.as_str());
-            }
-            let mut spans = vec![
-                Span::styled(format!("{sym} {display_name} "), opts.theme.cyan),
-                Span::styled(rest.to_string(), opts.theme.dim),
-            ];
-
-            let exit_code = if *status == ToolStatus::Error {
-                parse_exit_code(preview)
-            } else {
-                None
-            };
-
-            match status {
-                ToolStatus::Running => {
-                    spans.push(Span::raw(" "));
-                    // The cell bypasses the line cache while running, so the
-                    // braille spinner can turn on the anim frame alone.
-                    let spinner = opts.glyphs.spinner(anim_frame);
-                    let label = if let Some(ms) = duration_ms {
-                        format!(
-                            "{spinner} running {}",
-                            pacode_types::time::format_duration_ms(*ms)
-                        )
-                    } else {
-                        format!("{spinner} running")
-                    };
-                    spans.push(Span::styled(label, opts.theme.accent));
-                }
-                ToolStatus::Ok => {
-                    spans.push(Span::raw(" "));
-                    if let Some(diff) = diff {
-                        spans.extend(render_diff_stat(diff, opts));
-                    } else if let Some(ms) = duration_ms {
-                        spans.push(Span::styled(
-                            format!("ok {}", pacode_types::time::format_duration_ms(*ms)),
-                            opts.theme.green,
-                        ));
-                    } else {
-                        spans.push(Span::styled(opts.glyphs.ok, opts.theme.green));
-                    }
-                }
-                ToolStatus::Error => {
-                    spans.push(Span::raw(" "));
-                    let mut label = match duration_ms {
-                        Some(ms) => {
-                            format!("fail {}", pacode_types::time::format_duration_ms(*ms))
-                        }
-                        None => "fail".to_string(),
-                    };
-                    if let Some(code) = exit_code {
-                        label.push_str(&format!(" · exit {code}"));
-                    }
-                    spans.push(Span::styled(label, opts.theme.red));
-                }
-                ToolStatus::Backgrounded => {
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::styled(
-                        format!("{} background", opts.glyphs.arrow_right),
-                        opts.theme.violet,
-                    ));
-                }
-                ToolStatus::Denied => {
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::styled("denied", opts.theme.red));
-                }
-            }
-            out.push(Line::from(spans));
-
-            let is_exit_line = |l: &str| {
-                let t = l.trim();
-                t.starts_with("[exit code ") && t.ends_with(']')
-            };
-
-            if !preview.is_empty() {
-                if preview.starts_with("--- ") || preview.contains("\n+++ ") {
-                    // The cell gutter eats 4 cells; the diff renders at
-                    // width - 4 so its background bands end at the cell edge.
-                    let mut diff_opts = opts.clone();
-                    diff_opts.width = width.saturating_sub(4);
-                    let diff_lines = render_diff_ex(preview, &diff_opts, expanded);
-                    for dl in diff_lines {
-                        let mut spans = vec![Span::styled("  │ ", opts.theme.dim)];
-                        spans.extend(dl.spans);
-                        out.push(Line::from(spans));
-                    }
-                } else {
-                    let content_lines: Vec<&str> = preview
-                        .lines()
-                        .filter(|l| !(*status == ToolStatus::Error && is_exit_line(l)))
-                        .collect();
-
-                    if content_lines.iter().any(|l| !l.trim().is_empty()) {
-                        let body_width = (width as usize).saturating_sub(4);
-                        if expanded {
-                            // Expanded: the whole output, wrapped rather than cut,
-                            // and still bounded so one enormous result cannot make
-                            // the transcript unscrollable.
-                            let mut drawn = 0usize;
-                            for pl in &content_lines {
-                                for wrapped in pacode_render::wrap_text(pl, body_width) {
-                                    out.push(Line::from(vec![
-                                        Span::styled("  │ ", opts.theme.dim),
-                                        Span::styled(wrapped, opts.theme.faint),
-                                    ]));
-                                    drawn += 1;
-                                    if drawn >= EXPANDED_MAX_LINES {
-                                        break;
-                                    }
-                                }
-                                if drawn >= EXPANDED_MAX_LINES {
-                                    out.push(Line::from(Span::styled(
-                                        "  │ [output truncated]",
-                                        opts.theme.dim,
-                                    )));
-                                    break;
-                                }
-                            }
-                        } else {
-                            let hidden = content_lines.len().saturating_sub(COLLAPSED_MAX_LINES);
-                            for pl in content_lines.iter().take(COLLAPSED_MAX_LINES) {
-                                out.push(Line::from(vec![
-                                    Span::styled("  │ ", opts.theme.dim),
-                                    Span::styled(
-                                        truncate_to_width(pl, body_width, true),
-                                        opts.theme.faint,
-                                    ),
-                                ]));
-                            }
-                            // Say there is more, and how to see it.
-                            if hidden > 0 {
-                                out.push(Line::from(Span::styled(
-                                    format!("  │ +{hidden} more lines · click to expand"),
-                                    opts.theme.dim,
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-
-            out.push(Line::default());
-            out
-        }
+        } => crate::ui::toolcell::render(
+            &crate::ui::toolcell::ToolCallView {
+                name,
+                title,
+                status: *status,
+                preview,
+                diff: diff.as_ref(),
+                duration_ms: *duration_ms,
+            },
+            width,
+            opts,
+            anim_frame,
+            expanded,
+        ),
         TranscriptKind::Notice { level, text } => {
             let style = match level {
                 ToastLevel::Success => opts.theme.green,
@@ -712,33 +565,4 @@ fn render_item_inner(
             out
         }
     }
-}
-
-pub(crate) fn parse_exit_code(preview: &str) -> Option<i32> {
-    for line in preview.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("[exit code ")
-            && let Some(num_str) = rest.strip_suffix(']')
-            && let Ok(code) = num_str.trim().parse::<i32>()
-        {
-            return Some(code);
-        }
-    }
-    if let Some(start) = preview.find("[exit code ") {
-        let rest = &preview[start + "[exit code ".len()..];
-        if let Some(end) = rest.find(']')
-            && let Ok(code) = rest[..end].trim().parse::<i32>()
-        {
-            return Some(code);
-        }
-    }
-    None
-}
-
-fn render_diff_stat(diff: &DiffStat, opts: &RenderOptions) -> Vec<Span<'static>> {
-    vec![
-        Span::styled(format!("+{}", diff.added), opts.theme.green),
-        Span::raw(" "),
-        Span::styled(format!("-{}", diff.removed), opts.theme.red),
-    ]
 }

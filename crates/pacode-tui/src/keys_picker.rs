@@ -509,6 +509,9 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             vec![]
         }
         Focus::Overlay(Overlay::Import(_)) => vec![],
+        // Unreachable — `keys::handle_key` routes a menu to `keys_menu` before
+        // the overlay dispatch — but the match stays exhaustive.
+        Focus::Overlay(Overlay::Menu { .. }) => vec![],
         Focus::Overlay(Overlay::McpPicker {
             index,
             servers,

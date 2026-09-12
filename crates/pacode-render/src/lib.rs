@@ -8,6 +8,7 @@ pub mod markdown;
 pub mod palettes;
 pub mod stream;
 pub mod syntax;
+pub mod text;
 pub mod theme;
 pub mod wrap;
 

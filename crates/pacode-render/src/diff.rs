@@ -47,18 +47,11 @@ pub fn unified_diff(old: &str, new: &str, path: &str, context: usize) -> String 
 /// `… N строк свёрнуто · ctrl+o развернуть`.
 const CONTEXT: usize = 3;
 
-/// `строка/строки/строк` + `свёрнута/свёрнуто` by the usual Russian plural
-/// rules (11–14 always take the plural form).
+/// `… N строк свёрнуто · ctrl+o развернуть` — plural forms come from
+/// `crate::text` (the same rules the tool cell's `ещё N строк` marker uses).
 fn folded_text(n: usize, opts: &RenderOptions) -> String {
-    let (noun, verb) = if (11..=14).contains(&(n % 100)) {
-        ("строк", "свёрнуто")
-    } else {
-        match n % 10 {
-            1 => ("строка", "свёрнута"),
-            2..=4 => ("строки", "свёрнуто"),
-            _ => ("строк", "свёрнуто"),
-        }
-    };
+    let noun = crate::text::lines_noun(n);
+    let verb = crate::text::plural(n, "свёрнута", "свёрнуто", "свёрнуто");
     format!(
         "{} {n} {noun} {verb}{}ctrl+o развернуть",
         opts.glyphs.ellipsis, opts.glyphs.dot_sep,

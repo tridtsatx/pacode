@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use pacode_types::state::PermissionDecision;
 use pacode_types::{PermissionRequest, Request, TranscriptKind};
 
@@ -31,10 +31,37 @@ pub enum Action {
     RunBashInteractive {
         command: String,
     },
+    /// Page of git history: `after` is the last held commit hash, `None` asks
+    /// for the first page. Marks `state.git` as loading before the request
+    /// flies, which a bare `Send` cannot do.
+    GitLog {
+        after: Option<String>,
+    },
+    /// `git show --stat` of one commit for the submenu's detail pane.
+    GitShow {
+        hash: String,
+    },
+    /// Patch of one commit for the submenu's diff panel.
+    GitDiff {
+        hash: String,
+    },
     Quit,
 }
 
 pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Action> {
+    // Feed the double-Shift detector on the raw stream — a kitty tap arrives
+    // as Press + Release, and the drop below removes the Release (§4.2). The
+    // gate folds `Focus::Normal` and the `keys.double_shift` switch in.
+    let armed = state.focus == Focus::Normal && state.config.keys.double_shift_enabled();
+    let threshold = state.config.keys.double_shift_threshold_ms();
+    let hub_fired = state.double_shift.observe(key, now, threshold, armed);
+
+    // REPORT_EVENT_TYPES reports Release/Repeat alongside Press — without this
+    // drop every keypress would run its action twice (§4.2).
+    if matches!(key.kind, KeyEventKind::Release | KeyEventKind::Repeat) {
+        return vec![];
+    }
+
     let was_dirty = state.dirty;
     state.dirty = true;
 
@@ -45,6 +72,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 1. ctrl+c / ctrl+d (Cyrillic layout letters are mapped to their Latin key).
     let key = normalize_cyrillic_ctrl(key);
+
+    // The second Shift tap — opens the menu hub (§4.2).
+    if hub_fired {
+        return crate::keys_menu::open(state, crate::ui::menu::MenuId::Root);
+    }
 
     // Any key clears pending chord.
     let pending = state.pending_chord.take();
@@ -72,6 +104,20 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     {
         state.quit = true;
         return vec![Action::Quit];
+    }
+    // The menu base owns the keyboard while open (§3.4): `esc` peels a level
+    // and `ctrl+c` closes the whole stack — it must not reach the interrupt
+    // ladder below. `ctrl+d` above still quits, same as in legacy overlays.
+    if matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })) {
+        let taken = std::mem::replace(&mut state.focus, Focus::Normal);
+        let Focus::Overlay(Overlay::Menu { mut stack, mut ui }) = taken else {
+            return vec![];
+        };
+        let actions = crate::keys_menu::handle_menu_key(state, &mut stack, &mut ui, key);
+        if matches!(state.focus, Focus::Normal) && !stack.is_empty() {
+            state.focus = Focus::Overlay(Overlay::Menu { stack, ui });
+        }
+        return actions;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         if let Some(cancel_tx) = state.running_bash.take() {
@@ -158,14 +204,16 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return crate::paste::handle_paste_clipboard(state, now);
     }
 
+    // 1.9 The menu hub via ctrl+, — double-Shift is the other entry (§4.2).
+    if action == Some(KeyAction::Menu) {
+        log::debug!("open overlay: menu hub");
+        return crate::keys_menu::open(state, crate::ui::menu::MenuId::Root);
+    }
+
     // 2. Session picker via ctrl+p
     if action == Some(KeyAction::SessionPicker) {
         log::debug!("open overlay: SessionPicker");
-        state.focus = Focus::Overlay(Overlay::SessionPicker {
-            query: String::new(),
-            index: 0,
-        });
-        return vec![Action::Send(Request::ListSessions { limit: 50 })];
+        return crate::keys_menu::open(state, crate::ui::menu::MenuId::Sessions);
     }
 
     // 3. Shift+Tab: cycle permission mode; plain Tab: autocomplete slash command / @ / bash
@@ -299,8 +347,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     // 5.5 Files overlay: alt+f
     if action == Some(KeyAction::FilesOverlay) {
         log::debug!("open overlay: Files");
-        state.focus = Focus::Overlay(Overlay::Files { index: 0 });
-        return vec![];
+        return crate::keys_menu::open(state, crate::ui::menu::MenuId::Files);
     }
 
     // 5.6 Plan & agents overlay. Below 80 columns the rail is not drawn at all
@@ -373,8 +420,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     // 9. Single keys in empty prompt: '.', 's', 'k'
     if state.input.is_empty() && (!state.config.ui.vim || state.focus != Focus::Normal) {
         if action == Some(KeyAction::BgList) {
-            state.focus = Focus::BgList { index: 0 };
-            return vec![];
+            return crate::keys_menu::open(state, crate::ui::menu::MenuId::Background);
+        }
+        if action == Some(KeyAction::Help) {
+            return crate::keys_menu::open(state, crate::ui::menu::MenuId::Help);
         }
         if action == Some(KeyAction::StopAgent)
             && let Focus::Panel {
@@ -610,7 +659,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | Overlay::Help
                 | Overlay::ThemePicker { .. }
                 | Overlay::KeysPicker { .. }
-                | Overlay::LoginPicker { .. },
+                | Overlay::LoginPicker { .. }
+                // Unreachable — an open menu intercepts Enter earlier — but
+                // the match stays exhaustive.
+                | Overlay::Menu { .. },
             ) => {}
         }
         return vec![];

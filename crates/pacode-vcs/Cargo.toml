@@ -1,0 +1,22 @@
+[package]
+name = "pacode-vcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Read-only git history for the VCS submenu: log parsing, lane layout, commit show/diff via the exec layer"
+
+[dependencies]
+pacode-types = { workspace = true }
+pacode-exec = { workspace = true }
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "macros"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+pretty_assertions = { workspace = true }

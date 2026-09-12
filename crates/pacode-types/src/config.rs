@@ -879,11 +879,31 @@ pub struct FontConfig {
     pub weight: Option<String>,
 }
 
-/// `[keys]`: action name to key binding, e.g. `follow_agent = "alt+f"`.
-/// Unset actions keep their built-in binding.
+/// `[keys]`: action name to key binding, e.g. `follow_agent = "alt+f"`, plus
+/// the double-Shift hub settings. Unset actions keep their built-in binding.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeysConfig {
+    /// Double-tap Shift opens the menu hub (default true; §4.2 of the menu
+    /// spec). Named field — not a binding — so `Keymap::from_config` never
+    /// sees it as an unknown action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub double_shift: Option<bool>,
+    /// Max milliseconds between the two Shift taps (default 400).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub double_shift_ms: Option<u64>,
     #[serde(flatten)]
     pub bindings: BTreeMap<String, String>,
+}
+
+impl KeysConfig {
+    /// Whether the double-Shift gesture opens the menu hub.
+    pub fn double_shift_enabled(&self) -> bool {
+        self.double_shift.unwrap_or(true)
+    }
+
+    /// The pair window in milliseconds.
+    pub fn double_shift_threshold_ms(&self) -> u64 {
+        self.double_shift_ms.unwrap_or(400)
+    }
 }

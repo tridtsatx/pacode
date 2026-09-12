@@ -211,6 +211,23 @@ impl MenuRow {
     pub fn is_selectable(&self) -> bool {
         self.id().is_some()
     }
+
+    /// The row's searchable text — label plus the right-hand tail — checked
+    /// against `query_lower` (already lowercased) by `MenuView::apply_filter`.
+    /// Sections are headers, not match targets (§3.2).
+    pub fn matches(&self, query_lower: &str) -> bool {
+        let (label, right) = match self {
+            Self::Section { .. } => return false,
+            Self::Item { label, right, .. } | Self::Submenu { label, right, .. } => {
+                (label, right.as_deref())
+            }
+            Self::Toggle { label, .. } => (label, None),
+            Self::Value { label, value, .. } => (label, Some(value.as_str())),
+            Self::Check { label, .. } => (label, None),
+        };
+        let hit = |s: &str| s.to_lowercase().contains(query_lower);
+        hit(label) || right.is_some_and(hit)
+    }
 }
 
 /// `(row index, id)` of every selectable row in order — the cursor domain.

@@ -23,10 +23,12 @@ use crate::state::{
 };
 use crate::stream::Usage;
 use crate::transcript::TranscriptItem;
+use crate::vcs::{CommitRow, GitStatus};
 
 /// Bumped on any wire-visible change: v2 added `SetZdr`/`SetModelFlag`,
-/// `SessionMeta.zdr` and `ModelInfo.supported_efforts`.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// `SessionMeta.zdr` and `ModelInfo.supported_efforts`; v3 added the git
+/// requests (`GitLog`, `GitShow`, `GitDiff`) and their replies.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -200,6 +202,20 @@ pub enum Request {
     SetAuthAccount {
         provider: String,
         label: String,
+    },
+    /// One page of `git log` for the session's cwd (`Reply::GitLog`).
+    /// `after` is the hash of the last commit the client already holds.
+    GitLog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// `git show --stat` of one commit for the detail pane (`Reply::GitShow`).
+    GitShow {
+        hash: String,
+    },
+    /// Patch of one commit for the diff panel (`Reply::GitDiff`).
+    GitDiff {
+        hash: String,
     },
 }
 
@@ -446,6 +462,25 @@ pub enum Reply {
     },
     AuthStatus {
         providers: Vec<ProviderAuthInfo>,
+    },
+    /// Answer to `Request::GitLog`. `status` reports a non-repo cwd or a
+    /// missing git binary; both are normal outcomes, not errors.
+    GitLog {
+        commits: Vec<CommitRow>,
+        has_more: bool,
+        status: GitStatus,
+    },
+    /// Answer to `Request::GitShow`: the `git show --stat` block.
+    GitShow {
+        hash: String,
+        stat: String,
+    },
+    /// Answer to `Request::GitDiff`: the commit's patch, size-capped.
+    GitDiff {
+        hash: String,
+        patch: String,
+        /// The patch exceeded the daemon's capture cap and was cut.
+        truncated: bool,
     },
 }
 

@@ -226,6 +226,8 @@ pub static SETTINGS: &[SettingEntry] = &[
 
     // keys
     SettingEntry { dotted_key: "keys", label: "Keybindings", description: "Action keybindings (customize with /keys)", section: "keys", default_value: "/keys", kind: SettingKind::Action { command: "/keys" }, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "keys.double_shift", label: "Double-Shift Menu", description: "Double-tap Shift opens the menu hub", section: "keys", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "keys.double_shift_ms", label: "Double-Shift Interval", description: "Max milliseconds between the two Shift taps", section: "keys", default_value: "400", kind: SettingKind::Integer { min: 50, max: 2000 }, apply: ApplyMode::Immediate },
 
     // tools — `tools.<name>.enabled = false` removes the tool from the model
     // schema entirely (registry drops it; dispatch reports "unknown tool").
@@ -379,6 +381,8 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             "{} custom bindings (/keys)",
             config.keys.bindings.len()
         )),
+        "keys.double_shift" => Some(config.keys.double_shift_enabled().to_string()),
+        "keys.double_shift_ms" => Some(config.keys.double_shift_threshold_ms().to_string()),
         "web.default_num_results" => Some(config.web.default_num_results.to_string()),
         "web.request_timeout_secs" => Some(config.web.request_timeout_secs.to_string()),
         _ => None,
@@ -578,6 +582,16 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "plugins.marketplace" => {
             if let toml::Value::String(v) = value {
                 config.plugins.marketplace = v.clone();
+            }
+        }
+        "keys.double_shift" => {
+            if let toml::Value::Boolean(b) = value {
+                config.keys.double_shift = Some(*b);
+            }
+        }
+        "keys.double_shift_ms" => {
+            if let toml::Value::Integer(n) = value {
+                config.keys.double_shift_ms = Some(*n as u64);
             }
         }
         "ui.agent_view" => {

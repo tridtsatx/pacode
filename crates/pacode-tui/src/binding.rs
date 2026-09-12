@@ -60,6 +60,11 @@ pub enum Action {
     RailOverlay,
     /// Toggle zero-data-retention for the session (only `zdr = "session"`).
     ToggleZdr,
+    /// Open the menu hub — the `ctrl+,` half of the entry (§4.2); double-Shift
+    /// is the other.
+    Menu,
+    /// Open the help menu — the `?` key on an empty prompt.
+    Help,
 }
 
 impl Action {
@@ -111,6 +116,8 @@ impl Action {
             Self::PasteClipboard => "paste_clipboard",
             Self::RailOverlay => "rail_overlay",
             Self::ToggleZdr => "toggle_zdr",
+            Self::Menu => "menu",
+            Self::Help => "help",
         }
     }
 
@@ -162,6 +169,8 @@ impl Action {
             Self::PasteClipboard => "Paste from clipboard (image or text)",
             Self::RailOverlay => "Show plan and agents",
             Self::ToggleZdr => "Toggle ZDR mode",
+            Self::Menu => "Open the menu hub",
+            Self::Help => "Open help menu",
         }
     }
 }
@@ -393,6 +402,8 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("paste_clipboard", Action::PasteClipboard),
     ("rail_overlay", Action::RailOverlay),
     ("toggle_zdr", Action::ToggleZdr),
+    ("menu", Action::Menu),
+    ("help", Action::Help),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -655,6 +666,30 @@ impl Keymap {
                 code: KeyCode::Char('z'),
                 mods: KeyModifiers::ALT,
             }],
+        );
+        // ctrl+, — the keymap half of the menu-hub entry (§4.2); the other
+        // half is the double-Shift detector, which is not a binding.
+        bindings.insert(
+            Action::Menu,
+            vec![Binding {
+                code: KeyCode::Char(','),
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        // `?` on an empty prompt — Help. Both spellings: terminals disagree on
+        // whether SHIFT rides along.
+        bindings.insert(
+            Action::Help,
+            vec![
+                Binding {
+                    code: KeyCode::Char('?'),
+                    mods: KeyModifiers::NONE,
+                },
+                Binding {
+                    code: KeyCode::Char('?'),
+                    mods: KeyModifiers::SHIFT,
+                },
+            ],
         );
         // ctrl+v and, where the terminal forwards it, ctrl+shift+v: image first, text otherwise.
         bindings.insert(
