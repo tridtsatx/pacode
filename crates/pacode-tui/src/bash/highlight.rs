@@ -68,8 +68,8 @@ pub fn tokenize(line: &str) -> Vec<BashSpan<'_>> {
             i += 2;
             continue;
         }
-        if matches!(ch, '|' | ';' | '>' | '<' | '&') {
-            let resets_cmd = ch == '|' || ch == ';';
+        if matches!(ch, '|' | ';' | '>' | '<' | '&' | '(' | ')') {
+            let resets_cmd = ch == '|' || ch == ';' || ch == '(';
             spans.push(BashSpan {
                 text: &line[i..i + 1],
                 role: BashRole::Operator,
@@ -126,9 +126,19 @@ pub fn tokenize(line: &str) -> Vec<BashSpan<'_>> {
             continue;
         }
 
-        // 4. Variables ($NAME or ${NAME})
+        // 4. Variables ($NAME, ${NAME}) and the `$(` of a command substitution
         if ch == '$' && i + 1 < len {
             let next_ch = line[i + 1..].chars().next().unwrap_or(' ');
+            if next_ch == '(' {
+                spans.push(BashSpan {
+                    text: &line[i..i + 2],
+                    role: BashRole::Variable,
+                });
+                i += 2;
+                // What follows the opener is a command of its own.
+                expecting_command = true;
+                continue;
+            }
             if next_ch == '{' {
                 let start = i;
                 i += 2;
@@ -173,12 +183,27 @@ pub fn tokenize(line: &str) -> Vec<BashSpan<'_>> {
             }
         }
 
+        // A `$` that opens no variable and no substitution is literal text. Without
+        // this the word scanner below would stop on it before consuming a byte and
+        // the loop would push empty spans forever.
+        if ch == '$' {
+            spans.push(BashSpan {
+                text: &line[i..i + 1],
+                role: BashRole::Argument,
+            });
+            i += 1;
+            expecting_command = false;
+            continue;
+        }
+
         // 5. Option flags (-x, --long, -rf)
         if ch == '-' {
             let start = i;
             while i < len {
                 let c = line[i..].chars().next().unwrap_or(' ');
-                if c.is_whitespace() || matches!(c, '|' | ';' | '>' | '<' | '&' | '"' | '\'') {
+                if c.is_whitespace()
+                    || matches!(c, '|' | ';' | '>' | '<' | '&' | '"' | '\'' | '(' | ')')
+                {
                     break;
                 }
                 i += c.len_utf8();
@@ -191,11 +216,19 @@ pub fn tokenize(line: &str) -> Vec<BashSpan<'_>> {
             continue;
         }
 
-        // 6. Regular word: Command or Argument
+        // 6. Regular word: Command or Argument. The first character is always
+        // consumed — every delimiter is handled above, so a word that starts on one
+        // would otherwise produce an empty span and no progress.
         let start = i;
+        i += ch.len_utf8();
         while i < len {
             let c = line[i..].chars().next().unwrap_or(' ');
-            if c.is_whitespace() || matches!(c, '|' | ';' | '>' | '<' | '&' | '"' | '\'' | '$') {
+            if c.is_whitespace()
+                || matches!(
+                    c,
+                    '|' | ';' | '>' | '<' | '&' | '"' | '\'' | '$' | '(' | ')'
+                )
+            {
                 break;
             }
             i += c.len_utf8();
