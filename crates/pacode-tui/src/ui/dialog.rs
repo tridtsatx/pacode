@@ -1,5 +1,7 @@
 //! The transcript (main dialog and the agent panel share this renderer).
 
+use std::collections::{HashSet, VecDeque};
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -7,11 +9,11 @@ use ratatui::widgets::Paragraph;
 
 use pacode_render::cache::CacheKey;
 use pacode_render::markdown::split_stable_tail;
-use pacode_render::{RenderOptions, render_markdown, truncate_to_width, wrap_text};
+use pacode_render::{LineCache, RenderOptions, render_markdown, truncate_to_width, wrap_text};
 use pacode_types::transcript::ToolStatus;
 use pacode_types::{ToastLevel, TranscriptKind};
 
-use crate::state::transcript::{CellKind, Transcript};
+use crate::state::transcript::{Cell, CellKind, HeaderInfo, Transcript};
 
 #[cfg(test)]
 #[path = "dialog_tests.rs"]
@@ -30,47 +32,83 @@ pub fn draw(
     }
 
     let width = area.width;
-    let live_id = transcript.live_cell;
+    // Disjoint field borrows: the rendered blocks borrow the cache for the
+    // whole draw, so `&mut transcript` helpers (record_render) cannot run while
+    // they live — their writes go through the field bindings instead.
+    let Transcript {
+        cells,
+        expanded,
+        cache,
+        header,
+        cell_lines,
+        rendered_lines,
+        viewport_height,
+        scroll_from_bottom,
+        first_visible_line,
+        live_cell,
+        ..
+    } = &mut *transcript;
 
-    let cell_lines = build_cell_lines(transcript, live_id, width, opts, anim_frame, welcome_ms);
+    let blocks = build_cell_lines(
+        CellsSource {
+            cells,
+            expanded,
+            header: header.as_ref(),
+            live_id: *live_cell,
+            width,
+            anim_frame,
+            welcome_ms,
+        },
+        cache,
+        opts,
+    );
 
     // Remember where each cell landed, so a click on a row finds its cell. The
     // header block, when there is one, is not a cell and gets no entry.
-    let header_blocks = usize::from(transcript.header.is_some());
-    let mut spans = Vec::with_capacity(transcript.cells.len());
+    let header_blocks = usize::from(header.is_some());
+    let mut spans = Vec::with_capacity(cells.len());
     let mut cursor = 0usize;
-    for (i, lines) in cell_lines.iter().enumerate() {
-        let end = cursor + lines.len();
+    for (i, block) in blocks.iter().enumerate() {
+        let end = cursor + block.lines().len();
         if i >= header_blocks
-            && let Some(cell) = transcript.cells.get(i - header_blocks)
+            && let Some(cell) = cells.get(i - header_blocks)
         {
             spans.push((cell.id, cursor, end));
         }
         cursor = end;
     }
-    transcript.cell_lines = spans;
+    *cell_lines = spans;
 
-    let total_lines: usize = cell_lines.iter().map(|l| l.len()).sum();
+    let total_lines: usize = blocks.iter().map(|b| b.lines().len()).sum();
     let viewport = area.height as usize;
 
-    transcript.record_render(total_lines, viewport);
+    // record_render inlined: the cached-line borrows above rule out `&mut self`.
+    *rendered_lines = Some(total_lines);
+    *viewport_height = Some(viewport);
+    let max_scroll = total_lines.saturating_sub(viewport);
+    *scroll_from_bottom = (*scroll_from_bottom).min(max_scroll);
+    *first_visible_line = max_scroll.saturating_sub(*scroll_from_bottom);
 
     let (start_line, is_scrolled_up) = if total_lines <= viewport {
         (0, false)
     } else {
-        let max_scroll = total_lines.saturating_sub(viewport);
-        let scroll = transcript.scroll_from_bottom;
+        let scroll = *scroll_from_bottom;
         let start = max_scroll.saturating_sub(scroll);
         (start, scroll > 0)
     };
 
+    // Only the viewport window is cloned into the Paragraph — cached blocks
+    // stay borrowed, so a one-line redraw never copies the whole transcript.
     let mut visible_lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
     let mut current_idx = 0usize;
 
-    for lines in cell_lines {
-        for line in lines {
+    'collect: for block in &blocks {
+        for line in block.lines() {
             if current_idx >= start_line && visible_lines.len() < viewport {
-                visible_lines.push(line);
+                visible_lines.push(line.clone());
+            }
+            if visible_lines.len() >= viewport && current_idx >= start_line {
+                break 'collect;
             }
             current_idx += 1;
         }
@@ -78,11 +116,51 @@ pub fn draw(
 
     if is_scrolled_up && !visible_lines.is_empty() {
         let last_idx = visible_lines.len() - 1;
-        let msg = format!("↓ {} new lines", transcript.scroll_from_bottom);
+        let msg = format!("↓ {} new lines", *scroll_from_bottom);
         visible_lines[last_idx] = Line::from(Span::styled(msg, opts.theme.dim));
     }
 
     frame.render_widget(Paragraph::new(visible_lines), area);
+}
+
+/// One rendered block of the transcript. Cached cells stay borrowed from the
+/// line cache — only the cells that must render fresh own their lines.
+enum Block<'a> {
+    Cached(&'a [Line<'static>]),
+    Owned(Vec<Line<'static>>),
+}
+
+impl Block<'_> {
+    fn lines(&self) -> &[Line<'static>] {
+        match self {
+            Block::Cached(lines) => lines,
+            Block::Owned(lines) => lines,
+        }
+    }
+}
+
+/// How a cell's block is produced in the second phase.
+enum CellPlan {
+    /// Served from `cache` under this key; phase one made sure it is there.
+    Cached(CacheKey),
+    /// The live assistant cell: its stable part is cached, its tail renders
+    /// fresh every frame.
+    LiveAssistant,
+    /// Rendered fresh and never cached: running tool calls carry the spinner.
+    Fresh,
+}
+
+/// Everything `build_cell_lines` reads out of the transcript, as one borrow
+/// group: the cache and the render options stay separate because the cache is
+/// the `&mut` half and the options outlive the frame.
+struct CellsSource<'a> {
+    cells: &'a VecDeque<Cell>,
+    expanded: &'a HashSet<u64>,
+    header: Option<&'a HeaderInfo>,
+    live_id: Option<u64>,
+    width: u16,
+    anim_frame: u64,
+    welcome_ms: u64,
 }
 
 /// Render every block of the transcript in display order: the header banner
@@ -91,44 +169,209 @@ pub fn draw(
 ///
 /// §8.1: the cells and the render cache are borrowed as separate fields —
 /// the previous per-frame `CellKind` clone of every cell (each potentially a
-/// whole markdown document) is gone.
-fn build_cell_lines(
-    transcript: &mut Transcript,
-    live_id: Option<u64>,
-    width: u16,
+/// whole markdown document) is gone. The per-frame `to_vec` of every cached
+/// cell is gone too, in two phases: first a `&mut` pass makes sure every
+/// cacheable cell is in the cache (rendering misses, refreshing recency), then
+/// a `&` pass collects the blocks as borrows. Live assistant cells and running
+/// tool calls still render fresh every frame and stay `Owned`.
+fn build_cell_lines<'a>(
+    src: CellsSource<'a>,
+    cache: &'a mut LineCache,
     opts: &RenderOptions,
-    anim_frame: u64,
-    welcome_ms: u64,
-) -> Vec<Vec<Line<'static>>> {
-    let Transcript {
+) -> Vec<Block<'a>> {
+    let CellsSource {
         cells,
         expanded,
-        cache,
         header,
-        ..
-    } = transcript;
-    let mut cell_lines: Vec<Vec<Line<'static>>> = Vec::with_capacity(cells.len() + 1);
+        live_id,
+        width,
+        anim_frame,
+        welcome_ms,
+    } = src;
+    let mut blocks: Vec<Block<'a>> = Vec::with_capacity(cells.len() + 1);
 
-    if let Some(info) = header.as_ref() {
-        cell_lines.push(crate::ui::header::render(
+    if let Some(info) = header {
+        blocks.push(Block::Owned(crate::ui::header::render(
             info, width, opts, anim_frame, welcome_ms,
+        )));
+    }
+
+    // Phase one, `&mut cache`: plan every cell and fill cache misses.
+    let mut plans: Vec<CellPlan> = Vec::with_capacity(cells.len());
+    for cell in cells.iter() {
+        plans.push(plan_cell(
+            cell,
+            live_id == Some(cell.id),
+            expanded,
+            opts,
+            cache,
+            width,
+            anim_frame,
         ));
     }
 
-    for cell in cells.iter() {
-        let args = CellRenderArgs {
-            cell_id: cell.id,
-            cell_version: cell.version,
-            cell_kind: &cell.kind,
-            cell_stats: cell.stats.as_deref(),
-            is_live: live_id == Some(cell.id),
+    // Phase two, `& cache`: no more `&mut` calls, so the cached blocks can be
+    // borrowed out of the entries phase one left behind.
+    let cache: &'a LineCache = cache;
+    for (cell, plan) in cells.iter().zip(plans.iter()) {
+        blocks.push(cell_block(
+            cell,
+            plan,
+            expanded.contains(&cell.id),
+            opts,
+            cache,
             width,
             anim_frame,
-        };
-        cell_lines.push(get_or_render_cell(args, opts, expanded, cache));
+        ));
     }
 
-    cell_lines
+    blocks
+}
+
+/// The phase-one decision for a cell: where its lines come from, making sure
+/// the cache holds whatever phase two will borrow.
+fn plan_cell(
+    cell: &Cell,
+    is_live: bool,
+    expanded_set: &HashSet<u64>,
+    opts: &RenderOptions,
+    cache: &mut LineCache,
+    width: u16,
+    anim_frame: u64,
+) -> CellPlan {
+    // An expanded cell renders differently, so it is a different cache entry
+    // rather than a stale one.
+    let expanded = expanded_set.contains(&cell.id);
+    let expansion_bit = if expanded { 0x4000_0000_0000_0000 } else { 0 };
+    let key = CacheKey {
+        cell: cell.id ^ ((cell.version as u64) << 48) ^ expansion_bit,
+        width,
+    };
+
+    let is_running_tool = matches!(
+        cell.kind,
+        CellKind::Item(TranscriptKind::ToolCall {
+            status: ToolStatus::Running,
+            ..
+        })
+    );
+
+    if is_running_tool {
+        return CellPlan::Fresh;
+    }
+
+    if !is_live {
+        if cache.get(key).is_none() {
+            let rendered = render_cell(
+                &cell.kind,
+                cell.stats.as_deref(),
+                width,
+                opts,
+                anim_frame,
+                expanded,
+            );
+            cache.insert(key, rendered);
+        }
+        return CellPlan::Cached(key);
+    }
+
+    if let CellKind::Item(TranscriptKind::Assistant { text, .. }) = &cell.kind {
+        // The stable prefix of the live answer is cacheable; the tail is not.
+        let (stable, _) = split_stable_tail(text);
+        let stable_key = CacheKey {
+            cell: (cell.id << 1) ^ (stable.len() as u64) ^ 0x8000_0000_0000_0000,
+            width,
+        };
+        if cache.get(stable_key).is_none() {
+            cache.insert(stable_key, render_markdown(stable, opts));
+        }
+        return CellPlan::LiveAssistant;
+    }
+
+    // A live cell that is not an answer still caches; the version in the key
+    // keeps pace with its updates.
+    if cache.get(key).is_none() {
+        let rendered = render_cell(
+            &cell.kind,
+            cell.stats.as_deref(),
+            width,
+            opts,
+            anim_frame,
+            expanded,
+        );
+        cache.insert(key, rendered);
+    }
+    CellPlan::Cached(key)
+}
+
+/// The phase-two block for a cell: a borrow of what phase one cached, or the
+/// fresh render for the cells that draw anew every frame.
+fn cell_block<'a>(
+    cell: &Cell,
+    plan: &CellPlan,
+    expanded: bool,
+    opts: &RenderOptions,
+    cache: &'a LineCache,
+    width: u16,
+    anim_frame: u64,
+) -> Block<'a> {
+    match plan {
+        CellPlan::Cached(key) => match cache.peek(*key) {
+            Some(lines) => Block::Cached(lines),
+            // Phase one inserted it, so a miss cannot happen — render anyway
+            // rather than panic if the invariant is ever broken.
+            None => Block::Owned(render_cell(
+                &cell.kind,
+                cell.stats.as_deref(),
+                width,
+                opts,
+                anim_frame,
+                expanded,
+            )),
+        },
+        CellPlan::LiveAssistant => {
+            if let CellKind::Item(TranscriptKind::Assistant { text, .. }) = &cell.kind {
+                let (stable, tail) = split_stable_tail(text);
+                let stable_key = CacheKey {
+                    cell: (cell.id << 1) ^ (stable.len() as u64) ^ 0x8000_0000_0000_0000,
+                    width,
+                };
+
+                let mut combined = match cache.peek(stable_key) {
+                    Some(lines) => lines.to_vec(),
+                    None => render_markdown(stable, opts),
+                };
+                let mut tail_lines = render_markdown(tail, opts);
+                combined.append(&mut tail_lines);
+                if let Some(stats) = cell.stats.as_deref() {
+                    combined.push(Line::from(Span::styled(
+                        stats.to_string(),
+                        opts.theme.faint,
+                    )));
+                }
+                combined.push(Line::default());
+                return Block::Owned(combined);
+            }
+            // A live non-assistant cell is planned Cached, so this is
+            // unreachable — still render rather than panic.
+            Block::Owned(render_cell(
+                &cell.kind,
+                cell.stats.as_deref(),
+                width,
+                opts,
+                anim_frame,
+                expanded,
+            ))
+        }
+        CellPlan::Fresh => Block::Owned(render_cell(
+            &cell.kind,
+            cell.stats.as_deref(),
+            width,
+            opts,
+            anim_frame,
+            expanded,
+        )),
+    }
 }
 
 /// The transcript as plain text, one entry per rendered line, in the same order
@@ -141,110 +384,36 @@ pub(crate) fn plain_lines(
     anim_frame: u64,
     welcome_ms: u64,
 ) -> Vec<String> {
-    let live_id = transcript.live_cell;
-    build_cell_lines(transcript, live_id, width, opts, anim_frame, welcome_ms)
-        .into_iter()
-        .flatten()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect()
-}
-
-struct CellRenderArgs<'a> {
-    cell_id: u64,
-    cell_version: u32,
-    cell_kind: &'a CellKind,
-    cell_stats: Option<&'a str>,
-    is_live: bool,
-    width: u16,
-    anim_frame: u64,
-}
-
-fn get_or_render_cell(
-    args: CellRenderArgs<'_>,
-    opts: &RenderOptions,
-    expanded_set: &std::collections::HashSet<u64>,
-    cache: &mut pacode_render::LineCache,
-) -> Vec<Line<'static>> {
-    // An expanded cell renders differently, so it is a different cache entry
-    // rather than a stale one.
-    let expanded = expanded_set.contains(&args.cell_id);
-    let expansion_bit = if expanded { 0x4000_0000_0000_0000 } else { 0 };
-    let key = CacheKey {
-        cell: args.cell_id ^ ((args.cell_version as u64) << 48) ^ expansion_bit,
-        width: args.width,
-    };
-
-    let is_running_tool = matches!(
-        args.cell_kind,
-        CellKind::Item(TranscriptKind::ToolCall {
-            status: ToolStatus::Running,
-            ..
-        })
-    );
-
-    if !args.is_live && !is_running_tool {
-        if let Some(cached) = cache.get(key) {
-            return cached.to_vec();
-        }
-        let rendered = render_cell(
-            args.cell_kind,
-            args.cell_stats,
-            args.width,
-            opts,
-            args.anim_frame,
-            expanded,
-        );
-        let cached = cache.insert(key, rendered);
-        return cached.to_vec();
-    }
-
-    if let CellKind::Item(TranscriptKind::Assistant { text, .. }) = args.cell_kind {
-        let (stable, tail) = split_stable_tail(text);
-        let stable_key = CacheKey {
-            cell: (args.cell_id << 1) ^ (stable.len() as u64) ^ 0x8000_0000_0000_0000,
-            width: args.width,
-        };
-
-        let stable_lines = if let Some(cached) = cache.get(stable_key) {
-            cached.to_vec()
-        } else {
-            let rendered = render_markdown(stable, opts);
-            let cached = cache.insert(stable_key, rendered);
-            cached.to_vec()
-        };
-
-        let mut tail_lines = render_markdown(tail, opts);
-        let mut combined = stable_lines;
-        combined.append(&mut tail_lines);
-        if let Some(stats) = args.cell_stats {
-            combined.push(Line::from(Span::styled(
-                stats.to_string(),
-                opts.theme.faint,
-            )));
-        }
-        combined.push(Line::default());
-        return combined;
-    }
-
-    let rendered = render_cell(
-        args.cell_kind,
-        args.cell_stats,
-        args.width,
-        opts,
-        args.anim_frame,
+    let Transcript {
+        cells,
         expanded,
-    );
-    if !is_running_tool {
-        let cached = cache.insert(key, rendered);
-        cached.to_vec()
-    } else {
-        rendered
-    }
+        cache,
+        header,
+        live_cell,
+        ..
+    } = &mut *transcript;
+    build_cell_lines(
+        CellsSource {
+            cells,
+            expanded,
+            header: header.as_ref(),
+            live_id: *live_cell,
+            width,
+            anim_frame,
+            welcome_ms,
+        },
+        cache,
+        opts,
+    )
+    .iter()
+    .flat_map(|block| block.lines())
+    .map(|line| {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    })
+    .collect()
 }
 
 /// Test-only entry point: render one cell exactly as the transcript would.

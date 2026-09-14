@@ -227,6 +227,11 @@ pub const OVERLAY_GROW_MS: u64 = 140;
 pub const WELCOME_ANIM_MS: u64 = 400;
 /// AGENTS ⇄ SESSION switch debounce (spec §5).
 pub const IDLE_DEBOUNCE_MS: u64 = 2000;
+/// Animation frames in one blink of [`AppState::pulse_lit`], lit for half of
+/// them. Tuned for the default `tick_ms` of 66 ms, which puts the blink at
+/// ~1 s — the same beat as the `second_parity` fallback, so a pulse does not
+/// change speed when the animation clock takes over from the 1 s tick.
+pub const PULSE_FRAMES: u64 = 16;
 
 /// A selection copy the draw path prepared for the event loop. `clipboard::copy`
 /// writes OSC 52 to stdout and may touch `arboard` — that IO must not run inside
@@ -309,6 +314,9 @@ pub struct AppState {
     pub plugins: Vec<PluginInfo>,
     /// Set by any mutation; cleared after a frame is drawn.
     pub dirty: bool,
+    /// Set by the animation tick; cleared after a frame is drawn. Paced by
+    /// the animation clock (`ui.animation`), not the content clock (`ui.ups`).
+    pub dirty_anim: bool,
     /// Terminal size as last seen.
     pub cols: u16,
     pub rows: u16,
@@ -321,7 +329,8 @@ pub struct AppState {
     pub quit: bool,
     /// When the main agent turn started (for calculating thinking duration and animations).
     pub turn_started_at: Option<Instant>,
-    /// Frame counter for activity animations and spinners (8 fps).
+    /// Frame counter for activity animations and spinners; advanced by the
+    /// animation tick (paced by `ui.animation`, `tick_ms`/`fast_tick_ms`).
     pub anim_frame: u64,
     /// Mascot shown in the header banner; random per run, fixed for the session.
     pub mascot: crate::ui::mascot::MascotKind,
@@ -473,6 +482,7 @@ impl AppState {
             cache: crate::cache::DiskCache::default(),
             session_start_ms: now_ms(),
             dirty: true,
+            dirty_anim: false,
             cols,
             rows,
             selection: Selection::default(),
@@ -811,7 +821,7 @@ impl AppState {
     /// existing timers already advance — it never arms a timer of its own.
     pub fn pulse_lit(&self, now: Instant) -> bool {
         if self.turn_active || self.transcript.has_backlog() || self.needs_anim_tick(now) {
-            self.anim_frame % 4 < 2
+            self.anim_frame % PULSE_FRAMES < PULSE_FRAMES / 2
         } else {
             self.second_parity
         }

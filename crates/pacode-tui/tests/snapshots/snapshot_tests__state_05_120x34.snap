@@ -30,7 +30,7 @@ expression: view
 "                                                                                       │                                "
 "                                                                                       │BACKGROUND           1 ◍ 2 ✓ 1 ✗"
 "                                                                                       │✓ cargo build --release 3m02s   "
-"[  C • • • • • • • • • ] thinking.                                                  0s │✗ npm run lint 3 err            "
+"[C • • • • • • • • • • ] thinking.                                                  0s │✗ npm run lint 3 err            "
 "────────────────────────────────────────────────────────────────────────────────────── │✓ tsc --noEmit 12s              "
 "❯                                                                                      │◍ cargo test --all 214/380      "
 "────────────────────────────────────────────────────────────────────────────────────── │       ~/zed/pacode:master      "

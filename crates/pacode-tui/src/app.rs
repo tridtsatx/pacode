@@ -3,12 +3,17 @@
 //! One `tokio::select!` over: client events (`ClientEvent`), terminal events
 //! (`crossterm::event::EventStream`), the stream tick (paced by `config.ui.ups`,
 //! only while `state.needs_stream_tick()`), the second tick (1 s, only while
-//! `state.needs_second_tick()`), the animation tick (the pacman interval while
-//! the turn runs; 125 ms for ambient pulses; 70 ms while a transient animation —
-//! toast slide/fade, overlay unfold, welcome cascade — is on screen), and toast
-//! expiry (armed only while toasts exist).
-//! A frame is drawn when `state.dirty` and the frame interval has passed since the
-//! last frame (otherwise a deferred draw is scheduled). Nothing ticks in the idle state.
+//! `state.needs_second_tick()`), the animation tick (a phase-stable
+//! `tokio::time::Interval` clocked by `config.ui.animation`: `tick_ms` while
+//! the turn/spinner runs, `fast_tick_ms` while a transient animation — toast
+//! slide/fade, overlay unfold, welcome cascade — is on screen; armed only
+//! while something animates), and toast expiry (armed only while toasts exist).
+//!
+//! Two clocks pace two dirty flags: content sets `state.dirty` and is gated by
+//! `frame_interval` (`ui.ups`); the animation tick sets `state.dirty_anim` and
+//! is gated by the current animation period. Either flag with its gate elapsed
+//! draws a frame that clears both (otherwise a deferred draw is scheduled for
+//! the earliest pending gate). Nothing ticks in the idle state.
 //!
 //! Startup: connect (spawning the daemon), attach, apply the snapshot, send
 //! `initial_prompt` if any, then loop. On `quit`: leave the alt screen and close the
@@ -269,6 +274,13 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     crate::timing::mark(timing, "refresh_hz_spawn", t_probe);
 
     let mut last_draw = Instant::now() - frame_interval.unwrap_or(Duration::from_millis(33));
+    // Baseline of the animation clock's draw gate, tracked separately so a
+    // content-gated frame does not displace the animation phase.
+    let mut last_anim_draw = last_draw;
+    // The animation clock. `Some` exactly while `anim_active` holds; re-created
+    // only when the wanted period changes, so stream events can never reset the
+    // timer's phase mid-cycle (the jitter the old per-iteration sleep caused).
+    let mut anim_tick: Option<tokio::time::Interval> = None;
     // The refresh rate the auto-probe reported — `None` until it lands
     // (`frame_budget` then budgets for the 60 Hz floor).
     let mut detected_hz: Option<u16> = None;
@@ -299,18 +311,41 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         // only and the displayed duration never depends on when a redraw happened.
         state.tick_phase(Instant::now());
 
-        // Redraw if dirty and frame interval elapsed
+        // Redraw on two independent clocks: content (`state.dirty`) is gated by
+        // `frame_interval` (`ui.ups`); animation (`state.dirty_anim`) is gated
+        // by the current animation period. Either flag with its gate elapsed
+        // draws a frame that flushes both, so a pending anim frame can ride a
+        // content draw and never stalls waiting on the slower clock.
         let now = Instant::now();
-        let can_draw = match frame_interval {
+        let anim_mode = state.config.ui.animation;
+        let anim_ms = if state.fast_anim_active(now) {
+            anim_mode.fast_tick_ms()
+        } else {
+            anim_mode.tick_ms()
+        };
+        let content_gate_open = match frame_interval {
             Some(interval) => now.saturating_duration_since(last_draw) >= interval,
             None => true,
         };
-        if state.dirty && can_draw {
+        let anim_gate_open =
+            now.saturating_duration_since(last_anim_draw) >= Duration::from_millis(anim_ms);
+        if (state.dirty && content_gate_open) || (state.dirty_anim && anim_gate_open) {
+            let flushed_anim = state.dirty_anim;
             let t_frame = Instant::now();
-            term_guard.terminal.draw(|f| {
-                last_layout = ui::draw(f, &mut state);
-                crate::font::apply_weight_to_frame(f, &state.config.font);
-            })?;
+            // DEC 2026 synchronized output: the terminal buffers the frame and
+            // presents it whole instead of painting a half-drawn one. The
+            // `CompletedFrame` borrow is dropped before `end_sync` so the sync
+            // region still closes when `draw` errored.
+            term_guard.begin_sync();
+            let draw_res = term_guard
+                .terminal
+                .draw(|f| {
+                    last_layout = ui::draw(f, &mut state);
+                    crate::font::apply_weight_to_frame(f, &state.config.font);
+                })
+                .map(|_| ());
+            term_guard.end_sync();
+            draw_res?;
             // §8.3: warn when a frame ran over its refresh budget.
             crate::timing::warn_frame_over_budget(
                 timing,
@@ -318,7 +353,11 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                 crate::timing::frame_budget(detected_hz),
             );
             state.dirty = false;
+            state.dirty_anim = false;
             last_draw = Instant::now();
+            if flushed_anim {
+                last_anim_draw = last_draw;
+            }
 
             // Input image-strip escapes stashed by `ui::images::draw` —
             // emitted only on change.
@@ -372,29 +411,46 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
         };
 
+        // The animation clock: a phase-stable `Interval`, armed exactly while
+        // something animates — the same set of conditions that armed the old
+        // `anim_sleep`. Its cadence comes from `ui.animation` alone and never
+        // looks at the stream backlog: a growing backlog must not speed the
+        // spinner up.
+        let now = Instant::now();
+        let anim_mode = state.config.ui.animation;
+        let anim_active = state.turn_active
+            || state.transcript.has_backlog()
+            || state.needs_anim_tick(now)
+            || state.toast_needs_anim(now)
+            || state.fast_anim_active(now);
+        let anim_ms = if state.fast_anim_active(now) {
+            anim_mode.fast_tick_ms()
+        } else {
+            anim_mode.tick_ms()
+        };
+        if anim_active {
+            // A period change (a transient animation starting or ending, or
+            // `ui.animation` edited live) is the only reason to re-create the
+            // interval — re-arming per event would reset the phase and jitter.
+            if anim_tick.as_ref().map(tokio::time::Interval::period)
+                != Some(Duration::from_millis(anim_ms))
+            {
+                let mut iv = tokio::time::interval(Duration::from_millis(anim_ms));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                anim_tick = Some(iv);
+            }
+        } else {
+            // Nothing animates: drop the interval so no timer is armed at rest.
+            anim_tick = None;
+        }
         let anim_sleep = async {
-            // Every arm of this sleep is a visible animation; while nothing
-            // animates, the future stays pending and no timer runs.
-            let now = Instant::now();
-            let fast = state.fast_anim_active(now);
-            if state.turn_active || state.transcript.has_backlog() {
-                let mut interval_ms = crate::ui::anim::pacman_interval_ms(
-                    state.transcript.stream_backlog_chars(),
-                    state.transcript.has_pending_final(),
-                );
-                if fast {
-                    interval_ms = interval_ms.min(crate::ui::anim::TRANSIENT_TICK_MS);
+            match anim_tick.as_mut() {
+                // `Interval::tick` is cancel-safe: the select! can drop this
+                // future for any other branch without losing the tick phase.
+                Some(iv) => {
+                    iv.tick().await;
                 }
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            } else if state.needs_anim_tick(now) || state.toast_needs_anim(now) {
-                let interval_ms = if fast {
-                    crate::ui::anim::TRANSIENT_TICK_MS
-                } else {
-                    125
-                };
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            } else {
-                std::future::pending::<()>().await;
+                None => std::future::pending::<()>().await,
             }
         };
 
@@ -421,17 +477,28 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
         };
 
+        // A pending frame wakes the loop the moment its own gate opens: the
+        // content gate for `state.dirty`, the animation gate for
+        // `state.dirty_anim`. The earliest of the two arms the sleep, so an
+        // animation frame is never stalled waiting on the content clock.
+        let content_wait = if state.dirty {
+            frame_interval.map(|interval| {
+                let elapsed = Instant::now().saturating_duration_since(last_draw);
+                interval.saturating_sub(elapsed)
+            })
+        } else {
+            None
+        };
+        let anim_wait = if state.dirty_anim {
+            let elapsed = Instant::now().saturating_duration_since(last_anim_draw);
+            Some(Duration::from_millis(anim_ms).saturating_sub(elapsed))
+        } else {
+            None
+        };
         let deferred_draw_sleep = async {
-            if state.dirty {
-                if let Some(interval) = frame_interval {
-                    let elapsed = Instant::now().saturating_duration_since(last_draw);
-                    let remaining = interval.saturating_sub(elapsed);
-                    tokio::time::sleep(remaining).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } else {
-                std::future::pending::<()>().await;
+            match content_wait.into_iter().chain(anim_wait).min() {
+                Some(remaining) => tokio::time::sleep(remaining).await,
+                None => std::future::pending::<()>().await,
             }
         };
 
@@ -516,7 +583,7 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
             _ = anim_sleep => {
                 state.anim_frame = state.anim_frame.wrapping_add(1);
-                state.dirty = true;
+                state.dirty_anim = true;
             }
             _ = ctrl_c_expiry_sleep => {
                 state.ctrl_c_at = None;

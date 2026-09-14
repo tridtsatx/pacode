@@ -1,6 +1,8 @@
 //! Terminal setup/teardown: raw mode, alt screen, bracketed paste, mouse capture
 //! (`ui.mouse`), keyboard enhancement flags when supported (so `shift+enter` and
-//! `alt+arrows` arrive), a panic hook that restores the terminal.
+//! `alt+arrows` arrive), a panic hook that restores the terminal. Frames are
+//! bracketed in DEC 2026 synchronized output (`begin_sync`/`end_sync`) so the
+//! terminal presents a finished frame instead of a half-painted one.
 
 use std::io::{Stdout, Write};
 
@@ -17,6 +19,17 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+
+/// DEC 2026 synchronized-output begin: the terminal buffers output and
+/// presents it atomically when the matching end arrives (the Devin CLI emits
+/// the same pair, which is why its frames never tear). Terminals that do not
+/// implement the mode ignore the private sequence, so no probe is needed.
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+
+/// DEC 2026 synchronized-output end. Written defensively on every teardown
+/// path — dying between begin and end would otherwise leave the terminal
+/// frozen in synchronized mode with later output never presented.
+const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 pub struct TerminalGuard {
     pub terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -69,6 +82,26 @@ impl TerminalGuard {
         self.mouse
     }
 
+    /// Open a DEC 2026 synchronized update around the next `terminal.draw`.
+    /// Best effort: write errors are ignored exactly like `clear_image_area`
+    /// treats its escape — the worst outcome is a torn frame, not a panic.
+    /// Written through `std::io::stdout()` — the same shared handle the
+    /// crossterm backend writes frames to — so the ordering against the
+    /// backend's own buffered output is deterministic.
+    pub fn begin_sync(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(SYNC_BEGIN);
+        let _ = stdout.flush();
+    }
+
+    /// Close the synchronized update opened by [`Self::begin_sync`], then
+    /// flush so the frame and the end marker go out together.
+    pub fn end_sync(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(SYNC_END);
+        let _ = stdout.flush();
+    }
+
     /// Apply font configuration using the terminal backend writer.
     pub fn apply_font(&mut self, cfg: &pacode_types::FontConfig) -> crate::font::FontOutcome {
         let control = crate::font::detect();
@@ -108,6 +141,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = std::io::stdout();
+        // SYNC_END first: if drop raced an open synchronized update, later
+        // teardown output must not stay buffered in the frozen mode.
+        let _ = stdout.write_all(SYNC_END);
         let _ = stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\");
         let _ = stdout.flush();
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
@@ -123,6 +159,9 @@ impl Drop for TerminalGuard {
 /// Restore the terminal from a panic hook (best effort, never panics).
 pub fn restore_on_panic() {
     let mut stdout = std::io::stdout();
+    // SYNC_END first: a panic between begin_sync and end_sync must not leave
+    // the terminal frozen in synchronized mode.
+    let _ = stdout.write_all(SYNC_END);
     let _ = stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\");
     let _ = stdout.flush();
     let _ = execute!(stdout, PopKeyboardEnhancementFlags);
@@ -134,6 +173,9 @@ pub fn restore_on_panic() {
 /// Suspend the TUI: leave alternate screen and raw mode so child processes (e.g. editor) can run.
 pub fn suspend(mouse: bool) -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
+    // SYNC_END first: suspend may run while a synchronized update is open,
+    // and the child's output must reach the screen.
+    let _ = stdout.write_all(SYNC_END);
     let _ = stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\");
     let _ = stdout.flush();
     let _ = execute!(stdout, PopKeyboardEnhancementFlags);

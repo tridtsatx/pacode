@@ -21,6 +21,11 @@ const STAGE_3_MS: u64 = 30_000;
 /// Thinking reaches full yellow at this age.
 const GRADIENT_FULL_MS: u64 = 60_000;
 
+/// Animation frames per trailing-dot step, tuned for the 66 ms animation
+/// tick: `thinking.` → `thinking..` → `thinking...` lands every ~460 ms,
+/// which reads as a calm progress marker instead of a 15 fps strobe.
+pub const DOT_DIVIDER: u64 = 7;
+
 /// What the session is doing. The activity line renders exactly one of these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -72,11 +77,11 @@ impl Phase {
 }
 
 /// Trailing dots for an in-progress label: `".  "`, `".. "`, `"..."` picked
-/// by `frame % 3` — always 3 display cells wide so everything to the right
-/// of the label stays put between frames (§9.2). `…` is never used in the
-/// animation: it is one cell wide and would shrink the suffix.
+/// by `(frame / DOT_DIVIDER) % 3` — always 3 display cells wide so everything
+/// to the right of the label stays put between frames (§9.2). `…` is never
+/// used in the animation: it is one cell wide and would shrink the suffix.
 pub fn trailing_dots(frame: u64, _glyphs: &Glyphs) -> &'static str {
-    match frame % 3 {
+    match (frame / DOT_DIVIDER) % 3 {
         0 => ".  ",
         1 => ".. ",
         _ => "...",

@@ -256,6 +256,43 @@ fn test_validation_ups() {
 }
 
 #[test]
+fn test_ui_animation_round_trip() {
+    let mut cfg = Config::default();
+    assert_eq!(read_value(&cfg, "ui.animation"), Some("smooth".to_string()));
+
+    let entry = find_entry("ui.animation").unwrap();
+    assert_eq!(entry.default_value, "smooth");
+    // An enum, not free text: the three presets are the whole range, so the
+    // settings menu offers them instead of asking the reader to type one.
+    assert_eq!(
+        entry.kind,
+        SettingKind::Enum {
+            options: &["smooth", "balanced", "eco"]
+        }
+    );
+    assert_eq!(entry.apply, ApplyMode::Immediate);
+
+    let parsed = validate_candidate(entry, "eco").unwrap();
+    assert_eq!(parsed, toml::Value::String("eco".to_string()));
+    assert!(validate_candidate(entry, "turbo").is_err());
+
+    apply_to_config(&mut cfg, "ui.animation", &parsed);
+    assert_eq!(cfg.ui.animation, pacode_types::AnimationMode::Eco);
+    assert_eq!(read_value(&cfg, "ui.animation"), Some("eco".to_string()));
+
+    apply_to_config(
+        &mut cfg,
+        "ui.animation",
+        &toml::Value::String("balanced".to_string()),
+    );
+    assert_eq!(cfg.ui.animation, pacode_types::AnimationMode::Balanced);
+
+    reset_in_config(&mut cfg, "ui.animation");
+    assert_eq!(cfg.ui.animation, pacode_types::AnimationMode::Smooth);
+    assert_eq!(read_value(&cfg, "ui.animation"), Some("smooth".to_string()));
+}
+
+#[test]
 fn test_action_setting_not_directly_editable() {
     let keys_entry = find_entry("keys").unwrap();
     let err = validate_candidate(keys_entry, "ctrl+c").unwrap_err();
