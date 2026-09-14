@@ -16,7 +16,7 @@ expression: view
 "▣ Read · crates/pacode-tui/src/layout.rs · 120ms           ✓"
 "│ pub fn compute(area: Rect) -> ScreenLayout...             "
 "                                                            "
-"[  C • • • • • • • • • ] thinking.                        0s"
+"[C • • • • • • • • • • ] thinking.                        0s"
 "────────────────────────────────────────────────────────────"
 "❯                                                           "
 "────────────────────────────────────────────────────────────"

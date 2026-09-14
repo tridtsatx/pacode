@@ -2,7 +2,7 @@
 //!
 //! While `turn_active` (main agent thinking or running a tool), an animated status
 //! line is rendered as the last line of the dialog area:
-//! `C` moving right over candies, alternating `C`/`c` each frame.
+//! `C` walking right over a fixed candy track, chomping `C`/`c` as it goes.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,10 +13,15 @@ use pacode_render::{Glyphs, RenderOptions, Theme, display_width, truncate_to_wid
 /// Display width of the activity bar, including its brackets.
 const PACMAN_WIDTH: usize = 24;
 
-/// Tick interval for short-lived animations (toast slide/fade, overlay
-/// unfold, welcome cascade): ~14 fps is smooth enough for a sub-200 ms move
-/// and still bounded — the tick stops as soon as the window closes.
-pub const TRANSIENT_TICK_MS: u64 = 70;
+/// Frames between pacman's steps, tuned for the 66 ms animation tick: one
+/// cell every ~132 ms ≈ 7.6 cells/s, so he crosses the 22-cell inner track
+/// in ~2.9 s — a walk, not the old two-cell teleport.
+const PACMAN_MOVE_DIVIDER: u64 = 2;
+
+/// Frames between mouth states, tuned for the 66 ms animation tick: the
+/// `C`/`c` toggle lands every ~200 ms, so he visibly chomps (~5 Hz) instead
+/// of flickering on every redraw.
+const PACMAN_MOUTH_DIVIDER: u64 = 3;
 
 /// The dim half of a two-state pulse: `base` halfway to `faint` when both ends
 /// are RGB, else `base` with the terminal's DIM modifier. Two states are
@@ -56,13 +61,20 @@ pub fn candy_enabled(value: Option<&str>) -> bool {
     }
 }
 
-/// A plain bar of the same width, for when the candy is switched off.
+/// The env lookup runs once per process: reading `std::env` on every drawn
+/// frame showed up on the hot path, and a toggle mid-session was never a
+/// feature anyone asked for.
+static CANDY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// A plain bar of the same width, for when the candy is switched off. It
+/// fills on the pacman's own step divider, so the quiet bar walks at the
+/// same speed as the candy one.
 fn plain_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
     if width < 3 {
         return "#".chars().take(width).collect();
     }
     let inner = width - 2;
-    let filled = ((frame as usize) % (inner + 1)).min(inner);
+    let filled = ((frame / PACMAN_MOVE_DIVIDER) as usize) % (inner + 1);
     let full = if glyphs.ascii { '#' } else { '█' };
     let empty = if glyphs.ascii { '-' } else { '░' };
     let mut out = String::with_capacity(width);
@@ -76,7 +88,10 @@ fn plain_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
 
 /// Pure function generating the pacman progress bar frame.
 ///
-/// Format: `[  C • • • • ]` -> `[    c • • • ]`.
+/// Format: `[C • • • • • ]` -> `[  c • • • • ]`. The candies sit on fixed
+/// cells (every other inner cell) and never shift — pacman eats them as he
+/// walks through, leaving a blank trail. The wrap from the last cell back
+/// to the first is one more step on the loop, with the candy track restored.
 /// Width is the total display width including `[` and `]`.
 pub fn pacman_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
     if width < 3 {
@@ -84,53 +99,32 @@ pub fn pacman_frame(frame: u64, width: usize, glyphs: &Glyphs) -> String {
     }
 
     let inner_w = width - 2;
-    let candy_str = if glyphs.ascii { "o" } else { "•" };
-    let mouth = if frame.is_multiple_of(2) { 'C' } else { 'c' };
-
-    // Pacman advances by 2 cells per step (eating one candy slot: "  " or "    ").
-    // Step 0: 2 spaces, then C, then candies.
-    // Step 1: 4 spaces, then c, then candies.
-    let num_steps = inner_w / 2;
-    let step = if num_steps > 0 {
-        (frame as usize) % num_steps
+    let candy = if glyphs.ascii { 'o' } else { '•' };
+    let mouth = if (frame / PACMAN_MOUTH_DIVIDER).is_multiple_of(2) {
+        'C'
     } else {
-        0
+        'c'
     };
 
-    let spaces_count = 2 * step + 1;
+    // One cell per step — the two-cell hop teleported him past the gaps.
+    let pos = ((frame / PACMAN_MOVE_DIVIDER) as usize) % inner_w;
+
     let mut out = String::with_capacity(width + 8);
     out.push('[');
-
-    // Behind pacman: eaten cells are spaces, then pacman mouth if space permits
-    if spaces_count + 1 < inner_w {
-        for _ in 0..spaces_count {
-            out.push(' ');
-        }
-        out.push(' ');
-        out.push(mouth);
-    } else {
-        // Near the end: fill with spaces and place pacman
-        let spaces = (inner_w.saturating_sub(1)).min(spaces_count);
-        for _ in 0..spaces {
-            out.push(' ');
-        }
-        if out.len() < width - 1 {
+    for i in 0..inner_w {
+        if i == pos {
             out.push(mouth);
+        } else if i < pos {
+            // Behind him: the candy that stood here is eaten.
+            out.push(' ');
+        } else if i.is_multiple_of(2) {
+            // Ahead of him: candies live on fixed cells, so the track never
+            // slides under his feet.
+            out.push(candy);
+        } else {
+            out.push(' ');
         }
     }
-
-    // Ahead of pacman: alternating spaces and candies until inner_w is filled
-    let mut cur_len = out.chars().count() - 1; // excluding '['
-    while cur_len + 2 <= inner_w {
-        out.push(' ');
-        out.push_str(candy_str);
-        cur_len += 2;
-    }
-    while cur_len < inner_w {
-        out.push(' ');
-        cur_len += 1;
-    }
-
     out.push(']');
     out
 }
@@ -185,14 +179,15 @@ pub fn render_activity_line(
         ));
     }
 
-    let mut spans = if candy_enabled(std::env::var(CANDY_VAR).ok().as_deref()) {
-        pacman_spans(frame, PACMAN_WIDTH, opts)
-    } else {
-        vec![Span::styled(
-            plain_frame(frame, PACMAN_WIDTH, &opts.glyphs),
-            opts.theme.dim,
-        )]
-    };
+    let mut spans =
+        if *CANDY.get_or_init(|| candy_enabled(std::env::var(CANDY_VAR).ok().as_deref())) {
+            pacman_spans(frame, PACMAN_WIDTH, opts)
+        } else {
+            vec![Span::styled(
+                plain_frame(frame, PACMAN_WIDTH, &opts.glyphs),
+                opts.theme.dim,
+            )]
+        };
     let avail = max_line_width.saturating_sub(PACMAN_WIDTH);
     spans.push(Span::styled(
         spread_tail(" ", &label, &dur_str, avail),
@@ -230,20 +225,6 @@ fn pacman_spans(frame: u64, width: usize, opts: &RenderOptions) -> Vec<Span<'sta
     spans
 }
 
-/// Dynamic animation frame interval based on stream backlog and draining phase.
-///
-/// - Idle thinking: 240 ms / frame.
-/// - Once stream arrives: clamp(240 - backlog_chars / 8, 60, 240) ms.
-/// - When draining final item: 60 ms.
-pub fn pacman_interval_ms(backlog_chars: usize, draining: bool) -> u64 {
-    if draining {
-        60
-    } else {
-        let reduction = (backlog_chars / 8) as u64;
-        240u64.saturating_sub(reduction).clamp(60, 240)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,42 +259,34 @@ mod tests {
     }
 
     #[test]
-    fn test_pacman_interval_ms() {
-        // Draining is always 60 ms
-        assert_eq!(pacman_interval_ms(0, true), 60);
-        assert_eq!(pacman_interval_ms(500, true), 60);
-        assert_eq!(pacman_interval_ms(5000, true), 60);
-
-        // Not draining: clamp(240 - backlog/8, 60, 240)
-        assert_eq!(pacman_interval_ms(0, false), 240);
-        assert_eq!(pacman_interval_ms(80, false), 230);
-        assert_eq!(pacman_interval_ms(800, false), 140);
-        assert_eq!(pacman_interval_ms(1440, false), 60);
-        assert_eq!(pacman_interval_ms(2000, false), 60);
-        assert_eq!(pacman_interval_ms(usize::MAX, false), 60);
-    }
-
-    #[test]
     fn test_pacman_frame_ascii() {
         let glyphs = Glyphs::new(true);
+        // Step 0 (frames 0..2): pacman on cell 0, mouth still wide —
+        // PACMAN_MOUTH_DIVIDER is 3, so the first `c` appears at frame 3.
         let f0 = pacman_frame(0, 14, &glyphs);
-        assert_eq!(f0, "[  C o o o o ]");
+        assert_eq!(f0, "[C o o o o o ]");
 
-        let f1 = pacman_frame(1, 14, &glyphs);
-        assert_eq!(f1, "[    c o o o ]");
-
+        // Step 1 (frames 2..4): one cell right, mouth to the candy at cell 2.
         let f2 = pacman_frame(2, 14, &glyphs);
-        assert_eq!(f2, "[      C o o ]");
+        assert_eq!(f2, "[ Co o o o o ]");
+
+        // Same cell, but the mouth divider has flipped to the `c` half.
+        let f3 = pacman_frame(3, 14, &glyphs);
+        assert_eq!(f3, "[ co o o o o ]");
+
+        // Step 2 (frames 4..6): one more cell, the candy at cell 2 eaten.
+        let f4 = pacman_frame(4, 14, &glyphs);
+        assert_eq!(f4, "[  c o o o o ]");
     }
 
     #[test]
     fn test_pacman_frame_unicode() {
         let glyphs = Glyphs::new(false);
         let f0 = pacman_frame(0, 14, &glyphs);
-        assert_eq!(f0, "[  C • • • • ]");
+        assert_eq!(f0, "[C • • • • • ]");
 
-        let f1 = pacman_frame(1, 14, &glyphs);
-        assert_eq!(f1, "[    c • • • ]");
+        let f3 = pacman_frame(3, 14, &glyphs);
+        assert_eq!(f3, "[ c• • • • • ]");
     }
 
     #[test]
@@ -330,6 +303,32 @@ mod tests {
     }
 
     #[test]
+    fn pacman_never_jumps_more_than_one_cell() {
+        // The track is a loop: position is a cell index into `inner`, so a
+        // step is `(next - prev) mod inner` — the wrap from the last cell to
+        // the first measures as +1, not as a cross-screen teleport.
+        for ascii in [true, false] {
+            let glyphs = Glyphs::new(ascii);
+            let inner = PACMAN_WIDTH - 2;
+            let pos = |frame: u64| {
+                pacman_frame(frame, PACMAN_WIDTH, &glyphs)
+                    .chars()
+                    .position(|ch| ch == 'C' || ch == 'c')
+                    .expect("pacman is always on the track")
+                    - 1
+            };
+            let mut prev = pos(0);
+            // Two full position loops, so the wrap is exercised both ways.
+            for frame in 1..(2 * PACMAN_MOVE_DIVIDER * inner as u64) {
+                let cur = pos(frame);
+                let step = (cur + inner - prev) % inner;
+                assert!(step <= 1, "frame {frame}: jumped {step} cells");
+                prev = cur;
+            }
+        }
+    }
+
+    #[test]
     fn thinking_dots_advance_on_the_activity_line() {
         let opts = RenderOptions::new(80, false);
         let phase = Phase::Thinking;
@@ -340,10 +339,15 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect::<String>()
         };
+        // The dots step once per DOT_DIVIDER frames — at the 66 ms tick a
+        // dot lands every ~0.5 s instead of strobing per frame.
+        let d = crate::state::activity::DOT_DIVIDER;
         assert!(text(0).contains("thinking.  "), "{}", text(0));
-        assert!(text(1).contains("thinking.. "), "{}", text(1));
-        assert!(text(2).contains("thinking..."), "{}", text(2));
-        assert!(text(3).contains("thinking.  "), "{}", text(3));
+        assert!(text(d).contains("thinking.. "), "{}", text(d));
+        assert!(text(2 * d).contains("thinking..."), "{}", text(2 * d));
+        assert!(text(3 * d).contains("thinking.  "), "{}", text(3 * d));
+        // And it holds still between steps — that is the point of dividing.
+        assert!(text(1).contains("thinking.  "), "{}", text(1));
     }
 
     #[test]

@@ -220,3 +220,34 @@ fn non_error_notices_stay_plain_but_wrap() {
     assert!(lines.len() > 1, "{joined}");
     assert!(!joined.contains('✗'), "{joined}");
 }
+
+#[test]
+fn a_second_render_at_the_same_width_is_served_from_the_cache() {
+    let opts = pacode_render::RenderOptions::new(80, false);
+    let mut t = Transcript::new(16);
+    for id in 0..4 {
+        t.cells.push_back(Cell {
+            id,
+            kind: CellKind::Item(TranscriptKind::User {
+                text: format!("message {id}"),
+            }),
+            version: 0,
+            ts_ms: id,
+            stats: None,
+        });
+    }
+
+    let first = super::plain_lines(&mut t, 80, &opts, 0, 0);
+    let cached_after_first = t.cache.total_lines();
+    assert!(cached_after_first > 0, "the first render fills the cache");
+
+    // A fresh anim frame (a spinner tick) must not re-render anything: the
+    // cache contents are byte-identical and nothing new lands in it.
+    let second = super::plain_lines(&mut t, 80, &opts, 7, 0);
+    assert_eq!(first, second, "a cached render is identical");
+    assert_eq!(
+        t.cache.total_lines(),
+        cached_after_first,
+        "the second render found every cell in the cache"
+    );
+}

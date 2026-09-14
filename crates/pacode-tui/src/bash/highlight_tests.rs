@@ -132,3 +132,53 @@ fn test_tokenize_redirections() {
     let reconstructed: String = spans.iter().map(|s| s.text).collect();
     assert_eq!(reconstructed, input);
 }
+
+/// Every input must be reconstructible byte-for-byte from non-empty spans. An
+/// empty span means the scanner stood still on that byte — the shape that made
+/// `$(` spin the tokenizer until it exhausted RAM.
+fn assert_progress(input: &str) {
+    let spans = tokenize(input);
+    assert!(
+        spans.iter().all(|s| !s.text.is_empty()),
+        "empty span in {input:?}: {spans:?}"
+    );
+    let reconstructed: String = spans.iter().map(|s| s.text).collect();
+    assert_eq!(reconstructed, input);
+}
+
+#[test]
+fn test_tokenize_command_substitution_terminates() {
+    // The real transcript line that grew the span vector past 3 GiB on redraw.
+    assert_progress(
+        "GIT_DIR=$(cd \"$(git rev-parse --git-dir)\" 2>/dev/null && pwd -P); \
+         echo \"GIT_DIR=$GIT_DIR\"",
+    );
+    assert_progress("echo $(date)");
+    assert_progress("$(cmd)");
+    assert_progress("a=$(b $(c))");
+}
+
+#[test]
+fn test_tokenize_bare_dollar_terminates() {
+    assert_progress("echo $");
+    assert_progress("$");
+    assert_progress("echo $ $ $");
+    assert_progress("cost is 5$ total");
+    assert_progress("echo $-flag");
+}
+
+#[test]
+fn test_tokenize_parens_are_operators() {
+    assert_progress("(cd /tmp && ls)");
+    let spans = tokenize("echo $(git status)");
+    // The command inside the substitution is highlighted as a command, not as an
+    // argument of `echo`.
+    let commands: Vec<&str> = spans
+        .iter()
+        .filter(|s| s.role == BashRole::Command)
+        .map(|s| s.text)
+        .collect();
+    assert_eq!(commands, vec!["echo", "git"]);
+    let opener = spans.iter().find(|s| s.text == "$(").expect("$( span");
+    assert_eq!(opener.role, BashRole::Variable);
+}

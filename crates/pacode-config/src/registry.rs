@@ -132,6 +132,7 @@ const SUBAGENT_EFFORT_OPTIONS: &[&str] = &["", "low", "medium", "high", "xhigh",
 const COLOR_OPTIONS: &[&str] = &["auto", "truecolor", "ansi"];
 const IMAGE_OPTIONS: &[&str] = &["auto", "off"];
 const AGENT_VIEW_OPTIONS: &[&str] = &["replace", "panel"];
+const ANIMATION_OPTIONS: &[&str] = &["smooth", "balanced", "eco"];
 const PERM_OPTIONS: &[&str] = &["build", "auto", "plan", "bypass"];
 const FONT_WEIGHT_OPTIONS: &[&str] = &["", "normal", "bold"];
 const ZDR_OPTIONS: &[&str] = &["always", "session", "off"];
@@ -152,6 +153,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "ui.mouse", label: "Mouse Support", description: "Enable terminal mouse tracking and scrolling", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.auto_copy", label: "Auto Copy", description: "Automatically copy mouse selections to clipboard", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.ups", label: "Updates Per Second", description: "Render update rate: auto, dynamic, or fixed 1..=240", section: "ui", default_value: "10", kind: SettingKind::String, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.animation", label: "Animation Mode", description: "Animation clock preset: smooth, balanced, or eco", section: "ui", default_value: "smooth", kind: SettingKind::Enum { options: ANIMATION_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.color", label: "Color Mode", description: "Terminal color fidelity: auto, truecolor, or ansi", section: "ui", default_value: "auto", kind: SettingKind::Enum { options: COLOR_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.transcript_cells", label: "Transcript Cells", description: "Max transcript cells kept in RAM before evicting", section: "ui", default_value: "500", kind: SettingKind::Integer { min: 10, max: 100000 }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.images", label: "Image Rendering", description: "Terminal image protocol: auto or off", section: "ui", default_value: "auto", kind: SettingKind::Enum { options: IMAGE_OPTIONS }, apply: ApplyMode::Immediate },
@@ -308,6 +310,7 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             Ups::Dynamic => "dynamic".to_string(),
             Ups::Auto => "auto".to_string(),
         }),
+        "ui.animation" => Some(config.ui.animation.as_str().to_string()),
         "ui.color" => Some(config.ui.color.clone()),
         "ui.transcript_cells" => Some(config.ui.transcript_cells.to_string()),
         "ui.images" => Some(config.ui.images.clone()),
@@ -616,6 +619,13 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
             toml::Value::String(s) if s == "auto" => config.ui.ups = Ups::Auto,
             _ => {}
         },
+        "ui.animation" => {
+            if let toml::Value::String(s) = value
+                && let Some(mode) = pacode_types::config::AnimationMode::parse(s)
+            {
+                config.ui.animation = mode;
+            }
+        }
         "ui.color" => {
             if let toml::Value::String(s) = value {
                 config.ui.color = s.clone();

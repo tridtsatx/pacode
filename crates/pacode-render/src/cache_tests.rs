@@ -36,6 +36,40 @@ fn lru_eviction_order() {
 }
 
 #[test]
+fn a_get_makes_its_entry_the_most_recent() {
+    // Insert k1, k2, k3 (k3 most recent). A get on k1 moves it to the back, so
+    // the next eviction takes k2, not k1. `peek` checks without touching
+    // recency, so the assertions themselves cannot reshuffle the order.
+    let mut cache = LineCache::new(3);
+    let k1 = CacheKey { cell: 1, width: 80 };
+    let k2 = CacheKey { cell: 2, width: 80 };
+    let k3 = CacheKey { cell: 3, width: 80 };
+    let k4 = CacheKey { cell: 4, width: 80 };
+    let k5 = CacheKey { cell: 5, width: 80 };
+
+    cache.insert(k1, vec![Line::from("1")]);
+    cache.insert(k2, vec![Line::from("2")]);
+    cache.insert(k3, vec![Line::from("3")]);
+    assert!(cache.get(k1).is_some()); // order is now k2, k3, k1
+
+    // 4 lines > 3: evicts k2, the least recent since the k1 touch.
+    cache.insert(k4, vec![Line::from("4")]);
+    assert!(
+        cache.peek(k2).is_none(),
+        "k2 was the least recent once k1 was touched"
+    );
+    assert!(cache.peek(k1).is_some(), "the get on k1 kept it warm");
+    assert!(cache.peek(k3).is_some());
+    assert!(cache.peek(k4).is_some());
+
+    // Evicts k3 — k1, k4, k5 remain.
+    cache.insert(k5, vec![Line::from("5")]);
+    assert!(cache.peek(k3).is_none());
+    assert!(cache.peek(k1).is_some());
+    assert_eq!(cache.total_lines(), 3);
+}
+
+#[test]
 fn insert_never_evicts_itself() {
     let mut cache = LineCache::new(3);
     let k1 = CacheKey { cell: 1, width: 80 };

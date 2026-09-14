@@ -663,6 +663,26 @@ fn test_ups_toml_parsing() {
 }
 
 #[test]
+fn test_animation_toml_parsing() {
+    // Default when omitted.
+    let cfg = parse("[ui]\nmouse = false\n").expect("parse without animation");
+    assert_eq!(cfg.ui.animation, pacode_types::AnimationMode::Smooth);
+
+    for (raw, want) in [
+        ("smooth", pacode_types::AnimationMode::Smooth),
+        ("balanced", pacode_types::AnimationMode::Balanced),
+        ("eco", pacode_types::AnimationMode::Eco),
+    ] {
+        let cfg = parse(&format!("[ui]\nanimation = \"{raw}\"\n")).expect("parse animation mode");
+        assert_eq!(cfg.ui.animation, want);
+    }
+
+    // Unknown values must fail.
+    assert!(parse("[ui]\nanimation = \"wobbly\"\n").is_err());
+    assert!(parse("[ui]\nanimation = 3\n").is_err());
+}
+
+#[test]
 fn test_ups_frame_interval_clamping() {
     use std::time::Duration;
 

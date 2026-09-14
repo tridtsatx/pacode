@@ -297,6 +297,11 @@ pub struct UiConfig {
     /// Where a selected subagent's conversation is shown.
     #[serde(default)]
     pub agent_view: AgentView,
+    /// Animation clock preset (`smooth` / `balanced` / `eco`): the cadence of
+    /// the spinner/pacman tick and of short transient animations, independent
+    /// of the content frame rate (`ups`).
+    #[serde(default)]
+    pub animation: AnimationMode,
 }
 
 /// Where a selected subagent's conversation goes.
@@ -329,6 +334,61 @@ impl AgentView {
     }
 }
 
+/// `[ui] animation`: the preset driving the animation clock, a timer fully
+/// separate from the content frame clock (`ups`). `tick_ms` paces the
+/// spinner/pacman while activity runs; `fast_tick_ms` paces short transient
+/// animations (toast slide/fade, overlay unfold, welcome cascade) — honest
+/// 60 fps in the default `smooth` mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnimationMode {
+    /// Spinner at ~15 fps, transient animations at ~60 fps.
+    #[default]
+    Smooth,
+    /// Spinner at ~10 fps, transient animations at ~30 fps.
+    Balanced,
+    /// Spinner at ~4 fps, transient animations at ~14 fps.
+    Eco,
+}
+
+impl AnimationMode {
+    /// The spinner/pacman cadence while animation is active.
+    pub fn tick_ms(self) -> u64 {
+        match self {
+            Self::Smooth => 66,
+            Self::Balanced => 100,
+            Self::Eco => 240,
+        }
+    }
+
+    /// The cadence while a short transient animation (overlay unfold, welcome
+    /// cascade, toast slide/fade) is on screen.
+    pub fn fast_tick_ms(self) -> u64 {
+        match self {
+            Self::Smooth => 16,
+            Self::Balanced => 33,
+            Self::Eco => 70,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Smooth => "smooth",
+            Self::Balanced => "balanced",
+            Self::Eco => "eco",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "smooth" => Some(Self::Smooth),
+            "balanced" => Some(Self::Balanced),
+            "eco" => Some(Self::Eco),
+            _ => None,
+        }
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -343,6 +403,7 @@ impl Default for UiConfig {
             vim: false,
             thinking: false,
             agent_view: AgentView::default(),
+            animation: AnimationMode::default(),
         }
     }
 }
@@ -677,6 +738,7 @@ mod tests {
         assert_eq!(cfg.permissions.default_mode, Mode::Build);
         assert!(!cfg.ui.hints.model);
         assert_eq!(cfg.ui.ups, Ups::Fixed(10));
+        assert_eq!(cfg.ui.animation, AnimationMode::Smooth);
         assert_eq!(cfg.ui.images, "auto");
         assert!(cfg.ui.images_enabled());
         assert!(!cfg.ui.vim);
@@ -824,6 +886,32 @@ mod tests {
         assert_eq!(serde_json::to_string(&Ups::Fixed(10)).unwrap(), "10");
         assert_eq!(serde_json::to_string(&Ups::Dynamic).unwrap(), "\"dynamic\"");
         assert_eq!(serde_json::to_string(&Ups::Auto).unwrap(), "\"auto\"");
+    }
+
+    #[test]
+    fn animation_mode_serde_and_ticks() {
+        // `smooth` is the default both for a missing key and a missing table.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.ui.animation, AnimationMode::Smooth);
+        assert_eq!(AnimationMode::default(), AnimationMode::Smooth);
+
+        for (raw, want, tick, fast) in [
+            ("smooth", AnimationMode::Smooth, 66, 16),
+            ("balanced", AnimationMode::Balanced, 100, 33),
+            ("eco", AnimationMode::Eco, 240, 70),
+        ] {
+            let cfg: Config =
+                serde_json::from_str(&format!("{{\"ui\": {{\"animation\": \"{raw}\"}}}}")).unwrap();
+            assert_eq!(cfg.ui.animation, want);
+            assert_eq!(want.as_str(), raw);
+            assert_eq!(AnimationMode::parse(raw), Some(want));
+            assert_eq!(want.tick_ms(), tick);
+            assert_eq!(want.fast_tick_ms(), fast);
+            assert_eq!(serde_json::to_string(&want).unwrap(), format!("\"{raw}\""));
+        }
+
+        assert_eq!(AnimationMode::parse("wobbly"), None);
+        assert!(serde_json::from_str::<AnimationMode>("\"wobbly\"").is_err());
     }
 
     #[test]
