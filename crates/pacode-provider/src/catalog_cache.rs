@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pacode_types::ModelInfo;
 use serde::{Deserialize, Serialize};
 
-use crate::Provider;
+use crate::{Provider, ProviderError};
 
 #[cfg(test)]
 #[path = "catalog_cache_tests.rs"]
@@ -18,6 +18,10 @@ mod catalog_cache_tests;
 pub const CATALOG_CACHE_VERSION: u32 = 1;
 pub const DEFAULT_MAX_MODELS_PER_PROVIDER: usize = 500;
 pub const DEFAULT_CATALOG_TTL_SECS: u64 = 86400;
+/// Provider HTTP clients bound connect only — without this a server that
+/// accepts the socket but stalls the body would hold the in-flight slot
+/// (and every `ListModels` waiting on it) forever.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CatalogDiskCache {
@@ -240,7 +244,14 @@ impl CatalogCache {
             id: provider_id,
         };
 
-        match provider.refresh_models().await {
+        let fetched = match tokio::time::timeout(REFRESH_TIMEOUT, provider.refresh_models()).await {
+            Ok(res) => res,
+            Err(_) => Err(ProviderError::Transport(format!(
+                "model catalog request timed out after {}s",
+                REFRESH_TIMEOUT.as_secs()
+            ))),
+        };
+        match fetched {
             Ok(mut models) => {
                 if models.len() > self.max_models_per_provider {
                     models.truncate(self.max_models_per_provider);

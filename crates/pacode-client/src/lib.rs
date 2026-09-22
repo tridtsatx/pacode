@@ -92,8 +92,8 @@ pub enum ClientError {
     Protocol { daemon: u32, client: u32 },
     #[error("disconnected")]
     Disconnected,
-    #[error("request timed out")]
-    Timeout,
+    #[error("request timed out: {0}")]
+    Timeout(&'static str),
     #[error("daemon error: {0}")]
     Daemon(String),
     #[error("unexpected reply to {request}: {reply}")]

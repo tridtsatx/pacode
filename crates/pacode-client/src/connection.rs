@@ -235,6 +235,7 @@ impl Client {
         // send `Detach`+`Attach`), not through `attach()` — the remembered
         // session the reconnect supervisor re-attaches to must follow them.
         let is_detach = matches!(req, Request::Detach);
+        let req_name = req.name();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -294,7 +295,7 @@ impl Client {
                 if let Ok(mut pending) = self.pending.lock() {
                     pending.remove(&id);
                 }
-                Err(ClientError::Timeout)
+                Err(ClientError::Timeout(req_name))
             }
         }
     }

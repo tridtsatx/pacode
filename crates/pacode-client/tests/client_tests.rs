@@ -356,7 +356,7 @@ async fn test_request_timeout() {
 
     ignore_next.store(true, Ordering::Relaxed);
     let res = client.request(Request::Ping).await;
-    assert!(matches!(res, Err(ClientError::Timeout)));
+    assert!(matches!(res, Err(ClientError::Timeout("ping"))));
 
     client.close().await;
     cancel.cancel();

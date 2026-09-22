@@ -223,6 +223,64 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// Stable wire name (the serde `type` tag) for logs and error text —
+    /// exhaustive so a new variant cannot ship without one.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Request::Hello(_) => "hello",
+            Request::Attach(_) => "attach",
+            Request::Detach => "detach",
+            Request::UserMessage { .. } => "user_message",
+            Request::Interrupt => "interrupt",
+            Request::InterruptAll => "interrupt_all",
+            Request::PermissionReply { .. } => "permission_reply",
+            Request::SetModel(_) => "set_model",
+            Request::SetEffort(_) => "set_effort",
+            Request::SetMode(_) => "set_mode",
+            Request::SetZdr(_) => "set_zdr",
+            Request::SetModelFlag { .. } => "set_model_flag",
+            Request::StopAgent(_) => "stop_agent",
+            Request::KillTask(_) => "kill_task",
+            Request::AckTask(_) => "ack_task",
+            Request::GetSnapshot => "get_snapshot",
+            Request::GetHistory { .. } => "get_history",
+            Request::GetTaskOutput { .. } => "get_task_output",
+            Request::ListSessions { .. } => "list_sessions",
+            Request::ListModels => "list_models",
+            Request::RefreshModels => "refresh_models",
+            Request::Compact => "compact",
+            Request::DetachTurn => "detach_turn",
+            Request::Shutdown { .. } => "shutdown",
+            Request::Ping => "ping",
+            Request::ListMcpServers => "list_mcp_servers",
+            Request::RestartMcpServer { .. } => "restart_mcp_server",
+            Request::SetMcpServerEnabled { .. } => "set_mcp_server_enabled",
+            Request::GetMcpPrompt { .. } => "get_mcp_prompt",
+            Request::ListPlugins => "list_plugins",
+            Request::RunPluginCommand { .. } => "run_plugin_command",
+            Request::BrowseMarketplace { .. } => "browse_marketplace",
+            Request::InstallPlugin { .. } => "install_plugin",
+            Request::UninstallPlugin { .. } => "uninstall_plugin",
+            Request::AnswerQuestion { .. } => "answer_question",
+            Request::ListCronJobs => "list_cron_jobs",
+            Request::AddCronJob { .. } => "add_cron_job",
+            Request::RemoveCronJob(_) => "remove_cron_job",
+            Request::SetCronEnabled { .. } => "set_cron_enabled",
+            Request::RunCronJobNow(_) => "run_cron_job_now",
+            Request::ListMonitors => "list_monitors",
+            Request::StopMonitor(_) => "stop_monitor",
+            Request::ListAuth => "list_auth",
+            Request::Login { .. } => "login",
+            Request::Logout { .. } => "logout",
+            Request::SetAuthAccount { .. } => "set_auth_account",
+            Request::GitLog { .. } => "git_log",
+            Request::GitShow { .. } => "git_show",
+            Request::GitDiff { .. } => "git_diff",
+        }
+    }
+}
+
 /// One provider row in the `/login` picker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderAuthInfo {

@@ -448,3 +448,17 @@ fn a_diff_preview_renders_on_the_outcome_gutter() {
     // No `$` line, no line cap — the diff renderer owns this body.
     assert!(body.iter().all(|l| !l.contains("$ ")), "{body:?}");
 }
+
+/// ``/Cyrillic at a byte offset the tool-name prefix would split —
+/// `title_arg` must not slice mid-char (byte-index panic).
+#[test]
+fn title_arg_survives_a_multibyte_title() {
+    // "ab": 'a','b' are bytes 0-1, '' is bytes 2-4 — a 4-byte name prefix
+    // ("read") lands inside it. Slicing `title[..4]` would panic.
+    let c = call("read", "ab output", ToolStatus::Ok, "");
+    assert_eq!(title_arg(&c), "ab output");
+
+    // A title genuinely starting with the name still strips it.
+    let c = call("read", "read src/main.rs", ToolStatus::Ok, "");
+    assert_eq!(title_arg(&c), "src/main.rs");
+}

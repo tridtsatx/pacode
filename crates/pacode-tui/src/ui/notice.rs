@@ -14,6 +14,10 @@ use ratatui::text::{Line, Span};
 
 use pacode_render::{RenderOptions, truncate_to_width, wrap_text};
 
+#[cfg(test)]
+#[path = "notice_tests.rs"]
+mod notice_tests;
+
 /// An error notice as a block: `✗ <title>` in red bold, then the detail
 /// wrapped on a red `│ ` gutter in `dim`.
 pub(crate) fn render_error(text: &str, width: u16, opts: &RenderOptions) -> Vec<Line<'static>> {
@@ -115,7 +119,9 @@ fn split_error_notice(text: &str, dot_sep: &str) -> (String, String) {
 /// `text` without `prefix`, ASCII case-insensitive — old sessions and other
 /// emitters are not guaranteed to keep the exact casing.
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    if text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    let head = text.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        // `get` succeeding proves `prefix.len()` is a char boundary.
         Some(&text[prefix.len()..])
     } else {
         None

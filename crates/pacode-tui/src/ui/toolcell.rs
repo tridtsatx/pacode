@@ -210,7 +210,11 @@ fn short_arg(call: &ToolCallView<'_>) -> String {
 /// tools emit `Edit <path>` while the call is named `edit`.
 fn title_arg<'a>(call: &ToolCallView<'a>) -> &'a str {
     let prefix_len = call.name.len();
-    if call.title.len() >= prefix_len && call.title[..prefix_len].eq_ignore_ascii_case(call.name) {
+    if call
+        .title
+        .get(..prefix_len)
+        .is_some_and(|head| head.eq_ignore_ascii_case(call.name))
+    {
         return call.title[prefix_len..].trim_start();
     }
     call.title
