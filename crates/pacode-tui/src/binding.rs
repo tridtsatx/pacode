@@ -69,9 +69,21 @@ pub enum Action {
     ModelPickerFavorite,
     /// Toggle `zdr_capable` on the model picker's selected row (§9.1).
     ModelPickerZdr,
+    /// Force-refresh the model catalog, bypassing the stale cache (§9.1).
+    ModelPickerRefresh,
     /// Expand or collapse the newest tool-call cell with hidden output (§6);
     /// a click on a cell does the same for that specific cell.
     ExpandOutput,
+    /// Move the prompt cursor one word left (readline `backward-word`).
+    MoveWordLeft,
+    /// Move the prompt cursor one word right (readline `forward-word`).
+    MoveWordRight,
+    /// Move the prompt cursor to the very start of the input.
+    MoveStart,
+    /// Move the prompt cursor to the very end of the input.
+    MoveEnd,
+    /// Delete the current logical (`\n`-delimited) line of the prompt.
+    DeleteLine,
 }
 
 /// The part of the UI a rebindable action applies to — the Keys menu groups
@@ -188,7 +200,13 @@ impl Action {
             Self::Help => "help",
             Self::ModelPickerFavorite => "model_picker_favorite",
             Self::ModelPickerZdr => "model_picker_zdr",
+            Self::ModelPickerRefresh => "model_picker_refresh",
             Self::ExpandOutput => "expand_output",
+            Self::MoveWordLeft => "move_word_left",
+            Self::MoveWordRight => "move_word_right",
+            Self::MoveStart => "move_start",
+            Self::MoveEnd => "move_end",
+            Self::DeleteLine => "delete_line",
         }
     }
 
@@ -244,7 +262,13 @@ impl Action {
             Self::Help => "Open help menu",
             Self::ModelPickerFavorite => "Model picker: mark model as favorite",
             Self::ModelPickerZdr => "Model picker: mark model ZDR-capable",
+            Self::ModelPickerRefresh => "Model picker: force-refresh the catalog",
             Self::ExpandOutput => "Expand/collapse the latest tool output",
+            Self::MoveWordLeft => "Move cursor one word left",
+            Self::MoveWordRight => "Move cursor one word right",
+            Self::MoveStart => "Move cursor to input start",
+            Self::MoveEnd => "Move cursor to input end",
+            Self::DeleteLine => "Delete current input line",
         }
     }
 
@@ -272,6 +296,11 @@ impl Action {
             | Self::ClearInput
             | Self::DeleteWordForward
             | Self::DeleteWordBack
+            | Self::MoveWordLeft
+            | Self::MoveWordRight
+            | Self::MoveStart
+            | Self::MoveEnd
+            | Self::DeleteLine
             | Self::RemoveQueued
             | Self::ClearQueue
             | Self::PasteImage
@@ -300,7 +329,9 @@ impl Action {
             | Self::SelectSession8
             | Self::SelectSession9 => Scope::Rail,
             Self::StopAgent | Self::KillTask => Scope::Panel,
-            Self::ModelPickerFavorite | Self::ModelPickerZdr => Scope::Picker,
+            Self::ModelPickerFavorite | Self::ModelPickerZdr | Self::ModelPickerRefresh => {
+                Scope::Picker
+            }
         }
     }
 
@@ -543,11 +574,17 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("menu", Action::Menu),
     ("help", Action::Help),
     ("expand_output", Action::ExpandOutput),
+    ("move_word_left", Action::MoveWordLeft),
+    ("move_word_right", Action::MoveWordRight),
+    ("move_start", Action::MoveStart),
+    ("move_end", Action::MoveEnd),
+    ("delete_line", Action::DeleteLine),
     // Overlay-scoped actions sit last: `action_for` returns the first match,
     // and a chord spelled like a global one (`alt+f`, `alt+z`) must keep
     // resolving to its global owner in Normal focus (§9.1).
     ("model_picker_favorite", Action::ModelPickerFavorite),
     ("model_picker_zdr", Action::ModelPickerZdr),
+    ("model_picker_refresh", Action::ModelPickerRefresh),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -683,14 +720,62 @@ impl Keymap {
             Action::DeleteWordForward,
             vec![Binding {
                 code: KeyCode::Delete,
-                mods: KeyModifiers::ALT,
+                mods: KeyModifiers::CONTROL,
             }],
         );
         bindings.insert(
             Action::DeleteWordBack,
+            vec![
+                Binding {
+                    code: KeyCode::Char('w'),
+                    mods: KeyModifiers::CONTROL,
+                },
+                Binding {
+                    code: KeyCode::Backspace,
+                    mods: KeyModifiers::CONTROL,
+                },
+                Binding {
+                    code: KeyCode::Backspace,
+                    mods: KeyModifiers::ALT,
+                },
+            ],
+        );
+        // Readline-style prompt editing (§6): word jumps on ctrl+left/right,
+        // whole-input boundaries on ctrl+up/down, logical-line delete on
+        // alt+delete (its previous owner moved to ctrl+delete).
+        bindings.insert(
+            Action::MoveWordLeft,
             vec![Binding {
-                code: KeyCode::Char('w'),
+                code: KeyCode::Left,
                 mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::MoveWordRight,
+            vec![Binding {
+                code: KeyCode::Right,
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::MoveStart,
+            vec![Binding {
+                code: KeyCode::Up,
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::MoveEnd,
+            vec![Binding {
+                code: KeyCode::Down,
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::DeleteLine,
+            vec![Binding {
+                code: KeyCode::Delete,
+                mods: KeyModifiers::ALT,
             }],
         );
         bindings.insert(
@@ -889,6 +974,13 @@ impl Keymap {
                     mods: KeyModifiers::CONTROL,
                 },
             ],
+        );
+        bindings.insert(
+            Action::ModelPickerRefresh,
+            vec![Binding {
+                code: KeyCode::Char('r'),
+                mods: KeyModifiers::CONTROL,
+            }],
         );
 
         Self {

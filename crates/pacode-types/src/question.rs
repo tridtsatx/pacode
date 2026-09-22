@@ -86,6 +86,9 @@ impl QuestionOrigin {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
     pub id: QuestionId,
+    /// The asking agent. Serialized as `asking_agent` (alias `agent`) — see
+    /// `PermissionRequest::agent` for the flatten collision this avoids.
+    #[serde(rename = "asking_agent", alias = "agent")]
     pub agent: AgentId,
     pub agent_name: String,
     pub call_id: CallId,

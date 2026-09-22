@@ -155,9 +155,6 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
                 }
             }
             accept_res = listener.accept() => {
-                let _ = core
-                    .handle_global(&pacode_types::Request::ListMcpServers)
-                    .await;
                 match accept_res {
                     Ok((stream, _addr)) => {
                         idle_since = None;

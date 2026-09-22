@@ -80,7 +80,14 @@ impl Core {
         core
     }
 
-    pub(crate) async fn get_mcp_tools(&self) -> Vec<Arc<dyn Tool>> {
+    /// MCP tool proxies built purely from the schema cache — no server is
+    /// spawned here: a hit contributes its tools, a miss contributes nothing.
+    /// `open_session` uses this so attach never waits on MCP work; the
+    /// detached [`Self::spawn_mcp_tools_refresh`] task then runs the real
+    /// listing and swaps the merged registry into every open session.
+    /// A set the refresh (or `SetMcpServerEnabled`) already produced is
+    /// itself a cache and is served as-is.
+    pub(crate) fn get_mcp_tools_cached(&self) -> Vec<Arc<dyn Tool>> {
         if self.deps.mcp.server_names().is_empty() {
             return Vec::new();
         }
@@ -89,11 +96,51 @@ impl Core {
         {
             return tools.clone();
         }
-        let tools = pacode_tools::builtin::mcp::mcp_tools(self.deps.mcp.clone()).await;
+        let tools = pacode_tools::builtin::mcp::mcp_tools_cached(self.deps.mcp.clone());
         if let Ok(mut guard) = self.cached_mcp_tools.lock() {
             *guard = Some(tools.clone());
         }
         tools
+    }
+
+    /// Post-attach MCP discovery, off the attach path: the real listing —
+    /// which starts `lazy: false` servers and reaps idle ones — runs in a
+    /// detached task, then the merged registry replaces every session's (and
+    /// its main agent's) tools, the same swap `SetMcpServerEnabled` performs.
+    /// The schema cache wrote the misses down, so the next open sees them.
+    pub(crate) fn spawn_mcp_tools_refresh(&self) {
+        if self.deps.mcp.server_names().is_empty() {
+            return;
+        }
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(core) = weak.upgrade() else {
+                return;
+            };
+            let fresh_mcp_tools =
+                pacode_tools::builtin::mcp::mcp_tools(core.deps.mcp.clone()).await;
+            if let Ok(mut guard) = core.cached_mcp_tools.lock() {
+                *guard = Some(fresh_mcp_tools.clone());
+            }
+            let mut new_tools = core.deps.tools.clone();
+            for tool in &fresh_mcp_tools {
+                new_tools.register(tool.clone());
+            }
+            if let Ok(sessions) = core.sessions.read() {
+                for session in sessions.values() {
+                    if let Ok(mut g) = session.tools.write() {
+                        *g = new_tools.clone();
+                    }
+                    if let Some(main) = session.main_agent()
+                        && let Ok(mut g) = main.tools.write()
+                    {
+                        *g = new_tools.clone();
+                    }
+                }
+            }
+        });
     }
 
     /// `Attach::New` creates a session (persisted immediately); `Resume` loads meta,
@@ -516,7 +563,8 @@ impl Core {
             | Request::ListAuth
             | Request::Login { .. }
             | Request::Logout { .. }
-            | Request::SetAuthAccount { .. } => {
+            | Request::SetAuthAccount { .. }
+            | Request::RefreshModels => {
                 self.handle_global(&req)
                     .await
                     .unwrap_or_else(|| Reply::Error {

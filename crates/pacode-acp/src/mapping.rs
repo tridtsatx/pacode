@@ -380,7 +380,9 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         // Logging in is a pacode-side concern: an ACP client authenticates the agent
         // through its own `authenticate` call, not through session updates.
         | Event::LoginProgress { .. }
-        | Event::AuthUpdated(_) => vec![],
+        | Event::AuthUpdated(_)
+        // The model catalog is ACP `list_models` request data, not a session update.
+        | Event::ModelsUpdated { .. } => vec![],
     }
 }
 

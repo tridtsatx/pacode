@@ -391,6 +391,7 @@ fn draw_model(
     for (action, label) in [
         (crate::binding::Action::ModelPickerFavorite, "fav"),
         (crate::binding::Action::ModelPickerZdr, "zdr"),
+        (crate::binding::Action::ModelPickerRefresh, "refresh"),
     ] {
         let chords = state
             .keymap

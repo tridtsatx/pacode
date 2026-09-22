@@ -625,7 +625,7 @@ pub fn open_theme_picker(state: &mut AppState) -> Vec<Action> {
 
 fn push_notice(state: &mut AppState, level: ToastLevel, text: String) {
     let now = now_ms();
-    state.transcript.cells.push_back(Cell {
+    state.transcript.push_cell(Cell {
         id: now,
         kind: CellKind::Item(TranscriptKind::Notice { level, text }),
         version: 0,

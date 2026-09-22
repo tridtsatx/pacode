@@ -307,6 +307,11 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ClearInput
             | KeyAction::DeleteWordForward
             | KeyAction::DeleteWordBack
+            | KeyAction::MoveWordLeft
+            | KeyAction::MoveWordRight
+            | KeyAction::MoveStart
+            | KeyAction::MoveEnd
+            | KeyAction::DeleteLine
             | KeyAction::StopAgent
             | KeyAction::KillTask
             | KeyAction::CycleMode
@@ -342,7 +347,8 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             // Picker-scoped (§9.1): never reach the shared ladder — an open
             // picker overlay swallows its keys before this dispatch.
             | KeyAction::ModelPickerFavorite
-            | KeyAction::ModelPickerZdr => {}
+            | KeyAction::ModelPickerZdr
+            | KeyAction::ModelPickerRefresh => {}
         }
     } else {
         match action {
@@ -362,6 +368,11 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ClearInput
             | KeyAction::DeleteWordForward
             | KeyAction::DeleteWordBack
+            | KeyAction::MoveWordLeft
+            | KeyAction::MoveWordRight
+            | KeyAction::MoveStart
+            | KeyAction::MoveEnd
+            | KeyAction::DeleteLine
             | KeyAction::StopAgent
             | KeyAction::KillTask
             | KeyAction::CycleMode
@@ -395,7 +406,8 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::Help
             | KeyAction::ExpandOutput
             | KeyAction::ModelPickerFavorite
-            | KeyAction::ModelPickerZdr => {}
+            | KeyAction::ModelPickerZdr
+            | KeyAction::ModelPickerRefresh => {}
         }
         if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
             && state.transcript.is_at_top()

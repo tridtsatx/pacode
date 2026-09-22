@@ -21,6 +21,10 @@ mod input_tests;
 #[path = "input_delete_tests.rs"]
 mod input_delete_tests;
 
+#[cfg(test)]
+#[path = "input_move_tests.rs"]
+mod input_move_tests;
+
 pub const PROMPT_QUEUE_CAP: usize = 16;
 
 /// What an `@` scan was requested for — the candidates are only meaningful
@@ -126,6 +130,11 @@ pub struct InputState {
     pub text: String,
     /// Cursor as a char index into `text`.
     pub cursor: usize,
+    /// Sticky goal column for [`Self::move_up`]/[`Self::move_down`]: the
+    /// display column the cursor keeps while walking wrapped visual lines
+    /// (readline-style). Set by vertical moves; cleared by every other
+    /// cursor-moving or text-mutating method.
+    pub vert_goal: Option<usize>,
     /// Submitted prompts, newest last (cap 100).
     pub history: VecDeque<String>,
     /// Index into history while browsing with ↑/↓; `None` = editing a new prompt.
@@ -291,6 +300,7 @@ impl InputState {
         let byte_idx = char_to_byte_index(&self.text, self.cursor);
         self.text.insert_str(byte_idx, s);
         self.cursor += s.chars().count();
+        self.vert_goal = None;
         self.at_closed = false;
         self.bash_complete_closed = false;
     }
@@ -306,6 +316,7 @@ impl InputState {
             let end_byte = char_to_byte_index(&self.text, self.cursor);
             self.text.replace_range(start_byte..end_byte, "");
             self.cursor -= 1;
+            self.vert_goal = None;
             self.at_closed = false;
             self.bash_complete_closed = false;
         }
@@ -317,6 +328,7 @@ impl InputState {
             let start_byte = char_to_byte_index(&self.text, self.cursor);
             let end_byte = char_to_byte_index(&self.text, self.cursor + 1);
             self.text.replace_range(start_byte..end_byte, "");
+            self.vert_goal = None;
             self.at_closed = false;
             self.bash_complete_closed = false;
         }
@@ -324,6 +336,7 @@ impl InputState {
 
     pub fn move_left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
+        self.vert_goal = None;
     }
 
     pub fn move_right(&mut self) {
@@ -331,18 +344,81 @@ impl InputState {
         if self.cursor < len {
             self.cursor += 1;
         }
+        self.vert_goal = None;
     }
 
     pub fn home(&mut self) {
         self.cursor = 0;
+        self.vert_goal = None;
     }
 
     pub fn end(&mut self) {
         self.cursor = self.text.chars().count();
+        self.vert_goal = None;
     }
 
-    /// Delete the word before the cursor (ctrl+w).
+    /// Move the cursor to the start of the word on its left — the same
+    /// boundary [`Self::delete_word`] would delete up to (readline
+    /// `backward-word`).
+    pub fn move_word_left(&mut self) {
+        self.vert_goal = None;
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.text.chars().take(self.cursor).collect();
+        let mut i = chars.len();
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.cursor = i;
+    }
+
+    /// Move the cursor to the boundary [`Self::delete_word_forward`] would
+    /// delete up to (readline `forward-word`): the next word's start when
+    /// the cursor sits inside a word, the next word's end from whitespace.
+    pub fn move_word_right(&mut self) {
+        self.vert_goal = None;
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut i = self.cursor;
+        if i >= chars.len() {
+            return;
+        }
+        if !chars[i].is_whitespace() {
+            while i < chars.len() && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+        } else {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            while i < chars.len() && !chars[i].is_whitespace() {
+                i += 1;
+            }
+        }
+        self.cursor = i;
+    }
+
+    /// Cursor to the very start of the input (ctrl+up).
+    pub fn move_to_start(&mut self) {
+        self.cursor = 0;
+        self.vert_goal = None;
+    }
+
+    /// Cursor to the very end of the input (ctrl+down).
+    pub fn move_to_end(&mut self) {
+        self.cursor = self.text.chars().count();
+        self.vert_goal = None;
+    }
+
+    /// Delete the word before the cursor (ctrl+w / ctrl+backspace).
     pub fn delete_word(&mut self) {
+        self.vert_goal = None;
         if self.cursor > 0 {
             let chars: Vec<char> = self.text.chars().take(self.cursor).collect();
             let mut i = chars.len();
@@ -361,8 +437,9 @@ impl InputState {
         }
     }
 
-    /// Delete the word after the cursor (alt+delete).
+    /// Delete the word after the cursor (ctrl+delete).
     pub fn delete_word_forward(&mut self) {
+        self.vert_goal = None;
         let total_chars = self.text.chars().count();
         if self.cursor < total_chars {
             let chars: Vec<char> = self.text.chars().collect();
@@ -390,10 +467,49 @@ impl InputState {
         }
     }
 
+    /// Delete the current logical line (alt+delete): the chars between the
+    /// surrounding `\n`s, plus the `\n` after it — or the one before when
+    /// the cursor sits on the last line. A single-line input clears
+    /// entirely. The cursor lands where the deleted line started.
+    pub fn delete_line(&mut self) {
+        self.vert_goal = None;
+        if self.text.is_empty() {
+            return;
+        }
+        let chars: Vec<char> = self.text.chars().collect();
+        let cur = self.cursor.min(chars.len());
+        // Logical line bounds: after the previous '\n' .. at the next '\n'.
+        // A cursor on '\n' counts as sitting on the line above it.
+        let mut ls = cur;
+        while ls > 0 && chars[ls - 1] != '\n' {
+            ls -= 1;
+        }
+        let mut le = cur;
+        while le < chars.len() && chars[le] != '\n' {
+            le += 1;
+        }
+        let (del_start, del_end) = if le < chars.len() {
+            // A '\n' follows: consume it so the next line shifts up.
+            (ls, le + 1)
+        } else if ls > 0 {
+            // Last line: take the preceding '\n' with it instead.
+            (ls - 1, le)
+        } else {
+            (ls, le)
+        };
+        let sb = char_to_byte_index(&self.text, del_start);
+        let eb = char_to_byte_index(&self.text, del_end);
+        self.text.replace_range(sb..eb, "");
+        self.cursor = del_start.min(self.text.chars().count());
+        self.at_closed = false;
+        self.bash_complete_closed = false;
+    }
+
     /// Take the text for submission, push to history, reset.
     pub fn take(&mut self) -> String {
         let taken = std::mem::take(&mut self.text);
         self.cursor = 0;
+        self.vert_goal = None;
         self.history_index = None;
         self.draft.clear();
         self.slash_index = 0;
@@ -414,6 +530,7 @@ impl InputState {
     }
 
     pub fn bash_history_up(&mut self) {
+        self.vert_goal = None;
         if self.bash_history.is_empty() {
             return;
         }
@@ -436,6 +553,7 @@ impl InputState {
     }
 
     pub fn bash_history_down(&mut self) {
+        self.vert_goal = None;
         if let Some(idx) = self.bash_history_index {
             if idx + 1 < self.bash_history.len() {
                 let new_idx = idx + 1;
@@ -451,6 +569,7 @@ impl InputState {
     }
 
     pub fn history_up(&mut self) {
+        self.vert_goal = None;
         if self.history.is_empty() {
             return;
         }
@@ -473,6 +592,7 @@ impl InputState {
     }
 
     pub fn history_down(&mut self) {
+        self.vert_goal = None;
         if let Some(idx) = self.history_index {
             if idx + 1 < self.history.len() {
                 let new_idx = idx + 1;
@@ -515,5 +635,99 @@ impl InputState {
         let last_line = lines.last().map(|s| s.as_str()).unwrap_or("");
         let col = 2 + display_width(last_line);
         (line_idx, (col as u16).min(width.saturating_sub(1)))
+    }
+
+    /// Move the cursor one WRAPPED visual line up (plain Up on a multi-line
+    /// prompt). `width` is the input rect's outer width — the same value
+    /// [`Self::cursor_position`] takes; the text wraps at `width - 2`.
+    /// Returns `false` when the cursor already sits on the first visual
+    /// line, so the caller can fall back to history browsing.
+    pub fn move_up(&mut self, width: u16) -> bool {
+        self.move_vert(width, false)
+    }
+
+    /// Same as [`Self::move_up`] but one wrapped visual line down.
+    pub fn move_down(&mut self, width: u16) -> bool {
+        self.move_vert(width, true)
+    }
+
+    /// Shared vertical move: locate the wrapped (line, column) the cursor
+    /// renders at — the same wrap-the-prefix path as
+    /// [`Self::cursor_position`] — then land on the line `±1` away at the
+    /// sticky goal column, clamped to that line's width. The goal is the
+    /// column of the first vertical move in a run (`vert_goal`); any other
+    /// editing method clears it.
+    fn move_vert(&mut self, width: u16, down: bool) -> bool {
+        let text_w = (width as usize).saturating_sub(2).max(1);
+        let before_cursor: String = self.text.chars().take(self.cursor).collect();
+        let prefix_lines = wrap_text_non_trimming(&before_cursor, text_w);
+        // `wrap_text_non_trimming` always returns >= 1 line.
+        let cur_line = prefix_lines.len() - 1;
+        let cur_col = display_width(prefix_lines.last().map_or("", String::as_str));
+        let target = if down {
+            cur_line + 1
+        } else {
+            match cur_line.checked_sub(1) {
+                Some(t) => t,
+                None => return false,
+            }
+        };
+        let lines = wrap_text_non_trimming(&self.text, text_w);
+        if target >= lines.len() {
+            return false;
+        }
+        let goal = self.vert_goal.unwrap_or(cur_col);
+        self.cursor = self.visual_to_char_index(&lines, target, goal);
+        self.vert_goal = Some(goal);
+        true
+    }
+
+    /// Char index of wrapped `line`'s display cell `col`. Wrapped lines
+    /// partition each logical line's chars in order — only the `'\r'`
+    /// dropped before `'\n'` and the `'\n'` separators sit between the
+    /// covered ranges. The cursor lands on the last grapheme boundary
+    /// whose display width does not exceed `col`.
+    fn visual_to_char_index(&self, lines: &[String], line: usize, col: usize) -> usize {
+        let mut line_iter = lines.iter();
+        let mut idx = 0usize;
+        // Char offset of the current logical line's first char.
+        let mut char_pos = 0usize;
+        let piece_count = self.text.split('\n').count();
+        // Fallback: end of text (unreached — `line` is always in range).
+        let mut start = self.text.chars().count();
+        'outer: for (i, piece) in self.text.split('\n').enumerate() {
+            let stripped = piece.strip_suffix('\r').unwrap_or(piece);
+            let want = stripped.chars().count();
+            let mut covered = 0usize;
+            loop {
+                let Some(wrapped) = line_iter.next() else {
+                    break 'outer;
+                };
+                let n = wrapped.chars().count();
+                let line_start = char_pos + covered;
+                covered += n;
+                if idx == line {
+                    start = line_start;
+                    break 'outer;
+                }
+                idx += 1;
+                if covered >= want {
+                    break;
+                }
+            }
+            char_pos += want
+                + usize::from(piece.ends_with('\r')) // '\r' dropped by the wrapper
+                + usize::from(i + 1 < piece_count); // the '\n' separator itself
+        }
+        let mut w = 0usize;
+        for g in lines[line].graphemes(true) {
+            let gw = display_width(g);
+            if w + gw > col {
+                break;
+            }
+            w += gw;
+            start += g.chars().count();
+        }
+        start
     }
 }

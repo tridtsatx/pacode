@@ -202,7 +202,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
         }
         Event::PermissionRequested(req) => {
             let ts_ms = req.created_at_ms;
-            state.transcript.cells.push_back(Cell {
+            state.transcript.push_cell(Cell {
                 id: seq,
                 kind: CellKind::Item(TranscriptKind::Permission(req)),
                 version: 0,
@@ -392,6 +392,14 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             } else {
                 state.auth_providers.push(info);
             }
+            state.dirty = true;
+        }
+        Event::ModelsUpdated { models } => {
+            // The daemon pushed a fresh catalog (a force-refresh or a
+            // background refresh landing) — fold like a `Reply::Models`.
+            state.models = models;
+            state.lists.on_reply(crate::cache::ListKind::Models, true);
+            crate::cache::write_after_reply(state, crate::cache::ListKind::Models);
             state.dirty = true;
         }
     }

@@ -531,11 +531,16 @@ pub fn main() -> anyhow::Result<()> {
                 .build()
                 .context("failed to create tokio current_thread runtime")?;
 
+            // `None` when the user quit while the background attach was
+            // still in flight — no session was ever attached, so there is
+            // nothing to resume and no banner to print.
             let session_id = rt
                 .block_on(async { pacode_tui::run(tui_opts).await })
                 .context("tui error")?;
 
-            println!("Resume this session with:\n  pacode -s {session_id}");
+            if let Some(session_id) = session_id {
+                println!("Resume this session with:\n  pacode -s {session_id}");
+            }
 
             Ok(())
         }

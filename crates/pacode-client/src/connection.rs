@@ -231,6 +231,10 @@ impl Client {
         if !self.is_connected() {
             return Err(ClientError::Disconnected);
         }
+        // Session switches go through `request` (e.g. the TUI's slot keys
+        // send `Detach`+`Attach`), not through `attach()` — the remembered
+        // session the reconnect supervisor re-attaches to must follow them.
+        let is_detach = matches!(req, Request::Detach);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -272,7 +276,19 @@ impl Client {
         }
 
         match tokio::time::timeout(self.opts.request_timeout, rx).await {
-            Ok(Ok(reply)) => Ok(reply),
+            Ok(Ok(reply)) => {
+                if let Reply::Attached(snapshot) = &reply {
+                    if let Ok(mut guard) = self.attached_session.lock() {
+                        *guard = Some(snapshot.meta.id.clone());
+                    }
+                } else if is_detach
+                    && matches!(reply, Reply::Ok)
+                    && let Ok(mut guard) = self.attached_session.lock()
+                {
+                    *guard = None;
+                }
+                Ok(reply)
+            }
             Ok(Err(_)) => Err(ClientError::Disconnected),
             Err(_) => {
                 if let Ok(mut pending) = self.pending.lock() {

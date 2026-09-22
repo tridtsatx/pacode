@@ -207,6 +207,61 @@ async fn test_per_provider_cap_is_enforced() {
 }
 
 #[tokio::test]
+async fn test_force_refresh_bypasses_ttl_and_dedupes_concurrent_callers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_file = temp_dir.path().join("catalog.json");
+
+    // Fresh TTL — a plain `get_models_for_provider` would never fetch.
+    let cache = Arc::new(CatalogCache::new(
+        Some(cache_file),
+        86400,
+        DEFAULT_MAX_MODELS_PER_PROVIDER,
+    ));
+
+    let mock = Arc::new(MockProvider::new("mock-prov"));
+    mock.set_models(vec![make_model_info("mock-prov", "live-model")]);
+    mock.set_list_models_delay(Duration::from_millis(50));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    cache.seed_memory_cache(
+        "mock-prov",
+        now,
+        vec![make_model_info("mock-prov", "cached-model")],
+    );
+
+    let prov: Arc<dyn Provider> = mock.clone();
+    // The fresh copy serves without a provider call.
+    let cached = cache.get_models_for_provider("mock-prov", &prov).await;
+    assert_eq!(cached[0].route.model, "cached-model");
+    assert_eq!(mock.list_models_count(), 0);
+
+    // Three concurrent force-refreshes share a single provider fetch.
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let c = Arc::clone(&cache);
+        let p = Arc::clone(&prov);
+        handles.push(tokio::spawn(async move {
+            c.force_refresh("mock-prov", &p).await
+        }));
+    }
+    // Let the spawned callers register before probing (current-thread
+    // runtime: they only run once this task yields), while the 50 ms provider
+    // delay keeps the refresh in flight.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(cache.refresh_in_flight("mock-prov").is_some());
+    for h in handles {
+        let models = h.await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].route.model, "live-model");
+    }
+    assert_eq!(mock.list_models_count(), 1);
+    assert!(cache.refresh_in_flight("mock-prov").is_none());
+}
+
+#[tokio::test]
 async fn test_failed_refresh_leaves_previous_cache_in_place() {
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_file = temp_dir.path().join("catalog.json");

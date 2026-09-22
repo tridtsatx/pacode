@@ -1710,11 +1710,11 @@ fn test_keymap_delete_word_actions() {
     let mut state = make_test_state();
     let now = Instant::now();
 
-    // 1. alt+delete deletes word forward
+    // 1. ctrl+delete deletes word forward
     state.input.insert_str("foo   bar baz");
     state.input.cursor = 0;
-    let alt_del = KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT);
-    let actions = handle_key(&mut state, alt_del, now);
+    let ctrl_del = KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_del, now);
     assert!(actions.is_empty());
     assert_eq!(state.input.text, "bar baz");
     assert_eq!(state.input.cursor, 0);
@@ -1738,6 +1738,119 @@ fn test_keymap_delete_word_actions() {
     handle_key(&mut state, char_w, now);
     assert_eq!(state.input.cursor, 6);
     assert_eq!(state.input.text, "hello world");
+}
+
+#[test]
+fn test_keymap_word_move_and_boundary_actions() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // ctrl+left/right jump words (readline backward/forward-word).
+    state.input.insert_str("foo   bar baz");
+    let ctrl_left = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL);
+    let actions = handle_key(&mut state, ctrl_left, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.cursor, 10); // start of "baz"
+    let ctrl_right = KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL);
+    handle_key(&mut state, ctrl_right, now);
+    assert_eq!(state.input.cursor, 13); // end of input
+
+    // ctrl+up/down jump to whole-input boundaries.
+    let ctrl_up = KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL);
+    handle_key(&mut state, ctrl_up, now);
+    assert_eq!(state.input.cursor, 0);
+    let ctrl_down = KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL);
+    handle_key(&mut state, ctrl_down, now);
+    assert_eq!(state.input.cursor, 13);
+}
+
+#[test]
+fn test_keymap_delete_line_and_backspace_word_actions() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+
+    // alt+delete removes the current logical line (last line here, so the
+    // preceding '\n' goes with it).
+    state.input.insert_str("l1\nl2\nl3");
+    state.input.cursor = 6; // on "l3"
+    let alt_del = KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT);
+    let actions = handle_key(&mut state, alt_del, now);
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "l1\nl2");
+    assert_eq!(state.input.cursor, 5);
+
+    // ctrl+backspace and alt+backspace both delete the word to the left.
+    for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        state.input.text = "foo   bar baz".to_string();
+        state.input.cursor = state.input.text.chars().count();
+        let key = KeyEvent::new(KeyCode::Backspace, mods);
+        let actions = handle_key(&mut state, key, now);
+        assert!(actions.is_empty());
+        assert_eq!(state.input.text, "foo   bar ");
+        assert_eq!(state.input.cursor, 10);
+    }
+
+    // Plain backspace still deletes a single char.
+    let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+    handle_key(&mut state, backspace, now);
+    assert_eq!(state.input.text, "foo   bar");
+}
+
+#[test]
+fn test_up_down_move_within_multiline_prompt() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.input.insert_str("l1\nl2\nl3");
+    // Cursor at the end (visual line 2, column 2).
+    assert_eq!(state.input.cursor, 8);
+
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    handle_key(&mut state, up, now);
+    assert_eq!(state.input.cursor, 5); // end of "l2"
+    handle_key(&mut state, up, now);
+    assert_eq!(state.input.cursor, 2); // end of "l1"
+    // First visual line: falls back to the history gate — a non-empty
+    // prompt that isn't browsing history stays put.
+    handle_key(&mut state, up, now);
+    assert_eq!(state.input.cursor, 2);
+    assert_eq!(state.input.text, "l1\nl2\nl3");
+    assert_eq!(state.input.history_index, None);
+
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(state.input.cursor, 5);
+    handle_key(&mut state, down, now);
+    assert_eq!(state.input.cursor, 8); // back to the end
+    handle_key(&mut state, down, now);
+    assert_eq!(state.input.cursor, 8); // last line: no-op
+}
+
+#[test]
+fn test_up_down_history_edges_around_multiline_prompt() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.input.history.push_back("earlier".to_string());
+    state.input.history.push_back("multi\nline".to_string());
+
+    // Empty prompt: Up browses history as before.
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    handle_key(&mut state, up, now);
+    assert_eq!(state.input.text, "multi\nline");
+    assert_eq!(state.input.history_index, Some(1));
+
+    // While browsing, Up keeps stepping history — the recalled entry's
+    // extra visual lines do not switch to cursor movement.
+    handle_key(&mut state, up, now);
+    assert_eq!(state.input.text, "earlier");
+    assert_eq!(state.input.history_index, Some(0));
+
+    // Down steps forward again, then lands back on the empty draft.
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut state, down, now);
+    assert_eq!(state.input.text, "multi\nline");
+    handle_key(&mut state, down, now);
+    assert_eq!(state.input.text, "");
+    assert_eq!(state.input.history_index, None);
 }
 
 #[test]

@@ -63,9 +63,11 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
             };
             core.deps.store.upsert_session(&meta).await?;
 
+            // Attach must not wait on MCP servers starting: the session opens
+            // with schema-cached MCP tools only, and the detached refresh
+            // swaps the full set into `session.tools`/agents once it lands.
             let mut session_tools = core.deps.tools.clone();
-            let mcp_tools = core.get_mcp_tools().await;
-            for tool in mcp_tools {
+            for tool in core.get_mcp_tools_cached() {
                 session_tools.register(tool);
             }
 
@@ -126,6 +128,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
             if let Ok(mut sessions) = core.sessions.write() {
                 sessions.insert(id.clone(), session);
             }
+            core.spawn_mcp_tools_refresh();
 
             Ok(id)
         }
@@ -166,9 +169,10 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 }
             }
 
+            // Same cache-only rule as `Attach::New` — resuming must not start
+            // MCP servers on the attach path either.
             let mut session_tools = core.deps.tools.clone();
-            let mcp_tools = core.get_mcp_tools().await;
-            for tool in mcp_tools {
+            for tool in core.get_mcp_tools_cached() {
                 session_tools.register(tool);
             }
 
@@ -331,6 +335,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
             if let Ok(mut sessions) = core.sessions.write() {
                 sessions.insert(session_id.clone(), session);
             }
+            core.spawn_mcp_tools_refresh();
 
             Ok(session_id)
         }

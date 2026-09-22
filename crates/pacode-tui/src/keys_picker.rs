@@ -317,6 +317,17 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 return toggle_model_mark(state, row, &q_lower, zdr_only, mark);
             }
 
+            // `ctrl+r` by default: force-refresh the catalog server-side. The
+            // reply lands like `ListModels` — dispatch marks the section
+            // in-flight, so the picker badges `loading…` while it runs.
+            if keymap_has(
+                &state.keymap,
+                crate::binding::Action::ModelPickerRefresh,
+                key,
+            ) {
+                return vec![Action::Send(Request::RefreshModels)];
+            }
+
             match key.code {
                 KeyCode::Esc => state.focus = Focus::Normal,
                 KeyCode::Enter => {

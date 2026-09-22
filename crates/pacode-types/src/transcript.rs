@@ -104,6 +104,59 @@ mod tests {
         assert_eq!(back, item);
     }
 
+    /// `Permission`/`Question` carry their own `agent` which used to collide
+    /// with the item's on flatten — serde rejected the duplicate key and the
+    /// client dropped the whole `item_added` event. The inner field now
+    /// serializes as `asking_agent`.
+    #[test]
+    fn nested_agent_does_not_duplicate_on_flatten() {
+        let perm = TranscriptItem {
+            seq: 5,
+            agent: AgentId::main(),
+            ts_ms: 3,
+            kind: TranscriptKind::Permission(PermissionRequest {
+                id: crate::ids::PermissionId::new("perm_1"),
+                agent: AgentId::new("sub-1"),
+                agent_name: "sub".into(),
+                call_id: CallId::new("call_1"),
+                tool: "bash".into(),
+                title: "Bash: ls".into(),
+                detail: String::new(),
+                risk: None,
+                created_at_ms: 1,
+            }),
+        };
+        let json = serde_json::to_string(&perm).unwrap();
+        assert_eq!(json.matches("\"agent\":").count(), 1, "{json}");
+        assert_eq!(json.matches("\"asking_agent\":").count(), 1, "{json}");
+        let back: TranscriptItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, perm);
+
+        let question = TranscriptItem {
+            seq: 6,
+            agent: AgentId::main(),
+            ts_ms: 4,
+            kind: TranscriptKind::Question {
+                question: crate::question::Question {
+                    id: crate::ids::QuestionId::new("q_1"),
+                    agent: AgentId::new("sub-1"),
+                    agent_name: "sub".into(),
+                    call_id: CallId::new("call_2"),
+                    header: "h".into(),
+                    question: "which?".into(),
+                    options: Vec::new(),
+                    multi_select: false,
+                    created_at_ms: 2,
+                },
+                answer: None,
+            },
+        };
+        let json = serde_json::to_string(&question).unwrap();
+        assert_eq!(json.matches("\"agent\":").count(), 1, "{json}");
+        let back: TranscriptItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, question);
+    }
+
     #[test]
     fn bash_command_kind_tag() {
         let item = TranscriptItem {

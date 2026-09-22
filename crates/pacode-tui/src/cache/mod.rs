@@ -86,7 +86,7 @@ impl ListKind {
     pub fn for_request(req: &pacode_types::Request) -> Option<Self> {
         use pacode_types::Request as R;
         match req {
-            R::ListModels => Some(Self::Models),
+            R::ListModels | R::RefreshModels => Some(Self::Models),
             R::ListPlugins => Some(Self::Plugins),
             R::BrowseMarketplace { .. } => Some(Self::Marketplace),
             R::ListMcpServers => Some(Self::McpServers),

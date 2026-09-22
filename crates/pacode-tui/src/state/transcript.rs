@@ -287,10 +287,29 @@ impl Transcript {
                 }
             }
             other => {
+                // A terminal cell must never land mid-reveal: the live cell can
+                // still hold buffered text that precedes this item on the wire,
+                // and appending first would split the answer around the tool.
+                // Flushing preserves wire order. Updates to an existing cell
+                // replace in place and cannot reorder, so they skip the flush.
+                if !self.cells.iter().any(|c| c.id == seq) {
+                    self.flush_stream();
+                }
                 self.insert_or_replace(seq, other, item.ts_ms);
             }
         }
         self.enforce_cap();
+    }
+
+    /// Append a terminal (non-stream) cell. The paced reveal's backlog is
+    /// flushed first for the same reason as in `upsert`: a cell landing below
+    /// unrevealed text would visually precede text that came earlier on the
+    /// wire.
+    pub fn push_cell(&mut self, cell: Cell) {
+        if self.has_backlog() || self.has_pending_final() {
+            self.flush_stream();
+        }
+        self.cells.push_back(cell);
     }
 
     fn insert_or_replace(&mut self, seq: u64, kind: TranscriptKind, ts_ms: u64) {

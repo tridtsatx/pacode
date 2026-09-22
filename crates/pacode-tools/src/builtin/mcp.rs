@@ -79,6 +79,28 @@ pub async fn mcp_tools(pool: Arc<McpPool>) -> Vec<Arc<dyn Tool>> {
     tools
 }
 
+/// [`mcp_tools`] built purely from the schema cache: a hit contributes the
+/// server's tools, a miss contributes nothing, and no MCP server is spawned
+/// on this path. `open_session` uses it so attach never waits on MCP work —
+/// the daemon's post-attach refresh swaps in the full set once it lands.
+pub fn mcp_tools_cached(pool: Arc<McpPool>) -> Vec<Arc<dyn Tool>> {
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+
+    for (server, info) in pool.list_all_tools_cached() {
+        tools.push(Arc::new(McpTool::new(pool.clone(), server, info)));
+    }
+
+    let mut servers_with_resources = BTreeSet::new();
+    for (server, _) in pool.list_all_resources_cached() {
+        servers_with_resources.insert(server);
+    }
+    for server in servers_with_resources {
+        tools.push(Arc::new(McpResourceTool::new(pool.clone(), server)));
+    }
+
+    tools
+}
+
 #[async_trait]
 impl Tool for McpTool {
     fn name(&self) -> &str {

@@ -355,6 +355,7 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::GetTaskOutput { .. }
         | Request::ListSessions { .. }
         | Request::ListModels
+        | Request::RefreshModels
         | Request::Compact
         | Request::Shutdown { .. }
         | Request::Ping

@@ -587,6 +587,220 @@ fn a_delta_for_an_unknown_cell_is_ignored_and_leaves_the_live_cell_alone() {
     }
 }
 
+fn tool_item(seq: u64, agent: &AgentId) -> TranscriptItem {
+    TranscriptItem {
+        seq,
+        agent: agent.clone(),
+        ts_ms: seq,
+        kind: TranscriptKind::ToolCall {
+            call_id: pacode_types::CallId::new(format!("call_{seq}")),
+            name: "bash".into(),
+            title: "bash echo".into(),
+            intent: None,
+            status: pacode_types::ToolStatus::Running,
+            preview: String::new(),
+            diff: None,
+            duration_ms: None,
+            task: None,
+        },
+    }
+}
+
+/// A tool item arriving while the paced reveal still holds buffered text used
+/// to be appended below the unrevealed backlog, which split the answer around
+/// the tool. A terminal cell now flushes the backlog first, so the on-screen
+/// order matches the wire order.
+#[test]
+fn a_tool_cell_lands_after_the_answer_text_it_follows_on_the_wire() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    // Buffered into the paced stream but not yet revealed into the cell.
+    t.push_delta(1, "part one", false, now);
+    assert!(t.has_backlog());
+
+    t.upsert(tool_item(2, &agent), now);
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 1);
+    assert_eq!(t.cells[1].id, 2);
+    // The backlog was flushed into the answer cell, not dropped.
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+            assert_eq!(text, "part one");
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
+
+/// Deltas that arrive after the tool cell still belong to the answer cell
+/// above it — the tool keeps its position and the answer keeps growing.
+#[test]
+fn deltas_after_a_tool_cell_still_reach_the_answer_above_it() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(1, "part one", false, now);
+    t.upsert(tool_item(2, &agent), now);
+
+    t.push_delta(1, " and part two", false, now);
+    t.flush_stream();
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 1);
+    assert_eq!(t.cells[1].id, 2);
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+            assert_eq!(text, "part one and part two");
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
+
+/// A completed answer waiting behind a drained-looking backlog (`pending_final`)
+/// is flushed by a terminal cell too, not just raw stream text.
+#[test]
+fn a_terminal_cell_flushes_a_pending_final() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(1, "part one", false, now);
+    // The finished item waits for the backlog instead of cutting in.
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 1,
+            kind: TranscriptKind::Assistant {
+                text: "part one".into(),
+                complete: true,
+            },
+        },
+        now,
+    );
+    assert!(t.has_pending_final());
+
+    t.push_cell(tool_cell(2, "done"));
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 1);
+    assert_eq!(t.cells[1].id, 2);
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, complete }) => {
+            assert_eq!(text, "part one");
+            assert!(complete);
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
+
+/// Updating a cell that already exists replaces it in place: it cannot jump
+/// the queue, so it must not flush the backlog either.
+#[test]
+fn updating_an_existing_cell_does_not_flush_or_reorder() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(1, "part one", false, now);
+    t.upsert(tool_item(2, &agent), now);
+    assert_eq!(t.cells.len(), 2);
+
+    // More text streams in after the tool landed — backlog again.
+    t.push_delta(1, " more", false, now);
+    assert!(t.has_backlog());
+
+    // An `ItemUpdated` for the existing tool cell replaces it in place and
+    // leaves the pending backlog alone.
+    let mut updated = tool_item(2, &agent);
+    updated.kind = TranscriptKind::ToolCall {
+        call_id: pacode_types::CallId::new("call_2"),
+        name: "bash".into(),
+        title: "bash echo".into(),
+        intent: None,
+        status: pacode_types::ToolStatus::Ok,
+        preview: "done".into(),
+        diff: None,
+        duration_ms: Some(10),
+        task: None,
+    };
+    t.upsert(updated, now);
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 1);
+    assert_eq!(t.cells[1].id, 2);
+    assert!(
+        t.has_backlog(),
+        "an in-place update must not drain the stream"
+    );
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+            assert_eq!(text, "part one");
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+    match &t.cells[1].kind {
+        CellKind::Item(TranscriptKind::ToolCall {
+            preview, status, ..
+        }) => {
+            assert_eq!(preview, "done");
+            assert_eq!(*status, pacode_types::ToolStatus::Ok);
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
+
 fn tool_cell(id: u64, preview: &str) -> Cell {
     Cell {
         id,

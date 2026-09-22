@@ -27,8 +27,9 @@ use crate::vcs::{CommitRow, GitStatus};
 
 /// Bumped on any wire-visible change: v2 added `SetZdr`/`SetModelFlag`,
 /// `SessionMeta.zdr` and `ModelInfo.supported_efforts`; v3 added the git
-/// requests (`GitLog`, `GitShow`, `GitDiff`) and their replies.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// requests (`GitLog`, `GitShow`, `GitDiff`) and their replies; v4 adds
+/// `RefreshModels` + the `ModelsUpdated` broadcast.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -111,6 +112,9 @@ pub enum Request {
         limit: u32,
     },
     ListModels,
+    /// Force a re-fetch of every provider's model catalog, bypassing the cache
+    /// TTL (`Reply::Models`; an `Event::ModelsUpdated` broadcast follows).
+    RefreshModels,
     Compact,
     /// Detach a running turn on the main agent into a background subagent.
     DetachTurn,
@@ -568,6 +572,11 @@ pub enum Event {
     },
     /// Credentials of a provider changed (login, logout, account switch).
     AuthUpdated(ProviderAuthInfo),
+    /// The model catalog changed — a refresh landed. Carries the full list,
+    /// so clients replace their copy wholesale like a `Reply::Models` fold.
+    ModelsUpdated {
+        models: Vec<ModelInfo>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

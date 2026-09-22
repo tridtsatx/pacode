@@ -170,7 +170,12 @@ pub fn encode_messages(messages: &[Message], supports_vision: bool) -> Vec<proto
                         }
                     }
                 }
-                w.write_string(3, &text);
+                // An empty text field serializes to `{}` after the gateway's
+                // proto3 JSON pass, and the upstream rejects `text.text` as a
+                // missing required field — omit it like the assistant arm.
+                if !text.is_empty() {
+                    w.write_string(3, &text);
+                }
                 encoded.push(w);
             }
             Role::Assistant => {
@@ -214,7 +219,11 @@ pub fn encode_messages(messages: &[Message], supports_vision: bool) -> Vec<proto
                         let mut w = proto::Writer::new();
                         w.write_string(1, &random_uuid());
                         w.write_varint(2, 4);
-                        w.write_string(3, content);
+                        // Empty tool output must not emit the field — see the
+                        // user-role note above.
+                        if !content.is_empty() {
+                            w.write_string(3, content);
+                        }
                         w.write_string(7, call_id.as_str());
                         encoded.push(w);
                     }

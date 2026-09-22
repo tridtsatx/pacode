@@ -378,6 +378,17 @@ pub struct AppState {
     /// A copy the draw path prepared for the event loop to perform (§8.1 —
     /// `clipboard::copy` does IO and must not run inside `ui::draw`).
     pub pending_copy: Option<PendingCopy>,
+    /// Session-bound requests sent while no session was attached — the
+    /// startup attach runs as a background request, so the event loop is
+    /// already live before the first snapshot lands. Flushed in order when
+    /// it does; `dispatch_action` caps the queue and drops the oldest.
+    pub pending_requests: VecDeque<pacode_types::Request>,
+    /// The `-p`/`--prompt` argv text, carried until the startup attach lands
+    /// — `BgResponse::AttachFinished` sends it then.
+    pub initial_prompt: Option<String>,
+    /// Why the startup attach failed — `run` returns it once the loop exits
+    /// (the error also sets `quit`, so a failed attach still exits fast).
+    pub attach_error: Option<pacode_client::ClientError>,
 }
 
 /// What the panel shows.
@@ -509,6 +520,9 @@ impl AppState {
             last_focus_key: 0,
             overlay_since: None,
             pending_copy: None,
+            pending_requests: VecDeque::new(),
+            initial_prompt: None,
+            attach_error: None,
         }
     }
 
@@ -634,7 +648,15 @@ impl AppState {
     pub fn apply_client_event(&mut self, event: ClientEvent, now: Instant) -> bool {
         match event {
             ClientEvent::Connected { .. } => {
-                self.connection = Connection::Connected;
+                // While no session is attached — the startup attach is still
+                // in flight, or a slot switch is between Detach and Attach —
+                // the footer keeps saying "connecting…"; the incoming
+                // snapshot is what flips it to Connected.
+                self.connection = if self.meta.is_some() {
+                    Connection::Connected
+                } else {
+                    Connection::Connecting
+                };
                 self.dirty = true;
                 true
             }
@@ -729,7 +751,7 @@ impl AppState {
                 self.rail.update_idle(self.turn_active, now);
                 for (i, perm) in snapshot.pending_permissions.into_iter().enumerate() {
                     let ts_ms = perm.created_at_ms;
-                    self.transcript.cells.push_back(Cell {
+                    self.transcript.push_cell(Cell {
                         id: snapshot.seq.wrapping_add(1).wrapping_add(i as u64),
                         kind: CellKind::Item(TranscriptKind::Permission(perm)),
                         version: 0,
@@ -887,7 +909,7 @@ impl AppState {
 
     pub fn push_notice(&mut self, text: String) {
         let now = now_ms();
-        self.transcript.cells.push_back(Cell {
+        self.transcript.push_cell(Cell {
             id: now,
             kind: CellKind::Item(TranscriptKind::Notice {
                 level: ToastLevel::Info,
@@ -902,7 +924,7 @@ impl AppState {
 
     pub fn push_notice_with_level(&mut self, level: ToastLevel, text: String) {
         let now = now_ms();
-        self.transcript.cells.push_back(Cell {
+        self.transcript.push_cell(Cell {
             id: now,
             kind: CellKind::Item(TranscriptKind::Notice { level, text }),
             version: 0,
@@ -1013,7 +1035,7 @@ impl AppState {
 
     fn push_background_result(&mut self, result: BackgroundResult) {
         let now = now_ms();
-        self.transcript.cells.push_back(Cell {
+        self.transcript.push_cell(Cell {
             id: now,
             kind: CellKind::BackgroundResult(result),
             version: 0,

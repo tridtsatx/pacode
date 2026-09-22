@@ -127,6 +127,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         if !state.input.is_empty() {
             state.input.text.clear();
             state.input.cursor = 0;
+            state.input.vert_goal = None;
             state.input.history_index = None;
             state.input.draft.clear();
             state.ctrl_c_at = None;
@@ -231,6 +232,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 let new_cursor = prefix.chars().count() + insert.chars().count();
                 state.input.text = format!("{prefix}{insert}{suffix}");
                 state.input.cursor = new_cursor;
+                state.input.vert_goal = None;
                 if cand.is_dir {
                     state.input.at_closed = false;
                     state.input.at_index = 0;
@@ -250,6 +252,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 let cand = &candidates[sel];
                 state.input.text = format!("!{}", cand.replacement);
                 state.input.cursor = state.input.text.chars().count();
+                state.input.vert_goal = None;
                 return vec![];
             }
         }
@@ -405,7 +408,12 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     // 8.5 Vim mode handling on normal prompt
     if state.config.ui.vim && state.focus == Focus::Normal {
         match crate::state::vim::handle(&mut state.vim, &mut state.input, key) {
-            crate::state::vim::VimEffect::Consumed => return vec![],
+            crate::state::vim::VimEffect::Consumed => {
+                // Vim moves/edits write `input.cursor` directly, bypassing
+                // the InputState methods that reset the sticky goal column.
+                state.input.vert_goal = None;
+                return vec![];
+            }
             crate::state::vim::VimEffect::Submit => return submit_prompt(state),
             crate::state::vim::VimEffect::PassThrough => {}
         }
@@ -494,6 +502,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 let new_cursor = prefix.chars().count() + insert.chars().count();
                 state.input.text = format!("{prefix}{insert}{suffix}");
                 state.input.cursor = new_cursor;
+                state.input.vert_goal = None;
                 if cand.is_dir {
                     state.input.at_closed = false;
                     state.input.at_index = 0;
@@ -635,6 +644,31 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
     }
 
+    // 10.95 Readline-style prompt editing on modifier chords: word jumps,
+    // whole-input boundaries, logical-line delete. These resolve before the
+    // plain-arrow handlers below — ctrl+arrow shares the Up/Down/Left/Right
+    // key codes with history browsing and single-step movement.
+    if action == Some(KeyAction::MoveWordLeft) {
+        state.input.move_word_left();
+        return vec![];
+    }
+    if action == Some(KeyAction::MoveWordRight) {
+        state.input.move_word_right();
+        return vec![];
+    }
+    if action == Some(KeyAction::MoveStart) {
+        state.input.move_to_start();
+        return vec![];
+    }
+    if action == Some(KeyAction::MoveEnd) {
+        state.input.move_to_end();
+        return vec![];
+    }
+    if action == Some(KeyAction::DeleteLine) {
+        state.input.delete_line();
+        return vec![];
+    }
+
     // 11. Up / Down arrows for history / slash popup / @ popup / bash completion
     if key.code == KeyCode::Up {
         let byte_cursor =
@@ -667,6 +701,14 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         } else if state.input.is_empty() || state.input.history_index.is_some() {
             state.input.history_up();
+        } else {
+            // Multi-line prompt: Up walks wrapped visual lines (readline
+            // style); already on the first line falls back to history —
+            // `history_up` stashes the text in `draft` for Down to restore.
+            let (input_w, _) = input_view_size(state);
+            if !state.input.move_up(input_w) {
+                state.input.history_up();
+            }
         }
         return vec![];
     }
@@ -701,6 +743,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         } else if state.input.history_index.is_some() {
             state.input.history_down();
+        } else if !state.input.is_empty() {
+            // Multi-line prompt: Down walks wrapped visual lines; a single
+            // line or the last line is a no-op.
+            let (input_w, _) = input_view_size(state);
+            state.input.move_down(input_w);
         }
         return vec![];
     }
@@ -709,6 +756,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     if action == Some(KeyAction::ClearInput) {
         state.input.text.clear();
         state.input.cursor = 0;
+        state.input.vert_goal = None;
         return vec![];
     }
 
@@ -828,6 +876,7 @@ fn complete_slash_command(state: &mut AppState) -> bool {
             let name = &cmd.name;
             state.input.text = format!("/{name} ");
             state.input.cursor = state.input.text.chars().count();
+            state.input.vert_goal = None;
             state.input.slash_index = 0;
             return true;
         }

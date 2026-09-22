@@ -446,6 +446,11 @@ pub enum PermissionDecision {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     pub id: PermissionId,
+    /// The asking agent. Serialized as `asking_agent` (alias `agent` for
+    /// older payloads): inside a flattened `TranscriptItem` the outer
+    /// `agent` field is authoritative and an inner `agent` key would
+    /// duplicate-collide on deserialize.
+    #[serde(rename = "asking_agent", alias = "agent")]
     pub agent: AgentId,
     pub agent_name: String,
     pub call_id: CallId,

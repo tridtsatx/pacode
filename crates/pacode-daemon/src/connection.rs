@@ -37,6 +37,16 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Fire-and-forget MCP status refresh. `ListMcpServers` walks the pool —
+/// listing prompts of a ready server can start a lazy one — so it always
+/// runs detached; a client reply must never wait on it.
+fn spawn_mcp_status_refresh(core: &Arc<Core>) {
+    let core = Arc::clone(core);
+    tokio::spawn(async move {
+        let _ = core.handle_global(&Request::ListMcpServers).await;
+    });
+}
+
 async fn send_reply(tx: &mpsc::Sender<String>, id: u64, reply: Reply) -> bool {
     let msg = ServerMessage::Reply { id, reply };
     match serde_json::to_string(&msg) {
@@ -224,22 +234,34 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
             },
             Request::Attach(attach) => {
                 log::info!("client {} attaching: attach={attach:?}", hello.client_id);
-                let _ = core.handle_global(&Request::ListMcpServers).await;
+                spawn_mcp_status_refresh(&core);
                 if let Some(handle) = forwarder_handle.take() {
                     handle.abort();
                 }
                 // Pick up config edits (api keys, defaults) without a daemon restart.
-                match pacode_config::load(&control.paths) {
-                    Ok(cfg) => {
-                        let mut api_keys = std::collections::BTreeMap::new();
-                        for (id, pcfg) in &cfg.providers {
-                            api_keys.insert(id.clone(), pacode_config::resolve_api_key(pcfg));
-                        }
-                        if let Err(e) = core.reload_config(cfg, &api_keys) {
-                            log::warn!("config reload failed: {e}");
-                        }
+                // `load` is synchronous disk IO and `reload_config` builds a fresh
+                // provider registry — both run on a blocking thread; the task is
+                // still awaited so the fresh config applies to this attach.
+                {
+                    let core = Arc::clone(&core);
+                    let paths = control.paths.clone();
+                    let reload =
+                        tokio::task::spawn_blocking(move || match pacode_config::load(&paths) {
+                            Ok(cfg) => {
+                                let mut api_keys = std::collections::BTreeMap::new();
+                                for (id, pcfg) in &cfg.providers {
+                                    api_keys
+                                        .insert(id.clone(), pacode_config::resolve_api_key(pcfg));
+                                }
+                                if let Err(e) = core.reload_config(cfg, &api_keys) {
+                                    log::warn!("config reload failed: {e}");
+                                }
+                            }
+                            Err(e) => log::warn!("config reload failed: {e}"),
+                        });
+                    if let Err(e) = reload.await {
+                        log::warn!("config reload task failed: {e}");
                     }
-                    Err(e) => log::warn!("config reload failed: {e}"),
                 }
                 match core.open_session(attach).await {
                     Err(err) => {
@@ -297,7 +319,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                     "client {} detaching from session {attached_session:?}",
                     hello.client_id
                 );
-                let _ = core.handle_global(&Request::ListMcpServers).await;
+                spawn_mcp_status_refresh(&core);
                 if let Some(handle) = forwarder_handle.take() {
                     handle.abort();
                 }
@@ -305,7 +327,7 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                 Reply::Ok
             }
             Request::Ping => {
-                let _ = core.handle_global(&Request::ListMcpServers).await;
+                spawn_mcp_status_refresh(&core);
                 Reply::Pong
             }
             Request::Shutdown { force } => {

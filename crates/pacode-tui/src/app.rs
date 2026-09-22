@@ -15,9 +15,12 @@
 //! draws a frame that clears both (otherwise a deferred draw is scheduled for
 //! the earliest pending gate). Nothing ticks in the idle state.
 //!
-//! Startup: connect (spawning the daemon), attach, apply the snapshot, send
-//! `initial_prompt` if any, then loop. On `quit`: leave the alt screen and close the
-//! client (the daemon and its sessions keep running).
+//! Startup: paint the first frame, connect (spawning the daemon), then loop —
+//! the attach runs as a background request so keys work while the daemon is
+//! still opening the session. Its snapshot lands via `BgResponse::AttachFinished`,
+//! which applies it, flushes requests queued meanwhile, and sends
+//! `initial_prompt` plus the post-attach list batch. On `quit`: leave the alt
+//! screen and close the client (the daemon and its sessions keep running).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,7 +42,14 @@ use crate::terminal::TerminalGuard;
 use crate::ui;
 use crate::{TuiError, TuiOptions};
 
+/// Cap on session-bound requests queued while the attach is in flight —
+/// past it the oldest is dropped; a user cannot out-type a snapshot.
+const PENDING_REQUESTS_CAP: usize = 16;
+
 enum BgResponse {
+    /// The startup `client.attach()` resolved — `Ok` carries the session
+    /// snapshot; `Err` is fatal (fail-fast, like the old synchronous attach).
+    AttachFinished(Result<pacode_types::SessionSnapshot, pacode_client::ClientError>),
     Reply {
         /// Which cached list the request refreshed — `None` for non-list
         /// requests. Drives `state.lists` freshness/in-flight tracking (§8.2).
@@ -118,7 +128,9 @@ enum BgResponse {
     },
 }
 
-pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> {
+/// `None` when the loop exited before a session attached (the attach is a
+/// background request — quitting during it is allowed).
+pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>, TuiError> {
     let timing = crate::timing::enabled();
     let t_start = Instant::now();
     log::info!("TUI starting up");
@@ -144,6 +156,8 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     state.paths = opts.client.paths.clone();
     state.cache = crate::cache::DiskCache::new(state.paths.cache_dir.clone());
     state.connection = crate::state::Connection::Connecting;
+    // The `-p` prompt flies once the attach lands — `AttachFinished` sends it.
+    state.initial_prompt = opts.initial_prompt.take();
     crate::timing::mark(timing, "app_state_new", t);
 
     let t = Instant::now();
@@ -178,24 +192,28 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     let t = Instant::now();
     let (client, mut events) = Client::connect(opts.client).await?;
     crate::timing::mark(timing, "client_connect", t);
-    let t = Instant::now();
-    let snapshot = client.attach(opts.attach.clone()).await?;
-    crate::timing::mark(timing, "attach_snapshot", t);
-    let session_id = snapshot.meta.id.clone();
-    log::info!("TUI attached to session {session_id}");
     let client = Arc::new(client);
 
-    state.slots[0] = Some(crate::state::SessionSlot {
-        id: snapshot.meta.id.clone(),
-        title: snapshot.meta.title(),
-        turns: snapshot.usage.turns,
-        context_tokens: snapshot.usage.context_tokens,
-        agents_count: snapshot.agents.len(),
-        tasks_count: snapshot.tasks.len(),
-    });
-    let t = Instant::now();
-    state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
-    crate::timing::mark(timing, "apply_snapshot", t);
+    let mut term_events = EventStream::new();
+    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgResponse>();
+
+    // The attach is the slow part of startup — a cold session open may wait
+    // on the daemon's store and MCP work — so it runs as a background
+    // request and the event loop starts now. `AttachFinished` applies the
+    // snapshot, flushes `state.pending_requests`, sends `initial_prompt`,
+    // and fires the §8.2 post-attach list batch. `client.attach` (not a raw
+    // `request`) keeps the remembered session populated for reconnects.
+    let t_attach = Instant::now();
+    {
+        let cl = Arc::clone(&client);
+        let attach = opts.attach.clone();
+        let tx = bg_tx.clone();
+        tokio::spawn(async move {
+            let res = cl.attach(attach).await;
+            crate::timing::mark(timing, "attach_snapshot", t_attach);
+            let _ = tx.send(BgResponse::AttachFinished(res));
+        });
+    }
 
     let t = Instant::now();
     let font_outcome = term_guard.apply_font(&opts.config.font);
@@ -211,44 +229,6 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     }
     for warning in std::mem::take(&mut state.keymap_warnings) {
         state.push_toast(ToastLevel::Warn, warning, None, Instant::now());
-    }
-
-    if let Some(prompt) = opts.initial_prompt {
-        let _ = client
-            .ok(Request::UserMessage {
-                text: prompt,
-                images: Vec::new(),
-            })
-            .await;
-    }
-
-    let mut term_events = EventStream::new();
-    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgResponse>();
-
-    // §8.2: every post-attach list refresh runs in parallel — none may block
-    // a frame. Each reply folds in independently, replaces its state section
-    // wholesale and rewrites its cache file. (`ListSkills` does not exist in
-    // the protocol: skills ride inside `PluginInfo.skill_dirs`.)
-    for act in [
-        Action::Send(Request::ListPlugins),
-        Action::Send(Request::ListMcpServers),
-        Action::Send(Request::ListSessions { limit: 50 }),
-        Action::Send(Request::ListModels),
-        Action::GitLog { after: None },
-    ] {
-        dispatch_action(act, &mut state, &client, &bg_tx);
-    }
-    if !state.config.plugins.marketplace.is_empty() {
-        let source = state.config.plugins.marketplace.clone();
-        dispatch_action(
-            Action::Send(Request::BrowseMarketplace {
-                source,
-                query: String::new(),
-            }),
-            &mut state,
-            &client,
-            &bg_tx,
-        );
     }
 
     // `ui.ups = "auto"` probes external tools (hyprctl/wlr-randr/xrandr —
@@ -518,9 +498,18 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             client_ev = events.recv() => {
                 match client_ev {
                     Some(ev) => {
+                        let snapshot_landed = matches!(ev, ClientEvent::Snapshot(_));
                         state.apply_client_event(ev, Instant::now());
                         if let Some(req) = state.drain_prompt_queue() {
                             dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                        }
+                        if snapshot_landed {
+                            // A reconnect snapshot can land while requests
+                            // sat queued behind a missing session — flush
+                            // them now that one is attached.
+                            while let Some(req) = state.pending_requests.pop_front() {
+                                dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                            }
                         }
                     }
                     None => {
@@ -605,12 +594,13 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         }
     }
 
-    let attached_session = state
-        .meta
-        .as_ref()
-        .map(|m| m.id.clone())
-        .unwrap_or(session_id);
-    log::info!("TUI loop ended, quitting session {attached_session}");
+    // `None` is a real outcome: quitting while the background attach was
+    // still in flight means no session was ever attached.
+    let attached_session = state.meta.as_ref().map(|m| m.id.clone());
+    match &attached_session {
+        Some(id) => log::info!("TUI loop ended, quitting session {id}"),
+        None => log::info!("TUI loop ended before a session attached"),
+    }
     for (area, _) in active_image_escapes.drain(..) {
         let _ = term_guard.clear_image_area(area);
     }
@@ -618,6 +608,11 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     drop(bg_rx);
     if let Ok(c) = Arc::try_unwrap(client) {
         c.close().await;
+    }
+    // A failed startup attach propagated through `state.attach_error` — the
+    // CLI prints it the same way the old synchronous `?` did.
+    if let Some(err) = state.attach_error.take() {
+        return Err(err.into());
     }
     Ok(attached_session)
 }
@@ -630,6 +625,8 @@ fn dispatch_action(
 ) {
     match act {
         Action::Quit => {
+            // Nothing queued behind the attach will ever be sent.
+            state.pending_requests.clear();
             state.quit = true;
         }
         Action::Send(req) => {
@@ -649,6 +646,14 @@ fn dispatch_action(
                 }
                 other => other,
             };
+            // While no session is attached there is nothing for a
+            // session-bound request to land on — it waits in
+            // `pending_requests` and flushes when the snapshot arrives.
+            // Global requests (lists, auth, MCP, a second `Attach`) fly now.
+            if state.meta.is_none() && request_needs_session(&req) {
+                queue_pending_request(state, req);
+                return;
+            }
             // §8.2: a list request marks its section in-flight (the pickers
             // show `loading…` until the reply clears it).
             let kind = crate::cache::ListKind::for_request(&req);
@@ -703,7 +708,7 @@ fn dispatch_action(
             };
             let now = now_ms();
             let output = err_msg.unwrap_or_default();
-            state.transcript.cells.push_back(Cell {
+            state.transcript.push_cell(Cell {
                 id: now,
                 kind: CellKind::Item(TranscriptKind::BashCommand {
                     command,
@@ -731,6 +736,12 @@ fn dispatch_action(
             });
         }
         Action::GitLog { after } => {
+            if state.meta.is_none() {
+                // No session yet — the fetch would only earn "not attached".
+                // The post-attach batch sends a fresh `GitLog` anyway, and a
+                // page want re-arms on the next `dispatch_deferred` pass.
+                return;
+            }
             state.git.begin_log(after.as_deref());
             state.lists.mark_sent(crate::cache::ListKind::GitLog);
             state.dirty = true;
@@ -745,6 +756,12 @@ fn dispatch_action(
             });
         }
         Action::GitShow { hash } => {
+            if state.meta.is_none() {
+                // `dispatch_deferred` already marked the want in flight —
+                // undo so it re-arms and refires once a session exists.
+                state.git.show_in_flight = None;
+                return;
+            }
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
@@ -753,6 +770,12 @@ fn dispatch_action(
             });
         }
         Action::GitDiff { hash } => {
+            if state.meta.is_none() {
+                // A deliberate `enter` — queue it: the `Reply::GitDiff`
+                // lands via `handle_reply` and fills the commit-diff panel.
+                queue_pending_request(state, Request::GitDiff { hash });
+                return;
+            }
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
@@ -761,6 +784,10 @@ fn dispatch_action(
             });
         }
         Action::LoadPanel => {
+            if state.meta.is_none() {
+                // Panel targets only exist once a session is attached.
+                return;
+            }
             if let Some(ref target) = state.panel.target {
                 let target = target.clone();
                 // The MCP log is read locally off the daemon log file by
@@ -796,6 +823,11 @@ fn dispatch_action(
             }
         }
         Action::LoadHistory => {
+            if state.meta.is_none() {
+                // `has_more_history` only ever comes from a snapshot, so this
+                // cannot fire pre-attach anyway — defensive early return.
+                return;
+            }
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             let first_cell_id = state.transcript.oldest_seq();
@@ -814,6 +846,114 @@ fn dispatch_action(
             });
         }
     }
+}
+
+/// Whether the daemon needs an attached session to answer this request:
+/// everything `Core::handle_global` serves (plus the connection-level
+/// requests the daemon's serve loop answers itself) may fly before the first
+/// attach lands; the rest waits in `state.pending_requests`.
+fn request_needs_session(req: &Request) -> bool {
+    match req {
+        // Connection-level — `connection::serve_connection` answers these.
+        Request::Hello(_)
+        | Request::Attach(_)
+        | Request::Detach
+        | Request::Shutdown { .. }
+        | Request::Ping
+        // `Core::handle_global` — no session needed.
+        | Request::ListSessions { .. }
+        | Request::ListModels
+        | Request::RefreshModels
+        | Request::ListMcpServers
+        | Request::RestartMcpServer { .. }
+        | Request::SetMcpServerEnabled { .. }
+        | Request::GetMcpPrompt { .. }
+        | Request::ListPlugins
+        | Request::RunPluginCommand { .. }
+        | Request::BrowseMarketplace { .. }
+        | Request::InstallPlugin { .. }
+        | Request::UninstallPlugin { .. }
+        | Request::ListAuth
+        | Request::Login { .. }
+        | Request::Logout { .. }
+        | Request::SetAuthAccount { .. } => false,
+        Request::UserMessage { .. }
+        | Request::Interrupt
+        | Request::InterruptAll
+        | Request::PermissionReply { .. }
+        | Request::SetModel(_)
+        | Request::SetEffort(_)
+        | Request::SetMode(_)
+        | Request::SetZdr(_)
+        | Request::SetModelFlag { .. }
+        | Request::StopAgent(_)
+        | Request::KillTask(_)
+        | Request::AckTask(_)
+        | Request::GetSnapshot
+        | Request::GetHistory { .. }
+        | Request::GetTaskOutput { .. }
+        | Request::Compact
+        | Request::DetachTurn
+        | Request::AnswerQuestion { .. }
+        | Request::ListCronJobs
+        | Request::AddCronJob { .. }
+        | Request::RemoveCronJob(_)
+        | Request::SetCronEnabled { .. }
+        | Request::RunCronJobNow(_)
+        | Request::ListMonitors
+        | Request::StopMonitor(_)
+        | Request::GitLog { .. }
+        | Request::GitShow { .. }
+        | Request::GitDiff { .. } => true,
+    }
+}
+
+/// Queue a session-bound request until a session attaches. Bounded: a flood
+/// drops the oldest entry rather than growing without limit.
+fn queue_pending_request(state: &mut AppState, req: Request) {
+    if state.pending_requests.len() >= PENDING_REQUESTS_CAP {
+        let dropped = state.pending_requests.pop_front();
+        log::warn!(
+            "pending request queue full ({PENDING_REQUESTS_CAP}); dropped oldest: {dropped:?}"
+        );
+    }
+    state.pending_requests.push_back(req);
+}
+
+/// Fold an attach/snapshot reply into state: record the slot, apply the
+/// snapshot, flush requests queued while no session existed, and re-fetch
+/// the git list on a project switch (§8.2). Shared by `Reply::Attached`/
+/// `Reply::Snapshot` in [`handle_reply`] and `BgResponse::AttachFinished`.
+fn apply_attach_snapshot(
+    state: &mut AppState,
+    snapshot: pacode_types::SessionSnapshot,
+) -> Vec<Action> {
+    // §8.2 project switch: a new cwd means the old project's git list must
+    // not linger — `apply_client_event` resets the state and the
+    // per-project cache key does the file side. Re-fetch for the new
+    // project so the submenu is populated when opened.
+    let project_changed = state
+        .meta
+        .as_ref()
+        .is_some_and(|m| m.cwd != snapshot.meta.cwd);
+    let slot_idx = state.active_slot;
+    state.record_slot(
+        slot_idx,
+        &snapshot.meta,
+        &snapshot.usage,
+        snapshot.agents.len(),
+        snapshot.tasks.len(),
+    );
+    state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+    state.dirty = true;
+    // Session-bound requests queued while `meta` was empty — the startup
+    // attach gap, or between Detach and Attach on a slot switch — go out
+    // in order now that a session exists.
+    let mut actions: Vec<Action> = state.pending_requests.drain(..).map(Action::Send).collect();
+    if project_changed {
+        actions.push(Action::GitLog { after: None });
+    }
+    actions
 }
 
 /// Service the work items the draw path recorded this pass: completion scans,
@@ -1073,6 +1213,52 @@ fn resolve_preview_path(raw: &str, cwd: &std::path::Path) -> std::path::PathBuf 
 
 fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
     match res {
+        BgResponse::AttachFinished(res) => match res {
+            Ok(snapshot) => {
+                let session_id = snapshot.meta.id.clone();
+                log::info!("TUI attached to session {session_id}");
+                let mut actions = apply_attach_snapshot(state, snapshot);
+                // Order matters: what the user typed during the gap first,
+                // then the `-p` prompt, then the §8.2 list batch — all only
+                // now that a session exists for them to land on.
+                if let Some(prompt) = state.initial_prompt.take() {
+                    actions.push(Action::Send(Request::UserMessage {
+                        text: prompt,
+                        images: Vec::new(),
+                    }));
+                }
+                // §8.2: every post-attach list refresh runs in parallel —
+                // none may block a frame. Each reply folds in independently,
+                // replaces its state section wholesale and rewrites its
+                // cache file. (`ListSkills` does not exist in the protocol:
+                // skills ride inside `PluginInfo.skill_dirs`.)
+                actions.extend([
+                    Action::Send(Request::ListPlugins),
+                    Action::Send(Request::ListMcpServers),
+                    Action::Send(Request::ListSessions { limit: 50 }),
+                    Action::Send(Request::ListModels),
+                    Action::GitLog { after: None },
+                ]);
+                if !state.config.plugins.marketplace.is_empty() {
+                    let source = state.config.plugins.marketplace.clone();
+                    actions.push(Action::Send(Request::BrowseMarketplace {
+                        source,
+                        query: String::new(),
+                    }));
+                }
+                actions
+            }
+            Err(err) => {
+                log::error!("startup attach failed: {err}");
+                state.push_notice_with_level(ToastLevel::Error, format!("attach failed: {err}"));
+                // Fail fast, exactly like the old synchronous attach: the
+                // loop exits on `quit` and `run` returns the error for the
+                // CLI to print.
+                state.attach_error = Some(err);
+                state.quit = true;
+                vec![]
+            }
+        },
         BgResponse::Reply { kind, res } => {
             // §8.2: the reply ends the in-flight mark; a successful one
             // promotes the section to `Fresh`, a failed one leaves the cached
@@ -1267,7 +1453,7 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                         out.truncated
                     );
                     let now = now_ms();
-                    state.transcript.cells.push_back(Cell {
+                    state.transcript.push_cell(Cell {
                         id: now,
                         kind: CellKind::Item(TranscriptKind::BashCommand {
                             command: out.command,
@@ -1284,7 +1470,7 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                 Err(err) => {
                     log::warn!("bash-mode captured error: {err}");
                     let now = now_ms();
-                    state.transcript.cells.push_back(Cell {
+                    state.transcript.push_cell(Cell {
                         id: now,
                         kind: CellKind::Item(TranscriptKind::Notice {
                             level: ToastLevel::Error,
@@ -1312,7 +1498,7 @@ fn handle_reply(
     match res {
         Ok(Reply::Error { message }) => {
             let now = now_ms();
-            state.transcript.cells.push_back(Cell {
+            state.transcript.push_cell(Cell {
                 id: now,
                 kind: CellKind::Item(TranscriptKind::Notice {
                     level: ToastLevel::Error,
@@ -1415,34 +1601,12 @@ fn handle_reply(
             PluginCommandOutcome::Nothing => vec![],
         },
         Ok(Reply::Attached(snapshot)) | Ok(Reply::Snapshot(snapshot)) => {
-            // §8.2 project switch: a new cwd means the old project's git list
-            // must not linger — `apply_client_event` resets the state and the
-            // per-project cache key does the file side. Re-fetch for the new
-            // project so the submenu is populated when opened.
-            let project_changed = state
-                .meta
-                .as_ref()
-                .is_some_and(|m| m.cwd != snapshot.meta.cwd);
-            let slot_idx = state.active_slot;
-            state.record_slot(
-                slot_idx,
-                &snapshot.meta,
-                &snapshot.usage,
-                snapshot.agents.len(),
-                snapshot.tasks.len(),
-            );
-            state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
-            state.dirty = true;
-            if project_changed {
-                vec![Action::GitLog { after: None }]
-            } else {
-                vec![]
-            }
+            apply_attach_snapshot(state, snapshot)
         }
         Ok(_) => vec![],
         Err(err) => {
             let now = now_ms();
-            state.transcript.cells.push_back(Cell {
+            state.transcript.push_cell(Cell {
                 id: now,
                 kind: CellKind::Item(TranscriptKind::Notice {
                     level: ToastLevel::Error,

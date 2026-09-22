@@ -538,6 +538,34 @@ impl McpPool {
         Ok(tools)
     }
 
+    /// [`Self::list_all_tools`] answered purely from the schema cache: a hit
+    /// serves the cached schema — for an enabled lazy server it also marks the
+    /// status `Ready`, exactly like the live variant's lazy branch — and a
+    /// miss contributes nothing. Nothing here spawns a server or reaps idle
+    /// clients, so the attach path can call it synchronously without paying
+    /// for MCP startup.
+    pub fn list_all_tools_cached(&self) -> Vec<(String, McpToolInfo)> {
+        let mut all = Vec::new();
+        for (server, cfg) in self.all_server_configs() {
+            if !cfg.enabled {
+                continue;
+            }
+            let Some(schema) = self.get_cached_schema(&server, &cfg) else {
+                continue;
+            };
+            if cfg.lazy {
+                self.update_status_ready(&server);
+            }
+            for tool in schema.tools {
+                all.push((server.clone(), tool));
+            }
+        }
+        all.sort_by(|a, b| {
+            (a.0.as_str(), a.1.name.as_str()).cmp(&(b.0.as_str(), b.1.name.as_str()))
+        });
+        all
+    }
+
     pub async fn list_all_resources(&self) -> Vec<(String, McpResource)> {
         self.reap_idle().await;
         let mut all = Vec::new();
@@ -578,6 +606,27 @@ impl McpPool {
         self.save_cache(server, &cfg, &tools, &resources, &prompts);
         self.update_status_ready(server);
         Ok(resources)
+    }
+
+    /// [`Self::list_all_resources`] answered purely from the schema cache —
+    /// a hit serves the cached resources, a miss contributes nothing, and no
+    /// server is spawned or reaped. Matches the live variant's lazy branch,
+    /// which likewise leaves the status untouched.
+    pub fn list_all_resources_cached(&self) -> Vec<(String, McpResource)> {
+        let mut all = Vec::new();
+        for (server, cfg) in self.all_server_configs() {
+            if !cfg.enabled {
+                continue;
+            }
+            let Some(schema) = self.get_cached_schema(&server, &cfg) else {
+                continue;
+            };
+            for item in schema.resources {
+                all.push((server.clone(), item));
+            }
+        }
+        all.sort_by(|a, b| (a.0.as_str(), a.1.uri.as_str()).cmp(&(b.0.as_str(), b.1.uri.as_str())));
+        all
     }
 
     pub async fn list_all_prompts(&self) -> Vec<(String, McpPrompt)> {
@@ -622,6 +671,29 @@ impl McpPool {
         self.save_cache(server, &cfg, &tools, &resources, &prompts);
         self.update_status_ready(server);
         Ok(prompts)
+    }
+
+    /// [`Self::list_all_prompts`] answered purely from the schema cache —
+    /// a hit serves the cached prompts, a miss contributes nothing, and no
+    /// server is spawned or reaped. Matches the live variant's lazy branch,
+    /// which likewise leaves the status untouched.
+    pub fn list_all_prompts_cached(&self) -> Vec<(String, McpPrompt)> {
+        let mut all = Vec::new();
+        for (server, cfg) in self.all_server_configs() {
+            if !cfg.enabled {
+                continue;
+            }
+            let Some(schema) = self.get_cached_schema(&server, &cfg) else {
+                continue;
+            };
+            for item in schema.prompts {
+                all.push((server.clone(), item));
+            }
+        }
+        all.sort_by(|a, b| {
+            (a.0.as_str(), a.1.name.as_str()).cmp(&(b.0.as_str(), b.1.name.as_str()))
+        });
+        all
     }
 
     async fn with_retry<T, F, Fut>(&self, server: &str, f: F) -> Result<T, McpError>

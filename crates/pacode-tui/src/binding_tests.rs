@@ -460,6 +460,10 @@ fn test_keymap_action_for() {
     );
     assert_eq!(
         keymap.action_for(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT)),
+        Some(Action::DeleteLine)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL)),
         Some(Action::DeleteWordForward)
     );
     assert_eq!(
@@ -610,4 +614,77 @@ fn test_queue_actions_present_in_defaults() {
             mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
         }]
     );
+}
+
+#[test]
+fn test_editing_actions_defaults_scope_and_resolution() {
+    let keymap = Keymap::defaults();
+
+    // ctrl+arrows: word jumps and whole-input boundaries.
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)),
+        Some(Action::MoveWordLeft)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)),
+        Some(Action::MoveWordRight)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+        Some(Action::MoveStart)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)),
+        Some(Action::MoveEnd)
+    );
+
+    // Delete chords: alt+delete kills the line, ctrl+delete the next word,
+    // ctrl/alt+backspace the previous word (ctrl+w stays).
+    assert_eq!(
+        keymap.bindings_for(Action::DeleteWordBack),
+        &[
+            Binding {
+                code: KeyCode::Char('w'),
+                mods: KeyModifiers::CONTROL,
+            },
+            Binding {
+                code: KeyCode::Backspace,
+                mods: KeyModifiers::CONTROL,
+            },
+            Binding {
+                code: KeyCode::Backspace,
+                mods: KeyModifiers::ALT,
+            },
+        ]
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        Some(Action::DeleteWordBack)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+        Some(Action::DeleteWordBack)
+    );
+
+    // Plain arrows/backspace stay unbound — the code path owns them.
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        None
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        None
+    );
+
+    // All five are prompt-scoped and serialize to snake_case names.
+    for (act, name) in [
+        (Action::MoveWordLeft, "move_word_left"),
+        (Action::MoveWordRight, "move_word_right"),
+        (Action::MoveStart, "move_start"),
+        (Action::MoveEnd, "move_end"),
+        (Action::DeleteLine, "delete_line"),
+    ] {
+        assert_eq!(act.scope(), Scope::Prompt);
+        assert_eq!(act.name(), name);
+    }
 }
