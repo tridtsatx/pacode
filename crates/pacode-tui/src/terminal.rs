@@ -123,19 +123,16 @@ impl TerminalGuard {
         Ok(())
     }
 
-    /// Clear an image preview area by sending kitty delete command and overwriting cells with spaces.
-    pub fn clear_image_area(&mut self, area: ratatui::layout::Rect) -> std::io::Result<()> {
+    /// Clear input-strip image escapes. Kitty gets an explicit delete;
+    /// iterm2/sixel have no delete command, so the caller must follow with
+    /// `terminal.clear()` before the next draw — that repaints the text cells
+    /// the images covered. Never overwrite those cells with spaces here:
+    /// direct tty writes the buffer knows nothing about corrupt ratatui's
+    /// diff and leave holes (e.g. a truncated separator line).
+    pub fn clear_image_escapes(&mut self) -> std::io::Result<()> {
         let mut stdout = std::io::stdout();
-        execute!(stdout, SavePosition)?;
         let _ = stdout.write_all(b"\x1b_Ga=d,d=a\x1b\\");
-        let spaces = " ".repeat(area.width as usize);
-        for row in 0..area.height {
-            let _ = execute!(stdout, MoveTo(area.x, area.y + row));
-            let _ = stdout.write_all(spaces.as_bytes());
-        }
-        execute!(stdout, RestorePosition)?;
-        stdout.flush()?;
-        Ok(())
+        stdout.flush()
     }
 }
 

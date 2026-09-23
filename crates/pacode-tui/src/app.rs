@@ -272,6 +272,9 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     // post-draw flush can diff and never re-send tens of MB of kitty/sixel
     // payload per frame.
     let mut active_image_escapes: Vec<(ratatui::layout::Rect, String)> = Vec::new();
+    // Set when escapes were removed/moved: the next draw must repaint the
+    // cells the images covered (ratatui's diff can't see tty pixels).
+    let mut needs_image_repaint = false;
 
     loop {
         let files_view = files_view_on_screen(&state);
@@ -320,6 +323,14 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             // `CompletedFrame` borrow is dropped before `end_sync` so the sync
             // region still closes when `draw` errored.
             term_guard.begin_sync();
+            if needs_image_repaint {
+                // Image escapes were removed or moved last frame: the tty
+                // pixels they occupied sit on cells ratatui's buffer already
+                // considers painted, so a plain diff would leave ghosts. A
+                // buffer reset forces a full repaint inside the sync region.
+                let _ = term_guard.terminal.clear();
+                needs_image_repaint = false;
+            }
             let draw_res = term_guard
                 .terminal
                 .draw(|f| {
@@ -346,8 +357,9 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             // emitted only on change.
             let next_escapes = std::mem::take(&mut state.pending_image_escapes);
             if next_escapes != active_image_escapes {
-                for (old_area, _) in active_image_escapes.drain(..) {
-                    let _ = term_guard.clear_image_area(old_area);
+                if !active_image_escapes.is_empty() {
+                    let _ = term_guard.clear_image_escapes();
+                    needs_image_repaint = true;
                 }
                 for (area, esc) in &next_escapes {
                     let _ = term_guard.draw_image_escape(*area, esc);
@@ -652,8 +664,9 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         Some(id) => log::info!("TUI loop ended, quitting session {id}"),
         None => log::info!("TUI loop ended before a session attached"),
     }
-    for (area, _) in active_image_escapes.drain(..) {
-        let _ = term_guard.clear_image_area(area);
+    if !active_image_escapes.is_empty() {
+        let _ = term_guard.clear_image_escapes();
+        active_image_escapes.clear();
     }
     drop(events);
     drop(bg_rx);
