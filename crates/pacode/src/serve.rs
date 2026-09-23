@@ -23,6 +23,16 @@ pub fn run(
         return Ok(());
     }
 
+    // The daemon re-executes the `pacode` binary; rename the process so it
+    // shows up as `pacode-daemon` (15-byte comm limit) in top/btop instead
+    // of masquerading as the TUI.
+    #[cfg(target_os = "linux")]
+    // SAFETY: PR_SET_NAME copies a NUL-terminated name out of our address
+    // space and writes only this task's comm; the literal is NUL-terminated.
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, c"pacode-daemon".as_ptr(), 0, 0, 0);
+    }
+
     let log_level =
         pacode_config::logging::level_from_env(std::env::var("PACODE_LOG").ok().as_deref())
             .unwrap_or_else(|| {
