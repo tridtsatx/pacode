@@ -288,14 +288,16 @@ impl DevinStreamOpener {
             None
         };
 
-        loop {
-            let req_bytes = encode_get_chat_message_request(
-                &self.session_token,
-                &self.req,
-                &self.cfg,
-                self.assignment_jwt.as_deref(),
-            );
+        // The request is identical across retries — encode the proto once and
+        // resend the same bytes instead of re-walking the message history.
+        let req_bytes = encode_get_chat_message_request(
+            &self.session_token,
+            &self.req,
+            &self.cfg,
+            self.assignment_jwt.as_deref(),
+        );
 
+        loop {
             let stream_result = self
                 .connect_client
                 .server_stream_with_idle_timeout(

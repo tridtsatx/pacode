@@ -2,6 +2,8 @@
 //!
 //! Protocol specifications captured from live Devin CLI traffic.
 
+use std::sync::Arc;
+
 use pacode_types::{ContentBlock, Message, ProviderConfig, Role, ToolDefinition};
 
 use super::proto::{self, ProtoError, WireType};
@@ -139,7 +141,7 @@ pub fn model_supports_vision(_model: &str) -> bool {
 /// Encode messages from the conversation history into protobuf messages.
 // Field 10 { 1 base64_data, 2 mime_type } of a message is the image attachment
 // convention observed in live traffic (spec §1).
-pub fn encode_messages(messages: &[Message], supports_vision: bool) -> Vec<proto::Writer> {
+pub fn encode_messages(messages: &[Arc<Message>], supports_vision: bool) -> Vec<proto::Writer> {
     let mut encoded = Vec::new();
 
     for msg in messages {

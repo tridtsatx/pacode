@@ -361,7 +361,12 @@ impl Provider for Devin {
             // Must be the same id the chat request sends in field 16: the assignment
             // token is bound to the conversation.
             let conversation_id = crate::devin::wire::conversation_id(&req);
-            let latest_user_msg = req.messages.iter().rev().find(|m| m.role == Role::User);
+            let latest_user_msg = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .map(|m| &**m);
             let req_bytes = encode_assign_model_request(
                 &self.session_token,
                 "adaptive",

@@ -9,8 +9,8 @@ use pacode_provider::mock::{MockProvider, MockResponse};
 use pacode_store::Store;
 use pacode_tools::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, ToolRegistry};
 use pacode_types::{
-    AgentId, AgentStatus, Attach, Config, Effort, Event, ModelRoute, Reply, Request, Role, TurnId,
-    TurnStop,
+    AgentId, AgentStatus, Attach, CallId, Config, ContentBlock, Effort, Event, Message, ModelRoute,
+    Reply, Request, Role, TurnId, TurnStop,
 };
 
 use crate::core::{Core, CoreDeps};
@@ -39,6 +39,33 @@ impl Tool for PanicTool {
         _ctx: &ToolCtx,
     ) -> Result<ToolOutput, ToolError> {
         panic!("intentional test panic in panic_tool");
+    }
+}
+
+/// A tool that only resolves once the turn's cancel token fires — lets a test
+/// land an interrupt while dispatch is mid-execution.
+struct BlockTool;
+#[async_trait::async_trait]
+impl Tool for BlockTool {
+    fn name(&self) -> &'static str {
+        "block_tool"
+    }
+    fn description(&self) -> &'static str {
+        "Blocks until the turn is cancelled (test fixture)"
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        ctx.cancel.cancelled().await;
+        Err(ToolError::Cancelled)
     }
 }
 
@@ -77,6 +104,7 @@ async fn setup_test_session() -> (
     let paths = Paths::under(temp_dir.path());
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(PanicTool));
+    tools.register(Arc::new(BlockTool));
 
     let deps = CoreDeps {
         marketplace: std::sync::Arc::new(pacode_plugin::marketplace::Marketplace::new(
@@ -806,6 +834,57 @@ async fn wait_until(mut f: impl FnMut() -> bool) {
     panic!("condition not met within 2s");
 }
 
+/// Wire-shape assertion: every assistant `tool_use` in a request's message
+/// list must be answered by a `tool_result` in the `Role::Tool` run right
+/// after it — the invariant providers 400 on when broken.
+fn assert_no_orphan_tool_uses(messages: &[Arc<Message>]) {
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].role != Role::Assistant {
+            i += 1;
+            continue;
+        }
+        let uses: Vec<CallId> = messages[i]
+            .tool_uses()
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        i += 1;
+        let mut answered: Vec<CallId> = Vec::new();
+        while i < messages.len() && messages[i].role == Role::Tool {
+            for block in &messages[i].content {
+                if let ContentBlock::ToolResult { call_id, .. } = block {
+                    answered.push(call_id.clone());
+                }
+            }
+            i += 1;
+        }
+        for id in uses {
+            assert!(
+                answered.contains(&id),
+                "tool_use {id} has no tool_result in the request"
+            );
+        }
+    }
+}
+
+/// Wait for the main agent's next `TurnEnded` (3 s budget).
+async fn wait_main_turn_end(rx: &mut tokio::sync::broadcast::Receiver<(u64, Event)>) -> TurnStop {
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, stop, .. })) = res
+                    && agent.is_main()
+                {
+                    return stop;
+                }
+            }
+        }
+    }
+}
+
 fn sub_spec(name: &str) -> pacode_tools::AgentSpec {
     pacode_tools::AgentSpec {
         name: Some(name.into()),
@@ -1397,6 +1476,36 @@ async fn panicking_tool_turn_on_main_is_supervised() {
             .is_some_and(|e| e.contains("panicked")),
         "panic must be recorded on the agent info"
     );
+
+    // The crashed turn's `tool_use` must not stay dangling in persisted
+    // history: the supervisor writes a stub result for it.
+    let panic_call_id = {
+        let hist = main.history.lock().unwrap_or_else(|p| p.into_inner());
+        hist.messages
+            .iter()
+            .flat_map(|m| m.tool_uses())
+            .find(|(_, name, _)| *name == "panic_tool")
+            .map(|(id, _, _)| id.clone())
+            .expect("panic_tool tool_use persisted")
+    };
+    {
+        let hist = main.history.lock().unwrap_or_else(|p| p.into_inner());
+        let stubbed = hist.messages.iter().any(|m| {
+            m.role == Role::Tool
+                && m.content.iter().any(|b| {
+                    matches!(b, ContentBlock::ToolResult { call_id, .. } if *call_id == panic_call_id)
+                })
+        });
+        assert!(stubbed, "crash must persist a stub tool_result for the call");
+    }
+
+    // The next turn's request carries the pair cleanly — the exact 400 the
+    // orphaned `tool_use` used to produce on every provider.
+    mock.push(MockResponse::Text("ok".into()));
+    session.submit_user_message("next".into()).await.unwrap();
+    wait_main_turn_end(&mut rx).await;
+    let req = mock.requests().last().unwrap().clone();
+    assert_no_orphan_tool_uses(&req.messages);
 }
 
 /// A panicking subagent turn: the supervisor clears the token, the post-block
@@ -1498,4 +1607,106 @@ async fn interrupted_subagent_without_stop_request_lands_stopped() {
     let stop = crate::turn::lifecycle::handle_interrupted(&session, &main);
     assert_eq!(stop, TurnStop::Interrupted);
     assert_eq!(main.status(), AgentStatus::Idle);
+}
+
+/// A persisted `tool_use` that lost its `tool_result` (a crash under an older
+/// build, a lost store write) self-heals at request build: `for_model` injects
+/// a synthetic result so the provider never sees the orphan.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_tool_use_in_history_is_repaired_in_next_request() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    // Simulate a corrupted persisted tail: an assistant `tool_use` with no
+    // `tool_result` behind it.
+    main.history
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse {
+                id: CallId::new("call_orphaned"),
+                name: "bash".to_string(),
+                input: serde_json::json!({"command": "ls"}),
+            }],
+        ));
+
+    mock.push(MockResponse::Text("ok".into()));
+    session.submit_user_message("hi".into()).await.unwrap();
+    wait_main_turn_end(&mut rx).await;
+
+    let req = mock.requests().last().unwrap().clone();
+    let pos = req
+        .messages
+        .iter()
+        .position(|m| m.tool_uses().any(|(id, _, _)| id.as_str() == "call_orphaned"))
+        .expect("orphan tool_use must still be in the request");
+    let next = &req.messages[pos + 1];
+    assert_eq!(
+        next.role,
+        Role::Tool,
+        "a synthetic result must directly follow the orphaned tool_use"
+    );
+    assert!(next.content.iter().any(|b| matches!(
+        b,
+        ContentBlock::ToolResult {
+            call_id,
+            is_error: true,
+            ..
+        } if call_id.as_str() == "call_orphaned"
+    )));
+    assert_no_orphan_tool_uses(&req.messages);
+}
+
+/// Interrupt while a tool is mid-execution: the in-flight call still gets a
+/// persisted result ("cancelled"), so the next request pairs cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_mid_tool_call_leaves_no_orphan() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("block_tool".into(), serde_json::json!({}))],
+    });
+    session.submit_user_message("go".into()).await.unwrap();
+
+    // Interrupt only once the tool is actually running, then wait out the
+    // unwind: the interrupted turn lands the agent at `Idle`.
+    wait_until(|| main.status() == AgentStatus::RunningTool).await;
+    session.interrupt();
+    assert_eq!(wait_main_turn_end(&mut rx).await, TurnStop::Interrupted);
+    wait_until(|| !main.is_running()).await;
+
+    // The persisted tail must answer the dispatched call.
+    let block_call_id = {
+        let hist = main.history.lock().unwrap_or_else(|p| p.into_inner());
+        hist.messages
+            .iter()
+            .flat_map(|m| m.tool_uses())
+            .find(|(_, name, _)| *name == "block_tool")
+            .map(|(id, _, _)| id.clone())
+            .expect("block_tool tool_use persisted")
+    };
+    {
+        let hist = main.history.lock().unwrap_or_else(|p| p.into_inner());
+        let stubbed = hist.messages.iter().any(|m| {
+            m.role == Role::Tool
+                && m.content.iter().any(|b| {
+                    matches!(b, ContentBlock::ToolResult { call_id, .. } if *call_id == block_call_id)
+                })
+        });
+        assert!(stubbed, "interrupt must persist a tool_result for the call");
+    }
+
+    // And the next request is well formed.
+    mock.push(MockResponse::Text("ok".into()));
+    session.submit_user_message("next".into()).await.unwrap();
+    wait_main_turn_end(&mut rx).await;
+    let req = mock.requests().last().unwrap().clone();
+    assert_no_orphan_tool_uses(&req.messages);
 }

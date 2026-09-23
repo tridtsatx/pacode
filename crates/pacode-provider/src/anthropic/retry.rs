@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use pacode_types::{Effort, StreamEvent};
-use serde_json::Value;
 
 use super::stream::create_anthropic_event_stream;
 use crate::{EventStream, ProviderError};
@@ -13,7 +13,9 @@ pub(crate) struct AnthropicStreamOpener {
     pub(crate) client: reqwest::Client,
     pub(crate) url: String,
     pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Value,
+    /// Body serialized once at request build; `Bytes` makes each retry a
+    /// refcount bump instead of a DOM re-serialization.
+    pub(crate) body: Bytes,
     pub(crate) model: String,
     pub(crate) stream_idle_secs: u64,
     pub(crate) effort: Effort,
@@ -46,7 +48,7 @@ impl AnthropicStreamOpener {
             for (k, v) in &self.headers {
                 req_builder = req_builder.header(k, v);
             }
-            req_builder = req_builder.json(&self.body);
+            req_builder = req_builder.body(self.body.clone());
 
             let send_result = match header_wait {
                 Some(wait) => match tokio::time::timeout(wait, req_builder.send()).await {

@@ -22,7 +22,7 @@ pub async fn generate_title(
         model: model.to_string(),
         system_static,
         system_dynamic: String::new(),
-        messages: vec![Message::user(prompt_user)],
+        messages: vec![Arc::new(Message::user(prompt_user))],
         tools: Vec::new(),
         // Low effort and no output cap: a reasoning model spends a small cap on
         // thinking and returns nothing.

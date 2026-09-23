@@ -235,6 +235,12 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
             Err(err) => (report_turn_crash(&session, &agent, &err), None),
         };
 
+        // A turn that died mid-dispatch (panic/abort) can leave the persisted
+        // assistant `tool_use`s unanswered — the next request would 400 on
+        // every provider (`tool_use ids found without tool_result`). Stub them
+        // before anyone observes the ended turn; an intact tail is a no-op.
+        crate::turn::tools::stub_dangling_tool_calls(&session, &agent).await;
+
         // Always cleared, whatever happened above — this is what was missing
         // when a panic left `cancel` set and the UI stuck on "running".
         *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;

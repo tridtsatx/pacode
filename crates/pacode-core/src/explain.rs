@@ -80,7 +80,7 @@ async fn run(session: &Arc<Session>, req: &PermissionRequest) -> (Option<Explain
         model: route.model.clone(),
         system_static: SYSTEM_PROMPT.to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user(user)],
+        messages: vec![Arc::new(Message::user(user))],
         tools: Vec::new(),
         effort: None,
         max_output_tokens: Some(MAX_OUTPUT_TOKENS),

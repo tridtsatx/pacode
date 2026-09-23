@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::stream::{AnthropicState, parse_anthropic_payload};
 use super::types::{CLAUDE_CODE_IDENTITY, map_tool_name_for_oauth, map_tool_name_from_oauth};
 use super::{Anthropic, AnthropicAuth};
-use crate::{CompletionRequest, Provider, ProviderError};
+use crate::{CompletionRequest, Provider, ProviderError, shared};
 
 fn make_anthropic_provider(
     base_url: String,
@@ -111,7 +111,7 @@ fn test_request_shape_api_key_mode() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         system_static: "Static prompt".to_string(),
         system_dynamic: "Dynamic prompt".to_string(),
-        messages: vec![Message::user("Hello")],
+        messages: shared(vec![Message::user("Hello")]),
         tools: vec![ToolDefinition {
             name: "bash".to_string(),
             description: "Run command".to_string(),
@@ -173,7 +173,7 @@ fn test_request_shape_oauth_mode() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         system_static: "Static prompt".to_string(),
         system_dynamic: "Dynamic prompt".to_string(),
-        messages: vec![Message::user("Hello")],
+        messages: shared(vec![Message::user("Hello")]),
         tools: vec![
             ToolDefinition {
                 name: "bash".to_string(),
@@ -233,7 +233,7 @@ fn test_messages_conversion_and_role_merging() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         system_static: String::new(),
         system_dynamic: String::new(),
-        messages: vec![
+        messages: shared(vec![
             Message::user("Please list files"),
             Message {
                 role: Role::Assistant,
@@ -252,7 +252,7 @@ fn test_messages_conversion_and_role_merging() {
             },
             Message::tool_result(call_id, "file1.rs\nfile2.rs", false),
             Message::user("Now what?"),
-        ],
+        ]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -301,10 +301,10 @@ fn test_trailing_assistant_turn_repaired_with_continue() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         system_static: String::new(),
         system_dynamic: String::new(),
-        messages: vec![
+        messages: shared(vec![
             Message::user("Hello"),
             Message::assistant_text("Thinking..."),
-        ],
+        ]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -338,7 +338,7 @@ fn test_reasoning_effort_budget_mapping() {
             model: "claude-3-7-sonnet".to_string(),
             system_static: "".to_string(),
             system_dynamic: "".to_string(),
-            messages: vec![Message::user("hi")],
+            messages: shared(vec![Message::user("hi")]),
             tools: vec![],
             effort: Some(effort),
             max_output_tokens: Some(32000),
@@ -617,7 +617,7 @@ async fn test_complete_stream_mock_server_api_key() {
         model: "claude-3-5-sonnet".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Hi")],
+        messages: shared(vec![Message::user("Hi")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -719,7 +719,7 @@ async fn test_complete_stream_mock_server_oauth() {
         model: "claude-opus-4".to_string(),
         system_static: "Static sys".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("Run agent")],
+        messages: shared(vec![Message::user("Run agent")]),
         tools: vec![ToolDefinition {
             name: "bash".to_string(),
             description: "Bash tool".to_string(),
@@ -965,7 +965,7 @@ async fn test_retry_recovers_from_500_server_error() {
         model: "claude-3-5-sonnet".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("hi")],
+        messages: shared(vec![Message::user("hi")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1085,7 +1085,7 @@ fn anthropic_req(model: &str, messages: Vec<Message>) -> CompletionRequest {
         model: model.to_string(),
         system_static: "Sys".to_string(),
         system_dynamic: String::new(),
-        messages,
+        messages: shared(messages),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),

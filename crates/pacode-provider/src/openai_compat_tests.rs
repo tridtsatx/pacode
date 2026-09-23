@@ -7,7 +7,7 @@ use pacode_types::{
 };
 use serde_json::json;
 
-use crate::{CompletionRequest, OpenAiCompat, Provider, ProviderError, redact};
+use crate::{CompletionRequest, OpenAiCompat, Provider, ProviderError, redact, shared};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn make_provider(
@@ -97,7 +97,7 @@ fn test_build_body_messages_conversion() {
         model: "gpt-4o".to_string(),
         system_static: "System".to_string(),
         system_dynamic: String::new(),
-        messages: vec![
+        messages: shared(vec![
             Message {
                 role: Role::User,
                 content: vec![
@@ -143,7 +143,7 @@ fn test_build_body_messages_conversion() {
                 }],
                 meta: pacode_types::MessageMeta::default(),
             },
-        ],
+        ]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(4096),
@@ -731,7 +731,7 @@ fn text_req(model: &str, messages: Vec<Message>) -> CompletionRequest {
         model: model.to_string(),
         system_static: "Sys".to_string(),
         system_dynamic: String::new(),
-        messages,
+        messages: shared(messages),
         tools: vec![],
         effort: None,
         max_output_tokens: None,

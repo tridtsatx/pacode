@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use pacode_tools::ToolKind;
 use pacode_types::{
-    AgentStatus, CallId, Event, Message, ToolStatus, TranscriptItem, TranscriptKind,
+    AgentStatus, CallId, ContentBlock, Event, Message, Role, ToolStatus, TranscriptItem,
+    TranscriptKind,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -581,4 +582,109 @@ pub async fn execute_tool_calls(
     }
 
     interrupted
+}
+
+/// Append+persist a synthetic error `tool_result` for every `tool_use` in the
+/// trailing assistant message that never got one.
+///
+/// `run_single_tool` and the interrupted-chunk loop stub the calls they can
+/// reach; what they cannot cover is the turn task dying mid-dispatch — a tool
+/// panic unwinds `execute_tool_calls` before results land, and an abort drops
+/// it outright — leaving persisted `tool_use`s unanswered so every later
+/// request 400s (`tool_use ids found without tool_result`). Runs once per turn
+/// end from the spawn supervisor; an intact tail makes it a no-op.
+///
+/// Only the tail is repaired: a `tool_use` stranded deeper in history (e.g.
+/// behind a later user message, or loaded corrupted) is healed wire-side by
+/// `History::for_model`'s pairing pass instead — history is append-only and
+/// the store is too.
+pub(crate) async fn stub_dangling_tool_calls(session: &Arc<Session>, agent: &Arc<Agent>) {
+    // (call_id, name) of the trailing assistant's still-unanswered calls.
+    let missing: Vec<(CallId, String)> = {
+        let hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
+        let mut idx = hist.messages.len();
+        let mut answered: Vec<CallId> = Vec::new();
+        while idx > 0 && hist.messages[idx - 1].role == Role::Tool {
+            for block in &hist.messages[idx - 1].content {
+                if let ContentBlock::ToolResult { call_id, .. } = block {
+                    answered.push(call_id.clone());
+                }
+            }
+            idx -= 1;
+        }
+        let Some(last) = idx.checked_sub(1).map(|i| &hist.messages[i]) else {
+            return;
+        };
+        if last.role != Role::Assistant {
+            return;
+        }
+        last.tool_uses()
+            .filter(|(id, _, _)| !answered.contains(id))
+            .map(|(id, name, _)| (id.clone(), name.to_string()))
+            .collect()
+    };
+    if missing.is_empty() {
+        return;
+    }
+    log::warn!(
+        "turn ended with {} unanswered tool call(s), writing stubs: session={} agent={}",
+        missing.len(),
+        session.id,
+        agent.id()
+    );
+    for (call_id, name) in missing {
+        let stub = Message::tool_result(
+            call_id.clone(),
+            crate::agent::INTERRUPTED_TOOL_RESULT,
+            true,
+        );
+        let (seq, arc_stub) = agent
+            .history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(stub);
+        let _ = session
+            .store
+            .append_message(&session.id, &agent.id(), seq, &arc_stub)
+            .await;
+        // The cell allocated at `ToolCallStart` must not stay `Running`.
+        let prev = agent
+            .transcript
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .tool_item(&call_id)
+            .cloned();
+        if let Some(prev) = prev
+            && let TranscriptKind::ToolCall {
+                title,
+                intent,
+                duration_ms,
+                task,
+                ..
+            } = &prev.kind
+        {
+            let item = TranscriptItem {
+                seq: prev.seq,
+                agent: agent.id(),
+                ts_ms: pacode_types::now_ms(),
+                kind: TranscriptKind::ToolCall {
+                    call_id: call_id.clone(),
+                    name,
+                    title: title.clone(),
+                    intent: intent.clone(),
+                    status: ToolStatus::Error,
+                    preview: crate::agent::INTERRUPTED_TOOL_RESULT.to_string(),
+                    diff: None,
+                    duration_ms: *duration_ms,
+                    task: task.clone(),
+                },
+            };
+            agent
+                .transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .upsert(item.clone());
+            session.events.emit(Event::ItemUpdated(item));
+        }
+    }
 }

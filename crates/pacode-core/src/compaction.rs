@@ -62,29 +62,34 @@ pub fn split_for_compaction(
 }
 
 /// The summarisation prompt: previous summary (if any) + the messages to fold in.
+///
+/// Returns shared `Arc` refs like `History::for_model` — the folded-in history
+/// can be most of the conversation, cloning every block just to serialize it
+/// once is pure churn. The slice goes through `sanitize_tool_pairing`: a prefix
+/// cut can end on a `tool_use` whose result stays in `to_keep` (or the damage
+/// was already persisted), and the summary request must not 400 for that.
 pub fn build_summary_request(
     previous_summary: Option<&str>,
     messages: &[Arc<Message>],
-) -> Vec<Message> {
+) -> Vec<Arc<Message>> {
     use pacode_types::{ContentBlock, Role};
-    let mut out = Vec::new();
-    out.push(Message::new(
+    let (sanitized, _) = crate::agent::sanitize_tool_pairing(messages);
+    let mut out = Vec::with_capacity(sanitized.len() + 2);
+    out.push(Arc::new(Message::new(
         Role::System,
         vec![ContentBlock::Text {
             text: "Summarize the conversation so far for continuing the work: goals, decisions, files touched, open items. Be concise and structured.".to_string(),
         }],
-    ));
+    )));
     if let Some(prev) = previous_summary {
-        out.push(Message::user(format!(
+        out.push(Arc::new(Message::user(format!(
             "[Previous conversation summary to incorporate and update]\n{prev}"
-        )));
+        ))));
     }
-    for msg in messages {
-        out.push((**msg).clone());
-    }
-    out.push(Message::user(
+    out.extend(sanitized);
+    out.push(Arc::new(Message::user(
         "Summarize the conversation so far for continuing the work: goals, decisions, files touched, open items.",
-    ));
+    )));
     out
 }
 

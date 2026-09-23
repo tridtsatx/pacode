@@ -1,5 +1,7 @@
 //! Request body construction for the Anthropic Messages API.
 
+use std::sync::Arc;
+
 use pacode_types::{ContentBlock, Effort, ImageSource, Role};
 use serde_json::Value;
 
@@ -99,7 +101,7 @@ pub fn build_body(
 }
 
 fn build_messages(
-    messages: &[pacode_types::Message],
+    messages: &[Arc<pacode_types::Message>],
     is_oauth: bool,
     supports_vision: bool,
 ) -> Vec<Value> {

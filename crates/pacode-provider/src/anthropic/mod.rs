@@ -305,8 +305,10 @@ impl Anthropic {
         }
 
         let json_text = response.text().await.unwrap_or_default();
-        let redacted_json = redact(&json_text);
-        log::trace!("models response body: {redacted_json}");
+        if log::log_enabled!(log::Level::Trace) {
+            let redacted_json = redact(&json_text);
+            log::trace!("models response body: {redacted_json}");
+        }
         let json_val = match serde_json::from_str::<Value>(&json_text) {
             Ok(j) => j,
             Err(err) => {
@@ -363,16 +365,23 @@ impl Provider for Anthropic {
         let model = &req.model;
         log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
 
-        let serialized_body = serde_json::to_string(&body).unwrap_or_default();
-        let body_redacted = redact(&serialized_body);
-        log::trace!("request body: {body_redacted}");
+        // Serialize once: the opener resends these bytes on every retry, and
+        // the trace dump reuses them — the `Value` DOM dies with this fn and
+        // the redact copy only exists while `trace` is enabled.
+        let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+        if log::log_enabled!(log::Level::Trace) {
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            let body_redacted = redact(&body_text);
+            log::trace!("request body: {body_redacted}");
+        }
+        drop(body);
 
         let effort = req.effort.unwrap_or(self.defaults.effort);
         let opener = AnthropicStreamOpener {
             client: self.client.clone(),
             url,
             headers,
-            body,
+            body: body_bytes,
             model: req.model,
             stream_idle_secs: self.defaults.stream_idle_secs,
             effort,

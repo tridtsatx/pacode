@@ -3097,6 +3097,7 @@ version = "1.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "futures",
  "log",
  "pacode-auth",

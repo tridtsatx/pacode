@@ -1,6 +1,6 @@
 //! MCP sampling handler implementation using core's provider and session route.
 
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -80,7 +80,10 @@ impl SamplingHandler for CoreSamplingHandler {
                 }
                 _ => String::new(),
             };
-            messages.push(Message::new(role, vec![ContentBlock::Text { text }]));
+            messages.push(Arc::new(Message::new(
+                role,
+                vec![ContentBlock::Text { text }],
+            )));
         }
 
         let comp_req = pacode_provider::CompletionRequest {

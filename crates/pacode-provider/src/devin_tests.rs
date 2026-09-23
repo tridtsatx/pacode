@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -13,7 +14,7 @@ use crate::devin::Devin;
 use crate::devin::connect::{CONNECT_FLAG_END_STREAM, ConnectFrameDecoder, encode_connect_frame};
 use crate::devin::proto::{self, WireType, Writer};
 use crate::devin::wire::{encode_get_chat_message_request, encode_messages};
-use crate::{CompletionRequest, Provider, ProviderError};
+use crate::{CompletionRequest, Provider, ProviderError, shared};
 
 /// Provider whose fixture server answers `GetCliModelConfigs`, so the catalog —
 /// and with it the model families — is available.
@@ -212,7 +213,7 @@ fn test_exact_byte_layout_of_get_chat_message_request() {
         model: "swe-1-6-fast".to_string(),
         system_static: "You are an assistant.".to_string(),
         system_dynamic: "Current date: 2026-09-11".to_string(),
-        messages: vec![Message::user("Hello Devin")],
+        messages: shared(vec![Message::user("Hello Devin")]),
         tools: vec![],
         effort: Some(Effort::Medium),
         max_output_tokens: Some(4096),
@@ -544,7 +545,7 @@ async fn test_full_streamed_turn_text_thinking_usage_stop() {
         model: "swe-1-6-fast".to_string(),
         system_static: "system".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("hi")],
+        messages: shared(vec![Message::user("hi")]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),
@@ -661,7 +662,7 @@ async fn test_streamed_tool_call_split_across_three_frames_mid_json() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("run ls")],
+        messages: shared(vec![Message::user("run ls")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -774,7 +775,7 @@ async fn test_text_containing_word_functions_not_mistaken_for_tool_call() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("tell me about functions")],
+        messages: shared(vec![Message::user("tell me about functions")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1009,7 +1010,7 @@ async fn test_catalog_efforts_fold_into_one_family_and_effort_picks_the_id() {
         model: "swe-2".to_string(),
         system_static: "system".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("hi")],
+        messages: shared(vec![Message::user("hi")]),
         tools: vec![],
         effort: Some(Effort::High),
         max_output_tokens: Some(1024),
@@ -1105,7 +1106,7 @@ async fn test_error_mapping_streaming_trailer_error() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Hello")],
+        messages: shared(vec![Message::user("Hello")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1194,7 +1195,7 @@ async fn test_idle_timeout_surfaces_error() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Hello")],
+        messages: shared(vec![Message::user("Hello")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1266,7 +1267,7 @@ async fn test_structured_tool_call_field_and_stop_reason_ten() {
         model: "swe-1-6-fast".to_string(),
         system_static: "system".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("find beta")],
+        messages: shared(vec![Message::user("find beta")]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),
@@ -1378,7 +1379,7 @@ async fn test_structured_tool_call_arguments_streamed_across_frames() {
         model: "swe-2-max".to_string(),
         system_static: "system".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("list files")],
+        messages: shared(vec![Message::user("list files")]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),
@@ -1590,7 +1591,7 @@ async fn test_adaptive_route_issues_exactly_one_assign_model_and_carries_jwt_and
         model: "adaptive".to_string(),
         system_static: "system".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("solve problem")],
+        messages: shared(vec![Message::user("solve problem")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1709,7 +1710,7 @@ async fn test_non_adaptive_route_issues_no_assign_model() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("hi")],
+        messages: shared(vec![Message::user("hi")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1791,7 +1792,7 @@ async fn test_response_carrying_fields_10_and_21_produces_reasoning_signature_ev
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("do something")],
+        messages: shared(vec![Message::user("do something")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1841,7 +1842,7 @@ fn test_assistant_message_with_signature_re_encoded_as_11_12_18() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Question"), assistant_msg],
+        messages: shared(vec![Message::user("Question"), assistant_msg]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1930,14 +1931,14 @@ fn test_conversation_id_is_stable_across_turns_of_one_conversation() {
         model: "adaptive".to_string(),
         system_static: "system".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("find gamma")],
+        messages: shared(vec![Message::user("find gamma")]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),
     };
     let mut later = first.clone();
-    later.messages.push(Message::assistant_text("looking"));
-    later.messages.push(Message::user("and now delta"));
+    later.messages.push(Arc::new(Message::assistant_text("looking")));
+    later.messages.push(Arc::new(Message::user("and now delta")));
     later.system_dynamic = "changed between turns".to_string();
 
     assert_eq!(
@@ -1947,7 +1948,7 @@ fn test_conversation_id_is_stable_across_turns_of_one_conversation() {
     );
 
     let other = CompletionRequest {
-        messages: vec![Message::user("a different conversation")],
+        messages: shared(vec![Message::user("a different conversation")]),
         ..first.clone()
     };
     assert_ne!(
@@ -2013,12 +2014,12 @@ fn ld_string(val: &proto::WireValue<'_>) -> String {
     }
 }
 
-fn devin_msg(role: Role, content: Vec<ContentBlock>) -> Message {
-    Message {
+fn devin_msg(role: Role, content: Vec<ContentBlock>) -> Arc<Message> {
+    Arc::new(Message {
         role,
         content,
         meta: pacode_types::MessageMeta::default(),
-    }
+    })
 }
 
 #[test]

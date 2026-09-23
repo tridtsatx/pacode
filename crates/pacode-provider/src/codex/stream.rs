@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use pacode_types::{Effort, StopReason, StreamEvent};
 use serde_json::Value;
@@ -71,9 +72,13 @@ pub fn create_responses_event_stream(
                     return Some((Err(ProviderError::IdleTimeout(state.timeout_secs)), state));
                 }
                 Ok(Some(Ok(bytes))) => {
-                    let chunk_str = String::from_utf8_lossy(&bytes);
-                    let chunk_redacted = crate::redact(&chunk_str);
-                    log::trace!("responses body chunk: {chunk_redacted}");
+                    // The lossy copy + redact scan run per network chunk — only
+                    // when `trace` is actually on (off in release builds).
+                    if log::log_enabled!(log::Level::Trace) {
+                        let chunk_str = String::from_utf8_lossy(&bytes);
+                        let chunk_redacted = crate::redact(&chunk_str);
+                        log::trace!("responses body chunk: {chunk_redacted}");
+                    }
                     let payloads = state.parser.feed(bytes.as_ref());
                     for payload in payloads {
                         if payload.trim() == "[DONE]" {
@@ -172,7 +177,9 @@ pub struct CodexStreamOpener {
     pub client: reqwest::Client,
     pub url: String,
     pub headers: Vec<(String, String)>,
-    pub body: Value,
+    /// Body serialized once at request build; `Bytes` makes each retry a
+    /// refcount bump instead of a DOM re-serialization.
+    pub body: Bytes,
     pub model: String,
     pub stream_idle_secs: u64,
     pub effort: Effort,
@@ -200,7 +207,7 @@ impl CodexStreamOpener {
         let header_wait =
             (self.stream_idle_secs > 0).then(|| Duration::from_secs(timeout_secs.max(1)));
         loop {
-            let mut req_builder = self.client.post(&self.url).json(&self.body);
+            let mut req_builder = self.client.post(&self.url).body(self.body.clone());
 
             for (k, v) in &self.headers {
                 req_builder = req_builder.header(k, v);

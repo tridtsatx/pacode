@@ -23,6 +23,7 @@ mod retry;
 pub mod sse;
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -44,10 +45,21 @@ pub struct CompletionRequest {
     /// Static system prompt first (prefix cache), dynamic part second.
     pub system_static: String,
     pub system_dynamic: String,
-    pub messages: Vec<Message>,
+    /// Shared message refs: `History::for_model` hands over refcount bumps
+    /// instead of deep-cloning every content block on each model step, and a
+    /// request clone (mock capture, retry state) is cheap for the same reason.
+    /// Providers only ever read them.
+    pub messages: Vec<Arc<Message>>,
     pub tools: Vec<ToolDefinition>,
     pub effort: Option<Effort>,
     pub max_output_tokens: Option<u32>,
+}
+
+/// Test helper: wrap owned fixture messages into the shared refs a request
+/// carries — `shared(vec![Message::user("x")])` keeps fixtures readable.
+#[cfg(test)]
+pub(crate) fn shared(messages: Vec<Message>) -> Vec<Arc<Message>> {
+    messages.into_iter().map(Arc::new).collect()
 }
 
 #[derive(Debug, thiserror::Error)]

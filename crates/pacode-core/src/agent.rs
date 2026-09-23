@@ -4,11 +4,19 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use pacode_tools::ToolRegistry;
-use pacode_types::{AgentId, AgentInfo, AgentStatus, Message, TranscriptItem};
+use pacode_types::{
+    AgentId, AgentInfo, AgentStatus, CallId, ContentBlock, Message, Role, TranscriptItem,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::inject::InjectionQueue;
 use crate::transcript::TranscriptState;
+
+/// Content of a synthesized `tool_result` answering a `tool_use` that never
+/// produced one: the turn was interrupted or died mid-dispatch, or persisted
+/// history was loaded with the pairing already broken. `is_error` is set so
+/// adapters can mark it as a failed call.
+pub(crate) const INTERRUPTED_TOOL_RESULT: &str = "[interrupted]";
 
 /// The model-visible history of one agent: a compaction summary (if any) plus the
 /// messages after it. Messages are `Arc` so a forked subagent shares them.
@@ -36,19 +44,175 @@ impl History {
     }
 
     /// Messages sent to the model: summary (as a user message) then the rest.
-    pub fn for_model(&self) -> Vec<Message> {
-        let mut out = Vec::new();
+    ///
+    /// Returns shared refs — a deep clone of every content block on every model
+    /// step was a major allocation churn source on long histories. Providers
+    /// only read the messages; the `Arc`s also keep a `CompletionRequest` clone
+    /// cheap.
+    ///
+    /// The output passes through [`sanitize_tool_pairing_into`]: a turn that
+    /// died mid-dispatch (or a persisted history already carrying the damage)
+    /// would otherwise send `tool_use` blocks with no `tool_result` and every
+    /// provider rejects the whole request (`400: tool_use ids found without
+    /// tool_result`).
+    pub fn for_model(&self) -> Vec<Arc<Message>> {
+        let mut out = Vec::with_capacity(self.messages.len() + 1);
         if let Some(summary) = &self.summary {
-            out.push(
+            out.push(Arc::new(
                 Message::user(format!("[Previous conversation summary]\n{summary}"))
                     .with_kind(pacode_types::MessageKind::CompactionSummary),
-            );
+            ));
         }
-        for m in &self.messages {
-            out.push((**m).clone());
-        }
+        sanitize_tool_pairing_into(&self.messages, &mut out);
         out
     }
+}
+
+/// Single funnel for "history → wire" pairing repair (spec §6.2): every
+/// `ToolUse` block in an assistant message must be answered by a `ToolResult`
+/// in the run of `Role::Tool` messages immediately following it (adapters merge
+/// that run into the one user message the APIs require), and a `ToolResult`
+/// anywhere else is itself invalid (`unexpected tool_use_id`).
+///
+/// A turn killed mid-dispatch — panic, task abort, daemon restart, a lost store
+/// write — leaves persisted `tool_use`s unanswered and the provider then 400s
+/// every subsequent turn until compaction. Repairing at this seam heals loaded
+/// histories on the next request without rewriting the store. Returns the
+/// number of synthesized blocks (for the caller's log line).
+pub(crate) fn sanitize_tool_pairing(messages: &[Arc<Message>]) -> (Vec<Arc<Message>>, usize) {
+    let mut out = Vec::with_capacity(messages.len());
+    let repaired = sanitize_tool_pairing_into(messages, &mut out);
+    (out, repaired)
+}
+
+fn sanitize_tool_pairing_into(messages: &[Arc<Message>], out: &mut Vec<Arc<Message>>) -> usize {
+    let mut repaired = 0usize;
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &messages[i];
+        if msg.role != Role::Assistant || !msg.has_tool_uses() {
+            // A `Role::Tool` message outside an answering run can only carry
+            // stray results — degrade them to text blocks (they still reach
+            // the model but no longer trip the pairing check).
+            out.push(sanitize_stray_tool_message(msg, &mut repaired));
+            i += 1;
+            continue;
+        }
+
+        out.push(msg.clone());
+        i += 1;
+        let uses: Vec<&CallId> = msg.tool_uses().map(|(id, _, _)| id).collect();
+        // The answering run: consecutive `Role::Tool` messages. A non-`Tool`
+        // message ends it — a later result is positionally stray and gets
+        // degraded when the walk reaches it.
+        let mut answered: Vec<CallId> = Vec::new();
+        while i < messages.len() && messages[i].role == Role::Tool {
+            out.push(sanitize_tool_message_answered(
+                &messages[i],
+                &uses,
+                &mut answered,
+                &mut repaired,
+            ));
+            i += 1;
+        }
+        for id in uses
+            .iter()
+            .copied()
+            .filter(|id| !answered.contains(*id))
+        {
+            out.push(Arc::new(Message::tool_result(
+                id.clone(),
+                INTERRUPTED_TOOL_RESULT,
+                true,
+            )));
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
+/// `msg` (a `Role::Tool` message in an answering run): `ToolResult` blocks whose
+/// `call_id` is still pending are kept and marked answered; everything else —
+/// unknown or duplicate ids — is positionally stray and degrades to text.
+fn sanitize_tool_message_answered(
+    msg: &Arc<Message>,
+    uses: &[&CallId],
+    answered: &mut Vec<CallId>,
+    repaired: &mut usize,
+) -> Arc<Message> {
+    let has_stray = msg.content.iter().any(|block| match block {
+        ContentBlock::ToolResult { call_id, .. } => {
+            !uses.contains(&call_id) || answered.contains(call_id)
+        }
+        ContentBlock::Text { .. }
+        | ContentBlock::Reasoning { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::Image { .. } => false,
+    });
+    if !has_stray {
+        for block in &msg.content {
+            if let ContentBlock::ToolResult { call_id, .. } = block {
+                answered.push(call_id.clone());
+            }
+        }
+        return msg.clone();
+    }
+
+    *repaired += 1;
+    let mut fixed = (**msg).clone();
+    fixed.content = fixed
+        .content
+        .into_iter()
+        .map(|block| match block {
+            ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                if uses.contains(&&call_id) && !answered.contains(&call_id) {
+                    answered.push(call_id.clone());
+                    ContentBlock::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    }
+                } else {
+                    ContentBlock::Text {
+                        text: format!("[unmatched tool result (call {call_id})]\n{content}"),
+                    }
+                }
+            }
+            other => other,
+        })
+        .collect();
+    Arc::new(fixed)
+}
+
+/// `msg` with no pending `tool_use` run behind it: every `ToolResult` block is
+/// stray and degrades to text. Cheap path returns the shared ref untouched.
+fn sanitize_stray_tool_message(msg: &Arc<Message>, repaired: &mut usize) -> Arc<Message> {
+    let has_results = msg
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
+    if msg.role != Role::Tool || !has_results {
+        return msg.clone();
+    }
+    *repaired += 1;
+    let mut fixed = (**msg).clone();
+    fixed.content = fixed
+        .content
+        .into_iter()
+        .map(|block| match block {
+            ContentBlock::ToolResult {
+                call_id, content, ..
+            } => ContentBlock::Text {
+                text: format!("[unmatched tool result (call {call_id})]\n{content}"),
+            },
+            other => other,
+        })
+        .collect();
+    Arc::new(fixed)
 }
 
 pub struct Agent {

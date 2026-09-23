@@ -13,7 +13,7 @@ use crate::codex::events::{
     ResponsesChunkState, extract_responses_error, responses_chunk_to_events,
 };
 use crate::codex::{CHATGPT_RESPONSES_URL, Codex, OPENAI_RESPONSES_URL};
-use crate::{CompletionRequest, Provider, ProviderError};
+use crate::{CompletionRequest, Provider, ProviderError, shared};
 
 fn make_test_provider(auth: Option<CodexAuth>, base_url: Option<&str>) -> Codex {
     let cfg = ProviderConfig {
@@ -209,7 +209,7 @@ fn test_build_body_instructions_and_input_mapping() {
         model: "custom-plain".to_string(),
         system_static: "Base instructions".to_string(),
         system_dynamic: "Current workspace: /project".to_string(),
-        messages: vec![
+        messages: shared(vec![
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
@@ -249,7 +249,7 @@ fn test_build_body_instructions_and_input_mapping() {
                 }],
                 meta: Default::default(),
             },
-        ],
+        ]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(2048),
@@ -756,7 +756,7 @@ async fn test_complete_e2e_streaming_success() {
         model: "gpt-4o".to_string(),
         system_static: "You are a helper".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Hello")],
+        messages: shared(vec![Message::user("Hello")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -839,7 +839,7 @@ async fn test_complete_e2e_401_auth_error() {
         model: "gpt-4o".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Hi")],
+        messages: shared(vec![Message::user("Hi")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -915,7 +915,7 @@ async fn test_complete_e2e_429_rate_limit_error() {
         model: "gpt-4o".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Hi")],
+        messages: shared(vec![Message::user("Hi")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1101,7 +1101,7 @@ fn codex_req(model: &str, messages: Vec<Message>) -> CompletionRequest {
         model: model.to_string(),
         system_static: String::new(),
         system_dynamic: "Instr".to_string(),
-        messages,
+        messages: shared(messages),
         tools: vec![],
         effort: None,
         max_output_tokens: None,

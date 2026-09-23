@@ -269,9 +269,13 @@ pub(crate) fn create_anthropic_event_stream(
                     return Some((Err(ProviderError::IdleTimeout(ctx.timeout_secs)), ctx));
                 }
                 Ok(Some(Ok(bytes))) => {
-                    let chunk_str = String::from_utf8_lossy(&bytes);
-                    let chunk_redacted = crate::redact(&chunk_str);
-                    log::trace!("anthropic response chunk: {chunk_redacted}");
+                    // The lossy copy + redact scan run per network chunk — only
+                    // when `trace` is actually on (off in release builds).
+                    if log::log_enabled!(log::Level::Trace) {
+                        let chunk_str = String::from_utf8_lossy(&bytes);
+                        let chunk_redacted = crate::redact(&chunk_str);
+                        log::trace!("anthropic response chunk: {chunk_redacted}");
+                    }
                     let payloads = ctx.parser.feed(bytes.as_ref());
                     for payload in payloads {
                         let json = match serde_json::from_str::<Value>(&payload) {
