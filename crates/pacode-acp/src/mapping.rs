@@ -11,7 +11,9 @@ use agent_client_protocol::schema::v1::{
     ToolCall as AcpToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
     ToolCallUpdate as AcpToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
+use base64::Engine;
 use pacode_types::ids::SessionId as PacodeSessionId;
+use pacode_types::message::ImageSource;
 use pacode_types::protocol::{Event, TurnStop};
 use pacode_types::state::{Mode, PermissionDecision, PermissionRequest, Plan, PlanStatus};
 use pacode_types::transcript::{ToolStatus, TranscriptItem, TranscriptKind};
@@ -84,18 +86,21 @@ pub fn plan_to_acp(plan: &Plan) -> AcpPlan {
     AcpPlan::new(entries)
 }
 
+/// One-line description of a pacode `Mode`, shared by the legacy mode picker
+/// (`mode_to_session_mode`) and the config-option "mode" select so both
+/// surfaces always show identical texts.
+pub fn mode_description(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Build => "ask before edits and non-trivial commands",
+        Mode::Auto => "auto-accept edits and low-risk commands",
+        Mode::Plan => "read-only tools and planning",
+        Mode::Bypass => "bypass permissions except catastrophic deny",
+    }
+}
+
 /// Converts a pacode `Mode` to an ACP `SessionMode`.
 pub fn mode_to_session_mode(mode: Mode) -> SessionMode {
-    match mode {
-        Mode::Build => SessionMode::new("build", "Build")
-            .description("ask before edits and non-trivial commands"),
-        Mode::Auto => {
-            SessionMode::new("auto", "Auto").description("auto-accept edits and low-risk commands")
-        }
-        Mode::Plan => SessionMode::new("plan", "Plan").description("read-only tools and planning"),
-        Mode::Bypass => SessionMode::new("bypass", "Bypass")
-            .description("bypass permissions except catastrophic deny"),
-    }
+    SessionMode::new(mode.as_str(), mode.label()).description(mode_description(mode))
 }
 
 /// Builds the full `SessionModeState` for an ACP session given the current pacode mode.
@@ -469,15 +474,40 @@ pub fn transcript_item_to_session_updates(item: &TranscriptItem) -> Vec<SessionU
     }
 }
 
-/// Extracts plain prompt text from ACP prompt content blocks.
-pub fn prompt_content_to_text(prompt: &[ContentBlock]) -> String {
+/// Base64 length cap for one image block, matching the TUI's 20 MiB paste
+/// limit (`IMAGE_PASTE_MAX_BYTES`) after decoding — 4/3 ratio plus padding.
+/// Checked before decoding so an oversized payload never allocates the
+/// decoded buffer.
+const MAX_IMAGE_B64_LEN: usize = 20 * 1024 * 1024 * 4 / 3 + 8;
+
+/// Extracts prompt text and attached images from ACP prompt content blocks.
+///
+/// Text blocks, embedded text resources and resource links fold into one
+/// string; `Image` blocks decode into `ImageSource::Bytes`. An image that
+/// fails base64 decoding or exceeds the size cap degrades to a text
+/// placeholder rather than failing the whole prompt.
+pub fn prompt_content_to_parts(prompt: &[ContentBlock]) -> (String, Vec<ImageSource>) {
     let mut text_parts = Vec::new();
+    let mut images = Vec::new();
     for block in prompt {
         match block {
             ContentBlock::Text(t) => {
                 text_parts.push(t.text.clone());
             }
-            ContentBlock::Image(_) => {}
+            ContentBlock::Image(img) => {
+                let mime = &img.mime_type;
+                if img.data.len() > MAX_IMAGE_B64_LEN {
+                    text_parts.push(format!("[image: {mime}, too large]"));
+                } else {
+                    match base64::engine::general_purpose::STANDARD.decode(&img.data) {
+                        Ok(data) => images.push(ImageSource::Bytes {
+                            mime: mime.clone(),
+                            data,
+                        }),
+                        Err(_) => text_parts.push(format!("[image: {mime}, undecodable]")),
+                    }
+                }
+            }
             ContentBlock::Audio(_) => {}
             ContentBlock::Resource(r) => match &r.resource {
                 EmbeddedResourceResource::TextResourceContents(t) => {
@@ -498,7 +528,7 @@ pub fn prompt_content_to_text(prompt: &[ContentBlock]) -> String {
             _ => {}
         }
     }
-    text_parts.join("")
+    (text_parts.join(""), images)
 }
 
 #[cfg(test)]

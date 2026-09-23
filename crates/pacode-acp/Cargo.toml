@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
+base64 = { workspace = true }
 agent-client-protocol = "2.1.0"
 
 [dev-dependencies]

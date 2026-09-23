@@ -2,26 +2,32 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, CloseSessionRequest, CloseSessionResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SessionInfo, SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
-    StopReason as AcpStopReason,
+    CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionConfigOption, SessionInfo, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason as AcpStopReason,
 };
 use agent_client_protocol::{Client as AcpClient, ConnectionTo, Responder};
 use pacode_client::{Client, ClientEvent, ClientOptions, EventReceiver};
 use pacode_types::Attach;
 use pacode_types::ids::SessionId as PacodeSessionId;
+use pacode_types::model::ModelInfo;
 use pacode_types::protocol::{Event, Request};
-use pacode_types::state::Mode;
+use pacode_types::state::{Mode, SessionMeta};
 
+use crate::config_options::{
+    self, ConfigOptionCaps, SessionConfigState, apply_config_value, session_config_options,
+};
 use crate::error::AcpError;
 use crate::mapping::{
     MappingState, event_to_session_updates, modes_state, permission_request_to_acp,
-    permission_response_to_decision, plan_to_acp, prompt_content_to_text, session_id_from_acp,
+    permission_response_to_decision, plan_to_acp, prompt_content_to_parts, session_id_from_acp,
     session_id_to_acp, transcript_item_to_session_updates, turn_stop_to_stop_reason,
 };
 
@@ -52,14 +58,26 @@ pub struct SessionState {
     pub id: PacodeSessionId,
     pub client: Arc<Client>,
     pub events: Mutex<EventReceiver>,
+    /// Last known meta + model catalog backing the ACP config options.
+    pub config: Mutex<SessionConfigState>,
+    /// Config-option features the client advertised at initialize.
+    pub config_caps: ConfigOptionCaps,
 }
 
 impl SessionState {
-    pub fn new(id: PacodeSessionId, client: Client, events: EventReceiver) -> Self {
+    pub fn new(
+        id: PacodeSessionId,
+        client: Client,
+        events: EventReceiver,
+        config: SessionConfigState,
+        config_caps: ConfigOptionCaps,
+    ) -> Self {
         Self {
             id,
             client: Arc::new(client),
             events: Mutex::new(events),
+            config: Mutex::new(config),
+            config_caps,
         }
     }
 
@@ -82,17 +100,14 @@ impl SessionState {
         prompt: &PromptRequest,
         cx: &ConnectionTo<AcpClient>,
     ) -> Result<AcpStopReason, AcpError> {
-        let text = prompt_content_to_text(&prompt.prompt);
+        let (text, images) = prompt_content_to_parts(&prompt.prompt);
         let acp_session_id = prompt.session_id.clone();
 
         let mut events = self.events.lock().await;
 
         // Submit the user message to the pacode daemon
         self.client
-            .ok(Request::UserMessage {
-                text,
-                images: Vec::new(),
-            })
+            .ok(Request::UserMessage { text, images })
             .await?;
 
         let mut mapping_state = MappingState::new();
@@ -125,8 +140,9 @@ impl SessionState {
                         return Ok(stop_reason);
                     }
 
+                    let config_update = self.config_update(&event).await;
                     let updates = event_to_session_updates(&event, &mut mapping_state);
-                    for update in updates {
+                    for update in updates.into_iter().chain(config_update) {
                         cx.send_notification(SessionNotification::new(
                             acp_session_id.clone(),
                             update,
@@ -134,7 +150,22 @@ impl SessionState {
                         .map_err(AcpError::Protocol)?;
                     }
                 }
-                ClientEvent::Snapshot(_) => {}
+                ClientEvent::Snapshot(snapshot) => {
+                    // Re-attached after a reconnect: the snapshot replaces all
+                    // client state, so the cached meta follows it.
+                    let update = {
+                        let mut config = self.config.lock().await;
+                        config.meta = snapshot.meta.clone();
+                        config_options_update(&config, self.config_caps)
+                    };
+                    if let Some(update) = update {
+                        cx.send_notification(SessionNotification::new(
+                            acp_session_id.clone(),
+                            update,
+                        ))
+                        .map_err(AcpError::Protocol)?;
+                    }
+                }
                 ClientEvent::Connected { .. } => {}
                 ClientEvent::Disconnected { reason } => {
                     log::warn!("daemon disconnected: {reason}");
@@ -148,6 +179,31 @@ impl SessionState {
         // Stream closed before TurnEnded
         Ok(AcpStopReason::EndTurn)
     }
+
+    /// Folds `event` into the config-option cache; when the client advertised
+    /// config-option support, returns the rebuilt list to notify about.
+    async fn config_update(&self, event: &Event) -> Option<SessionUpdate> {
+        let mut config = self.config.lock().await;
+        if !config_options::apply_event(&mut config, event) {
+            return None;
+        }
+        config_options_update(&config, self.config_caps)
+    }
+}
+
+/// Rebuilds the config-option list as a `ConfigOptionUpdate` when the client
+/// advertised support; `None` otherwise.
+fn config_options_update(
+    config: &SessionConfigState,
+    caps: ConfigOptionCaps,
+) -> Option<SessionUpdate> {
+    caps.select.then(|| {
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(session_config_options(
+            &config.meta,
+            &config.models,
+            caps,
+        )))
+    })
 }
 
 /// Manages active ACP sessions connected to the pacode daemon.
@@ -162,6 +218,12 @@ pub struct SessionManager {
     sessions: RwLock<HashMap<PacodeSessionId, Arc<SessionState>>>,
     order: Mutex<VecDeque<PacodeSessionId>>,
     max_sessions: usize,
+    /// `session.config_options` advertised at initialize: when false, session
+    /// responses carry `modes` only and the model catalog is never fetched.
+    config_options_supported: AtomicBool,
+    /// `config_options.boolean` sub-capability: controls whether the ZDR
+    /// option is emitted as a toggle or a two-value select.
+    boolean_options_supported: AtomicBool,
 }
 
 const MAX_SESSIONS: usize = 64;
@@ -173,7 +235,72 @@ impl SessionManager {
             sessions: RwLock::new(HashMap::new()),
             order: Mutex::new(VecDeque::new()),
             max_sessions: MAX_SESSIONS,
+            config_options_supported: AtomicBool::new(false),
+            boolean_options_supported: AtomicBool::new(false),
         }
+    }
+
+    /// Stores the config-option capabilities negotiated at initialize.
+    /// Initialize arrives once before any session request, so relaxed
+    /// ordering is enough.
+    pub fn set_config_caps(&self, caps: ConfigOptionCaps) {
+        self.config_options_supported
+            .store(caps.select, Ordering::Relaxed);
+        self.boolean_options_supported
+            .store(caps.boolean, Ordering::Relaxed);
+    }
+
+    fn config_caps(&self) -> ConfigOptionCaps {
+        ConfigOptionCaps {
+            select: self.config_options_supported.load(Ordering::Relaxed),
+            boolean: self.boolean_options_supported.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Fetches the model catalog for the config options — only when the
+    /// client uses them. Errors degrade to an empty list (the picker then
+    /// shows just the current route) and never fail the session attach.
+    async fn fetch_models(&self, client: &Client) -> Vec<ModelInfo> {
+        if !self.config_options_supported.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        match client.list_models().await {
+            Ok(models) => models,
+            Err(e) => {
+                log::warn!(
+                    "list_models failed; model picker will show the current route only: {e}"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Builds a `SessionState` around a freshly attached client: populates
+    /// the config-option cache and returns the initial option list to embed
+    /// in the session response when the client advertised support.
+    async fn build_state(
+        &self,
+        id: PacodeSessionId,
+        client: Client,
+        events: EventReceiver,
+        meta: &SessionMeta,
+    ) -> (Arc<SessionState>, Option<Vec<SessionConfigOption>>) {
+        let caps = self.config_caps();
+        let models = self.fetch_models(&client).await;
+        let options = caps
+            .select
+            .then(|| session_config_options(meta, &models, caps));
+        let session = Arc::new(SessionState::new(
+            id,
+            client,
+            events,
+            SessionConfigState {
+                meta: meta.clone(),
+                models,
+            },
+            caps,
+        ));
+        (session, options)
     }
 
     /// Inserts a session, evicting the least recently used one at capacity.
@@ -229,13 +356,15 @@ impl SessionManager {
 
         // Attempt to connect and attach to the session on the daemon
         let (client, events) = Client::connect(self.client_opts.clone()).await?;
-        let _snapshot = client
+        let snapshot = client
             .attach(Attach::Resume {
                 session: id.clone(),
             })
             .await?;
 
-        let session = Arc::new(SessionState::new(id.clone(), client, events));
+        let (session, _options) = self
+            .build_state(id.clone(), client, events, &snapshot.meta)
+            .await;
         self.insert(id.clone(), Arc::clone(&session)).await;
         Ok(session)
     }
@@ -257,10 +386,14 @@ impl SessionManager {
 
         let session_id = snapshot.meta.id.clone();
         let acp_id = session_id_to_acp(&session_id);
-        let session = Arc::new(SessionState::new(session_id.clone(), client, events));
+        let (session, config_options) = self
+            .build_state(session_id.clone(), client, events, &snapshot.meta)
+            .await;
         self.insert(session_id, session).await;
 
-        Ok(NewSessionResponse::new(acp_id).modes(modes_state(snapshot.meta.mode)))
+        Ok(NewSessionResponse::new(acp_id)
+            .modes(modes_state(snapshot.meta.mode))
+            .config_options(config_options))
     }
 
     /// Handles `session/load`.
@@ -294,10 +427,14 @@ impl SessionManager {
             .map_err(AcpError::Protocol)?;
         }
 
-        let session = Arc::new(SessionState::new(pacode_id.clone(), client, events));
+        let (session, config_options) = self
+            .build_state(pacode_id.clone(), client, events, &snapshot.meta)
+            .await;
         self.insert(pacode_id, session).await;
 
-        Ok(LoadSessionResponse::new().modes(modes_state(snapshot.meta.mode)))
+        Ok(LoadSessionResponse::new()
+            .modes(modes_state(snapshot.meta.mode))
+            .config_options(config_options))
     }
 
     /// Handles `session/resume`.
@@ -330,10 +467,14 @@ impl SessionManager {
             .map_err(AcpError::Protocol)?;
         }
 
-        let session = Arc::new(SessionState::new(pacode_id.clone(), client, events));
+        let (session, config_options) = self
+            .build_state(pacode_id.clone(), client, events, &snapshot.meta)
+            .await;
         self.insert(pacode_id, session).await;
 
-        Ok(ResumeSessionResponse::new().modes(modes_state(snapshot.meta.mode)))
+        Ok(ResumeSessionResponse::new()
+            .modes(modes_state(snapshot.meta.mode))
+            .config_options(config_options))
     }
 
     /// Handles `session/prompt`.
@@ -377,6 +518,29 @@ impl SessionManager {
         session.client.ok(Request::SetMode(mode)).await?;
 
         Ok(SetSessionModeResponse::new())
+    }
+
+    /// Handles `session/set_config_option`.
+    ///
+    /// Sends the validated change to the daemon, folds it into the cached
+    /// meta on success and answers with the full rebuilt option list, as the
+    /// method contract requires.
+    pub async fn set_config_option(
+        &self,
+        req: SetSessionConfigOptionRequest,
+    ) -> Result<SetSessionConfigOptionResponse, AcpError> {
+        let change = apply_config_value(req.config_id.0.as_ref(), &req.value)?;
+        let pacode_id = session_id_from_acp(&req.session_id);
+        let session = self.get_or_resume(&pacode_id).await?;
+        session.client.ok(change.to_request()).await?;
+
+        let mut config = session.config.lock().await;
+        change.apply_to_meta(&mut config.meta);
+        Ok(SetSessionConfigOptionResponse::new(session_config_options(
+            &config.meta,
+            &config.models,
+            session.config_caps,
+        )))
     }
 
     /// Handles `session/list`.

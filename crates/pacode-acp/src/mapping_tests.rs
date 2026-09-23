@@ -1,8 +1,9 @@
 use super::*;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, PermissionOptionKind, PlanEntryPriority, PlanEntryStatus,
-    RequestPermissionOutcome, SelectedPermissionOutcome, SessionId as AcpSessionId, SessionUpdate,
-    ToolCallContent, ToolCallStatus, ToolKind,
+    CancelNotification, ContentBlock, ImageContent, PermissionOptionKind, PlanEntryPriority,
+    PlanEntryStatus, RequestPermissionOutcome, SelectedPermissionOutcome,
+    SessionId as AcpSessionId, SessionUpdate, TextContent, ToolCallContent, ToolCallStatus,
+    ToolKind,
 };
 use pacode_types::ids::{AgentId, CallId, PermissionId, SessionId as PacodeSessionId, TurnId};
 use pacode_types::protocol::{Event, Request, TurnStop};
@@ -329,6 +330,58 @@ fn test_unmapped_events_dropped_cleanly() {
         assert!(
             updates.is_empty(),
             "unmapped event must produce empty updates"
+        );
+    }
+}
+
+#[test]
+fn test_prompt_content_extracts_text_and_images() {
+    // "hi" in base64.
+    let prompt = vec![
+        ContentBlock::Text(TextContent::new("look at this ".to_string())),
+        ContentBlock::Image(ImageContent::new("aGk=", "image/png")),
+        ContentBlock::Text(TextContent::new("please".to_string())),
+    ];
+    let (text, images) = prompt_content_to_parts(&prompt);
+    assert_eq!(text, "look at this please");
+    assert_eq!(images.len(), 1);
+    match &images[0] {
+        ImageSource::Bytes { mime, data } => {
+            assert_eq!(mime, "image/png");
+            assert_eq!(data, b"hi");
+        }
+        ImageSource::Path(_) => panic!("expected bytes image source"),
+    }
+}
+
+#[test]
+fn test_undecodable_image_degrades_to_text_placeholder() {
+    let prompt = vec![
+        ContentBlock::Text(TextContent::new("before ".to_string())),
+        ContentBlock::Image(ImageContent::new("!!!not-base64!!!", "image/png")),
+    ];
+    let (text, images) = prompt_content_to_parts(&prompt);
+    assert!(images.is_empty());
+    assert_eq!(text, "before [image: image/png, undecodable]");
+}
+
+#[test]
+fn test_oversized_image_is_rejected_before_decoding() {
+    let huge = "A".repeat(MAX_IMAGE_B64_LEN + 1);
+    let prompt = vec![ContentBlock::Image(ImageContent::new(huge, "image/png"))];
+    let (text, images) = prompt_content_to_parts(&prompt);
+    assert!(images.is_empty());
+    assert_eq!(text, "[image: image/png, too large]");
+}
+
+#[test]
+fn test_mode_descriptions_match_the_mode_picker() {
+    for mode in Mode::CYCLE {
+        let session_mode = mode_to_session_mode(mode);
+        assert_eq!(
+            session_mode.description.as_deref(),
+            Some(mode_description(mode)),
+            "config options and the legacy picker must share mode texts"
         );
     }
 }

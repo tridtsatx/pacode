@@ -2885,6 +2885,7 @@ name = "pacode-acp"
 version = "1.1.0"
 dependencies = [
  "agent-client-protocol",
+ "base64 0.22.1",
  "chrono",
  "log",
  "pacode-client",
