@@ -60,6 +60,9 @@ impl WidthTier {
 pub const INPUT_MIN_LINES: u16 = 1;
 pub const INPUT_MAX_LINES: u16 = 6;
 pub const FOOTER_LINES: u16 = 2;
+/// Toast strip capacity: up to this many plain text lines directly above the
+/// input separator (spec §7).
+pub const TOAST_STRIP_MAX: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScreenLayout {
@@ -83,13 +86,22 @@ pub struct ScreenLayout {
     pub rail: Rect,
     /// Vertical line between dialog column and rail.
     pub rail_separator: Rect,
-    /// Toast area: 4 lines above `input_top`, right-aligned inside the dialog column.
+    /// Toast strip: up to `TOAST_STRIP_MAX` plain lines directly above the
+    /// input separator, borrowing rows from the dialog like the preview strip.
+    /// Zero-height when no toast is live.
     pub toast: Rect,
 }
 
 /// Compute the layout for a terminal of `area` with `input_lines` lines of input,
-/// `panel_open`, and `preview_lines` rows of image preview strip (0 = none).
-pub fn compute(area: Rect, input_lines: u16, panel_open: bool, preview_lines: u16) -> ScreenLayout {
+/// `panel_open`, `preview_lines` rows of image preview strip (0 = none), and
+/// `toast_lines` rows of toast strip (0 = none).
+pub fn compute(
+    area: Rect,
+    input_lines: u16,
+    panel_open: bool,
+    preview_lines: u16,
+    toast_lines: u16,
+) -> ScreenLayout {
     let tier = WidthTier::for_width(area.width);
     let rail_w = tier.rail_width();
 
@@ -142,8 +154,17 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool, preview_lines: u1
         input_y.saturating_sub(preview_y),
     );
 
-    let dialog_h = input_top_y.saturating_sub(left_area.y);
+    // The toast strip borrows rows from the bottom of the dialog, directly
+    // above the input separator — the same mechanism as the preview strip,
+    // so the strip's lines never overdraw transcript text.
     let dialog_y = left_area.y;
+    let toast_h = toast_lines
+        .min(TOAST_STRIP_MAX)
+        .min(input_top_y.saturating_sub(dialog_y));
+    let toast_y = input_top_y.saturating_sub(toast_h);
+    let toast = Rect::new(left_area.x, toast_y, left_area.width, toast_h);
+
+    let dialog_h = toast_y.saturating_sub(dialog_y);
 
     let (dialog, panel, panel_separator) = if panel_open {
         let share = tier.dialog_share_with_panel();
@@ -176,12 +197,6 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool, preview_lines: u1
             None,
         )
     };
-
-    let toast_w = (dialog.width.saturating_sub(2)).min(62);
-    let toast_h = if toast_w > 0 { 4.min(dialog.height) } else { 0 };
-    let toast_y = input_top_y.saturating_sub(toast_h);
-    let toast_x = dialog.x + dialog.width.saturating_sub(1).saturating_sub(toast_w);
-    let toast = Rect::new(toast_x, toast_y, toast_w, toast_h);
 
     ScreenLayout {
         tier,

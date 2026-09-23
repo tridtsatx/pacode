@@ -37,7 +37,7 @@ use pacode_types::{AgentId, PluginCommandOutcome, Reply, Request, TranscriptKind
 use crate::keys::{Action, handle_key, handle_mouse};
 use crate::layout::ScreenLayout;
 use crate::state::transcript::{Cell, CellKind};
-use crate::state::{AppState, PanelTarget, TOAST_TTL_SECS};
+use crate::state::{AppState, PanelTarget, TOAST_EXIT_MS, TOAST_TTL_SECS};
 use crate::terminal::TerminalGuard;
 use crate::ui;
 use crate::{TuiError, TuiOptions};
@@ -56,6 +56,9 @@ enum BgResponse {
         kind: Option<crate::cache::ListKind>,
         res: Result<Reply, pacode_client::ClientError>,
     },
+    /// The seq-gap `GetSnapshot` resync finished — clears the in-flight mark
+    /// so a later gap may re-arm. `Ok(Reply::Snapshot)` folds as usual.
+    ResyncDone(Result<Reply, pacode_client::ClientError>),
     LoadPanelReply {
         target: PanelTarget,
         result: Result<Reply, pacode_client::ClientError>,
@@ -447,13 +450,29 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         };
 
         let toast_expiry_sleep = async {
-            if let Some(oldest) = state.toasts.front() {
-                let dur = Duration::from_secs(TOAST_TTL_SECS);
-                let elapsed = Instant::now().saturating_duration_since(oldest.shown_at);
-                let remaining = dur.saturating_sub(elapsed);
-                tokio::time::sleep(remaining).await;
-            } else {
-                std::future::pending::<()>().await;
+            // Wake at the nearest toast boundary: the fade start (TTL − EXIT)
+            // arms the anim tick so the fade actually gets frames while the
+            // app is idle; the expiry (TTL) drops the toast. Past the fade
+            // start only the expiry remains — never a zero-duration spin.
+            let now = Instant::now();
+            let fade_at = Duration::from_secs(TOAST_TTL_SECS)
+                .saturating_sub(Duration::from_millis(TOAST_EXIT_MS));
+            let expire_at = Duration::from_secs(TOAST_TTL_SECS);
+            let next = state
+                .toasts
+                .iter()
+                .map(|t| {
+                    let age = now.saturating_duration_since(t.shown_at);
+                    if age < fade_at {
+                        fade_at - age
+                    } else {
+                        expire_at.saturating_sub(age)
+                    }
+                })
+                .min();
+            match next {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => std::future::pending::<()>().await,
             }
         };
 
@@ -494,12 +513,37 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             }
         };
 
+        // A seq-gap resync that lost its send slot to the debounce — or a
+        // failed send that re-armed the want — must not wait on the next
+        // daemon event: a quiet stream would strand the heal and leave the
+        // rail stale. Armed only while a want waits on the send gate (the
+        // in-flight case wakes via `BgResponse::ResyncDone`), firing at the
+        // debounce boundary, at most `RESYNC_DEBOUNCE_MS` out.
+        let resync_sleep = async {
+            if !state.resync_want || state.resync_in_flight {
+                return std::future::pending::<()>().await;
+            }
+            let wait = match state.resync_sent_at {
+                Some(t) => Duration::from_millis(crate::state::RESYNC_DEBOUNCE_MS)
+                    .saturating_sub(Instant::now().saturating_duration_since(t)),
+                None => Duration::ZERO,
+            };
+            tokio::time::sleep(wait).await;
+        };
+
         tokio::select! {
             client_ev = events.recv() => {
                 match client_ev {
                     Some(ev) => {
                         let snapshot_landed = matches!(ev, ClientEvent::Snapshot(_));
-                        state.apply_client_event(ev, Instant::now());
+                        let now = Instant::now();
+                        state.apply_client_event(ev, now);
+                        // A dropped daemon event leaves the rail stale — the
+                        // debounced snapshot resync is the heal (at most one
+                        // in flight; see `take_resync_request`).
+                        if let Some(req) = state.take_resync_request(now) {
+                            dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                        }
                         if let Some(req) = state.drain_prompt_queue() {
                             dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
                         }
@@ -591,6 +635,13 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
                     dispatch_action(act, &mut state, &client, &bg_tx);
                 }
             }
+            _ = resync_sleep => {
+                // The debounce window closed with a want still armed — the
+                // send gate inside re-checks attachment and connection.
+                if let Some(req) = state.take_resync_request(Instant::now()) {
+                    dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                }
+            }
         }
     }
 
@@ -673,11 +724,19 @@ fn dispatch_action(
                 }
                 _ => {}
             }
+            // `GetSnapshot` only ever flies as a seq-gap resync — it reports
+            // on its own variant so a failed one clears `resync_in_flight`
+            // instead of sticking it forever.
+            let is_resync = matches!(req, Request::GetSnapshot);
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
                 let res = cl.request(req).await;
-                let _ = tx.send(BgResponse::Reply { kind, res });
+                if is_resync {
+                    let _ = tx.send(BgResponse::ResyncDone(res));
+                } else {
+                    let _ = tx.send(BgResponse::Reply { kind, res });
+                }
             });
         }
         Action::RunBashInteractive { command } => {
@@ -719,6 +778,7 @@ fn dispatch_action(
                 version: 0,
                 ts_ms: now,
                 stats: None,
+                perm_explain: None,
             });
             state.transcript.scroll_to_bottom();
             state.dirty = true;
@@ -881,6 +941,7 @@ fn request_needs_session(req: &Request) -> bool {
         | Request::Interrupt
         | Request::InterruptAll
         | Request::PermissionReply { .. }
+        | Request::ExplainPermission { .. }
         | Request::SetModel(_)
         | Request::SetEffort(_)
         | Request::SetMode(_)
@@ -1276,6 +1337,41 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             }
             handle_reply(res, state)
         }
+        BgResponse::ResyncDone(res) => {
+            // The in-flight mark clears whatever the outcome; a landing
+            // `Reply::Snapshot` additionally rebases `last_event_seq` and
+            // settles `resync_want` inside `apply_attach_snapshot`.
+            state.resync_in_flight = false;
+            match res {
+                // Best-effort heal, no transcript noise: a dead link recovers
+                // through the reconnect's own snapshot, so only a live one
+                // re-arms the want — the retry still waits out
+                // `RESYNC_DEBOUNCE_MS` (`resync_sleep`).
+                Ok(Reply::Error { message }) => {
+                    log::warn!("snapshot resync answered with error: {message}");
+                    state.resync_want =
+                        matches!(state.connection, crate::state::Connection::Connected);
+                    vec![]
+                }
+                Ok(reply) => {
+                    // A resync that did not deliver a snapshot leaves the
+                    // recorded gap unhealed — re-arm so the retry runs.
+                    let landed_snapshot = matches!(reply, Reply::Attached(_) | Reply::Snapshot(_));
+                    let actions = handle_reply(Ok(reply), state);
+                    if !landed_snapshot {
+                        state.resync_want =
+                            matches!(state.connection, crate::state::Connection::Connected);
+                    }
+                    actions
+                }
+                Err(e) => {
+                    log::warn!("snapshot resync failed: {e}");
+                    state.resync_want =
+                        matches!(state.connection, crate::state::Connection::Connected);
+                    vec![]
+                }
+            }
+        }
         BgResponse::AtCompleted { key, candidates } => {
             state.input.at_comp.finish_scan(key, candidates);
             state.dirty = true;
@@ -1464,6 +1560,7 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                         version: 0,
                         ts_ms: now,
                         stats: None,
+                        perm_explain: None,
                     });
                     state.transcript.scroll_to_bottom();
                 }
@@ -1479,6 +1576,7 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                         version: 0,
                         ts_ms: now,
                         stats: None,
+                        perm_explain: None,
                     });
                     state.transcript.scroll_to_bottom();
                 }
@@ -1507,6 +1605,7 @@ fn handle_reply(
                 version: 0,
                 ts_ms: now,
                 stats: None,
+                perm_explain: None,
             });
             state.dirty = true;
             vec![]
@@ -1615,6 +1714,7 @@ fn handle_reply(
                 version: 0,
                 ts_ms: now,
                 stats: None,
+                perm_explain: None,
             });
             state.dirty = true;
             vec![]

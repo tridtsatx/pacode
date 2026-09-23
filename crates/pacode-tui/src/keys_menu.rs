@@ -89,8 +89,9 @@ fn list_key(
     key: KeyEvent,
 ) -> Vec<Action> {
     match key.code {
-        // `esc` — one level back; the last level pops into "closed" (§3.4).
-        KeyCode::Esc => {
+        // `esc` and `←` — one level back; the last level pops into "closed"
+        // (§3.4). Edit mode keeps `←` for its own cursor — this arm is List only.
+        KeyCode::Esc | KeyCode::Left => {
             stack.pop();
             if let Some(parent) = stack.current() {
                 *ui = parent.ui();
@@ -184,7 +185,9 @@ fn list_key_inner(
             tab_step(ui, view, -1);
             tab_follow_up(state, stack, ui)
         }
-        KeyCode::Enter => enter_row(state, stack, ui, view),
+        // `→` activates the row like `enter` — descend into a submenu, flip
+        // an enum, open the row's target (§3.4).
+        KeyCode::Enter | KeyCode::Right => enter_row(state, stack, ui, view),
         KeyCode::Backspace if filtering => {
             let changed = ui.query.pop().is_some();
             ui.cursor = RowId::default();

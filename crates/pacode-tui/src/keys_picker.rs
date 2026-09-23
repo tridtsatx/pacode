@@ -122,37 +122,77 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     actions
 }
 
+/// Send `answer` for the question the queue is focused on NOW. The id is
+/// read off the queue at send time — never from a key handler's earlier
+/// view of it — so a resolve or a new ask that shifted the focus between
+/// keypresses can never stamp the stale question. The copy is dropped
+/// optimistically: the `QuestionResolved` echo just finds it already gone.
+fn submit_answer(state: &mut AppState, answer: pacode_types::QuestionAnswer) -> Vec<Action> {
+    let Some(id) = state.questions.current().map(|q| q.id.clone()) else {
+        state.focus = Focus::Normal;
+        return vec![];
+    };
+    state.questions.resolve(&id);
+    if state.questions.is_empty() {
+        state.focus = Focus::Normal;
+    }
+    state.dirty = true;
+    vec![Action::Send(pacode_types::Request::AnswerQuestion {
+        question: id,
+        answer,
+    })]
+}
+
 fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     match &mut state.focus {
-        Focus::Overlay(Overlay::QuestionPicker {
-            question,
-            index,
-            selected,
-            typed,
-            typing,
-        }) => {
-            let count = question.options.len();
-            let multi = question.multi_select;
-            let id = question.id.clone();
+        Focus::Overlay(Overlay::QuestionPicker) => {
+            let Some((count, multi)) = state
+                .questions
+                .current()
+                .map(|q| (q.options.len(), q.multi_select))
+            else {
+                // The queue ran dry without the picker noticing — a resolve
+                // folded while the layer was up. Drop the layer.
+                state.focus = Focus::Normal;
+                return vec![];
+            };
 
-            if *typing {
+            if state.questions.focus().is_some_and(|f| f.typing) {
                 match key.code {
                     KeyCode::Esc => {
-                        *typing = false;
-                        typed.clear();
+                        let f = state.questions.focus_mut().expect("current exists");
+                        f.typing = false;
+                        f.typed.clear();
                     }
                     KeyCode::Enter => {
-                        let answer = pacode_types::QuestionAnswer::typed(typed.clone());
-                        state.focus = Focus::Normal;
-                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                            question: id,
-                            answer,
-                        })];
+                        let typed = state
+                            .questions
+                            .focus()
+                            .map(|f| f.typed.clone())
+                            .unwrap_or_default();
+                        return submit_answer(state, pacode_types::QuestionAnswer::typed(typed));
                     }
+                    // Arrows still walk the queue while typing: `typed` and
+                    // `typing` are stored per question, so a half-written
+                    // answer is right there when the cursor comes back.
+                    KeyCode::Left => state.questions.move_cursor(-1),
+                    KeyCode::Right => state.questions.move_cursor(1),
                     KeyCode::Backspace => {
-                        typed.pop();
+                        state
+                            .questions
+                            .focus_mut()
+                            .expect("current exists")
+                            .typed
+                            .pop();
                     }
-                    KeyCode::Char(c) => typed.push(c),
+                    KeyCode::Char(c) => {
+                        state
+                            .questions
+                            .focus_mut()
+                            .expect("current exists")
+                            .typed
+                            .push(c);
+                    }
                     _ => {}
                 }
                 state.dirty = true;
@@ -161,29 +201,45 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
 
             match key.code {
                 // Dismissing answers the question as dismissed: the turn is
-                // waiting on it, so leaving it unanswered would hang the model.
+                // waiting on it, so leaving it unanswered would hang the
+                // model. More questions may still wait behind it.
                 KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                    return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                        question: id,
-                        answer: pacode_types::QuestionAnswer::cancelled(),
-                    })];
+                    return submit_answer(state, pacode_types::QuestionAnswer::cancelled());
                 }
-                KeyCode::Up | KeyCode::Char('k') => *index = index.saturating_sub(1),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(f) = state.questions.focus_mut() {
+                        f.index = f.index.saturating_sub(1);
+                    }
+                }
                 // The free-text plaque sits at `index == count` — one row past
                 // the last option.
-                KeyCode::Down | KeyCode::Char('j') => *index = (*index + 1).min(count),
-                KeyCode::Char('t') => *typing = true,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(f) = state.questions.focus_mut() {
+                        f.index = (f.index + 1).min(count);
+                    }
+                }
+                // Several questions can wait at once: walk the queue.
+                // Per-question state is keyed by id, so a half-typed answer
+                // survives the round trip.
+                KeyCode::Left | KeyCode::Char('h') => state.questions.move_cursor(-1),
+                KeyCode::Right | KeyCode::Char('l') => state.questions.move_cursor(1),
+                KeyCode::Char('t') => {
+                    if let Some(f) = state.questions.focus_mut() {
+                        f.typing = true;
+                    }
+                }
                 KeyCode::Char(' ') => {
-                    if *index == count {
-                        // Space on the plaque means "type here" (in typing mode
-                        // the Char arm above already appends it to `typed`).
-                        *typing = true;
-                    } else if multi {
-                        if let Some(pos) = selected.iter().position(|i| i == index) {
-                            selected.remove(pos);
-                        } else {
-                            selected.push(*index);
+                    if let Some(f) = state.questions.focus_mut() {
+                        if f.index == count {
+                            // Space on the plaque means "type here" (in typing
+                            // mode the Char arm above appends it to `typed`).
+                            f.typing = true;
+                        } else if multi {
+                            if let Some(pos) = f.selected.iter().position(|i| *i == f.index) {
+                                f.selected.remove(pos);
+                            } else {
+                                f.selected.push(f.index);
+                            }
                         }
                     }
                 }
@@ -192,33 +248,49 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     if picked == count {
                         // `N+1` jumps to the free-text plaque rather than
                         // answering — typing there starts with enter.
-                        *index = count;
+                        if let Some(f) = state.questions.focus_mut() {
+                            f.index = count;
+                        }
                     } else if picked < count {
-                        state.focus = Focus::Normal;
-                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                            question: id,
-                            answer: pacode_types::QuestionAnswer::choice(picked),
-                        })];
+                        return submit_answer(state, pacode_types::QuestionAnswer::choice(picked));
+                    }
+                }
+                // On the plaque any other printable key starts typing
+                // immediately — the "Type something" row IS the input, so a
+                // letter there should not fall dead.
+                KeyCode::Char(c)
+                    if state.questions.focus().is_some_and(|f| f.index == count)
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(f) = state.questions.focus_mut() {
+                        f.typing = true;
+                        f.typed.push(c);
                     }
                 }
                 KeyCode::Enter => {
-                    if *index == count {
-                        *typing = true;
+                    let index = state.questions.focus().map(|f| f.index).unwrap_or(0);
+                    if index == count {
+                        if let Some(f) = state.questions.focus_mut() {
+                            f.typing = true;
+                        }
                     } else {
+                        let selected = state
+                            .questions
+                            .focus()
+                            .map(|f| f.selected.clone())
+                            .unwrap_or_default();
                         let answer = if multi && !selected.is_empty() {
                             pacode_types::QuestionAnswer {
-                                selected: selected.clone(),
+                                selected,
                                 free_text: None,
                                 cancelled: false,
                             }
                         } else {
-                            pacode_types::QuestionAnswer::choice(*index)
+                            pacode_types::QuestionAnswer::choice(index)
                         };
-                        state.focus = Focus::Normal;
-                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                            question: id,
-                            answer,
-                        })];
+                        return submit_answer(state, answer);
                     }
                 }
                 // Any other printable key is ignored: the question is a closed

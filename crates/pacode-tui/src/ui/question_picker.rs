@@ -3,7 +3,7 @@
 //! the free-text plaque (`index == options.len()` reaches it) and the hints:
 //!
 //! ```text
-//!  Storage
+//!  Storage · 1/2
 //! Where should the cache live?
 //!
 //!  › 1. Cache dir
@@ -14,9 +14,11 @@
 //!    3. Type something.
 //!    > enter your answer
 //!
-//! ↑/↓ select · 1-3 pick · t type · enter · esc dismiss
+//! ↑/↓ select · 1-3 pick · ←/→ question · t type · enter · esc dismiss
 //! ```
 //!
+//! Several questions can wait at once — the `i/n` in the chip and the
+//! `←/→ question` hint appear only while the queue holds more than one.
 //! When the whole block does not fit the reserved height, the options list
 //! windows around the cursor while the plaque and hint stay pinned.
 
@@ -44,11 +46,12 @@ fn option_height(option: &pacode_types::QuestionOption, width: usize) -> usize {
     }
 }
 
-/// Rows the picker wants at `width`: header chip, wrapped question, blank,
-/// the option rows, then the plaque block and hint (`TAIL_LINES`).
-/// `AppState::bottom_picker_height` caps the result.
-pub(crate) fn height(question: &pacode_types::Question, width: usize) -> usize {
-    let head = usize::from(!question.header.is_empty())
+/// Rows the picker wants at `width`: header chip (also the queue badge's
+/// home, so it exists whenever the queue is deeper than one), wrapped
+/// question, blank, the option rows, then the plaque block and hint
+/// (`TAIL_LINES`). `AppState::bottom_picker_height` caps the result.
+pub(crate) fn height(question: &pacode_types::Question, queue_len: usize, width: usize) -> usize {
+    let head = usize::from(!question.header.is_empty() || queue_len > 1)
         + pacode_render::wrap_text(&question.question, width.max(1)).len()
         + 1;
     let options: usize = question
@@ -80,26 +83,34 @@ fn tail_to_width(s: &str, width: usize) -> String {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw(
     frame: &mut Frame,
     area: Rect,
     question: &pacode_types::Question,
-    index: usize,
-    selected: &[usize],
-    typed: &str,
-    typing: bool,
+    focus: &crate::state::QuestionFocus,
+    position: usize,
+    queue_len: usize,
     opts: &RenderOptions,
 ) {
+    let index = focus.index;
+    let selected = &focus.selected;
+    let typed = focus.typed.as_str();
+    let typing = focus.typing;
     let width = area.width as usize;
     let count = question.options.len();
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    if !question.header.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(" {} ", question.header),
-            opts.theme.selected_bg,
-        )));
+    if !question.header.is_empty() || queue_len > 1 {
+        let chip = if queue_len > 1 {
+            if question.header.is_empty() {
+                format!(" {position}/{queue_len} ")
+            } else {
+                format!(" {} · {position}/{queue_len} ", question.header)
+            }
+        } else {
+            format!(" {} ", question.header)
+        };
+        lines.push(Line::from(Span::styled(chip, opts.theme.selected_bg)));
     }
     for line in pacode_render::wrap_text(&question.question, width.max(1)) {
         lines.push(Line::from(Span::styled(line, opts.theme.bold)));
@@ -220,12 +231,16 @@ pub(crate) fn draw(
 
     let sep = opts.glyphs.dot_sep;
     let arrows = if opts.glyphs.ascii { "^/v" } else { "↑/↓" };
+    let side = if opts.glyphs.ascii { "</>" } else { "←/→" };
     let hint = if typing {
         format!("type an answer{sep}enter send{sep}esc back")
     } else {
         let mut h = format!("{arrows} select{sep}1-{} pick{sep}", count + 1);
         if question.multi_select {
             h.push_str(&format!("space toggle{sep}"));
+        }
+        if queue_len > 1 {
+            h.push_str(&format!("{side} question{sep}"));
         }
         h.push_str(&format!("t type{sep}enter{sep}esc dismiss"));
         h
@@ -275,12 +290,15 @@ mod tests {
     }
 
     /// Draw `draw` on a test backend; returns (buffer text, cursor position).
+    /// `queue` is (position, len) — the `i/n` badge only shows past 1.
+    #[allow(clippy::too_many_arguments)]
     fn render_question(
         question: &pacode_types::Question,
         index: usize,
         selected: &[usize],
         typed: &str,
         typing: bool,
+        queue: (usize, usize),
         width: u16,
         height: u16,
     ) -> (String, Option<(u16, u16)>) {
@@ -288,8 +306,14 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let area = Rect::new(0, 0, width, height);
+        let focus = crate::state::QuestionFocus {
+            index,
+            selected: selected.to_vec(),
+            typed: typed.to_string(),
+            typing,
+        };
         terminal
-            .draw(|f| draw(f, area, question, index, selected, typed, typing, &opts))
+            .draw(|f| draw(f, area, question, &focus, queue.0, queue.1, &opts))
             .expect("draw");
         let text = format!("{}", terminal.backend());
         let cursor = terminal
@@ -303,7 +327,7 @@ mod tests {
     #[test]
     fn shows_every_option_description_and_the_plaque() {
         let q = test_question();
-        let (text, _) = render_question(&q, 0, &[], "", false, 60, 18);
+        let (text, _) = render_question(&q, 0, &[], "", false, (1, 1), 60, 18);
         // Header chip, the question, both options with their descriptions —
         // not only the one under the cursor.
         assert!(text.contains("Storage"), "{text}");
@@ -321,18 +345,40 @@ mod tests {
     }
 
     #[test]
+    fn a_deeper_queue_badges_the_chip_and_hints_the_walk() {
+        let q = test_question();
+        let (text, _) = render_question(&q, 0, &[], "", false, (1, 3), 60, 18);
+        assert!(text.contains("Storage · 1/3"), "{text}");
+        assert!(text.contains("←/→ question"), "{text}");
+
+        // A headerless question still shows the bare position.
+        let mut bare = test_question();
+        bare.header = String::new();
+        let (text, _) = render_question(&bare, 0, &[], "", false, (2, 2), 60, 18);
+        assert!(text.contains(" 2/2 "), "{text}");
+        // …and at depth one there is no badge and no hint.
+        let (text, _) = render_question(&bare, 0, &[], "", false, (1, 1), 60, 18);
+        assert!(!text.contains("/1"), "{text}");
+        assert!(!text.contains("question"), "{text}");
+    }
+
+    #[test]
     fn the_cursor_reaches_the_plaque() {
         let q = test_question();
         // index == options.len() is the plaque; its input row takes the bar.
-        let (text, _) = render_question(&q, 2, &[], "", false, 60, 18);
+        let (text, _) = render_question(&q, 2, &[], "", false, (1, 1), 60, 18);
         assert!(text.contains("> enter your answer"), "{text}");
 
         let opts = RenderOptions::with_theme(60, false, pacode_render::Theme::ansi());
         let backend = TestBackend::new(60, 18);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let area = Rect::new(0, 0, 60, 18);
+        let focus = crate::state::QuestionFocus {
+            index: 2,
+            ..crate::state::QuestionFocus::default()
+        };
         terminal
-            .draw(|f| draw(f, area, &q, 2, &[], "", false, &opts))
+            .draw(|f| draw(f, area, &q, &focus, 1, 1, &opts))
             .expect("draw");
         // The `> enter your answer` row is the selected bar (ansi selected_bg
         // marks cells REVERSED): find its row and check a padded cell.
@@ -355,14 +401,14 @@ mod tests {
     #[test]
     fn typing_shows_the_text_and_a_cursor() {
         let q = test_question();
-        let (text, cursor) = render_question(&q, 0, &[], "abc", true, 60, 18);
+        let (text, cursor) = render_question(&q, 0, &[], "abc", true, (1, 1), 60, 18);
         assert!(text.contains("> abc"), "{text}");
         // Cursor sits after the typed text: `   > ` is 5 cells + 3 chars.
         assert_eq!(cursor, Some((5 + 3, 9)), "{text}");
 
         // Long input keeps the tail on screen, cursor at the right edge.
         let long = "x".repeat(100);
-        let (_text, cursor) = render_question(&q, 0, &[], &long, true, 60, 18);
+        let (_text, cursor) = render_question(&q, 0, &[], &long, true, (1, 1), 60, 18);
         assert_eq!(cursor, Some((59, 9)));
     }
 
@@ -370,14 +416,20 @@ mod tests {
     fn height_counts_every_row() {
         let q = test_question();
         // header 1 + question 1 + blank 1 + 2 options × 2 + tail 5 = 12.
-        assert_eq!(height(&q, 86), 12);
+        assert_eq!(height(&q, 1, 86), 12);
 
         // An empty description costs one row, a long one more.
         let mut q2 = test_question();
         q2.options[0].description = String::new();
-        assert_eq!(height(&q2, 86), 11);
+        assert_eq!(height(&q2, 1, 86), 11);
         q2.options[0].description = "x".repeat(400);
-        assert!(height(&q2, 86) > 12);
+        assert!(height(&q2, 1, 86) > 12);
+
+        // The badge row exists even when the header is empty.
+        let mut bare = test_question();
+        bare.header = String::new();
+        assert_eq!(height(&bare, 1, 86), 11);
+        assert_eq!(height(&bare, 3, 86), 12);
     }
 
     #[test]
@@ -402,7 +454,7 @@ mod tests {
             0,
         )
         .expect("question");
-        let (text, _) = render_question(&q, 5, &[], "", false, 60, 14);
+        let (text, _) = render_question(&q, 5, &[], "", false, (1, 1), 60, 14);
         assert!(text.contains("> enter your answer"), "{text}");
         assert!(text.contains("esc dismiss"), "{text}");
         // The window follows the cursor: the last option is shown, the first

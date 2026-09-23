@@ -19,7 +19,8 @@ use ratatui::text::{Line, Span};
 
 use pacode_render::text as rtext;
 use pacode_render::{
-    RenderOptions, display_width, render_diff_ex, truncate_spans, truncate_to_width, wrap_text,
+    RenderOptions, display_width, render_diff_ex, truncate_spans, truncate_to_width, wrap_line,
+    wrap_text,
 };
 use pacode_types::time::format_duration_ms;
 use pacode_types::transcript::{DiffStat, ToolStatus};
@@ -86,22 +87,30 @@ pub fn render(
             .lines()
             .filter(|l| !(drop_exit && is_exit_line(l)))
             .collect();
-        if content_lines.iter().any(|l| !l.trim().is_empty()) {
+        if expanded {
+            // Expanded spells out the call's input first — the command on the
+            // `$` row for bash, the title arg on its own row for every other
+            // tool — then every output line wrapped, never cut or folded.
+            if call.name == "bash" {
+                push_command_lines(&mut out, call, body_w, gutter_style, opts);
+            } else {
+                push_arg_lines(&mut out, call, body_w, gutter_style, opts);
+            }
+            if content_lines.iter().any(|l| !l.trim().is_empty()) {
+                push_expanded(&mut out, &content_lines, body_w, gutter_style, opts);
+            }
+        } else if content_lines.iter().any(|l| !l.trim().is_empty()) {
             if call.name == "bash" {
                 out.push(command_line(call, body_w, gutter_style, opts));
             }
-            if expanded {
-                push_expanded(&mut out, &content_lines, body_w, gutter_style, opts);
-            } else {
-                push_collapsed(
-                    &mut out,
-                    call.status,
-                    &content_lines,
-                    body_w,
-                    gutter_style,
-                    opts,
-                );
-            }
+            push_collapsed(
+                &mut out,
+                call.status,
+                &content_lines,
+                body_w,
+                gutter_style,
+                opts,
+            );
         }
     }
 
@@ -218,6 +227,54 @@ fn title_arg<'a>(call: &ToolCallView<'a>) -> &'a str {
         return call.title[prefix_len..].trim_start();
     }
     call.title
+}
+
+/// `│ $ <command>` wrapped across as many gutter rows as it needs — the
+/// expanded bash body shows the whole command, highlighted; continuation
+/// lines align under the command (the `$ ` prefix is two cells).
+fn push_command_lines(
+    out: &mut Vec<Line<'static>>,
+    call: &ToolCallView<'_>,
+    body_w: usize,
+    gutter_style: Style,
+    opts: &RenderOptions,
+) {
+    let cleaned = strip_ansi(title_arg(call));
+    if cleaned.trim().is_empty() {
+        return;
+    }
+    let mut code = vec![Span::styled("$ ", opts.theme.dim)];
+    code.extend(
+        crate::bash::tokenize(&cleaned)
+            .into_iter()
+            .map(|s| Span::styled(s.text.to_string(), opts.theme.bash_style(s.role))),
+    );
+    for wrapped in wrap_line(Line::from(code), body_w.max(1), 2) {
+        let mut spans = vec![gutter(opts, gutter_style)];
+        spans.extend(wrapped.spans);
+        out.push(Line::from(spans));
+    }
+}
+
+/// `│ <arg>` — a non-bash call's full argument, wrapped; the header only ever
+/// has room for a truncated summary, so expansion is where the whole arg shows.
+/// Brighter than the dim output lines: it is the call's input, not its output.
+fn push_arg_lines(
+    out: &mut Vec<Line<'static>>,
+    call: &ToolCallView<'_>,
+    body_w: usize,
+    gutter_style: Style,
+    opts: &RenderOptions,
+) {
+    let cleaned = strip_ansi(title_arg(call));
+    for l in cleaned.lines() {
+        for wrapped in wrap_text(l, body_w.max(1)) {
+            out.push(Line::from(vec![
+                gutter(opts, gutter_style),
+                Span::styled(wrapped, opts.theme.fg),
+            ]));
+        }
+    }
 }
 
 /// `│ $ <command>` — the bash command in the theme's bash-role highlighting.
@@ -397,9 +454,7 @@ fn diff_stat_spans(diff: &DiffStat, opts: &RenderOptions) -> Vec<Span<'static>> 
 /// Whether a preview is a unified diff and goes through the diff renderer.
 /// `--- a/` and `--- /dev/null` are the headers `unified_diff` emits; a bare
 /// `--- ` prefix alone is not enough (`batch` section headers look alike).
-/// `pub(crate)`: `state::transcript` reuses it to decide whether a cell's
-/// collapsed body actually hides lines.
-pub(crate) fn is_diff_preview(preview: &str) -> bool {
+fn is_diff_preview(preview: &str) -> bool {
     preview.starts_with("--- a/")
         || preview.starts_with("--- /dev/null")
         || preview.contains("\n+++ ")

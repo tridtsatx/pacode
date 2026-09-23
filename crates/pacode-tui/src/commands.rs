@@ -631,6 +631,7 @@ fn push_notice(state: &mut AppState, level: ToastLevel, text: String) {
         version: 0,
         ts_ms: now,
         stats: None,
+        perm_explain: None,
     });
     state.dirty = true;
 }

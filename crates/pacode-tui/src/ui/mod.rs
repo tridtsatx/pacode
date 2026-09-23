@@ -17,7 +17,6 @@ pub mod overlays;
 pub mod panel;
 pub mod phrases;
 pub mod picker;
-pub mod popup;
 pub mod question_picker;
 pub mod rail;
 pub mod rail_session;
@@ -48,7 +47,7 @@ pub fn focus_key(focus: &Focus) -> u8 {
             Overlay::ModelPicker { .. } => 10,
             Overlay::EffortPicker { .. } => 11,
             Overlay::ModePicker { .. } => 12,
-            Overlay::QuestionPicker { .. } => 14,
+            Overlay::QuestionPicker => 14,
             Overlay::ThemePicker { .. } => 15,
             Overlay::RailOverlay => 22,
             Overlay::LoginPicker { .. } => 24,
@@ -123,9 +122,16 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     } else {
         state.image_strip_rows()
     };
-    let temp_layout = crate::layout::compute(frame.area(), 1, panel_open, 0);
+    let toast_lines = toast::live_toasts(state, now).len() as u16;
+    let temp_layout = crate::layout::compute(frame.area(), 1, panel_open, 0, 0);
     let input_lines = state.input.wrapped_lines(temp_layout.input.width);
-    let layout = crate::layout::compute(frame.area(), input_lines, panel_open, preview_lines);
+    let layout = crate::layout::compute(
+        frame.area(),
+        input_lines,
+        panel_open,
+        preview_lines,
+        toast_lines,
+    );
 
     // Fold markers name the chord actually bound to ExpandOutput — "click"
     // when it is unbound (a click on the cell still toggles it).
@@ -165,7 +171,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
     };
     let dialog_area = if is_picker {
         let picker_y = frame.area().height.saturating_sub(picker_h);
-        let d_h = picker_y.saturating_sub(layout.dialog.y);
+        // The toast strip sits on dedicated rows right above the picker.
+        let d_h = picker_y
+            .saturating_sub(layout.dialog.y)
+            .saturating_sub(layout.toast.height);
         Rect::new(layout.dialog.x, layout.dialog.y, layout.dialog.width, d_h)
     } else {
         layout.dialog
@@ -316,26 +325,23 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
             None => picker_area,
         };
         picker::draw(frame, picker_area, state, &opts);
-    } else {
-        input::draw(frame, &layout, state, &opts);
-        images::draw(frame, layout.preview, state, &opts);
-        footer::draw(frame, layout.footer, state, &opts);
-    }
-
-    if layout.toast.width > 0 && layout.toast.height > 0 {
-        let toast_area = if is_picker {
-            let picker_y = frame.area().height.saturating_sub(picker_h);
-            let toast_y = picker_y.saturating_sub(layout.toast.height);
-            Rect::new(
-                layout.toast.x,
-                toast_y,
-                layout.toast.width,
+        if layout.toast.height > 0 {
+            let toast_area = Rect::new(
+                picker_area.x,
+                picker_y.saturating_sub(layout.toast.height),
+                picker_area.width,
                 layout.toast.height,
-            )
-        } else {
-            layout.toast
-        };
-        toast::draw(frame, toast_area, state, &opts);
+            );
+            toast::draw(frame, toast_area, state, &opts);
+        }
+    } else {
+        // The strip draws before the input: slash/@/bash completion popups
+        // extend over its rows and must paint on top of it. `layout.input`
+        // rides along so thumbnails center over their `[Image N]` tokens.
+        toast::draw(frame, layout.toast, state, &opts);
+        input::draw(frame, &layout, state, &opts);
+        images::draw(frame, layout.preview, layout.input, state, &opts);
+        footer::draw(frame, layout.footer, state, &opts);
     }
 
     let dialog_or_full = if layout.dialog.width > 0 {
@@ -396,18 +402,6 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
                 auto: matches!(copy_req, crate::state::selection::CopyRequest::Auto),
             });
         }
-    }
-
-    if let Some(popup_toast) = state
-        .toasts
-        .iter()
-        .find(|t| t.title == popup::POPUP_TOAST_TITLE)
-    {
-        let text = popup_toast
-            .detail
-            .as_deref()
-            .unwrap_or(crate::clipboard::REMOTE_HINT_TEXT);
-        popup::draw(frame, frame.area(), text, &opts);
     }
 
     layout

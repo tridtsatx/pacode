@@ -53,7 +53,8 @@ impl TerminalGuard {
         // REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESCAPE_CODES: Press/Repeat/
         // Release arrive distinctly and a bare Shift press is an event — the
         // double-Shift menu gesture needs both (§4.2). `keys::handle_key`
-        // drops non-Press events before any action runs.
+        // drops Release events; Repeat runs the same action as Press so a
+        // held key auto-repeats (auto-scroll, held-char typing).
         let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
             | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
             | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS

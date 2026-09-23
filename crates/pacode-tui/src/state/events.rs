@@ -5,8 +5,12 @@ use std::time::Instant;
 use pacode_types::{Event, PermissionDecision, ToastLevel, TranscriptKind};
 
 use crate::state::stats;
-use crate::state::transcript::{Cell, CellKind, Transcript};
+use crate::state::transcript::{Cell, CellKind, PermExplain, Transcript};
 use crate::state::{AppState, Focus, PanelTarget};
+
+#[cfg(test)]
+#[path = "events_tests.rs"]
+mod events_tests;
 
 pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
     match event {
@@ -115,6 +119,25 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                         }
                     }
                 }
+                // Fail-safe for a dropped `AgentUpdated`: the daemon stamps a
+                // subagent's terminal status BEFORE emitting this event
+                // (`turn/lifecycle.rs`), so a TurnEnded that finds the rail
+                // entry still live means that update was lost — set it
+                // locally with the daemon's own mapping (`Completed`→Finished,
+                // `Interrupted`→Stopped, `Failed`→Failed) and the same
+                // stamp-once rule for `finished_at_ms`.
+                if let Some(info) = state.rail.agents.iter_mut().find(|a| a.id == agent)
+                    && info.status.is_live()
+                {
+                    info.status = match &stop {
+                        pacode_types::TurnStop::Completed => pacode_types::AgentStatus::Finished,
+                        pacode_types::TurnStop::Interrupted => pacode_types::AgentStatus::Stopped,
+                        pacode_types::TurnStop::Failed { .. } => pacode_types::AgentStatus::Failed,
+                    };
+                    if info.finished_at_ms.is_none() {
+                        info.finished_at_ms = Some(pacode_types::time::now_ms());
+                    }
+                }
             }
         }
         Event::ItemAdded(item) => {
@@ -202,17 +225,14 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
         }
         Event::PermissionRequested(req) => {
             let ts_ms = req.created_at_ms;
-            state.transcript.push_cell(Cell {
-                id: seq,
-                kind: CellKind::Item(TranscriptKind::Permission(req)),
-                version: 0,
-                ts_ms,
-                stats: None,
-            });
+            // The daemon also records the request as a transcript item — the
+            // upsert keys on the permission id so both land on one prompt.
+            state.transcript.upsert_permission(req, ts_ms, seq);
         }
         Event::PermissionResolved {
             permission,
             decision,
+            reason,
         } => {
             for cell in &mut state.transcript.cells {
                 if let CellKind::Item(TranscriptKind::Permission(ref req)) = cell.kind
@@ -226,14 +246,69 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                             ToastLevel::Success,
                             format!("Allowed for session: {}", req.title),
                         ),
-                        PermissionDecision::Deny => {
-                            (ToastLevel::Warn, format!("Denied: {}", req.title))
-                        }
+                        PermissionDecision::Deny => (
+                            ToastLevel::Warn,
+                            // The title stays so the row still says what was
+                            // denied; the reason explains who/what denied it
+                            // ("interrupted", a client note, …).
+                            match &reason {
+                                Some(reason) => format!("Denied: {} — {reason}", req.title),
+                                None => format!("Denied: {}", req.title),
+                            },
+                        ),
                     };
                     cell.kind = CellKind::Item(TranscriptKind::Notice { level, text });
+                    cell.perm_explain = None;
                     cell.version = cell.version.wrapping_add(1);
                     break;
                 }
+            }
+        }
+        Event::PermissionExplained {
+            permission,
+            text,
+            level,
+        } => {
+            // The answer folds into the still-pending prompt itself: the
+            // request stays answerable underneath it, and a re-asked `e`
+            // replaces the text instead of stacking another paragraph. Both
+            // transcripts are tried — a followed subagent's request also sits
+            // in the panel's copy.
+            let explain = PermExplain::Done {
+                text: text.clone(),
+                level,
+            };
+            let landed = state.transcript.set_perm_explain(&permission, &explain)
+                | state
+                    .panel
+                    .agent_transcript
+                    .set_perm_explain(&permission, &explain);
+            if !landed {
+                // The request was answered before the aux call finished, so
+                // no prompt is left to carry the result — land it as a notice
+                // rather than dropping the answer silently. A `None` level is
+                // the daemon's honest-failure text, which already says what
+                // it is; a rating gets the `explain · <level>:` prefix the
+                // prompt would have shown.
+                let text = match level {
+                    Some(lv) => format!(
+                        "explain · {}: {text}",
+                        crate::state::transcript::explain_level_name(lv)
+                    ),
+                    None => text,
+                };
+                let now_ms = pacode_types::time::now_ms();
+                state.transcript.push_cell(Cell {
+                    id: seq,
+                    kind: CellKind::Item(TranscriptKind::Notice {
+                        level: ToastLevel::Info,
+                        text,
+                    }),
+                    version: 0,
+                    ts_ms: now_ms,
+                    stats: None,
+                    perm_explain: None,
+                });
             }
         }
         Event::PlanUpdated(plan) => {
@@ -267,21 +342,23 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             state.rail.upsert_task(info);
         }
         Event::QuestionAsked(question) => {
-            // The turn is blocked on this, so it takes the keyboard immediately.
-            state.focus = Focus::Overlay(crate::state::Overlay::QuestionPicker {
-                index: question.recommended_index().unwrap_or(0),
-                question: Box::new(question),
-                selected: Vec::new(),
-                typed: String::new(),
-                typing: false,
-            });
+            // The turn is blocked on this, so it takes the keyboard
+            // immediately. It joins the queue — an ask that was already
+            // waiting is never thrown away for the new one.
+            if state.questions.push(question) {
+                state.focus = Focus::Overlay(crate::state::Overlay::QuestionPicker);
+            }
             state.dirty = true;
         }
         Event::QuestionResolved { question, answer } => {
-            // Another client may have answered it; drop our picker either way.
-            if let Focus::Overlay(crate::state::Overlay::QuestionPicker { question: q, .. }) =
-                &state.focus
-                && q.id == question
+            // Answered here or on another client — either way it leaves the
+            // queue. The picker stays up while more questions wait.
+            state.questions.resolve(&question);
+            if state.questions.is_empty()
+                && matches!(
+                    state.focus,
+                    Focus::Overlay(crate::state::Overlay::QuestionPicker)
+                )
             {
                 state.focus = Focus::Normal;
             }

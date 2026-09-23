@@ -7,6 +7,7 @@ pub mod files;
 pub mod git;
 pub mod images;
 pub mod input;
+pub mod questions;
 pub mod rail;
 pub mod selection;
 pub mod slots;
@@ -19,7 +20,7 @@ mod picker_tests;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use pacode_client::ClientEvent;
 use pacode_types::time::now_ms;
@@ -32,11 +33,12 @@ use pacode_types::{
 pub use files::FilesState;
 pub use git::GitState;
 pub use input::InputState;
+pub use questions::{PendingQuestions, QuestionFocus};
 pub use rail::RailState;
 pub use selection::Selection;
 pub use slots::{NUM_SLOTS, SessionSlot};
 pub use transcript::{
-    BackgroundKind, BackgroundOutcome, BackgroundResult, Cell, CellKind, Transcript,
+    BackgroundKind, BackgroundOutcome, BackgroundResult, Cell, CellKind, PermExplain, Transcript,
 };
 
 /// A background job shorter than this is not reported in the transcript: it is
@@ -171,18 +173,11 @@ pub enum Overlay {
     ModePicker {
         index: usize,
     },
-    /// A question the model asked. The turn is waiting on the answer, so this
-    /// overlay owns the keyboard until it is answered or dismissed.
-    QuestionPicker {
-        question: Box<pacode_types::Question>,
-        index: usize,
-        /// Chosen options, in the order they were picked (multi-select only).
-        selected: Vec<usize>,
-        /// Free text typed instead of picking.
-        typed: String,
-        /// Whether the reader is typing rather than choosing.
-        typing: bool,
-    },
+    /// Questions the model asked. The turn is waiting on the answers, so
+    /// this overlay owns the keyboard until the queue in `state.questions`
+    /// is empty — the questions and the per-question picker state live
+    /// there, not on the layer, so several pending asks can be walked.
+    QuestionPicker,
     ThemePicker {
         index: usize,
         original_theme: Box<pacode_render::Theme>,
@@ -212,15 +207,18 @@ pub struct Toast {
     pub level: ToastLevel,
     pub title: String,
     pub detail: Option<String>,
+    /// Liveness link to an input token (e.g. `[Image 3]`): once the label is
+    /// gone from the input text the toast is dead — a "pasted" line must not
+    /// outlive the token it describes.
+    pub token_label: Option<String>,
     pub shown_at: Instant,
 }
 
 pub const TOAST_TTL_SECS: u64 = 6;
 pub const TOAST_MAX: usize = 2;
-/// Toast enter window: the slide-in lasts this long.
-pub const TOAST_ENTER_MS: u64 = 150;
-/// Toast exit window: the fade starts this long before expiry.
-pub const TOAST_EXIT_MS: u64 = 600;
+/// Toast exit window: the strip line fades to `theme.faint` this long before
+/// expiry.
+pub const TOAST_EXIT_MS: u64 = 800;
 /// Overlay/picker unfold duration (the centred grow-in, spec §animation).
 pub const OVERLAY_GROW_MS: u64 = 140;
 /// Welcome cascade window after attach: the header animates only inside it.
@@ -232,6 +230,9 @@ pub const IDLE_DEBOUNCE_MS: u64 = 2000;
 /// ~1 s — the same beat as the `second_parity` fallback, so a pulse does not
 /// change speed when the animation clock takes over from the 1 s tick.
 pub const PULSE_FRAMES: u64 = 16;
+/// Minimum spacing between two `GetSnapshot` resync sends — a burst of
+/// dropped daemon events arms one request, not one per detected seq gap.
+pub const RESYNC_DEBOUNCE_MS: u64 = 500;
 
 /// A selection copy the draw path prepared for the event loop. `clipboard::copy`
 /// writes OSC 52 to stdout and may touch `arboard` — that IO must not run inside
@@ -322,7 +323,7 @@ pub struct AppState {
     pub rows: u16,
     /// Mouse selection in dialog area.
     pub selection: Selection,
-    /// Whether the OSC 52 remote clipboard hint popup has already been shown this session.
+    /// Whether the OSC 52 remote clipboard hint toast has already been shown this session.
     pub clipboard_warned: bool,
     /// `ctrl+c` pressed once (exit on second within 2 s).
     pub ctrl_c_at: Option<Instant>,
@@ -345,6 +346,10 @@ pub struct AppState {
     pub slots: [Option<SessionSlot>; NUM_SLOTS],
     /// Currently active slot index (0..8).
     pub active_slot: usize,
+    /// Questions the model asked and still waits on — several can be open at
+    /// once (other agents, replays). The `QuestionPicker` overlay renders the
+    /// one under the queue cursor.
+    pub questions: PendingQuestions,
     /// Working directory for the session.
     pub cwd: PathBuf,
     /// Cancellation sender for currently running local bash command.
@@ -383,6 +388,24 @@ pub struct AppState {
     /// already live before the first snapshot lands. Flushed in order when
     /// it does; `dispatch_action` caps the queue and drops the oldest.
     pub pending_requests: VecDeque<pacode_types::Request>,
+    /// Seq of the last applied daemon event (`ClientEvent::Event`). A jump
+    /// over `last + 1` means the lossy daemon→client pipe dropped events in
+    /// between (broadcast lag, a full client queue) and the folded state is
+    /// stale until a `GetSnapshot` resync lands — a lost `AgentUpdated`
+    /// leaves a subagent "live" in the rail forever. Rebased to
+    /// `snapshot.seq` whenever a snapshot is applied.
+    pub last_event_seq: Option<u64>,
+    /// A seq gap asked for a snapshot resync. The event loop drains this
+    /// into ONE debounced `Request::GetSnapshot` via
+    /// [`Self::take_resync_request`]; a landing snapshot clears it — any
+    /// gap it was armed by is covered by the fresh state.
+    pub resync_want: bool,
+    /// A `GetSnapshot` resync was sent and no reply landed yet — blocks a
+    /// second send until the reply arrives or the request fails.
+    pub resync_in_flight: bool,
+    /// When the last resync request was sent — rate-limits resends to
+    /// `RESYNC_DEBOUNCE_MS`.
+    pub resync_sent_at: Option<Instant>,
     /// The `-p`/`--prompt` argv text, carried until the startup attach lands
     /// — `BgResponse::AttachFinished` sends it then.
     pub initial_prompt: Option<String>,
@@ -481,6 +504,7 @@ impl AppState {
             input: InputState::default(),
             vim: VimState::default(),
             focus: Focus::Normal,
+            questions: PendingQuestions::default(),
             toasts: VecDeque::new(),
             models: Vec::new(),
             model_flags,
@@ -521,6 +545,10 @@ impl AppState {
             overlay_since: None,
             pending_copy: None,
             pending_requests: VecDeque::new(),
+            last_event_seq: None,
+            resync_want: false,
+            resync_in_flight: false,
+            resync_sent_at: None,
             initial_prompt: None,
             attach_error: None,
         }
@@ -672,6 +700,14 @@ impl AppState {
             }
             ClientEvent::Snapshot(snapshot) => {
                 self.connection = Connection::Connected;
+                // `snapshot.seq` is the last event folded into the snapshot —
+                // the tracker must rebase on it, or the first post-snapshot
+                // event looks like a fresh gap and resyncs forever. The landing
+                // snapshot also ends any in-flight resync and settles a want
+                // armed by a pre-snapshot gap (that gap is now covered).
+                self.last_event_seq = Some(snapshot.seq);
+                self.resync_want = false;
+                self.resync_in_flight = false;
                 // One-time config-split migration notice (spec §5): the
                 // daemon leaves a marker when it split `config.toml`; the
                 // first attach to see it toasts the message.
@@ -751,18 +787,40 @@ impl AppState {
                 self.rail.update_idle(self.turn_active, now);
                 for (i, perm) in snapshot.pending_permissions.into_iter().enumerate() {
                     let ts_ms = perm.created_at_ms;
-                    self.transcript.push_cell(Cell {
-                        id: snapshot.seq.wrapping_add(1).wrapping_add(i as u64),
-                        kind: CellKind::Item(TranscriptKind::Permission(perm)),
-                        version: 0,
+                    // A pending request also sits in the transcript tail —
+                    // keying on the permission id keeps one prompt, not two.
+                    self.transcript.upsert_permission(
+                        perm,
                         ts_ms,
-                        stats: None,
-                    });
+                        snapshot.seq.wrapping_add(1).wrapping_add(i as u64),
+                    );
+                }
+                // The snapshot is authoritative for the question queue:
+                // anything still waiting lands (re-attach must not orphan an
+                // ask), everything else is gone. Focus state survives for
+                // ids that are still queued.
+                if self.questions.replace(snapshot.pending_questions) {
+                    self.focus = Focus::Overlay(Overlay::QuestionPicker);
+                } else if matches!(self.focus, Focus::Overlay(Overlay::QuestionPicker)) {
+                    self.focus = Focus::Normal;
                 }
                 self.dirty = true;
                 true
             }
             ClientEvent::Event { seq, event } => {
+                // The daemon→client pipe drops events silently under load
+                // (broadcast lag, a full client queue): a jump in `seq` means
+                // the folded state is stale — a lost `AgentUpdated` leaves a
+                // subagent "live" in the rail forever. Arm ONE debounced
+                // `GetSnapshot` resync; skipped pre-attach, where the incoming
+                // snapshot is authoritative anyway.
+                if let Some(last) = self.last_event_seq
+                    && seq != last.wrapping_add(1)
+                    && self.meta.is_some()
+                {
+                    self.resync_want = true;
+                }
+                self.last_event_seq = Some(seq);
                 self.observe_background_completion(&event);
                 self.apply_event(seq, event, now);
                 self.dirty = true;
@@ -783,10 +841,35 @@ impl AppState {
         detail: Option<String>,
         now: Instant,
     ) {
+        self.push_toast_inner(level, title, detail, None, now);
+    }
+
+    /// `push_toast` plus a liveness link: the toast expires early once
+    /// `token_label` leaves the input text (token deleted or submitted).
+    pub fn push_toast_linked(
+        &mut self,
+        level: ToastLevel,
+        title: String,
+        detail: Option<String>,
+        now: Instant,
+        token_label: String,
+    ) {
+        self.push_toast_inner(level, title, detail, Some(token_label), now);
+    }
+
+    fn push_toast_inner(
+        &mut self,
+        level: ToastLevel,
+        title: String,
+        detail: Option<String>,
+        token_label: Option<String>,
+        now: Instant,
+    ) {
         let toast = Toast {
             level,
             title,
             detail,
+            token_label,
             shown_at: now,
         };
         self.toasts.push_back(toast);
@@ -796,11 +879,16 @@ impl AppState {
         self.dirty = true;
     }
 
-    /// Drop expired toasts; returns true when something changed.
+    /// Drop expired toasts and toasts whose linked token left the input;
+    /// returns true when something changed.
     pub fn expire_toasts(&mut self, now: Instant) -> bool {
         let before = self.toasts.len();
-        self.toasts
-            .retain(|t| now.saturating_duration_since(t.shown_at).as_secs() < TOAST_TTL_SECS);
+        self.toasts.retain(|t| {
+            now.saturating_duration_since(t.shown_at).as_secs() < TOAST_TTL_SECS
+                && t.token_label
+                    .as_ref()
+                    .is_none_or(|label| self.input.text.contains(label.as_str()))
+        });
         let changed = self.toasts.len() != before;
         if changed {
             self.dirty = true;
@@ -808,13 +896,13 @@ impl AppState {
         changed
     }
 
-    /// Whether a toast sits inside its enter or exit window, i.e. the fast
-    /// tick has visible work. Bounded: ~750 ms around each toast's life.
+    /// Whether a toast sits inside its fade-out window, i.e. the fast tick
+    /// has visible work. Bounded: the last `TOAST_EXIT_MS` of each toast.
     pub fn toast_needs_anim(&self, now: Instant) -> bool {
         let ttl_ms = TOAST_TTL_SECS * 1000;
         self.toasts.iter().any(|t| {
             let age = now.saturating_duration_since(t.shown_at).as_millis() as u64;
-            age < TOAST_ENTER_MS || ttl_ms.saturating_sub(age) < TOAST_EXIT_MS
+            ttl_ms.saturating_sub(age) < TOAST_EXIT_MS
         })
     }
 
@@ -918,6 +1006,7 @@ impl AppState {
             version: 0,
             ts_ms: now,
             stats: None,
+            perm_explain: None,
         });
         self.dirty = true;
     }
@@ -930,9 +1019,35 @@ impl AppState {
             version: 0,
             ts_ms: now,
             stats: None,
+            perm_explain: None,
         });
         self.transcript.scroll_to_bottom();
         self.dirty = true;
+    }
+
+    /// Drain a seq-gap resync want into a `Request::GetSnapshot` — at most
+    /// one in flight, and no resend within `RESYNC_DEBOUNCE_MS` of the last
+    /// send. While no session is attached or the link is down the want is
+    /// dropped instead: the (re)attach snapshot supersedes any resync.
+    pub fn take_resync_request(&mut self, now: Instant) -> Option<pacode_types::Request> {
+        if !self.resync_want {
+            return None;
+        }
+        if self.meta.is_none() || !matches!(self.connection, Connection::Connected) {
+            self.resync_want = false;
+            return None;
+        }
+        if self.resync_in_flight
+            || self.resync_sent_at.is_some_and(|t| {
+                (now.saturating_duration_since(t).as_millis() as u64) < RESYNC_DEBOUNCE_MS
+            })
+        {
+            return None;
+        }
+        self.resync_want = false;
+        self.resync_in_flight = true;
+        self.resync_sent_at = Some(now);
+        Some(pacode_types::Request::GetSnapshot)
     }
 
     /// Drain the first prompt from the queue if the main agent is idle.
@@ -1041,6 +1156,7 @@ impl AppState {
             version: 0,
             ts_ms: now,
             stats: None,
+            perm_explain: None,
         });
         self.transcript.scroll_to_bottom();
         self.dirty = true;
@@ -1101,7 +1217,7 @@ impl AppState {
                 | Focus::Overlay(Overlay::ModePicker { .. })
                 | Focus::Overlay(Overlay::ModelPicker { .. })
                 | Focus::Overlay(Overlay::LoginPicker { .. })
-                | Focus::Overlay(Overlay::QuestionPicker { .. })
+                | Focus::Overlay(Overlay::QuestionPicker)
                 | Focus::Overlay(Overlay::ThemePicker { .. })
         )
     }
@@ -1115,9 +1231,14 @@ impl AppState {
             Focus::Overlay(Overlay::LoginPicker { .. }) => 13,
             // Header chip + wrapped question + two rows per option + the
             // free-text plaque + hint, capped — the options window scrolls.
-            Focus::Overlay(Overlay::QuestionPicker { question, .. }) => {
-                crate::ui::question_picker::height(question, self.picker_width()).min(18) as u16
-            }
+            Focus::Overlay(Overlay::QuestionPicker) => self
+                .questions
+                .current()
+                .map(|q| {
+                    crate::ui::question_picker::height(q, self.questions.len(), self.picker_width())
+                        .min(18) as u16
+                })
+                .unwrap_or(0),
             _ => 0,
         }
     }
@@ -1276,6 +1397,12 @@ impl AppState {
         self.rail.tasks.clear();
         self.rail.plan = pacode_types::state::Plan::default();
         self.rail.usage = pacode_types::state::UsageTotals::default();
+        // The next attach starts a fresh seq space and lands its own
+        // snapshot — no gap tracking or resync state carries over.
+        self.last_event_seq = None;
+        self.resync_want = false;
+        self.resync_in_flight = false;
+        self.resync_sent_at = None;
     }
 
     /// Drop a cache file (§8.2 invalidation points: plugin install/remove,
@@ -1302,17 +1429,12 @@ impl AppState {
         );
         if crate::clipboard::remote_hint().is_some() && !self.clipboard_warned {
             self.clipboard_warned = true;
-            let now = Instant::now();
-            let shown_at = now
-                .checked_sub(Duration::from_secs(TOAST_TTL_SECS.saturating_sub(4)))
-                .unwrap_or(now);
-            self.toasts.push_back(Toast {
-                level: ToastLevel::Warn,
-                title: crate::ui::popup::POPUP_TOAST_TITLE.to_string(),
-                detail: Some(crate::clipboard::REMOTE_HINT_TEXT.to_string()),
-                shown_at,
-            });
-            self.dirty = true;
+            self.push_toast(
+                ToastLevel::Warn,
+                "remote clipboard".to_string(),
+                Some(crate::clipboard::REMOTE_HINT_TEXT.to_string()),
+                Instant::now(),
+            );
         }
     }
 }

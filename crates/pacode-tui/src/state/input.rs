@@ -637,6 +637,53 @@ impl InputState {
         (line_idx, (col as u16).min(width.saturating_sub(1)))
     }
 
+    /// (wrapped line, display column) of byte offset `byte` in the FULL wrap
+    /// at outer `width` — the same wrap [`Self::wrap_lines`] and
+    /// [`Self::cursor_position`] use (text wraps at `width - 2`), but the
+    /// column counts text cells only, WITHOUT the 2-cell prompt prefix the
+    /// renderer adds per line. `input_scroll` does not affect columns.
+    ///
+    /// Unlike `cursor_position` this cannot just wrap the prefix: a word's
+    /// line depends on lookahead (a token starting after a full line wraps
+    /// to the next one). Instead it replays the wrap per logical line —
+    /// `wrap_text_non_trimming` splits on `\n`, strips one trailing `\r`,
+    /// then wraps each raw line into pieces that partition it contiguously,
+    /// so each piece covers the next `piece.len()` bytes of `text`.
+    ///
+    /// Callers pass `str::find` results, always char boundaries; a byte
+    /// inside a `\r`/`\n` separator or past the end lands on the last
+    /// covered position.
+    pub fn wrapped_position_of_byte(&self, byte: usize, width: u16) -> (usize, usize) {
+        let text_w = (width as usize).saturating_sub(2).max(1);
+        let mut line_idx = 0usize;
+        let mut pos = 0usize; // byte offset of the current logical line
+        // (wrapped line, end column) of the previous piece — the landing
+        // spot for bytes that fall between covered ranges.
+        let mut last_end = (0usize, 0usize);
+        for raw in self.text.split('\n') {
+            let stripped = raw.strip_suffix('\r').unwrap_or(raw);
+            let mut lpos = pos;
+            for piece in wrap_text_non_trimming(stripped, text_w) {
+                if byte < lpos {
+                    // `byte` sits in a separator between covered ranges.
+                    return last_end;
+                }
+                if byte < lpos + piece.len() {
+                    // `piece` is a verbatim substring of `text` starting at
+                    // `lpos`, so `byte - lpos` is a boundary when `byte` is.
+                    let inner = piece.get(..(byte - lpos)).unwrap_or(piece.as_str());
+                    return (line_idx, display_width(inner));
+                }
+                lpos += piece.len();
+                last_end = (line_idx, display_width(&piece));
+                line_idx += 1;
+            }
+            // + 1 for the `\n` the split dropped.
+            pos += raw.len() + 1;
+        }
+        last_end
+    }
+
     /// Move the cursor one WRAPPED visual line up (plain Up on a multi-line
     /// prompt). `width` is the input rect's outer width — the same value
     /// [`Self::cursor_position`] takes; the text wraps at `width - 2`.

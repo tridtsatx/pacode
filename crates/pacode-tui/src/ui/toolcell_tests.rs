@@ -404,8 +404,9 @@ fn expanded_is_still_bounded() {
     let lines = render(&c, 60, &opts, 0, true);
     let text = text_of(&lines);
     let body = body_rows(&text, &opts);
+    // arg row + EXPANDED_MAX_LINES wrapped rows + the truncation marker.
     assert!(
-        body.len() <= EXPANDED_MAX_LINES + 1,
+        body.len() <= EXPANDED_MAX_LINES + 2,
         "an enormous output must stay bounded: {}",
         body.len()
     );
@@ -414,6 +415,75 @@ fn expanded_is_still_bounded() {
         "{:?}",
         body.last()
     );
+}
+
+/// Body-row text without the `│ ` gutter — glued back together it must hold
+/// every piece a wrap split mid-word.
+fn glued_body(text: &[String], opts: &RenderOptions) -> String {
+    let g = format!("{} ", opts.glyphs.vline);
+    body_rows(text, opts)
+        .iter()
+        .map(|l| l[g.len()..].to_string())
+        .collect()
+}
+
+#[test]
+fn expanded_bash_wraps_the_whole_command() {
+    let opts = RenderOptions::new(40, false);
+    let cmd = "find crates -name '*.rs' -exec grep -n expand {} +";
+    let title = format!("bash {cmd}");
+    let c = call("bash", &title, ToolStatus::Ok, "one");
+    let lines = render(&c, 40, &opts, 0, true);
+    let text = text_of(&lines);
+    let body = body_rows(&text, &opts);
+    // The collapsed `$` row truncates; expanded wraps the command across
+    // gutter rows so every piece is on screen.
+    assert!(body.len() > 2, "{body:?}");
+    assert!(body[0].contains("$ find crates"), "{}", body[0]);
+    // Wrap drops the break-point space and re-indents, so compare the pieces
+    // glued without spaces.
+    let glued = glued_body(&text, &opts).replace(' ', "");
+    assert!(glued.contains(&cmd.replace(' ', "")), "{glued}");
+    assert!(glued.contains("one"), "{glued}");
+    assert!(
+        body.iter().all(|l| !l.contains('…')),
+        "expanded rows wrap instead of being cut: {body:?}"
+    );
+}
+
+#[test]
+fn expanded_non_bash_spells_out_the_full_arg() {
+    let opts = RenderOptions::new(40, false);
+    let arg = "a/very/long/path/that/does/not/fit/inside/forty/cells/at/all.rs";
+    let title = format!("read_file {arg}");
+    let c = call("read_file", &title, ToolStatus::Ok, "1 line");
+    let lines = render(&c, 40, &opts, 0, true);
+    let text = text_of(&lines);
+    // The header stays a truncated one-line summary…
+    assert!(!text[0].contains(arg), "{}", text[0]);
+    // …while the expanded body wraps the whole argument before the output.
+    let glued = glued_body(&text, &opts);
+    assert!(glued.contains(arg), "{glued}");
+    assert!(glued.contains("1 line"), "{glued}");
+}
+
+#[test]
+fn a_denied_cell_expands_to_the_full_refused_command() {
+    let opts = RenderOptions::new(30, false);
+    let c = call(
+        "bash",
+        "bash rm -rf /very/long/path/that/wont/fit",
+        ToolStatus::Denied,
+        "Denied",
+    );
+    let lines = render(&c, 30, &opts, 0, true);
+    let text = text_of(&lines);
+    let glued = glued_body(&text, &opts).replace(' ', "");
+    assert!(
+        glued.contains("rm-rf/very/long/path/that/wont/fit"),
+        "{glued}"
+    );
+    assert!(glued.contains("Denied"), "{glued}");
 }
 
 #[test]

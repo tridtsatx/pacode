@@ -93,7 +93,7 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
         Overlay::LoginPicker { .. } => "LoginPicker",
         Overlay::RailOverlay => "RailOverlay",
         Overlay::ThemePicker { .. } => "ThemePicker",
-        Overlay::QuestionPicker { .. } => "QuestionPicker",
+        Overlay::QuestionPicker => "QuestionPicker",
         // The level on screen names the menu in the log (§3.1).
         Overlay::Menu { stack, .. } => stack.current().map_or("Menu", |l| l.id.title()),
     }
@@ -203,7 +203,7 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
         | Focus::Panel { .. }
         | Focus::Overlay(
             Overlay::ModePicker { .. }
-            | Overlay::QuestionPicker { .. }
+            | Overlay::QuestionPicker
             | Overlay::RailOverlay
             | Overlay::ThemePicker { .. }
             // Unreachable — an open menu intercepts keys before `nav` — but
@@ -241,7 +241,7 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
             | Overlay::LoginPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
-            | Overlay::QuestionPicker { .. }
+            | Overlay::QuestionPicker
             | Overlay::RailOverlay
             | Overlay::ThemePicker { .. }
             | Overlay::Menu { .. },

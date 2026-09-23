@@ -9,11 +9,13 @@ use ratatui::widgets::Paragraph;
 
 use pacode_render::cache::CacheKey;
 use pacode_render::markdown::split_stable_tail;
-use pacode_render::{LineCache, RenderOptions, render_markdown, truncate_to_width, wrap_text};
+use pacode_render::{
+    LineCache, RenderOptions, display_width, render_markdown, truncate_to_width, wrap_text,
+};
 use pacode_types::transcript::ToolStatus;
-use pacode_types::{ToastLevel, TranscriptKind};
+use pacode_types::{ExplainLevel, RiskLevel, ToastLevel, TranscriptKind};
 
-use crate::state::transcript::{Cell, CellKind, HeaderInfo, Transcript};
+use crate::state::transcript::{Cell, CellKind, HeaderInfo, PermExplain, Transcript};
 
 #[cfg(test)]
 #[path = "dialog_tests.rs"]
@@ -262,14 +264,7 @@ fn plan_cell(
 
     if !is_live {
         if cache.get(key).is_none() {
-            let rendered = render_cell(
-                &cell.kind,
-                cell.stats.as_deref(),
-                width,
-                opts,
-                anim_frame,
-                expanded,
-            );
+            let rendered = render_cell(cell, width, opts, anim_frame, expanded);
             cache.insert(key, rendered);
         }
         return CellPlan::Cached(key);
@@ -291,14 +286,7 @@ fn plan_cell(
     // A live cell that is not an answer still caches; the version in the key
     // keeps pace with its updates.
     if cache.get(key).is_none() {
-        let rendered = render_cell(
-            &cell.kind,
-            cell.stats.as_deref(),
-            width,
-            opts,
-            anim_frame,
-            expanded,
-        );
+        let rendered = render_cell(cell, width, opts, anim_frame, expanded);
         cache.insert(key, rendered);
     }
     CellPlan::Cached(key)
@@ -320,14 +308,7 @@ fn cell_block<'a>(
             Some(lines) => Block::Cached(lines),
             // Phase one inserted it, so a miss cannot happen — render anyway
             // rather than panic if the invariant is ever broken.
-            None => Block::Owned(render_cell(
-                &cell.kind,
-                cell.stats.as_deref(),
-                width,
-                opts,
-                anim_frame,
-                expanded,
-            )),
+            None => Block::Owned(render_cell(cell, width, opts, anim_frame, expanded)),
         },
         CellPlan::LiveAssistant => {
             if let CellKind::Item(TranscriptKind::Assistant { text, .. }) = &cell.kind {
@@ -354,23 +335,9 @@ fn cell_block<'a>(
             }
             // A live non-assistant cell is planned Cached, so this is
             // unreachable — still render rather than panic.
-            Block::Owned(render_cell(
-                &cell.kind,
-                cell.stats.as_deref(),
-                width,
-                opts,
-                anim_frame,
-                expanded,
-            ))
+            Block::Owned(render_cell(cell, width, opts, anim_frame, expanded))
         }
-        CellPlan::Fresh => Block::Owned(render_cell(
-            &cell.kind,
-            cell.stats.as_deref(),
-            width,
-            opts,
-            anim_frame,
-            expanded,
-        )),
+        CellPlan::Fresh => Block::Owned(render_cell(cell, width, opts, anim_frame, expanded)),
     }
 }
 
@@ -419,24 +386,31 @@ pub(crate) fn plain_lines(
 /// Test-only entry point: render one cell exactly as the transcript would.
 #[cfg(test)]
 pub(crate) fn render_cell_for_test(
-    cell_kind: &CellKind,
+    cell: &Cell,
     width: u16,
     opts: &RenderOptions,
 ) -> Vec<Line<'static>> {
-    render_cell(cell_kind, None, width, opts, 0, false)
+    render_cell(cell, width, opts, 0, false)
 }
 
 fn render_cell(
-    cell_kind: &CellKind,
-    stats: Option<&str>,
+    cell: &Cell,
     width: u16,
     opts: &RenderOptions,
     anim_frame: u64,
     expanded: bool,
 ) -> Vec<Line<'static>> {
-    match cell_kind {
+    match &cell.kind {
         CellKind::Gap => vec![Line::default()],
-        CellKind::Item(kind) => render_item_inner(kind, stats, width, opts, anim_frame, expanded),
+        CellKind::Item(kind) => render_item_inner(
+            kind,
+            cell.perm_explain.as_ref(),
+            cell.stats.as_deref(),
+            width,
+            opts,
+            anim_frame,
+            expanded,
+        ),
         CellKind::BackgroundResult(result) => render_background_result(result, width, opts),
     }
 }
@@ -492,13 +466,15 @@ pub(crate) fn render_item(
     opts: &RenderOptions,
     anim_frame: u64,
 ) -> Vec<Line<'static>> {
-    render_item_inner(kind, stats, width, opts, anim_frame, false)
+    render_item_inner(kind, None, stats, width, opts, anim_frame, false)
 }
 
 /// `expanded` shows a tool call's whole output, wrapped, instead of its first
-/// few lines cut to the width.
+/// few lines cut to the width. `perm_explain` rides along for permission
+/// cells — the `e`-key answer is cell state, not part of the wire item.
 fn render_item_inner(
     kind: &TranscriptKind,
+    perm_explain: Option<&PermExplain>,
     stats: Option<&str>,
     width: u16,
     opts: &RenderOptions,
@@ -605,14 +581,34 @@ fn render_item_inner(
             }
         }
         TranscriptKind::Permission(req) => {
-            let line1 = Line::from(vec![
+            // The static classifier's risk rides the header as a chip; the
+            // title yields width first so the chip can never be cut off.
+            let head = format!("{} permission: ", opts.glyphs.chevrons);
+            let chip = req
+                .risk
+                .map(|r| (format!("risk: {}", risk_label(r)), risk_style(r, opts)));
+            let chip_w = chip
+                .as_ref()
+                .map(|(t, _)| display_width(t) + display_width(opts.glyphs.dot_sep) + 2)
+                .unwrap_or(0);
+            let title_w = (width as usize)
+                .saturating_sub(display_width(&head) + chip_w)
+                .max(1);
+            let mut head_spans = vec![
+                Span::styled(head, opts.theme.accent),
                 Span::styled(
-                    format!("{} permission: ", opts.glyphs.chevrons),
-                    opts.theme.accent,
+                    truncate_to_width(&req.title, title_w, true),
+                    opts.theme.bold,
                 ),
-                Span::styled(req.title.clone(), opts.theme.bold),
-            ]);
-            let mut lines = vec![line1];
+            ];
+            if let Some((text, style)) = chip {
+                head_spans.push(Span::styled(
+                    format!(" {} ", opts.glyphs.dot_sep),
+                    opts.theme.faint,
+                ));
+                head_spans.push(Span::styled(text, style));
+            }
+            let mut lines = vec![Line::from(head_spans)];
             if !req.detail.is_empty() {
                 for dl in req.detail.lines().take(4) {
                     lines.push(Line::from(Span::styled(
@@ -624,8 +620,21 @@ fn render_item_inner(
                     )));
                 }
             }
+            match perm_explain {
+                // `e` pressed — the aux answer is still in flight.
+                Some(PermExplain::Requested) => lines.push(Line::from(Span::styled(
+                    "    explain requested…".to_string(),
+                    opts.theme.faint,
+                ))),
+                // The aux model's answer landed — display-only, the verdict
+                // keys below stay live while it is read.
+                Some(PermExplain::Done { text, level }) => {
+                    lines.extend(render_explain_lines(text, *level, width, opts));
+                }
+                None => {}
+            }
             lines.push(Line::from(Span::styled(
-                "y allow · a session · n deny",
+                "y allow · a session · n deny · e explain",
                 opts.theme.cyan,
             )));
             lines.push(Line::default());
@@ -741,5 +750,97 @@ fn render_item_inner(
             out.push(Line::default());
             out
         }
+    }
+}
+
+/// The `e`-key answer under a pending permission: `explain · <level>:` in
+/// the rating's colour, then the aux model's text dim-wrapped beneath it.
+/// `level: None` is the daemon's honest-failure path — the label drops the
+/// rating word and the text says what went wrong. Capped at a few lines: the
+/// daemon already caps the answer at ~2k chars, but a narrow pane must not
+/// let it push the verdict hints off the bottom of the cell.
+fn render_explain_lines(
+    text: &str,
+    level: Option<ExplainLevel>,
+    width: u16,
+    opts: &RenderOptions,
+) -> Vec<Line<'static>> {
+    /// The most wrapped lines a permission explanation may occupy.
+    const EXPLAIN_MAX_LINES: usize = 8;
+    let indent = "    ";
+    let mut label = vec![Span::styled(format!("{indent}explain"), opts.theme.faint)];
+    if let Some(lv) = level {
+        label.push(Span::styled(
+            opts.glyphs.dot_sep.to_string(),
+            opts.theme.faint,
+        ));
+        label.push(Span::styled(
+            crate::state::transcript::explain_level_name(lv),
+            explain_level_style(lv, opts),
+        ));
+    }
+    label.push(Span::styled(": ".to_string(), opts.theme.faint));
+    let label_w: usize = label.iter().map(|s| display_width(&s.content)).sum();
+    let text_w = (width as usize).saturating_sub(label_w).max(1);
+    let wrapped = wrap_text(text, text_w);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut first = label;
+    if let Some(head) = wrapped.first() {
+        first.push(Span::styled(head.clone(), opts.theme.dim));
+    }
+    out.push(Line::from(first));
+    for wl in wrapped.iter().skip(1).take(EXPLAIN_MAX_LINES - 1) {
+        out.push(Line::from(Span::styled(
+            format!("{indent}{wl}"),
+            opts.theme.dim,
+        )));
+    }
+    let hidden = wrapped.len().saturating_sub(EXPLAIN_MAX_LINES);
+    if hidden > 0 {
+        out.push(Line::from(Span::styled(
+            format!(
+                "{indent}{} {hidden} more {}",
+                opts.glyphs.ellipsis,
+                pacode_render::text::lines_noun(hidden)
+            ),
+            opts.theme.faint,
+        )));
+    }
+    out
+}
+
+/// Colour for the aux model's danger rating: `none` stays quiet, `low` is
+/// fine, `medium` asks attention, `high` is red, `catastrophic` shouts.
+fn explain_level_style(level: ExplainLevel, opts: &RenderOptions) -> ratatui::style::Style {
+    match level {
+        ExplainLevel::None => opts.theme.faint,
+        ExplainLevel::Low => opts.theme.green,
+        ExplainLevel::Medium => opts.theme.yellow,
+        ExplainLevel::High => opts.theme.red,
+        ExplainLevel::Catastrophic => opts.theme.red.add_modifier(ratatui::style::Modifier::BOLD),
+    }
+}
+
+/// The `risk: <word>` chip on a permission header — the static classifier's
+/// vocabulary (`pacode-risk`), kept lowercase like the explain rating.
+fn risk_label(risk: RiskLevel) -> &'static str {
+    match risk {
+        RiskLevel::Safe => "safe",
+        RiskLevel::Low => "low",
+        RiskLevel::Confirm => "confirm",
+        RiskLevel::Catastrophic => "catastrophic",
+    }
+}
+
+/// Same colour ladder as [`explain_level_style`], mapped onto the static
+/// risk classes: `safe` is quiet, `low` fine, `confirm` needs a look, and
+/// `catastrophic` shouts.
+fn risk_style(risk: RiskLevel, opts: &RenderOptions) -> ratatui::style::Style {
+    match risk {
+        RiskLevel::Safe => opts.theme.faint,
+        RiskLevel::Low => opts.theme.green,
+        RiskLevel::Confirm => opts.theme.yellow,
+        RiskLevel::Catastrophic => opts.theme.red.add_modifier(ratatui::style::Modifier::BOLD),
     }
 }

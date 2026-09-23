@@ -34,16 +34,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         Focus::Overlay(Overlay::LoginPicker { query, index }) => {
             crate::ui::login_picker::draw(frame, area, state, query, *index, opts);
         }
-        Focus::Overlay(Overlay::QuestionPicker {
-            question,
-            index,
-            selected,
-            typed,
-            typing,
-        }) => {
-            crate::ui::question_picker::draw(
-                frame, area, question, *index, selected, typed, *typing, opts,
-            );
+        Focus::Overlay(Overlay::QuestionPicker) => {
+            if let Some(question) = state.questions.current() {
+                let focus = state.questions.focus().cloned().unwrap_or_default();
+                crate::ui::question_picker::draw(
+                    frame,
+                    area,
+                    question,
+                    &focus,
+                    state.questions.position(),
+                    state.questions.len(),
+                    opts,
+                );
+            }
         }
         Focus::Overlay(Overlay::ThemePicker { .. }) => {
             crate::ui::theme_picker::draw(frame, area, state, opts);

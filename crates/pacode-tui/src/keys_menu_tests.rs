@@ -116,6 +116,92 @@ fn esc_restores_cursor_and_filter_of_the_parent() {
 }
 
 #[test]
+fn right_descends_like_enter() {
+    let mut state = make_test_state();
+    let mut stack = MenuStack::root(MenuId::Root);
+    let mut ui = MenuUiState {
+        cursor: RowId::new("help"),
+        ..MenuUiState::default()
+    };
+    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Right));
+    assert_eq!(stack.depth(), 2);
+    assert_eq!(stack.current().map(|l| l.id), Some(MenuId::Help));
+    // The hub's cursor was saved into its level, same as with Enter.
+    assert_eq!(stack.levels()[0].cursor, RowId::new("help"));
+}
+
+#[test]
+fn right_on_an_item_row_runs_it_like_enter() {
+    let mut state = make_test_state();
+    let mut stack = MenuStack::root(MenuId::Root);
+    let mut ui = MenuUiState {
+        cursor: RowId::new("model"),
+        ..MenuUiState::default()
+    };
+    let actions = handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Right));
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::ModelPicker { .. })
+    ));
+    assert_eq!(
+        actions,
+        vec![Action::Send(pacode_types::Request::ListModels)]
+    );
+}
+
+#[test]
+fn left_pops_one_level_then_closes() {
+    let mut state = make_test_state();
+    let mut stack = MenuStack::root(MenuId::Root);
+    let mut ui = MenuUiState {
+        cursor: RowId::new("git"),
+        query: "abc".to_string(),
+        ..MenuUiState::default()
+    };
+    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Right));
+    assert_eq!(stack.current().map(|l| l.id), Some(MenuId::Git));
+    // `←` — back to the hub with its saved ui, exactly like `esc`.
+    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Left));
+    assert_eq!(stack.depth(), 1);
+    assert_eq!(stack.current().map(|l| l.id), Some(MenuId::Root));
+    assert_eq!(ui.cursor, RowId::new("git"));
+    assert_eq!(ui.query, "abc");
+    // `←` again — the last level pops into "closed".
+    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Left));
+    assert!(stack.is_empty());
+}
+
+#[test]
+fn edit_mode_keeps_arrows_for_the_edit_cursor() {
+    let mut state = make_test_state();
+    let mut stack = MenuStack::root(MenuId::Root);
+    let mut ui = MenuUiState {
+        mode: MenuMode::Edit {
+            buffer: "abc".to_string(),
+            cursor: 2,
+        },
+        ..MenuUiState::default()
+    };
+    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Left));
+    assert_eq!(
+        ui.mode,
+        MenuMode::Edit {
+            buffer: "abc".to_string(),
+            cursor: 1,
+        }
+    );
+    assert_eq!(stack.depth(), 1, "Left in Edit mode must not pop the menu");
+    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Right));
+    assert_eq!(
+        ui.mode,
+        MenuMode::Edit {
+            buffer: "abc".to_string(),
+            cursor: 2,
+        }
+    );
+}
+
+#[test]
 fn ctrl_c_closes_the_whole_stack() {
     let mut state = make_test_state();
     let mut stack = MenuStack::root(MenuId::Root);
@@ -207,24 +293,26 @@ fn ctrl_c_through_handle_key_closes_the_menu() {
 }
 
 #[test]
-fn release_and_repeat_events_never_reach_the_menu() {
+fn release_never_reaches_the_menu_but_repeat_acts_like_press() {
     let mut state = make_test_state();
     let now = Instant::now();
     handle_key(&mut state, ctrl(','), now);
-    // A Release/Repeat of Down must not move the cursor.
+    // A Release of Down must not move the cursor; a Repeat is a held key —
+    // it moves the cursor exactly like a Press (auto-repeat navigation).
     let before = menu_parts(&state).1.cursor.clone();
     let rel = KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release);
     let rep = KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat);
     handle_key(&mut state, rel, now);
-    handle_key(&mut state, rep, now);
     assert_eq!(menu_parts(&state).1.cursor, before);
+    handle_key(&mut state, rep, now);
+    assert_eq!(menu_parts(&state).1.cursor, RowId::new("plugins"));
     // The Press still works.
     handle_key(&mut state, key(KeyCode::Down), now);
-    assert_eq!(menu_parts(&state).1.cursor, RowId::new("plugins"));
+    assert_eq!(menu_parts(&state).1.cursor, RowId::new("mcp"));
 }
 
 #[test]
-fn release_and_repeat_never_duplicate_input() {
+fn release_is_ignored_and_repeat_types_like_a_held_key() {
     let mut state = make_test_state();
     let now = Instant::now();
     let press = key(KeyCode::Char('a'));
@@ -238,7 +326,8 @@ fn release_and_repeat_never_duplicate_input() {
     handle_key(&mut state, press, now);
     handle_key(&mut state, repeat, now);
     handle_key(&mut state, release, now);
-    assert_eq!(state.input.text, "a");
+    // Press + Repeat each insert once; the Release inserts nothing.
+    assert_eq!(state.input.text, "aa");
 }
 
 fn shift_press() -> KeyEvent {

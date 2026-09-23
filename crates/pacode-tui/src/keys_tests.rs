@@ -1320,7 +1320,7 @@ fn test_default_binding_copy_selection() {
     let mut state = make_test_state();
     let now = Instant::now();
 
-    // Selection not active -> does nothing, returns empty
+    // No selection and an empty prompt -> does nothing, returns empty
     let copy_key = KeyEvent::new(
         KeyCode::Char('c'),
         KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -1331,8 +1331,23 @@ fn test_default_binding_copy_selection() {
         state.selection.copy_request,
         crate::state::selection::CopyRequest::None
     );
+    assert!(state.pending_copy.is_none());
 
-    // Make selection active and non-empty
+    // No selection but text in the prompt -> the input is what gets copied.
+    state.input.text = "draft prompt".to_string();
+    state.input.cursor = state.input.text.chars().count();
+    let actions = handle_key(&mut state, copy_key, now);
+    assert!(actions.is_empty());
+    assert_eq!(
+        state.pending_copy,
+        Some(crate::state::PendingCopy {
+            text: "draft prompt".to_string(),
+            auto: false,
+        })
+    );
+    state.pending_copy = None;
+
+    // Make selection active and non-empty — it wins over the prompt text.
     let rect = ratatui::layout::Rect::new(0, 0, 80, 24);
     state.selection.start(0, 0, rect, 0);
     state.selection.drag(5, 0, rect, 0);
@@ -1345,6 +1360,7 @@ fn test_default_binding_copy_selection() {
         state.selection.copy_request,
         crate::state::selection::CopyRequest::Explicit
     );
+    assert!(state.pending_copy.is_none());
 }
 
 #[test]
@@ -1565,6 +1581,7 @@ fn test_leaving_slot_clears_transcript_cells() {
         version: 0,
         ts_ms: 100,
         stats: None,
+        perm_explain: None,
     });
     assert!(!state.transcript.cells.is_empty());
 
@@ -1649,6 +1666,7 @@ fn test_slash_command_enter_completion_and_execution() {
         version: 0,
         ts_ms: 0,
         stats: None,
+        perm_explain: None,
     });
     assert!(!state.transcript.cells.is_empty());
     let actions2 = handle_key(&mut state, enter, now);
@@ -1671,6 +1689,7 @@ fn test_slash_command_enter_completion_and_execution() {
         version: 0,
         ts_ms: 0,
         stats: None,
+        perm_explain: None,
     });
     state.input.insert_str("/clear");
     let actions_exact = handle_key(&mut state, enter, now);
@@ -2142,7 +2161,7 @@ fn test_background_completion_renders_a_result_cell_with_exit_code() {
     assert!(state.toasts.is_empty(), "the duplicate toast must be gone");
 
     let opts = pacode_render::RenderOptions::new(80, false);
-    let lines = crate::ui::dialog::render_cell_for_test(&cell.kind, 80, &opts);
+    let lines = crate::ui::dialog::render_cell_for_test(cell, 80, &opts);
     assert_eq!(lines.len(), 1);
     let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(rendered.contains("101"), "exit code missing: {rendered}");
@@ -2255,11 +2274,289 @@ fn test_a_question_takes_the_keyboard_and_starts_on_the_recommended_option() {
     let mut state = make_test_state();
     ask(&mut state, test_question(), Instant::now());
 
-    match &state.focus {
-        Focus::Overlay(Overlay::QuestionPicker { index, .. }) => assert_eq!(*index, 1),
-        other => panic!("expected the question picker, got {other:?}"),
-    }
+    assert!(
+        matches!(state.focus, Focus::Overlay(Overlay::QuestionPicker)),
+        "expected the question picker, got {:?}",
+        state.focus
+    );
+    assert_eq!(state.questions.focus().map(|f| f.index), Some(1));
     assert!(state.is_bottom_picker());
+}
+
+#[test]
+fn test_questions_queue_up_and_walk_with_arrows() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+    let mut second = test_question();
+    second.id = pacode_types::QuestionId::new("qst_2");
+    second.question = "And the second?".to_string();
+    ask(&mut state, second, now);
+
+    // Both are waiting; the first keeps the cursor.
+    assert_eq!(state.questions.len(), 2);
+    assert_eq!(
+        state.questions.current().map(|q| q.id.as_str()),
+        Some("qst_1")
+    );
+    assert_eq!(state.questions.position(), 1);
+
+    // Right/Left walk the queue, wrapping at the ends.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        now,
+    );
+    assert_eq!(
+        state.questions.current().map(|q| q.id.as_str()),
+        Some("qst_2")
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        now,
+    );
+    assert_eq!(
+        state.questions.current().map(|q| q.id.as_str()),
+        Some("qst_1")
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        now,
+    );
+    assert_eq!(
+        state.questions.current().map(|q| q.id.as_str()),
+        Some("qst_2")
+    );
+}
+
+#[test]
+fn test_each_question_keeps_its_own_picker_state() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+    let mut second = test_question();
+    second.id = pacode_types::QuestionId::new("qst_2");
+    ask(&mut state, second, now);
+
+    // Cursor to the plaque on qst_1 (2 options → index 2), then walk.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        now,
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        now,
+    );
+    assert_eq!(state.questions.focus().map(|f| f.index), Some(2));
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        now,
+    );
+    assert_eq!(
+        state.questions.focus().map(|f| f.index),
+        Some(1),
+        "qst_2 opens on its own recommended option"
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        now,
+    );
+    assert_eq!(
+        state.questions.focus().map(|f| f.index),
+        Some(2),
+        "qst_1 kept its plaque cursor"
+    );
+}
+
+#[test]
+fn test_typed_text_survives_walking_the_queue() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+    let mut second = test_question();
+    second.id = pacode_types::QuestionId::new("qst_2");
+    ask(&mut state, second, now);
+
+    // Half-type a custom answer on qst_1.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        now,
+    );
+    for c in "half".chars() {
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            now,
+        );
+    }
+    // Arrows still walk the queue while typing; the other question shows its
+    // own (empty) state…
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        now,
+    );
+    let f = state.questions.focus().expect("focus");
+    assert!(f.typed.is_empty());
+    assert!(!f.typing);
+    // …and coming back restores the half-written answer, still typing.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        now,
+    );
+    let f = state.questions.focus().expect("focus");
+    assert_eq!(f.typed, "half");
+    assert!(f.typing);
+
+    // Enter submits it against qst_1.
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { question, answer })] => {
+            assert_eq!(question.as_str(), "qst_1");
+            assert_eq!(answer.free_text.as_deref(), Some("half"));
+        }
+        other => panic!("expected the typed answer, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_resolving_one_question_keeps_the_picker_for_the_rest() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+    let mut second = test_question();
+    second.id = pacode_types::QuestionId::new("qst_2");
+    ask(&mut state, second, now);
+
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 2,
+            event: pacode_types::Event::QuestionResolved {
+                question: pacode_types::QuestionId::new("qst_1"),
+                answer: pacode_types::QuestionAnswer::choice(0),
+            },
+        },
+        now,
+    );
+    // One down, one still waiting — the picker re-anchors on it.
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::QuestionPicker)
+    ));
+    assert_eq!(state.questions.len(), 1);
+    assert_eq!(
+        state.questions.current().map(|q| q.id.as_str()),
+        Some("qst_2")
+    );
+}
+
+#[test]
+fn test_answering_one_question_advances_to_the_next() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+    let mut second = test_question();
+    second.id = pacode_types::QuestionId::new("qst_2");
+    ask(&mut state, second, now);
+
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { question, .. })] => {
+            assert_eq!(question.as_str(), "qst_1");
+        }
+        other => panic!("expected an answer for qst_1, got {other:?}"),
+    }
+    // The answered question leaves the queue; the picker stays for qst_2.
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::QuestionPicker)
+    ));
+    assert_eq!(
+        state.questions.current().map(|q| q.id.as_str()),
+        Some("qst_2")
+    );
+}
+
+#[test]
+fn test_submissions_follow_the_queue_cursor_not_a_stale_view() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+    let mut second = test_question();
+    second.id = pacode_types::QuestionId::new("qst_2");
+    ask(&mut state, second, now);
+
+    // The user walked to qst_2 — digit and Enter both answer THAT question.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        now,
+    );
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { question, answer })] => {
+            assert_eq!(question.as_str(), "qst_2");
+            assert_eq!(answer.selected, vec![1]);
+        }
+        other => panic!("expected an answer for qst_2, got {other:?}"),
+    }
+
+    // Same guard after a resolve: qst_1 answered elsewhere while a third
+    // question waits behind it — the queue re-anchored, so the next Enter
+    // goes to what is actually on screen, not the stale view.
+    let mut third = test_question();
+    third.id = pacode_types::QuestionId::new("qst_3");
+    ask(&mut state, third, now);
+    // Queue is now [qst_1, qst_3] with the cursor on qst_1.
+    assert_eq!(
+        state.questions.current().map(|q| q.id.as_str()),
+        Some("qst_1")
+    );
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            seq: 3,
+            event: pacode_types::Event::QuestionResolved {
+                question: pacode_types::QuestionId::new("qst_1"),
+                answer: pacode_types::QuestionAnswer::choice(0),
+            },
+        },
+        now,
+    );
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::AnswerQuestion { question, .. })] => {
+            assert_eq!(
+                question.as_str(),
+                "qst_3",
+                "the resolved question must not take the answer"
+            );
+        }
+        other => panic!("expected an answer, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2313,7 +2610,7 @@ fn test_a_digit_picks_that_option_directly() {
     assert!(actions.is_empty());
     assert!(matches!(
         state.focus,
-        Focus::Overlay(Overlay::QuestionPicker { .. })
+        Focus::Overlay(Overlay::QuestionPicker)
     ));
 }
 
@@ -2416,20 +2713,14 @@ fn test_the_free_text_plaque_is_a_pseudo_option_past_the_last() {
         KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
         now,
     );
-    match &state.focus {
-        Focus::Overlay(Overlay::QuestionPicker { index, .. }) => assert_eq!(*index, 2),
-        other => panic!("expected the question picker, got {other:?}"),
-    }
+    assert_eq!(state.questions.focus().map(|f| f.index), Some(2));
     // …and stays there on another j.
     handle_key(
         &mut state,
         KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
         now,
     );
-    match &state.focus {
-        Focus::Overlay(Overlay::QuestionPicker { index, .. }) => assert_eq!(*index, 2),
-        other => panic!("expected the question picker, got {other:?}"),
-    }
+    assert_eq!(state.questions.focus().map(|f| f.index), Some(2));
 
     // Enter on the plaque does not answer — it starts typing.
     let actions = handle_key(
@@ -2438,10 +2729,7 @@ fn test_the_free_text_plaque_is_a_pseudo_option_past_the_last() {
         now,
     );
     assert!(actions.is_empty());
-    match &state.focus {
-        Focus::Overlay(Overlay::QuestionPicker { typing, .. }) => assert!(*typing),
-        other => panic!("expected the question picker, got {other:?}"),
-    }
+    assert_eq!(state.questions.focus().map(|f| f.typing), Some(true));
 }
 
 #[test]
@@ -2457,10 +2745,45 @@ fn test_digit_past_the_options_jumps_to_the_plaque() {
         now,
     );
     assert!(actions.is_empty());
-    match &state.focus {
-        Focus::Overlay(Overlay::QuestionPicker { index, .. }) => assert_eq!(*index, 2),
-        other => panic!("expected the question picker, got {other:?}"),
-    }
+    assert_eq!(state.questions.focus().map(|f| f.index), Some(2));
+}
+
+#[test]
+fn test_a_letter_on_the_plaque_starts_typing_immediately() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    ask(&mut state, test_question(), now);
+
+    // Reach the plaque (index == count), then a plain letter types it.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        now,
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        now,
+    );
+    let f = state.questions.focus().expect("focus");
+    assert!(f.typing);
+    assert_eq!(f.typed, "x");
+
+    // Nav letters still navigate while parked on the plaque: 'k' steps back
+    // to the last option rather than typing a 'k'.
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        now,
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        now,
+    );
+    let f = state.questions.focus().expect("focus");
+    assert!(!f.typing);
+    assert_eq!(f.index, 1);
 }
 
 #[test]
@@ -2487,13 +2810,9 @@ fn test_esc_from_typing_returns_to_the_list() {
         now,
     );
     assert!(actions.is_empty());
-    match &state.focus {
-        Focus::Overlay(Overlay::QuestionPicker { typing, typed, .. }) => {
-            assert!(!*typing);
-            assert!(typed.is_empty());
-        }
-        other => panic!("expected the question picker, got {other:?}"),
-    }
+    let f = state.questions.focus().expect("focus");
+    assert!(!f.typing);
+    assert!(f.typed.is_empty());
 }
 
 #[test]
@@ -2515,15 +2834,9 @@ fn test_space_on_the_plaque_starts_typing_even_in_multi_select() {
         KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
         now,
     );
-    match &state.focus {
-        Focus::Overlay(Overlay::QuestionPicker {
-            typing, selected, ..
-        }) => {
-            assert!(*typing);
-            assert!(selected.is_empty());
-        }
-        other => panic!("expected the question picker, got {other:?}"),
-    }
+    let f = state.questions.focus().expect("focus");
+    assert!(f.typing);
+    assert!(f.selected.is_empty());
 }
 
 #[test]
@@ -3254,4 +3567,116 @@ fn test_model_switch_clamps_unsupported_effort() {
         ),
         "second action must be the downgrade to Medium, got {actions:?}"
     );
+}
+
+fn permission_cell(id: u64, perm_id: &str) -> crate::state::Cell {
+    crate::state::Cell {
+        id,
+        kind: CellKind::Item(TranscriptKind::Permission(
+            pacode_types::PermissionRequest {
+                id: pacode_types::PermissionId::new(perm_id),
+                agent: AgentId::main(),
+                agent_name: "main".into(),
+                call_id: pacode_types::CallId::new("call_1"),
+                tool: "bash".into(),
+                title: "Bash: rm -rf /tmp/x".into(),
+                detail: String::new(),
+                risk: Some(pacode_types::RiskLevel::Confirm),
+                created_at_ms: 1,
+            },
+        )),
+        version: 0,
+        ts_ms: 0,
+        stats: None,
+        perm_explain: None,
+    }
+}
+
+#[test]
+fn test_e_on_a_pending_permission_asks_for_the_explanation() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state
+        .transcript
+        .cells
+        .push_back(permission_cell(1, "perm_1"));
+
+    // 'e' asks the daemon's detached explainer — it never resolves the
+    // request. The prompt flips to the in-flight mark so the press is
+    // visibly acknowledged.
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [Action::Send(Request::ExplainPermission { permission })] => {
+            assert_eq!(permission.as_str(), "perm_1");
+        }
+        other => panic!("expected ExplainPermission, got {other:?}"),
+    }
+    assert_eq!(
+        state.transcript.cells[0].perm_explain,
+        Some(crate::state::PermExplain::Requested)
+    );
+    assert!(
+        state.input.is_empty(),
+        "'e' on the prompt must not type into the input"
+    );
+
+    // The verdict keys stay armed while the answer is in flight.
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        now,
+    );
+    match actions.as_slice() {
+        [
+            Action::Send(Request::PermissionReply {
+                permission,
+                decision,
+                ..
+            }),
+        ] => {
+            assert_eq!(permission.as_str(), "perm_1");
+            assert_eq!(
+                *decision,
+                pacode_types::state::PermissionDecision::AllowOnce
+            );
+        }
+        other => panic!("expected PermissionReply, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_e_with_text_in_the_prompt_types_instead_of_explaining() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state
+        .transcript
+        .cells
+        .push_back(permission_cell(1, "perm_1"));
+    state.input.insert_str("not");
+
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        now,
+    );
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "note");
+    assert_eq!(state.transcript.cells[0].perm_explain, None);
+}
+
+#[test]
+fn test_e_without_a_pending_permission_types_into_the_prompt() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        now,
+    );
+    assert!(actions.is_empty());
+    assert_eq!(state.input.text, "e");
 }

@@ -8,8 +8,8 @@ use pacode_types::{PermissionRequest, Request, TranscriptKind};
 
 use crate::binding::Action as KeyAction;
 use crate::commands;
-use crate::state::transcript::CellKind;
-use crate::state::{AppState, Focus, Overlay, PanelTarget};
+use crate::state::transcript::{CellKind, PermExplain};
+use crate::state::{AppState, Focus, Overlay, PanelTarget, PendingCopy};
 
 #[cfg(test)]
 #[path = "keys_tests.rs"]
@@ -56,19 +56,16 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     let threshold = state.config.keys.double_shift_threshold_ms();
     let hub_fired = state.double_shift.observe(key, now, threshold, armed);
 
-    // REPORT_EVENT_TYPES reports Release/Repeat alongside Press — without this
-    // drop every keypress would run its action twice (§4.2).
-    if matches!(key.kind, KeyEventKind::Release | KeyEventKind::Repeat) {
+    // REPORT_EVENT_TYPES reports Release and Repeat alongside Press (§4.2).
+    // Release is dropped — lifting a key must not re-run its action — while
+    // Repeat is fed through on purpose: a held key auto-repeats its action,
+    // which is how held arrows auto-scroll and held chars auto-type.
+    if matches!(key.kind, KeyEventKind::Release) {
         return vec![];
     }
 
     let was_dirty = state.dirty;
     state.dirty = true;
-
-    // Dismiss remote clipboard hint popup on any key.
-    state
-        .toasts
-        .retain(|t| t.title != crate::ui::popup::POPUP_TOAST_TITLE);
 
     // 1. ctrl+c / ctrl+d (Cyrillic layout letters are mapped to their Latin key).
     let key = normalize_cyrillic_ctrl(key);
@@ -91,10 +88,17 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
-    // ctrl+shift+c: copy current selection
+    // ctrl+shift+c: copy the current selection; with no selection the prompt
+    // text is what the reader most likely wants on the clipboard. Both paths
+    // only stash the text — the event loop performs the copy off-thread.
     if state.keymap.action_for(key) == Some(KeyAction::CopySelection) {
         if state.selection.is_active() && !state.selection.is_empty() {
             state.selection.request_explicit_copy();
+        } else if !state.input.is_empty() {
+            state.pending_copy = Some(PendingCopy {
+                text: state.input.text.clone(),
+                auto: false,
+            });
         }
         return vec![];
     }
@@ -387,10 +391,25 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
-    // 8. Interactive permission prompt when input is empty: y / a / n
+    // 8. Interactive permission prompt when input is empty: y / a / n / e
     if state.input.is_empty()
         && let Some(pending_req) = find_pending_permission(state)
     {
+        // 'e' asks the daemon's detached explainer about the live request.
+        // It never resolves the permission, so the verdict keys below stay
+        // armed while the answer is in flight — the prompt flips to
+        // "explain requested…" immediately for feedback.
+        if key.code == KeyCode::Char('e') {
+            let explain = PermExplain::Requested;
+            state.transcript.set_perm_explain(&pending_req.id, &explain);
+            state
+                .panel
+                .agent_transcript
+                .set_perm_explain(&pending_req.id, &explain);
+            return vec![Action::Send(Request::ExplainPermission {
+                permission: pending_req.id,
+            })];
+        }
         let decision = match key.code {
             KeyCode::Char('y') => Some(PermissionDecision::AllowOnce),
             KeyCode::Char('a') => Some(PermissionDecision::AllowSession),
@@ -401,6 +420,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             return vec![Action::Send(Request::PermissionReply {
                 permission: pending_req.id,
                 decision,
+                // 'n' with no comment: a plain user refusal.
+                reason: None,
             })];
         }
     }
@@ -615,7 +636,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             | Focus::Panel { .. }
             | Focus::Overlay(
                 Overlay::ModePicker { .. }
-                | Overlay::QuestionPicker { .. }
+                | Overlay::QuestionPicker
                 | Overlay::RailOverlay
                 | Overlay::ThemePicker { .. }
                 | Overlay::LoginPicker { .. }

@@ -818,6 +818,7 @@ fn tool_cell(id: u64, preview: &str) -> Cell {
         version: 0,
         ts_ms: id,
         stats: None,
+        perm_explain: None,
     }
 }
 
@@ -838,7 +839,7 @@ fn clicking_a_cell_toggles_its_expansion_and_an_unknown_cell_is_ignored() {
 }
 
 #[test]
-fn ctrl_o_expands_the_newest_foldable_cell_and_collapses_it_back() {
+fn ctrl_o_expands_the_newest_tool_cell_and_collapses_it_back() {
     let mut t = Transcript::new(8);
     let long: String = (1..=12)
         .map(|i| format!("row {i}"))
@@ -848,24 +849,42 @@ fn ctrl_o_expands_the_newest_foldable_cell_and_collapses_it_back() {
     t.cells.push_back(tool_cell(2, &long));
     t.cells.push_back(tool_cell(3, "tiny"));
 
-    // Skips the newest non-foldable cell, lands on the long one.
+    // The newest tool cell is always the target — expansion also reveals the
+    // call's full argument, so a short preview is still worth expanding.
     assert!(t.toggle_last_expandable());
-    assert!(t.is_expanded(2));
+    assert!(t.is_expanded(3));
     assert!(!t.is_expanded(1));
-    assert!(!t.is_expanded(3));
+    assert!(!t.is_expanded(2));
 
     // Second press toggles the same cell back.
     assert!(t.toggle_last_expandable());
-    assert!(!t.is_expanded(2));
+    assert!(!t.is_expanded(3));
 }
 
 #[test]
-fn ctrl_o_ignores_cells_that_render_the_same_expanded() {
+fn ctrl_o_expands_short_and_denied_cells_too() {
+    // A single-line output still expands — the expanded cell also spells out
+    // the call's full argument.
     let mut t = Transcript::new(8);
     t.cells.push_back(tool_cell(1, "only one line"));
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(1));
 
+    // A denied call expands too: its one-line "Denied" preview used to make
+    // the cell look unexpandable, but the refused command is exactly what the
+    // reader wants to see.
+    let mut denied_cell = tool_cell(1, "Denied");
+    if let CellKind::Item(TranscriptKind::ToolCall { ref mut status, .. }) = denied_cell.kind {
+        *status = pacode_types::ToolStatus::Denied;
+    }
+    let mut t = Transcript::new(8);
+    t.cells.push_back(denied_cell);
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(1));
+
+    // With no tool cell at all there is nothing to toggle.
+    let mut t = Transcript::new(8);
     assert!(!t.toggle_last_expandable());
-    assert!(!t.is_expanded(1));
 }
 
 #[test]
@@ -897,4 +916,81 @@ fn a_content_line_maps_back_to_the_cell_drawn_there() {
     assert_eq!(t.cell_at_line(8), Some(11));
     assert_eq!(t.cell_at_line(9), Some(12));
     assert_eq!(t.cell_at_line(10), None);
+}
+
+fn perm_request(id: &str, title: &str) -> PermissionRequest {
+    PermissionRequest {
+        id: PermissionId::new(id),
+        agent: AgentId::main(),
+        agent_name: "main".into(),
+        call_id: pacode_types::CallId::new("call_1"),
+        tool: "bash".into(),
+        title: title.into(),
+        detail: String::new(),
+        risk: Some(pacode_types::RiskLevel::Confirm),
+        created_at_ms: 1,
+    }
+}
+
+/// The daemon emits the same request as an event AND as a transcript item
+/// (and again in a snapshot's `pending_permissions`) — all three writes must
+/// land on one prompt cell.
+#[test]
+fn a_permission_request_lands_once_no_matter_how_often_it_arrives() {
+    let mut t = Transcript::new(16);
+    t.upsert_permission(perm_request("perm_1", "Bash: rm -rf /tmp/x"), 1, 10);
+    // The ItemAdded echo — a different seq, the same request id.
+    t.upsert(
+        TranscriptItem {
+            seq: 42,
+            agent: AgentId::main(),
+            ts_ms: 2,
+            kind: TranscriptKind::Permission(perm_request("perm_1", "Bash: rm -rf /tmp/x")),
+        },
+        Instant::now(),
+    );
+    // …and the snapshot's pending_permissions repeat.
+    t.upsert_permission(perm_request("perm_1", "Bash: rm -rf /tmp/x"), 3, 99);
+
+    let prompts: Vec<&Cell> = t
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Permission(_))))
+        .collect();
+    assert_eq!(prompts.len(), 1, "one request must render one prompt");
+    // The first write keeps the slot; the echoes refresh it in place.
+    assert_eq!(prompts[0].id, 10);
+    assert_eq!(prompts[0].ts_ms, 3);
+
+    // A different request is a different prompt.
+    t.upsert_permission(perm_request("perm_2", "Bash: ls"), 4, 12);
+    assert_eq!(t.cells.len(), 2);
+}
+
+#[test]
+fn set_perm_explain_marks_the_prompt_and_reports_a_miss() {
+    let mut t = Transcript::new(16);
+    t.upsert_permission(perm_request("perm_1", "Bash: rm -rf /tmp/x"), 1, 10);
+
+    assert!(t.set_perm_explain(&PermissionId::new("perm_1"), &PermExplain::Requested));
+    assert_eq!(t.cells[0].perm_explain, Some(PermExplain::Requested));
+
+    // A landing answer replaces the mark rather than stacking.
+    let done = PermExplain::Done {
+        text: "deletes the dir".into(),
+        level: Some(ExplainLevel::High),
+    };
+    assert!(t.set_perm_explain(&PermissionId::new("perm_1"), &done));
+    assert_eq!(t.cells[0].perm_explain, Some(done));
+
+    // An unknown id lands nowhere.
+    assert!(!t.set_perm_explain(&PermissionId::new("perm_zzz"), &PermExplain::Requested));
+
+    // Once the verdict swapped the prompt for a notice, a late answer has no
+    // target — the caller falls back to a notice of its own.
+    t.cells[0].kind = CellKind::Item(TranscriptKind::Notice {
+        level: pacode_types::ToastLevel::Warn,
+        text: "Denied".into(),
+    });
+    assert!(!t.set_perm_explain(&PermissionId::new("perm_1"), &PermExplain::Requested));
 }

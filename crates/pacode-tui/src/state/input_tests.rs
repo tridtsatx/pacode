@@ -173,3 +173,47 @@ fn test_wrap_cursor_consistency() {
     state.cursor = 4;
     assert_eq!(state.cursor_position(10), (0, 6));
 }
+
+#[test]
+fn test_wrapped_position_of_byte() {
+    // Single line: the column is the display width of the text before it.
+    let mut state = InputState::default();
+    state.insert_str("see [Image 2] ok");
+    let byte = state.text.find("[Image 2]").unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 80), (0, 4));
+
+    // Outer width 10 → text width 8: "see " fills line 0, "[Image " wraps
+    // to line 1 — the token's byte lands on the line where it STARTS.
+    assert_eq!(state.wrapped_position_of_byte(byte, 10), (1, 0));
+
+    // A token split mid-word: "a b c d e [Image 3]" at text width 6 wraps
+    // into ["a b c ", "d e ", "[Image", " 3]"] — the space after `[Image`
+    // overflows onto line 3 as leading whitespace (non-trimming wrap), so
+    // '[' is line 2 col 0 and '3' is line 3 col 1.
+    let mut state = InputState::default();
+    state.insert_str("a b c d e [Image 3]");
+    let byte = state.text.find("[Image 3]").unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 8), (2, 0));
+    let byte = state.text.find('3').unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 8), (3, 1));
+
+    // Wide chars before the token count display cells, not bytes: "你好 "
+    // is 5 cells, so the token starts at col 0 of wrapped line 1.
+    let mut state = InputState::default();
+    state.insert_str("你好 [Image 1]");
+    let byte = state.text.find("[Image 1]").unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 10), (1, 0));
+
+    // Multi-line text: the '\n' separator is bridged, the token maps to
+    // line 1 at its column there.
+    let mut state = InputState::default();
+    state.insert_str("ab\ncd [Image 1]");
+    let byte = state.text.find("[Image 1]").unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 20), (1, 3));
+
+    // A byte past the end lands on the last line's end.
+    assert_eq!(
+        state.wrapped_position_of_byte(state.text.len() + 100, 20),
+        (1, 12)
+    );
+}

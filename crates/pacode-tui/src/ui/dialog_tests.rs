@@ -25,7 +25,7 @@ fn question_cell(answer: Option<pacode_types::QuestionAnswer>) -> TranscriptKind
 #[test]
 fn an_unanswered_question_does_not_repeat_the_picker() {
     let opts = pacode_render::RenderOptions::new(80, false);
-    let lines = super::render_item_inner(&question_cell(None), None, 80, &opts, 0, false);
+    let lines = super::render_item_inner(&question_cell(None), None, None, 80, &opts, 0, false);
     let text: Vec<String> = lines
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -46,7 +46,7 @@ fn an_unanswered_question_does_not_repeat_the_picker() {
 fn an_answered_question_shows_what_was_chosen() {
     let opts = pacode_render::RenderOptions::new(80, false);
     let answered = question_cell(Some(pacode_types::QuestionAnswer::choice(1)));
-    let lines = super::render_item_inner(&answered, None, 80, &opts, 0, false);
+    let lines = super::render_item_inner(&answered, None, None, 80, &opts, 0, false);
     let joined: String = lines
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
@@ -58,7 +58,7 @@ fn an_answered_question_shows_what_was_chosen() {
     assert!(!joined.contains("waiting for your answer"), "{joined}");
 
     let dismissed = question_cell(Some(pacode_types::QuestionAnswer::cancelled()));
-    let lines = super::render_item_inner(&dismissed, None, 80, &opts, 0, false);
+    let lines = super::render_item_inner(&dismissed, None, None, 80, &opts, 0, false);
     let joined: String = lines
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
@@ -73,7 +73,7 @@ fn an_answered_question_keeps_the_description_and_the_typed_text() {
     let mut answer = pacode_types::QuestionAnswer::choice(1);
     answer.free_text = Some("with a twist".to_string());
     let answered = question_cell(Some(answer));
-    let lines = super::render_item_inner(&answered, None, 80, &opts, 0, false);
+    let lines = super::render_item_inner(&answered, None, None, 80, &opts, 0, false);
     let joined: String = lines
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
@@ -94,7 +94,7 @@ fn notice_text(level: ToastLevel, text: &str, width: u16) -> String {
         level,
         text: text.to_string(),
     };
-    super::render_item_inner(&kind, None, width, &opts, 0, false)
+    super::render_item_inner(&kind, None, None, width, &opts, 0, false)
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
         .collect::<Vec<_>>()
@@ -234,6 +234,7 @@ fn a_second_render_at_the_same_width_is_served_from_the_cache() {
             version: 0,
             ts_ms: id,
             stats: None,
+            perm_explain: None,
         });
     }
 
@@ -249,5 +250,98 @@ fn a_second_render_at_the_same_width_is_served_from_the_cache() {
         t.cache.total_lines(),
         cached_after_first,
         "the second render found every cell in the cache"
+    );
+}
+
+fn permission_cell(risk: Option<RiskLevel>, explain: Option<PermExplain>) -> Cell {
+    Cell {
+        id: 1,
+        kind: CellKind::Item(TranscriptKind::Permission(
+            pacode_types::PermissionRequest {
+                id: pacode_types::PermissionId::new("perm_1"),
+                agent: pacode_types::AgentId::main(),
+                agent_name: "main".into(),
+                call_id: pacode_types::CallId::new("call_1"),
+                tool: "bash".into(),
+                title: "Bash: rm -rf /tmp/x".into(),
+                detail: "rm -rf /tmp/x".into(),
+                risk,
+                created_at_ms: 1,
+            },
+        )),
+        version: 0,
+        ts_ms: 0,
+        stats: None,
+        perm_explain: explain,
+    }
+}
+
+fn cell_text(cell: &Cell, width: u16) -> String {
+    let opts = pacode_render::RenderOptions::new(width, false);
+    super::render_cell_for_test(cell, width, &opts)
+        .iter()
+        .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_permission_prompt_shows_the_risk_and_the_verdict_keys() {
+    let cell = permission_cell(Some(RiskLevel::Confirm), None);
+    let joined = cell_text(&cell, 80);
+    assert!(joined.contains("permission:"), "{joined}");
+    assert!(joined.contains("Bash: rm -rf /tmp/x"), "{joined}");
+    assert!(joined.contains("risk: confirm"), "{joined}");
+    assert!(
+        joined.contains("y allow · a session · n deny · e explain"),
+        "{joined}"
+    );
+    assert!(!joined.contains("explain requested"), "{joined}");
+}
+
+#[test]
+fn pressing_e_marks_the_prompt_until_the_answer_lands() {
+    let cell = permission_cell(Some(RiskLevel::Confirm), Some(PermExplain::Requested));
+    let joined = cell_text(&cell, 80);
+    assert!(joined.contains("explain requested"), "{joined}");
+    // The verdict keys stay visible under the pending mark.
+    assert!(joined.contains("y allow"), "{joined}");
+}
+
+#[test]
+fn a_landed_explanation_renders_level_and_text_and_keeps_the_keys() {
+    let cell = permission_cell(
+        None,
+        Some(PermExplain::Done {
+            text: "recursively deletes the tmp dir".into(),
+            level: Some(ExplainLevel::High),
+        }),
+    );
+    let joined = cell_text(&cell, 80);
+    assert!(joined.contains("explain · high:"), "{joined}");
+    assert!(
+        joined.contains("recursively deletes the tmp dir"),
+        "{joined}"
+    );
+    assert!(joined.contains("y allow"), "{joined}");
+    // No risk on the request -> no chip.
+    assert!(!joined.contains("risk:"), "{joined}");
+}
+
+#[test]
+fn an_honest_explain_failure_has_no_rating_word() {
+    let cell = permission_cell(
+        Some(RiskLevel::Catastrophic),
+        Some(PermExplain::Done {
+            text: "explain unavailable under zero-data-retention".into(),
+            level: None,
+        }),
+    );
+    let joined = cell_text(&cell, 80);
+    assert!(joined.contains("risk: catastrophic"), "{joined}");
+    assert!(joined.contains("explain:"), "{joined}");
+    assert!(
+        joined.contains("explain unavailable under zero-data-retention"),
+        "{joined}"
     );
 }

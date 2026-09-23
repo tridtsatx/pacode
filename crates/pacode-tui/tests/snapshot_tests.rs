@@ -667,3 +667,48 @@ fn test_turn_ended_response_stats_rendered() {
         "Tokens must no longer be shown in the turn stats line"
     );
 }
+
+#[test]
+fn test_snapshot_seeds_the_question_queue() {
+    fn question(id: &str, text: &str) -> pacode_types::Question {
+        pacode_types::Question::new(
+            pacode_types::QuestionId::new(id),
+            pacode_types::QuestionOrigin::new(
+                AgentId::main(),
+                "main",
+                pacode_types::CallId::new(format!("call_{id}")),
+            ),
+            "",
+            text,
+            vec![
+                pacode_types::QuestionOption::new("a", ""),
+                pacode_types::QuestionOption::new("b", ""),
+            ],
+            false,
+            0,
+        )
+        .expect("question")
+    }
+
+    // Attaching to a session with two waiting questions opens the picker on
+    // the first — nothing is orphaned.
+    let mut snapshot = make_base_snapshot();
+    snapshot.pending_questions = vec![question("qst_1", "first?"), question("qst_2", "second?")];
+    let mut state = create_state(120, 34, snapshot);
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(pacode_tui::state::Overlay::QuestionPicker)
+    ));
+    assert_eq!(state.questions.len(), 2);
+    assert_eq!(
+        state.questions.current().map(|q| q.id.as_str()),
+        Some("qst_1")
+    );
+
+    // A later snapshot with the queue empty closes the picker again.
+    let mut snapshot = make_base_snapshot();
+    snapshot.pending_questions = Vec::new();
+    state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+    assert!(state.questions.is_empty());
+    assert_eq!(state.focus, Focus::Normal);
+}

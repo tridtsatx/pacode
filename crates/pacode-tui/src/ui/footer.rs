@@ -233,7 +233,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                     vec![
                         Span::styled(format!("{} permission: ", opts.glyphs.chevrons), pulse),
                         Span::styled(format!("{} · ", req.title), opts.theme.bold.patch(pulse)),
-                        Span::styled("y allow · a session · n deny", opts.theme.cyan),
+                        Span::styled("y allow · a session · n deny · e explain", opts.theme.cyan),
                     ],
                     true,
                 )

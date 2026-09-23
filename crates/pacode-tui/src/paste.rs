@@ -297,7 +297,7 @@ pub fn handle_paste_image_with_runner(
                 } else {
                     state.input.insert_str(&token);
                 }
-                state.push_toast(
+                state.push_toast_linked(
                     ToastLevel::Info,
                     format!("Image pasted as {}", record.token_label()),
                     Some(
@@ -305,6 +305,7 @@ pub fn handle_paste_image_with_runner(
                             .to_string(),
                     ),
                     now,
+                    record.token_label(),
                 );
                 state.dirty = true;
             }

@@ -1,124 +1,108 @@
-//! Toasts (spec §7): up to 2 lines, right-aligned above the input, 6 s TTL:
-//! `✓ cargo build finished 3m02s` + `warnings 2`.
+//! Toasts (spec §7): a plain strip of up to `TOAST_STRIP_MAX` lines directly
+//! above the input separator, 6 s TTL: `✓ cargo build finished · 3m02s`.
 //!
-//! Two bounded animations ride the anim tick while a toast is young or about
-//! to expire: a slide-in from the right edge over `TOAST_ENTER_MS` with a faint
-//! border, and a fade to `theme.faint` over the last `TOAST_EXIT_MS` of life.
+//! The strip has no box and no slide-in — the layout gives it dedicated rows
+//! carved from the dialog's bottom, so no `Clear` is needed either. The only
+//! animation left is the fade to `theme.faint` over the last `TOAST_EXIT_MS`
+//! of a toast's life, riding the anim tick.
+
+use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
-use pacode_render::{RenderOptions, truncate_to_width};
+use pacode_render::{RenderOptions, display_width, truncate_to_width};
 use pacode_types::state::ToastLevel;
 
-use crate::state::{AppState, TOAST_ENTER_MS, TOAST_EXIT_MS, TOAST_TTL_SECS};
-
-/// Cells of left-edge travel remaining at `age_ms`: an ease-out slide-in over
-/// `TOAST_ENTER_MS` covering four cells. Pure, so tests can pin the curve.
-pub fn enter_offset(age_ms: u64) -> u16 {
-    if age_ms >= TOAST_ENTER_MS {
-        return 0;
-    }
-    let t = age_ms as f32 / TOAST_ENTER_MS as f32;
-    let eased = 1.0 - (1.0 - t) * (1.0 - t);
-    ((1.0 - eased) * 4.0).round() as u16
-}
+use crate::layout::TOAST_STRIP_MAX;
+use crate::state::{AppState, TOAST_EXIT_MS, TOAST_TTL_SECS, Toast};
 
 /// Whether a toast of `age_ms` is inside its fade-out window.
 pub fn is_fading(age_ms: u64) -> bool {
     (TOAST_TTL_SECS * 1000).saturating_sub(age_ms) < TOAST_EXIT_MS
 }
 
+/// The toasts the strip shows: unexpired, capped at `TOAST_STRIP_MAX`, oldest
+/// first so the newest lands on the row closest to the input. `ui::draw` sizes
+/// `ScreenLayout::toast` from this, so it is the strip's single source of truth.
+pub fn live_toasts(state: &AppState, now: Instant) -> Vec<&Toast> {
+    let mut out: Vec<&Toast> = state
+        .toasts
+        .iter()
+        .rev()
+        .filter(|t| now.saturating_duration_since(t.shown_at).as_secs() < TOAST_TTL_SECS)
+        // A toast linked to an input token dies with it (deleted/submitted).
+        .filter(|t| {
+            t.token_label
+                .as_ref()
+                .is_none_or(|label| state.input.text.contains(label.as_str()))
+        })
+        .take(TOAST_STRIP_MAX as usize)
+        .collect();
+    out.reverse();
+    out
+}
+
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOptions) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-
-    let Some(toast) = state
-        .toasts
-        .iter()
-        .rev()
-        .find(|t| t.title != crate::ui::popup::POPUP_TOAST_TITLE)
-    else {
-        return;
-    };
-
-    let age_ms = std::time::Instant::now()
-        .saturating_duration_since(toast.shown_at)
-        .as_millis() as u64;
-
-    // The slide-in narrows the toast toward its right edge — subtractive, so
-    // nothing is ever drawn outside the layout's toast area.
-    let off = enter_offset(age_ms);
-    let area = Rect::new(
-        area.x + off.min(area.width),
-        area.y,
-        area.width.saturating_sub(off),
-        area.height,
-    );
-    if area.width == 0 || area.height == 0 {
+    let now = Instant::now();
+    let toasts = live_toasts(state, now);
+    if toasts.is_empty() {
         return;
     }
 
-    let (sym, style) = match toast.level {
-        ToastLevel::Success => (opts.glyphs.ok, opts.theme.green),
-        ToastLevel::Error => (opts.glyphs.fail, opts.theme.red),
-        ToastLevel::Warn => ("!", opts.theme.accent),
-        ToastLevel::Info => (opts.glyphs.main_dot, opts.theme.cyan),
-    };
-
-    // Fading flattens every span to faint; entering keeps the border faint
-    // until the toast has landed.
-    let fading = is_fading(age_ms);
-    let (sym_style, border_style, title_style) = if fading {
-        (opts.theme.faint, opts.theme.faint, opts.theme.faint)
-    } else {
-        let border = if off > 0 {
-            opts.theme.faint
-        } else {
-            opts.theme.cyan
+    // Anchor at the bottom row of the strip area: the newest toast sits
+    // closest to the input.
+    let rows = (toasts.len() as u16).min(area.height);
+    let y0 = area.bottom() - rows;
+    for (i, toast) in toasts.iter().take(rows as usize).enumerate() {
+        let age_ms = now.saturating_duration_since(toast.shown_at).as_millis() as u64;
+        let (sym, level_style) = match toast.level {
+            ToastLevel::Success => (opts.glyphs.ok, opts.theme.green),
+            ToastLevel::Error => (opts.glyphs.fail, opts.theme.red),
+            ToastLevel::Warn => ("!", opts.theme.accent),
+            ToastLevel::Info => (opts.glyphs.main_dot, opts.theme.cyan),
         };
-        (style, border, opts.theme.bold)
-    };
+        // Fading flattens every span to faint.
+        let (sym_style, title_style, detail_style) = if is_fading(age_ms) {
+            (opts.theme.faint, opts.theme.faint, opts.theme.faint)
+        } else {
+            (level_style, opts.theme.fg, opts.theme.faint)
+        };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style);
-    let inner = block.inner(area);
+        // One line: `{glyph} {title}`, plus ` · {detail}` when it fits.
+        let sym_w = display_width(sym) + 1;
+        let text_w = (area.width as usize).saturating_sub(sym_w);
+        let combined = match toast.detail.as_deref() {
+            Some(detail) => format!("{} · {detail}", toast.title),
+            None => toast.title.clone(),
+        };
+        let trunc = truncate_to_width(&combined, text_w, true);
+        // The detail span exists only where the title survived in full;
+        // a cut inside the title keeps the whole line in the title style.
+        let boundary = if trunc.starts_with(toast.title.as_str()) {
+            toast.title.len()
+        } else {
+            trunc.len()
+        };
+        let (title_part, detail_part) = trunc.split_at(boundary);
+        let mut spans = vec![
+            Span::styled(format!("{sym} "), sym_style),
+            Span::styled(title_part.to_string(), title_style),
+        ];
+        if !detail_part.is_empty() {
+            spans.push(Span::styled(detail_part.to_string(), detail_style));
+        }
 
-    let mut lines = Vec::new();
-    let sym_w = pacode_render::display_width(sym) + 1;
-    let title_line = Line::from(vec![
-        Span::styled(format!("{sym} "), sym_style),
-        Span::styled(
-            truncate_to_width(
-                &toast.title,
-                (inner.width as usize).saturating_sub(sym_w),
-                true,
-            ),
-            title_style,
-        ),
-    ]);
-    lines.push(title_line);
-
-    if inner.height > 1
-        && let Some(detail_str) = toast.detail.as_deref()
-    {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                truncate_to_width(detail_str, (inner.width as usize).saturating_sub(2), true),
-                opts.theme.faint,
-            ),
-        ]));
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, y0 + i as u16, area.width, 1),
+        );
     }
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 #[cfg(test)]

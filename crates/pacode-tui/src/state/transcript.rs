@@ -4,8 +4,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use pacode_render::{LineCache, StreamBuffer, StreamKind, StreamOp};
-use pacode_types::transcript::ToolStatus;
-use pacode_types::{TranscriptItem, TranscriptKind};
+use pacode_types::{ExplainLevel, PermissionId, PermissionRequest, TranscriptItem, TranscriptKind};
 
 #[cfg(test)]
 #[path = "transcript_tests.rs"]
@@ -21,6 +20,39 @@ pub struct Cell {
     pub version: u32,
     pub ts_ms: u64,
     pub stats: Option<String>,
+    /// `e`-key explanation state — `Some` only while the cell still carries a
+    /// pending `TranscriptKind::Permission` request; a verdict's swap to a
+    /// notice drops it with the prompt.
+    pub perm_explain: Option<PermExplain>,
+}
+
+/// Display state of the detached permission explanation. `e` on a pending
+/// permission sends `Request::ExplainPermission`; the aux model's answer
+/// arrives later as `Event::PermissionExplained`. It lives on the cell rather
+/// than inside `TranscriptKind::Permission` — that is the wire item and has
+/// no room for client-side state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermExplain {
+    /// `e` was pressed; the daemon has not answered yet.
+    Requested,
+    /// The explanation landed. `level` is the model's danger rating —
+    /// `None` when the aux call failed and `text` holds the honest reason.
+    Done {
+        text: String,
+        level: Option<ExplainLevel>,
+    },
+}
+
+/// The word shown for an explanation's danger rating — the same spellings
+/// the aux model's `LEVEL:` line uses (`ExplainLevel::parse` accepts them).
+pub fn explain_level_name(level: ExplainLevel) -> &'static str {
+    match level {
+        ExplainLevel::None => "none",
+        ExplainLevel::Low => "low",
+        ExplainLevel::Medium => "medium",
+        ExplainLevel::High => "high",
+        ExplainLevel::Catastrophic => "catastrophic",
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +186,7 @@ impl Transcript {
                 version: 0,
                 ts_ms: item.ts_ms,
                 stats: None,
+                perm_explain: None,
             };
             self.cells.push_back(cell);
         }
@@ -172,6 +205,7 @@ impl Transcript {
                 version: 0,
                 ts_ms: item.ts_ms,
                 stats: None,
+                perm_explain: None,
             };
             self.cells.push_front(cell);
         }
@@ -312,7 +346,63 @@ impl Transcript {
         self.cells.push_back(cell);
     }
 
+    /// Insert or refresh the pending-permission prompt for `req`, keyed on the
+    /// permission id rather than a seq: the daemon emits the same request
+    /// twice (`PermissionRequested`, then an `ItemAdded` transcript item) and
+    /// a snapshot repeats it via `pending_permissions`. The first write keeps
+    /// the slot — later writes refresh the request in place, so the prompt
+    /// never renders twice and any `perm_explain` state survives the
+    /// duplicate.
+    pub fn upsert_permission(&mut self, req: PermissionRequest, ts_ms: u64, fallback_id: u64) {
+        if let Some(cell) = self.cells.iter_mut().find(|c| {
+            matches!(
+                &c.kind,
+                CellKind::Item(TranscriptKind::Permission(existing)) if existing.id == req.id
+            )
+        }) {
+            cell.kind = CellKind::Item(TranscriptKind::Permission(req));
+            cell.version = cell.version.wrapping_add(1);
+            cell.ts_ms = ts_ms;
+            return;
+        }
+        self.push_cell(Cell {
+            id: fallback_id,
+            kind: CellKind::Item(TranscriptKind::Permission(req)),
+            version: 0,
+            ts_ms,
+            stats: None,
+            perm_explain: None,
+        });
+    }
+
+    /// Fold an `e`-key explanation state into every cell still carrying the
+    /// pending request — the `PermissionRequested` row and the transcript
+    /// item share the request's id. Returns true when at least one live
+    /// prompt took it; false means the request already resolved and its
+    /// prompt is gone.
+    pub fn set_perm_explain(&mut self, permission: &PermissionId, explain: &PermExplain) -> bool {
+        let mut landed = false;
+        for cell in &mut self.cells {
+            if matches!(
+                &cell.kind,
+                CellKind::Item(TranscriptKind::Permission(req)) if req.id == *permission
+            ) {
+                cell.perm_explain = Some(explain.clone());
+                cell.version = cell.version.wrapping_add(1);
+                landed = true;
+            }
+        }
+        landed
+    }
+
     fn insert_or_replace(&mut self, seq: u64, kind: TranscriptKind, ts_ms: u64) {
+        // A permission item is the same prompt `PermissionRequested` already
+        // rendered — keyed by request id so the daemon's double emission
+        // lands on one cell instead of prompting twice.
+        if let TranscriptKind::Permission(req) = kind {
+            self.upsert_permission(req, ts_ms, seq);
+            return;
+        }
         if let Some(existing) = self.cells.iter_mut().find(|c| c.id == seq) {
             existing.kind = CellKind::Item(kind);
             existing.version = existing.version.wrapping_add(1);
@@ -324,6 +414,7 @@ impl Transcript {
                 version: 0,
                 ts_ms,
                 stats: None,
+                perm_explain: None,
             });
         }
     }
@@ -471,47 +562,14 @@ impl Transcript {
             .map(|(id, _, _)| *id)
     }
 
-    /// Whether the cell's body hides lines in its collapsed form — the
-    /// keyboard expand (`ctrl+o`) skips cells that would render identically
-    /// either way. Mirrors `ui::toolcell` exactly: diff previews ask the diff
-    /// renderer whether `fold_context` would emit a fold; plain bodies drop
-    /// the `[exit code N]` line the same way the cell does and compare
-    /// against the 6+3 / tail-8 caps.
-    fn body_is_foldable(preview: &str, status: ToolStatus) -> bool {
-        let preview = crate::ui::toolcell::strip_ansi(preview);
-        if crate::ui::toolcell::is_diff_preview(&preview) {
-            return pacode_render::diff_hides_lines(&preview);
-        }
-        let drop_exit = status == ToolStatus::Error
-            || matches!(status, ToolStatus::Ok | ToolStatus::Error)
-                && preview.lines().any(|l| {
-                    let t = l.trim();
-                    t.starts_with("[exit code ") && t.ends_with(']')
-                });
-        let cap = if status == ToolStatus::Error {
-            crate::ui::toolcell::ERROR_TAIL_LINES
-        } else {
-            crate::ui::toolcell::COLLAPSED_HEAD_LINES + crate::ui::toolcell::COLLAPSED_TAIL_LINES
-        };
-        preview
-            .lines()
-            .filter(|l| {
-                !(drop_exit && {
-                    let t = l.trim();
-                    t.starts_with("[exit code ") && t.ends_with(']')
-                })
-            })
-            .count()
-            > cap
-    }
-
-    /// `ctrl+o`: expand the newest cell whose body hides lines when collapsed,
-    /// or collapse it back when it is already expanded. Returns true on change.
+    /// `ctrl+o`: expand the newest tool cell, or collapse it back when it is
+    /// already expanded. Every tool call is expandable — any status (a denied
+    /// call reveals the refused command) and any preview length (expansion
+    /// also shows the call's full argument, which the collapsed cell never
+    /// had room for). Returns true on change.
     pub fn toggle_last_expandable(&mut self) -> bool {
         let id = self.cells.iter().rev().find_map(|c| match &c.kind {
-            CellKind::Item(TranscriptKind::ToolCall {
-                preview, status, ..
-            }) if Self::body_is_foldable(preview, *status) => Some(c.id),
+            CellKind::Item(TranscriptKind::ToolCall { .. }) => Some(c.id),
             _ => None,
         });
         let Some(id) = id else { return false };
