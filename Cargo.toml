@@ -9,6 +9,7 @@ members = [
     "crates/pacode-provider",
     "crates/pacode-mcp",
     "crates/pacode-store",
+    "crates/pacode-symbols",
     "crates/pacode-tools",
     "crates/pacode-core",
     "crates/pacode-daemon",
@@ -45,6 +46,7 @@ pacode-exec = { path = "crates/pacode-exec", version = "1.1.0" }
 pacode-provider = { path = "crates/pacode-provider", version = "1.1.0" }
 pacode-mcp = { path = "crates/pacode-mcp", version = "1.1.0" }
 pacode-store = { path = "crates/pacode-store", version = "1.1.0" }
+pacode-symbols = { path = "crates/pacode-symbols", version = "1.1.0" }
 pacode-tools = { path = "crates/pacode-tools", version = "1.1.0" }
 pacode-core = { path = "crates/pacode-core", version = "1.1.0" }
 pacode-daemon = { path = "crates/pacode-daemon", version = "1.1.0" }

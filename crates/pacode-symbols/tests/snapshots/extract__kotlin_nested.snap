@@ -1,0 +1,19 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Kotlin, src)"
+---
+ERR@Some(1)
+interface Repo 3-5
+  method save 4-4
+enum Kind 7-7
+class User 9-11
+  method label 10-10
+class Registry 13-15
+  method get 14-14
+class Outer 17-20
+  class Inner 18-18
+    method m 18-18
+  method constructor 19-19
+fn Int.double 22-22
+fn free 23-23
+const top 24-24

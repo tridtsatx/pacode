@@ -1,0 +1,18 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Rust, src)"
+---
+const LIMIT 1-1
+const FLAG 2-2
+struct Config 4-6
+enum Mode 8-8
+trait Run 10-12
+  method run 11-11
+impl Config 14-18
+  method new 15-17
+impl Run for Config 20-22
+  method run 21-21
+module inner 24-26
+  fn helper 25-25
+macro m 28-30
+fn top 32-34

@@ -95,10 +95,13 @@ impl ToolHost for StubHost {
         self.schedule.stop_monitor(id)
     }
 
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
+    async fn request_permission(&self, draft: PermissionDraft) -> pacode_tools::PermissionOutcome {
         let dec = *self.decision.lock().unwrap();
         self.drafts.lock().unwrap().push(draft);
-        dec
+        pacode_tools::PermissionOutcome {
+            decision: dec,
+            reason: None,
+        }
     }
 
     async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError> {

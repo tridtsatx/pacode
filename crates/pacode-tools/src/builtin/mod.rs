@@ -6,8 +6,9 @@
 //! - model-visible output is capped to `ctx.output_cap_chars` with
 //!   `pacode_types::truncate_head_tail`; when a result is withheld for size the tool
 //!   returns an error result naming the size and the `accept_large_output` flag;
-//! - paths are resolved with `ctx.resolve`; symlinks are followed; writes outside
-//!   `ctx.cwd` require permission even in Auto mode (spec §6.3 "writes stay inside cwd").
+//! - paths are resolved with `ctx.resolve`; the shared walk does not follow
+//!   symlinks; writes outside `ctx.cwd` require permission even in Auto mode
+//!   (spec §6.3 "writes stay inside cwd").
 
 pub mod agent;
 pub mod ask_question;
@@ -28,6 +29,7 @@ pub mod read;
 pub mod report_status;
 pub mod schedule;
 pub mod skill;
+pub mod symbols;
 pub mod webfetch;
 pub mod websearch;
 pub mod write;
@@ -56,6 +58,7 @@ pub fn builtin_tools(web: &WebConfig) -> ToolRegistry {
         .with(Arc::new(grep::GrepTool))
         .with(Arc::new(glob::GlobTool))
         .with(Arc::new(ls::LsTool))
+        .with(Arc::new(symbols::SymbolsTool))
         .with(Arc::new(plan::PlanTool))
         .with(Arc::new(agent::AgentTool))
         .with(Arc::new(webfetch::WebFetchTool))

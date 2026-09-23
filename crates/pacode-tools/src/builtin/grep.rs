@@ -32,7 +32,9 @@ impl Tool for GrepTool {
 
     fn description(&self) -> &str {
         "Search file contents with a regular expression (Rust regex syntax), \
-         respecting .gitignore. Returns `path:line:text` lines."
+         respecting .gitignore. Returns `path:line:text` lines; hits stop at \
+         `max_results`, so narrow broad searches with `path`/`glob`. `glob` \
+         finds files by name; `symbols` maps functions/classes."
     }
 
     fn schema(&self) -> Value {

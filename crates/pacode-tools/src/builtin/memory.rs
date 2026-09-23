@@ -206,7 +206,10 @@ impl Tool for MemoryReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read persistent memory files."
+        "Read persistent memory. Without `scope` returns both stores: project \
+         (<cwd>/.pacode/memory.md) and global (~/.config/pacode/memory.md). \
+         Read at the start of an unfamiliar task; store entries with \
+         `memory_write`."
     }
 
     fn schema(&self) -> Value {

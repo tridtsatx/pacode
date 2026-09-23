@@ -15,7 +15,6 @@ use super::bash::{BashInput, run_authorized};
 use super::helpers::{cap_output, parse_input, preview_body};
 use crate::host::PermissionDraft;
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
-use pacode_types::PermissionDecision;
 
 pub const NAME: &str = "batch";
 
@@ -24,7 +23,7 @@ const MAX_OPS: usize = 8;
 
 /// Read-only tools an op may invoke. `bash` is further restricted to commands
 /// passing `pacode_risk::is_read_only` (the same check Plan mode applies).
-const ALLOWED_OPS: &[&str] = &["read", "grep", "glob", "ls", "bash"];
+const ALLOWED_OPS: &[&str] = &["read", "grep", "glob", "ls", "symbols", "bash"];
 
 pub struct BatchTool;
 
@@ -335,10 +334,11 @@ async fn ask_batch_permission(ops: &[PreparedOp], ctx: &ToolCtx) -> Result<(), T
         max_risk,
     )
     .with_tool(NAME, ToolKind::Exec);
-    match ctx.host.request_permission(draft).await {
-        PermissionDecision::AllowOnce | PermissionDecision::AllowSession => Ok(()),
-        PermissionDecision::Deny => Err(ToolError::Denied("user denied the batch".to_string())),
-    }
+    ctx.host
+        .request_permission(draft)
+        .await
+        .into_result("user denied the batch")
+        .map(|_| ())
 }
 
 async fn run_op(op: PreparedOp, ctx: &ToolCtx, per_op_cap: usize) -> OpResult {

@@ -34,7 +34,7 @@ impl Tool for ReportStatusTool {
             "type": "object",
             "required": ["text"],
             "properties": {
-                "text": {"type": "string", "description": "Brief status, max ~500 chars."}
+                "text": {"type": "string", "description": "Brief status, capped at 1000 chars."}
             }
         })
     }

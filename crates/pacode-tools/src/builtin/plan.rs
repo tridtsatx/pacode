@@ -41,6 +41,44 @@ fn parse_plan_status(s: &str) -> Result<PlanStatus, ToolError> {
     }
 }
 
+/// Apply one `update` to `plan`: set the item's status (`done` clears progress)
+/// and/or progress. Activating an item demotes every other `active` item back
+/// to `pending` — the description promises exactly one `active` at a time.
+fn apply_update(
+    plan: &mut Plan,
+    item_id: &str,
+    status: Option<&str>,
+    progress: Option<u8>,
+) -> Result<(), ToolError> {
+    let idx = plan
+        .items
+        .iter()
+        .position(|i| i.id == item_id)
+        .ok_or_else(|| ToolError::invalid(format!("plan item not found: {item_id}")))?;
+    let item = &mut plan.items[idx];
+
+    if let Some(status_str) = status {
+        let new_status = parse_plan_status(status_str)?;
+        item.status = new_status;
+        if new_status == PlanStatus::Done {
+            item.progress = None;
+        }
+    }
+    if let Some(p) = progress.filter(|_| item.status != PlanStatus::Done) {
+        item.progress = Some(p);
+    }
+
+    if item.status == PlanStatus::Active {
+        for (i, other) in plan.items.iter_mut().enumerate() {
+            if i != idx && other.status == PlanStatus::Active {
+                other.status = PlanStatus::Pending;
+                other.progress = None;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn render_plan(plan: &Plan) -> String {
     if plan.items.is_empty() {
         return "No plan set.".to_string();
@@ -109,8 +147,9 @@ impl Tool for PlanTool {
     }
 
     /// `set`: build `Plan{version: old+1, items}` assigning ids `p1..pN` when missing;
-    /// `update`: modify the item (unknown id → InvalidInput); `done` clears progress;
-    /// `get`: render the plan. Output = rendered plan (`[x]`/`[*] 60%`/`[ ]` lines).
+    /// `update`: [`apply_update`] (unknown id → InvalidInput; `done` clears progress;
+    /// a new `active` demotes the previous one); `get`: render the plan.
+    /// Output = rendered plan (`[x]`/`[*] 60%`/`[ ]` lines).
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _accept_large_output) = parse_input::<PlanInput>(input)?;
         match args.action.as_str() {
@@ -153,22 +192,7 @@ impl Tool for PlanTool {
                     .item_id
                     .ok_or_else(|| ToolError::invalid("item_id is required for update"))?;
                 let mut plan = ctx.host.plan();
-                let item = plan
-                    .items
-                    .iter_mut()
-                    .find(|i| i.id == item_id)
-                    .ok_or_else(|| ToolError::invalid(format!("plan item not found: {item_id}")))?;
-
-                if let Some(status_str) = args.status.as_deref() {
-                    let new_status = parse_plan_status(status_str)?;
-                    item.status = new_status;
-                    if new_status == PlanStatus::Done {
-                        item.progress = None;
-                    }
-                }
-                if let Some(p) = args.progress.filter(|_| item.status != PlanStatus::Done) {
-                    item.progress = Some(p);
-                }
+                apply_update(&mut plan, &item_id, args.status.as_deref(), args.progress)?;
 
                 plan.version += 1;
                 ctx.host.set_plan(plan.clone());
@@ -190,3 +214,7 @@ impl Tool for PlanTool {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "plan_tests.rs"]
+mod plan_tests;

@@ -102,8 +102,8 @@ impl ToolHost for DummyHost {
         self.schedule.stop_monitor(id)
     }
 
-    async fn request_permission(&self, _draft: PermissionDraft) -> PermissionDecision {
-        PermissionDecision::AllowOnce
+    async fn request_permission(&self, _draft: PermissionDraft) -> crate::PermissionOutcome {
+        PermissionDecision::AllowOnce.into()
     }
     async fn spawn_task(&self, _spec: TaskSpec) -> Result<TaskId, ToolError> {
         Err(ToolError::failed("unused"))

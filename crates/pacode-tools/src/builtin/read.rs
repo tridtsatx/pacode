@@ -29,8 +29,8 @@ impl Tool for ReadTool {
 
     fn description(&self) -> &str {
         "Read a file. Returns lines prefixed with their 1-based number (`   12\\tcode`). \
-         Use offset/limit for large files; output above the cap is cut head+tail and the \
-         full size is reported. Binary files are refused."
+         Use offset/limit for large files; output above the cap is cut head+tail with a \
+         marker reporting the dropped size. Binary files are refused."
     }
 
     fn schema(&self) -> Value {
@@ -50,9 +50,11 @@ impl Tool for ReadTool {
     }
 
     /// Reads the file (tokio::fs), rejects files with a NUL byte in the first 8 KiB,
-    /// applies offset/limit, formats `{:>6}\t{line}`, caps to `ctx.output_cap_chars`
-    /// (unless `accept_large_output`), title `Read <path>`, preview = the
-    /// numbered lines (bounded) so the transcript cell can show and expand them.
+    /// applies offset/limit, formats `{:>6}\t{line}`, appends a `— N more lines;
+    /// read with offset=` footer when `limit` cut the listing short, caps to
+    /// `ctx.output_cap_chars` (unless `accept_large_output`), title `Read
+    /// <path>`, preview = the numbered lines (bounded) so the transcript cell
+    /// can show and expand them.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<ReadInput>(input)?;
         if args.path.is_empty() {
@@ -74,13 +76,26 @@ impl Tool for ReadTool {
         let limit = args.limit.unwrap_or(2000);
 
         let mut lines_out = Vec::new();
+        let mut total_lines = 0usize;
         for (line_num, line) in (1..).zip(text.lines()) {
+            total_lines = line_num;
             if line_num >= offset && lines_out.len() < limit {
                 lines_out.push(format!("{line_num:>6}\t{line}"));
             }
         }
 
-        let raw = lines_out.join("\n");
+        let mut raw = lines_out.join("\n");
+        // When `limit` cut the listing short, a footer names the remainder and
+        // the `offset` that continues it, so the model can page on its own. The
+        // char cap needs no hint — `cap_output` already reports its own cut.
+        let next_offset = offset + lines_out.len();
+        let remaining = total_lines.saturating_sub(next_offset.saturating_sub(1));
+        if remaining > 0 {
+            let noun = if remaining == 1 { "line" } else { "lines" };
+            raw.push_str(&format!(
+                "\n— {remaining} more {noun}; read with offset={next_offset}"
+            ));
+        }
         let content = cap_output(&raw, accept_large_output, ctx.output_cap_chars);
         let preview = preview_body(&content);
         let title = format!("Read {}", args.path);
@@ -90,3 +105,7 @@ impl Tool for ReadTool {
             .with_preview(preview))
     }
 }
+
+#[cfg(test)]
+#[path = "read_tests.rs"]
+mod read_tests;

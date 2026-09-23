@@ -1,0 +1,16 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::JavaScript, src)"
+---
+const C 1-1
+fn helper 2-2
+fn legacy 3-3
+fn decl 5-5
+class Klass 7-12
+  method #priv 8-8
+  method constructor 9-9
+  method method 10-10
+  method value 11-11
+fn main 14-14
+export { decl, Klass } 15-15
+fn e 16-16

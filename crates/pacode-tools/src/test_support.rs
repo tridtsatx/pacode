@@ -115,12 +115,14 @@ impl ScheduleStub {
 /// might reach for is refused loudly rather than pretending to work.
 ///
 /// Permission drafts are recorded in `drafts` and answered with `decision`
-/// (default `AllowOnce`). When `tasks` is set, task calls delegate to a real
-/// `TaskManager`, so tests can run actual commands.
+/// (default `AllowOnce`) plus the optional deny `reason`. When `tasks` is set,
+/// task calls delegate to a real `TaskManager`, so tests can run actual
+/// commands.
 pub struct StubToolHost {
     pub schedule: ScheduleStub,
     pub drafts: Mutex<Vec<PermissionDraft>>,
     pub decision: Mutex<PermissionDecision>,
+    pub reason: Mutex<Option<String>>,
     pub tasks: Option<Arc<pacode_exec::TaskManager>>,
 }
 
@@ -130,6 +132,7 @@ impl Default for StubToolHost {
             schedule: ScheduleStub::default(),
             drafts: Mutex::new(Vec::new()),
             decision: Mutex::new(PermissionDecision::AllowOnce),
+            reason: Mutex::new(None),
             tasks: None,
         }
     }
@@ -137,12 +140,19 @@ impl Default for StubToolHost {
 
 #[async_trait]
 impl ToolHost for StubToolHost {
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
+    async fn request_permission(&self, draft: PermissionDraft) -> crate::host::PermissionOutcome {
         self.drafts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(draft);
-        *self.decision.lock().unwrap_or_else(|p| p.into_inner())
+        crate::host::PermissionOutcome {
+            decision: *self.decision.lock().unwrap_or_else(|p| p.into_inner()),
+            reason: self
+                .reason
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        }
     }
 
     async fn ask_question(

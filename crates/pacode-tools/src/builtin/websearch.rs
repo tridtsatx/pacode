@@ -222,7 +222,8 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web using DuckDuckGo. Returns a numbered list of results with title, URL, and snippet."
+        "Search the web using DuckDuckGo. Returns a numbered list of results with \
+         title, URL, and snippet; open a result with `webfetch`."
     }
 
     fn schema(&self) -> Value {

@@ -18,6 +18,7 @@ pacode-risk = { workspace = true }
 pacode-render = { workspace = true }
 pacode-mcp = { workspace = true }
 pacode-plugin = { workspace = true }
+pacode-symbols = { workspace = true }
 tokio = { workspace = true, features = ["rt", "fs", "io-util", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

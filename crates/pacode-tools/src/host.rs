@@ -67,8 +67,7 @@ impl ToolCtx {
         detail: impl Into<String>,
         risk: Option<RiskLevel>,
     ) -> Result<PermissionDecision, ToolError> {
-        let decision = self
-            .host
+        self.host
             .request_permission(PermissionDraft {
                 agent: self.agent.clone(),
                 agent_name: self.agent_name.clone(),
@@ -79,10 +78,51 @@ impl ToolCtx {
                 tool_name: self.tool_name.clone(),
                 tool_kind: self.tool_kind,
             })
-            .await;
-        match decision {
-            PermissionDecision::AllowOnce | PermissionDecision::AllowSession => Ok(decision),
-            PermissionDecision::Deny => Err(ToolError::Denied("user denied the request".into())),
+            .await
+            .into_result("user denied the request")
+    }
+}
+
+/// The host's answer to a permission request. `reason` explains a `Deny` that
+/// was NOT the user's refusal: the policy gate's reason, `zdr_blocked: …`,
+/// `interrupted`, or a client-supplied note. `None` on `Deny` means the user
+/// pressed deny without a comment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PermissionOutcome {
+    pub decision: PermissionDecision,
+    pub reason: Option<String>,
+}
+
+impl PermissionOutcome {
+    /// `Ok(decision)` for `Allow*`; `Err(ToolError::Denied)` for `Deny`.
+    /// `user_denied` is the model-facing text for a bare user refusal; a
+    /// `Some` reason is quoted back verbatim and marked as an automatic deny
+    /// so the model does not retry the same call expecting a user answer.
+    pub fn into_result(self, user_denied: &str) -> Result<PermissionDecision, ToolError> {
+        match self.decision {
+            PermissionDecision::AllowOnce | PermissionDecision::AllowSession => Ok(self.decision),
+            PermissionDecision::Deny => {
+                let message = match self.reason {
+                    Some(reason) => {
+                        let reason = reason.trim().trim_end_matches('.');
+                        format!(
+                            "{reason}. This call was denied automatically, not refused by the \
+                             user — do not retry it; choose a different approach or ask the user."
+                        )
+                    }
+                    None => user_denied.to_string(),
+                };
+                Err(ToolError::Denied(message))
+            }
+        }
+    }
+}
+
+impl From<PermissionDecision> for PermissionOutcome {
+    fn from(decision: PermissionDecision) -> Self {
+        Self {
+            decision,
+            reason: None,
         }
     }
 }
@@ -433,8 +473,10 @@ fn strip_quotes(s: &str) -> &str {
 #[async_trait]
 pub trait ToolHost: Send + Sync {
     /// Ask the user (or the mode) whether the call may proceed. The host applies the
-    /// permission matrix and the `AllowSession` cache before prompting.
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision;
+    /// permission matrix and the `AllowSession` cache before prompting. The returned
+    /// [`PermissionOutcome`] carries the reason whenever a `Deny` was decided by
+    /// policy or the environment rather than by the user's refusal.
+    async fn request_permission(&self, draft: PermissionDraft) -> PermissionOutcome;
 
     /// Ask the user a question and wait for the answer. The turn blocks exactly
     /// as it does for a permission prompt; a dismissed question comes back as a

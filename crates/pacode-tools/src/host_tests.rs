@@ -1,6 +1,12 @@
-//! Agent-kind discovery tests: frontmatter parsing and `discover_agent_kinds`.
+//! Agent-kind discovery tests: frontmatter parsing and `discover_agent_kinds`,
+//! plus `require_permission`'s deny-reason wording.
+
+use std::sync::Arc;
+
+use pacode_types::PermissionDecision;
 
 use super::{AgentKindWarning, discover_agent_kinds};
+use crate::test_support::{StubToolHost, stub_ctx};
 
 fn write(dir: &std::path::Path, name: &str, content: &str) {
     std::fs::write(dir.join(name), content).unwrap();
@@ -118,4 +124,55 @@ fn missing_dir_is_not_a_warning() {
         discover_agent_kinds(&[std::path::PathBuf::from("/nonexistent-pacode-agents-dir")]);
     assert!(kinds.is_empty());
     assert!(warnings.is_empty());
+}
+
+#[tokio::test]
+async fn require_permission_allow_returns_decision() {
+    let host = Arc::new(StubToolHost::default());
+    let ctx = stub_ctx(host);
+    let decision = ctx
+        .require_permission("Bash: ls", "ls", None)
+        .await
+        .unwrap();
+    assert_eq!(decision, PermissionDecision::AllowOnce);
+}
+
+#[tokio::test]
+async fn require_permission_policy_deny_quotes_reason_and_forbids_retry() {
+    let host = Arc::new(StubToolHost::default());
+    *host.decision.lock().unwrap() = PermissionDecision::Deny;
+    *host.reason.lock().unwrap() =
+        Some("catastrophic operations are denied by policy.".to_string());
+    let ctx = stub_ctx(host);
+
+    let err = ctx
+        .require_permission("Bash: rm -rf ~", "rm -rf ~", None)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("catastrophic operations are denied by policy"),
+        "policy reason must reach the model: {msg}"
+    );
+    assert!(
+        msg.contains("do not retry"),
+        "policy denials must be marked non-retryable: {msg}"
+    );
+    assert!(
+        !msg.contains("user denied"),
+        "a policy deny must not read as a user refusal: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn require_permission_user_deny_keeps_refusal_wording() {
+    let host = Arc::new(StubToolHost::default());
+    *host.decision.lock().unwrap() = PermissionDecision::Deny;
+    let ctx = stub_ctx(host);
+
+    let err = ctx
+        .require_permission("Bash: ls", "ls", None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "denied: user denied the request");
 }

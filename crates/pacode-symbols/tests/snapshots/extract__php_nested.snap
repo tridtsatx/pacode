@@ -1,0 +1,16 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Php, src)"
+---
+module App\Core 2-2
+const LIMIT 4-4
+interface Repo 6-8
+  method save 7-7
+trait Log 10-12
+  method log 11-11
+enum Status 14-16
+  const Ok 15-15
+class Service 18-22
+  method __construct 20-20
+  method save 21-21
+fn free_helper 24-24

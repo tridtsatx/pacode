@@ -43,8 +43,9 @@ impl Tool for AskQuestionTool {
         "Ask the user to choose between options and wait for the answer. Use it for \
          a decision that is genuinely theirs — an architectural trade-off, an \
          ambiguity you cannot resolve from the code — not for something you can \
-         decide yourself. Mark exactly one option as recommended. The user can also \
-         type an answer of their own or dismiss the question."
+         decide yourself. Mark one option as recommended; marking several is \
+         refused. The user can also type an answer of their own or dismiss the \
+         question."
     }
 
     fn schema(&self) -> Value {
@@ -79,6 +80,16 @@ impl Tool for AskQuestionTool {
 
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _): (AskInput, bool) = parse_input(input)?;
+
+        // Refused here, before the question reaches the host: the picker can only
+        // highlight one recommendation, and a correctable input error is cheaper
+        // than a question that fails downstream.
+        let recommended = args.options.iter().filter(|o| o.recommended).count();
+        if recommended > 1 {
+            return Err(ToolError::invalid(format!(
+                "at most one option may be marked as recommended, {recommended} were"
+            )));
+        }
 
         let options: Vec<QuestionOption> = args
             .options

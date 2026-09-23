@@ -1,0 +1,15 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::C, src)"
+---
+const MAX 1-1
+macro SQR 2-2
+struct Point 4-6
+struct Data 8-8
+enum Color 10-10
+type Point 12-12
+type size_t2 13-13
+fn dup 15-15
+fn proto 16-16
+fn add 18-20
+fn helper 22-24

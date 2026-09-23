@@ -65,6 +65,30 @@ async fn a_question_the_picker_could_not_present_is_refused() {
 }
 
 #[tokio::test]
+async fn several_recommended_options_are_refused_before_asking() {
+    let ctx = stub_ctx(std::sync::Arc::new(StubToolHost::default()));
+
+    let err = AskQuestionTool
+        .call(
+            json!({
+                "question": "Which storage?",
+                "options": [
+                    {"label": "a", "description": "x", "recommended": true},
+                    {"label": "b", "description": "y", "recommended": true}
+                ],
+                "intent": "ask"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("two recommendations are not a recommendation");
+    assert!(
+        format!("{err}").contains("at most one option may be marked as recommended"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn a_dismissed_question_reads_as_dismissed_not_as_a_choice() {
     let answer = pacode_types::QuestionAnswer::cancelled();
     let text = answer_text(&answer, &["a".to_string()], "Which one?");
