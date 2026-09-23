@@ -127,11 +127,22 @@ impl ConnectClient {
         let req_builder = self.prepare_request(&url, "application/connect+proto");
 
         let framed_body = encode_connect_frame(0x00, body);
-        let response = req_builder
-            .body(framed_body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let send = req_builder.body(framed_body).send();
+        // Bound the wait for response headers with the same idle budget the body
+        // phase uses; `None` leaves the wait unbounded (idle timeout disabled).
+        let response = match idle_timeout {
+            Some((wait, secs)) => match tokio::time::timeout(wait, send).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(err)) => return Err(ProviderError::Transport(err.to_string())),
+                Err(_) => {
+                    log::warn!("connect request: no response headers within {secs}s");
+                    return Err(ProviderError::IdleTimeout(secs));
+                }
+            },
+            None => send
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?,
+        };
 
         let status = response.status();
         if !status.is_success() {

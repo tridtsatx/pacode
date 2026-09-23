@@ -168,8 +168,12 @@ impl RailState {
             .filter(|a| a.status.is_live() && !a.id.is_main())
     }
 
+    /// Live non-main agents (same set `live_agents` yields): a subagent is
+    /// live from spawn — `Idle` included, it sits there until `TurnStarted` —
+    /// so its rail duration keeps ticking. The main agent's own liveness is
+    /// gated by `turn_active` at the call sites, never by this predicate.
     pub fn has_live_agents(&self) -> bool {
-        self.agents.iter().any(|a| a.status.is_active())
+        self.live_agents().next().is_some()
     }
 
     /// Tasks shown in the BACKGROUND zone: backgrounded ones, running or finished and

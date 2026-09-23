@@ -1269,9 +1269,13 @@ impl AppState {
         }
     }
 
-    /// Whether a periodic 1 s tick is needed (live agents or tasks: durations change).
+    /// Whether a periodic 1 s tick is needed (live agents or tasks: durations
+    /// change, and the SESSION-stats debounce has to fire on a quiet screen).
     pub fn needs_second_tick(&self) -> bool {
-        self.turn_active || self.rail.has_live_agents() || self.rail.has_running_tasks()
+        self.turn_active
+            || self.rail.has_live_agents()
+            || self.rail.has_running_tasks()
+            || self.rail.idle_debounce_pending()
     }
 
     /// Whether the animation tick is needed: the turn running, an active panel

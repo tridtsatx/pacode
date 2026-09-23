@@ -160,6 +160,24 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
     // still wiring up the token, and a fresh token would outrun the stop. Only
     // `Session::continue_agent` restarts one — it clears the request first.
     if !agent.id().is_main() && agent.stop_requested() {
+        // The flag can outlive a status flap (`continue_agent` stamping `Idle`
+        // while a `stop_agent` is in flight, or a spawn-time stop): a live
+        // status with no turn behind it is a zombie card that keeps the
+        // session busy and the rail blinking forever, so force the terminal
+        // landing `Session::stop_agent` performs.
+        if agent.status().is_live() {
+            agent.set_status(AgentStatus::Stopped, None);
+            let info = agent.info();
+            session.events.emit(Event::AgentUpdated(info.clone()));
+            let session = session.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                let _ = session
+                    .store
+                    .upsert_agent(&session.id, &info, agent.prompt().as_deref())
+                    .await;
+            });
+        }
         return;
     }
 

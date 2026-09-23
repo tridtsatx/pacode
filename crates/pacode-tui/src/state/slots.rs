@@ -33,11 +33,18 @@ pub struct SessionSlot {
 
 /// Status seeded from an attach snapshot: waiting input wins over a running
 /// turn; anything else is `Idle` — `Done` never survives an attach since the
-/// session is on screen now.
+/// session is on screen now. A live-but-idle subagent (spawned, waiting on
+/// `TurnStarted`) still reads `Working`; the main agent is covered by
+/// `snapshot.turn_active` alone.
 pub fn status_from_snapshot(snapshot: &SessionSnapshot) -> SessionStatusKind {
     if !snapshot.pending_permissions.is_empty() || !snapshot.pending_questions.is_empty() {
         SessionStatusKind::NeedsInput
-    } else if snapshot.turn_active || snapshot.agents.iter().any(|a| a.status.is_active()) {
+    } else if snapshot.turn_active
+        || snapshot
+            .agents
+            .iter()
+            .any(|a| a.status.is_live() && !a.id.is_main())
+    {
         SessionStatusKind::Working
     } else {
         SessionStatusKind::Idle

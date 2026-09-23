@@ -632,6 +632,20 @@ fn leaving_slot_seeds_its_live_status() {
         state.slots[0].as_ref().unwrap().status,
         SessionStatusKind::NeedsInput
     );
+
+    // A live-but-idle subagent -> Working too: between spawn and
+    // `TurnStarted` the subagent is work in flight, not a quiet session.
+    let mut state = attached_state();
+    state.apply_event(
+        1,
+        Event::AgentAdded(sub_agent("sub_1", AgentStatus::Idle)),
+        Instant::now(),
+    );
+    state.leave_active_slot();
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::Working
+    );
 }
 
 #[test]
@@ -666,6 +680,28 @@ fn attach_snapshot_reseeds_the_slot_status() {
     assert_eq!(
         state.slots[0].as_ref().unwrap().status,
         SessionStatusKind::NeedsInput
+    );
+
+    // A live-but-idle subagent still seeds Working — the gap between spawn
+    // and `TurnStarted` is work in flight.
+    let mut snap = snapshot(8, PathBuf::from("/tmp"));
+    snap.agents = vec![sub_agent("sub_1", AgentStatus::Idle)];
+    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::Working
+    );
+
+    // The main agent's own row does not count — `turn_active` covers it.
+    let mut snap = snapshot(9, PathBuf::from("/tmp"));
+    let mut main = sub_agent("main", AgentStatus::Thinking);
+    main.kind = AgentKind::Main;
+    main.parent = None;
+    snap.agents = vec![main];
+    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::Idle
     );
 }
 
@@ -724,4 +760,29 @@ fn active_slot_status_tracks_asks_and_turn() {
         now,
     );
     assert_eq!(state.active_slot_status(), Kind::Working);
+}
+
+#[test]
+fn an_idle_subagent_reads_working_and_keeps_the_second_tick() {
+    use pacode_types::SessionStatusKind as Kind;
+
+    let mut state = attached_state();
+    let now = Instant::now();
+    assert_eq!(state.active_slot_status(), Kind::Idle);
+    assert!(!state.needs_second_tick());
+
+    // Between spawn and `TurnStarted` a subagent sits in `Idle` — still live:
+    // the slot reads Working and the second tick stays armed so the rail
+    // duration does not freeze.
+    state.apply_event(
+        1,
+        Event::AgentAdded(sub_agent("sub_1", AgentStatus::Idle)),
+        now,
+    );
+    assert_eq!(state.active_slot_status(), Kind::Working);
+    assert!(state.needs_second_tick());
+
+    // And it is not quiet: the session-stats debounce must not start.
+    assert!(!state.rail.update_idle(state.turn_active, now));
+    assert!(state.rail.idle_since.is_none());
 }

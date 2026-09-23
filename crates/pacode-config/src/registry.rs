@@ -172,10 +172,8 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "exec.default_timeout_secs", label: "Default Timeout Seconds", description: "Hard timeout in seconds for foreground command", section: "exec", default_value: "3600", kind: SettingKind::Integer { min: 1, max: 604800 }, apply: ApplyMode::Restart },
 
     // agents
-    SettingEntry { dotted_key: "agents.max_live", label: "Max Live Agents", description: "Maximum concurrent live subagents", section: "agents", default_value: "8", kind: SettingKind::Integer { min: 1, max: 64 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "agents.default_model", label: "Subagent Model", description: "provider/model for subagents when unspecified", section: "agents", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "agents.default_effort", label: "Subagent Effort", description: "Reasoning effort for subagents: low, medium, high, xhigh, max", section: "agents", default_value: "", kind: SettingKind::Enum { options: SUBAGENT_EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.max_turns", label: "Max Turns", description: "Maximum tool-calling turns for a subagent before stopping", section: "agents", default_value: "200", kind: SettingKind::Integer { min: 1, max: 10000 }, apply: ApplyMode::NextTurn },
 
     // daemon
     SettingEntry { dotted_key: "daemon.idle_timeout_secs", label: "Idle Timeout Seconds", description: "Seconds of inactivity before daemon shuts down (0 to disable)", section: "daemon", default_value: "600", kind: SettingKind::Integer { min: 0, max: 2592000 }, apply: ApplyMode::Restart },
@@ -326,7 +324,6 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "exec.kill_grace_secs" => Some(config.exec.kill_grace_secs.to_string()),
         "exec.max_tasks" => Some(config.exec.max_tasks.to_string()),
         "exec.default_timeout_secs" => Some(config.exec.default_timeout_secs.to_string()),
-        "agents.max_live" => Some(config.agents.max_live.to_string()),
         "agents.default_model" => Some(config.agents.default_model.clone().unwrap_or_default()),
         "agents.default_effort" => Some(
             config
@@ -335,7 +332,6 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
                 .map(|e| e.as_str().to_string())
                 .unwrap_or_default(),
         ),
-        "agents.max_turns" => Some(config.agents.max_turns.to_string()),
         "daemon.idle_timeout_secs" => Some(config.daemon.idle_timeout_secs.to_string()),
         "daemon.socket" => Some(
             config
@@ -712,11 +708,6 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 config.exec.default_timeout_secs = *n as u64;
             }
         }
-        "agents.max_live" => {
-            if let toml::Value::Integer(n) = value {
-                config.agents.max_live = *n as usize;
-            }
-        }
         "agents.default_model" => {
             if let toml::Value::String(s) = value {
                 config.agents.default_model = if s.is_empty() { None } else { Some(s.clone()) };
@@ -725,11 +716,6 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "agents.default_effort" => {
             if let toml::Value::String(s) = value {
                 config.agents.default_effort = Effort::parse(s);
-            }
-        }
-        "agents.max_turns" => {
-            if let toml::Value::Integer(n) = value {
-                config.agents.max_turns = *n as u32;
             }
         }
         "daemon.idle_timeout_secs" => {

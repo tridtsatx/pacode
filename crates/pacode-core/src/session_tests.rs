@@ -73,7 +73,6 @@ async fn setup_test_session() -> (
 
     let mut config = Config::default();
     config.provider.default = Some("mock/mock-model".to_string());
-    config.agents.max_live = 2;
 
     let paths = Paths::under(temp_dir.path());
     let mut tools = ToolRegistry::new();
@@ -164,11 +163,11 @@ async fn test_detach_with_no_turn_running_fails() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_detach_at_live_subagent_cap_fails() {
+async fn test_detach_with_live_subagents_succeeds() {
     let (core, mock, _tmp, session_id) = setup_test_session().await;
     let session = core.session(&session_id).unwrap();
 
-    // Spawn 2 subagents to reach config.agents.max_live (set to 2 in setup)
+    // Two live subagents must not block the detach: there is no live cap.
     mock.push(MockResponse::Slow {
         delay: Duration::from_millis(100),
         text: "subagent 1 working...".into(),
@@ -212,12 +211,45 @@ async fn test_detach_at_live_subagent_cap_fails() {
         .await
         .unwrap();
 
-    // Detach main turn must fail because live_count (2) >= max_live (2)
-    let err = session.detach_main_turn().await.unwrap_err();
-    assert!(
-        err.to_string().contains("maximum live subagents"),
-        "expected maximum live subagents error, got: {err}"
-    );
+    // Detach succeeds regardless of how many subagents are live.
+    let detached_id = session.detach_main_turn().await.unwrap();
+    assert!(!detached_id.is_main());
+}
+
+/// There is no concurrency cap on subagents: spawning more than the old
+/// `agents.max_live` default (8) must succeed for every spawn.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_spawn_agent_has_no_live_cap() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+
+    const SPAWNS: usize = 10;
+    for i in 0..SPAWNS {
+        mock.push(MockResponse::Slow {
+            delay: Duration::from_millis(300),
+            text: format!("subagent {i} working..."),
+        });
+    }
+
+    let mut ids = Vec::new();
+    for i in 0..SPAWNS {
+        let id = session
+            .spawn_agent(pacode_tools::AgentSpec {
+                name: Some(format!("sub{i}")),
+                prompt: format!("work {i}"),
+                tools: None,
+                fork: false,
+                model: None,
+                effort: None,
+            })
+            .await;
+        assert!(id.is_ok(), "spawn {i} failed: {:?}", id.err());
+        ids.push(id.unwrap());
+    }
+
+    assert_eq!(ids.len(), SPAWNS);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), SPAWNS, "spawned agent ids must be unique");
 }
 
 #[tokio::test(flavor = "multi_thread")]

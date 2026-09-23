@@ -73,6 +73,11 @@ impl StreamOpener {
 
     async fn post(&self) -> Result<reqwest::Response, ProviderError> {
         let mut attempt = 0;
+        // Bound the wait for response headers with the same "nothing heard yet"
+        // budget the SSE body phase uses; `stream_idle_secs == 0` leaves it unbounded.
+        let timeout_secs = self.stream_idle_secs * self.effort.idle_timeout_factor();
+        let header_wait =
+            (self.stream_idle_secs > 0).then(|| Duration::from_secs(timeout_secs.max(1)));
         loop {
             let mut req_builder = self
                 .client
@@ -90,7 +95,23 @@ impl StreamOpener {
                 req_builder = req_builder.header(k, v);
             }
 
-            match req_builder.send().await {
+            let send_result = match header_wait {
+                Some(wait) => match tokio::time::timeout(wait, req_builder.send()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        log::warn!("no response headers within {timeout_secs}s");
+                        if attempt < self.max_retries {
+                            sleep_backoff(attempt, self.backoff_base).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(ProviderError::IdleTimeout(timeout_secs));
+                    }
+                },
+                None => req_builder.send().await,
+            };
+
+            match send_result {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {

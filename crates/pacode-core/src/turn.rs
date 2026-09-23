@@ -20,7 +20,6 @@
 //!   // point D
 //!   history.extend(render_injections(injections.drain()))
 //!   if needs_compaction → compaction::compact
-//!   subagent: turns += 1; stop at agents.max_turns with a notice
 //! }
 //! ```
 
@@ -32,10 +31,7 @@ pub use lifecycle::start_turn;
 
 use std::sync::Arc;
 
-use pacode_types::{
-    AgentStatus, ContentBlock, Event, Message, Role, TranscriptItem, TranscriptKind, TurnId,
-    TurnStop, Usage,
-};
+use pacode_types::{AgentStatus, ContentBlock, Event, Message, Role, TurnId, TurnStop, Usage};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
@@ -340,36 +336,6 @@ pub async fn run_turn(
         let threshold = session.config.context.compaction_threshold;
         if crate::compaction::needs_compaction(last_input_tokens, context_window, threshold) {
             let _ = crate::compaction::compact(&session, &agent).await;
-        }
-
-        if !agent.id().is_main() {
-            let mut turns_guard = agent.turns.lock().unwrap_or_else(|p| p.into_inner());
-            *turns_guard += 1;
-            if *turns_guard >= session.config.agents.max_turns {
-                let notice_item = TranscriptItem {
-                    seq: agent
-                        .transcript
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .next_seq(),
-                    agent: agent.id(),
-                    ts_ms: pacode_types::now_ms(),
-                    kind: TranscriptKind::Notice {
-                        level: pacode_types::ToastLevel::Warn,
-                        text: format!(
-                            "Subagent stopped: reached maximum turns limit ({})",
-                            session.config.agents.max_turns
-                        ),
-                    },
-                };
-                agent
-                    .transcript
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .upsert(notice_item.clone());
-                session.events.emit(Event::ItemAdded(notice_item));
-                break;
-            }
         }
     }
 

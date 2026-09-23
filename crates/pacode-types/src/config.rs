@@ -462,26 +462,12 @@ impl Default for ExecConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsConfig {
-    pub max_live: usize,
     /// `provider/model` for subagents when the spawn call does not name one.
     pub default_model: Option<String>,
     pub default_effort: Option<Effort>,
-    /// Max tool-calling turns for one subagent before it is stopped.
-    pub max_turns: u32,
-}
-
-impl Default for AgentsConfig {
-    fn default() -> Self {
-        Self {
-            max_live: 8,
-            default_model: None,
-            default_effort: None,
-            max_turns: 200,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

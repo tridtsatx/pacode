@@ -529,10 +529,6 @@ fn test_live_restart_classification_spot_checks() {
         ApplyMode::NextTurn
     );
     assert_eq!(
-        find_entry("agents.max_live").unwrap().apply,
-        ApplyMode::NextTurn
-    );
-    assert_eq!(
         find_entry("permissions.default_mode").unwrap().apply,
         ApplyMode::NextTurn
     );

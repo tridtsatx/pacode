@@ -37,9 +37,6 @@ effort = true
 yield_after_secs = 10
 stall_secs = 120
 
-[agents]
-max_live = 8
-
 [daemon]
 idle_timeout_secs = 600
 
@@ -93,8 +90,6 @@ fn parse_spec_example() {
     assert_eq!(cfg.exec.yield_after_secs, 10);
     assert_eq!(cfg.exec.stall_secs, 120);
 
-    assert_eq!(cfg.agents.max_live, 8);
-
     assert_eq!(cfg.daemon.idle_timeout_secs, 600);
 
     assert!((cfg.context.compaction_threshold - 0.85).abs() < 1e-6);
@@ -139,9 +134,6 @@ fn defaults_from_empty_text() {
     assert_eq!(cfg.exec.kill_grace_secs, 5);
     assert_eq!(cfg.exec.max_tasks, 64);
     assert_eq!(cfg.exec.default_timeout_secs, 3600);
-
-    assert_eq!(cfg.agents.max_live, 8);
-    assert_eq!(cfg.agents.max_turns, 200);
 
     assert_eq!(cfg.daemon.idle_timeout_secs, 600);
 

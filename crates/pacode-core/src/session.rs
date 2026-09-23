@@ -588,24 +588,8 @@ impl Session {
         }
     }
 
-    /// Spawn a subagent (depth 1, `agents.max_live` cap) and start its turn.
+    /// Spawn a subagent (depth 1, no concurrency cap) and start its turn.
     pub async fn spawn_agent(self: &Arc<Self>, spec: AgentSpec) -> Result<AgentId, CoreError> {
-        let live_count = self
-            .agents
-            .read()
-            .map(|a| {
-                a.values()
-                    .filter(|agent| agent.status().is_live() && !agent.id().is_main())
-                    .count()
-            })
-            .unwrap_or(0);
-        if live_count >= self.config.agents.max_live {
-            return Err(CoreError::Invalid(format!(
-                "maximum live subagents ({}) reached",
-                self.config.agents.max_live
-            )));
-        }
-
         let id = AgentId::generate();
         let name = spec.name.unwrap_or_else(|| {
             let count = self.agents.read().unwrap_or_else(|p| p.into_inner()).len();
@@ -816,26 +800,6 @@ impl Session {
             "detaching running turn on main agent in session {}",
             self.id
         );
-        let live_count = self
-            .agents
-            .read()
-            .map(|a| {
-                a.values()
-                    .filter(|agent| agent.status().is_live() && !agent.id().is_main())
-                    .count()
-            })
-            .unwrap_or(0);
-        if live_count >= self.config.agents.max_live {
-            log::warn!(
-                "failed to detach main turn: maximum live subagents ({}) reached",
-                self.config.agents.max_live
-            );
-            return Err(CoreError::Invalid(format!(
-                "maximum live subagents ({}) reached",
-                self.config.agents.max_live
-            )));
-        }
-
         let main = self
             .main_agent()
             .ok_or_else(|| CoreError::AgentNotFound(AgentId::main()))?;

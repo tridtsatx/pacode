@@ -44,6 +44,14 @@ async fn write_sse(socket: &mut TcpStream, body: &str) {
 }
 
 fn provider_for(port: u16, max_retries: u32) -> OpenAiCompat {
+    provider_with_idle_secs(
+        port,
+        max_retries,
+        ProviderDefaults::default().stream_idle_secs,
+    )
+}
+
+fn provider_with_idle_secs(port: u16, max_retries: u32, stream_idle_secs: u64) -> OpenAiCompat {
     let cfg = ProviderConfig {
         kind: Default::default(),
         base_url: format!("http://127.0.0.1:{port}"),
@@ -60,6 +68,7 @@ fn provider_for(port: u16, max_retries: u32) -> OpenAiCompat {
     };
     let defaults = ProviderDefaults {
         max_retries,
+        stream_idle_secs,
         ..ProviderDefaults::default()
     };
     OpenAiCompat::new("test-prov", cfg, defaults, None, BTreeMap::new())
@@ -194,5 +203,31 @@ async fn test_error_after_content_is_not_retried() {
         1,
         "the request must not be reopened once content was emitted"
     );
+    server.abort();
+}
+
+/// A server that accepts the connection and reads the request but never writes
+/// response headers must not hang `complete` forever: the header wait is bounded
+/// by the same idle budget as the SSE body phase.
+#[tokio::test]
+async fn test_response_headers_timeout_surfaces_idle_timeout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        read_request(&mut socket).await;
+        // Never answer; keep the socket open so send() cannot resolve or fail.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let provider = provider_with_idle_secs(port, 0, 1);
+    match provider.complete(request()).await {
+        Err(ProviderError::IdleTimeout(secs)) => assert_eq!(secs, 1),
+        Err(other) => panic!("expected IdleTimeout, got {other:?}"),
+        Ok(_) => panic!("header wait must time out instead of opening a stream"),
+    }
     server.abort();
 }

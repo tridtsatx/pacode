@@ -77,8 +77,6 @@ pub struct Agent {
     pub transcript: Mutex<TranscriptState>,
     /// The prompt a subagent was spawned with (persisted).
     pub prompt: RwLock<Option<String>>,
-    /// Turns run so far (subagent cap `agents.max_turns`).
-    pub turns: Mutex<u32>,
     /// History snapshot as it stood before the current turn began (for turn detach).
     pub history_before_turn: Mutex<Option<History>>,
     /// Turn-scoped prompt cache (invalidation point: turn start).
@@ -105,7 +103,6 @@ impl Agent {
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             transcript: Mutex::new(TranscriptState::new(history_page as usize * 2)),
             prompt: RwLock::new(prompt),
-            turns: Mutex::new(0),
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
         }
@@ -130,7 +127,6 @@ impl Agent {
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             transcript: Mutex::new(transcript),
             prompt: RwLock::new(prompt),
-            turns: Mutex::new(0),
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
         }
