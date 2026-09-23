@@ -127,6 +127,7 @@ impl ToolHost for SessionHost {
                 self.session
                     .events
                     .emit(pacode_types::Event::PermissionRequested(perm_req.clone()));
+                self.session.emit_session_status();
                 crate::hooks::notification(
                     &self.session,
                     &draft.agent,
@@ -309,6 +310,7 @@ impl ToolHost for SessionHost {
         self.session
             .events
             .emit(pacode_types::Event::QuestionAsked(question.clone()));
+        self.session.emit_session_status();
         crate::hooks::notification(&self.session, &question.agent, None);
 
         // A client that goes away, or an agent that is stopped, drops the sender:

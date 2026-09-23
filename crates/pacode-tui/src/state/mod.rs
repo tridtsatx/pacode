@@ -733,13 +733,7 @@ impl AppState {
                 // cascade re-arms here: a re-attach replays it.
                 self.started_at = now;
                 self.meta = Some(snapshot.meta.clone());
-                self.record_slot(
-                    self.active_slot,
-                    &snapshot.meta,
-                    &snapshot.usage,
-                    snapshot.agents.len(),
-                    snapshot.tasks.len(),
-                );
+                self.record_slot(self.active_slot, &snapshot);
                 self.transcript
                     .reset(snapshot.transcript.clone(), snapshot.has_more_history);
                 let header = crate::state::transcript::HeaderInfo {
@@ -814,13 +808,24 @@ impl AppState {
                 // subagent "live" in the rail forever. Arm ONE debounced
                 // `GetSnapshot` resync; skipped pre-attach, where the incoming
                 // snapshot is authoritative anyway.
-                if let Some(last) = self.last_event_seq
-                    && seq != last.wrapping_add(1)
-                    && self.meta.is_some()
-                {
-                    self.resync_want = true;
+                //
+                // `SessionStatus` and `LoginProgress` ride the daemon-wide
+                // stream instead — their `seq` is the GLOBAL seq space, so
+                // folding them into the per-session tracker would forge a gap
+                // and resync on every other session's turn boundary.
+                let session_stream = !matches!(
+                    event,
+                    Event::SessionStatus { .. } | Event::LoginProgress { .. }
+                );
+                if session_stream {
+                    if let Some(last) = self.last_event_seq
+                        && seq != last.wrapping_add(1)
+                        && self.meta.is_some()
+                    {
+                        self.resync_want = true;
+                    }
+                    self.last_event_seq = Some(seq);
                 }
-                self.last_event_seq = Some(seq);
                 self.observe_background_completion(&event);
                 self.apply_event(seq, event, now);
                 self.dirty = true;
@@ -1281,12 +1286,18 @@ impl AppState {
         }
         // A permission request pulses until it is answered; waiting on the
         // reader is activity, so the tick is allowed.
-        let permission_pending = self
-            .transcript
-            .cells
-            .iter()
-            .any(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Permission(_))));
-        if permission_pending {
+        if self.has_pending_permission() {
+            return true;
+        }
+        // A `NeedsInput` slot badge blinks while it waits — armed only while
+        // one exists (an unanswered question is the active slot's own badge).
+        if !self.questions.is_empty()
+            || self
+                .slots
+                .iter()
+                .flatten()
+                .any(|s| s.status == pacode_types::SessionStatusKind::NeedsInput)
+        {
             return true;
         }
         if matches!(self.connection, Connection::Reconnecting { .. }) {
@@ -1339,28 +1350,52 @@ impl AppState {
         self.transcript.has_more_history && !self.transcript.loading_history
     }
 
-    pub fn record_slot(
-        &mut self,
-        index: usize,
-        meta: &SessionMeta,
-        usage: &pacode_types::state::UsageTotals,
-        agents_count: usize,
-        tasks_count: usize,
-    ) {
+    /// Refresh the slot's retained summary from an attach snapshot. The status
+    /// is reseeded too: an attach means the session is on screen, so a stale
+    /// `Done` clears and live pending/turn state wins.
+    pub fn record_slot(&mut self, index: usize, snapshot: &pacode_types::SessionSnapshot) {
         if index < NUM_SLOTS {
             self.slots[index] = Some(SessionSlot {
-                id: meta.id.clone(),
-                title: meta.title(),
-                turns: usage.turns,
-                context_tokens: usage.context_tokens,
-                agents_count,
-                tasks_count,
+                id: snapshot.meta.id.clone(),
+                title: snapshot.meta.title(),
+                turns: snapshot.usage.turns,
+                context_tokens: snapshot.usage.context_tokens,
+                agents_count: snapshot.agents.len(),
+                tasks_count: snapshot.tasks.len(),
+                status: crate::state::slots::status_from_snapshot(snapshot),
             });
+        }
+    }
+
+    /// A pending permission cell still sitting in the transcript — the same
+    /// predicate the footer prompt and the anim tick use.
+    pub fn has_pending_permission(&self) -> bool {
+        self.transcript
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Permission(_))))
+    }
+
+    /// The status the ACTIVE slot shows. Derived live: `SessionStatus` events
+    /// describe sessions nobody is attached to, while this session's asks and
+    /// turn are on screen — `Done` cannot apply to the slot being viewed.
+    pub fn active_slot_status(&self) -> pacode_types::SessionStatusKind {
+        use pacode_types::SessionStatusKind as Kind;
+        if !self.questions.is_empty() || self.has_pending_permission() {
+            Kind::NeedsInput
+        } else if self.turn_active || self.rail.has_live_agents() {
+            Kind::Working
+        } else {
+            Kind::Idle
         }
     }
 
     pub fn leave_active_slot(&mut self) {
         let current = self.active_slot;
+        // Computed while the leaving session's asks/turn are still live state
+        // — and quiet lands on `Idle`, not `Done`: the session was on screen,
+        // so there is nothing unseen.
+        let status = self.active_slot_status();
         if let Some(meta) = &self.meta {
             self.slots[current] = Some(SessionSlot {
                 id: meta.id.clone(),
@@ -1369,6 +1404,7 @@ impl AppState {
                 context_tokens: self.rail.usage.context_tokens,
                 agents_count: self.rail.agents.len(),
                 tasks_count: self.rail.tasks.len(),
+                status,
             });
         }
         self.transcript.cells.clear();

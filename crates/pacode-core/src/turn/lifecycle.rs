@@ -232,6 +232,10 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
         // `start_turn` cannot emit `TurnStarted` ahead of this `TurnEnded`.
         emit_turn_end(&session, &agent, &turn_id, spawned_at, usage, &stop).await;
         drop(turn_guard);
+        // Now that the guard is gone the badge reads `Done` (or `Working` when
+        // another agent still runs; a queued injection re-drive flips it right
+        // back via that turn's `TurnStarted`).
+        session.emit_session_status();
 
         // An injection that landed between the last drain and the end of the turn
         // would otherwise wait for the next user message: run another turn for it.

@@ -386,7 +386,10 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         | Event::LoginProgress { .. }
         | Event::AuthUpdated(_)
         // The model catalog is ACP `list_models` request data, not a session update.
-        | Event::ModelsUpdated { .. } => vec![],
+        | Event::ModelsUpdated { .. }
+        // The slot badge is a pacode client concern; ACP sessions are driven
+        // one at a time and have no slot strip.
+        | Event::SessionStatus { .. } => vec![],
     }
 }
 

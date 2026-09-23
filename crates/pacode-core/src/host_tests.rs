@@ -396,6 +396,7 @@ mod zdr {
                     ..ModelFlags::default()
                 },
             )])),
+            global_events: crate::transcript::EventSink::new(),
         });
         (temp, session)
     }

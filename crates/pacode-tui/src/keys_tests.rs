@@ -1547,6 +1547,7 @@ fn test_session_slot_switching() {
         context_tokens: 1200,
         agents_count: 1,
         tasks_count: 0,
+        status: pacode_types::SessionStatusKind::Idle,
     });
 
     // Switching to an occupied slot (ctrl+alt+3) emits Detach then Resume with the right id

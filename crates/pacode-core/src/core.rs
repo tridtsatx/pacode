@@ -401,6 +401,7 @@ impl Core {
                         session
                             .events
                             .emit(Event::QuestionResolved { question, answer });
+                        session.emit_session_status();
                         Reply::Ok
                     }
                     None => Reply::Error {

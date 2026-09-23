@@ -100,6 +100,7 @@ fn test_session(config: Config) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>)
         skills: Arc::new(pacode_skills::SkillRegistry::default()),
         scheduler: crate::schedule::Scheduler::new(),
         model_flags: RwLock::new(HashMap::new()),
+        global_events: crate::transcript::EventSink::new(),
     });
     (temp, session, agent)
 }

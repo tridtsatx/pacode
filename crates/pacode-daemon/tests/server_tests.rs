@@ -12,9 +12,11 @@ use pacode_provider::mock::{MockProvider, MockResponse};
 use pacode_store::Store;
 use pacode_tools::builtin_tools;
 use pacode_types::protocol::{
-    Attach, ClientHello, Envelope, PROTOCOL_VERSION, Reply, Request, ServerMessage,
+    Attach, ClientHello, Envelope, Event, PROTOCOL_VERSION, Reply, Request, ServerMessage,
 };
-use pacode_types::{ClientId, Config, ExecConfig, ModelRoute, WebConfig};
+use pacode_types::{
+    ClientId, Config, ExecConfig, ModelRoute, SessionStatusKind, WebConfig, now_ms,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 
@@ -586,5 +588,139 @@ async fn test_mcp_requests_in_daemon() {
     let reply = read_reply(&mut lines, 4).await;
     assert_eq!(reply, Reply::Ok);
 
+    let _ = server_task.await;
+}
+
+/// `Event::SessionStatus` rides the daemon-wide stream: a client attached to
+/// one session sees another session's slot badge change over the same socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_status_events_reach_client_attached_elsewhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock_path = tmp.path().join("daemon_status.sock");
+
+    let paths = pacode_config::Paths::under(tmp.path());
+    let mut config = Config::default();
+    config.daemon.idle_timeout_secs = 3600;
+    config
+        .providers
+        .insert("mock".to_string(), pacode_types::ProviderConfig::default());
+    config.provider.default = Some("mock/mock-model".to_string());
+    let config = Arc::new(config);
+    let core = build_test_core(&tmp, Arc::clone(&config)).await;
+
+    let opts = DaemonOptions {
+        paths,
+        config: Arc::clone(&config),
+        socket: sock_path.clone(),
+        app_version: "0.1.0".to_string(),
+    };
+
+    let server_task = tokio::spawn(run(opts, Arc::clone(&core)));
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Client attached to session A through the socket.
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    send_env(
+        &mut writer,
+        &Envelope {
+            id: 1,
+            req: Request::Hello(ClientHello {
+                client_id: ClientId::generate(),
+                app_version: "0.1.0".to_string(),
+                protocol: PROTOCOL_VERSION,
+            }),
+        },
+    )
+    .await;
+    let reply = read_reply(&mut lines, 1).await;
+    assert!(matches!(reply, Reply::Hello { .. }));
+
+    send_env(
+        &mut writer,
+        &Envelope {
+            id: 2,
+            req: Request::Attach(Attach::New {
+                cwd: tmp.path().to_path_buf(),
+                model: None,
+                effort: None,
+                mode: None,
+            }),
+        },
+    )
+    .await;
+    let session_a = match read_reply(&mut lines, 2).await {
+        Reply::Attached(snapshot) => snapshot.meta.id,
+        other => panic!("expected Reply::Attached, got {other:?}"),
+    };
+
+    // Session B exists only daemon-side — no client ever attaches to it.
+    let session_b = core
+        .open_session(Attach::New {
+            cwd: tmp.path().to_path_buf(),
+            model: None,
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    assert_ne!(session_a, session_b);
+
+    core.handle(
+        &session_b,
+        Request::UserMessage {
+            text: "hi".to_string(),
+            images: Vec::new(),
+        },
+    )
+    .await;
+
+    // The socket sees B's badge flip Working -> Done even though the client is
+    // attached to A.
+    let deadline = now_ms() + 10_000;
+    let mut statuses = Vec::new();
+    while now_ms() < deadline {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("timed out waiting for SessionStatus::Done")
+            .expect("stream ended")
+            .expect("read error");
+        let msg: ServerMessage = serde_json::from_str(&msg).unwrap();
+        if let ServerMessage::Event {
+            event: Event::SessionStatus { session, status },
+            ..
+        } = msg
+            && session == session_b
+        {
+            statuses.push(status);
+            if status == SessionStatusKind::Done {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        statuses,
+        vec![SessionStatusKind::Working, SessionStatusKind::Done],
+        "B's badge must run Working -> Done on the global stream"
+    );
+
+    send_env(
+        &mut writer,
+        &Envelope {
+            id: 3,
+            req: Request::Shutdown { force: true },
+        },
+    )
+    .await;
+    let reply = read_reply(&mut lines, 3).await;
+    assert_eq!(reply, Reply::Ok);
     let _ = server_task.await;
 }

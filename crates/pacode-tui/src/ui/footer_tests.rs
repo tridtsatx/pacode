@@ -186,3 +186,84 @@ fn test_footer_vim_mode_badges() {
     assert!(row1_text.contains("VIS"), "row1_text was: {row1_text}");
     assert!(!row1_text.contains("NOR"));
 }
+
+#[test]
+fn slots_spans_color_by_status() {
+    use pacode_types::SessionStatusKind as Kind;
+
+    let mut state = make_test_state();
+    let opts = RenderOptions::new(120, false);
+    let slot = |id: &str, status| crate::state::SessionSlot {
+        id: pacode_types::SessionId::new(id),
+        title: id.to_string(),
+        turns: 0,
+        context_tokens: 0,
+        agents_count: 0,
+        tasks_count: 0,
+        status,
+    };
+    state.slots[1] = Some(slot("ses_w", Kind::Working));
+    state.slots[2] = Some(slot("ses_n", Kind::NeedsInput));
+    state.slots[3] = Some(slot("ses_d", Kind::Done));
+    state.slots[4] = Some(slot("ses_i", Kind::Idle));
+
+    // Lit pulse phase (anim_frame 0): NeedsInput reads as accent.
+    let spans = render_slots_spans(&state, &opts);
+    assert_eq!(spans[0].content, "[1]");
+    assert_eq!(spans[0].style, opts.theme.accent, "active slot");
+    assert_eq!(spans[1].style, opts.theme.green, "working");
+    assert_eq!(spans[2].style, opts.theme.accent, "needs_input lit");
+    assert_eq!(spans[3].style, opts.theme.cyan, "done");
+    assert_eq!(spans[4].style, opts.theme.faint, "idle");
+    assert_eq!(spans[8].content, "·");
+    assert_eq!(spans[8].style, opts.theme.faint, "empty");
+
+    // Unlit pulse phase: NeedsInput dims, the rest hold their color.
+    state.anim_frame = crate::state::PULSE_FRAMES / 2;
+    let spans = render_slots_spans(&state, &opts);
+    assert_ne!(spans[2].style, opts.theme.accent, "needs_input dimmed");
+    assert_eq!(spans[1].style, opts.theme.green, "working stays put");
+    assert_eq!(spans[3].style, opts.theme.cyan, "done stays put");
+}
+
+#[test]
+fn active_slot_blinks_when_input_is_pending() {
+    use pacode_types::SessionStatusKind as Kind;
+
+    let mut state = make_test_state();
+    let opts = RenderOptions::new(120, false);
+    state.turn_active = true;
+    let question = pacode_types::Question::new(
+        pacode_types::QuestionId::generate(),
+        pacode_types::QuestionOrigin::new(
+            pacode_types::AgentId::main(),
+            "main",
+            pacode_types::CallId::new("call_1"),
+        ),
+        "pick",
+        "which?",
+        vec![
+            pacode_types::QuestionOption::new("a", ""),
+            pacode_types::QuestionOption::new("b", ""),
+        ],
+        false,
+        1,
+    )
+    .unwrap();
+    state.apply_event(
+        1,
+        pacode_types::Event::QuestionAsked(question),
+        std::time::Instant::now(),
+    );
+    assert_eq!(state.active_slot_status(), Kind::NeedsInput);
+
+    // Lit phase: the active badge takes the blinking accent.
+    let spans = render_slots_spans(&state, &opts);
+    assert_eq!(spans[0].content, "[1]");
+    assert_eq!(spans[0].style, opts.theme.accent);
+
+    // Unlit phase: it dims instead of holding accent.
+    state.anim_frame = crate::state::PULSE_FRAMES / 2;
+    let spans = render_slots_spans(&state, &opts);
+    assert_ne!(spans[0].style, opts.theme.accent);
+}

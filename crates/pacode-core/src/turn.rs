@@ -81,6 +81,7 @@ pub async fn run_turn(
         agent: agent.id(),
         turn: turn_id.clone(),
     });
+    session.emit_session_status();
     // Don't flap Thinking over a stop that landed during turn setup;
     // `handle_interrupted` keeps `Stopped` once the loop observes the cancel.
     if !agent.stop_requested() {

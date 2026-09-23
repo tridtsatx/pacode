@@ -9,11 +9,11 @@ use pacode_types::ids::{AgentId, SessionId};
 use pacode_types::model::{Effort, ModelRoute};
 use pacode_types::state::{AgentKind, AgentStatus, Mode};
 use pacode_types::{
-    AgentInfo, Config, Event, Plan, Request, SessionMeta, SessionSnapshot, TurnId, TurnStop,
-    UsageTotals,
+    AgentInfo, Config, Event, Plan, Request, SessionMeta, SessionSnapshot, SessionStatusKind,
+    TurnId, TurnStop, UsageTotals,
 };
 
-use crate::state::{AppState, Connection, RESYNC_DEBOUNCE_MS};
+use crate::state::{AppState, Connection, RESYNC_DEBOUNCE_MS, SessionSlot};
 
 fn meta() -> SessionMeta {
     SessionMeta {
@@ -508,4 +508,220 @@ fn permission_explained_without_level_keeps_the_honest_text() {
             level: None,
         })
     );
+}
+
+fn slot(session: &str, status: SessionStatusKind) -> SessionSlot {
+    SessionSlot {
+        id: SessionId::new(session),
+        title: session.to_string(),
+        turns: 0,
+        context_tokens: 0,
+        agents_count: 0,
+        tasks_count: 0,
+        status,
+    }
+}
+
+#[test]
+fn session_status_event_updates_the_named_slot() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    state.slots[1] = Some(slot("ses_b", SessionStatusKind::Idle));
+    state.slots[2] = Some(slot("ses_c", SessionStatusKind::Idle));
+
+    state.apply_client_event(
+        ClientEvent::Event {
+            seq: 1,
+            event: Event::SessionStatus {
+                session: SessionId::new("ses_b"),
+                status: SessionStatusKind::NeedsInput,
+            },
+        },
+        now,
+    );
+    assert_eq!(
+        state.slots[1].as_ref().unwrap().status,
+        SessionStatusKind::NeedsInput
+    );
+    // Only the named slot moved.
+    assert_eq!(
+        state.slots[2].as_ref().unwrap().status,
+        SessionStatusKind::Idle
+    );
+
+    // An id no slot holds is ignored.
+    state.apply_client_event(
+        ClientEvent::Event {
+            seq: 2,
+            event: Event::SessionStatus {
+                session: SessionId::new("ses_elsewhere"),
+                status: SessionStatusKind::Done,
+            },
+        },
+        now,
+    );
+    assert_eq!(
+        state.slots[1].as_ref().unwrap().status,
+        SessionStatusKind::NeedsInput
+    );
+}
+
+#[test]
+fn session_status_seq_stays_out_of_session_tracking() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    state.slots[1] = Some(slot("ses_b", SessionStatusKind::Idle));
+    state.last_event_seq = Some(7);
+
+    // `SessionStatus` rides the daemon-wide stream — its seq belongs to the
+    // global space and must never forge a session-stream gap.
+    state.apply_client_event(
+        ClientEvent::Event {
+            seq: 999,
+            event: Event::SessionStatus {
+                session: SessionId::new("ses_b"),
+                status: SessionStatusKind::Working,
+            },
+        },
+        now,
+    );
+    assert!(!state.resync_want);
+    assert_eq!(state.last_event_seq, Some(7));
+
+    // A real session event still tracks normally after it.
+    state.apply_client_event(
+        ClientEvent::Event {
+            seq: 8,
+            event: Event::PlanUpdated(Plan::default()),
+        },
+        now,
+    );
+    assert!(!state.resync_want);
+    assert_eq!(state.last_event_seq, Some(8));
+}
+
+#[test]
+fn leaving_slot_seeds_its_live_status() {
+    // Quiet on screen -> Idle (a `Done` would be wrong: it was just viewed).
+    let mut state = attached_state();
+    state.leave_active_slot();
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::Idle
+    );
+
+    // Running turn -> Working.
+    let mut state = attached_state();
+    state.turn_active = true;
+    state.leave_active_slot();
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::Working
+    );
+
+    // Pending permission -> NeedsInput, and it outranks the running turn.
+    let mut state = attached_state();
+    state.turn_active = true;
+    state.apply_event(
+        1,
+        Event::PermissionRequested(perm_request("perm_1")),
+        Instant::now(),
+    );
+    state.leave_active_slot();
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::NeedsInput
+    );
+}
+
+#[test]
+fn attach_snapshot_reseeds_the_slot_status() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    state.slots[0] = Some(slot("ses_test", SessionStatusKind::Done));
+
+    // A quiet attach clears `Done` — the session is being viewed.
+    state.apply_client_event(
+        ClientEvent::Snapshot(snapshot(5, PathBuf::from("/tmp"))),
+        now,
+    );
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::Idle
+    );
+
+    // A snapshot with a running turn seeds Working.
+    let mut snap = snapshot(6, PathBuf::from("/tmp"));
+    snap.turn_active = true;
+    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::Working
+    );
+
+    // A snapshot with a pending permission seeds NeedsInput.
+    let mut snap = snapshot(7, PathBuf::from("/tmp"));
+    snap.pending_permissions = vec![perm_request("perm_9")];
+    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    assert_eq!(
+        state.slots[0].as_ref().unwrap().status,
+        SessionStatusKind::NeedsInput
+    );
+}
+
+#[test]
+fn active_slot_status_tracks_asks_and_turn() {
+    use pacode_types::SessionStatusKind as Kind;
+
+    let mut state = attached_state();
+    let now = Instant::now();
+    assert_eq!(state.active_slot_status(), Kind::Idle);
+
+    state.turn_active = true;
+    assert_eq!(state.active_slot_status(), Kind::Working);
+
+    // A pending permission outranks the running turn.
+    state.apply_event(1, Event::PermissionRequested(perm_request("perm_1")), now);
+    assert_eq!(state.active_slot_status(), Kind::NeedsInput);
+    state.apply_event(
+        2,
+        Event::PermissionResolved {
+            permission: pacode_types::PermissionId::new("perm_1"),
+            decision: pacode_types::PermissionDecision::AllowOnce,
+            reason: None,
+        },
+        now,
+    );
+    assert_eq!(state.active_slot_status(), Kind::Working);
+
+    // An unanswered question reads the same.
+    let question = pacode_types::Question::new(
+        pacode_types::QuestionId::generate(),
+        pacode_types::QuestionOrigin::new(
+            AgentId::main(),
+            "main",
+            pacode_types::CallId::new("call_1"),
+        ),
+        "pick",
+        "which?",
+        vec![
+            pacode_types::QuestionOption::new("a", ""),
+            pacode_types::QuestionOption::new("b", ""),
+        ],
+        false,
+        1,
+    )
+    .unwrap();
+    let qid = question.id.clone();
+    state.apply_event(3, Event::QuestionAsked(question), now);
+    assert_eq!(state.active_slot_status(), Kind::NeedsInput);
+    state.apply_event(
+        4,
+        Event::QuestionResolved {
+            question: qid,
+            answer: pacode_types::QuestionAnswer::choice(0),
+        },
+        now,
+    );
+    assert_eq!(state.active_slot_status(), Kind::Working);
 }

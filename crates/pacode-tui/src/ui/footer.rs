@@ -28,33 +28,52 @@ pub fn format_tokens_upper(n: u64) -> String {
     }
 }
 
-pub fn format_slots_summary(state: &AppState) -> String {
-    let mut s = String::new();
-    for i in 0..9 {
-        let num = i + 1;
-        if i == state.active_slot {
-            s.push_str(&format!("[{num}]"));
-        } else if state.slots[i].is_some() {
-            s.push_str(&format!("{num}"));
-        } else {
-            s.push('·');
-        }
-    }
-    s
-}
-
+/// Slot badges with per-status colors: `NeedsInput` blinks on the shared
+/// pulse phase (accent while lit, dimmed otherwise), `Working` is green,
+/// `Done` cyan, `Idle` faint. The active slot keeps its `[N]` accent except
+/// under `NeedsInput`, where it blinks like the others.
 pub fn render_slots_spans(state: &AppState, opts: &RenderOptions) -> Vec<Span<'static>> {
+    use pacode_types::SessionStatusKind as Kind;
+    let lit = state.pulse_lit(std::time::Instant::now());
+    let blinking =
+        |opts: &RenderOptions| crate::ui::anim::pulse(&opts.theme, opts.theme.accent, lit);
     let mut spans = Vec::with_capacity(9);
     for i in 0..9 {
         let num = i + 1;
         if i == state.active_slot {
-            spans.push(Span::styled(format!("[{num}]"), opts.theme.accent));
-        } else if state.slots[i].is_some() {
-            spans.push(Span::styled(format!("{num}"), opts.theme.fg));
+            let style = match state.active_slot_status() {
+                Kind::NeedsInput => blinking(opts),
+                _ => opts.theme.accent,
+            };
+            spans.push(Span::styled(format!("[{num}]"), style));
+        } else if let Some(slot) = &state.slots[i] {
+            let style = match slot.status {
+                Kind::NeedsInput => blinking(opts),
+                Kind::Working => opts.theme.green,
+                Kind::Done => opts.theme.cyan,
+                Kind::Idle => opts.theme.faint,
+            };
+            spans.push(Span::styled(format!("{num}"), style));
         } else {
             spans.push(Span::styled("·", opts.theme.faint));
         }
     }
+    spans
+}
+
+/// `slots · tokens · ctrl+p · menu hint` — the footer's right side, shared by
+/// the plain row and every degradation step so all of them stay colored.
+fn context_right_spans(state: &AppState, opts: &RenderOptions) -> Vec<Span<'static>> {
+    let tokens = state.rail.usage.context_tokens as u64;
+    let mut spans = render_slots_spans(state, opts);
+    spans.push(Span::styled(" · ", opts.theme.faint));
+    if tokens > 0 {
+        spans.push(Span::styled(format_tokens_upper(tokens), opts.theme.faint));
+        spans.push(Span::styled(" · ", opts.theme.faint));
+    }
+    spans.push(Span::styled("ctrl+p", opts.theme.faint));
+    spans.push(Span::styled(" · ", opts.theme.faint));
+    spans.push(Span::styled(menu_hint(state), opts.theme.faint));
     spans
 }
 
@@ -160,16 +179,15 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
 
 fn render_row2_with_right(
     left_spans: Vec<Span<'static>>,
-    right_text: String,
+    right_spans: Vec<Span<'static>>,
     width: usize,
-    opts: &RenderOptions,
 ) -> Line<'static> {
     let left_len: usize = left_spans.iter().map(|s| display_width(&s.content)).sum();
-    let right_len = display_width(&right_text);
+    let right_len: usize = right_spans.iter().map(|s| display_width(&s.content)).sum();
     let spaces = width.saturating_sub(left_len + right_len);
     let mut out = left_spans;
     out.push(Span::raw(" ".repeat(spaces)));
-    out.push(Span::styled(right_text, opts.theme.faint));
+    out.extend(right_spans);
     Line::from(out)
 }
 
@@ -345,11 +363,9 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                             Mode::Build | Mode::Auto => opts.theme.cyan,
                         };
 
-                        let tok_str = format_tokens_upper(state.rail.usage.context_tokens as u64);
-                        let slots_str = format_slots_summary(state);
-                        let right_text =
-                            format!("{slots_str} · {tok_str} · ctrl+p · {}", menu_hint(state));
-                        let right_len = display_width(&right_text);
+                        let right_spans = context_right_spans(state, opts);
+                        let right_len: usize =
+                            right_spans.iter().map(|s| display_width(&s.content)).sum();
 
                         let perm_base =
                             format!("{} {}", opts.glyphs.chevrons, mode.permission_line());
@@ -422,9 +438,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                         if full_left_len + 2 + right_len <= width {
                             return render_row2_with_right(
                                 make_spans(true, true, true),
-                                right_text,
+                                right_spans,
                                 width,
-                                opts,
                             );
                         }
 
@@ -433,9 +448,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                         if no_hint_len + 2 + right_len <= width {
                             return render_row2_with_right(
                                 make_spans(true, false, true),
-                                right_text,
+                                right_spans,
                                 width,
-                                opts,
                             );
                         }
 
@@ -444,9 +458,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                         if base_status_len + 2 + right_len <= width {
                             return render_row2_with_right(
                                 make_spans(true, false, false),
-                                right_text,
+                                right_spans,
                                 width,
-                                opts,
                             );
                         }
 
@@ -473,18 +486,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
     };
 
     let right_spans = if show_context {
-        let tokens = state.rail.usage.context_tokens as u64;
-        let mut spans = render_slots_spans(state, opts);
-        spans.push(Span::styled(" · ", opts.theme.faint));
-        if tokens > 0 {
-            let tok_str = format_tokens_upper(tokens);
-            spans.push(Span::styled(tok_str, opts.theme.faint));
-            spans.push(Span::styled(" · ", opts.theme.faint));
-        }
-        spans.push(Span::styled("ctrl+p", opts.theme.faint));
-        spans.push(Span::styled(" · ", opts.theme.faint));
-        spans.push(Span::styled(menu_hint(state), opts.theme.faint));
-        spans
+        context_right_spans(state, opts)
     } else {
         Vec::new()
     };

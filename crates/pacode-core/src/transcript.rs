@@ -9,8 +9,13 @@ use pacode_types::{AgentId, CallId, Event, Message, TranscriptItem};
 use tokio::sync::broadcast;
 
 /// Per-session event fan-out with a monotonic seq.
+///
+/// `Clone` shares the seq counter and the channel — a `Session` clones the
+/// `Core` daemon-wide sink to publish `Event::SessionStatus` into the same
+/// seq space.
+#[derive(Clone)]
 pub struct EventSink {
-    seq: AtomicU64,
+    seq: Arc<AtomicU64>,
     tx: broadcast::Sender<(u64, Event)>,
 }
 
@@ -19,7 +24,7 @@ impl EventSink {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
-            seq: AtomicU64::new(0),
+            seq: Arc::new(AtomicU64::new(0)),
             tx,
         }
     }

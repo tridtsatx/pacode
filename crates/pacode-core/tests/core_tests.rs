@@ -11,8 +11,8 @@ use pacode_store::Store;
 use pacode_tools::host::PermissionDraft;
 use pacode_tools::{AgentSpec, Tool, ToolCtx, ToolError, ToolKind, ToolOutput, ToolRegistry};
 use pacode_types::{
-    Attach, Config, ContentBlock, Event, Mode, ModelRoute, PermissionDecision, Request, RiskLevel,
-    Role, ToolStatus, TranscriptKind, TurnStop,
+    Attach, Config, ContentBlock, Event, Mode, ModelRoute, PermissionDecision, QuestionAnswer,
+    Request, RiskLevel, Role, SessionId, SessionStatusKind, ToolStatus, TranscriptKind, TurnStop,
 };
 
 struct StubBash;
@@ -195,6 +195,48 @@ impl Tool for StubTriggerBgTask {
     }
 }
 
+/// Drives the `ask_question` host path so slot-status tests can exercise the
+/// `NeedsInput` transition without a permission gate.
+struct StubAsk;
+#[async_trait::async_trait]
+impl Tool for StubAsk {
+    fn name(&self) -> &'static str {
+        "ask"
+    }
+    fn description(&self) -> &'static str {
+        "Ask the user a question"
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let answer = ctx
+            .host
+            .ask_question(
+                &ctx.call_id,
+                "pick".into(),
+                "which one?".into(),
+                vec![
+                    pacode_types::QuestionOption::new("red", ""),
+                    pacode_types::QuestionOption::new("blue", ""),
+                ],
+                false,
+            )
+            .await?;
+        Ok(ToolOutput::text(format!(
+            "answered: {}",
+            answer.selected.len()
+        )))
+    }
+}
+
 async fn setup_test_core() -> (Arc<Core>, Arc<MockProvider>, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = Store::open_in_memory().unwrap();
@@ -230,6 +272,7 @@ async fn setup_test_core() -> (Arc<Core>, Arc<MockProvider>, tempfile::TempDir) 
     tools.register(Arc::new(StubWrite));
     tools.register(Arc::new(StubAgent));
     tools.register(Arc::new(StubTriggerBgTask));
+    tools.register(Arc::new(StubAsk));
 
     let deps = CoreDeps {
         marketplace: std::sync::Arc::new(pacode_plugin::marketplace::Marketplace::new(
@@ -1077,4 +1120,222 @@ async fn tool_call_args_stream_into_the_transcript_cell() {
     let (_, _, status, _, preview) = cell_events.last().unwrap();
     assert_eq!(*status, ToolStatus::Ok);
     assert_eq!(preview.as_str(), "hi\n");
+}
+
+// ---- daemon-wide slot status (`Event::SessionStatus` on `subscribe_global`) ----
+
+/// Next `SessionStatus` for `session` on the daemon-wide stream; everything
+/// else (other events, broadcast lag) is skipped.
+async fn next_session_status(
+    rx: &mut tokio::sync::broadcast::Receiver<(u64, Event)>,
+    session: &SessionId,
+) -> SessionStatusKind {
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for SessionStatus"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::SessionStatus { session: s, status })) = res
+                    && s == *session
+                {
+                    return status;
+                }
+            }
+        }
+    }
+}
+
+async fn open_status_session(core: &Arc<Core>, tmp: &tempfile::TempDir, mode: Mode) -> SessionId {
+    core.open_session(Attach::New {
+        cwd: tmp.path().to_path_buf(),
+        model: Some(ModelRoute {
+            provider: "mock".into(),
+            model: "mock-model".into(),
+        }),
+        effort: None,
+        mode: Some(mode),
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_status_marks_turn_working_then_done() {
+    let (core, mock, tmp) = setup_test_core().await;
+    let session_id = open_status_session(&core, &tmp, Mode::Build).await;
+
+    let mut global = core.subscribe_global();
+    mock.push(MockResponse::Text("done".into()));
+    core.handle(
+        &session_id,
+        Request::UserMessage {
+            text: "go".into(),
+            images: Vec::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::Working
+    );
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::Done
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_status_needs_input_on_pending_permission() {
+    let (core, mock, tmp) = setup_test_core().await;
+    let session_id = open_status_session(&core, &tmp, Mode::Build).await;
+
+    let mut global = core.subscribe_global();
+    let mut rx = core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![(
+            "write".into(),
+            serde_json::json!({"path": "p.txt", "content": "x"}),
+        )],
+    });
+    mock.push(MockResponse::Text("done".into()));
+    core.handle(
+        &session_id,
+        Request::UserMessage {
+            text: "write it".into(),
+            images: Vec::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::Working
+    );
+
+    // The permission request flips the badge to NeedsInput.
+    let perm_id = loop {
+        let (_seq, event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Event::PermissionRequested(req) = event {
+            break req.id;
+        }
+    };
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::NeedsInput
+    );
+
+    // Resolved while the turn still runs: back to Working, then Done at the end.
+    core.handle(
+        &session_id,
+        Request::PermissionReply {
+            permission: perm_id,
+            decision: PermissionDecision::AllowOnce,
+            reason: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::Working
+    );
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::Done
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_status_needs_input_on_pending_question() {
+    let (core, mock, tmp) = setup_test_core().await;
+    let session_id = open_status_session(&core, &tmp, Mode::Build).await;
+
+    let mut global = core.subscribe_global();
+    let mut rx = core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("ask".into(), serde_json::json!({}))],
+    });
+    mock.push(MockResponse::Text("done".into()));
+    core.handle(
+        &session_id,
+        Request::UserMessage {
+            text: "ask me".into(),
+            images: Vec::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::Working
+    );
+
+    let question_id = loop {
+        let (_seq, event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Event::QuestionAsked(q) = event {
+            break q.id;
+        }
+    };
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::NeedsInput
+    );
+
+    core.handle(
+        &session_id,
+        Request::AnswerQuestion {
+            question: question_id,
+            answer: QuestionAnswer::choice(0),
+        },
+    )
+    .await;
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::Working
+    );
+    assert_eq!(
+        next_session_status(&mut global, &session_id).await,
+        SessionStatusKind::Done
+    );
+}
+
+/// A second session's badge reaches the same global stream — the propagation
+/// a client attached to slot A relies on to paint slot B.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_status_reports_other_sessions() {
+    let (core, mock, tmp) = setup_test_core().await;
+    let session_a = open_status_session(&core, &tmp, Mode::Build).await;
+    let session_b = open_status_session(&core, &tmp, Mode::Build).await;
+
+    let mut global = core.subscribe_global();
+    mock.push(MockResponse::Text("b done".into()));
+    core.handle(
+        &session_b,
+        Request::UserMessage {
+            text: "go".into(),
+            images: Vec::new(),
+        },
+    )
+    .await;
+
+    // B's Working arrives tagged with B — while A never ran a turn.
+    assert_eq!(
+        next_session_status(&mut global, &session_b).await,
+        SessionStatusKind::Working
+    );
+    assert_eq!(
+        next_session_status(&mut global, &session_b).await,
+        SessionStatusKind::Done
+    );
+    // And A stayed silent on the stream.
+    assert_ne!(session_a, session_b);
 }

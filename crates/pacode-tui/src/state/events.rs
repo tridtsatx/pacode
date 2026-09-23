@@ -479,6 +479,17 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             crate::cache::write_after_reply(state, crate::cache::ListKind::Models);
             state.dirty = true;
         }
+        Event::SessionStatus { session, status } => {
+            // Daemon-wide event: mark the slot it names. The active slot
+            // derives its badge from live state instead, so this only feeds
+            // the retained summaries of slots nobody is attached to.
+            for slot in state.slots.iter_mut().flatten() {
+                if slot.id == session {
+                    slot.status = status;
+                    state.dirty = true;
+                }
+            }
+        }
     }
     state.rail.update_idle(state.turn_active, now);
 }

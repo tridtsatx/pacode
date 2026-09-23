@@ -1010,14 +1010,7 @@ fn apply_attach_snapshot(
         .meta
         .as_ref()
         .is_some_and(|m| m.cwd != snapshot.meta.cwd);
-    let slot_idx = state.active_slot;
-    state.record_slot(
-        slot_idx,
-        &snapshot.meta,
-        &snapshot.usage,
-        snapshot.agents.len(),
-        snapshot.tasks.len(),
-    );
+    // The slot summary is recorded inside the `Snapshot` fold.
     state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
     state.dirty = true;
     // Session-bound requests queued while `meta` was empty — the startup

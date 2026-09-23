@@ -45,6 +45,9 @@ pub struct Session {
     /// Per-route user flags (`zdr_capable`, `favorite`) loaded from `prefs.toml`
     /// at session open; `SetModelFlag` updates this copy, the TUI persists it.
     pub model_flags: RwLock<HashMap<String, ModelFlags>>,
+    /// Clone of `Core::global_events` (shared seq + channel): how a session
+    /// publishes `Event::SessionStatus` to clients attached to other sessions.
+    pub global_events: EventSink,
 }
 
 impl Session {
@@ -139,6 +142,40 @@ impl Session {
         self.tasks_of_session()
             .iter()
             .any(|t| t.status == pacode_types::TaskStatus::Running)
+    }
+
+    /// The slot-badge status this session would show right now:
+    /// `NeedsInput` while a permission or question is waiting, `Working` while
+    /// any agent holds a turn, `Done` once everything went quiet. `Idle` is
+    /// never produced here — it is the client's resting state, not a
+    /// transition the daemon reports.
+    fn session_status_kind(&self) -> pacode_types::SessionStatusKind {
+        use pacode_types::SessionStatusKind as Kind;
+        if !self.permissions.pending().is_empty() || !self.questions.pending().is_empty() {
+            return Kind::NeedsInput;
+        }
+        let any_running = self
+            .agents
+            .read()
+            .map(|a| a.values().any(|agent| agent.is_running()))
+            .unwrap_or(false);
+        if any_running {
+            Kind::Working
+        } else {
+            Kind::Done
+        }
+    }
+
+    /// Publish the current slot-badge status on the daemon-wide stream so
+    /// clients attached to another session see the transition. Called at every
+    /// seam that can flip it: turn start/end, permission/question ask and
+    /// resolve. Recomputing from live state (rather than trusting the caller's
+    /// intent) keeps a resolve correct while other asks stay pending.
+    pub fn emit_session_status(&self) {
+        self.global_events.emit(pacode_types::Event::SessionStatus {
+            session: self.id.clone(),
+            status: self.session_status_kind(),
+        });
     }
 
     /// Start a turn on the main agent, or queue a steer injection when a turn is
@@ -298,6 +335,7 @@ impl Session {
                 answer,
             });
         }
+        self.emit_session_status();
     }
 
     /// Deny every permission `agent` is still waiting on (interrupt/stop_agent).
@@ -338,6 +376,7 @@ impl Session {
             decision,
             reason: reason.clone(),
         });
+        self.emit_session_status();
         let Some(seq) = item_seq else {
             return;
         };

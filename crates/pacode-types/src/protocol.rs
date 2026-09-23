@@ -29,8 +29,9 @@ use crate::vcs::{CommitRow, GitStatus};
 /// `SessionMeta.zdr` and `ModelInfo.supported_efforts`; v3 added the git
 /// requests (`GitLog`, `GitShow`, `GitDiff`) and their replies; v4 adds
 /// `RefreshModels` + the `ModelsUpdated` broadcast; v5 adds
-/// `ExplainPermission` + the `PermissionExplained` broadcast.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// `ExplainPermission` + the `PermissionExplained` broadcast; v6 adds the
+/// daemon-wide `SessionStatus` event for footer slot badges.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -597,6 +598,25 @@ pub enum TurnStop {
     Failed { message: String },
 }
 
+/// The state a session's slot badge should show. The daemon reports
+/// transitions on the daemon-wide stream so a client attached to a different
+/// session can still paint the slot. Priority when several apply at once:
+/// `NeedsInput` > `Working` > `Done` > `Idle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatusKind {
+    /// Nothing pending, nothing running — the client's resting color.
+    Idle,
+    /// A turn or a live subagent is running.
+    Working,
+    /// A permission request or a model question is waiting for the user.
+    NeedsInput,
+    /// A turn ended while the session was not being viewed. The badge stays
+    /// until the user looks at the slot; the daemon only reports the
+    /// transition, "viewed" is the client's call.
+    Done,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -692,6 +712,14 @@ pub enum Event {
     /// so clients replace their copy wholesale like a `Reply::Models` fold.
     ModelsUpdated {
         models: Vec<ModelInfo>,
+    },
+    /// A session's slot-badge status changed. Emitted on the daemon-wide
+    /// stream only — never on the session's own seq space — so a client
+    /// attached to another session still sees the transition without
+    /// subscribing to that session's events.
+    SessionStatus {
+        session: SessionId,
+        status: SessionStatusKind,
     },
 }
 
@@ -860,6 +888,33 @@ mod tests {
         assert!(json.get("level").is_none());
         let back: Event = serde_json::from_value(json).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn session_status_round_trip() {
+        for status in [
+            SessionStatusKind::Idle,
+            SessionStatusKind::Working,
+            SessionStatusKind::NeedsInput,
+            SessionStatusKind::Done,
+        ] {
+            let event = Event::SessionStatus {
+                session: SessionId::new("ses_test1"),
+                status,
+            };
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["type"], "session_status");
+            assert_eq!(json["session"], "ses_test1");
+            let back: Event = serde_json::from_value(json).unwrap();
+            assert_eq!(back, event);
+        }
+        // The wire names are snake_case and stable.
+        let json = serde_json::to_value(Event::SessionStatus {
+            session: SessionId::new("ses_x"),
+            status: SessionStatusKind::NeedsInput,
+        })
+        .unwrap();
+        assert_eq!(json["status"], "needs_input");
     }
 
     #[test]
