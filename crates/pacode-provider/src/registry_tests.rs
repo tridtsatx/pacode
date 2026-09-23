@@ -254,6 +254,28 @@ fn test_transport_selection_per_kind() {
         devin_reg.get("my-devin").is_some(),
         "devin transport is wired"
     );
+
+    // OpenCode builds OpenCodeProvider transport
+    let mut opencode_providers = BTreeMap::new();
+    opencode_providers.insert(
+        "my-opencode".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::OpenCode,
+            base_url: "https://opencode.ai/zen/v1".to_string(),
+            ..ProviderConfig::default()
+        },
+    );
+    let opencode_cfg = Config {
+        providers: opencode_providers,
+        ..Config::default()
+    };
+    let opencode_reg =
+        ProviderRegistry::from_config_with_store(&opencode_cfg, &BTreeMap::new(), None)
+            .expect("opencode registry builds");
+    assert!(
+        opencode_reg.get("my-opencode").is_some(),
+        "opencode transport is wired"
+    );
 }
 
 #[test]
@@ -324,6 +346,21 @@ fn test_synthesized_builtin_providers() {
     assert_eq!(devin_cfg.kind, ProviderKind::Devin);
     assert_eq!(devin_cfg.base_url, "https://api.devin.ai/rpc");
 
+    // opencode synthesized (unconditionally, even without store entry)
+    assert!(providers.contains_key("opencode"));
+    let opencode_cfg = &providers["opencode"];
+    assert_eq!(opencode_cfg.kind, ProviderKind::OpenCode);
+    assert_eq!(opencode_cfg.base_url, "https://opencode.ai/zen/v1");
+    assert_eq!(opencode_cfg.api_key.as_deref(), Some("public"));
+    assert!(opencode_cfg.headers.contains_key("User-Agent"));
+    assert_eq!(
+        opencode_cfg
+            .headers
+            .get("x-opencode-client")
+            .map(String::as_str),
+        Some("cli")
+    );
+
     // from_config_with_store with empty config builds synthesized providers
     let empty_cfg = Config::default();
     let reg = ProviderRegistry::from_config_with_store(&empty_cfg, &BTreeMap::new(), Some(&store))
@@ -331,6 +368,7 @@ fn test_synthesized_builtin_providers() {
 
     assert!(reg.get("claude").is_some());
     assert!(reg.get("openai").is_some());
+    assert!(reg.get("opencode").is_some());
 }
 
 #[test]

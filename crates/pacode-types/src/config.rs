@@ -150,6 +150,8 @@ pub enum ProviderKind {
     Anthropic,
     Codex,
     Devin,
+    #[serde(alias = "opencode")]
+    OpenCode,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

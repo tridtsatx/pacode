@@ -103,13 +103,16 @@ pub fn resolve_provider_credential(
 /// Synthesize built-in provider entries so `/login claude` etc. work with an empty config.toml.
 ///
 /// Rules:
-/// - claude -> kind anthropic, base_url `https://api.anthropic.com/v1`
-/// - openai -> kind codex, base_url `https://api.openai.com/v1`
-/// - devin  -> kind devin, base_url from account's `extra["api_server_url"]`
+/// - claude   -> kind anthropic, base_url `https://api.anthropic.com/v1`
+/// - openai   -> kind codex, base_url `https://api.openai.com/v1`
+/// - devin    -> kind devin, base_url from account's `extra["api_server_url"]`
+/// - opencode -> kind open_code, base_url `https://opencode.ai/zen/v1` (always; free tier)
 pub fn synthesize_builtin_providers(
     providers: &mut BTreeMap<String, ProviderConfig>,
     store: &AuthStore,
 ) {
+    // OpenCode Zen free tier — always available, no credentials required.
+    synthesize_opencode(providers);
     if !providers.contains_key("claude") && store.get("claude").is_some() {
         providers.insert(
             "claude".to_string(),
@@ -262,7 +265,62 @@ fn build_transport(
             )?;
             Ok(Arc::new(provider))
         }
+        ProviderKind::OpenCode => {
+            // OpenCode Zen: OpenAI-compatible with `api_key = "public"` and
+            // opencode-specific headers injected via ProviderConfig.headers.
+            // Uses OpenCodeProvider which fetches models from api.json catalog.
+            let api_key = credential
+                .api_key()
+                .map(String::from)
+                .or_else(|| Some("public".to_string()));
+            let provider = crate::opencode::OpenCodeProvider::new(
+                id.to_string(),
+                pcfg.clone(),
+                defaults.clone(),
+                api_key,
+                pricing.clone(),
+            )?;
+            Ok(Arc::new(provider))
+        }
     }
+}
+
+/// Inject the OpenCode Zen free-tier provider unconditionally.
+///
+/// The free tier uses `api_key = "public"` and opencode-specific headers.
+/// No credentials are needed; this runs even without an AuthStore.
+pub fn synthesize_opencode(providers: &mut BTreeMap<String, ProviderConfig>) {
+    if providers.contains_key("opencode") {
+        return;
+    }
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        "User-Agent".to_string(),
+        format!("opencode/{}", crate::opencode::OPENCODE_VERSION),
+    );
+    headers.insert("x-opencode-client".to_string(), "cli".to_string());
+    // Session and request IDs are expected by the Zen server.
+    // Session ID is stable per pacode process; request ID is static here
+    // but the server does not enforce uniqueness per-request.
+    headers.insert(
+        "x-opencode-session".to_string(),
+        crate::opencode::random_hex_id(),
+    );
+    headers.insert(
+        "x-opencode-request".to_string(),
+        crate::opencode::random_hex_id(),
+    );
+    providers.insert(
+        "opencode".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::OpenCode,
+            base_url: crate::opencode::OPENCODE_ZEN_BASE_URL.to_string(),
+            catalog: false, // catalog fetched via opencode::fetch_free_models, not /models
+            api_key: Some("public".to_string()),
+            headers,
+            ..ProviderConfig::default()
+        },
+    );
 }
 
 #[derive(Clone)]
@@ -323,6 +381,8 @@ impl ProviderRegistry {
         ));
 
         let mut all_providers = cfg.providers.clone();
+        // OpenCode Zen free tier is always available (no credentials needed).
+        synthesize_opencode(&mut all_providers);
         if let Some(store) = store {
             registry.auth_path = Some(store.path().to_path_buf());
             synthesize_builtin_providers(&mut all_providers, store);

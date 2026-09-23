@@ -17,6 +17,7 @@ pub mod error_body;
 pub mod image;
 pub mod mock;
 pub mod openai_compat;
+pub mod opencode;
 pub mod registry;
 mod retry;
 pub mod sse;
