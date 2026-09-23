@@ -188,8 +188,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) -> ScreenLayout {
         )
         .thinking(state.config.ui.thinking)
         .expand_hint(expand_hint.clone());
-        // The activity line is drawn whenever there is something to report, which
-        // includes waiting on a subagent or a background task with the turn over.
+        // The activity line is drawn only while the main agent's own turn is
+        // running — background work stays on the rail, not on this line.
         // Whose conversation is on screen must be visible: the column looks the
         // same whether it holds the main thread or a subagent.
         let takeover = state.agent_replaces_dialog();

@@ -248,10 +248,8 @@ fn draw_agents(
     let now = now_ms();
     // The rail says the same thing as the activity line: whatever the main agent
     // is really doing, aged from the same phase start, in whole seconds.
-    let main_line = if let Some((phase, _)) = state
-        .phase
-        .as_ref()
-        .filter(|(p, _)| p.shows_pacman() && state.turn_active)
+    let main_line = if let Some((phase, _)) =
+        state.phase.as_ref().filter(|_| state.turn_active)
     {
         let elapsed = state.phase_elapsed_ms;
         let dur_str = crate::state::activity::format_activity_secs(

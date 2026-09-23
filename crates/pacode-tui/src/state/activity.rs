@@ -26,7 +26,10 @@ const GRADIENT_FULL_MS: u64 = 60_000;
 /// which reads as a calm progress marker instead of a 15 fps strobe.
 pub const DOT_DIVIDER: u64 = 7;
 
-/// What the session is doing. The activity line renders exactly one of these.
+/// What the session is doing. The activity line renders exactly one of these,
+/// and only while the main agent's own turn is running — background agents and
+/// tasks keep their rail entries and card animations, but waiting on them is
+/// plain idle on this line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// The model is reasoning: no tool running, nothing streaming yet.
@@ -35,22 +38,9 @@ pub enum Phase {
     Responding,
     /// A tool call is executing; the string is the tool's title.
     Tool(String),
-    /// The main agent is idle and the session is waiting on a subagent.
-    WaitingAgent(String),
-    /// The main agent is idle and the session is waiting on background tasks.
-    WaitingTask(usize),
 }
 
 impl Phase {
-    /// The pacman bar means "the model itself is working". Waiting on someone else
-    /// is not the model working, so the bar is dropped for those phases.
-    pub fn shows_pacman(&self) -> bool {
-        match self {
-            Self::Thinking | Self::Responding | Self::Tool(_) => true,
-            Self::WaitingAgent(_) | Self::WaitingTask(_) => false,
-        }
-    }
-
     /// Text shown after the bar. `elapsed_ms` is the age of this phase, `frame`
     /// the shared animation counter that makes the trailing dots move.
     pub fn label(&self, elapsed_ms: u64, frame: u64, glyphs: &Glyphs) -> String {
@@ -64,14 +54,6 @@ impl Phase {
                 }
             }
             Self::Tool(title) => title.clone(),
-            Self::WaitingAgent(name) => format!("waiting for agent {name}"),
-            Self::WaitingTask(n) => {
-                if *n == 1 {
-                    "waiting for a background task".to_string()
-                } else {
-                    format!("waiting for {n} background tasks")
-                }
-            }
         }
     }
 }

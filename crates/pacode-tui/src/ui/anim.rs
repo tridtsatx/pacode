@@ -149,9 +149,9 @@ fn spread_tail(lead: &str, label: &str, right: &str, width: usize) -> String {
 
 /// Renders the activity line for `phase`.
 ///
-/// The pacman bar is drawn only while the model itself is working; waiting on a
-/// subagent or a background task gets a plain line. The duration is whole seconds,
-/// so a redraw between ticks shows the same value as the tick before it.
+/// A phase exists only while the main agent's own turn is running, so the
+/// pacman bar always shows. The duration is whole seconds, so a redraw between
+/// ticks shows the same value as the tick before it.
 pub fn render_activity_line(
     frame: u64,
     opts: &RenderOptions,
@@ -168,16 +168,8 @@ pub fn render_activity_line(
             opts.theme.fg.fg(thinking_color(elapsed_ms, from, to))
         }
         Phase::Responding | Phase::Tool(_) => opts.theme.fg,
-        Phase::WaitingAgent(_) | Phase::WaitingTask(_) => opts.theme.faint,
     };
     let label = phase.label(elapsed_ms, frame, &opts.glyphs);
-
-    if !phase.shows_pacman() {
-        return Line::from(Span::styled(
-            spread_tail("", &label, &dur_str, max_line_width),
-            text_style,
-        ));
-    }
 
     let mut spans =
         if *CANDY.get_or_init(|| candy_enabled(std::env::var(CANDY_VAR).ok().as_deref())) {
@@ -376,19 +368,16 @@ mod tests {
             }
         }
 
-        // No pacman while waiting on someone else — the duration still sits
-        // at the right edge.
-        let waiting = Phase::WaitingTask(2);
-        let line = render_activity_line(0, &opts, &waiting, 5_000, 80)
+        // A tool phase reads the same bar — every phase is the main agent's
+        // own work now, so the pacman always shows.
+        let tool = Phase::Tool("bash cargo test".to_string());
+        let line = render_activity_line(0, &opts, &tool, 5_000, 80)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
         assert_eq!(display_width(&line), 80, "{line:?}");
-        assert!(
-            line.starts_with("waiting for 2 background tasks"),
-            "{line:?}"
-        );
+        assert!(line.contains("bash cargo test"), "{line:?}");
         assert!(line.ends_with("5s"), "{line:?}");
     }
 

@@ -270,7 +270,16 @@ pub struct AppState {
     pub app_version: String,
     pub meta: Option<SessionMeta>,
     pub connection: Connection,
+    /// Daemon truth only — `TurnStarted`/`TurnEnded`, a snapshot, or the
+    /// optimistic `ctrl+c` clear. Send paths never set it: the prompt queue's
+    /// send gate is `user_msgs_in_flight`, so a `UserMessage` that is rejected
+    /// or lost cannot leave this stuck `true` (which used to swallow every
+    /// later prompt into a queue that never drained).
     pub turn_active: bool,
+    /// `Request::UserMessage` sends the daemon has not answered yet — the
+    /// prompt queue's send gate (`drain_prompt_queue`). Counted out by
+    /// `dispatch_action`, counted back in when `BgResponse::Reply` arrives.
+    pub user_msgs_in_flight: usize,
     /// Main agent transcript.
     pub transcript: Transcript,
     /// Panel transcript (agent) or task output lines.
@@ -488,6 +497,7 @@ impl AppState {
             meta: None,
             connection: Connection::Connected,
             turn_active: false,
+            user_msgs_in_flight: 0,
             transcript: Transcript::new(cells),
             panel: PanelState {
                 target: None,
@@ -601,14 +611,9 @@ impl AppState {
             });
         }
 
-        // The main agent is idle: the session may still be waiting on someone else.
-        if let Some(agent) = self.rail.live_agents().next() {
-            return Some(Phase::WaitingAgent(agent.name.clone()));
-        }
-        let running = self.rail.running_task_count();
-        if running > 0 {
-            return Some(Phase::WaitingTask(running));
-        }
+        // The main agent is idle — plain idle, whoever else is still running.
+        // Live subagents and background tasks keep their rail entries and card
+        // animations; they are just not the activity line's business.
         None
     }
 
@@ -1055,19 +1060,25 @@ impl AppState {
         Some(pacode_types::Request::GetSnapshot)
     }
 
-    /// Drain the first prompt from the queue if the main agent is idle.
+    /// Drain the first queued prompt — only while the main agent is idle and
+    /// no user message is still in flight. The send gate (`user_msgs_in_flight`)
+    /// is what keeps the queue serial: a second queued prompt sent before the
+    /// first one's turn started would steer into that turn instead of getting
+    /// its own. `dispatch_action` counts a send out, `handle_bg_response`
+    /// counts its reply back in — `turn_active` itself stays daemon-truth
+    /// (`TurnStarted`/`TurnEnded`/snapshot) so a failed send can never wedge
+    /// the queue behind a phantom turn.
     pub fn drain_prompt_queue(&mut self) -> Option<pacode_types::Request> {
-        if !self.turn_active && !self.input.prompt_queue.is_empty() {
-            let text = self.input.prompt_queue.pop_front()?;
-            self.turn_active = true;
-            self.dirty = true;
-            Some(pacode_types::Request::UserMessage {
-                text,
-                images: Vec::new(),
-            })
-        } else {
-            None
+        if self.turn_active || self.user_msgs_in_flight > 0 || self.input.prompt_queue.is_empty()
+        {
+            return None;
         }
+        let text = self.input.prompt_queue.pop_front()?;
+        self.dirty = true;
+        Some(pacode_types::Request::UserMessage {
+            text,
+            images: Vec::new(),
+        })
     }
 
     /// Observe background tasks and subagents ending and record a line in the transcript.
