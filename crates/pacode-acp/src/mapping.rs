@@ -361,6 +361,10 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         Event::TurnStarted { .. }
         | Event::PermissionRequested(_)
         | Event::PermissionResolved { .. }
+        // The explanation is a display hint attached to a pending permission;
+        // ACP has no channel for it and the prompt itself is already a
+        // `session/request_permission` round-trip.
+        | Event::PermissionExplained { .. }
         | Event::AgentAdded(_)
         | Event::AgentUpdated(_)
         | Event::TaskAdded(_)

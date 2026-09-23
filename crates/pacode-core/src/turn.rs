@@ -28,7 +28,6 @@ pub(crate) mod lifecycle;
 pub(crate) mod stream;
 pub(crate) mod tools;
 
-pub(crate) use lifecycle::emit_failure_notice;
 pub use lifecycle::start_turn;
 
 use std::sync::Arc;
@@ -43,22 +42,23 @@ use crate::agent::Agent;
 use crate::prompt::DynamicContext;
 use crate::session::Session;
 
+/// Run one turn loop. `start_turn` claims `agent.turn_lock` before spawning
+/// this and holds it across the task and its post-block, so a turn always has
+/// the agent to itself. `turn_id` is minted by the caller: the supervisor needs
+/// it to emit the matching `TurnEnded` — every exit returns the stop + usage
+/// and the supervisor emits the event itself, AFTER the cancel token is
+/// cleared (an observer reacting to `TurnEnded` must never see the agent
+/// still "running"), which also covers this task dying mid-turn.
 pub async fn run_turn(
     session: Arc<Session>,
     agent: Arc<Agent>,
     cancel: CancellationToken,
-) -> TurnStop {
-    let _turn_guard = match agent.turn_lock.try_lock() {
-        Ok(g) => g,
-        Err(_) => {
-            return TurnStop::Failed {
-                message: "a turn is already running on this agent".to_string(),
-            };
-        }
-    };
+    turn_id: TurnId,
+) -> (TurnStop, Usage) {
+    // `start_turn` holds `agent.turn_lock` for the whole call — a bare
+    // `run_turn` would race that turn's cleanup, so fail loudly in debug.
+    debug_assert!(agent.turn_lock.try_lock().is_err());
 
-    let turn_id = TurnId::generate();
-    let turn_start_instant = std::time::Instant::now();
     log::info!(
         "turn start: session={} agent={} turn={}",
         session.id,
@@ -107,14 +107,7 @@ pub async fn run_turn(
     loop {
         if cancel.is_cancelled() {
             *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            return lifecycle::handle_interrupted(
-                &session,
-                &agent,
-                &turn_id,
-                turn_start_instant,
-                turn_usage,
-            )
-            .await;
+            return (lifecycle::handle_interrupted(&session, &agent), turn_usage);
         }
 
         // Fold queued injections into history BEFORE building the request: a
@@ -182,91 +175,49 @@ pub async fn run_turn(
         let provider = match provider {
             Ok(p) => p,
             Err(e) => {
-                emit_failure_notice(&session, &agent, &e.to_string());
-                let stop = TurnStop::Failed {
-                    message: e.to_string(),
-                };
-                let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
-                let output_tokens = turn_usage.output_tokens;
-                log::warn!(
-                    "turn end: session={} agent={} turn={} stop=Failed duration={}ms error={e}",
-                    session.id,
-                    agent.id(),
-                    turn_id,
-                    duration_ms
+                return (
+                    lifecycle::finish_failed_turn(&session, &agent, e.to_string()),
+                    turn_usage,
                 );
-                let _ = session
-                    .plugins
-                    .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
-                        duration_ms,
-                        output_tokens,
-                    })
-                    .await;
-                session.events.emit(Event::TurnEnded {
-                    agent: agent.id(),
-                    turn: turn_id,
-                    usage: Some(turn_usage),
-                    stop: stop.clone(),
-                });
-                return stop;
             }
         };
 
-        let stream = match provider.complete(req).await {
+        // A provider that accepted the request but never streams back must not
+        // hold the turn: cancelling here takes the same path as
+        // `outcome.interrupted` below.
+        let complete_res = tokio::select! {
+            _ = cancel.cancelled() => {
+                *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                return (
+                    lifecycle::handle_interrupted(&session, &agent),
+                    turn_usage,
+                );
+            }
+            res = provider.complete(req) => res,
+        };
+
+        let stream = match complete_res {
             Ok(s) => s,
             Err(e) => {
-                emit_failure_notice(&session, &agent, &e.to_string());
-                let stop = TurnStop::Failed {
-                    message: e.to_string(),
-                };
-                let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
-                let output_tokens = turn_usage.output_tokens;
-                log::warn!(
-                    "turn end: session={} agent={} turn={} stop=Failed duration={}ms error={e}",
-                    session.id,
-                    agent.id(),
-                    turn_id,
-                    duration_ms
+                return (
+                    lifecycle::finish_failed_turn(&session, &agent, e.to_string()),
+                    turn_usage,
                 );
-                let _ = session
-                    .plugins
-                    .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
-                        duration_ms,
-                        output_tokens,
-                    })
-                    .await;
-                session.events.emit(Event::TurnEnded {
-                    agent: agent.id(),
-                    turn: turn_id,
-                    usage: Some(turn_usage),
-                    stop: stop.clone(),
-                });
-                return stop;
             }
         };
 
         let outcome = match stream::consume_stream(&session, &agent, &cancel, stream).await {
             Ok(out) => out,
             Err(stop) => {
-                if let TurnStop::Failed { message } = &stop {
-                    emit_failure_notice(&session, &agent, message);
-                }
-                let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
-                let output_tokens = turn_usage.output_tokens;
-                let _ = session
-                    .plugins
-                    .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
-                        duration_ms,
-                        output_tokens,
-                    })
-                    .await;
-                session.events.emit(Event::TurnEnded {
-                    agent: agent.id(),
-                    turn: turn_id,
-                    usage: Some(turn_usage),
-                    stop: stop.clone(),
-                });
-                return stop;
+                // `consume_stream` yields only `Failed` today; a `Failed`
+                // still wants the notice + status exit, the rest unwinds as-is.
+                let stop = match stop {
+                    TurnStop::Failed { message } => {
+                        lifecycle::finish_failed_turn(&session, &agent, message)
+                    }
+                    TurnStop::Completed | TurnStop::Interrupted => stop,
+                };
+                return (stop, turn_usage);
             }
         };
 
@@ -274,14 +225,7 @@ pub async fn run_turn(
 
         if outcome.interrupted {
             *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            return lifecycle::handle_interrupted(
-                &session,
-                &agent,
-                &turn_id,
-                turn_start_instant,
-                turn_usage,
-            )
-            .await;
+            return (lifecycle::handle_interrupted(&session, &agent), turn_usage);
         }
 
         let mut content_blocks = Vec::new();
@@ -297,11 +241,11 @@ pub async fn run_turn(
             });
         }
 
-        for (call_id, name, input, _) in &outcome.tool_calls {
+        for call in &outcome.tool_calls {
             content_blocks.push(ContentBlock::ToolUse {
-                id: call_id.clone(),
-                name: name.clone(),
-                input: input.clone(),
+                id: call.call_id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
             });
         }
 
@@ -370,14 +314,7 @@ pub async fn run_turn(
             tools::execute_tool_calls(&session, &agent, &cancel, outcome.tool_calls).await;
         if tool_interrupted || cancel.is_cancelled() {
             *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            return lifecycle::handle_interrupted(
-                &session,
-                &agent,
-                &turn_id,
-                turn_start_instant,
-                turn_usage,
-            )
-            .await;
+            return (lifecycle::handle_interrupted(&session, &agent), turn_usage);
         }
 
         drain_injections(&session, &agent).await;
@@ -450,33 +387,9 @@ pub async fn run_turn(
         .estimated_tokens;
     session.record_usage(&agent.id(), turn_usage, context_tokens);
 
-    let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
-    let output_tokens = turn_usage.output_tokens;
-    log::info!(
-        "turn end: session={} agent={} turn={} stop=Completed duration={}ms output_tokens={output_tokens}",
-        session.id,
-        agent.id(),
-        turn_id,
-        duration_ms
-    );
-    let _ = session
-        .plugins
-        .run_hooks(&pacode_plugin::HookEvent::TurnEnd {
-            duration_ms,
-            output_tokens,
-        })
-        .await;
-
-    session.events.emit(Event::TurnEnded {
-        agent: agent.id(),
-        turn: turn_id,
-        usage: Some(turn_usage),
-        stop: TurnStop::Completed,
-    });
-
     *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
-    TurnStop::Completed
+    (TurnStop::Completed, turn_usage)
 }
 
 /// Drain queued injections into history (rendered as one user message,

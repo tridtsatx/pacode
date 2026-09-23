@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_exec::TaskSpec;
-use pacode_tools::host::{AgentKindDef, PermissionDraft};
+use pacode_tools::host::{AgentKindDef, PermissionDraft, PermissionOutcome};
 use pacode_tools::{AgentSpec, ToolError, ToolHost, WaitOutcome};
 use pacode_types::{
     AgentId, AgentInfo, CallId, ModelRoute, PermissionDecision, Plan, TaskId, TaskInfo,
@@ -25,9 +25,15 @@ impl ToolHost for SessionHost {
     /// Applies `permissions::gate` with the session mode and the draft's risk; checks
     /// the AllowSession cache; otherwise registers the request, emits
     /// `PermissionRequested` + an `ItemAdded(Permission)` item, sets the agent to
-    /// `WaitingApproval`, awaits the decision (cancel → Deny), emits
-    /// `PermissionResolved`, caches `AllowSession`.
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
+    /// `WaitingApproval`, awaits the decision (cancel → Deny + "interrupted"),
+    /// emits `PermissionResolved`, caches `AllowSession`.
+    ///
+    /// The `reason` in the outcome is `Some` whenever a `Deny` was not the
+    /// user's refusal: the gate's policy reason, `zdr_blocked: …`,
+    /// `interrupted`, `permission request aborted` (sender dropped), or a
+    /// client-supplied note from `PermissionReply`. `require_permission` uses
+    /// it to tell the model a policy deny apart from a user refusal.
+    async fn request_permission(&self, draft: PermissionDraft) -> PermissionOutcome {
         let (tool_name, kind) = {
             let session_tools = self.session.tools.read().unwrap_or_else(|p| p.into_inner());
 
@@ -73,7 +79,12 @@ impl ToolHost for SessionHost {
         if self.session.zdr_active()
             && (kind == pacode_tools::ToolKind::Network || tool_name.contains("__"))
         {
-            return PermissionDecision::Deny;
+            return PermissionOutcome {
+                decision: PermissionDecision::Deny,
+                reason: Some(format!(
+                    "zdr_blocked: {tool_name} is disabled while zero-data-retention is active"
+                )),
+            };
         }
 
         let mode = self.session.meta().mode;
@@ -81,13 +92,22 @@ impl ToolHost for SessionHost {
         let gate_decision = crate::permissions::gate(mode, kind, draft.risk, allow_catastrophic);
 
         match gate_decision {
-            crate::permissions::GateDecision::Allow => PermissionDecision::AllowOnce,
-            crate::permissions::GateDecision::Deny(_) => PermissionDecision::Deny,
+            crate::permissions::GateDecision::Allow => PermissionOutcome {
+                decision: PermissionDecision::AllowOnce,
+                reason: None,
+            },
+            crate::permissions::GateDecision::Deny(reason) => PermissionOutcome {
+                decision: PermissionDecision::Deny,
+                reason: Some(reason),
+            },
             crate::permissions::GateDecision::Ask => {
                 let target = draft.detail.lines().next().unwrap_or("").trim();
                 let cache_key = crate::permissions::session_key(&tool_name, target);
                 if self.session.permissions.is_allowed_for_session(&cache_key) {
-                    return PermissionDecision::AllowSession;
+                    return PermissionOutcome {
+                        decision: PermissionDecision::AllowSession,
+                        reason: None,
+                    };
                 }
 
                 let perm_id = pacode_types::PermissionId::generate();
@@ -128,7 +148,7 @@ impl ToolHost for SessionHost {
                     seq: item_seq,
                     agent: draft.agent.clone(),
                     ts_ms: perm_req.created_at_ms,
-                    kind: pacode_types::TranscriptKind::Permission(perm_req),
+                    kind: pacode_types::TranscriptKind::Permission(perm_req.clone()),
                 };
 
                 if let Some(agent) = &agent_opt {
@@ -162,63 +182,49 @@ impl ToolHost for SessionHost {
                     .as_ref()
                     .and_then(|a| a.cancel.lock().unwrap_or_else(|p| p.into_inner()).clone());
 
-                let decision = match cancel_token {
+                // `biased` keeps the interrupt arm in front: when the token
+                // fired AND the sender was dropped by `cancel_for_agent`, the
+                // reason is "interrupted", not "aborted" — matching the
+                // `PermissionResolved` the cancel path already emitted.
+                let (decision, reason) = match cancel_token {
                     Some(token) => {
                         tokio::select! {
+                            biased;
                             _ = token.cancelled() => {
                                 self.session.permissions.cancel(&perm_id);
-                                PermissionDecision::Deny
+                                (
+                                    PermissionDecision::Deny,
+                                    Some("interrupted".to_string()),
+                                )
                             }
-                            res = rx => res.unwrap_or(PermissionDecision::Deny),
+                            res = rx => res.unwrap_or_else(|_| {
+                                (
+                                    PermissionDecision::Deny,
+                                    Some("permission request aborted".to_string()),
+                                )
+                            }),
                         }
                     }
-                    None => rx.await.unwrap_or(PermissionDecision::Deny),
+                    None => rx.await.unwrap_or_else(|_| {
+                        (
+                            PermissionDecision::Deny,
+                            Some("permission request aborted".to_string()),
+                        )
+                    }),
                 };
 
-                self.session
-                    .events
-                    .emit(pacode_types::Event::PermissionResolved {
-                        permission: perm_id,
-                        decision,
-                    });
+                // `PermissionResolved` + the transcript Permission cell →
+                // Notice, shared with `Session::cancel_permissions_for`.
+                self.session.emit_permission_resolution(
+                    &perm_req,
+                    Some(perm_item.seq),
+                    decision,
+                    reason.clone(),
+                );
 
                 if decision == PermissionDecision::AllowSession {
                     self.session.permissions.allow_for_session(cache_key);
                 }
-
-                let (level, notice_text) = match decision {
-                    PermissionDecision::AllowOnce => (
-                        pacode_types::ToastLevel::Info,
-                        "Permission allowed".to_string(),
-                    ),
-                    PermissionDecision::AllowSession => (
-                        pacode_types::ToastLevel::Info,
-                        "Permission allowed for session".to_string(),
-                    ),
-                    PermissionDecision::Deny => (
-                        pacode_types::ToastLevel::Warn,
-                        "Permission denied".to_string(),
-                    ),
-                };
-                let notice_item = pacode_types::TranscriptItem {
-                    seq: perm_item.seq,
-                    agent: draft.agent.clone(),
-                    ts_ms: pacode_types::now_ms(),
-                    kind: pacode_types::TranscriptKind::Notice {
-                        level,
-                        text: notice_text,
-                    },
-                };
-                if let Some(agent) = &agent_opt {
-                    agent
-                        .transcript
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .upsert(notice_item.clone());
-                }
-                self.session
-                    .events
-                    .emit(pacode_types::Event::ItemUpdated(notice_item));
 
                 if let Some(agent) = &agent_opt {
                     // A stop that landed during the permission wait wins over
@@ -231,7 +237,7 @@ impl ToolHost for SessionHost {
                         .emit(pacode_types::Event::AgentUpdated(agent.info()));
                 }
 
-                decision
+                PermissionOutcome { decision, reason }
             }
         }
     }

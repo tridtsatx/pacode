@@ -315,6 +315,12 @@ fn test_unmapped_events_dropped_cleanly() {
         Event::PermissionResolved {
             permission: PermissionId::new("p"),
             decision: PermissionDecision::AllowOnce,
+            reason: None,
+        },
+        Event::PermissionExplained {
+            permission: PermissionId::new("p"),
+            text: "Deletes files.".to_string(),
+            level: Some(pacode_types::ExplainLevel::High),
         },
     ];
 
@@ -342,6 +348,7 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::InterruptAll
         | Request::UserMessage { .. }
         | Request::PermissionReply { .. }
+        | Request::ExplainPermission { .. }
         | Request::SetModel(_)
         | Request::SetEffort(_)
         | Request::SetMode(_)

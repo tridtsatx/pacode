@@ -47,8 +47,7 @@ impl Tool for StubBash {
         } else {
             RiskLevel::Confirm
         };
-        let decision = ctx
-            .host
+        ctx.host
             .request_permission(PermissionDraft {
                 agent: ctx.agent.clone(),
                 agent_name: ctx.agent_name.clone(),
@@ -59,11 +58,9 @@ impl Tool for StubBash {
                 tool_name: Some("bash".to_string()),
                 tool_kind: Some(ToolKind::Exec),
             })
-            .await;
-        match decision {
-            PermissionDecision::Deny => Err(ToolError::Denied("user denied execution".to_string())),
-            _ => Ok(ToolOutput::text("hi\n")),
-        }
+            .await
+            .into_result("user denied execution")?;
+        Ok(ToolOutput::text("hi\n"))
     }
 }
 
@@ -95,8 +92,7 @@ impl Tool for StubWrite {
             .and_then(|p| p.as_str())
             .unwrap_or("test.txt");
         let content = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        let decision = ctx
-            .host
+        ctx.host
             .request_permission(PermissionDraft {
                 agent: ctx.agent.clone(),
                 agent_name: ctx.agent_name.clone(),
@@ -107,21 +103,17 @@ impl Tool for StubWrite {
                 tool_name: Some("write".to_string()),
                 tool_kind: Some(ToolKind::Edit),
             })
-            .await;
-        match decision {
-            PermissionDecision::Deny => Err(ToolError::Denied("user denied write".to_string())),
-            _ => {
-                let file_path = ctx.cwd.join(path);
-                tokio::fs::write(&file_path, content)
-                    .await
-                    .map_err(|e| ToolError::Failed(e.to_string()))?;
-                Ok(ToolOutput::text(format!(
-                    "Wrote {} bytes to {}",
-                    content.len(),
-                    path
-                )))
-            }
-        }
+            .await
+            .into_result("user denied write")?;
+        let file_path = ctx.cwd.join(path);
+        tokio::fs::write(&file_path, content)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        Ok(ToolOutput::text(format!(
+            "Wrote {} bytes to {}",
+            content.len(),
+            path
+        )))
     }
 }
 
@@ -467,6 +459,7 @@ async fn test_03_permission_ask_in_build_mode() {
         Request::PermissionReply {
             permission: perm_id,
             decision: PermissionDecision::AllowOnce,
+            reason: None,
         },
     )
     .await;
@@ -727,4 +720,361 @@ async fn test_06_interrupt_mid_stream() {
     let messages = main_agent.history.lock().unwrap().messages.clone();
     assert!(!messages.is_empty());
     assert_eq!(messages[0].role, Role::User);
+}
+
+/// End-to-end: a tool parked on a permission prompt gets a `Deny` with the
+/// `interrupted` reason when Ctrl+C lands, the pending map is cleaned, and the
+/// turn ends `Interrupted` instead of hanging forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_during_permission_wait_denies_and_unwinds() {
+    let (core, mock, _tmp) = setup_test_core().await;
+    let cwd = _tmp.path().to_path_buf();
+
+    let session_id = core
+        .open_session(Attach::New {
+            cwd,
+            model: Some(ModelRoute {
+                provider: "mock".into(),
+                model: "mock-model".into(),
+            }),
+            effort: None,
+            mode: Some(Mode::Build),
+        })
+        .await
+        .unwrap();
+
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![(
+            "write".into(),
+            serde_json::json!({"path": "a.txt", "content": "x"}),
+        )],
+    });
+
+    let mut rx = core.subscribe(&session_id).unwrap();
+    core.handle(
+        &session_id,
+        Request::UserMessage {
+            text: "write a file".into(),
+            images: Vec::new(),
+        },
+    )
+    .await;
+
+    // Wait until the tool actually parks on the permission prompt.
+    let perm_id = {
+        let timeout = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                _ = &mut timeout => panic!("timed out waiting for permission request"),
+                res = rx.recv() => {
+                    if let Ok((_seq, Event::PermissionRequested(req))) = res {
+                        break req.id;
+                    }
+                }
+            }
+        }
+    };
+
+    core.handle(&session_id, Request::Interrupt).await;
+
+    let mut saw_resolved = false;
+    let mut saw_interrupted_end = false;
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => break,
+            res = rx.recv() => {
+                match res {
+                    Ok((_seq, Event::PermissionResolved { permission, decision, reason })) => {
+                        assert_eq!(permission, perm_id);
+                        assert_eq!(decision, PermissionDecision::Deny);
+                        assert_eq!(
+                            reason.as_deref(),
+                            Some("interrupted"),
+                            "interrupt must explain the denial"
+                        );
+                        saw_resolved = true;
+                    }
+                    Ok((_seq, Event::TurnEnded {
+                        stop: TurnStop::Interrupted,
+                        ..
+                    })) => {
+                        saw_interrupted_end = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(saw_resolved, "PermissionResolved must be emitted");
+    assert!(saw_interrupted_end, "turn must end Interrupted");
+
+    let session = core.session(&session_id).unwrap();
+    assert!(
+        session.permissions.pending().is_empty(),
+        "interrupt must clear pending permissions"
+    );
+}
+
+/// End-to-end: `ExplainPermission` answers `Reply::Ok` for a pending request,
+/// runs the model call detached, and broadcasts `Event::PermissionExplained`
+/// with the parsed level. Unknown ids error, and the explanation never
+/// resolves the permission itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_permission_runs_detached_and_broadcasts() {
+    let (core, mock, _tmp) = setup_test_core().await;
+    let cwd = _tmp.path().to_path_buf();
+
+    let session_id = core
+        .open_session(Attach::New {
+            cwd,
+            model: Some(ModelRoute {
+                provider: "mock".into(),
+                model: "mock-model".into(),
+            }),
+            effort: None,
+            mode: Some(Mode::Build),
+        })
+        .await
+        .unwrap();
+
+    // Script order: the turn's ToolCalls, then the detached explain call's
+    // LEVEL/EXPLANATION reply, then the post-tool answer.
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![(
+            "write".into(),
+            serde_json::json!({"path": "out.txt", "content": "data"}),
+        )],
+    });
+    mock.push(MockResponse::Text(
+        "LEVEL: high\nEXPLANATION: Writes a file, which can clobber existing content.".into(),
+    ));
+    mock.push(MockResponse::Text("done".into()));
+
+    let mut rx = core.subscribe(&session_id).unwrap();
+    core.handle(
+        &session_id,
+        Request::UserMessage {
+            text: "write out.txt".into(),
+            images: Vec::new(),
+        },
+    )
+    .await;
+
+    let perm_id = {
+        let timeout = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                _ = &mut timeout => panic!("timed out waiting for permission request"),
+                res = rx.recv() => {
+                    if let Ok((_seq, Event::PermissionRequested(req))) = res {
+                        break req.id;
+                    }
+                }
+            }
+        }
+    };
+
+    // Unknown or already-resolved ids fail synchronously.
+    let reply = core
+        .handle(
+            &session_id,
+            Request::ExplainPermission {
+                permission: pacode_types::PermissionId::new("perm_nope"),
+            },
+        )
+        .await;
+    assert!(
+        matches!(reply, pacode_types::Reply::Error { .. }),
+        "unknown permission id must error"
+    );
+
+    let reply = core
+        .handle(
+            &session_id,
+            Request::ExplainPermission {
+                permission: perm_id.clone(),
+            },
+        )
+        .await;
+    assert!(matches!(reply, pacode_types::Reply::Ok));
+
+    // The detached task resolves the route, calls the provider, parses the
+    // reply, and broadcasts — the test only waits on the event.
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for PermissionExplained"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::PermissionExplained { permission, text, level })) = res {
+                    assert_eq!(permission, perm_id);
+                    assert_eq!(level, Some(pacode_types::ExplainLevel::High));
+                    assert!(text.contains("clobber"), "unexpected explain text: {text}");
+                    break;
+                }
+            }
+        }
+    }
+
+    // The explain call is display-only: the permission stays pending.
+    let session = core.session(&session_id).unwrap();
+    assert_eq!(session.permissions.pending().len(), 1);
+
+    // The second recorded request is the explain call — its own system prompt,
+    // not the turn's.
+    let requests = mock.requests();
+    assert!(
+        requests[1].system_static.contains("permission explainer"),
+        "expected the explain system prompt, got: {}",
+        requests[1].system_static
+    );
+
+    core.handle(
+        &session_id,
+        Request::PermissionReply {
+            permission: perm_id,
+            decision: PermissionDecision::AllowOnce,
+            reason: None,
+        },
+    )
+    .await;
+
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { .. })) = res {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Tool-call transcript cells appear at `ToolCallStart`, stream raw args via
+/// `ItemUpdated`, and dispatch reuses the same seq — no second cell, and the
+/// tool output replaces the args preview when the call lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_call_args_stream_into_the_transcript_cell() {
+    let (core, mock, _tmp) = setup_test_core().await;
+    let cwd = _tmp.path().to_path_buf();
+
+    let session_id = core
+        .open_session(Attach::New {
+            cwd,
+            model: Some(ModelRoute {
+                provider: "mock".into(),
+                model: "mock-model".into(),
+            }),
+            effort: None,
+            mode: Some(Mode::Bypass),
+        })
+        .await
+        .unwrap();
+
+    // >256 bytes of args: the coalescer flushes inside the delta arm, so an
+    // `ItemUpdated` lands mid-stream rather than only at dispatch.
+    let command = format!("echo {}", "x".repeat(300));
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("bash".into(), serde_json::json!({ "command": command }))],
+    });
+    mock.push(MockResponse::Text("done".into()));
+
+    let mut rx = core.subscribe(&session_id).unwrap();
+    core.handle(
+        &session_id,
+        Request::UserMessage {
+            text: "run bash".into(),
+            images: Vec::new(),
+        },
+    )
+    .await;
+
+    // (added?, item seq, status, title, preview) per ToolCall cell event.
+    let mut cell_events: Vec<(bool, u64, ToolStatus, String, String)> = Vec::new();
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for turn end"),
+            res = rx.recv() => {
+                let (_seq, event) = res.unwrap();
+                let is_added = matches!(event, Event::ItemAdded(_));
+                match event {
+                    Event::ItemAdded(item) | Event::ItemUpdated(item) => {
+                        if let TranscriptKind::ToolCall {
+                            status, title, preview, ..
+                        } = &item.kind
+                        {
+                            cell_events.push((
+                                is_added,
+                                item.seq,
+                                *status,
+                                title.clone(),
+                                preview.clone(),
+                            ));
+                        }
+                    }
+                    Event::TurnEnded { .. } => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let (added, first_seq, status, title, preview) = &cell_events[0];
+    assert!(*added, "the cell arrives via ItemAdded at ToolCallStart");
+    assert_eq!(*status, ToolStatus::Running);
+    assert_eq!(
+        title.as_str(),
+        "bash",
+        "title is the tool name until args parse"
+    );
+    assert!(preview.is_empty(), "no args have streamed yet");
+
+    // Every later cell event reuses the same seq: dispatch emits
+    // ItemUpdated, never a second ItemAdded.
+    assert_eq!(cell_events.iter().filter(|(added, ..)| *added).count(), 1);
+    assert!(cell_events.iter().all(|(_, seq, ..)| seq == first_seq));
+
+    // Mid-stream: a Running update whose preview is the raw args JSON.
+    assert!(
+        cell_events
+            .iter()
+            .any(|(added, _, status, title, preview)| {
+                !*added
+                    && *status == ToolStatus::Running
+                    && title == "bash"
+                    && preview.contains("\"command\"")
+            }),
+        "args deltas must update the cell preview while Running"
+    );
+
+    // Dispatch: real title (args-derived), still Running, args preview kept.
+    assert!(
+        cell_events
+            .iter()
+            .any(|(added, _, status, title, preview)| {
+                !*added
+                    && *status == ToolStatus::Running
+                    && title.starts_with("bash echo")
+                    && preview.contains("\"command\"")
+            }),
+        "dispatch must refresh the title on the same cell"
+    );
+
+    // Final: the tool output replaces the args preview.
+    let (_, _, status, _, preview) = cell_events.last().unwrap();
+    assert_eq!(*status, ToolStatus::Ok);
+    assert_eq!(preview.as_str(), "hi\n");
 }

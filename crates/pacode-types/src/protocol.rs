@@ -28,8 +28,9 @@ use crate::vcs::{CommitRow, GitStatus};
 /// Bumped on any wire-visible change: v2 added `SetZdr`/`SetModelFlag`,
 /// `SessionMeta.zdr` and `ModelInfo.supported_efforts`; v3 added the git
 /// requests (`GitLog`, `GitShow`, `GitDiff`) and their replies; v4 adds
-/// `RefreshModels` + the `ModelsUpdated` broadcast.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// `RefreshModels` + the `ModelsUpdated` broadcast; v5 adds
+/// `ExplainPermission` + the `PermissionExplained` broadcast.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -81,6 +82,18 @@ pub enum Request {
     PermissionReply {
         permission: PermissionId,
         decision: PermissionDecision,
+        /// Optional note attached to a `Deny` (e.g. why the call was refused);
+        /// reaches the model and the transcript verbatim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Ask the daemon to explain a pending permission: a detached one-shot
+    /// model call describes the gated tool call and rates its danger. The
+    /// reply is `Reply::Ok` once the task is accepted (or `Reply::Error` when
+    /// the id is unknown/already resolved); the result arrives later as
+    /// `Event::PermissionExplained` and never changes the decision itself.
+    ExplainPermission {
+        permission: PermissionId,
     },
     SetModel(ModelRoute),
     SetEffort(Effort),
@@ -235,6 +248,7 @@ impl Request {
             Request::Interrupt => "interrupt",
             Request::InterruptAll => "interrupt_all",
             Request::PermissionReply { .. } => "permission_reply",
+            Request::ExplainPermission { .. } => "explain_permission",
             Request::SetModel(_) => "set_model",
             Request::SetEffort(_) => "set_effort",
             Request::SetMode(_) => "set_mode",
@@ -546,6 +560,35 @@ pub enum Reply {
     },
 }
 
+/// Danger rating a model assigns to a pending permission call. Display-only:
+/// it colors the cell in the UI and is NEVER consulted by the permission
+/// gate — the decision stays with the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainLevel {
+    /// The model declined to rate, or rated the call harmless.
+    None,
+    Low,
+    Medium,
+    High,
+    Catastrophic,
+}
+
+impl ExplainLevel {
+    /// Parse the model's `LEVEL:` line value; anything unrecognized is `None`
+    /// (the UI shows no badge rather than a wrong one).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "catastrophic" => Some(Self::Catastrophic),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnStop {
@@ -587,6 +630,21 @@ pub enum Event {
     PermissionResolved {
         permission: PermissionId,
         decision: PermissionDecision,
+        /// Why a `Deny` landed when it was not a plain user refusal (policy
+        /// reason, `zdr_blocked: …`, `interrupted`, or a client note).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// The detached explanation requested by `Request::ExplainPermission`
+    /// landed. `level` is display-only — it never feeds the permission gate;
+    /// `None` means the model's rating was missing or unparseable. `text`
+    /// carries the explanation, or an honest `explain failed: …`/`explain
+    /// unavailable …` note so the client never waits forever.
+    PermissionExplained {
+        permission: PermissionId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level: Option<ExplainLevel>,
     },
     PlanUpdated(Plan),
     AgentAdded(AgentInfo),
@@ -762,5 +820,59 @@ mod tests {
         assert!(json.contains("\"type\":\"interrupt_all\""));
         let back: Envelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back, env);
+    }
+
+    #[test]
+    fn explain_permission_round_trip() {
+        let env = Envelope {
+            id: 13,
+            req: Request::ExplainPermission {
+                permission: PermissionId::new("perm_42"),
+            },
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"explain_permission\""));
+        assert!(json.contains("\"permission\":\"perm_42\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, env);
+    }
+
+    #[test]
+    fn permission_explained_round_trip() {
+        let event = Event::PermissionExplained {
+            permission: PermissionId::new("perm_7"),
+            text: "Deletes files recursively.".to_string(),
+            level: Some(ExplainLevel::High),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "permission_explained");
+        assert_eq!(json["level"], "high");
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back, event);
+
+        // A missing level stays absent on the wire and reads back as `None`.
+        let event = Event::PermissionExplained {
+            permission: PermissionId::new("perm_8"),
+            text: "explain unavailable under zero-data-retention".to_string(),
+            level: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("level").is_none());
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back, event);
+    }
+
+    #[test]
+    fn explain_level_parses_all_variants() {
+        assert_eq!(ExplainLevel::parse("none"), Some(ExplainLevel::None));
+        assert_eq!(ExplainLevel::parse("low"), Some(ExplainLevel::Low));
+        assert_eq!(ExplainLevel::parse("Medium"), Some(ExplainLevel::Medium));
+        assert_eq!(ExplainLevel::parse(" HIGH "), Some(ExplainLevel::High));
+        assert_eq!(
+            ExplainLevel::parse("catastrophic"),
+            Some(ExplainLevel::Catastrophic)
+        );
+        assert_eq!(ExplainLevel::parse("bogus"), None);
+        assert_eq!(ExplainLevel::parse(""), None);
     }
 }

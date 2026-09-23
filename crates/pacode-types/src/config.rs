@@ -537,6 +537,9 @@ impl Default for ContextConfig {
 pub struct PermissionsConfig {
     pub default_mode: Mode,
     pub allow_catastrophic: bool,
+    /// `provider/model` for permission explanations (the `e` key on a pending
+    /// permission); default: the session's own model.
+    pub explain_model: Option<String>,
 }
 
 impl Default for PermissionsConfig {
@@ -544,6 +547,7 @@ impl Default for PermissionsConfig {
         Self {
             default_mode: Mode::Build,
             allow_catastrophic: false,
+            explain_model: None,
         }
     }
 }

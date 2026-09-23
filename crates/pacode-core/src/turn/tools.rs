@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
 use crate::session::Session;
+use crate::turn::stream::PendingToolCall;
 
 struct ToolCallInfo {
     call_id: CallId,
@@ -53,6 +54,21 @@ pub(crate) const TITLE_KEYS: &[&str] = &[
 
 fn tool_title(name: &str, input: &serde_json::Value) -> String {
     crate::transcript::tool_title(name, input, TITLE_KEYS)
+}
+
+/// `Denied: <first sentence of the reason>` — one bounded line for the cell
+/// preview so a long policy/hook note cannot stretch the row.
+fn denied_preview(reason: &str) -> String {
+    let first_sentence = reason
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split(". ")
+        .next()
+        .unwrap_or("")
+        .trim();
+    let short: String = first_sentence.chars().take(80).collect();
+    format!("Denied: {short}")
 }
 
 async fn run_single_tool(
@@ -192,7 +208,7 @@ async fn run_single_tool(
         (
             format!("Permission denied: {reason}"),
             true,
-            "Denied".to_string(),
+            denied_preview(&reason),
             None,
             None,
             ToolStatus::Denied,
@@ -207,14 +223,8 @@ async fn run_single_tool(
             ToolStatus::Denied,
         )
     } else if let Some(reason) = zdr_block {
-        (
-            reason,
-            true,
-            "Denied".to_string(),
-            None,
-            None,
-            ToolStatus::Denied,
-        )
+        let preview = denied_preview(&reason);
+        (reason, true, preview, None, None, ToolStatus::Denied)
     } else if let Some(err) = call.parse_err {
         (
             format!("Invalid JSON arguments: {err}"),
@@ -302,7 +312,7 @@ async fn run_single_tool(
                     Err(pacode_tools::ToolError::Denied(reason)) => (
                         format!("Permission denied: {reason}"),
                         true,
-                        "Denied".to_string(),
+                        denied_preview(&reason),
                         None,
                         None,
                         ToolStatus::Denied,
@@ -393,32 +403,61 @@ async fn run_single_tool(
     ToolExecutionStatus::Ok
 }
 
+/// The preview the streamed cell already shows (raw args so far), kept across
+/// the dispatch refresh so the row does not blink empty before the tool lands.
+/// Empty when the cell is missing or belongs to a different seq.
+fn streamed_args_preview(agent: &Agent, call_id: &CallId, seq: u64) -> String {
+    agent
+        .transcript
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .tool_item(call_id)
+        .and_then(|item| match &item.kind {
+            TranscriptKind::ToolCall { preview, .. } if item.seq == seq => Some(preview.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 pub async fn execute_tool_calls(
     session: &Arc<Session>,
     agent: &Arc<Agent>,
     cancel: &CancellationToken,
-    tool_calls: Vec<(CallId, String, serde_json::Value, Option<String>)>,
+    tool_calls: Vec<PendingToolCall>,
 ) -> bool {
     let mut prepared_calls = Vec::new();
-    for (call_id, name, input, parse_err) in tool_calls {
-        let title = tool_title(&name, &input);
-        let intent = pacode_tools::intent_of(&input);
-        let item_seq = agent
-            .transcript
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .next_seq();
+    for call in tool_calls {
+        let title = tool_title(&call.name, &call.input);
+        let intent = pacode_tools::intent_of(&call.input);
+        // Calls the stream announced at `ToolCallStart` already have a cell
+        // (its preview shows the raw args): refresh it in place — real
+        // title/intent now, the args preview stays until the tool output
+        // replaces it. A call that arrived without a start event gets a fresh
+        // cell. On a JSON parse error the existing cell is updated to
+        // "Invalid JSON" by `run_single_tool` — no second cell appears.
+        let (item_seq, preview, streamed) = match call.item_seq {
+            Some(seq) => (seq, streamed_args_preview(agent, &call.call_id, seq), true),
+            None => (
+                agent
+                    .transcript
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .next_seq(),
+                String::new(),
+                false,
+            ),
+        };
         let item = TranscriptItem {
             seq: item_seq,
             agent: agent.id(),
             ts_ms: pacode_types::now_ms(),
             kind: TranscriptKind::ToolCall {
-                call_id: call_id.clone(),
-                name: name.clone(),
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
                 title: title.clone(),
                 intent: intent.clone(),
                 status: ToolStatus::Running,
-                preview: String::new(),
+                preview,
                 diff: None,
                 duration_ms: None,
                 task: None,
@@ -429,13 +468,17 @@ pub async fn execute_tool_calls(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .upsert(item.clone());
-        session.events.emit(Event::ItemAdded(item));
+        if streamed {
+            session.events.emit(Event::ItemUpdated(item));
+        } else {
+            session.events.emit(Event::ItemAdded(item));
+        }
 
         prepared_calls.push(ToolCallInfo {
-            call_id,
-            name,
-            input,
-            parse_err,
+            call_id: call.call_id,
+            name: call.name,
+            input: call.input,
+            parse_err: call.parse_err,
             item_seq,
             title,
             intent,

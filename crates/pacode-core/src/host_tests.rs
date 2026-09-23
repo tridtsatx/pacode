@@ -443,13 +443,24 @@ mod zdr {
         let net = host
             .request_permission(draft("webfetch", ToolKind::Network))
             .await;
-        assert_eq!(net, PermissionDecision::Deny, "network tool must be denied");
+        assert_eq!(
+            net.decision,
+            PermissionDecision::Deny,
+            "network tool must be denied"
+        );
+        assert!(
+            net.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("zdr_blocked")),
+            "zdr deny must carry its reason, got {:?}",
+            net.reason
+        );
 
         let mcp = host
             .request_permission(draft("remote__query", ToolKind::Exec))
             .await;
         assert_eq!(
-            mcp,
+            mcp.decision,
             PermissionDecision::Deny,
             "mcp server__tool must be denied"
         );
@@ -459,7 +470,7 @@ mod zdr {
             .request_permission(draft("read", ToolKind::ReadOnly))
             .await;
         assert_eq!(
-            fs,
+            fs.decision,
             PermissionDecision::AllowOnce,
             "fs tool must stay allowed under ZDR"
         );
@@ -540,6 +551,6 @@ mod zdr {
         let net = host
             .request_permission(draft("webfetch", ToolKind::Network))
             .await;
-        assert_eq!(net, PermissionDecision::AllowOnce);
+        assert_eq!(net.decision, PermissionDecision::AllowOnce);
     }
 }

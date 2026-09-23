@@ -7,12 +7,40 @@ use pacode_mcp::McpPool;
 use pacode_provider::ProviderRegistry;
 use pacode_provider::mock::{MockProvider, MockResponse};
 use pacode_store::Store;
-use pacode_tools::ToolRegistry;
+use pacode_tools::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, ToolRegistry};
 use pacode_types::{
-    AgentId, AgentStatus, Attach, Config, Effort, Event, ModelRoute, Reply, Request, Role, TurnStop,
+    AgentId, AgentStatus, Attach, Config, Effort, Event, ModelRoute, Reply, Request, Role, TurnId,
+    TurnStop,
 };
 
 use crate::core::{Core, CoreDeps};
+
+/// A tool that panics inside `call` — exercises the turn-task supervisor: a
+/// panic in `run_turn` must still clear the cancel token, land a terminal
+/// status and emit `TurnEnded` instead of leaving the agent "running" forever.
+struct PanicTool;
+#[async_trait::async_trait]
+impl Tool for PanicTool {
+    fn name(&self) -> &'static str {
+        "panic_tool"
+    }
+    fn description(&self) -> &'static str {
+        "Panics on call (test fixture)"
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        panic!("intentional test panic in panic_tool");
+    }
+}
 
 async fn setup_test_session() -> (
     Arc<Core>,
@@ -48,7 +76,8 @@ async fn setup_test_session() -> (
     config.agents.max_live = 2;
 
     let paths = Paths::under(temp_dir.path());
-    let tools = ToolRegistry::new();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(PanicTool));
 
     let deps = CoreDeps {
         marketplace: std::sync::Arc::new(pacode_plugin::marketplace::Marketplace::new(
@@ -1035,4 +1064,406 @@ fn restored_transcript_items_do_not_collide_with_new_ones() {
         state.tail.iter().all(|item| item.seq < next),
         "a new item must not reuse a restored seq"
     );
+}
+
+/// Ctrl+C while a permission prompt is still pending must resolve it like a
+/// denial: the entry leaves the pending map (a later live request is not
+/// shadowed by a stale one), the waiter resolves to `Deny`, the transcript
+/// cell flips to the outcome notice, and `PermissionResolved` carries the
+/// `interrupted` reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_denies_pending_permission() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    let main = session.main_agent().unwrap();
+    let req = pacode_types::PermissionRequest {
+        id: pacode_types::PermissionId::generate(),
+        agent: AgentId::main(),
+        agent_name: "main".into(),
+        call_id: pacode_types::CallId::new("call_test"),
+        tool: "bash".into(),
+        title: "Bash: rm -rf ~".into(),
+        detail: "rm -rf ~".into(),
+        risk: None,
+        created_at_ms: pacode_types::now_ms(),
+    };
+    let waiter = session.permissions.register(req.clone());
+    let seq = main
+        .transcript
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_seq();
+    main.transcript
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upsert(pacode_types::TranscriptItem {
+            seq,
+            agent: AgentId::main(),
+            ts_ms: req.created_at_ms,
+            kind: pacode_types::TranscriptKind::Permission(req.clone()),
+        });
+
+    session.interrupt();
+
+    // The pending map is clean and the parked waiter is released.
+    assert!(session.permissions.pending().is_empty());
+    assert!(
+        waiter.await.is_err(),
+        "dropped sender resolves the waiter to Deny"
+    );
+
+    // The transcript Permission cell flipped to the interrupted-denial notice.
+    {
+        let transcript = main.transcript.lock().unwrap_or_else(|p| p.into_inner());
+        let item = transcript
+            .tail
+            .iter()
+            .find(|i| i.seq == seq)
+            .expect("permission cell must still be in the tail");
+        match &item.kind {
+            pacode_types::TranscriptKind::Notice { text, .. } => {
+                assert_eq!(text, "Permission denied: interrupted");
+            }
+            other => panic!("permission cell must become a notice, got {other:?}"),
+        }
+    }
+
+    // The wire event says Deny + why.
+    let timeout = tokio::time::sleep(Duration::from_secs(2));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("no PermissionResolved emitted"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::PermissionResolved { permission, decision, reason })) = res {
+                    assert_eq!(permission, req.id);
+                    assert_eq!(decision, pacode_types::PermissionDecision::Deny);
+                    assert_eq!(reason.as_deref(), Some("interrupted"));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// A prompt sent while Ctrl+C unwinds the turn lands in `agent.injections`
+/// (the agent still reads as running). The dying turn never drains it, so it
+/// used to be orphaned until the next user message: the turn must re-drive
+/// once, draining the queued steer.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_redrives_queued_steer() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    // Turn 1 streams slowly; while it runs we queue a steer and interrupt.
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(400),
+        text: "first answer".into(),
+    });
+    session.submit_user_message("first".into()).await.unwrap();
+
+    // Give the turn a moment to enter the stream, then queue the steer (the
+    // agent is still running, so this becomes an Injection::UserSteer) and
+    // interrupt.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    session.submit_user_message("second".into()).await.unwrap();
+    let reply = core.handle(&session_id, Request::Interrupt).await;
+    assert!(matches!(reply, Reply::Ok));
+
+    // The re-driven turn's provider call.
+    mock.push(MockResponse::Text("after steer".into()));
+
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+    let mut ends: Vec<TurnStop> = Vec::new();
+    loop {
+        tokio::select! {
+            _ = &mut timeout => break,
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, stop, .. })) = res
+                    && agent.is_main()
+                {
+                    ends.push(stop);
+                    if ends.len() >= 2 { break; }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        ends,
+        vec![TurnStop::Interrupted, TurnStop::Completed],
+        "the queued steer must re-drive the turn after the interrupt"
+    );
+
+    // The steer reached the model: some request carries the injected message.
+    let saw_steer = mock.requests().iter().any(|r| {
+        r.messages
+            .iter()
+            .any(|m| m.text().contains("<user_message>second</user_message>"))
+    });
+    assert!(saw_steer, "queued steer must reach the provider");
+}
+
+/// A provider failure on the main agent ends the turn `Failed` and lands the
+/// agent back at `Idle` — before the fix the status stayed live (`Thinking`)
+/// forever even though no turn was running.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_turn_on_main_lands_idle() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    mock.push(MockResponse::Error("provider blew up".into()));
+    session.submit_user_message("go".into()).await.unwrap();
+
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for failed turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, stop, .. })) = res
+                    && agent.is_main()
+                {
+                    match stop {
+                        TurnStop::Failed { message } => {
+                            assert!(message.contains("provider blew up"), "got: {message}");
+                        }
+                        other => panic!("expected Failed, got {other:?}"),
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let main = session.main_agent().unwrap();
+    wait_until(|| !main.is_running()).await;
+    assert_eq!(main.status(), AgentStatus::Idle);
+}
+
+/// The same failure on a subagent must stamp `Failed` with the error recorded
+/// (not a fake `Finished` ✓) and still notify the parent — the orchestrator
+/// may be parked waiting for the report.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_turn_on_subagent_lands_failed_and_reports_parent() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    // The subagent's provider call fails; the parent's re-driven turn gets a
+    // plain reply.
+    mock.push(MockResponse::Error("provider blew up".into()));
+    mock.push(MockResponse::Text("noted".into()));
+
+    let sub_id = session.spawn_agent(sub_spec("sub")).await.unwrap();
+
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for subagent turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, stop, .. })) = res
+                    && agent == sub_id
+                {
+                    match stop {
+                        TurnStop::Failed { message } => {
+                            assert!(message.contains("provider blew up"), "got: {message}");
+                        }
+                        other => panic!("expected Failed, got {other:?}"),
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let sub = session.agent(&sub_id).unwrap();
+    wait_until(|| !sub.is_running() && sub.status() == AgentStatus::Failed).await;
+    let info = sub.info();
+    assert_eq!(info.status, AgentStatus::Failed);
+    assert!(
+        info.error
+            .as_deref()
+            .is_some_and(|e| e.contains("provider blew up")),
+        "subagent error must be recorded, got: {:?}",
+        info.error
+    );
+    assert!(
+        info.summary.is_none(),
+        "a failed subagent must not get a fake summary"
+    );
+
+    // The parent is re-driven with the failure report.
+    wait_until(|| {
+        mock.requests().iter().any(|r| {
+            r.messages.iter().any(|m| {
+                m.text().contains("<agent_finished") && m.text().contains("subagent failed")
+            })
+        })
+    })
+    .await;
+}
+
+/// A panic inside the turn task (here: a tool that panics) is supervised:
+/// the cancel token is cleared, the main agent lands `Failed`, and a
+/// `TurnEnded` carrying the same `turn_id` as `TurnStarted` is still emitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn panicking_tool_turn_on_main_is_supervised() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("panic_tool".into(), serde_json::json!({}))],
+    });
+    session.submit_user_message("go".into()).await.unwrap();
+
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    let mut started_turn: Option<TurnId> = None;
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for crashed turn end"),
+            res = rx.recv() => {
+                match res {
+                    Ok((_seq, Event::TurnStarted { agent, turn })) if agent.is_main() => {
+                        started_turn = Some(turn);
+                    }
+                    Ok((_seq, Event::TurnEnded { agent, turn, stop, .. })) if agent.is_main() => {
+                        match stop {
+                            TurnStop::Failed { message } => {
+                                assert!(message.contains("panicked"), "got: {message}");
+                            }
+                            other => panic!("expected Failed, got {other:?}"),
+                        }
+                        assert_eq!(
+                            Some(turn),
+                            started_turn,
+                            "the synthesized TurnEnded must carry the started turn's id"
+                        );
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let main = session.main_agent().unwrap();
+    wait_until(|| !main.is_running()).await;
+    assert_eq!(main.status(), AgentStatus::Failed);
+    assert!(
+        main.info()
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("panicked")),
+        "panic must be recorded on the agent info"
+    );
+}
+
+/// A panicking subagent turn: the supervisor clears the token, the post-block
+/// stamps `Failed` (not `Finished`) and the parent still gets its report.
+#[tokio::test(flavor = "multi_thread")]
+async fn panicking_tool_turn_on_subagent_is_supervised_and_reports_parent() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("panic_tool".into(), serde_json::json!({}))],
+    });
+    // The parent's re-driven turn after the crash report lands.
+    mock.push(MockResponse::Text("acknowledged".into()));
+
+    let sub_id = session.spawn_agent(sub_spec("sub")).await.unwrap();
+
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for crashed subagent turn end"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, stop, .. })) = res
+                    && agent == sub_id
+                {
+                    match stop {
+                        TurnStop::Failed { message } => {
+                            assert!(message.contains("panicked"), "got: {message}");
+                        }
+                        other => panic!("expected Failed, got {other:?}"),
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let sub = session.agent(&sub_id).unwrap();
+    wait_until(|| !sub.is_running() && sub.status() == AgentStatus::Failed).await;
+    assert!(
+        sub.info()
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("panicked")),
+        "panic must be recorded on the subagent info"
+    );
+
+    // The parent's next request must carry the failure report — the
+    // orchestrator would otherwise wait on the subagent forever.
+    wait_until(|| {
+        mock.requests().iter().any(|r| {
+            r.messages.iter().any(|m| {
+                let t = m.text();
+                t.contains("<agent_finished")
+                    && t.contains("subagent failed")
+                    && t.contains("panicked")
+            })
+        })
+    })
+    .await;
+}
+
+/// `handle_interrupted` mapping: the main agent rests at `Idle`, but a
+/// subagent has no resting live state — interrupted without a stop request it
+/// must land `Stopped` (terminal, resumable) instead of a permanent fake
+/// "live" `Idle`.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_subagent_without_stop_request_lands_stopped() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+
+    // Let the spawned turn end fast (provider error → Failed post-block) so
+    // the direct `handle_interrupted` call exercises the mapping cleanly.
+    mock.push(MockResponse::Error("sub turn over".into()));
+    mock.push(MockResponse::Text("parent noted".into()));
+
+    let sub_id = session.spawn_agent(sub_spec("sub")).await.unwrap();
+    let sub = session.agent(&sub_id).unwrap();
+    wait_until(|| !sub.is_running() && sub.status() == AgentStatus::Failed).await;
+
+    let stop = crate::turn::lifecycle::handle_interrupted(&session, &sub);
+    assert_eq!(stop, TurnStop::Interrupted);
+    assert_eq!(
+        sub.status(),
+        AgentStatus::Stopped,
+        "a subagent interrupted without a stop request must not sit at live `Idle`"
+    );
+
+    // With the stop flag raised it stays `Stopped` too (the pre-existing path).
+    sub.request_stop();
+    let stop = crate::turn::lifecycle::handle_interrupted(&session, &sub);
+    assert_eq!(stop, TurnStop::Interrupted);
+    assert_eq!(sub.status(), AgentStatus::Stopped);
+
+    let main = session.main_agent().unwrap();
+    let stop = crate::turn::lifecycle::handle_interrupted(&session, &main);
+    assert_eq!(stop, TurnStop::Interrupted);
+    assert_eq!(main.status(), AgentStatus::Idle);
 }

@@ -112,6 +112,9 @@ impl SessionState {
                             .ok(Request::PermissionReply {
                                 permission: perm.id.clone(),
                                 decision,
+                                // ACP deny/cancel carries no note: a plain
+                                // user refusal.
+                                reason: None,
                             })
                             .await?;
                         continue;

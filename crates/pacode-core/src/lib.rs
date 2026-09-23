@@ -21,6 +21,7 @@ pub mod auth;
 pub mod compaction;
 pub mod core;
 pub mod expand;
+pub mod explain;
 pub mod hooks;
 pub mod host;
 pub mod inject;

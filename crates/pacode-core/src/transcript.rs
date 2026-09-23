@@ -86,6 +86,22 @@ impl TranscriptState {
         })
     }
 
+    /// Seq of the item carrying the `Permission` cell for `id`, while it is
+    /// still in the tail — the mirror of `find_question_seq`, used when a
+    /// pending permission is cancelled without its waiter (interrupt/stop).
+    pub fn find_permission_seq(&self, id: &pacode_types::PermissionId) -> Option<u64> {
+        self.tail.iter().rev().find_map(|item| match &item.kind {
+            pacode_types::TranscriptKind::Permission(req) if &req.id == id => Some(item.seq),
+            _ => None,
+        })
+    }
+
+    /// The latest `ToolCall` item for `call_id`, if any — the cell the stream
+    /// created at `ToolCallStart` and dispatch updates in place.
+    pub fn tool_item(&self, call_id: &CallId) -> Option<&TranscriptItem> {
+        self.tool_items.get(call_id)
+    }
+
     /// Insert or replace (same seq) in the tail, evicting the oldest past the cap.
     pub fn upsert(&mut self, item: TranscriptItem) {
         let mut replaced = false;

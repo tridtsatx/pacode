@@ -243,13 +243,28 @@ impl Core {
             Request::PermissionReply {
                 permission,
                 decision,
+                reason,
             } => {
-                if session.resolve_permission(&permission, decision) {
+                if session.resolve_permission(&permission, decision, reason) {
                     Reply::Ok
                 } else {
                     Reply::Error {
                         message: "unknown permission request".to_string(),
                     }
+                }
+            }
+            Request::ExplainPermission { permission } => {
+                match session.permissions.get(&permission) {
+                    Some(req) => {
+                        // Accepted: the model call runs detached — this handler
+                        // must not wait on an LLM round-trip. The result is
+                        // broadcast as `Event::PermissionExplained`.
+                        crate::explain::spawn(session.clone(), req);
+                        Reply::Ok
+                    }
+                    None => Reply::Error {
+                        message: "unknown permission request".to_string(),
+                    },
                 }
             }
             Request::SetModel(route) => match session.set_model(route).await {

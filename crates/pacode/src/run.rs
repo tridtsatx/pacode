@@ -148,6 +148,13 @@ async fn run_headless(opts: RunOptions) {
                         let reply = Request::PermissionReply {
                             permission: req.id.clone(),
                             decision: PermissionDecision::Deny,
+                            // Headless has nobody to answer the prompt — tell
+                            // the model so it does not read this as a refusal
+                            // it can retry past.
+                            reason: Some(
+                                "permission prompts are auto-denied in headless `pacode run`"
+                                    .to_string(),
+                            ),
                         };
                         let _ = client.request(reply).await;
                     }

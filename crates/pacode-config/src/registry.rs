@@ -194,6 +194,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     // permissions
     SettingEntry { dotted_key: "permissions.default_mode", label: "Default Permission Mode", description: "Default mode: build, auto, plan, or bypass", section: "permissions", default_value: "build", kind: SettingKind::Enum { options: PERM_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "permissions.allow_catastrophic", label: "Allow Catastrophic", description: "Allow destructive commands without prompt in bypass mode", section: "permissions", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "permissions.explain_model", label: "Permission Explain Model", description: "Model for permission explanations (default: session model)", section: "permissions", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
 
     // mcp
     SettingEntry { dotted_key: "mcp.servers", label: "MCP Servers", description: "Configured MCP servers (manage with /mcp or /import)", section: "mcp", default_value: "/mcp", kind: SettingKind::Action { command: "/mcp" }, apply: ApplyMode::Restart },
@@ -358,6 +359,9 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "context.default_context_window" => Some(config.context.default_context_window.to_string()),
         "permissions.default_mode" => Some(config.permissions.default_mode.as_str().to_string()),
         "permissions.allow_catastrophic" => Some(config.permissions.allow_catastrophic.to_string()),
+        "permissions.explain_model" => {
+            Some(config.permissions.explain_model.clone().unwrap_or_default())
+        }
         "mcp.servers" => Some(format!("{} servers (/mcp)", config.mcp.servers.len())),
         "mcp.sampling" => Some(config.mcp.sampling.to_string()),
         "mcp.sampling_max_tokens" => Some(config.mcp.sampling_max_tokens.to_string()),
@@ -792,6 +796,12 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "permissions.allow_catastrophic" => {
             if let toml::Value::Boolean(b) = value {
                 config.permissions.allow_catastrophic = *b;
+            }
+        }
+        "permissions.explain_model" => {
+            if let toml::Value::String(s) = value {
+                config.permissions.explain_model =
+                    if s.is_empty() { None } else { Some(s.clone()) };
             }
         }
         "mcp.sampling" => {

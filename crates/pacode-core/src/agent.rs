@@ -58,15 +58,22 @@ pub struct Agent {
     pub injections: InjectionQueue,
     /// Tools this agent may call (main: all; subagent: subset without `agent`).
     pub tools: RwLock<ToolRegistry>,
-    /// Cancellation token of the running turn, if any.
+    /// Cancellation token of the running turn, if any. Bookkeeping for the
+    /// interrupt paths — `is_running` derives from `turn_lock` instead, so the
+    /// whole post-block counts as "running" and a racing `start_turn` can
+    /// never observe a turn-ended-but-still-locked gap.
     pub cancel: Mutex<Option<CancellationToken>>,
     /// Set by `stop_agent`/`interrupt_all`/`close_session` BEFORE the token is
     /// cancelled; the unwinding turn reads it to keep `Stopped` and skip the
     /// finished-report path. Survives status flaps mid-unwind. Cleared by
     /// `Session::continue_agent`.
     pub stop_requested: std::sync::atomic::AtomicBool,
-    /// One turn at a time.
-    pub turn_lock: tokio::sync::Mutex<()>,
+    /// One turn at a time — and what `is_running` reads. `Arc` so
+    /// `start_turn` can claim it with an owned guard and move it into the
+    /// supervisor task, which holds it across the spawned turn's whole
+    /// lifetime: run, token cleanup, `TurnEnded` emission, and the post-block
+    /// (re-drive check + terminal landing).
+    pub turn_lock: Arc<tokio::sync::Mutex<()>>,
     pub transcript: Mutex<TranscriptState>,
     /// The prompt a subagent was spawned with (persisted).
     pub prompt: RwLock<Option<String>>,
@@ -95,7 +102,7 @@ impl Agent {
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
-            turn_lock: tokio::sync::Mutex::new(()),
+            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             transcript: Mutex::new(TranscriptState::new(history_page as usize * 2)),
             prompt: RwLock::new(prompt),
             turns: Mutex::new(0),
@@ -120,7 +127,7 @@ impl Agent {
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
-            turn_lock: tokio::sync::Mutex::new(()),
+            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             transcript: Mutex::new(transcript),
             prompt: RwLock::new(prompt),
             turns: Mutex::new(0),
@@ -179,8 +186,14 @@ impl Agent {
         self.info().status
     }
 
+    /// A turn (or its post-block) currently owns this agent: `start_turn`'s
+    /// supervisor holds `turn_lock` for the whole lifecycle, so "running" ==
+    /// "the lock is taken". Because refusal to start and `is_running` are the
+    /// same condition, a racing submit can never land a message with no turn
+    /// behind it — it takes the steer path instead and is drained by the
+    /// turn's end-of-turn injection check.
     pub fn is_running(&self) -> bool {
-        self.cancel.lock().map(|c| c.is_some()).unwrap_or(false)
+        self.turn_lock.try_lock().is_err()
     }
 
     pub fn request_stop(&self) {
@@ -210,6 +223,19 @@ impl Agent {
             } else if info.finished_at_ms.is_none() {
                 info.finished_at_ms = Some(pacode_types::now_ms());
             }
+        }
+    }
+
+    /// Terminal `Failed` status: records the error text and stamps the finish
+    /// time in one write. Poison-tolerant — this runs on panic-recovery paths
+    /// where the lock may already be poisoned. The caller emits `AgentUpdated`.
+    pub fn set_failed(&self, activity: Option<String>, error: String) {
+        let mut info = self.info.write().unwrap_or_else(|p| p.into_inner());
+        info.status = AgentStatus::Failed;
+        info.activity = activity;
+        info.error = Some(error);
+        if info.finished_at_ms.is_none() {
+            info.finished_at_ms = Some(pacode_types::now_ms());
         }
     }
 

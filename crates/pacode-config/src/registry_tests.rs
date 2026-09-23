@@ -67,6 +67,7 @@ fn test_drift_guard_fully_populated_config() {
     cfg.daemon.socket = Some(PathBuf::from("/tmp/pacode.sock"));
     cfg.context.compaction_model = Some("test/compact".to_string());
     cfg.session.title_model = Some("test/title".to_string());
+    cfg.permissions.explain_model = Some("test/explain".to_string());
     cfg.font.family = Some("JetBrains Mono".to_string());
     cfg.font.size = Some(14);
     cfg.font.weight = Some("bold".to_string());
@@ -352,6 +353,41 @@ fn test_catalog_ttl_secs_round_trip() {
     assert!(validate_candidate(entry, "0").is_err());
     assert!(validate_candidate(entry, "3000000").is_err());
     assert!(validate_candidate(entry, "not-a-number").is_err());
+}
+
+#[test]
+fn test_permissions_explain_model_round_trip() {
+    let mut cfg = Config::default();
+    assert_eq!(
+        read_value(&cfg, "permissions.explain_model"),
+        Some("".to_string())
+    );
+
+    let entry = find_entry("permissions.explain_model").unwrap();
+    assert_eq!(entry.default_value, "");
+    assert_eq!(entry.kind, SettingKind::String);
+
+    apply_to_config(
+        &mut cfg,
+        "permissions.explain_model",
+        &toml::Value::String("anthropic/claude-haiku".to_string()),
+    );
+    assert_eq!(
+        cfg.permissions.explain_model.as_deref(),
+        Some("anthropic/claude-haiku")
+    );
+    assert_eq!(
+        read_value(&cfg, "permissions.explain_model"),
+        Some("anthropic/claude-haiku".to_string())
+    );
+
+    // Empty string resets to `None` — the session model is used again.
+    apply_to_config(
+        &mut cfg,
+        "permissions.explain_model",
+        &toml::Value::String(String::new()),
+    );
+    assert_eq!(cfg.permissions.explain_model, None);
 }
 
 #[test]

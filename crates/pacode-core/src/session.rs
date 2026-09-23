@@ -10,7 +10,8 @@ use pacode_store::Store;
 use pacode_tools::{AgentSpec, ToolRegistry};
 use pacode_types::{
     AgentId, AgentInfo, Config, Effort, Mode, ModelFlags, ModelRoute, PermissionDecision,
-    PermissionId, Plan, SessionId, SessionMeta, SessionSnapshot, TaskInfo, UsageTotals, ZdrMode,
+    PermissionId, PermissionRequest, Plan, SessionId, SessionMeta, SessionSnapshot, TaskInfo,
+    UsageTotals, ZdrMode,
 };
 
 use crate::CoreError;
@@ -178,16 +179,25 @@ impl Session {
             self.config.context.tool_output_cap_chars,
         );
 
-        if !main.is_running() {
-            let hist_snapshot = main
-                .history
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            *main
+        // `history_before_turn` is the detach baseline: history as it stood
+        // before the user message that started the next turn. Snapshot it
+        // whenever none is pending — not only when the agent is idle: a submit
+        // landing mid-turn (steer) or in the post-block gap still precedes
+        // the turn that will consume this message, and only here is the
+        // pre-message history still known.
+        {
+            let mut hbt = main
                 .history_before_turn
                 .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(hist_snapshot);
+                .unwrap_or_else(|p| p.into_inner());
+            if hbt.is_none() {
+                *hbt = Some(
+                    main.history
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone(),
+                );
+            }
         }
 
         let mut content = vec![pacode_types::ContentBlock::Text {
@@ -255,9 +265,10 @@ impl Session {
 
     /// Cancel the main agent's running turn (history kept).
     pub fn interrupt(&self) {
-        // A question the turn is blocked on has to go with the turn, or the tool
-        // call keeps waiting for an answer nobody will give now.
-        self.cancel_questions_for(&AgentId::main());
+        // Token first: a parked permission waiter must see the cancellation
+        // (its biased cancel arm then beats the dropped-sender arm, so the
+        // deny reason lands as "interrupted", not "aborted"). Whatever it had
+        // not reached yet is cleaned up below.
         if let Some(main) = self.main_agent()
             && let Some(cancel) = main
                 .cancel
@@ -267,6 +278,13 @@ impl Session {
         {
             cancel.cancel();
         }
+        // A question the turn is blocked on has to go with the turn, or the tool
+        // call keeps waiting for an answer nobody will give now.
+        self.cancel_questions_for(&AgentId::main());
+        // Same for a pending permission: without this the entry stays in the
+        // pending map and its transcript cell never resolves, which can shadow
+        // a later live request in clients.
+        self.cancel_permissions_for(&AgentId::main());
     }
 
     /// Dismiss every question an agent is waiting on, telling clients to drop
@@ -282,8 +300,88 @@ impl Session {
         }
     }
 
-    pub fn resolve_permission(&self, id: &PermissionId, decision: PermissionDecision) -> bool {
-        self.permissions.resolve(id, decision)
+    /// Deny every permission `agent` is still waiting on (interrupt/stop_agent).
+    /// Dropping the pending entry makes the waiting call resolve to `Deny`, and
+    /// each request gets the same `PermissionResolved` + transcript notice an
+    /// answered one would — no stale Permission cell left shadowing clients.
+    pub fn cancel_permissions_for(&self, agent: &AgentId) {
+        for req in self.permissions.cancel_for_agent(agent) {
+            let seq = self.agent(&req.agent).and_then(|a| {
+                a.transcript
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .find_permission_seq(&req.id)
+            });
+            self.emit_permission_resolution(
+                &req,
+                seq,
+                PermissionDecision::Deny,
+                Some("interrupted".to_string()),
+            );
+        }
+    }
+
+    /// Emit `PermissionResolved` and swap the transcript `Permission` cell for
+    /// the outcome notice at `item_seq` (`None` skips the cell — e.g. the tail
+    /// rolled over). Shared by `SessionHost::request_permission` after its wait
+    /// and by `cancel_permissions_for`, so a cancelled request lands exactly
+    /// like an answered one.
+    pub fn emit_permission_resolution(
+        &self,
+        req: &PermissionRequest,
+        item_seq: Option<u64>,
+        decision: PermissionDecision,
+        reason: Option<String>,
+    ) {
+        self.events.emit(pacode_types::Event::PermissionResolved {
+            permission: req.id.clone(),
+            decision,
+            reason: reason.clone(),
+        });
+        let Some(seq) = item_seq else {
+            return;
+        };
+        let (level, text) = match decision {
+            PermissionDecision::AllowOnce => (
+                pacode_types::ToastLevel::Info,
+                "Permission allowed".to_string(),
+            ),
+            PermissionDecision::AllowSession => (
+                pacode_types::ToastLevel::Info,
+                "Permission allowed for session".to_string(),
+            ),
+            PermissionDecision::Deny => (
+                pacode_types::ToastLevel::Warn,
+                match &reason {
+                    Some(reason) => format!("Permission denied: {reason}"),
+                    None => "Permission denied".to_string(),
+                },
+            ),
+        };
+        let notice_item = pacode_types::TranscriptItem {
+            seq,
+            agent: req.agent.clone(),
+            ts_ms: pacode_types::time::now_ms(),
+            kind: pacode_types::TranscriptKind::Notice { level, text },
+        };
+        if let Some(agent) = self.agent(&req.agent) {
+            agent
+                .transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .upsert(notice_item.clone());
+        }
+        self.events
+            .emit(pacode_types::Event::ItemUpdated(notice_item));
+    }
+
+    pub fn resolve_permission(
+        &self,
+        id: &PermissionId,
+        decision: PermissionDecision,
+        reason: Option<String>,
+    ) -> bool {
+        self.permissions.resolve(id, decision, reason)
     }
 
     /// Switch the session model. The route must resolve against this session's
@@ -663,6 +761,7 @@ impl Session {
             cancel.cancel();
         }
         self.cancel_questions_for(id);
+        self.cancel_permissions_for(id);
         let info = agent.info();
         let _ = self
             .store
