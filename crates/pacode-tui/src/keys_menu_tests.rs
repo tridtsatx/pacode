@@ -2,15 +2,17 @@
 //! the legacy bridge, direct-vs-hub entries and the double-Shift path.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use pacode_types::model::{Effort, ModelRoute};
-use pacode_types::state::{AgentKind, AgentStatus};
-use pacode_types::{AgentId, AgentInfo, Config};
+use pacode_types::state::{AgentKind, AgentStatus, TaskStatus};
+use pacode_types::vcs::{CommitRow, GitStatus};
+use pacode_types::{AgentId, AgentInfo, Config, SessionId, TaskId, TaskInfo};
 
 use super::*;
 use crate::keys::handle_key;
-use crate::state::AppState;
+use crate::state::{AppState, Focus, Overlay, PanelTarget};
 use crate::ui::menu::MenuId;
 
 fn make_test_state() -> AppState {
@@ -33,6 +35,51 @@ fn make_test_state() -> AppState {
         error: None,
     });
     state
+}
+
+fn populate_task_rows(state: &mut AppState) {
+    for i in 0..40 {
+        state.rail.upsert_task(TaskInfo {
+            id: TaskId::new(format!("task-{i:02}")),
+            session: SessionId::new("session"),
+            owner: AgentId::main(),
+            label: format!("task {i}"),
+            command: format!("run {i}"),
+            cwd: PathBuf::from("/repo"),
+            status: TaskStatus::Running,
+            backgrounded: true,
+            exit_code: None,
+            started_at_ms: i,
+            ended_at_ms: None,
+            progress: None,
+            warnings: 0,
+            errors: 0,
+            output_path: PathBuf::from("/tmp/task.log"),
+            output_bytes: 0,
+            acked: false,
+        });
+    }
+    state.panel.target = Some(PanelTarget::Task(TaskId::new("task-00")));
+}
+
+fn populate_git_rows(state: &mut AppState) {
+    state.git.commits = (0..40)
+        .map(|i| CommitRow {
+            hash: format!("{:040x}", i + 1),
+            short: format!("{:07x}", i + 1),
+            parents: Vec::new(),
+            refs: Vec::new(),
+            subject: format!("commit {i}"),
+            body: String::new(),
+            author: "Ada".to_string(),
+            date_ms: 1_700_000_000_000 + i,
+        })
+        .collect();
+    state.git.status = Some(GitStatus::Ready);
+    state.git.has_more = false;
+    state.panel.target = Some(PanelTarget::CommitDiff {
+        hash: format!("{:040x}", 1),
+    });
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -488,4 +535,58 @@ fn enter_on_a_hub_item_row_opens_the_bottom_picker() {
         actions,
         vec![Action::Send(pacode_types::Request::ListModels)]
     );
+}
+
+#[test]
+fn page_navigation_keeps_the_panel_fallback_geometry_at_every_width() {
+    for (menu, is_task) in [(MenuId::Background, true), (MenuId::Git, false)] {
+        for cols in [60u16, 80, 100, 140] {
+            let mut state = make_test_state();
+            state.cols = cols;
+            state.rows = 34;
+            if is_task {
+                populate_task_rows(&mut state);
+            } else {
+                populate_git_rows(&mut state);
+            }
+
+            let _ = open(&mut state, menu);
+            let Focus::Overlay(Overlay::Menu { mut stack, mut ui }) =
+                std::mem::replace(&mut state.focus, Focus::Normal)
+            else {
+                panic!("menu did not open");
+            };
+            let view = menu::view_for(&stack, &state, &ui);
+            let rows: Vec<RowId> = selectable(&view.rows).map(|(_, id)| id).collect();
+            let page_down = page_rows(&state, &view, &ui);
+            assert!(
+                page_down > 1,
+                "{menu:?} at {cols} columns: page={page_down}"
+            );
+
+            handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::PageDown));
+            let view_after_down = menu::view_for(&stack, &state, &ui);
+            let down_index = selectable(&view_after_down.rows)
+                .position(|(_, id)| id == ui.cursor)
+                .expect("PageDown keeps a selectable cursor");
+            assert_eq!(down_index, page_down);
+            assert!(
+                ui.scroll > 0,
+                "{menu:?} at {cols} columns has no scroll window"
+            );
+
+            let last = rows.last().expect("fixture has rows").clone();
+            ui.cursor = last;
+            let view_at_end = menu::view_for(&stack, &state, &ui);
+            let page_up = page_rows(&state, &view_at_end, &ui);
+            assert!(page_up > 1, "{menu:?} at {cols} columns: page={page_up}");
+            let last_index = rows.len() - 1;
+            handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::PageUp));
+            let view_after_up = menu::view_for(&stack, &state, &ui);
+            let up_index = selectable(&view_after_up.rows)
+                .position(|(_, id)| id == ui.cursor)
+                .expect("PageUp keeps a selectable cursor");
+            assert!(last_index - up_index > 1);
+        }
+    }
 }

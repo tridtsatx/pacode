@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use pacode_types::{Event, PermissionDecision, ToastLevel, TranscriptKind};
 
+use crate::state::session::TurnEndMatch;
 use crate::state::stats;
 use crate::state::transcript::{Cell, CellKind, PermExplain, Transcript};
 use crate::state::{AppState, Focus, PanelTarget};
@@ -31,19 +32,29 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             state.transcript.set_header(header);
             state.meta = Some(meta);
         }
-        Event::TurnStarted { agent, turn: _ } => {
+        Event::TurnStarted { agent, turn } => {
             if agent.is_main() {
-                state.turn_active = true;
-                state.turn_started_at = Some(now);
-                state.rail.update_idle(true, now);
+                if state.session.observe_turn_started_for(Some(&turn)) {
+                    state.turn_started_at = Some(now);
+                    state.rail.update_idle(true, now);
+                }
+            } else {
+                state.rail.begin_agent_turn(&agent, &turn);
             }
         }
         Event::TurnEnded {
             agent,
-            turn: _,
+            turn,
             usage,
             stop,
         } => {
+            let turn_match = if agent.is_main() {
+                state.session.observe_turn_end(&turn)
+            } else {
+                state
+                    .rail
+                    .finish_agent_turn(&agent, &turn, &stop, pacode_types::time::now_ms())
+            };
             if let pacode_types::TurnStop::Failed { message } = &stop {
                 state.push_toast(
                     ToastLevel::Error,
@@ -52,17 +63,52 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                     now,
                 );
             }
-            if agent.is_main() {
-                state.transcript.flush_stream();
-                if let Some(ref u) = usage
-                    && u.output_tokens > 0
-                {
-                    let duration_ms = state
-                        .turn_started_at
-                        .map(|t| now.saturating_duration_since(t).as_millis() as u64)
-                        .unwrap_or_else(|| {
+            if turn_match != TurnEndMatch::Stale {
+                if agent.is_main() {
+                    state.transcript.flush_stream();
+                    if let Some(ref u) = usage
+                        && u.output_tokens > 0
+                    {
+                        let duration_ms = state
+                            .turn_started_at
+                            .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+                            .unwrap_or_else(|| {
+                                let last_ts = state
+                                    .transcript
+                                    .cells
+                                    .iter()
+                                    .rev()
+                                    .find_map(|c| {
+                                        if matches!(
+                                            c.kind,
+                                            CellKind::Item(TranscriptKind::Assistant { .. })
+                                        ) {
+                                            Some(c.ts_ms)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                pacode_types::time::now_ms().saturating_sub(last_ts)
+                            });
+                        if let Some(stats) = compute_turn_stats(duration_ms, u) {
+                            attach_turn_stats(&mut state.transcript, stats);
+                        }
+                    }
+                    state.turn_started_at = None;
+                } else {
+                    let is_panel_target = state.panel.target.as_ref().is_some_and(|t| match t {
+                        PanelTarget::Agent(id) => *id == agent,
+                        _ => false,
+                    });
+                    if is_panel_target {
+                        state.panel.agent_transcript.flush_stream();
+                        if let Some(ref u) = usage
+                            && u.output_tokens > 0
+                        {
                             let last_ts = state
-                                .transcript
+                                .panel
+                                .agent_transcript
                                 .cells
                                 .iter()
                                 .rev()
@@ -77,65 +123,11 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                                     }
                                 })
                                 .unwrap_or(0);
-                            pacode_types::time::now_ms().saturating_sub(last_ts)
-                        });
-                    if let Some(stats) = compute_turn_stats(duration_ms, u) {
-                        attach_turn_stats(&mut state.transcript, stats);
-                    }
-                }
-                state.turn_active = false;
-                state.turn_started_at = None;
-                state.rail.update_idle(false, now);
-            } else {
-                let is_panel_target = state.panel.target.as_ref().is_some_and(|t| match t {
-                    PanelTarget::Agent(id) => *id == agent,
-                    _ => false,
-                });
-                if is_panel_target {
-                    state.panel.agent_transcript.flush_stream();
-                    if let Some(ref u) = usage
-                        && u.output_tokens > 0
-                    {
-                        let last_ts = state
-                            .panel
-                            .agent_transcript
-                            .cells
-                            .iter()
-                            .rev()
-                            .find_map(|c| {
-                                if matches!(
-                                    c.kind,
-                                    CellKind::Item(TranscriptKind::Assistant { .. })
-                                ) {
-                                    Some(c.ts_ms)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(0);
-                        let duration_ms = pacode_types::time::now_ms().saturating_sub(last_ts);
-                        if let Some(stats) = compute_turn_stats(duration_ms, u) {
-                            attach_turn_stats(&mut state.panel.agent_transcript, stats);
+                            let duration_ms = pacode_types::time::now_ms().saturating_sub(last_ts);
+                            if let Some(stats) = compute_turn_stats(duration_ms, u) {
+                                attach_turn_stats(&mut state.panel.agent_transcript, stats);
+                            }
                         }
-                    }
-                }
-                // Fail-safe for a dropped `AgentUpdated`: the daemon stamps a
-                // subagent's terminal status BEFORE emitting this event
-                // (`turn/lifecycle.rs`), so a TurnEnded that finds the rail
-                // entry still live means that update was lost — set it
-                // locally with the daemon's own mapping (`Completed`→Finished,
-                // `Interrupted`→Stopped, `Failed`→Failed) and the same
-                // stamp-once rule for `finished_at_ms`.
-                if let Some(info) = state.rail.agents.iter_mut().find(|a| a.id == agent)
-                    && info.status.is_live()
-                {
-                    info.status = match &stop {
-                        pacode_types::TurnStop::Completed => pacode_types::AgentStatus::Finished,
-                        pacode_types::TurnStop::Interrupted => pacode_types::AgentStatus::Stopped,
-                        pacode_types::TurnStop::Failed { .. } => pacode_types::AgentStatus::Failed,
-                    };
-                    if info.finished_at_ms.is_none() {
-                        info.finished_at_ms = Some(pacode_types::time::now_ms());
                     }
                 }
             }
@@ -331,6 +323,11 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             {
                 *follow = false;
             }
+            if !info.id.is_main() && !info.status.is_live() {
+                state
+                    .rail
+                    .mark_agent_terminal(&info.id, pacode_types::time::now_ms());
+            }
             state.rail.upsert_agent(info);
         }
         Event::TaskAdded(info) => {
@@ -403,65 +400,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             }
         }
         Event::LoginProgress { provider, stage } => {
-            match stage {
-                pacode_types::LoginStage::OpenUrl { url, opened } => {
-                    let text = if opened {
-                        format!("Opened browser to sign in to {provider}: {url}")
-                    } else {
-                        format!("Open this URL in your browser to sign in to {provider}:\n{url}")
-                    };
-                    state.push_notice_with_level(ToastLevel::Info, text);
-                }
-                pacode_types::LoginStage::Waiting => {
-                    state.push_notice_with_level(
-                        ToastLevel::Info,
-                        format!("Waiting for authorization from {provider}..."),
-                    );
-                }
-                pacode_types::LoginStage::Exchanging => {
-                    state.push_notice_with_level(
-                        ToastLevel::Info,
-                        format!("Exchanging authorization code with {provider}..."),
-                    );
-                }
-                pacode_types::LoginStage::Done { label } => {
-                    state.push_notice_with_level(
-                        ToastLevel::Success,
-                        format!("Successfully signed in to {provider} ({label})"),
-                    );
-                    state.push_toast(
-                        ToastLevel::Success,
-                        format!("Signed in to {provider}"),
-                        Some(label),
-                        now,
-                    );
-                    if matches!(
-                        state.focus,
-                        Focus::Overlay(crate::state::Overlay::LoginPicker { .. })
-                    ) {
-                        state.focus = Focus::Normal;
-                    }
-                }
-                pacode_types::LoginStage::Failed { message } => {
-                    state.push_notice_with_level(
-                        ToastLevel::Error,
-                        format!("Login to {provider} failed: {message}"),
-                    );
-                    state.push_toast(
-                        ToastLevel::Error,
-                        format!("Login failed: {provider}"),
-                        Some(message),
-                        now,
-                    );
-                    if matches!(
-                        state.focus,
-                        Focus::Overlay(crate::state::Overlay::LoginPicker { .. })
-                    ) {
-                        state.focus = Focus::Normal;
-                    }
-                }
-            }
-            state.dirty = true;
+            state.apply_login_progress(provider, stage, now);
         }
         Event::AuthUpdated(info) => {
             if let Some(pos) = state.auth_providers.iter().position(|p| p.id == info.id) {
@@ -480,18 +419,11 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             state.dirty = true;
         }
         Event::SessionStatus { session, status } => {
-            // Daemon-wide event: mark the slot it names. The active slot
-            // derives its badge from live state instead, so this only feeds
-            // the retained summaries of slots nobody is attached to.
-            for slot in state.slots.iter_mut().flatten() {
-                if slot.id == session {
-                    slot.status = status;
-                    state.dirty = true;
-                }
-            }
+            state.apply_session_status(session, status);
         }
     }
-    state.rail.update_idle(state.turn_active, now);
+    let turn_active = state.turn_active;
+    state.rail.update_idle(turn_active, now);
 }
 
 fn compute_turn_stats(duration_ms: u64, usage: &pacode_types::stream::Usage) -> Option<String> {

@@ -14,16 +14,19 @@ pub mod catalog_cache;
 pub mod codex;
 pub mod devin;
 pub mod error_body;
+mod governor;
 pub mod image;
 pub mod mock;
 pub mod openai_compat;
 pub mod opencode;
+mod post;
 pub mod registry;
 mod retry;
 pub mod sse;
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -36,8 +39,66 @@ pub use error_body::error_body_message;
 pub use mock::MockProvider;
 pub use openai_compat::{OpenAiCompat, redact};
 pub use registry::ProviderRegistry;
+pub use retry::RetryBudget;
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
+
+pub const DEFAULT_PROVIDER_CONCURRENCY: usize = 128;
+pub const MAX_PROVIDER_CONCURRENCY: usize = 1024;
+pub const PROVIDER_QUEUE_ITEM_LIMIT: usize = 4096;
+pub const PROVIDER_QUEUE_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+
+static PROVIDER_CONCURRENCY: AtomicUsize = AtomicUsize::new(DEFAULT_PROVIDER_CONCURRENCY);
+static PROVIDER_QUEUE_ITEMS: AtomicUsize = AtomicUsize::new(PROVIDER_QUEUE_ITEM_LIMIT);
+static PROVIDER_QUEUE_BYTES: AtomicU64 = AtomicU64::new(PROVIDER_QUEUE_BYTE_LIMIT);
+
+/// Admission control applied to every provider account: `max_concurrency`
+/// requests in flight, the rest parked in a queue bounded by items and bytes.
+/// A zero queue cap never waits — it rejects instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderLimits {
+    pub max_concurrency: usize,
+    pub max_queue_items: usize,
+    pub max_queue_bytes: u64,
+}
+
+impl Default for ProviderLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrency: DEFAULT_PROVIDER_CONCURRENCY,
+            max_queue_items: PROVIDER_QUEUE_ITEM_LIMIT,
+            max_queue_bytes: PROVIDER_QUEUE_BYTE_LIMIT,
+        }
+    }
+}
+
+impl ProviderLimits {
+    pub fn new(
+        max_concurrency: usize,
+        max_queue_items: usize,
+        max_queue_bytes: u64,
+    ) -> Result<Self, ProviderError> {
+        let limits = Self {
+            max_concurrency,
+            max_queue_items,
+            max_queue_bytes,
+        };
+        if max_concurrency == 0 || max_concurrency > MAX_PROVIDER_CONCURRENCY {
+            return Err(ProviderError::Config(format!(
+                "provider concurrency must be between 1 and {MAX_PROVIDER_CONCURRENCY}"
+            )));
+        }
+        Ok(limits)
+    }
+
+    pub fn with_concurrency(max_concurrency: usize) -> Result<Self, ProviderError> {
+        Self::new(
+            max_concurrency,
+            PROVIDER_QUEUE_ITEM_LIMIT,
+            PROVIDER_QUEUE_BYTE_LIMIT,
+        )
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompletionRequest {
@@ -96,6 +157,45 @@ impl ProviderError {
             | ProviderError::Cancelled => false,
         }
     }
+}
+
+/// A reading of every live provider governor: in-flight and queued requests,
+/// high-water marks, refusals, cooldowns, and how long callers waited for a
+/// permit. Cheap enough for a request handler, and the thing to look at first
+/// when a session with many agents feels slow — a non-zero wait says the
+/// concurrency ceiling is the binding constraint rather than the model.
+pub fn provider_stats() -> pacode_types::ProviderStats {
+    governor::provider_stats()
+}
+
+pub fn provider_concurrency_ceiling() -> usize {
+    PROVIDER_CONCURRENCY.load(Ordering::Acquire)
+}
+
+pub fn provider_limits() -> ProviderLimits {
+    ProviderLimits {
+        max_concurrency: provider_concurrency_ceiling(),
+        max_queue_items: PROVIDER_QUEUE_ITEMS.load(Ordering::Acquire),
+        max_queue_bytes: PROVIDER_QUEUE_BYTES.load(Ordering::Acquire),
+    }
+}
+
+pub fn apply_provider_limits(limits: ProviderLimits) -> Result<ProviderLimits, ProviderError> {
+    ProviderLimits::new(
+        limits.max_concurrency,
+        limits.max_queue_items,
+        limits.max_queue_bytes,
+    )?;
+    PROVIDER_CONCURRENCY.store(limits.max_concurrency, Ordering::Release);
+    PROVIDER_QUEUE_ITEMS.store(limits.max_queue_items, Ordering::Release);
+    PROVIDER_QUEUE_BYTES.store(limits.max_queue_bytes, Ordering::Release);
+    governor::apply_provider_limits(limits);
+    Ok(limits)
+}
+
+pub fn set_provider_concurrency_ceiling(limit: usize) -> Result<usize, ProviderError> {
+    let limits = apply_provider_limits(ProviderLimits::with_concurrency(limit)?)?;
+    Ok(limits.max_concurrency)
 }
 
 #[async_trait]

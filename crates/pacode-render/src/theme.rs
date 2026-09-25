@@ -79,8 +79,6 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    /// `PACODE_COLOR` (written from `[ui] color` at startup) wins over
-    /// `NO_COLOR`, which wins over `COLORTERM` autodetection.
     pub fn detect() -> Self {
         match std::env::var("PACODE_COLOR").ok().as_deref() {
             Some("mono") => Self::Mono,
@@ -89,6 +87,15 @@ impl ColorMode {
             _ if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) => Self::Mono,
             _ if detect_truecolor() => Self::Truecolor,
             _ => Self::Ansi,
+        }
+    }
+
+    pub fn from_setting(setting: &str, detected: Self) -> Self {
+        match setting.trim().to_ascii_lowercase().as_str() {
+            "ansi" => Self::Ansi,
+            "truecolor" | "24bit" => Self::Truecolor,
+            "mono" => Self::Mono,
+            _ => detected,
         }
     }
 }
@@ -282,6 +289,29 @@ impl Theme {
             bash_string: Style::default().fg(Color::Green),
             bash_operator: Style::default().fg(Color::Yellow),
             bash_variable: Style::default().fg(Color::Yellow),
+            bash_arg: Style::default(),
+        }
+    }
+
+    pub fn mono() -> Self {
+        Self {
+            fg: Style::default(),
+            dim: Style::default(),
+            faint: Style::default(),
+            accent: Style::default(),
+            green: Style::default(),
+            cyan: Style::default(),
+            red: Style::default(),
+            violet: Style::default(),
+            yellow: Style::default(),
+            bold: Style::default().add_modifier(Modifier::BOLD),
+            selected_bg: Style::default().add_modifier(Modifier::REVERSED),
+            user_bar: Style::default(),
+            bash_command: Style::default().add_modifier(Modifier::BOLD),
+            bash_flag: Style::default(),
+            bash_string: Style::default(),
+            bash_operator: Style::default(),
+            bash_variable: Style::default(),
             bash_arg: Style::default(),
         }
     }

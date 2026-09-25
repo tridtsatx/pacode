@@ -1,19 +1,86 @@
 //! The prompt (spec §3): thin line above, `❯` dim + text + block cursor, thin line
-//! below; no background, no border. Multi-line up to 6 rows. Slash popup above the
-//! input (max 6 rows) listing matching commands with usage and help.
+//! below; no background, no border. Multi-line up to 6 rows.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use pacode_render::RenderOptions;
 
-use crate::commands;
+use crate::commands::{self, SlashCommand};
 use crate::layout::ScreenLayout;
 use crate::state::AppState;
+use crate::state::input::InputState;
 
-pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts: &RenderOptions) {
+pub(crate) struct PreparedInput {
+    lines: Vec<String>,
+    cursor: (u16, u16),
+    scroll: usize,
+}
+
+struct WrapMemo {
+    text: String,
+    cursor: usize,
+    scroll: usize,
+    width: u16,
+    height: u16,
+    prepared: Rc<PreparedInput>,
+}
+
+thread_local! {
+    static WRAP_MEMO: RefCell<Option<WrapMemo>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn prepare(input: &mut InputState, width: u16, height: u16) -> Rc<PreparedInput> {
+    if let Some(memo) = WRAP_MEMO.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|memo| wrap_matches(memo, input, width, height))
+            .map(|memo| Rc::clone(&memo.prepared))
+    }) {
+        return memo;
+    }
+    input.reconcile_scroll(width, height);
+    let prepared = Rc::new(measure(input, width));
+    WRAP_MEMO.with(|cell| {
+        *cell.borrow_mut() = Some(WrapMemo {
+            text: input.text.clone(),
+            cursor: input.cursor,
+            scroll: input.input_scroll,
+            width,
+            height,
+            prepared: Rc::clone(&prepared),
+        });
+    });
+    prepared
+}
+
+fn wrap_matches(memo: &WrapMemo, input: &InputState, width: u16, height: u16) -> bool {
+    memo.width == width
+        && memo.height == height
+        && memo.cursor == input.cursor
+        && memo.scroll == input.input_scroll
+        && memo.text == input.text
+}
+
+fn measure(input: &InputState, width: u16) -> PreparedInput {
+    PreparedInput {
+        lines: input.wrap_lines(width),
+        cursor: input.cursor_position(width),
+        scroll: input.input_scroll,
+    }
+}
+
+pub(crate) fn draw(
+    frame: &mut Frame,
+    layout: &ScreenLayout,
+    state: &AppState,
+    opts: &RenderOptions,
+    view: &Rc<PreparedInput>,
+) {
     if layout.input_top.height > 0 {
         let hline = opts.glyphs.hline.repeat(layout.input_top.width as usize);
         frame.render_widget(
@@ -23,39 +90,16 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
     }
 
     if layout.input.height > 0 {
-        let lines = state.input.wrap_lines(layout.input.width);
-        let total_lines = lines.len();
         let height = layout.input.height as usize;
-        let (cur_line, cur_col) = state.input.cursor_position(layout.input.width);
 
-        let max_scroll = total_lines.saturating_sub(height);
-        state.input.input_scroll = state.input.input_scroll.min(max_scroll);
-
-        let cur_line_idx = cur_line as usize;
-        if cur_line_idx < state.input.input_scroll {
-            state.input.input_scroll = cur_line_idx;
-        } else if cur_line_idx >= state.input.input_scroll + height {
-            state.input.input_scroll = cur_line_idx.saturating_sub(height.saturating_sub(1));
-        }
-
-        let matching_cmd_token = if state.input.text.starts_with('/') {
-            let token = state
-                .input
-                .text
-                .split_whitespace()
-                .next()
-                .unwrap_or(&state.input.text);
-            let name = token.strip_prefix('/').unwrap_or("");
-            if commands::all_commands().iter().any(|c| c.name == name) {
-                Some(token.to_string())
-            } else {
-                None
+        let named = named_command(&state.input.text);
+        let matching_cmd_token = named.as_ref().map(|(token, _)| (*token).to_string());
+        let inline_hint = match &named {
+            Some((_, command)) if takes_arg_hint(&state.input.text) => {
+                arg_hint(&state.input.text, command)
             }
-        } else {
-            None
+            _ => None,
         };
-
-        let inline_hint = command_inline_hint(&state.input.text);
         let is_bash = state.input.text.starts_with('!');
 
         let mut rendered = Vec::new();
@@ -84,12 +128,7 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
             }
             rendered.push(Line::from(line_spans));
         } else {
-            for (i, wl) in lines
-                .iter()
-                .enumerate()
-                .skip(state.input.input_scroll)
-                .take(height)
-            {
+            for (i, wl) in view.lines.iter().enumerate().skip(view.scroll).take(height) {
                 let prefix = if i == 0 {
                     Span::styled(format!("{} ", opts.glyphs.prompt), opts.theme.dim)
                 } else {
@@ -119,9 +158,13 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
 
         frame.render_widget(Paragraph::new(rendered), layout.input);
 
-        let cur_screen_line = cur_line.saturating_sub(state.input.input_scroll as u16);
-        if cur_line >= state.input.input_scroll as u16 && (cur_screen_line as usize) < height {
-            frame.set_cursor_position((layout.input.x + cur_col, layout.input.y + cur_screen_line));
+        let cur_line = view.cursor.0;
+        let cur_screen_line = cur_line.saturating_sub(view.scroll as u16);
+        if cur_line >= view.scroll as u16 && (cur_screen_line as usize) < height {
+            frame.set_cursor_position((
+                layout.input.x + view.cursor.1,
+                layout.input.y + cur_screen_line,
+            ));
         }
     }
 
@@ -132,240 +175,40 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
             layout.input_bottom,
         );
     }
+}
 
-    if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-        let query = &state.input.text[1..];
-        let matches = commands::matching(query);
-        if !matches.is_empty() {
-            let max_visible = 6;
-            let count = matches.len().min(max_visible);
-            let popup_h = count as u16;
-            let popup_y = layout.input_top.y.saturating_sub(popup_h);
-            let popup_w = layout.input.width.min(50);
-            let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
+fn named_command(text: &str) -> Option<(&str, SlashCommand)> {
+    let token = text.strip_prefix('/')?.split_whitespace().next()?;
+    Some((token, commands::find_command(token)?))
+}
 
-            frame.render_widget(Clear, popup_area);
-
-            let selected = state.input.slash_index % matches.len();
-            let start = if selected >= max_visible {
-                selected + 1 - max_visible
-            } else {
-                0
-            };
-
-            let mut popup_lines = Vec::new();
-            for (i, cmd) in matches.iter().enumerate().skip(start).take(count) {
-                let is_sel = i == selected;
-                let usage_style = if is_sel {
-                    opts.theme
-                        .selected_bg
-                        .patch(opts.theme.cyan)
-                        .patch(opts.theme.bold)
-                } else {
-                    opts.theme.accent
-                };
-                let help_style = if is_sel {
-                    opts.theme.selected_bg.patch(opts.theme.fg)
-                } else {
-                    opts.theme.dim
-                };
-
-                let usage = format!("{:<12}", cmd.usage);
-                let line = if is_sel {
-                    let text = format!("{usage} {}", cmd.help);
-                    let padded = format!("{:<width$}", text, width = popup_w as usize);
-                    Line::from(Span::styled(
-                        padded,
-                        opts.theme
-                            .selected_bg
-                            .patch(opts.theme.cyan)
-                            .patch(opts.theme.bold),
-                    ))
-                } else {
-                    Line::from(vec![
-                        Span::styled(usage, usage_style),
-                        Span::raw(" "),
-                        Span::styled(cmd.help.to_string(), help_style),
-                    ])
-                };
-                popup_lines.push(line);
-            }
-
-            frame.render_widget(Paragraph::new(popup_lines), popup_area);
-        }
-    }
-
-    // @ file reference popup (drawn ABOVE the input box). §8.1: the directory
-    // scan must never run inside draw — the popup records `want`, the event
-    // loop scans on a blocking thread and the next frame reads `ready`.
-    let byte_cursor =
-        crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
-    let at_query = if !state.input.at_closed {
-        pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
-    } else {
-        None
+fn takes_arg_hint(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('/') else {
+        return false;
     };
-    let at_key = at_query.as_ref().map(|q| crate::state::input::AtKey {
-        query: q.query.clone(),
-        cursor_byte: byte_cursor,
-        cwd: state.cwd(),
-    });
-    state.input.at_comp.set_want(at_key.clone());
-    let at_candidates = at_key
-        .as_ref()
-        .and_then(|k| state.input.at_comp.candidates_for(k));
-    if let Some(candidates) = at_candidates
-        && !candidates.is_empty()
-    {
-        let max_visible = 6;
-        let count = candidates.len().min(max_visible);
-        let popup_h = count as u16;
-        let popup_y = layout.input_top.y.saturating_sub(popup_h);
-        let popup_w = layout.input.width.min(50);
-        let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
-
-        frame.render_widget(Clear, popup_area);
-
-        let selected = state.input.at_index % candidates.len();
-        let start = if selected >= max_visible {
-            selected + 1 - max_visible
-        } else {
-            0
-        };
-
-        let mut popup_lines = Vec::new();
-        for (i, cand) in candidates.iter().enumerate().skip(start).take(count) {
-            let is_sel = i == selected;
-            let padded = format!("{:<width$}", cand.path, width = popup_w as usize);
-            let style = if is_sel {
-                opts.theme
-                    .selected_bg
-                    .patch(opts.theme.cyan)
-                    .patch(opts.theme.bold)
-            } else if cand.is_dir {
-                opts.theme.cyan
-            } else {
-                opts.theme.fg
-            };
-            popup_lines.push(Line::from(Span::styled(padded, style)));
-        }
-
-        frame.render_widget(Paragraph::new(popup_lines), popup_area);
-    }
-
-    // Bash completion popup (drawn ABOVE the input box) — same deferred-scan
-    // contract as `@` above.
-    let bash_key = if state.input.text.starts_with('!') && !state.input.bash_complete_closed {
-        Some(crate::state::input::BashKey {
-            text: state.input.text[1..].to_string(),
-            cursor: state.input.cursor.saturating_sub(1),
-            cwd: state.cwd(),
-            history_len: state.input.bash_history.len(),
-        })
-    } else {
-        None
+    let Some(name) = rest.split_whitespace().next() else {
+        return false;
     };
-    state.input.bash_comp.set_want(bash_key.clone());
-    let bash_candidates = bash_key
-        .as_ref()
-        .and_then(|k| state.input.bash_comp.candidates_for(k));
-    if let Some(candidates) = bash_candidates
-        && !candidates.is_empty()
-    {
-        let max_visible = 6;
-        let count = candidates.len().min(max_visible);
-        let popup_h = count as u16;
-        let popup_y = layout.input_top.y.saturating_sub(popup_h);
-        let popup_w = layout.input.width.min(50);
-        let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
+    rest[name.len()..].trim().is_empty()
+}
 
-        frame.render_widget(Clear, popup_area);
-
-        let selected = state.input.bash_complete_index % candidates.len();
-        let start = if selected >= max_visible {
-            selected + 1 - max_visible
-        } else {
-            0
-        };
-
-        let mut popup_lines = Vec::new();
-        for (i, cand) in candidates.iter().enumerate().skip(start).take(count) {
-            let is_sel = i == selected;
-            let padded = format!("{:<width$}", cand.display, width = popup_w as usize);
-            let style = if is_sel {
-                opts.theme
-                    .selected_bg
-                    .patch(opts.theme.cyan)
-                    .patch(opts.theme.bold)
-            } else {
-                opts.theme.fg
-            };
-            popup_lines.push(Line::from(Span::styled(padded, style)));
-        }
-
-        frame.render_widget(Paragraph::new(popup_lines), popup_area);
+fn arg_hint(text: &str, command: &SlashCommand) -> Option<String> {
+    if command.arg_hint.is_empty() {
+        return None;
     }
-
-    // Prompt queue popup (drawn ABOVE the input box when no other popup is active)
-    let slash_popup_active = state.input.text.starts_with('/') && !state.input.text.contains(' ');
-    let bash_popup_active = state.input.text.starts_with('!') && !state.input.bash_complete_closed;
-    let at_popup_active = at_query.is_some();
-
-    if !slash_popup_active
-        && !bash_popup_active
-        && !at_popup_active
-        && !state.input.prompt_queue.is_empty()
-    {
-        let max_visible = 6;
-        let queue_len = state.input.prompt_queue.len();
-        let count = queue_len.min(max_visible);
-        let popup_h = count as u16;
-        let popup_y = layout.input_top.y.saturating_sub(popup_h);
-        let popup_w = layout.input.width.min(60);
-        let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
-
-        frame.render_widget(Clear, popup_area);
-
-        let mut popup_lines = Vec::new();
-        for (i, prompt) in state
-            .input
-            .prompt_queue
-            .iter()
-            .enumerate()
-            .take(max_visible)
-        {
-            let prefix = format!(" queued #{}: ", i + 1);
-            let avail = (popup_w as usize).saturating_sub(prefix.len()).max(1);
-            let single_line = prompt.lines().next().unwrap_or("");
-            let truncated = pacode_render::truncate_to_width(single_line, avail, true);
-            let line = Line::from(vec![
-                Span::styled(prefix, opts.theme.accent),
-                Span::styled(truncated, opts.theme.fg),
-            ]);
-            popup_lines.push(line);
-        }
-
-        frame.render_widget(Paragraph::new(popup_lines), popup_area);
-    }
+    Some(if text.ends_with(' ') {
+        command.arg_hint.to_string()
+    } else {
+        format!(" {}", command.arg_hint)
+    })
 }
 
 pub fn command_inline_hint(text: &str) -> Option<String> {
-    if let Some(rest) = text.strip_prefix('/') {
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() == 1 {
-            let cmd_name = parts[0];
-            if let Some(cmd) = commands::find_command(cmd_name)
-                && !cmd.arg_hint.is_empty()
-            {
-                if text.ends_with(' ') {
-                    return Some(cmd.arg_hint.to_string());
-                } else {
-                    return Some(format!(" {}", cmd.arg_hint));
-                }
-            }
-        }
+    if !takes_arg_hint(text) {
+        return None;
     }
-    None
+    let (_, command) = named_command(text)?;
+    arg_hint(text, &command)
 }
 
 #[cfg(test)]
@@ -401,17 +244,61 @@ mod tests {
         assert_eq!(command_inline_hint("/export"), Some(" [path]".into()));
         assert_eq!(command_inline_hint("/export "), Some("[path]".into()));
 
-        // Commands with no argument hint
         assert_eq!(command_inline_hint("/config"), None);
         assert_eq!(command_inline_hint("/config "), None);
 
-        // Commands with arguments already typed
         assert_eq!(command_inline_hint("/effort hi"), None);
         assert_eq!(command_inline_hint("/mode plan"), None);
 
-        // Unknown or non-slash inputs
         assert_eq!(command_inline_hint("/unknown"), None);
         assert_eq!(command_inline_hint("hello"), None);
         assert_eq!(command_inline_hint(""), None);
+    }
+
+    #[test]
+    fn a_slash_token_resolves_by_name_and_the_hint_needs_a_bare_command() {
+        assert_eq!(
+            named_command("/effort").map(|(token, _)| token),
+            Some("effort")
+        );
+        assert_eq!(named_command("effort").map(|(token, _)| token), None);
+        assert_eq!(named_command("/").map(|(token, _)| token), None);
+        assert_eq!(named_command("/nope").map(|(token, _)| token), None);
+
+        assert!(takes_arg_hint("/effort"));
+        assert!(takes_arg_hint("/effort  "));
+        assert!(!takes_arg_hint("/effort high"));
+        assert!(!takes_arg_hint("effort"));
+        assert!(!takes_arg_hint("/"));
+    }
+
+    #[test]
+    fn an_unchanged_prompt_is_wrapped_once_and_reused_by_the_next_frame() {
+        let mut input = InputState::default();
+        input.insert_str("hello world");
+        let first = prepare(&mut input, 20, 4);
+        let second = prepare(&mut input, 20, 4);
+        assert!(Rc::ptr_eq(&first, &second));
+
+        input.insert_str("!");
+        let third = prepare(&mut input, 20, 4);
+        assert!(!Rc::ptr_eq(&first, &third));
+        // Another width is another wrap, even for the same text.
+        let other_width = prepare(&mut input, 21, 4);
+        assert!(!Rc::ptr_eq(&third, &other_width));
+        assert!(Rc::ptr_eq(&prepare(&mut input, 21, 4), &other_width));
+    }
+
+    #[test]
+    fn prepare_scrolls_the_cursor_line_into_view_and_the_draw_reuses_it() {
+        let mut input = InputState::default();
+        input.insert_str(&"word ".repeat(40));
+        input.cursor = input.text.chars().count();
+        let prepared = prepare(&mut input, 20, 3);
+        assert!(prepared.scroll > 0);
+        assert_eq!(input.input_scroll, prepared.scroll);
+        assert_eq!(prepared.cursor.0 as usize, prepared.scroll + 2);
+        // The frame hands the paint the very wrap it prepared.
+        assert!(Rc::ptr_eq(&prepare(&mut input, 20, 3), &prepared));
     }
 }

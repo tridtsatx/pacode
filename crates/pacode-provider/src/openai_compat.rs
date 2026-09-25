@@ -37,7 +37,7 @@ use pacode_types::{
 use serde_json::Value;
 
 pub use crate::sse::{ChunkState, SseParser, chunk_to_events};
-use crate::{CompletionRequest, EventStream, Provider, ProviderError};
+use crate::{CompletionRequest, EventStream, Provider, ProviderError, RetryBudget};
 
 #[cfg(test)]
 #[path = "openai_compat_tests.rs"]
@@ -375,7 +375,7 @@ impl OpenAiCompat {
             req_builder = req_builder.header(k, v);
         }
 
-        let response = match req_builder.send().await {
+        let mut response = match req_builder.send().await {
             Ok(resp) => resp,
             Err(err) => {
                 if !configured_models.is_empty() {
@@ -392,7 +392,7 @@ impl OpenAiCompat {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            let text = crate::error_body::read_error_body(&mut response).await;
             let redacted_text = redact(&text);
             log::trace!("models response body: {redacted_text}");
             if !configured_models.is_empty() {
@@ -785,14 +785,10 @@ impl Provider for OpenAiCompat {
             model: req.model,
             stream_idle_secs: self.defaults.stream_idle_secs,
             effort,
-            max_retries,
             backoff_base: self.backoff_base,
         };
 
-        // The first open is eager: a hard failure (auth, 4xx) is reported by `complete`
-        // itself rather than as the first item of an otherwise valid stream.
-        let inner = opener.open().await?;
-        Ok(crate::retry::retrying_stream(opener, inner))
+        opener.open(RetryBudget::new(max_retries)).await
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

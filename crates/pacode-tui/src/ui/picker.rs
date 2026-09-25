@@ -416,14 +416,45 @@ fn draw_model(
 
     frame.render_widget(Paragraph::new(lines), area);
 
-    // Set cursor on query input
-    let cursor_x = area.x + 2 + (query.len() as u16).min(area.width.saturating_sub(3));
-    frame.set_cursor_position((cursor_x, area.y + 1));
+    if let Some(position) = crate::ui::popup::query_cursor(area, query, 2, 1) {
+        frame.set_cursor_position(position);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::{Backend, TestBackend};
+
     use super::*;
+
+    #[test]
+    fn unicode_query_cursor_uses_cells_and_stays_inside() {
+        let mut state =
+            crate::state::AppState::new(pacode_types::Config::default(), "test".to_string(), 10, 3);
+        state.focus = crate::state::Focus::Overlay(crate::state::Overlay::ModelPicker {
+            query: "模型".to_string(),
+            index: 0,
+            for_zdr: false,
+        });
+        let opts = RenderOptions::new(10, false);
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let area = Rect::new(0, 0, 10, 3);
+
+        terminal
+            .draw(|frame| draw(frame, area, &state, &opts))
+            .expect("draw");
+
+        assert_eq!(
+            terminal
+                .backend_mut()
+                .get_cursor_position()
+                .ok()
+                .map(|position| (position.x, position.y)),
+            Some((6, 1))
+        );
+    }
 
     #[test]
     fn test_picker_marker_aligns_with_label_center() {

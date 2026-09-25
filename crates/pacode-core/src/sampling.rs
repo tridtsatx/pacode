@@ -34,6 +34,19 @@ impl SamplingHandler for CoreSamplingHandler {
         let (provider, model_name) = {
             let session_model = {
                 let sessions = core.sessions.read().unwrap_or_else(|p| p.into_inner());
+                // Sampling is an MCP-initiated provider call: a server the user
+                // may not trust can ask the daemon to spend a completion on
+                // arbitrary content. Under ZDR the answer is never — a
+                // non-zdr_capable route would carry that content out of the
+                // retention boundary, and no client is asked about it. Any
+                // session in ZDR mode closes the door for the pool, since the
+                // request carries no session of its own.
+                if sessions.values().any(|s| s.zdr_active()) {
+                    return Err(McpError::Protocol(format!(
+                        "{}: MCP sampling is disabled while zero-data-retention is active",
+                        crate::permissions::ZDR_BLOCKED
+                    )));
+                }
                 sessions.values().last().map(|s| s.meta().model)
             };
             let providers = core.providers();

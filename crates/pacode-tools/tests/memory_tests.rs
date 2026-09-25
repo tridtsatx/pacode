@@ -28,6 +28,9 @@ struct StubHost {
     tasks: Arc<TaskManager>,
     plan: Mutex<Plan>,
     agents: Mutex<Vec<AgentInfo>>,
+    /// How long a permission prompt stays open; widens the window between a
+    /// tool's read of a file and its write for the concurrency tests.
+    permission_delay: Duration,
 }
 
 impl StubHost {
@@ -41,6 +44,14 @@ impl StubHost {
             tasks,
             plan: Mutex::new(Plan::default()),
             agents: Mutex::new(Vec::new()),
+            permission_delay: Duration::ZERO,
+        }
+    }
+
+    fn slow_permissions(self, delay: Duration) -> Self {
+        Self {
+            permission_delay: delay,
+            ..self
         }
     }
 }
@@ -98,6 +109,9 @@ impl ToolHost for StubHost {
     async fn request_permission(&self, draft: PermissionDraft) -> pacode_tools::PermissionOutcome {
         let dec = *self.decision.lock().unwrap();
         self.drafts.lock().unwrap().push(draft);
+        if !self.permission_delay.is_zero() {
+            tokio::time::sleep(self.permission_delay).await;
+        }
         pacode_tools::PermissionOutcome {
             decision: dec,
             reason: None,
@@ -445,4 +459,50 @@ async fn test_memory_write_permission_denied() {
 
     assert!(matches!(err, Err(ToolError::Denied(_))));
     assert!(!project_memory_path(&ctx.cwd).exists());
+}
+
+#[tokio::test]
+async fn concurrent_notes_all_survive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(
+        StubHost::new(tmp.path().join("spool")).slow_permissions(Duration::from_millis(40)),
+    );
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    let project_file = project_memory_path(&ctx.cwd);
+
+    // The duplicate check and the append are one read-modify-write: without the
+    // path lock the later writers read the same empty prefix and every note but
+    // the last would be dropped.
+    let notes = (0..8).map(|index| format!("note {index}"));
+    for note in notes {
+        MemoryWriteTool
+            .call(json!({"scope": "project", "text": note}), &ctx)
+            .await
+            .unwrap();
+    }
+    let (alpha, beta, gamma) = tokio::join!(
+        MemoryWriteTool.call(json!({"scope": "project", "text": "alpha"}), &ctx),
+        MemoryWriteTool.call(json!({"scope": "project", "text": "beta"}), &ctx),
+        MemoryWriteTool.call(json!({"scope": "project", "text": "gamma"}), &ctx),
+    );
+    alpha.expect("store alpha");
+    beta.expect("store beta");
+    gamma.expect("store gamma");
+
+    let text = tokio::fs::read_to_string(&project_file).await.unwrap();
+    let bullets: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(bullets.len(), 11, "a note was lost: {text}");
+    for expected in ["alpha", "beta", "gamma", "note 0", "note 7"] {
+        assert!(
+            bullets.contains(&format!("- {expected}").as_str()),
+            "{expected} missing from {text}"
+        );
+    }
+    let leftovers: Vec<String> = std::fs::read_dir(project_file.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains("pacode-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
 }

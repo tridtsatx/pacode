@@ -401,11 +401,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             }
         }
         "theme" => {
-            let truecolor = match state.config.ui.color.as_str() {
-                "ansi" => false,
-                "truecolor" | "24bit" => true,
-                _ => pacode_render::detect_truecolor(),
-            };
+            let truecolor = state.truecolor;
             if arg.is_empty() {
                 open_theme_picker(state)
             } else {
@@ -416,6 +412,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 let (palette, warnings) = pacode_config::load_theme(&state.paths, &theme_cfg);
                 state.theme = pacode_render::Theme::from_palette(&palette, truecolor);
                 state.config.theme.name = arg.clone();
+                state.sync_render_context();
                 if let Err(e) = pacode_config::update_config_value(
                     &state.paths,
                     "theme.name",

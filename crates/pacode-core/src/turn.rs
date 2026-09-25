@@ -34,6 +34,7 @@ use std::sync::Arc;
 use pacode_types::{AgentStatus, ContentBlock, Event, Message, Role, TurnId, TurnStop, Usage};
 use tokio_util::sync::CancellationToken;
 
+use crate::CoreError;
 use crate::agent::Agent;
 use crate::prompt::DynamicContext;
 use crate::session::Session;
@@ -50,6 +51,7 @@ pub async fn run_turn(
     agent: Arc<Agent>,
     cancel: CancellationToken,
     turn_id: TurnId,
+    admission: Option<String>,
 ) -> (TurnStop, Usage) {
     // `start_turn` holds `agent.turn_lock` for the whole call — a bare
     // `run_turn` would race that turn's cleanup, so fail loudly in debug.
@@ -61,6 +63,20 @@ pub async fn run_turn(
         agent.id(),
         turn_id
     );
+    if let Some(admission) = admission.as_deref() {
+        agent.mark_admission_progressed(admission, &turn_id);
+    }
+    if cancel.is_cancelled() {
+        session.events.emit(Event::TurnStarted {
+            agent: agent.id(),
+            turn: turn_id,
+        });
+        session.emit_session_status();
+        return (
+            lifecycle::handle_interrupted(&session, &agent),
+            Usage::default(),
+        );
+    }
     let _ = session
         .plugins
         .run_hooks(&pacode_plugin::HookEvent::TurnStart)
@@ -73,15 +89,16 @@ pub async fn run_turn(
         crate::hooks::session_start(&session, &agent);
     }
 
+    if !agent.stop_requested() {
+        agent.clear_error();
+        agent.set_status(AgentStatus::Thinking, Some("thinking".to_string()));
+    }
     session.events.emit(Event::TurnStarted {
         agent: agent.id(),
         turn: turn_id.clone(),
     });
     session.emit_session_status();
-    // Don't flap Thinking over a stop that landed during turn setup;
-    // `handle_interrupted` keeps `Stopped` once the loop observes the cancel.
     if !agent.stop_requested() {
-        agent.set_status(AgentStatus::Thinking, Some("thinking".to_string()));
         session.events.emit(Event::AgentUpdated(agent.info()));
     }
 
@@ -100,6 +117,7 @@ pub async fn run_turn(
     *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(prompt_cache.clone());
 
     let mut turn_usage = Usage::default();
+    let mut last_input_tokens: Option<u64>;
 
     loop {
         if cancel.is_cancelled() {
@@ -112,8 +130,16 @@ pub async fn run_turn(
         // parent) must see it in the first call — otherwise the provider gets
         // a stale (or even empty) message list and the injection only lands
         // after a wasted round-trip.
-        drain_injections(&session, &agent).await;
-
+        match drain_injections(&session, &agent, admission.as_deref(), false).await {
+            Ok(DrainOutcome::DeferredAdmission) => break,
+            Ok(DrainOutcome::Idle | DrainOutcome::Continue) => {}
+            Err(error) => {
+                return (
+                    lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
+                    turn_usage,
+                );
+            }
+        }
         let system_dynamic = {
             let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
             let dyn_ctx = DynamicContext {
@@ -218,7 +244,16 @@ pub async fn run_turn(
             }
         };
 
-        turn_usage = outcome.usage;
+        let observed_usage = agent.take_stream_usage();
+        let provider_usage = if observed_usage.is_empty() {
+            outcome.usage
+        } else {
+            observed_usage
+        };
+        last_input_tokens =
+            (provider_usage.input_tokens > 0).then_some(provider_usage.input_tokens);
+        agent.record_turn_usage(provider_usage);
+        turn_usage += outcome.usage;
 
         if outcome.interrupted {
             *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -246,16 +281,18 @@ pub async fn run_turn(
             });
         }
 
-        let assistant_msg = Message::new(Role::Assistant, content_blocks);
-        let (msg_seq, arc_msg) = agent
-            .history
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(assistant_msg.clone());
-        let _ = session
-            .store
-            .append_message(&session.id, &agent.id(), msg_seq, &arc_msg)
-            .await;
+        if let Err(error) = persist_history_message(
+            &session,
+            &agent,
+            Message::new(Role::Assistant, content_blocks),
+        )
+        .await
+        {
+            return (
+                lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
+                turn_usage,
+            );
+        }
 
         let _ = session
             .plugins
@@ -301,10 +338,16 @@ pub async fn run_turn(
         }
 
         if outcome.tool_calls.is_empty() {
-            if drain_injections(&session, &agent).await {
-                continue;
+            match drain_injections(&session, &agent, admission.as_deref(), true).await {
+                Ok(DrainOutcome::DeferredAdmission | DrainOutcome::Idle) => break,
+                Ok(DrainOutcome::Continue) => continue,
+                Err(error) => {
+                    return (
+                        lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
+                        turn_usage,
+                    );
+                }
             }
-            break;
         }
 
         let tool_interrupted =
@@ -314,7 +357,16 @@ pub async fn run_turn(
             return (lifecycle::handle_interrupted(&session, &agent), turn_usage);
         }
 
-        drain_injections(&session, &agent).await;
+        match drain_injections(&session, &agent, admission.as_deref(), true).await {
+            Ok(DrainOutcome::DeferredAdmission) => break,
+            Ok(DrainOutcome::Idle | DrainOutcome::Continue) => {}
+            Err(error) => {
+                return (
+                    lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
+                    turn_usage,
+                );
+            }
+        }
 
         let est_tokens = agent
             .history
@@ -323,19 +375,21 @@ pub async fn run_turn(
             .estimated_tokens;
         // Spec §6.4: trigger based on last observed usage.input_tokens (or est_tokens if none)
         // against the active model's context window.
-        let last_input_tokens = if turn_usage.input_tokens > 0 {
-            turn_usage.input_tokens as u32
-        } else {
-            est_tokens
-        };
+        let last_input_tokens = compaction_input_tokens(last_input_tokens, est_tokens);
         let model_info = provider.model_info(&agent_info.model.model);
         let context_window = crate::compaction::resolve_context_window(
             Some(&model_info),
             session.config.context.default_context_window,
         );
         let threshold = session.config.context.compaction_threshold;
-        if crate::compaction::needs_compaction(last_input_tokens, context_window, threshold) {
-            let _ = crate::compaction::compact(&session, &agent).await;
+        if crate::compaction::needs_compaction(last_input_tokens, context_window, threshold)
+            && let Err(error) = crate::compaction::compact(&session, &agent).await
+        {
+            log::warn!(
+                "compaction failed: session={} agent={}: {error}",
+                session.id,
+                agent.id()
+            );
         }
     }
 
@@ -344,38 +398,172 @@ pub async fn run_turn(
     } else {
         AgentStatus::Finished
     };
+    if matches!(final_status, AgentStatus::Idle | AgentStatus::Finished) {
+        agent.clear_error();
+    }
     agent.set_status(final_status, None);
     session.events.emit(Event::AgentUpdated(agent.info()));
-
-    let context_tokens = agent
-        .history
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .estimated_tokens;
-    session.record_usage(&agent.id(), turn_usage, context_tokens);
 
     *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     (TurnStop::Completed, turn_usage)
 }
 
-/// Drain queued injections into history (rendered as one user message,
-/// persisted) — returns `true` when anything was appended.
-async fn drain_injections(session: &Arc<Session>, agent: &Arc<Agent>) -> bool {
+fn compaction_input_tokens(last_input_tokens: Option<u64>, estimated_tokens: u32) -> u32 {
+    last_input_tokens
+        .map(|tokens| tokens.min(u32::MAX as u64) as u32)
+        .unwrap_or(estimated_tokens)
+}
+
+enum DrainOutcome {
+    Idle,
+    Continue,
+    DeferredAdmission,
+}
+
+async fn drain_injections(
+    session: &Arc<Session>,
+    agent: &Arc<Agent>,
+    admission: Option<&str>,
+    defer_admissions: bool,
+) -> Result<DrainOutcome, CoreError> {
     let drained = agent.injections.drain();
-    if drained.is_empty() {
-        return false;
+    if defer_admissions
+        && drained.iter().any(|item| {
+            matches!(
+                item,
+                crate::inject::Injection::UserSteer {
+                    admission: Some(candidate)
+                } if Some(candidate.as_str()) != admission
+            )
+        })
+    {
+        agent.injections.restore(drained);
+        return Ok(DrainOutcome::DeferredAdmission);
     }
+
+    let mut deferred = Vec::new();
+    let mut active = Vec::new();
+    for item in drained {
+        if matches!(
+            &item,
+            crate::inject::Injection::UserSteer {
+                admission: Some(candidate)
+            } if Some(candidate.as_str()) != admission
+        ) {
+            deferred.push(item);
+        } else {
+            active.push(item);
+        }
+    }
+
+    if let Err(error) = hide_other_admission_messages(session, agent, admission).await {
+        agent.injections.restore(deferred);
+        return Err(error);
+    }
+
+    if active.is_empty() {
+        agent.injections.restore(deferred);
+        return Ok(DrainOutcome::Idle);
+    }
+
+    let has_user_steer = active
+        .iter()
+        .any(|item| matches!(item, crate::inject::Injection::UserSteer { .. }));
+    let renderable = active
+        .into_iter()
+        .filter(|item| !matches!(item, crate::inject::Injection::UserSteer { .. }))
+        .collect::<Vec<_>>();
+    if renderable.is_empty() {
+        agent.injections.restore(deferred);
+        return Ok(if has_user_steer {
+            DrainOutcome::Continue
+        } else {
+            DrainOutcome::Idle
+        });
+    }
+
     let injection_msg =
-        crate::inject::render_injections(&drained, session.config.context.injection_cap_chars);
-    let (inj_seq, arc_inj) = agent
+        crate::inject::render_injections(&renderable, session.config.context.injection_cap_chars);
+    if let Err(error) = persist_history_message(session, agent, injection_msg).await {
+        agent.injections.restore(deferred);
+        return Err(error);
+    }
+    agent.injections.restore(deferred);
+    Ok(DrainOutcome::Continue)
+}
+
+async fn hide_other_admission_messages(
+    session: &Session,
+    agent: &Agent,
+    current_admission: Option<&str>,
+) -> Result<(), CoreError> {
+    // Both queries are keyed by (session, agent): this runs on every injection
+    // drain, several times per model step, and the agent's own history can be
+    // tens of thousands of rows long.
+    let mut message_seqs = session
+        .store
+        .cancelled_message_seqs(&session.id, &agent.id())
+        .await?;
+    for record in session
+        .store
+        .load_unresolved_message_admissions(&session.id, &agent.id())
+        .await?
+    {
+        if current_admission == Some(record.message_id.as_str()) {
+            continue;
+        }
+        if let Some(seq) = record.message_seq {
+            message_seqs.insert(seq);
+        }
+    }
+    if message_seqs.is_empty() {
+        return Ok(());
+    }
+
+    let mut history = agent.history.lock().unwrap_or_else(|p| p.into_inner());
+    let mut index = 0;
+    while index < history.message_seqs.len() {
+        if message_seqs.contains(&history.message_seqs[index]) {
+            history.message_seqs.remove(index);
+            history.messages.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    history.estimated_tokens = history
+        .messages
+        .iter()
+        .map(|message| message.estimate_tokens())
+        .sum();
+    Ok(())
+}
+
+async fn persist_history_message(
+    session: &Session,
+    agent: &Agent,
+    message: Message,
+) -> Result<(), CoreError> {
+    let reservation = agent
         .history
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push(injection_msg);
-    let _ = session
-        .store
-        .append_message(&session.id, &agent.id(), inj_seq, &arc_inj)
-        .await;
-    true
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .reserve(message);
+    if let Err(error) = session
+        .append_agent_message(agent, reservation.seq(), reservation.message())
+        .await
+    {
+        agent
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .rollback_reserved(&reservation);
+        return Err(error);
+    }
+    agent
+        .history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .commit_reserved(&reservation);
+    Ok(())
 }

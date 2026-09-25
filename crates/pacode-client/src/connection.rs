@@ -3,30 +3,143 @@
 mod reconnect;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use pacode_types::ids::ClientId;
 use pacode_types::model::ModelInfo;
 use pacode_types::state::SessionMeta;
 use pacode_types::{
-    Attach, ClientHello, Envelope, McpServerInfo, PROTOCOL_VERSION, PluginCommandOutcome,
-    PluginInfo, Reply, Request, ServerMessage, SessionId, SessionSnapshot,
+    Attach, AttachEnvelope, ClientHello, Envelope, McpServerInfo, PROTOCOL_VERSION,
+    PluginCommandOutcome, PluginInfo, Reply, Request, SessionId, SessionSnapshot,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::BufReader;
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ClientError, ClientEvent, ClientExt, ClientOptions, EventReceiver};
+use crate::{
+    AttachAttempt, ClientError, ClientEvent, ClientEventContext, ClientExt, ClientOptions,
+    EventReceiver, EventSink, LifecycleState, lock,
+};
+
+enum RequestScope {
+    Unscoped,
+    Session(ClientEventContext),
+    Attach(AttachAttempt),
+}
+
+fn requires_session(req: &Request) -> bool {
+    !matches!(
+        req,
+        Request::Hello(_)
+            | Request::Attach(_)
+            | Request::Detach
+            | Request::CloseSession
+            | Request::Shutdown { .. }
+            | Request::Ping
+            | Request::ListSessions { .. }
+            | Request::RuntimeStats
+            | Request::ListModels
+            | Request::RefreshModels
+            | Request::ListMcpServers
+            | Request::RestartMcpServer { .. }
+            | Request::SetMcpServerEnabled { .. }
+            | Request::GetMcpPrompt { .. }
+            | Request::ListPlugins
+            | Request::RunPluginCommand { .. }
+            | Request::BrowseMarketplace { .. }
+            | Request::InstallPlugin { .. }
+            | Request::UninstallPlugin { .. }
+            | Request::ListAuth
+            | Request::Login { .. }
+            | Request::Logout { .. }
+            | Request::SetAuthAccount { .. }
+    )
+}
+
+pub(super) fn clear_unacknowledged_attach_state(
+    lifecycle: &LifecycleState,
+    attempt: &AttachAttempt,
+) {
+    let _transition = lock(&lifecycle.transition_lock);
+    if lifecycle.connection_epoch.load(Ordering::Acquire) != attempt.connection_epoch
+        || lifecycle.session_epoch.load(Ordering::Acquire) != attempt.session_epoch
+    {
+        return;
+    }
+    let mut desired_guard = lock(&lifecycle.desired_attach);
+    let Some(desired) = desired_guard.as_mut() else {
+        return;
+    };
+    if desired.request_id != attempt.request_id
+        || desired.idempotency_key != attempt.idempotency_key
+        || desired.session_epoch != attempt.session_epoch
+        || desired.connection_epoch != attempt.connection_epoch
+    {
+        return;
+    }
+    desired.target = attempt.target.clone();
+    drop(desired_guard);
+    *lock(&lifecycle.attached_session) = None;
+    *lock(&lifecycle.snapshot_seq) = 0;
+    *lock(&lifecycle.last_session_seq) = 0;
+}
+
+struct PendingRequestGuard {
+    id: u64,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    pending_attaches: Arc<Mutex<HashMap<u64, AttachAttempt>>>,
+    lifecycle: Arc<LifecycleState>,
+    attach: Option<AttachAttempt>,
+    armed: bool,
+}
+
+impl PendingRequestGuard {
+    fn new(
+        id: u64,
+        pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+        pending_attaches: Arc<Mutex<HashMap<u64, AttachAttempt>>>,
+        lifecycle: Arc<LifecycleState>,
+        attach: Option<AttachAttempt>,
+    ) -> Self {
+        Self {
+            id,
+            pending,
+            pending_attaches,
+            lifecycle,
+            attach,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        lock(&self.pending).remove(&self.id);
+        lock(&self.pending_attaches).remove(&self.id);
+        if let Some(attempt) = self.attach.as_ref() {
+            clear_unacknowledged_attach_state(&self.lifecycle, attempt);
+        }
+    }
+}
 
 pub struct Client {
     opts: ClientOptions,
     client_id: ClientId,
     next_id: Arc<AtomicU64>,
-    pending: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
-    writer_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<String>>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    pending_attaches: Arc<Mutex<HashMap<u64, AttachAttempt>>>,
+    session_gate: Arc<RwLock<()>>,
+    writer_tx: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     connected: Arc<AtomicBool>,
-    attached_session: Arc<std::sync::Mutex<Option<SessionId>>>,
+    lifecycle: Arc<LifecycleState>,
     cancel_token: CancellationToken,
     supervisor_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -38,13 +151,13 @@ impl Client {
         let socket_path = opts.socket_path();
         log::info!("connecting to daemon at {}", socket_path.display());
         let stream = match tokio::net::UnixStream::connect(&socket_path).await {
-            Ok(s) => s,
+            Ok(stream) => stream,
             Err(connect_err) => {
                 if opts.spawn_daemon {
                     let exe = match &opts.exe {
-                        Some(e) => e.clone(),
+                        Some(exe) => exe.clone(),
                         None => std::env::current_exe()
-                            .map_err(|e| ClientError::Spawn(e.to_string()))?,
+                            .map_err(|error| ClientError::Spawn(error.to_string()))?,
                     };
                     crate::daemon_ctl::spawn_daemon(
                         &exe,
@@ -68,9 +181,9 @@ impl Client {
                     }
                     tokio::net::UnixStream::connect(&socket_path)
                         .await
-                        .map_err(|e| ClientError::Connect {
+                        .map_err(|error| ClientError::Connect {
                             path: socket_path.clone(),
-                            source: e,
+                            source: error,
                         })?
                 } else {
                     return Err(ClientError::Connect {
@@ -84,8 +197,8 @@ impl Client {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         let client_id = ClientId::generate();
-
-        let hello_env = Envelope {
+        let cancel_token = CancellationToken::new();
+        let hello = Envelope {
             id: 1,
             req: Request::Hello(ClientHello {
                 client_id: client_id.clone(),
@@ -93,23 +206,18 @@ impl Client {
                 protocol: PROTOCOL_VERSION,
             }),
         };
-        let mut hello_line = serde_json::to_string(&hello_env)?;
-        hello_line.push('\n');
-        write_half.write_all(hello_line.as_bytes()).await?;
-        write_half.flush().await?;
-
-        let mut reply_line = String::new();
-        reader.read_line(&mut reply_line).await?;
-        let server_msg: ServerMessage = serde_json::from_str(reply_line.trim())?;
-        let (daemon_version, pid, version_mismatch) = match server_msg {
-            ServerMessage::Reply {
-                id: 1,
-                reply:
-                    Reply::Hello {
-                        daemon_version,
-                        protocol,
-                        pid,
-                    },
+        reconnect::write_handshake(&mut write_half, &hello, opts.request_timeout, &cancel_token)
+            .await
+            .map_err(reconnect::client_error)?;
+        let (reply, buffered_events) =
+            reconnect::read_reply_handshake(&mut reader, 1, opts.request_timeout, &cancel_token)
+                .await
+                .map_err(|failure| reconnect::client_error(failure.kind))?;
+        let (daemon_version, pid, version_mismatch) = match reply {
+            Reply::Hello {
+                daemon_version,
+                protocol,
+                pid,
             } => {
                 if protocol != PROTOCOL_VERSION {
                     log::error!(
@@ -126,10 +234,7 @@ impl Client {
                 );
                 (daemon_version, pid, version_mismatch)
             }
-            ServerMessage::Reply {
-                id: 1,
-                reply: Reply::Error { message },
-            } => {
+            Reply::Error { message } => {
                 log::warn!("daemon rejected hello: {message}");
                 return Err(ClientError::Daemon(message));
             }
@@ -141,39 +246,76 @@ impl Client {
             }
         };
 
-        let (events_tx, events_rx) = mpsc::channel(1024);
+        let (events_tx, events_rx) = EventSink::channel(cancel_token.clone());
         let dropped_events = Arc::new(AtomicUsize::new(0));
+        let lifecycle = Arc::new(LifecycleState::new(1));
+        if buffered_events.overflowed() {
+            return Err(ClientError::UnexpectedReply {
+                request: "hello".into(),
+                reply: "event buffer overflow".into(),
+            });
+        }
+        let buffered_events = buffered_events.into_events();
         reconnect::emit_event(
             &events_tx,
             &dropped_events,
             ClientEvent::Connected {
+                context: lifecycle.context(),
                 daemon_version,
                 pid,
                 version_mismatch,
             },
-        );
+        )
+        .await;
+        for event in buffered_events {
+            match event {
+                reconnect::BufferedServerEvent::Event { seq, event } => {
+                    if !event.is_global() {
+                        continue;
+                    }
+                    if let Some(context) = lifecycle.accepted_event_context(seq, event.as_ref()) {
+                        reconnect::emit_event(
+                            &events_tx,
+                            &dropped_events,
+                            ClientEvent::Event {
+                                context,
+                                seq,
+                                event: *event,
+                            },
+                        )
+                        .await;
+                    }
+                }
+                reconnect::BufferedServerEvent::Resync { current_seq } => {
+                    if let Some(context) = lifecycle.accepted_resync_context(current_seq) {
+                        events_tx.emit_resync(context, current_seq);
+                    }
+                }
+            }
+        }
 
-        let cancel_token = CancellationToken::new();
-        let (writer_tx, writer_rx) = mpsc::channel::<String>(128);
-        reconnect::spawn_writer(write_half, writer_rx, cancel_token.clone());
-        let writer_tx_holder = Arc::new(std::sync::Mutex::new(Some(writer_tx)));
-
+        let writer =
+            reconnect::spawn_writer(write_half, cancel_token.clone(), opts.request_timeout);
+        let writer_tx_holder = Arc::new(Mutex::new(Some(writer.sender())));
         let next_id = Arc::new(AtomicU64::new(2));
-        let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending_attaches = Arc::new(Mutex::new(HashMap::new()));
+        let session_gate = Arc::new(RwLock::new(()));
         let connected = Arc::new(AtomicBool::new(true));
-        let attached_session = Arc::new(std::sync::Mutex::new(None));
-
         let supervisor_handle = tokio::spawn(reconnect::run_supervisor(reconnect::SupervisorCtx {
             reader,
             socket_path,
             client_id: client_id.clone(),
             opts: opts.clone(),
+            next_id: next_id.clone(),
             pending: pending.clone(),
+            pending_attaches: pending_attaches.clone(),
             events_tx,
             dropped_events,
             writer_tx_holder: writer_tx_holder.clone(),
+            writer: Some(writer),
             connected: connected.clone(),
-            attached_session: attached_session.clone(),
+            lifecycle: lifecycle.clone(),
             cancel_token: cancel_token.clone(),
         }));
 
@@ -183,9 +325,11 @@ impl Client {
                 client_id,
                 next_id,
                 pending,
+                pending_attaches,
+                session_gate,
                 writer_tx: writer_tx_holder,
                 connected,
-                attached_session,
+                lifecycle,
                 cancel_token,
                 supervisor_handle: Some(supervisor_handle),
             },
@@ -197,106 +341,286 @@ impl Client {
         &self.client_id
     }
 
+    pub fn event_context(&self) -> ClientEventContext {
+        self.lifecycle.context()
+    }
+
+    pub fn session_event_floor(&self) -> u64 {
+        self.lifecycle.session_event_floor()
+    }
+
+    fn current_session(&self) -> Option<SessionId> {
+        self.lifecycle.session()
+    }
+
+    fn begin_attach(&self, attach: Attach) -> AttachAttempt {
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let idempotency_key = SessionId::generate().as_str().to_owned();
+        self.lifecycle
+            .begin_attach(attach, request_id, idempotency_key)
+    }
+
     /// Attach to a session and return its snapshot; remembered for reconnects.
     pub async fn attach(&self, attach: Attach) -> Result<SessionSnapshot, ClientError> {
-        log::info!("attaching to session: {attach:?}");
-        match self.request(Request::Attach(attach)).await? {
+        let _guard = self.session_gate.write().await;
+        let attempt = self.begin_attach(attach);
+        self.attach_inner(attempt).await
+    }
+
+    pub async fn retry_attach(&self, attach: Attach) -> Result<SessionSnapshot, ClientError> {
+        let _guard = self.session_gate.write().await;
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let Some(attempt) = self.lifecycle.retry_attach(&attach, request_id) else {
+            return Err(ClientError::StaleSession);
+        };
+        log::info!("retrying attach: {:?}", attempt.target);
+        self.attach_inner(attempt).await
+    }
+
+    async fn attach_inner(&self, attempt: AttachAttempt) -> Result<SessionSnapshot, ClientError> {
+        log::info!("attaching to session: {:?}", attempt.target);
+        let reply = self
+            .request_inner(
+                Request::Attach(attempt.target.clone()),
+                RequestScope::Attach(attempt.clone()),
+            )
+            .await?;
+        match reply {
             Reply::Attached(snapshot) => {
-                log::info!("attached to session {}", snapshot.meta.id);
-                if let Ok(mut guard) = self.attached_session.lock() {
-                    *guard = Some(snapshot.meta.id.clone());
+                if !self
+                    .lifecycle
+                    .is_attach_current(&attempt, &snapshot.meta.id)
+                {
+                    return Err(ClientError::StaleSession);
                 }
+                log::info!("attached to session {}", snapshot.meta.id);
                 Ok(snapshot)
             }
             Reply::Error { message } => {
+                self.clear_failed_attach(&attempt);
                 log::warn!("failed to attach to session: {message}");
                 Err(ClientError::Daemon(message))
             }
-            other => Err(ClientError::UnexpectedReply {
-                request: "attach".into(),
-                reply: format!("{other:?}"),
-            }),
+            other => {
+                self.clear_failed_attach(&attempt);
+                Err(ClientError::UnexpectedReply {
+                    request: "attach".into(),
+                    reply: format!("{other:?}"),
+                })
+            }
         }
     }
 
+    /// Detach and attach as one ordered transition on the connection.
+    pub async fn switch_session(&self, attach: Attach) -> Result<SessionSnapshot, ClientError> {
+        let _guard = self.session_gate.write().await;
+        let attempt = self.begin_attach(attach);
+        let detach = self
+            .request_inner(Request::Detach, RequestScope::Unscoped)
+            .await;
+        match detach {
+            Ok(Reply::Ok) => {}
+            Ok(Reply::Error { message }) => {
+                self.clear_failed_attach(&attempt);
+                return Err(ClientError::Daemon(message));
+            }
+            Ok(other) => {
+                self.clear_failed_attach(&attempt);
+                return Err(ClientError::UnexpectedReply {
+                    request: "detach".into(),
+                    reply: format!("{other:?}"),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        self.attach_inner(attempt).await
+    }
+
     pub fn session(&self) -> Option<SessionId> {
-        self.attached_session
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+        self.current_session()
     }
 
     /// Send a request and await its reply (with `request_timeout`).
     pub async fn request(&self, req: Request) -> Result<Reply, ClientError> {
+        match req {
+            Request::Attach(attach) => self.attach(attach).await.map(Reply::Attached),
+            Request::Detach => self.detach().await,
+            Request::Hello(_) => Err(ClientError::InvalidSequenceRequest { request: "hello" }),
+            req if requires_session(&req) => self.request_session(req).await,
+            req => self.request_inner(req, RequestScope::Unscoped).await,
+        }
+    }
+
+    async fn detach(&self) -> Result<Reply, ClientError> {
+        let _guard = self.session_gate.write().await;
+        self.lifecycle.begin_detach();
+        self.request_inner(Request::Detach, RequestScope::Unscoped)
+            .await
+    }
+
+    pub async fn close_session(&self) -> Result<Reply, ClientError> {
+        let _guard = self.session_gate.write().await;
+        let context = self.lifecycle.context();
+        if context.session.is_none() {
+            return Err(ClientError::StaleSession);
+        }
+        let reply = self
+            .request_inner(Request::CloseSession, RequestScope::Session(context))
+            .await?;
+        if matches!(reply, Reply::Ok) {
+            self.lifecycle.begin_detach();
+        }
+        Ok(reply)
+    }
+
+    pub async fn request_session_for(
+        &self,
+        context: ClientEventContext,
+        req: Request,
+    ) -> Result<Reply, ClientError> {
+        if !requires_session(&req) {
+            return Err(ClientError::InvalidSequenceRequest {
+                request: req.name(),
+            });
+        }
+        if context.session.is_none() {
+            return Err(ClientError::StaleSession);
+        }
+        let _guard = self.session_gate.read().await;
+        self.request_inner(req, RequestScope::Session(context))
+            .await
+    }
+
+    pub async fn request_sequence<I>(
+        &self,
+        context: ClientEventContext,
+        requests: I,
+    ) -> Result<Vec<Reply>, ClientError>
+    where
+        I: IntoIterator<Item = Request>,
+    {
+        if context.session.is_none() {
+            return Err(ClientError::StaleSession);
+        }
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        let _guard = self.session_gate.read().await;
+        if !self.lifecycle.is_context_current(&context) {
+            return Err(ClientError::StaleSession);
+        }
+        if let Some(request) = requests.iter().find(|request| !requires_session(request)) {
+            return Err(ClientError::InvalidSequenceRequest {
+                request: request.name(),
+            });
+        }
+        let mut replies = Vec::with_capacity(requests.len());
+        for request in requests {
+            let reply = self
+                .request_inner(request, RequestScope::Session(context.clone()))
+                .await?;
+            match reply {
+                Reply::Error { message } => return Err(ClientError::Daemon(message)),
+                reply => replies.push(reply),
+            }
+        }
+        Ok(replies)
+    }
+
+    /// Send a session-bound request while holding the session transition gate.
+    pub async fn request_session(&self, req: Request) -> Result<Reply, ClientError> {
+        let context = self.event_context();
+        self.request_session_for(context, req).await
+    }
+
+    fn clear_failed_attach(&self, attempt: &AttachAttempt) {
+        let _ = self.lifecycle.clear_failed_attach(attempt);
+    }
+
+    async fn request_inner(&self, req: Request, scope: RequestScope) -> Result<Reply, ClientError> {
         if !self.is_connected() {
             return Err(ClientError::Disconnected);
         }
-        // Session switches go through `request` (e.g. the TUI's slot keys
-        // send `Detach`+`Attach`), not through `attach()` — the remembered
-        // session the reconnect supervisor re-attaches to must follow them.
-        let is_detach = matches!(req, Request::Detach);
+        let attach_metadata = match &scope {
+            RequestScope::Attach(attempt) => Some(attempt.clone()),
+            RequestScope::Unscoped | RequestScope::Session(_) => None,
+        };
+        let id = attach_metadata
+            .as_ref()
+            .map(|attempt| attempt.request_id)
+            .unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::Relaxed));
         let req_name = req.name();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().map_err(|_| ClientError::Disconnected)?;
-            pending.insert(id, tx);
+        let mut pending_guard = PendingRequestGuard::new(
+            id,
+            self.pending.clone(),
+            self.pending_attaches.clone(),
+            self.lifecycle.clone(),
+            attach_metadata.clone(),
+        );
+        lock(&self.pending).insert(id, tx);
+        if let Some(attempt) = &attach_metadata {
+            lock(&self.pending_attaches).insert(id, attempt.clone());
         }
 
         let envelope = Envelope { id, req };
-        let mut line = match serde_json::to_string(&envelope) {
-            Ok(l) => l,
-            Err(e) => {
-                if let Ok(mut pending) = self.pending.lock() {
-                    pending.remove(&id);
-                }
-                return Err(ClientError::Json(e));
-            }
+        let serialized = match attach_metadata.as_ref() {
+            Some(attempt) => serde_json::to_string(&AttachEnvelope {
+                envelope,
+                idempotency_key: Some(attempt.idempotency_key.clone()),
+            }),
+            None => serde_json::to_string(&envelope),
+        };
+        let mut line = match serialized {
+            Ok(line) => line,
+            Err(error) => return Err(ClientError::Json(error)),
         };
         line.push('\n');
-
-        let writer = {
-            let guard = self
-                .writer_tx
-                .lock()
-                .map_err(|_| ClientError::Disconnected)?;
-            guard.clone()
-        };
+        let writer = lock(&self.writer_tx).clone();
         let Some(writer) = writer else {
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.remove(&id);
-            }
             return Err(ClientError::Disconnected);
         };
-
-        if writer.send(line).await.is_err() {
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.remove(&id);
+        let deadline = tokio::time::Instant::now() + self.opts.request_timeout;
+        let permit = tokio::select! {
+            _ = self.cancel_token.cancelled() => {
+                return Err(ClientError::Disconnected);
             }
-            return Err(ClientError::Disconnected);
+            result = tokio::time::timeout_at(deadline, writer.reserve()) => {
+                match result {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        return Err(ClientError::Disconnected);
+                    }
+                    Err(_) => {
+                        return Err(ClientError::Timeout(req_name));
+                    }
+                }
+            }
+        };
+        {
+            let _transition = lock(&self.lifecycle.transition_lock);
+            let current = match &scope {
+                RequestScope::Unscoped => true,
+                RequestScope::Session(expected) => self.lifecycle.context_unlocked() == *expected,
+                RequestScope::Attach(attempt) => {
+                    self.lifecycle.outgoing_attach_is_current_unlocked(attempt)
+                }
+            };
+            if !current {
+                drop(permit);
+                return Err(ClientError::StaleSession);
+            }
+            permit.send(line);
         }
 
-        match tokio::time::timeout(self.opts.request_timeout, rx).await {
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(reply)) => {
-                if let Reply::Attached(snapshot) = &reply {
-                    if let Ok(mut guard) = self.attached_session.lock() {
-                        *guard = Some(snapshot.meta.id.clone());
-                    }
-                } else if is_detach
-                    && matches!(reply, Reply::Ok)
-                    && let Ok(mut guard) = self.attached_session.lock()
-                {
-                    *guard = None;
+                if let Reply::Snapshot(snapshot) = &reply {
+                    let _ = self.lifecycle.observe_snapshot(snapshot);
                 }
+                pending_guard.disarm();
                 Ok(reply)
             }
             Ok(Err(_)) => Err(ClientError::Disconnected),
-            Err(_) => {
-                if let Ok(mut pending) = self.pending.lock() {
-                    pending.remove(&id);
-                }
-                Err(ClientError::Timeout(req_name))
-            }
+            Err(_) => Err(ClientError::Timeout(req_name)),
         }
     }
 
@@ -436,10 +760,8 @@ impl Client {
         log::info!("closing client connection (client_id={})", self.client_id);
         self.cancel_token.cancel();
         self.connected.store(false, Ordering::Relaxed);
-        if let Ok(mut w) = self.writer_tx.lock() {
-            *w = None;
-        }
-        reconnect::fail_pending(&self.pending);
+        *lock(&self.writer_tx) = None;
+        reconnect::fail_pending(&self.pending, &self.pending_attaches);
         if let Some(handle) = self.supervisor_handle.take() {
             let _ = handle.await;
         }
@@ -465,5 +787,79 @@ impl std::fmt::Debug for Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.cancel_token.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn committed_attach_timeout_preserves_retry_state() {
+        let lifecycle = LifecycleState::new(1);
+        let session = SessionId::new("ses_test");
+        let attempt = lifecycle.begin_attach(
+            Attach::New {
+                cwd: PathBuf::from("/tmp"),
+                model: None,
+                effort: None,
+                mode: None,
+            },
+            2,
+            "key".into(),
+        );
+        *lock(&lifecycle.desired_attach) = Some(AttachAttempt {
+            request_id: attempt.request_id,
+            idempotency_key: attempt.idempotency_key.clone(),
+            target: Attach::Resume {
+                session: session.clone(),
+            },
+            session_epoch: attempt.session_epoch,
+            connection_epoch: attempt.connection_epoch,
+        });
+        *lock(&lifecycle.attached_session) = Some(session.clone());
+
+        clear_unacknowledged_attach_state(&lifecycle, &attempt);
+
+        assert_eq!(lifecycle.desired_attach().unwrap().target, attempt.target);
+        assert!(lifecycle.session().is_none());
+        let retry = lifecycle.retry_attach(&attempt.target, 3).unwrap();
+        assert_eq!(retry.idempotency_key, attempt.idempotency_key);
+    }
+
+    #[test]
+    fn dropping_pending_request_removes_waiter_and_rolls_back_attach() {
+        let lifecycle = Arc::new(LifecycleState::new(1));
+        let attempt = lifecycle.begin_attach(
+            Attach::New {
+                cwd: PathBuf::from("/tmp"),
+                model: None,
+                effort: None,
+                mode: None,
+            },
+            2,
+            "key".into(),
+        );
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending_attaches = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        lock(&pending).insert(attempt.request_id, tx);
+        lock(&pending_attaches).insert(attempt.request_id, attempt.clone());
+        let guard = PendingRequestGuard::new(
+            attempt.request_id,
+            pending.clone(),
+            pending_attaches.clone(),
+            lifecycle.clone(),
+            Some(attempt.clone()),
+        );
+
+        drop(guard);
+
+        assert!(lock(&pending).is_empty());
+        assert!(lock(&pending_attaches).is_empty());
+        assert_eq!(lifecycle.desired_attach().unwrap().target, attempt.target);
+        assert!(lifecycle.session().is_none());
     }
 }

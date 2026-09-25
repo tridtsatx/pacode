@@ -4,8 +4,8 @@
 //! for internal queries (`git log`, version probes) that must stay invisible.
 //!
 //! Shares the supervisor's spawn conventions: own process group on unix, stdin
-//! null, both pipes drained concurrently, the process group is SIGKILLed when
-//! the timeout fires (never left running).
+//! null, both pipes drained concurrently, the process group is SIGKILLed on the
+//! timeout and right after the child exits (never left running).
 
 use std::path::Path;
 use std::time::Duration;
@@ -73,7 +73,10 @@ pub async fn run_capture(
 
     let mut timed_out = false;
     let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(res) => res.ok().and_then(|s| s.code()),
+        Ok(res) => {
+            crate::supervisor::force_kill(child_pid);
+            res.ok().and_then(|s| s.code())
+        }
         Err(_) => {
             timed_out = true;
             kill_group(&mut child, child_pid).await;
@@ -81,9 +84,7 @@ pub async fn run_capture(
         }
     };
 
-    // Pipes close once the process group dies; a short bound guards against a
-    // wedged reader task.
-    let drain = tokio::time::timeout(Duration::from_secs(3), async {
+    let drain = tokio::time::timeout(crate::supervisor::DRAIN_GRACE, async {
         let out = stdout_reader.await.unwrap_or_default();
         let err = stderr_reader.await.unwrap_or_default();
         (out, err)
@@ -133,14 +134,8 @@ async fn read_bounded(
 
 /// SIGKILL the whole process group (the supervisor's timeout semantics); falls
 /// back to killing just the child when the group signal is unavailable.
-async fn kill_group(child: &mut tokio::process::Child, pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        // Safety: signalling our own spawned process group.
-        unsafe {
-            libc::killpg(pid as i32, libc::SIGKILL);
-        }
-    }
+async fn kill_group(child: &mut tokio::process::Child, child_pid: Option<u32>) {
+    crate::supervisor::force_kill(child_pid);
     let _ = child.kill().await;
     let _ = child.wait().await;
 }

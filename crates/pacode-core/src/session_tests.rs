@@ -2,15 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pacode_config::Paths;
-use pacode_exec::TaskManager;
+use pacode_exec::{TaskManager, TaskSpec};
 use pacode_mcp::McpPool;
 use pacode_provider::ProviderRegistry;
 use pacode_provider::mock::{MockProvider, MockResponse};
 use pacode_store::Store;
-use pacode_tools::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, ToolRegistry};
+use pacode_tools::{Tool, ToolCtx, ToolError, ToolHost, ToolKind, ToolOutput, ToolRegistry};
 use pacode_types::{
     AgentId, AgentStatus, Attach, CallId, Config, ContentBlock, Effort, Event, Message, ModelRoute,
-    Reply, Request, Role, TurnId, TurnStop,
+    Reply, Request, Role, TranscriptKind, TurnId, TurnStop,
 };
 
 use crate::core::{Core, CoreDeps};
@@ -69,15 +69,11 @@ impl Tool for BlockTool {
     }
 }
 
-async fn setup_test_session() -> (
-    Arc<Core>,
-    Arc<MockProvider>,
-    tempfile::TempDir,
-    pacode_types::SessionId,
-) {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let store = Store::open_in_memory().unwrap();
-
+async fn build_test_core(
+    store: Store,
+    temp_dir: &tempfile::TempDir,
+    mock_provider: Arc<MockProvider>,
+) -> Arc<Core> {
     let exec_cfg = pacode_types::ExecConfig {
         yield_after_secs: 1,
         stall_secs: 100,
@@ -90,9 +86,8 @@ async fn setup_test_session() -> (
     let tasks = TaskManager::new(temp_dir.path().to_path_buf(), exec_cfg);
     let mcp = McpPool::new(Default::default(), None, None);
 
-    let mock_provider = Arc::new(MockProvider::new("mock"));
     let mut reg = ProviderRegistry::empty();
-    reg.insert(mock_provider.clone());
+    reg.insert(mock_provider);
     reg.set_default_route(Some(ModelRoute {
         provider: "mock".into(),
         model: "mock-model".into(),
@@ -125,11 +120,22 @@ async fn setup_test_session() -> (
         skills: Arc::new(pacode_skills::SkillRegistry::default()),
     };
 
-    let core = Core::new(deps).await;
-    let cwd = temp_dir.path().to_path_buf();
+    Core::new(deps).await
+}
+
+async fn setup_test_session() -> (
+    Arc<Core>,
+    Arc<MockProvider>,
+    tempfile::TempDir,
+    pacode_types::SessionId,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let mock_provider = Arc::new(MockProvider::new("mock"));
+    let core = build_test_core(store, &temp_dir, mock_provider.clone()).await;
     let session_id = core
         .open_session(Attach::New {
-            cwd,
+            cwd: temp_dir.path().to_path_buf(),
             model: Some(ModelRoute {
                 provider: "mock".into(),
                 model: "mock-model".into(),
@@ -168,6 +174,374 @@ async fn test_identity_accessor_and_swap() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn close_and_resume_share_one_session_lifecycle_owner() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let original_main = session.main_agent().unwrap();
+    let held_turn = original_main.turn_lock.clone().lock_owned().await;
+
+    let close = tokio::spawn({
+        let core = core.clone();
+        let session_id = session_id.clone();
+        async move { core.close_session(&session_id).await }
+    });
+    wait_until(|| original_main.stop_requested()).await;
+    let resume = tokio::spawn({
+        let core = core.clone();
+        let session_id = session_id.clone();
+        async move {
+            core.open_session(Attach::Resume {
+                session: session_id,
+            })
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !resume.is_finished(),
+        "resume must wait for close quiescence"
+    );
+
+    drop(held_turn);
+    close.await.unwrap();
+    assert_eq!(resume.await.unwrap().unwrap(), session_id);
+    let resumed = core.session(&session_id).unwrap();
+    assert!(!Arc::ptr_eq(&resumed, &session));
+    assert!(!Arc::ptr_eq(&resumed.main_agent().unwrap(), &original_main));
+    assert!(!original_main.is_running());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn close_fences_spawn_and_continue_agent_operations() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let close = tokio::spawn({
+        let core = core.clone();
+        let session_id = session_id.clone();
+        async move { core.close_session(&session_id).await }
+    });
+    wait_until(|| session.closed.load(std::sync::atomic::Ordering::SeqCst)).await;
+    assert!(
+        session
+            .spawn_agent(pacode_tools::AgentSpec {
+                name: Some("late".into()),
+                prompt: "must not spawn".into(),
+                tools: None,
+                fork: false,
+                model: None,
+                effort: None,
+            })
+            .await
+            .is_err()
+    );
+    assert!(session.continue_agent(&AgentId::main()).await.is_err());
+    close.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn latest_attach_reuses_existing_identity_without_recursive_lock() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let cwd = core.session(&session_id).unwrap().meta().cwd;
+    let opened = tokio::time::timeout(
+        Duration::from_secs(1),
+        core.open_session_with_id(Attach::Latest { cwd }, session_id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(opened, session_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_resolution_does_not_invert_alias_and_agent_locks() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    let alias_id = AgentId::new("agt_alias_only");
+    session.alias_agent(alias_id.clone(), main.clone());
+    let resolver_session = session.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let agents = session.agents.write().unwrap();
+
+    let (alias_was_available, resolved) = std::thread::scope(|scope| {
+        let resolver = scope.spawn(move || {
+            started_tx.send(()).unwrap();
+            resolver_session.agent_for_host(&alias_id)
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let alias_was_available = session.agent_aliases.try_lock().is_ok();
+        drop(agents);
+        let resolved = resolver.join().unwrap();
+        (alias_was_available, resolved)
+    });
+
+    assert!(alias_was_available);
+    assert!(Arc::ptr_eq(&resolved.unwrap(), &main));
+}
+
+/// A turn owns its agent's turn lock for its whole lifetime, and a tool inside
+/// that turn can need the session submit lock (spawning a subagent is a tool
+/// call). So `InterruptAll` has to take the turn lock first: taking the submit
+/// lock and then waiting for the turn left the turn waiting for a lock nobody
+/// was going to release.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_all_waits_for_the_turn_without_holding_the_submit_lock() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    let turn = main.turn_lock.clone().try_lock_owned().unwrap();
+
+    let interrupt = tokio::spawn({
+        let session = session.clone();
+        async move { session.interrupt_all().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !interrupt.is_finished(),
+        "InterruptAll must wait for the turn in flight"
+    );
+    assert!(
+        session.submit_lock.try_lock().is_ok(),
+        "InterruptAll must not hold the submit lock while waiting for the turn"
+    );
+
+    drop(turn);
+    tokio::time::timeout(Duration::from_secs(2), interrupt)
+        .await
+        .expect("InterruptAll deadlocked waiting for the turn lock")
+        .unwrap();
+    assert!(!main.is_running());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn close_waits_for_the_turn_without_holding_the_submit_lock() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    let turn = main.turn_lock.clone().try_lock_owned().unwrap();
+
+    let close = tokio::spawn({
+        let core = core.clone();
+        let session_id = session_id.clone();
+        async move { core.close_session(&session_id).await }
+    });
+    wait_until(|| session.closed.load(std::sync::atomic::Ordering::SeqCst)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !close.is_finished(),
+        "close must wait for the turn in flight"
+    );
+    assert!(
+        session.submit_lock.try_lock().is_ok(),
+        "close must not hold the submit lock while waiting for the turn"
+    );
+
+    drop(turn);
+    tokio::time::timeout(Duration::from_secs(2), close)
+        .await
+        .expect("close deadlocked waiting for the turn lock")
+        .unwrap();
+    assert!(core.session_ids().is_empty());
+    core.shutdown().await;
+}
+
+/// An admission whose claim failed goes back to the head of its agent's queue:
+/// it was the one being replayed first, and a re-queue at the tail would let
+/// later messages overtake it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requeued_admission_goes_back_to_the_head_of_the_recovery_queue() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let agent = AgentId::main();
+
+    session.queue_recovery_admissions(&agent, ["first".to_string(), "second".to_string()]);
+    assert!(!session.queue_recovery_admission_first(&agent, "first".to_string()));
+    assert_eq!(
+        session.take_recovery_admissions(&agent),
+        vec!["first".to_string(), "second".to_string()],
+        "an already-queued admission keeps its place instead of duplicating"
+    );
+
+    session.queue_recovery_admissions(
+        &agent,
+        [
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ],
+    );
+    assert!(session.queue_recovery_admission_first(&agent, "retried".to_string()));
+    assert_eq!(
+        session.take_recovery_admissions(&agent),
+        vec![
+            "retried".to_string(),
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string()
+        ]
+    );
+
+    let cap = crate::session::MAX_RECOVERY_ADMISSIONS;
+    session.queue_recovery_admissions(&agent, (0..cap).map(|index| format!("cap-{index}")));
+    assert!(session.queue_recovery_admission_first(&agent, "requeued".to_string()));
+    let queued = session.take_recovery_admissions(&agent);
+    assert_eq!(queued.len(), cap, "the queue stays bounded");
+    assert_eq!(queued.first().map(String::as_str), Some("requeued"));
+    assert_eq!(
+        queued.last().map(String::as_str),
+        Some(format!("cap-{}", cap - 2).as_str())
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detach_reassigns_waiters_and_tasks_to_immutable_old_owner() {
+    let (core, mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let original_main = session.main_agent().unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(500),
+        text: "detached".into(),
+    });
+    session
+        .submit_user_message("run pending work".into())
+        .await
+        .unwrap();
+    wait_until(|| original_main.is_running()).await;
+
+    let permission = pacode_types::PermissionRequest {
+        id: pacode_types::PermissionId::generate(),
+        agent: AgentId::main(),
+        agent_name: "main".into(),
+        call_id: CallId::generate(),
+        tool: "write".into(),
+        title: "Write owned.txt".into(),
+        detail: "content".into(),
+        risk: None,
+        created_at_ms: pacode_types::now_ms(),
+    };
+    let _permission_waiter = session
+        .permissions
+        .register(permission.clone())
+        .expect("permission should register");
+    let question = pacode_types::question::Question::new(
+        pacode_types::QuestionId::generate(),
+        pacode_types::question::QuestionOrigin::new(AgentId::main(), "main", CallId::generate()),
+        "Pick",
+        "Pick one",
+        vec![
+            pacode_types::question::QuestionOption::new("yes", ""),
+            pacode_types::question::QuestionOption::new("no", ""),
+        ],
+        false,
+        pacode_types::now_ms(),
+    )
+    .unwrap();
+    let _question_waiter = session.questions.register(question.clone()).unwrap();
+    let task = session
+        .tasks
+        .spawn(TaskSpec::new(
+            session.id.clone(),
+            AgentId::main(),
+            "sleep 5",
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+    session.store.upsert_task(&task).await.unwrap();
+
+    let detached_id = session.detach_main_turn().await.unwrap();
+    let fresh_main = session.main_agent().unwrap();
+    assert!(Arc::ptr_eq(
+        &session.agent_for_host(&AgentId::main()).unwrap(),
+        &fresh_main
+    ));
+    assert!(Arc::ptr_eq(
+        &session.agent_for_host(&detached_id).unwrap(),
+        &original_main
+    ));
+    assert_eq!(session.permissions.pending()[0].agent, detached_id);
+    assert_eq!(session.questions.pending()[0].agent, detached_id);
+    assert_eq!(session.tasks.info(&task.id).unwrap().owner, detached_id);
+    assert_eq!(
+        session
+            .store
+            .list_tasks(&session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|info| info.id == task.id)
+            .unwrap()
+            .owner,
+        detached_id
+    );
+    let (next_item_seq, expected_next) = {
+        let main = session.main_agent().unwrap();
+        let transcript = main.transcript.lock().unwrap();
+        // Detach reserves the band reserved for store history, so the counter
+        // starts there rather than at 0 even when the tail is empty.
+        let floor = transcript
+            .tail
+            .iter()
+            .map(|item| item.seq.saturating_add(1))
+            .max()
+            .unwrap_or(crate::transcript::HISTORY_ITEM_BASE);
+        (transcript.next_item_seq, floor)
+    };
+    assert_eq!(next_item_seq, expected_next);
+
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    let after = host
+        .spawn_task(TaskSpec::new(
+            session.id.clone(),
+            AgentId::main(),
+            "sleep 5",
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session.tasks.info(&after).unwrap().owner, AgentId::main());
+    session.tasks.kill(&after).await.unwrap();
+    session.stop_agent(&detached_id).await.unwrap();
+    session.tasks.kill(&task.id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_session_rejects_prepared_detach_commit() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(200),
+        text: "detached".into(),
+    });
+    session
+        .submit_user_message("detach while open".into())
+        .await
+        .unwrap();
+    let main = session.main_agent().unwrap();
+    wait_until(|| main.is_running()).await;
+    let plan = session.prepare_detach(&main);
+
+    session
+        .closed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = session.commit_detach(&main, plan).unwrap_err();
+    assert!(error.to_string().contains("closed"));
+    assert!(Arc::ptr_eq(&session.main_agent().unwrap(), &main));
+    assert!(main.id().is_main());
+    assert_eq!(session.agents.read().unwrap().len(), 1);
+
+    session.stop_agent(&AgentId::main()).await.unwrap();
+    wait_until(|| !main.is_running()).await;
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_detach_with_no_turn_running_fails() {
     let (core, _mock, _tmp, session_id) = setup_test_session().await;
     let session = core.session(&session_id).unwrap();
@@ -188,6 +562,92 @@ async fn test_detach_with_no_turn_running_fails() {
         }
         other => panic!("expected Reply::Error, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subagent_prompt_and_fork_history_survive_reopen() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("subagent-prompt.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let session = first_core.session(&session_id).unwrap();
+    mock.push(MockResponse::Text("parent answer".into()));
+    session
+        .submit_user_message("parent prompt".into())
+        .await
+        .unwrap();
+    wait_until(|| {
+        session
+            .main_agent()
+            .unwrap()
+            .history
+            .lock()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|(_, message)| message.text() == "parent answer")
+    })
+    .await;
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(100),
+        text: "sub answer".into(),
+    });
+    let sub_id = session
+        .spawn_agent(pacode_tools::AgentSpec {
+            name: Some("forked".into()),
+            prompt: "fork prompt".into(),
+            tools: None,
+            fork: true,
+            model: None,
+            effort: None,
+        })
+        .await
+        .unwrap();
+    let sub = session.agent(&sub_id).unwrap();
+    wait_until(|| sub.is_running()).await;
+    let before = sub.history.lock().unwrap().clone();
+    assert_eq!(before.next_seq, 3);
+    assert_eq!(
+        before
+            .rows()
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(sub.prompt(), Some("fork prompt".into()));
+    wait_until(|| !sub.is_running()).await;
+    first_core.shutdown().await;
+
+    let second_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let restored = second_core
+        .session(&session_id)
+        .unwrap()
+        .agent(&sub_id)
+        .unwrap();
+    assert_eq!(restored.prompt(), Some("fork prompt".into()));
+    let after = restored.history.lock().unwrap().clone();
+    assert_eq!(after.next_seq, 4);
+    assert_eq!(
+        after.rows().iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    second_core.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -298,13 +758,13 @@ async fn test_detach_turn_events_carry_new_id_and_none_carry_main() {
         .await
         .unwrap();
 
-    // Wait until turn starts and first delta arrives
-    let timeout = tokio::time::sleep(Duration::from_secs(3));
-    tokio::pin!(timeout);
-
+    // Wait until turn starts and first delta arrives. Each wait gets its own
+    // deadline so a slow first leg cannot starve the second one.
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for initial text delta"),
+            _ = &mut deadline => panic!("timed out waiting for initial text delta"),
             res = rx.recv() => {
                 if let Ok((_seq, Event::TextDelta { .. })) = res {
                     break;
@@ -326,8 +786,10 @@ async fn test_detach_turn_events_carry_new_id_and_none_carry_main() {
     let mut saw_turn_ended = false;
 
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => break,
+            _ = &mut deadline => break,
             res = rx.recv() => {
                 if let Ok((_seq, event)) = res {
                     match event {
@@ -368,12 +830,15 @@ async fn test_fresh_main_history_equals_conversation_as_it_stood_before_detached
         .unwrap();
 
     let mut rx = core.subscribe(&session_id).unwrap();
-    let timeout = tokio::time::sleep(Duration::from_secs(3));
-    tokio::pin!(timeout);
 
+    // Each wait gets its own deadline: one shared budget across three waits
+    // made this test fail under load, since a slow first turn left the later
+    // ones with whatever time was left over.
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for Turn 1 to complete"),
+            _ = &mut deadline => panic!("timed out waiting for Turn 1 to complete"),
             res = rx.recv() => {
                 if let Ok((_seq, Event::TurnEnded { agent, .. })) = res
                     && agent.is_main()
@@ -401,8 +866,10 @@ async fn test_fresh_main_history_equals_conversation_as_it_stood_before_detached
         .unwrap();
 
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for turn 2 delta"),
+            _ = &mut deadline => panic!("timed out waiting for turn 2 delta"),
             res = rx.recv() => {
                 if let Ok((_seq, Event::TextDelta { .. })) = res {
                     break;
@@ -437,8 +904,10 @@ async fn test_fresh_main_history_equals_conversation_as_it_stood_before_detached
 
     let mut saw_main_turn_3_ended = false;
     while !saw_main_turn_3_ended {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for Turn 3 on fresh main"),
+            _ = &mut deadline => panic!("timed out waiting for Turn 3 on fresh main"),
             res = rx.recv() => {
                 if let Ok((_seq, Event::TurnEnded { agent, .. })) = res
                     && agent.is_main()
@@ -466,6 +935,201 @@ async fn test_fresh_main_history_equals_conversation_as_it_stood_before_detached
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn detach_copies_persisted_pending_steer_with_original_seq() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("block_tool".into(), serde_json::json!({}))],
+    });
+    session.submit_user_message("first".into()).await.unwrap();
+    wait_until(|| main.status() == AgentStatus::RunningTool).await;
+    session
+        .submit_user_message("pending steer".into())
+        .await
+        .unwrap();
+
+    let detached_id = session.detach_main_turn().await.unwrap();
+    let stored = session
+        .store
+        .load_messages(&session.id, &detached_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 3);
+    assert_eq!(stored[0].seq, 0);
+    assert_eq!(stored[0].message.text(), "first");
+    assert_eq!(stored[1].seq, 1);
+    assert!(stored[1].message.has_tool_uses());
+    assert_eq!(stored[2].seq, 2);
+    assert_eq!(stored[2].message.text(), "pending steer");
+
+    let fresh_main = session.main_agent().unwrap();
+    {
+        let fresh_history = fresh_main.history.lock().unwrap();
+        assert!(fresh_history.messages.is_empty());
+    }
+
+    let detached = session.agent(&detached_id).unwrap();
+    assert!(detached.has_pending_user_messages());
+    session.stop_agent(&detached_id).await.unwrap();
+    wait_until(|| !detached.is_running()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detach_upsert_failure_keeps_running_main_and_pending_reservations() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("block_tool".into(), serde_json::json!({}))],
+    });
+    session
+        .submit_user_message("running prompt".into())
+        .await
+        .unwrap();
+    let main = session.main_agent().unwrap();
+    wait_until(|| main.status() == AgentStatus::RunningTool).await;
+    session
+        .submit_user_message("pending steer".into())
+        .await
+        .unwrap();
+
+    let main_id = main.id();
+    let history = main.history.lock().unwrap().clone();
+    let next_seq = history.next_seq;
+    let baseline = main
+        .history_before_turn
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|history| (history.messages.len(), history.next_seq));
+    let prompt = main.prompt();
+    let pending_seq = main.persisted_pending_user_messages()[0].0;
+    session.store.set_fault_injection(true);
+
+    let error = session.detach_main_turn().await.unwrap_err();
+    assert!(error.to_string().contains("store"), "got: {error}");
+    let current = session.main_agent().unwrap();
+    assert!(Arc::ptr_eq(&current, &main));
+    assert_eq!(current.id(), main_id);
+    assert!(current.is_running());
+    assert_eq!(current.history.lock().unwrap().next_seq, next_seq);
+    assert!(current.has_pending_user_messages());
+    assert_eq!(current.persisted_pending_user_messages()[0].0, pending_seq);
+    assert_eq!(
+        current
+            .history_before_turn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|history| (history.messages.len(), history.next_seq)),
+        baseline
+    );
+    assert_eq!(current.prompt(), prompt);
+    assert_eq!(session.agents.read().unwrap().len(), 1);
+
+    session.store.set_fault_injection(false);
+    session.stop_agent(&main_id).await.unwrap();
+    wait_until(|| !main.is_running()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detach_store_failure_keeps_main_state_and_pending_seq() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("block_tool".into(), serde_json::json!({}))],
+    });
+    session
+        .submit_user_message("running prompt".into())
+        .await
+        .unwrap();
+    let main = session.main_agent().unwrap();
+    wait_until(|| main.status() == AgentStatus::RunningTool).await;
+    session
+        .submit_user_message("pending steer".into())
+        .await
+        .unwrap();
+    let next_seq = main.history.lock().unwrap().next_seq;
+    let pending_seq = main.persisted_pending_user_messages()[0].0;
+    session.store.set_fault_injection(true);
+
+    assert!(session.detach_main_turn().await.is_err());
+    let current = session.main_agent().unwrap();
+    assert!(Arc::ptr_eq(&current, &main));
+    assert!(current.id().is_main());
+    assert!(current.is_running());
+    assert_eq!(current.history.lock().unwrap().next_seq, next_seq);
+    assert!(current.has_pending_user_messages());
+    assert_eq!(current.persisted_pending_user_messages()[0].0, pending_seq);
+    assert_eq!(session.agents.read().unwrap().len(), 1);
+
+    session.store.set_fault_injection(false);
+    session.stop_agent(&AgentId::main()).await.unwrap();
+    wait_until(|| !main.is_running()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detach_orders_waiting_submit_on_fresh_main() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut events = core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(500),
+        text: "detached answer".into(),
+    });
+    mock.push(MockResponse::Text("fresh answer".into()));
+    session
+        .submit_user_message("before detach".into())
+        .await
+        .unwrap();
+    let original_main = session.main_agent().unwrap();
+    wait_until(|| original_main.is_running()).await;
+
+    let submit_guard = session.submit_lock.lock().await;
+    let detach = tokio::spawn({
+        let session = session.clone();
+        async move { session.detach_main_turn().await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let submit = tokio::spawn({
+        let session = session.clone();
+        async move { session.submit_user_message("after detach".into()).await }
+    });
+    drop(submit_guard);
+
+    let detached_id = detach.await.unwrap().unwrap();
+    session.stop_agent(&detached_id).await.unwrap();
+    submit.await.unwrap().unwrap();
+
+    assert_eq!(wait_main_turn_end(&mut events).await, TurnStop::Completed);
+    let fresh_main = session.main_agent().unwrap();
+    assert!(!Arc::ptr_eq(&fresh_main, &original_main));
+    assert!(
+        fresh_main
+            .history
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.text() == "after detach")
+    );
+    assert!(
+        !original_main
+            .history
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.text() == "after detach")
+    );
+    wait_until(|| !original_main.is_running()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_detached_agent_reaches_terminal_status_when_finished() {
     let (core, mock, _tmp, session_id) = setup_test_session().await;
     let session = core.session(&session_id).unwrap();
@@ -481,12 +1145,11 @@ async fn test_detached_agent_reaches_terminal_status_when_finished() {
         .await
         .unwrap();
 
-    let timeout = tokio::time::sleep(Duration::from_secs(3));
-    tokio::pin!(timeout);
-
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for stream start"),
+            _ = &mut deadline => panic!("timed out waiting for stream start"),
             res = rx.recv() => {
                 if let Ok((_seq, Event::TextDelta { .. })) = res {
                     break;
@@ -500,8 +1163,10 @@ async fn test_detached_agent_reaches_terminal_status_when_finished() {
     // Wait until the detached agent turn completes
     let mut saw_agent_updated_finished = false;
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for detached agent to finish"),
+            _ = &mut deadline => panic!("timed out waiting for detached agent to finish"),
             res = rx.recv() => {
                 if let Ok((_seq, event)) = res {
                     match event {
@@ -551,13 +1216,12 @@ async fn test_point_4_assistant_messages_appended_only_at_completion() {
         .await
         .unwrap();
 
-    let timeout = tokio::time::sleep(Duration::from_secs(3));
-    tokio::pin!(timeout);
-
     // Wait until first delta arrives (mid-stream)
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for first delta"),
+            _ = &mut deadline => panic!("timed out waiting for first delta"),
             res = rx.recv() => {
                 if let Ok((_seq, Event::TextDelta { .. })) = res {
                     break;
@@ -595,8 +1259,10 @@ async fn test_point_4_assistant_messages_appended_only_at_completion() {
 
     // Wait for the turn to complete
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for turn completion"),
+            _ = &mut deadline => panic!("timed out waiting for turn completion"),
             res = rx.recv() => {
                 if let Ok((_seq, Event::TurnEnded { agent, .. })) = res
                     && agent.is_main()
@@ -885,6 +1551,1535 @@ async fn wait_main_turn_end(rx: &mut tokio::sync::broadcast::Receiver<(u64, Even
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_user_message_id_does_not_append_or_start_another_turn() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let mut rx = core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(200),
+        text: "one answer".into(),
+    });
+    let request = Request::UserMessage {
+        text: "send once".into(),
+        images: Vec::new(),
+        message_id: Some("msg-duplicate".into()),
+    };
+
+    let (first, second) = tokio::join!(
+        core.handle(&session_id, request.clone()),
+        core.handle(&session_id, request)
+    );
+    assert!(matches!(first, Reply::Ok));
+    assert!(matches!(second, Reply::Ok));
+
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    assert_eq!(
+        main.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count(),
+        1
+    );
+    assert_eq!(
+        main.transcript
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tail
+            .iter()
+            .filter(|item| matches!(&item.kind, TranscriptKind::User { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(wait_main_turn_end(&mut rx).await, TurnStop::Completed);
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reused_user_message_id_with_different_text_is_rejected() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let mut rx = core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::Text("first answer".into()));
+    assert!(matches!(
+        core.handle(
+            &session_id,
+            Request::UserMessage {
+                text: "first".into(),
+                images: Vec::new(),
+                message_id: Some("msg-conflict".into()),
+            },
+        )
+        .await,
+        Reply::Ok
+    ));
+    assert_eq!(wait_main_turn_end(&mut rx).await, TurnStop::Completed);
+
+    let reply = core
+        .handle(
+            &session_id,
+            Request::UserMessage {
+                text: "second".into(),
+                images: Vec::new(),
+                message_id: Some("msg-conflict".into()),
+            },
+        )
+        .await;
+    assert!(matches!(
+        reply,
+        Reply::Error { ref message } if message.contains("different content")
+    ));
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    assert_eq!(
+        main.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count(),
+        1
+    );
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_user_message_submission_releases_its_id_for_retry() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    session
+        .meta
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .zdr = true;
+    let request = Request::UserMessage {
+        text: "retry after rejection".into(),
+        images: Vec::new(),
+        message_id: Some("msg-retry".into()),
+    };
+
+    let reply = core.handle(&session_id, request.clone()).await;
+    assert!(matches!(
+        reply,
+        Reply::Error { ref message } if message.contains("zdr_blocked")
+    ));
+    session
+        .meta
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .zdr = false;
+    mock.push(MockResponse::Text("accepted".into()));
+    let mut rx = core.subscribe(&session_id).unwrap();
+    assert!(matches!(core.handle(&session_id, request).await, Reply::Ok));
+    assert_eq!(wait_main_turn_end(&mut rx).await, TurnStop::Completed);
+    assert_eq!(
+        session
+            .main_agent()
+            .unwrap()
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_user_message_append_rolls_back_reservation_and_retry_succeeds() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut events = core.subscribe(&session_id).unwrap();
+    let request = Request::UserMessage {
+        text: "retry after append failure".into(),
+        images: Vec::new(),
+        message_id: Some("msg-append-retry".into()),
+    };
+
+    session.store.delete_session(&session.id).await.unwrap();
+    let reply = core.handle(&session_id, request.clone()).await;
+    assert!(matches!(
+        reply,
+        Reply::Error { ref message } if message.contains("store")
+    ));
+
+    let main = session.main_agent().unwrap();
+    {
+        let history = main
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(history.messages.is_empty());
+        assert_eq!(history.next_seq, 0);
+        assert_eq!(history.estimated_tokens, 0);
+    }
+    assert!(!main.has_pending_user_messages());
+    assert!(main.injections.is_empty());
+    assert!(
+        main.history_before_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+    );
+    assert!(!main.is_running());
+    assert!(mock.requests().is_empty());
+    assert!(
+        !main
+            .transcript
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tail
+            .iter()
+            .any(|item| matches!(&item.kind, TranscriptKind::User { .. }))
+    );
+
+    tokio::task::yield_now().await;
+    while let Ok((_seq, event)) = events.try_recv() {
+        assert!(!matches!(
+            event,
+            Event::ItemAdded(_) | Event::TurnStarted { .. }
+        ));
+    }
+
+    let reservations = core.user_message_ids.read().await.get(&session_id).cloned();
+    if let Some(reservations) = reservations {
+        assert!(reservations.lock().await.is_empty());
+    }
+
+    let meta = session.meta();
+    session.store.upsert_session(&meta).await.unwrap();
+    mock.push(MockResponse::Text("accepted after recovery".into()));
+    assert!(matches!(core.handle(&session_id, request).await, Reply::Ok));
+    assert_eq!(wait_main_turn_end(&mut events).await, TurnStop::Completed);
+
+    {
+        let history = main
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(history.messages.len(), 2);
+        assert_eq!(history.messages[0].role, Role::User);
+        assert_eq!(history.messages[1].role, Role::Assistant);
+    }
+    assert!(!main.has_pending_user_messages());
+    assert_eq!(mock.requests().len(), 1);
+    let stored = session
+        .store
+        .load_messages(&session.id, &main.id())
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].message.role, Role::User);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_store_failure_does_not_mutate_history() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    {
+        let mut history = main.history.lock().unwrap();
+        for index in 0..10 {
+            history.push(Message::user(format!("history {index}")));
+        }
+    }
+    let before = main.history.lock().unwrap().clone();
+    mock.push(MockResponse::Text("summary".into()));
+    session.store.set_fault_injection(true);
+
+    assert!(crate::compaction::compact(&session, &main).await.is_err());
+    session.store.set_fault_injection(false);
+    let after = main.history.lock().unwrap().clone();
+    assert_eq!(after.summary, before.summary);
+    assert_eq!(after.summary_upto, before.summary_upto);
+    assert_eq!(after.rows(), before.rows());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_host_persists_task_started_and_terminal_rows() {
+    let (core, _mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    let task = host
+        .spawn_task(TaskSpec::new(
+            session_id.clone(),
+            AgentId::main(),
+            "printf done",
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+    let running = session
+        .store
+        .list_tasks(&session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|info| info.id == task)
+        .unwrap();
+    assert_eq!(running.status, pacode_types::TaskStatus::Running);
+    host.wait_task(&task, Duration::from_secs(5), false).await;
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("task terminal row was not persisted"),
+            _ = tokio::task::yield_now() => {
+                if session
+                    .store
+                    .list_tasks(&session_id)
+                    .await
+                    .ok()
+                    .and_then(|tasks| tasks.into_iter().find(|info| info.id == task))
+                    .is_some_and(|info| info.status.is_terminal())
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn close_reopen_keeps_task_router_tombstone() {
+    let (core, _mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let task = session
+        .tasks
+        .spawn(TaskSpec::new(
+            session_id.clone(),
+            AgentId::main(),
+            "sleep 5",
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+    session.store.upsert_task(&task).await.unwrap();
+    core.close_session(&session_id).await;
+    assert!(core.is_task_tombstoned(&task.id));
+    core.open_session(Attach::Resume {
+        session: session_id.clone(),
+    })
+    .await
+    .unwrap();
+    assert!(core.is_task_tombstoned(&task.id));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_hydrates_terminal_tasks_from_store() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("task-hydration.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let session = first_core.session(&session_id).unwrap();
+    let task = session
+        .tasks
+        .spawn(TaskSpec::new(
+            session_id.clone(),
+            AgentId::main(),
+            "printf persisted",
+            temp_dir.path(),
+        ))
+        .await
+        .unwrap();
+    session.store.upsert_task(&task).await.unwrap();
+    session
+        .tasks
+        .wait(&task.id, Duration::from_secs(5), false)
+        .await;
+    let ended = session.tasks.info(&task.id).unwrap();
+    assert!(ended.status.is_terminal());
+    session.store.upsert_task(&ended).await.unwrap();
+    first_core.shutdown().await;
+
+    let second_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let restored = second_core
+        .session(&session_id)
+        .unwrap()
+        .tasks_of_session()
+        .into_iter()
+        .find(|info| info.id == task.id)
+        .unwrap();
+    assert_eq!(restored.status, ended.status);
+    second_core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_admission_queue_is_bounded_and_deduplicated() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let agent = AgentId::main();
+    let admissions = (0..crate::session::MAX_RECOVERY_ADMISSIONS + 17)
+        .map(|index| format!("bounded-{index}"))
+        .collect::<Vec<_>>();
+
+    session.queue_recovery_admissions(&agent, admissions);
+    {
+        let queue = session
+            .recovery_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(queue.len(), crate::session::MAX_RECOVERY_ADMISSIONS);
+        assert_eq!(queue.front().unwrap().1, "bounded-0");
+        assert_eq!(
+            queue.back().unwrap().1,
+            format!("bounded-{}", crate::session::MAX_RECOVERY_ADMISSIONS - 1)
+        );
+    }
+    session.queue_recovery_admissions(&agent, ["bounded-0".to_string()]);
+    assert_eq!(
+        session
+            .recovery_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len(),
+        crate::session::MAX_RECOVERY_ADMISSIONS
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_admission_redrives_after_store_commit_before_dispatch() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let store = session.store.clone();
+    core.close_session(&session_id).await;
+
+    let message = Message::user("recover after crash");
+    assert_eq!(
+        store
+            .append_user_message_with_turn(
+                &session_id,
+                &AgentId::main(),
+                0,
+                "msg-crash-window",
+                41,
+                Some("trn_msg-crash-window"),
+                &message,
+            )
+            .await
+            .unwrap(),
+        pacode_store::MessageAdmissionResult::Appended
+    );
+
+    mock.push(MockResponse::Text("recovered answer".into()));
+    core.open_session(Attach::Resume {
+        session: session_id.clone(),
+    })
+    .await
+    .unwrap();
+
+    wait_until(|| !mock.requests().is_empty()).await;
+    wait_until(|| {
+        core.session(&session_id)
+            .and_then(|session| session.main_agent())
+            .is_some_and(|agent| {
+                agent
+                    .history
+                    .lock()
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|message| {
+                        message.role == Role::Assistant && message.text() == "recovered answer"
+                    })
+            })
+    })
+    .await;
+    let admission = store
+        .get_message_admission(&session_id, "msg-crash-window")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        admission.state,
+        pacode_store::MessageAdmissionState::Terminal
+    );
+    assert_eq!(
+        store
+            .load_messages(&session_id, &AgentId::main())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_recovery_redrives_all_pending_admissions() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let store = core.session(&session_id).unwrap().store.clone();
+    core.close_session(&session_id).await;
+    for (seq, message_id, text) in [
+        (0, "msg-recovery-one", "recover one"),
+        (1, "msg-recovery-two", "recover two"),
+    ] {
+        store
+            .append_user_message_with_turn(
+                &session_id,
+                &AgentId::main(),
+                seq,
+                message_id,
+                seq + 100,
+                Some(&format!("trn_{message_id}")),
+                &Message::user(text),
+            )
+            .await
+            .unwrap();
+    }
+    mock.push(MockResponse::Text("answer one".into()));
+    mock.push(MockResponse::Text("answer two".into()));
+    core.open_session(Attach::Resume {
+        session: session_id.clone(),
+    })
+    .await
+    .unwrap();
+
+    wait_until(|| mock.requests().len() >= 2).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let first = store
+            .get_message_admission(&session_id, "msg-recovery-one")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .get_message_admission(&session_id, "msg-recovery-two")
+            .await
+            .unwrap()
+            .unwrap();
+        if first.state == pacode_store::MessageAdmissionState::Terminal
+            && second.state == pacode_store::MessageAdmissionState::Terminal
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "admission recovery did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn internal_submit_creates_a_durable_admission() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(100),
+        text: "internal answer".into(),
+    });
+    session
+        .submit_user_message("internal prompt".into())
+        .await
+        .unwrap();
+    wait_until(|| !mock.requests().is_empty()).await;
+    let admission = session
+        .store
+        .load_message_admissions()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|admission| admission.message_id.starts_with("internal-"))
+        .expect("internal submit must have a durable admission");
+    assert_eq!(
+        admission.state,
+        pacode_store::MessageAdmissionState::Running
+    );
+    wait_until(|| {
+        session
+            .main_agent()
+            .unwrap()
+            .history
+            .lock()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|(_, message)| message.text() == "internal answer")
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let admission = session
+            .store
+            .load_message_admissions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|admission| admission.message_id.starts_with("internal-"))
+            .expect("internal submit must have a durable admission");
+        if admission.state == pacode_store::MessageAdmissionState::Terminal {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "internal admission did not become terminal"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn early_interrupt_fences_admission_before_progress_and_survives_restart() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("early-interrupt.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let session = first_core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    let message_id = "early-interrupt-admission";
+    let turn = TurnId::new("trn_early-interrupt-admission");
+    session
+        .store
+        .append_user_message_with_turn(
+            &session_id,
+            &AgentId::main(),
+            0,
+            message_id,
+            1,
+            Some(turn.as_str()),
+            &Message::user("cancel before progress"),
+        )
+        .await
+        .unwrap();
+    assert!(main.begin_admission_turn(message_id.into(), turn.clone()));
+
+    session.interrupt_all().await;
+
+    assert!(main.admission_is_cancelled(message_id));
+    let finish = main
+        .finish_admission_turn(&turn, &TurnStop::Interrupted)
+        .expect("fenced admission must finish through the supervisor path");
+    assert!(finish.terminal);
+    assert!(main.injections.is_empty());
+    assert_eq!(
+        session
+            .store
+            .get_message_admission(&session_id, message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        pacode_store::MessageAdmissionState::Terminal
+    );
+    first_core.shutdown().await;
+
+    let second_core =
+        build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(mock.requests().is_empty());
+    second_core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_exposes_turn_fences_and_clears_previous_agent_error() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(100),
+        text: "first answer".into(),
+    });
+    session
+        .submit_user_message_with_images_idempotent(
+            "first".into(),
+            Vec::new(),
+            "snapshot-fence-first".into(),
+            1,
+        )
+        .await
+        .unwrap();
+    wait_until(|| session.snapshot().active_turn.is_some()).await;
+    let active = session.snapshot();
+    assert_eq!(
+        active.active_turn,
+        Some(TurnId::new("trn_snapshot-fence-first"))
+    );
+    assert!(active.turn_active);
+    wait_until(|| session.snapshot().terminal_turn.is_some()).await;
+    let terminal = session.snapshot();
+    assert_eq!(
+        terminal.terminal_turn,
+        Some(TurnId::new("trn_snapshot-fence-first"))
+    );
+    assert!(!terminal.turn_active);
+    assert_eq!(terminal.terminal_error, None);
+
+    main.info
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .error = Some("stale failure".into());
+    mock.push(MockResponse::Text("second answer".into()));
+    session
+        .submit_user_message_with_images_idempotent(
+            "second".into(),
+            Vec::new(),
+            "snapshot-fence-second".into(),
+            2,
+        )
+        .await
+        .unwrap();
+    wait_until(|| {
+        session
+            .snapshot()
+            .terminal_turn
+            .is_some_and(|turn| turn == TurnId::new("trn_snapshot-fence-second"))
+    })
+    .await;
+    assert_eq!(session.snapshot().terminal_error, None);
+    assert_eq!(main.info().error, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn close_session_terminalizes_admissions_and_removes_runtime_owner() {
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let store = session.store.clone();
+    store
+        .append_user_message_with_turn(
+            &session_id,
+            &AgentId::main(),
+            0,
+            "close-durable-admission",
+            1,
+            Some("trn_close-durable-admission"),
+            &Message::user("close me"),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        core.handle(&session_id, Request::CloseSession).await,
+        Reply::Ok
+    ));
+    assert!(core.session_ids().is_empty());
+    assert_eq!(
+        store
+            .get_message_admission(&session_id, "close-durable-admission")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        pacode_store::MessageAdmissionState::Terminal
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_pending_message_is_filtered_but_kept_in_audit() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("cancelled-message.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let store = first_core.session(&session_id).unwrap().store.clone();
+    store
+        .append_user_message_with_turn(
+            &session_id,
+            &AgentId::main(),
+            0,
+            "cancelled-pending",
+            1,
+            Some("trn_cancelled-pending"),
+            &Message::user("do not resume this"),
+        )
+        .await
+        .unwrap();
+    store
+        .mark_message_admission_terminal(&session_id, "cancelled-pending", Some("interrupted"))
+        .await
+        .unwrap();
+    drop(store);
+    drop(first_core);
+
+    let second_core =
+        build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let session = second_core.session(&session_id).unwrap();
+    assert!(
+        !session
+            .main_agent()
+            .unwrap()
+            .history
+            .lock()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|(_, message)| message.text() == "do not resume this")
+    );
+    assert_eq!(
+        session
+            .main_agent()
+            .unwrap()
+            .history
+            .lock()
+            .unwrap()
+            .next_seq,
+        1
+    );
+    assert_eq!(
+        session
+            .store
+            .load_messages(&session_id, &AgentId::main())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let admission = store_for_test(&second_core, &session_id, "cancelled-pending").await;
+    assert_eq!(
+        admission.state,
+        pacode_store::MessageAdmissionState::Terminal
+    );
+    assert_eq!(admission.terminal_stop.as_deref(), Some("interrupted"));
+    assert!(mock.requests().is_empty());
+    second_core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_synthesizes_missing_tool_result_before_redrive() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("admission-tool-recovery.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let store = first_core.session(&session_id).unwrap().store.clone();
+    let call_id = CallId::generate();
+    let admission = "tool-recovery-admission";
+    store
+        .append_user_message_with_turn(
+            &session_id,
+            &AgentId::main(),
+            0,
+            admission,
+            1,
+            Some(&format!("trn_{admission}")),
+            &Message::user("run tool"),
+        )
+        .await
+        .unwrap();
+    store
+        .append_message(
+            &session_id,
+            &AgentId::main(),
+            1,
+            &Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolUse {
+                    id: call_id.clone(),
+                    name: "read".into(),
+                    input: serde_json::json!({"path": "Cargo.toml"}),
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .mark_message_admission_running(&session_id, admission, &format!("trn_{admission}"))
+        .await
+        .unwrap();
+    drop(store);
+    drop(first_core);
+
+    mock.push(MockResponse::Text("recovered tool answer".into()));
+    let second_core =
+        build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_until(|| !mock.requests().is_empty()).await;
+    let request = mock.requests().last().unwrap().clone();
+    assert!(request.messages.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { call_id: result, .. } if result == &call_id)
+        })
+    }));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if store_for_test(&second_core, &session_id, admission)
+            .await
+            .state
+            == pacode_store::MessageAdmissionState::Terminal
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tool recovery did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    second_core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_redrives_a_tool_round_without_a_final_assistant() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("admission-tool-round-recovery.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let store = first_core.session(&session_id).unwrap().store.clone();
+    let call_id = CallId::generate();
+    let admission = "tool-round-recovery-admission";
+    store
+        .append_user_message_with_turn(
+            &session_id,
+            &AgentId::main(),
+            0,
+            admission,
+            1,
+            Some(&format!("trn_{admission}")),
+            &Message::user("run tool"),
+        )
+        .await
+        .unwrap();
+    store
+        .append_message(
+            &session_id,
+            &AgentId::main(),
+            1,
+            &Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolUse {
+                    id: call_id.clone(),
+                    name: "read".into(),
+                    input: serde_json::json!({"path": "Cargo.toml"}),
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .append_message(
+            &session_id,
+            &AgentId::main(),
+            2,
+            &Message::tool_result(call_id.clone(), "tool output", false),
+        )
+        .await
+        .unwrap();
+    store
+        .mark_message_admission_running(&session_id, admission, &format!("trn_{admission}"))
+        .await
+        .unwrap();
+    drop(store);
+    drop(first_core);
+
+    mock.push(MockResponse::Text("final answer after tools".into()));
+    let second_core =
+        build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    wait_until(|| !mock.requests().is_empty()).await;
+    let request = mock.requests().last().unwrap().clone();
+    assert!(request.messages.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { call_id: result, .. } if result == &call_id)
+        })
+    }));
+    assert_no_orphan_tool_uses(&request.messages);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if store_for_test(&second_core, &session_id, admission)
+            .await
+            .state
+            == pacode_store::MessageAdmissionState::Terminal
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tool-round recovery did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    second_core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crashed_admission_retries_without_terminalizing_queued_admissions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("admission-crash-retry.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let store = first_core.session(&session_id).unwrap().store.clone();
+    let crashed = "crashed-admission";
+    let queued = "queued-admission";
+    store
+        .append_user_message_with_turn(
+            &session_id,
+            &AgentId::main(),
+            0,
+            crashed,
+            1,
+            Some(&format!("trn_{crashed}")),
+            &Message::user("crashed prompt"),
+        )
+        .await
+        .unwrap();
+    store
+        .append_user_message_with_turn(
+            &session_id,
+            &AgentId::main(),
+            1,
+            queued,
+            2,
+            Some(&format!("trn_{queued}")),
+            &Message::user("queued prompt"),
+        )
+        .await
+        .unwrap();
+    store
+        .mark_message_admission_running(&session_id, crashed, &format!("trn_{crashed}"))
+        .await
+        .unwrap();
+    drop(store);
+    drop(first_core);
+
+    mock.push(MockResponse::Text("retry answer".into()));
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(100),
+        text: "queued answer".into(),
+    });
+    let second_core =
+        build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    wait_until(|| mock.requests().len() >= 2).await;
+    let first = store_for_test(&second_core, &session_id, crashed).await;
+    let second = store_for_test(&second_core, &session_id, queued).await;
+    assert_eq!(first.state, pacode_store::MessageAdmissionState::Terminal);
+    assert_ne!(second.state, pacode_store::MessageAdmissionState::Terminal);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let first = store_for_test(&second_core, &session_id, crashed).await;
+        let second = store_for_test(&second_core, &session_id, queued).await;
+        if first.state == pacode_store::MessageAdmissionState::Terminal
+            && second.state == pacode_store::MessageAdmissionState::Terminal
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "admission retry did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(mock.requests().len(), 2);
+    second_core.shutdown().await;
+}
+
+async fn store_for_test(
+    core: &Core,
+    session_id: &pacode_types::SessionId,
+    message_id: &str,
+) -> pacode_store::MessageAdmission {
+    core.session(session_id)
+        .unwrap()
+        .store
+        .get_message_admission(session_id, message_id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detached_history_reloads_on_resume() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("detached-admission.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let session = first_core.session(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "old detached".into(),
+    });
+    session
+        .submit_user_message_with_images_idempotent(
+            "recover detached".into(),
+            Vec::new(),
+            "msg-detached-recovery".into(),
+            77,
+        )
+        .await
+        .unwrap();
+    wait_until(|| session.main_agent().unwrap().is_running()).await;
+    wait_until(|| !mock.requests().is_empty()).await;
+    let detached_id = session.detach_main_turn().await.unwrap();
+    session.stop_agent(&detached_id).await.unwrap();
+    wait_until(|| !session.agent(&detached_id).unwrap().is_running()).await;
+    first_core.shutdown().await;
+
+    let second_core =
+        build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let restored = second_core.session(&session_id).unwrap();
+    assert!(
+        !restored
+            .agent(&detached_id)
+            .unwrap()
+            .history
+            .lock()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|(_, message)| message.text() == "recover detached")
+    );
+    assert!(
+        restored
+            .store
+            .load_messages(&session_id, &detached_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.message.text() == "recover detached")
+    );
+    assert!(
+        !restored
+            .main_agent()
+            .unwrap()
+            .history
+            .lock()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|(_, message)| message.text() == "recover detached")
+    );
+    assert_eq!(
+        restored
+            .store
+            .get_message_admission(&session_id, "msg-detached-recovery")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        pacode_store::MessageAdmissionState::Terminal
+    );
+    assert_eq!(mock.requests().len(), 1);
+    second_core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_admission_retries_the_durable_detached_owner() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(200),
+        text: "detached answer".into(),
+    });
+    session
+        .submit_user_message_with_images_idempotent(
+            "detach owner".into(),
+            Vec::new(),
+            "detach-owner-turn".into(),
+            1,
+        )
+        .await
+        .unwrap();
+    wait_until(|| !mock.requests().is_empty()).await;
+    let detached_id = session.detach_main_turn().await.unwrap();
+    let fresh_main = session.main_agent().unwrap();
+    let detached = session.agent(&detached_id).unwrap();
+    let seq = detached.history.lock().unwrap().next_seq;
+    session
+        .store
+        .append_user_message_with_turn(
+            &session_id,
+            &detached_id,
+            seq,
+            "retry-detached-owner",
+            9,
+            Some("trn_retry-detached-owner"),
+            &Message::user("retry detached prompt"),
+        )
+        .await
+        .unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(100),
+        text: "retry sub answer".into(),
+    });
+    session
+        .submit_user_message_with_images_idempotent(
+            "retry detached prompt".into(),
+            Vec::new(),
+            "retry-detached-owner".into(),
+            9,
+        )
+        .await
+        .unwrap();
+    wait_until(|| {
+        mock.requests().iter().any(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.text() == "retry detached prompt")
+        })
+    })
+    .await;
+    assert!(
+        detached
+            .history
+            .lock()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|(_, message)| message.text() == "retry detached prompt")
+    );
+    assert!(
+        !fresh_main
+            .history
+            .lock()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|(_, message)| message.text() == "retry detached prompt")
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_recovery_does_not_redrive_an_already_answered_message() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let store = session.store.clone();
+    core.close_session(&session_id).await;
+    let message = Message::user("already answered");
+    store
+        .append_user_message_with_turn(
+            &session_id,
+            &AgentId::main(),
+            0,
+            "msg-answered",
+            51,
+            Some("trn_answered"),
+            &message,
+        )
+        .await
+        .unwrap();
+    store
+        .append_message(
+            &session_id,
+            &AgentId::main(),
+            1,
+            &Message::assistant_text("answer already persisted"),
+        )
+        .await
+        .unwrap();
+
+    core.open_session(Attach::Resume {
+        session: session_id.clone(),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(mock.requests().is_empty());
+    assert_eq!(
+        store
+            .get_message_admission(&session_id, "msg-answered")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        pacode_store::MessageAdmissionState::Terminal
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_user_message_id_survives_core_restart() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("admission-restart.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    if let Some(session) = first_core.session(&session_id) {
+        session
+            .meta
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .name = Some("restart test".into());
+    }
+    let mut events = first_core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::Text("first answer".into()));
+    let request = Request::UserMessage {
+        text: "survive restart".into(),
+        images: Vec::new(),
+        message_id: Some("msg-restart".into()),
+    };
+    assert!(matches!(
+        first_core.handle(&session_id, request.clone()).await,
+        Reply::Ok
+    ));
+    assert_eq!(wait_main_turn_end(&mut events).await, TurnStop::Completed);
+    assert_eq!(mock.requests().len(), 1);
+    first_core.shutdown().await;
+
+    let second_core =
+        build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    if let Some(session) = second_core.session(&session_id) {
+        session
+            .meta
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .zdr = true;
+    }
+
+    assert!(matches!(
+        second_core.handle(&session_id, request.clone()).await,
+        Reply::Ok
+    ));
+    let session = second_core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    assert_eq!(
+        main.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count(),
+        1
+    );
+    assert_eq!(mock.requests().len(), 1);
+    assert!(matches!(
+        second_core
+            .handle(
+                &session_id,
+                Request::UserMessage {
+                    text: "different after restart".into(),
+                    images: Vec::new(),
+                    message_id: Some("msg-restart".into()),
+                },
+            )
+            .await,
+        Reply::Error { ref message } if message.contains("different content")
+    ));
+    second_core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_duplicate_replays_durable_turn_boundary_after_core_restart() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("acp-admission-restart.db");
+    let mock = Arc::new(MockProvider::new("mock"));
+    let first_core = build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    let session_id = first_core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    if let Some(session) = first_core.session(&session_id) {
+        session
+            .meta
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .name = Some("ACP restart test".into());
+    }
+    let mut first_events = first_core.subscribe(&session_id).unwrap();
+    let request = Request::UserMessage {
+        text: "survive ACP restart".into(),
+        images: Vec::new(),
+        message_id: Some("acp-restart-fence".into()),
+    };
+    mock.push(MockResponse::Text("first answer".into()));
+    assert!(matches!(
+        first_core.handle(&session_id, request.clone()).await,
+        Reply::Ok
+    ));
+    assert_eq!(
+        wait_main_turn_end(&mut first_events).await,
+        TurnStop::Completed
+    );
+    first_core.shutdown().await;
+
+    let second_core =
+        build_test_core(Store::open(&db_path).unwrap(), &temp_dir, mock.clone()).await;
+    second_core
+        .open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let mut events = second_core.subscribe(&session_id).unwrap();
+    let restored_snapshot = second_core.snapshot(&session_id).unwrap();
+    assert_eq!(
+        restored_snapshot.terminal_turn,
+        Some(TurnId::new("trn_acp-restart-fence"))
+    );
+    assert!(!restored_snapshot.turn_active);
+    let restored_admission = second_core
+        .session(&session_id)
+        .unwrap()
+        .store
+        .get_message_admission(&session_id, "acp-restart-fence")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restored_admission.state,
+        pacode_store::MessageAdmissionState::Terminal
+    );
+    assert_eq!(
+        restored_admission.turn_id,
+        Some(TurnId::new("trn_acp-restart-fence"))
+    );
+    assert!(matches!(
+        second_core.handle(&session_id, request).await,
+        Reply::Ok
+    ));
+    let expected_turn = TurnId::new("trn_acp-restart-fence");
+    let mut started = false;
+    let mut ended = false;
+    let timeout = tokio::time::sleep(Duration::from_secs(2));
+    tokio::pin!(timeout);
+    while !started || !ended {
+        tokio::select! {
+            _ = &mut timeout => panic!("missing durable ACP turn boundary"),
+            result = events.recv() => {
+                if let Ok((_seq, event)) = result {
+                    match event {
+                        Event::TurnStarted { agent, turn }
+                            if agent.is_main() && turn == expected_turn =>
+                        {
+                            started = true;
+                        }
+                        Event::TurnEnded { agent, turn, .. }
+                            if agent.is_main() && turn == expected_turn =>
+                        {
+                            ended = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(mock.requests().len(), 1);
+    second_core.shutdown().await;
+}
+
 fn sub_spec(name: &str) -> pacode_tools::AgentSpec {
     pacode_tools::AgentSpec {
         name: Some(name.into()),
@@ -894,6 +3089,34 @@ fn sub_spec(name: &str) -> pacode_tools::AgentSpec {
         model: None,
         effort: None,
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_agent_inherits_parent_route() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let parent = session.main_agent().unwrap();
+    let route = ModelRoute::new("mock", "parent-model");
+    let effort = Effort::High;
+    {
+        let mut info = parent.info.write().unwrap();
+        info.model = route.clone();
+        info.effort = effort;
+    }
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(100),
+        text: "child".into(),
+    });
+
+    let id = session.spawn_agent(sub_spec("child")).await.unwrap();
+    let child = session.agent(&id).unwrap();
+    assert_eq!(child.info().model, route);
+    assert_eq!(child.info().effort, effort);
+    assert_eq!(child.info().parent, Some(AgentId::main()));
+
+    session.stop_agent(&id).await.unwrap();
+    wait_until(|| !child.is_running()).await;
+    core.shutdown().await;
 }
 
 /// `submit_user_message` returns after enqueueing, not when the turn ends —
@@ -1087,6 +3310,56 @@ async fn continue_redrives_stopped_agent_with_nudge() {
     assert!(sub.info().finished_at_ms.is_some());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_fences_a_waiting_continue_before_restart() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(200),
+        text: "initial".into(),
+    });
+    let id = session.spawn_agent(sub_spec("fenced")).await.unwrap();
+    let agent = session.agent(&id).unwrap();
+    session.stop_agent(&id).await.unwrap();
+    wait_until(|| !agent.is_running()).await;
+    let requests_before = mock.requests().len();
+    let generation = agent.turn_generation();
+    let message_guard = agent.message_write_lock.clone().lock_owned().await;
+
+    let continue_task = tokio::spawn({
+        let session = session.clone();
+        let id = id.clone();
+        async move { session.continue_agent(&id).await }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if session.submit_lock.try_lock().is_err() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "continue did not enter the lifecycle fence"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let stop_task = tokio::spawn({
+        let session = session.clone();
+        let id = id.clone();
+        async move { session.stop_agent(&id).await }
+    });
+    wait_until(|| agent.turn_generation() != generation).await;
+    drop(message_guard);
+
+    assert!(continue_task.await.unwrap().is_err());
+    stop_task.await.unwrap().unwrap();
+    assert!(!agent.is_running());
+    assert!(agent.stop_requested());
+    assert_eq!(mock.requests().len(), requests_before);
+    core.shutdown().await;
+}
+
 /// `continue` refuses agents that are not stopped: unknown id, still running,
 /// or already finished.
 #[tokio::test(flavor = "multi_thread")]
@@ -1153,27 +3426,33 @@ fn restored_transcript_items_do_not_collide_with_new_ones() {
 
     let tail_cap = 4usize;
     let tail_start = messages.len().saturating_sub(tail_cap);
-    let items = crate::transcript::history_to_items(
-        &AgentId::main(),
-        &messages[tail_start..],
-        tail_start as u64,
-    );
-    assert_eq!(items.len(), tail_cap, "only the tail is rendered");
-    assert_eq!(items[0].seq, tail_start as u64);
+    let entries = crate::transcript::history_to_items(&AgentId::main(), &messages[tail_start..]);
+    assert_eq!(entries.len(), tail_cap, "only the tail is rendered");
+    assert_eq!(entries[0].message_seq, tail_start as u64);
 
+    // The tail is numbered by the transcript's own counter, lifted above the
+    // band reserved for store history.
     let mut state = crate::transcript::TranscriptState::new(tail_cap);
-    let mut highest = None;
-    for item in items {
-        highest = Some(item.seq);
+    state.reserve_history_band();
+    let first = state.next_seq();
+    for entry in entries {
+        let mut item = entry.item;
+        item.seq = state.next_seq();
         state.upsert(item);
     }
-    state.next_item_seq = highest.expect("items") + 1;
 
     let next = state.next_seq();
-    assert_eq!(next, messages.len() as u64);
+    assert!(next > first, "seqs must advance past the restored tail");
     assert!(
         state.tail.iter().all(|item| item.seq < next),
         "a new item must not reuse a restored seq"
+    );
+    assert!(
+        state
+            .tail
+            .iter()
+            .all(|item| item.seq >= crate::transcript::HISTORY_ITEM_BASE),
+        "tail items must sit above the store band so pages cannot collide"
     );
 }
 
@@ -1200,7 +3479,10 @@ async fn interrupt_denies_pending_permission() {
         risk: None,
         created_at_ms: pacode_types::now_ms(),
     };
-    let waiter = session.permissions.register(req.clone());
+    let waiter = session
+        .permissions
+        .register(req.clone())
+        .expect("permission should register");
     let seq = main
         .transcript
         .lock()
@@ -1220,9 +3502,11 @@ async fn interrupt_denies_pending_permission() {
 
     // The pending map is clean and the parked waiter is released.
     assert!(session.permissions.pending().is_empty());
-    assert!(
-        waiter.await.is_err(),
-        "dropped sender resolves the waiter to Deny"
+    let (decision, reason) = waiter.await.expect("cancelled permission resolves");
+    assert_eq!(decision, pacode_types::PermissionDecision::Deny);
+    assert_eq!(
+        reason.as_deref(),
+        Some(crate::permissions::CANCELLED_BY_AGENT_REASON)
     );
 
     // The transcript Permission cell flipped to the interrupted-denial notice.
@@ -1257,6 +3541,42 @@ async fn interrupt_denies_pending_permission() {
             }
         }
     }
+    let mut resolved_events = 1;
+    while let Ok((_seq, event)) = rx.try_recv() {
+        if matches!(event, Event::PermissionResolved { permission, .. } if permission == req.id) {
+            resolved_events += 1;
+        }
+    }
+    assert_eq!(resolved_events, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_all_cancels_pending_question() {
+    use pacode_types::question::{Question, QuestionOption, QuestionOrigin};
+
+    let (core, _mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let question = Question::new(
+        pacode_types::QuestionId::generate(),
+        QuestionOrigin::new(AgentId::main(), "main", pacode_types::CallId::generate()),
+        "Choice",
+        "Continue?",
+        vec![
+            QuestionOption::new("yes", ""),
+            QuestionOption::new("no", ""),
+        ],
+        false,
+        pacode_types::now_ms(),
+    )
+    .unwrap();
+    let waiter = session.questions.register(question).unwrap();
+
+    assert!(matches!(
+        core.handle(&session_id, Request::InterruptAll).await,
+        Reply::Ok
+    ));
+    assert!(session.questions.pending().is_empty());
+    assert!(waiter.await.unwrap().cancelled);
 }
 
 /// A prompt sent while Ctrl+C unwinds the turn lands in `agent.injections`
@@ -1309,13 +3629,227 @@ async fn interrupt_redrives_queued_steer() {
         "the queued steer must re-drive the turn after the interrupt"
     );
 
-    // The steer reached the model: some request carries the injected message.
-    let saw_steer = mock.requests().iter().any(|r| {
-        r.messages
+    let recorded_requests = mock.requests();
+    let steer_requests = recorded_requests
+        .iter()
+        .filter(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.role == Role::User && message.text() == "second")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        steer_requests.len(),
+        1,
+        "queued steer must reach the provider once"
+    );
+    assert!(
+        steer_requests[0]
+            .messages
             .iter()
-            .any(|m| m.text().contains("<user_message>second</user_message>"))
+            .all(|message| !message.text().contains("<user_message>"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_redrives_two_correlated_steers_in_order() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut events = core.subscribe(&session_id).unwrap();
+
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "first answer".into(),
     });
-    assert!(saw_steer, "queued steer must reach the provider");
+    session
+        .submit_user_message_with_images_idempotent(
+            "first".into(),
+            Vec::new(),
+            "msg-two-steer-1".into(),
+            1,
+        )
+        .await
+        .unwrap();
+    wait_until(|| !mock.requests().is_empty()).await;
+    session
+        .submit_user_message_with_images_idempotent(
+            "second".into(),
+            Vec::new(),
+            "msg-two-steer-2".into(),
+            2,
+        )
+        .await
+        .unwrap();
+    session
+        .submit_user_message_with_images_idempotent(
+            "third".into(),
+            Vec::new(),
+            "msg-two-steer-3".into(),
+            3,
+        )
+        .await
+        .unwrap();
+    mock.push(MockResponse::Text("after second steer".into()));
+    mock.push(MockResponse::Text("after third steer".into()));
+    assert!(matches!(
+        core.handle(&session_id, Request::Interrupt).await,
+        Reply::Ok
+    ));
+
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+    let mut ends = Vec::new();
+    while ends.len() < 3 {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for batched steer turn"),
+            result = events.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, stop, .. })) = result
+                    && agent.is_main()
+                {
+                    ends.push(stop);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        ends,
+        vec![
+            TurnStop::Interrupted,
+            TurnStop::Completed,
+            TurnStop::Completed
+        ]
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().any(|request| {
+        request
+            .messages
+            .iter()
+            .any(|message| message.role == Role::User && message.text() == "second")
+    }));
+    assert!(requests.iter().any(|request| {
+        request
+            .messages
+            .iter()
+            .any(|message| message.role == Role::User && message.text() == "third")
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_all_discards_admitted_queued_steer() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut events = core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(400),
+        text: "first answer".into(),
+    });
+
+    session.submit_user_message("first".into()).await.unwrap();
+    wait_until(|| !mock.requests().is_empty()).await;
+    session
+        .submit_user_message_with_images_idempotent(
+            "cancel me".into(),
+            Vec::new(),
+            "msg-cancel".into(),
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(session.main_agent().unwrap().has_pending_user_messages());
+
+    assert!(matches!(
+        core.handle(&session_id, Request::InterruptAll).await,
+        Reply::Ok
+    ));
+    let timeout = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for interrupted turn"),
+            result = events.recv() => {
+                if let Ok((_seq, Event::TurnEnded { agent, stop, .. })) = result
+                    && agent.is_main()
+                {
+                    assert_eq!(stop, TurnStop::Interrupted);
+                    break;
+                }
+            }
+        }
+    }
+
+    let main = session.main_agent().unwrap();
+    assert!(!main.is_running());
+    assert!(!main.has_pending_user_messages());
+    assert!(main.injections.is_empty());
+    assert_eq!(
+        session
+            .store
+            .get_message_admission(&session_id, "msg-cancel")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        pacode_store::MessageAdmissionState::Terminal
+    );
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_racing_with_post_block_redrive_starts_the_claimed_turn() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+    mock.push(MockResponse::Text("raced answer".into()));
+
+    let post_block_guard = main.turn_lock.clone().try_lock_owned().unwrap();
+    let submit_session = session.clone();
+    let submit = tokio::spawn(async move {
+        submit_session
+            .submit_user_message("raced prompt".into())
+            .await
+            .unwrap();
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while main.injections.is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(!main.injections.is_empty());
+    assert!(main.has_pending_user_messages());
+    assert!(
+        !main
+            .history
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.text() == "raced prompt")
+    );
+    drop(post_block_guard);
+    crate::turn::lifecycle::request_turn(session.clone(), main.clone());
+
+    submit.await.unwrap();
+    assert_eq!(wait_main_turn_end(&mut rx).await, TurnStop::Completed);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User && message.text() == "raced prompt")
+            .count(),
+        1
+    );
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .all(|message| !message.text().contains("<user_message>"))
+    );
+    assert!(!main.has_pending_user_messages());
 }
 
 /// A provider failure on the main agent ends the turn `Failed` and lands the
@@ -1476,6 +4010,9 @@ async fn panicking_tool_turn_on_main_is_supervised() {
             .is_some_and(|e| e.contains("panicked")),
         "panic must be recorded on the agent info"
     );
+    let totals = session.store.usage_totals(&session.id).await.unwrap();
+    assert_eq!(totals.input, 100);
+    assert_eq!(totals.output, 20);
 
     // The crashed turn's `tool_use` must not stay dangling in persisted
     // history: the supervisor writes a stub result for it.
@@ -1496,7 +4033,10 @@ async fn panicking_tool_turn_on_main_is_supervised() {
                     matches!(b, ContentBlock::ToolResult { call_id, .. } if *call_id == panic_call_id)
                 })
         });
-        assert!(stubbed, "crash must persist a stub tool_result for the call");
+        assert!(
+            stubbed,
+            "crash must persist a stub tool_result for the call"
+        );
     }
 
     // The next turn's request carries the pair cleanly — the exact 400 the
@@ -1641,7 +4181,10 @@ async fn orphan_tool_use_in_history_is_repaired_in_next_request() {
     let pos = req
         .messages
         .iter()
-        .position(|m| m.tool_uses().any(|(id, _, _)| id.as_str() == "call_orphaned"))
+        .position(|m| {
+            m.tool_uses()
+                .any(|(id, _, _)| id.as_str() == "call_orphaned")
+        })
         .expect("orphan tool_use must still be in the request");
     let next = &req.messages[pos + 1];
     assert_eq!(
@@ -1709,4 +4252,27 @@ async fn interrupt_mid_tool_call_leaves_no_orphan() {
     wait_main_turn_end(&mut rx).await;
     let req = mock.requests().last().unwrap().clone();
     assert_no_orphan_tool_uses(&req.messages);
+}
+
+#[test]
+fn optimistic_snapshot_retries_when_event_seq_changes() {
+    let events = crate::transcript::EventSink::new();
+    let mut attempts = 0;
+    let mut boundary = None;
+    let state = crate::session::optimistic_snapshot(&events, |seq| {
+        boundary = Some(seq);
+        attempts += 1;
+        if attempts == 1 {
+            events.emit(Event::Toast {
+                level: pacode_types::ToastLevel::Info,
+                title: "race".into(),
+                detail: None,
+            });
+        }
+        attempts
+    });
+
+    assert_eq!(boundary, Some(1));
+    assert_eq!(state, 2);
+    assert_eq!(attempts, 2);
 }

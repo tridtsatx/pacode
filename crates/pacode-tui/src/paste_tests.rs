@@ -79,6 +79,25 @@ fn test_paste_size_cap_trips_and_reports() {
 }
 
 #[test]
+fn filter_paste_is_bounded_before_flattening() {
+    let mut state = make_state();
+    state.focus = Focus::Overlay(Overlay::ModelPicker {
+        query: String::new(),
+        index: 0,
+        for_zdr: false,
+    });
+    handle_paste(
+        &mut state,
+        "x\n".repeat(FILTER_MAX_CHARS * 4),
+        Instant::now(),
+    );
+    let Focus::Overlay(Overlay::ModelPicker { query, .. }) = &state.focus else {
+        panic!("focus changed unexpectedly");
+    };
+    assert!(query.chars().count() <= FILTER_MAX_CHARS);
+}
+
+#[test]
 fn test_paste_with_model_picker_focused_goes_into_filter() {
     let mut state = make_state();
     let now = Instant::now();

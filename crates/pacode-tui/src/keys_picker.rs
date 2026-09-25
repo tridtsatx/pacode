@@ -143,8 +143,53 @@ fn submit_answer(state: &mut AppState, answer: pacode_types::QuestionAnswer) -> 
     })]
 }
 
+fn handle_rail_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
+    let Focus::Overlay(Overlay::RailOverlay { selected }) = &state.focus else {
+        return vec![];
+    };
+    let selected = selected.clone();
+    let agents = crate::nav::selectable_agents(state);
+    if agents.is_empty() {
+        if key.code == KeyCode::Esc {
+            state.focus = Focus::Normal;
+        }
+        return vec![];
+    }
+    let current = agents
+        .iter()
+        .position(|agent| agent == &selected)
+        .unwrap_or(0);
+    if is_overlay_up(&key) {
+        state.focus = Focus::Overlay(Overlay::RailOverlay {
+            selected: agents[(current + agents.len() - 1) % agents.len()].clone(),
+        });
+        return vec![];
+    }
+    if is_overlay_down(&key) {
+        state.focus = Focus::Overlay(Overlay::RailOverlay {
+            selected: agents[(current + 1) % agents.len()].clone(),
+        });
+        return vec![];
+    }
+    match key.code {
+        KeyCode::Esc => state.focus = Focus::Normal,
+        KeyCode::Enter => {
+            if !agents.contains(&selected) {
+                return vec![];
+            }
+            state.focus = Focus::Normal;
+            return crate::nav::select_agent_by_id(state, &selected);
+        }
+        _ => {}
+    }
+    vec![]
+}
+
 fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
-    match &mut state.focus {
+    if matches!(state.focus, Focus::Overlay(Overlay::RailOverlay { .. })) {
+        return handle_rail_overlay_key(state, key);
+    }
+    match &mut state.session.focus {
         Focus::Overlay(Overlay::QuestionPicker) => {
             let Some((count, multi)) = state
                 .questions
@@ -354,8 +399,8 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
         }) => {
             let q_lower = query.to_lowercase();
             let for_zdr_flag = *for_zdr;
-            let zdr_only =
-                for_zdr_flag || crate::state::zdr_active(&state.config, state.meta.as_ref());
+            let zdr_only = for_zdr_flag
+                || crate::state::zdr_active(&state.config, state.session.meta.as_ref());
             let filtered_count =
                 crate::state::picker_models(&state.models, &state.model_flags, &q_lower, zdr_only)
                     .len();
@@ -565,12 +610,7 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
-        Focus::Overlay(Overlay::RailOverlay) => {
-            if key.code == KeyCode::Esc {
-                state.focus = Focus::Normal;
-            }
-            vec![]
-        }
+        Focus::Overlay(Overlay::RailOverlay { .. }) => vec![],
         // Unreachable — `keys::handle_key` routes a menu to `keys_menu` before
         // the overlay dispatch — but the match stays exhaustive.
         Focus::Overlay(Overlay::Menu { .. }) => vec![],
@@ -581,11 +621,7 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             step,
             user_themes,
         }) => {
-            let truecolor = match state.config.ui.color.as_str() {
-                "ansi" => false,
-                "truecolor" | "24bit" => true,
-                _ => pacode_render::detect_truecolor(),
-            };
+            let truecolor = state.truecolor;
             let builtins = pacode_render::builtin_palettes();
 
             match step {

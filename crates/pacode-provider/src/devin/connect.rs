@@ -21,6 +21,8 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 
 use crate::ProviderError;
+use crate::error_body::MAX_ERROR_BODY_BYTES;
+use crate::retry::{error_body_read_timeout, retry_after_from_response};
 
 /// Flag bit in Connect frame header indicating the trailer/end-of-stream message.
 pub const CONNECT_FLAG_END_STREAM: u8 = 0x02;
@@ -94,7 +96,7 @@ impl ConnectClient {
         let url = self.build_url(method);
         let req_builder = self.prepare_request(&url, "application/proto");
 
-        let response = req_builder
+        let mut response = req_builder
             .body(body.to_vec())
             .send()
             .await
@@ -103,8 +105,9 @@ impl ConnectClient {
         let status = response.status();
         if !status.is_success() {
             let status_u16 = status.as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(parse_connect_error(&text, status_u16));
+            return Err(read_connect_error(&mut response, status_u16, None)
+                .await
+                .error);
         }
 
         let bytes = response
@@ -123,6 +126,18 @@ impl ConnectClient {
         idle_timeout: Option<(Duration, u64)>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>, ProviderError>
     {
+        self.server_stream(method, body, idle_timeout)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn server_stream(
+        &self,
+        method: &str,
+        body: &[u8],
+        idle_timeout: Option<(Duration, u64)>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>, ConnectFailure>
+    {
         let url = self.build_url(method);
         let req_builder = self.prepare_request(&url, "application/connect+proto");
 
@@ -133,25 +148,71 @@ impl ConnectClient {
         let response = match idle_timeout {
             Some((wait, secs)) => match tokio::time::timeout(wait, send).await {
                 Ok(Ok(resp)) => resp,
-                Ok(Err(err)) => return Err(ProviderError::Transport(err.to_string())),
+                Ok(Err(err)) => {
+                    return Err(ConnectFailure::new(ProviderError::Transport(
+                        err.to_string(),
+                    )));
+                }
                 Err(_) => {
                     log::warn!("connect request: no response headers within {secs}s");
-                    return Err(ProviderError::IdleTimeout(secs));
+                    return Err(ConnectFailure::new(ProviderError::IdleTimeout(secs)));
                 }
             },
-            None => send
-                .await
-                .map_err(|e| ProviderError::Transport(e.to_string()))?,
+            None => match send.await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    return Err(ConnectFailure::new(ProviderError::Transport(
+                        err.to_string(),
+                    )));
+                }
+            },
         };
 
         let status = response.status();
         if !status.is_success() {
             let status_u16 = status.as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(parse_connect_error(&text, status_u16));
+            let mut response = response;
+            let failure =
+                read_connect_error(&mut response, status_u16, idle_timeout.map(|(w, _)| w)).await;
+            return Err(failure);
         }
 
         Ok(decode_response_stream(response, idle_timeout))
+    }
+}
+
+pub(crate) struct ConnectFailure {
+    pub(crate) error: ProviderError,
+    pub(crate) retry_after: Option<Duration>,
+}
+
+impl ConnectFailure {
+    fn new(error: ProviderError) -> Self {
+        Self {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+async fn read_connect_error(
+    response: &mut reqwest::Response,
+    status: u16,
+    idle_wait: Option<Duration>,
+) -> ConnectFailure {
+    let retry_after = retry_after_from_response(response);
+    let body = crate::error_body::read_response_body_with_limits(
+        response,
+        MAX_ERROR_BODY_BYTES,
+        error_body_read_timeout(idle_wait),
+    )
+    .await;
+    let redacted = crate::redact(&body);
+    log::trace!("connect error body: {redacted}");
+    log::warn!("connect request failed ({status}): {redacted}");
+    ConnectFailure {
+        error: parse_connect_error(&body, status),
+        retry_after,
     }
 }
 

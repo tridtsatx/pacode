@@ -276,6 +276,32 @@ fn test_pasted_images_size_cap_rejected() {
     assert!(res.is_err());
 }
 
+#[test]
+fn submitted_images_cannot_bypass_the_aggregate_cap() {
+    let tmp = TempDir::new().unwrap();
+    let mut manager = PastedImages::new_in(tmp.path().to_path_buf());
+    for _ in 0..PASTED_IMAGES_MAX_COUNT {
+        manager.create_image_file(b"png").unwrap();
+    }
+    let tokens = (1..=PASTED_IMAGES_MAX_COUNT)
+        .map(|token| format!("[Image {token}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    manager.mark_submitted(&tokens);
+
+    let result = manager.create_image_file(b"png");
+    assert!(result.is_err());
+    assert_eq!(manager.records().len(), PASTED_IMAGES_MAX_COUNT);
+
+    manager.records.push(PastedImageRecord {
+        token: PASTED_IMAGES_MAX_COUNT + 1,
+        path: tmp.path().join("synthetic.png"),
+        bytes_len: PASTED_IMAGES_MAX_TOTAL_BYTES,
+        submitted: true,
+    });
+    assert!(manager.create_image_file(b"png").is_err());
+}
+
 fn wl_runner() -> MockCommandRunner {
     let mut runner = MockCommandRunner::new();
     runner.available.insert("wl-paste".to_string());

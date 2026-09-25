@@ -1,5 +1,4 @@
-//! Bounded cache of rendered lines keyed by (cell id, width). Total cached lines are
-//! capped; eviction is LRU by cell. The TUI owns one per transcript.
+//! Bounded cache of rendered lines. Total cached lines are capped; eviction is LRU by key.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -10,9 +9,43 @@ use ratatui::text::Line;
 mod cache_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StablePrefixKey {
+    pub revision: u64,
+    pub len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub cell: u64,
+    pub version: u32,
     pub width: u16,
+    pub expanded: bool,
+    pub context: u64,
+    pub stable_prefix: Option<StablePrefixKey>,
+}
+
+impl CacheKey {
+    pub fn cell(cell: u64, version: u32, width: u16, expanded: bool, context: u64) -> Self {
+        Self {
+            cell,
+            version,
+            width,
+            expanded,
+            context,
+            stable_prefix: None,
+        }
+    }
+
+    pub fn stable_prefix(cell: u64, revision: u64, len: usize, width: u16, context: u64) -> Self {
+        Self {
+            cell,
+            version: 0,
+            width,
+            expanded: false,
+            context,
+            stable_prefix: Some(StablePrefixKey { revision, len }),
+        }
+    }
 }
 
 struct Entry {

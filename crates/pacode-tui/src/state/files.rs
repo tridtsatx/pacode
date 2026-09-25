@@ -264,7 +264,7 @@ impl FilesState {
             if let Some(row) = self.rows.iter_mut().find(|r| r.path == path) {
                 row.kinds.add(kind_flag);
                 row.count = row.count.saturating_add(1);
-                row.last_ts_ms = ts_ms;
+                row.last_ts_ms = row.last_ts_ms.max(ts_ms);
             } else {
                 let mut kinds = FileKinds::new();
                 kinds.add(kind_flag);

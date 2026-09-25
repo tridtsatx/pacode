@@ -36,6 +36,9 @@ struct StubHost {
     agents: Mutex<Vec<AgentInfo>>,
     agent_kinds: Mutex<Vec<AgentKindDef>>,
     spawned_specs: Mutex<Vec<AgentSpec>>,
+    /// How long a permission prompt stays open; widens the window between a
+    /// tool's read of a file and its write for the concurrency tests.
+    permission_delay: Duration,
 }
 
 impl StubHost {
@@ -51,6 +54,14 @@ impl StubHost {
             agents: Mutex::new(Vec::new()),
             agent_kinds: Mutex::new(Vec::new()),
             spawned_specs: Mutex::new(Vec::new()),
+            permission_delay: Duration::ZERO,
+        }
+    }
+
+    fn slow_permissions(self, delay: Duration) -> Self {
+        Self {
+            permission_delay: delay,
+            ..self
         }
     }
 }
@@ -108,6 +119,9 @@ impl ToolHost for StubHost {
     async fn request_permission(&self, draft: PermissionDraft) -> pacode_tools::PermissionOutcome {
         let dec = *self.decision.lock().unwrap();
         self.drafts.lock().unwrap().push(draft.clone());
+        if !self.permission_delay.is_zero() {
+            tokio::time::sleep(self.permission_delay).await;
+        }
         if draft.risk == Some(RiskLevel::Catastrophic) {
             return pacode_tools::PermissionOutcome {
                 decision: PermissionDecision::Deny,
@@ -411,7 +425,13 @@ async fn test_edit_unique_ambiguous_replace_all_atomic() {
     assert_eq!(out.content, "Edited file.txt: 1 replacement(s)");
     let content = tokio::fs::read_to_string(&file_path).await.unwrap();
     assert_eq!(content, "hi world\nhello zed\n");
-    assert!(!tmp.path().join("file.txt.pacode-tmp").exists());
+    let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains("pacode-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
 
     // Replace all
     let out_all = tool
@@ -1134,4 +1154,119 @@ async fn test_mcp_resource_proxy() {
     assert!(out_blob.content.contains("[blob: image/png]"));
 
     pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_edits_of_one_file_both_land() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(
+        StubHost::new(tmp.path().join("spool")).slow_permissions(Duration::from_millis(40)),
+    );
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+    let file = tmp.path().join("shared.txt");
+    tokio::fs::write(&file, "aaa\nbbb\n").await.unwrap();
+
+    // Both callers read the same starting content; without the per-path lock one
+    // of the two writes would be computed from a file the other had already
+    // replaced, and the first change would vanish.
+    let (first, second) = tokio::join!(
+        EditTool.call(
+            json!({"path": "shared.txt", "old_string": "aaa", "new_string": "AAA"}),
+            &ctx
+        ),
+        EditTool.call(
+            json!({"path": "./shared.txt", "old_string": "bbb", "new_string": "BBB"}),
+            &ctx
+        )
+    );
+    first.expect("first edit");
+    second.expect("second edit");
+
+    assert_eq!(
+        tokio::fs::read_to_string(&file).await.unwrap(),
+        "AAA\nBBB\n"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains("pacode-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}
+
+#[tokio::test]
+async fn write_keeps_the_mode_and_caps_a_huge_permission_detail() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    let file = tmp.path().join("run.sh");
+    tokio::fs::write(&file, "old\n").await.unwrap();
+    tokio::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+        .await
+        .unwrap();
+
+    WriteTool
+        .call(json!({"path": "run.sh", "content": "new\n"}), &ctx)
+        .await
+        .unwrap();
+
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o755,
+        "an overwrite must not strip the exec bit"
+    );
+
+    let filler = "z".repeat(200_000);
+    WriteTool
+        .call(json!({"path": "run.sh", "content": filler}), &ctx)
+        .await
+        .unwrap();
+    let drafts = host.drafts.lock().unwrap().clone();
+    let last = drafts.last().expect("a draft");
+    assert!(
+        last.detail.len() <= pacode_tools::registry::MAX_PERMISSION_DETAIL_BYTES,
+        "permission detail of {} bytes escaped the cap",
+        last.detail.len()
+    );
+    assert!(
+        last.detail.contains("output truncated"),
+        "{}",
+        &last.detail[..80]
+    );
+    assert_eq!(tokio::fs::read_to_string(&file).await.unwrap(), filler);
+}
+
+#[tokio::test]
+async fn a_file_too_large_to_diff_is_refused_instead_of_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    let file = tmp.path().join("huge.txt");
+    let handle = std::fs::File::create(&file).unwrap();
+    handle
+        .set_len(pacode_tools::registry::MAX_SOURCE_FILE_BYTES + 1)
+        .unwrap();
+    drop(handle);
+
+    let err = EditTool
+        .call(
+            json!({"path": "huge.txt", "old_string": "a", "new_string": "b"}),
+            &ctx,
+        )
+        .await
+        .expect_err("too large to load whole");
+    assert!(format!("{err}").contains("byte limit"), "{err}");
+
+    let err = WriteTool
+        .call(json!({"path": "huge.txt", "content": "b"}), &ctx)
+        .await
+        .expect_err("too large to load whole");
+    assert!(format!("{err}").contains("byte limit"), "{err}");
+
+    // Nothing was written, and nothing was asked.
+    assert!(host.drafts.lock().unwrap().is_empty());
 }

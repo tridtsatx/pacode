@@ -7,6 +7,7 @@ use futures::StreamExt;
 use pacode_types::{CallId, Effort, StopReason, StreamEvent, Usage};
 use serde_json::Value;
 
+use crate::retry::RetryAfterSignal;
 use crate::{EventStream, ProviderError};
 
 #[cfg(test)]
@@ -14,26 +15,41 @@ use crate::{EventStream, ProviderError};
 mod sse_tests;
 
 pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_SSE_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_PENDING_TOOL_CALLS: usize = 256;
 pub(crate) const MAX_BUFFERED_ARGS_BYTES: usize = 1024 * 1024;
 
 /// Incremental SSE parser: feed raw bytes, get complete `data:` payloads.
 pub struct SseParser {
     buffer: Vec<u8>,
+    max_buffer_bytes: usize,
 }
 
 impl SseParser {
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self::with_max_buffer_bytes(MAX_SSE_BUFFER_BYTES)
     }
 
-    /// Append bytes; returns the `data:` payloads of every complete event.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() > MAX_SSE_BUFFER_BYTES {
-            self.buffer.clear();
-            return Vec::new();
+    pub(crate) fn with_max_buffer_bytes(max_buffer_bytes: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            max_buffer_bytes,
         }
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.feed_checked(bytes).unwrap_or_default()
+    }
+
+    pub(crate) fn feed_checked(&mut self, bytes: &[u8]) -> Result<Vec<String>, ProviderError> {
+        if self.buffer.len().saturating_add(bytes.len()) > self.max_buffer_bytes {
+            self.buffer.clear();
+            return Err(ProviderError::Malformed(format!(
+                "SSE event exceeds {}-byte buffer budget",
+                self.max_buffer_bytes
+            )));
+        }
+        self.buffer.extend_from_slice(bytes);
 
         let mut events = Vec::new();
         let mut cursor = 0;
@@ -54,7 +70,7 @@ impl SseParser {
         }
 
         self.buffer.drain(..cursor);
-        events
+        Ok(events)
     }
 }
 
@@ -354,14 +370,81 @@ pub(crate) struct PendingToolCall {
     pub(crate) buffered_args: String,
 }
 
-pub(crate) fn create_event_stream(
+pub(crate) struct ResponseReadBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl ResponseReadBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    pub(crate) fn consume(&mut self, bytes: usize) -> Result<(), ProviderError> {
+        let next = self.used.checked_add(bytes).ok_or_else(|| {
+            ProviderError::Malformed("SSE response byte count overflowed".to_string())
+        })?;
+        if next > self.limit {
+            return Err(ProviderError::Malformed(format!(
+                "SSE response exceeds {}-byte read budget",
+                self.limit
+            )));
+        }
+        self.used = next;
+        Ok(())
+    }
+}
+
+pub(crate) fn retry_after_from_error(error: &Value) -> Option<Duration> {
+    let metadata = error.get("metadata");
+    let direct = error
+        .get("retry_after")
+        .or_else(|| error.get("retryAfter"))
+        .or_else(|| metadata.and_then(|value| value.get("retry_after")))
+        .or_else(|| metadata.and_then(|value| value.get("retryAfter")));
+    if let Some(delay) = direct.and_then(crate::retry::retry_after_value) {
+        return Some(delay);
+    }
+
+    let headers = error
+        .get("response_headers")
+        .or_else(|| error.get("responseHeaders"))
+        .or_else(|| metadata.and_then(|value| value.get("response_headers")))
+        .or_else(|| metadata.and_then(|value| value.get("responseHeaders")))?
+        .as_object()?;
+    headers
+        .iter()
+        .find(|(name, _)| name.as_str().eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| crate::retry::retry_after_value(value))
+}
+
+pub(crate) fn create_event_stream_with_retry_after(
     response: reqwest::Response,
     req_model: String,
     stream_idle_secs: u64,
     effort: Effort,
+    retry_after: RetryAfterSignal,
 ) -> EventStream {
-    let timeout_secs = stream_idle_secs * effort.idle_timeout_factor();
-    let idle_duration = Duration::from_secs(timeout_secs.max(1));
+    create_event_stream_with_limits(
+        response,
+        req_model,
+        stream_idle_secs,
+        effort,
+        retry_after,
+        MAX_SSE_RESPONSE_BYTES,
+    )
+}
+
+fn create_event_stream_with_limits(
+    response: reqwest::Response,
+    req_model: String,
+    stream_idle_secs: u64,
+    effort: Effort,
+    retry_after: RetryAfterSignal,
+    max_response_bytes: usize,
+) -> EventStream {
+    let timeout_secs = stream_idle_secs.saturating_mul(effort.idle_timeout_factor());
+    let idle_duration = (stream_idle_secs > 0).then(|| Duration::from_secs(timeout_secs.max(1)));
 
     struct StreamState<S> {
         byte_stream: S,
@@ -374,8 +457,10 @@ pub(crate) fn create_event_stream(
         model: Option<String>,
         message_start_emitted: bool,
         stream_ended: bool,
-        idle_duration: Duration,
+        idle_duration: Option<Duration>,
         timeout_secs: u64,
+        read_budget: ResponseReadBudget,
+        retry_after: RetryAfterSignal,
     }
 
     let initial_state = StreamState {
@@ -389,6 +474,8 @@ pub(crate) fn create_event_stream(
         stream_ended: false,
         idle_duration,
         timeout_secs,
+        read_budget: ResponseReadBudget::new(max_response_bytes),
+        retry_after,
     };
 
     let stream = futures::stream::unfold(initial_state, |mut state| async move {
@@ -406,8 +493,12 @@ pub(crate) fn create_event_stream(
                 return None;
             }
 
-            let next_chunk =
-                tokio::time::timeout(state.idle_duration, state.byte_stream.next()).await;
+            let next_chunk = match state.idle_duration {
+                Some(idle_duration) => {
+                    tokio::time::timeout(idle_duration, state.byte_stream.next()).await
+                }
+                None => Ok(state.byte_stream.next().await),
+            };
 
             match next_chunk {
                 Err(_) => {
@@ -415,6 +506,11 @@ pub(crate) fn create_event_stream(
                     return Some((Err(ProviderError::IdleTimeout(state.timeout_secs)), state));
                 }
                 Ok(Some(Ok(bytes))) => {
+                    if let Err(error) = state.read_budget.consume(bytes.len()) {
+                        state.stream_ended = true;
+                        state.pending_error = Some(error);
+                        continue;
+                    }
                     // The lossy copy + redact scan run per network chunk — only
                     // when `trace` is actually on (off in release builds).
                     if log::log_enabled!(log::Level::Trace) {
@@ -422,7 +518,14 @@ pub(crate) fn create_event_stream(
                         let chunk_redacted = crate::redact(&chunk_str);
                         log::trace!("response body chunk: {chunk_redacted}");
                     }
-                    let payloads = state.parser.feed(bytes.as_ref());
+                    let payloads = match state.parser.feed_checked(bytes.as_ref()) {
+                        Ok(payloads) => payloads,
+                        Err(error) => {
+                            state.stream_ended = true;
+                            state.pending_error = Some(error);
+                            continue;
+                        }
+                    };
                     for payload in payloads {
                         if payload.trim() == "[DONE]" {
                             state.stream_ended = true;
@@ -456,6 +559,12 @@ pub(crate) fn create_event_stream(
 
                                 match chunk_to_events(&json, &mut state.chunk_state) {
                                     Err(err) => {
+                                        if matches!(&err, ProviderError::RateLimited(_))
+                                            && let Some(delay) =
+                                                json.get("error").and_then(retry_after_from_error)
+                                        {
+                                            state.retry_after.set(delay);
+                                        }
                                         state.stream_ended = true;
                                         state.pending_error = Some(err);
                                         break;

@@ -10,14 +10,6 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Microseconds since the Unix epoch (used for id generation).
-pub(crate) fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
-}
-
 /// Format a duration: `342ms` under a second, `7.3s` under 10s, `42s` under a minute,
 /// `1m05s` under an hour, `1h02m` above.
 pub fn format_duration_ms(ms: u64) -> String {

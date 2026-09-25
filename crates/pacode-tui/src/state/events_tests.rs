@@ -4,16 +4,16 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use pacode_client::ClientEvent;
+use pacode_client::{ClientEvent, ClientEventContext};
 use pacode_types::ids::{AgentId, SessionId};
 use pacode_types::model::{Effort, ModelRoute};
 use pacode_types::state::{AgentKind, AgentStatus, Mode};
 use pacode_types::{
     AgentInfo, Config, Event, Plan, Request, SessionMeta, SessionSnapshot, SessionStatusKind,
-    TurnId, TurnStop, UsageTotals,
+    ToastLevel, TranscriptItem, TranscriptKind, TurnId, TurnStop, UsageTotals,
 };
 
-use crate::state::{AppState, Connection, RESYNC_DEBOUNCE_MS, SessionSlot};
+use crate::state::{AppState, Connection, Focus, PanelTarget, RESYNC_DEBOUNCE_MS, SessionSlot};
 
 fn meta() -> SessionMeta {
     SessionMeta {
@@ -37,7 +37,18 @@ fn attached_state() -> AppState {
     let mut state = AppState::new(Config::default(), "1.0.0".to_string(), 120, 34);
     state.meta = Some(meta());
     state.connection = Connection::Connected;
+    state.event_connection_epoch = 1;
+    state.event_session_epoch = 1;
+    state.awaiting_snapshot = false;
     state
+}
+
+fn event_context() -> ClientEventContext {
+    ClientEventContext {
+        connection_epoch: 1,
+        session_epoch: 1,
+        session: Some(SessionId::new("ses_test")),
+    }
 }
 
 fn snapshot(seq: u64, cwd: PathBuf) -> SessionSnapshot {
@@ -54,6 +65,9 @@ fn snapshot(seq: u64, cwd: PathBuf) -> SessionSnapshot {
         pending_permissions: vec![],
         pending_questions: vec![],
         turn_active: false,
+        active_turn: None,
+        terminal_turn: None,
+        terminal_error: None,
         cron_jobs: vec![],
         monitors: vec![],
         seq,
@@ -62,6 +76,7 @@ fn snapshot(seq: u64, cwd: PathBuf) -> SessionSnapshot {
 
 fn ev(seq: u64) -> ClientEvent {
     ClientEvent::Event {
+        context: event_context(),
         seq,
         event: Event::PlanUpdated(Plan::default()),
     }
@@ -88,6 +103,7 @@ fn sub_agent(id: &str, status: AgentStatus) -> AgentInfo {
 
 fn turn_ended(id: &AgentId, stop: TurnStop) -> ClientEvent {
     ClientEvent::Event {
+        context: event_context(),
         seq: 1,
         event: Event::TurnEnded {
             agent: id.clone(),
@@ -96,6 +112,83 @@ fn turn_ended(id: &AgentId, stop: TurnStop) -> ClientEvent {
             stop,
         },
     }
+}
+
+fn resync_marker() -> ClientEvent {
+    ClientEvent::ResyncNeeded {
+        context: event_context(),
+    }
+}
+
+#[test]
+fn wire_resync_marker_arms_the_existing_snapshot_request() {
+    let mut state = attached_state();
+    let now = Instant::now();
+
+    assert!(state.apply_client_event(resync_marker(), now));
+    assert!(state.resync_want);
+    assert_eq!(state.take_resync_request(now), Some(Request::GetSnapshot));
+    assert!(state.resync_in_flight);
+}
+
+#[test]
+fn reconnect_snapshot_marker_does_not_duplicate_recovery() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    let reconnect_context = ClientEventContext {
+        connection_epoch: 2,
+        session_epoch: 1,
+        session: Some(SessionId::new("ses_test")),
+    };
+
+    assert!(state.apply_client_event(
+        ClientEvent::Connected {
+            context: reconnect_context.clone(),
+            daemon_version: "test".into(),
+            pid: 1,
+            version_mismatch: false,
+        },
+        now,
+    ));
+    assert!(!state.apply_client_event(
+        ClientEvent::ResyncNeeded {
+            context: reconnect_context.clone(),
+        },
+        now,
+    ));
+    assert!(!state.resync_want);
+
+    assert!(state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: reconnect_context,
+            snapshot: snapshot(10, PathBuf::from("/tmp")),
+        },
+        now,
+    ));
+    assert!(state.take_resync_request(now).is_none());
+}
+
+#[test]
+fn marker_during_resync_remains_wanted_after_snapshot_barrier() {
+    let mut state = attached_state();
+    let t0 = Instant::now();
+
+    assert!(state.apply_client_event(resync_marker(), t0));
+    assert_eq!(state.take_resync_request(t0), Some(Request::GetSnapshot));
+    assert!(state.apply_client_event(resync_marker(), t0));
+
+    assert!(state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snapshot(2, PathBuf::from("/tmp")),
+        },
+        t0,
+    ));
+    assert!(state.resync_want);
+    assert_eq!(
+        state.take_resync_request(t0 + Duration::from_millis(RESYNC_DEBOUNCE_MS)),
+        Some(Request::GetSnapshot)
+    );
 }
 
 #[test]
@@ -137,7 +230,13 @@ fn snapshot_rebases_seq_and_settles_resync() {
     // The answering snapshot rebases the tracker on its own seq — without
     // the rebase the first post-snapshot event would look like a fresh gap
     // and resync forever.
-    state.apply_client_event(ClientEvent::Snapshot(snapshot(7, cwd)), now);
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snapshot(7, cwd),
+        },
+        now,
+    );
     assert!(!state.resync_in_flight);
     assert!(!state.resync_want);
     assert_eq!(state.last_event_seq, Some(7));
@@ -146,6 +245,215 @@ fn snapshot_rebases_seq_and_settles_resync() {
     state.apply_client_event(ev(8), now);
     assert!(!state.resync_want);
     assert!(state.take_resync_request(now).is_none());
+}
+
+#[test]
+fn stale_seq_at_or_before_snapshot_is_ignored_without_gap() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    let cwd = state.cwd();
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snapshot(10, cwd),
+        },
+        now,
+    );
+
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 9,
+            event: Event::Toast {
+                level: ToastLevel::Info,
+                title: "stale".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert!(state.toasts.is_empty());
+    assert!(!state.resync_want);
+    assert_eq!(state.last_event_seq, Some(10));
+}
+
+#[test]
+fn forward_gap_arms_resync_without_later_rollback() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    let cwd = state.cwd();
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snapshot(10, cwd),
+        },
+        now,
+    );
+
+    assert!(state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 12,
+            event: Event::Toast {
+                level: ToastLevel::Info,
+                title: "newer".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert!(state.resync_want);
+    assert_eq!(state.last_event_seq, Some(12));
+
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 11,
+            event: Event::Toast {
+                level: ToastLevel::Info,
+                title: "late".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert_eq!(state.toasts.len(), 1);
+    assert_eq!(state.last_event_seq, Some(12));
+    let stale_cwd = state.cwd();
+    assert!(!state.apply_snapshot(snapshot(11, stale_cwd), now));
+    assert_eq!(state.toasts.len(), 1);
+    assert_eq!(state.last_event_seq, Some(12));
+}
+
+#[test]
+fn reconnect_snapshot_can_rebase_a_restarted_daemon_seq_space() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    let cwd = state.cwd();
+    state.last_event_seq = Some(20);
+    let context = ClientEventContext {
+        connection_epoch: 2,
+        session_epoch: 1,
+        session: Some(SessionId::new("ses_test")),
+    };
+
+    assert!(state.apply_client_event(
+        ClientEvent::Connected {
+            context: context.clone(),
+            daemon_version: "test".into(),
+            pid: 1,
+            version_mismatch: false,
+        },
+        now,
+    ));
+    assert!(state.apply_client_event(
+        ClientEvent::Snapshot {
+            context,
+            snapshot: snapshot(5, cwd),
+        },
+        now,
+    ));
+    assert_eq!(state.last_event_seq, Some(5));
+    assert!(state.apply_client_event(
+        ClientEvent::Event {
+            context: ClientEventContext {
+                connection_epoch: 2,
+                session_epoch: 1,
+                session: Some(SessionId::new("ses_test")),
+            },
+            seq: 6,
+            event: Event::PlanUpdated(Plan::default()),
+        },
+        now,
+    ));
+    assert!(!state.resync_want);
+}
+
+#[test]
+fn a_new_connection_heals_a_stale_resync_barrier() {
+    let mut state = attached_state();
+    state.resync_want = true;
+    state.resync_in_flight = true;
+    state.resync_sent_at = Some(Instant::now());
+    state.awaiting_snapshot = true;
+    assert!(state.apply_client_event(
+        ClientEvent::Connected {
+            context: ClientEventContext {
+                connection_epoch: 2,
+                session_epoch: 1,
+                session: Some(SessionId::new("ses_test")),
+            },
+            daemon_version: "test".into(),
+            pid: 1,
+            version_mismatch: false,
+        },
+        Instant::now(),
+    ));
+    assert!(!state.resync_in_flight);
+    assert!(!state.resync_want);
+    assert!(state.resync_sent_at.is_none());
+}
+
+#[test]
+fn pre_snapshot_events_replay_once_in_seq_order() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    let cwd = state.cwd();
+    state.awaiting_snapshot = true;
+
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 11,
+            event: Event::Toast {
+                level: ToastLevel::Info,
+                title: "live".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 9,
+            event: Event::Toast {
+                level: ToastLevel::Info,
+                title: "covered".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert_eq!(state.session.buffered_event_count(), 2);
+    assert!(state.toasts.is_empty());
+
+    assert!(state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snapshot(10, cwd),
+        },
+        now,
+    ));
+    assert_eq!(state.session.buffered_event_count(), 0);
+    assert_eq!(state.last_event_seq, Some(11));
+    assert_eq!(state.toasts.len(), 1);
+    assert_eq!(state.toasts[0].title, "live");
+    assert!(!state.resync_want);
+
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 11,
+            event: Event::Toast {
+                level: ToastLevel::Info,
+                title: "live".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert_eq!(state.toasts.len(), 1);
 }
 
 #[test]
@@ -201,7 +509,7 @@ fn seq_gap_ignored_before_attach() {
     state.apply_client_event(ev(1), now);
     state.apply_client_event(ev(9), now);
     assert!(!state.resync_want);
-    assert_eq!(state.last_event_seq, Some(9));
+    assert_eq!(state.last_event_seq, None);
 }
 
 #[test]
@@ -280,6 +588,159 @@ fn turn_ended_main_does_not_touch_rail() {
     assert!(info.finished_at_ms.is_none());
 }
 
+#[test]
+fn unselected_agent_deltas_are_filtered_without_forcing_a_resync() {
+    let mut state = attached_state();
+    let id = AgentId::new("agt_sub1");
+    state.awaiting_snapshot = true;
+    let now = Instant::now();
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 1,
+            event: Event::TextDelta {
+                agent: id.clone(),
+                item_seq: 1,
+                text: "hidden".into(),
+            },
+        },
+        now,
+    ));
+    assert_eq!(state.session.buffered_event_count(), 1);
+    assert!(state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snapshot(1, PathBuf::from("/tmp")),
+        },
+        now,
+    ));
+    assert!(!state.resync_want);
+    assert!(state.panel.agent_transcript.cells.is_empty());
+}
+
+#[test]
+fn selected_agent_deltas_survive_the_snapshot_barrier() {
+    let mut state = attached_state();
+    let id = AgentId::new("agt_sub1");
+    state.awaiting_snapshot = true;
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(id.clone()),
+        follow: false,
+        follow_paused: false,
+    };
+    let now = Instant::now();
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 1,
+            event: Event::ItemAdded(TranscriptItem {
+                seq: 1,
+                agent: id.clone(),
+                ts_ms: 1,
+                kind: TranscriptKind::Assistant {
+                    text: String::new(),
+                    complete: false,
+                },
+            }),
+        },
+        now,
+    ));
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 2,
+            event: Event::TextDelta {
+                agent: id,
+                item_seq: 1,
+                text: "visible".into(),
+            },
+        },
+        now,
+    ));
+    assert!(state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snapshot(0, PathBuf::from("/tmp")),
+        },
+        now,
+    ));
+    assert!(!state.resync_want);
+    assert!(!state.panel.agent_transcript.cells.is_empty());
+}
+
+#[test]
+fn a_stale_turn_end_cannot_finish_a_new_agent_turn() {
+    let mut state = attached_state();
+    let id = AgentId::new("agt_sub1");
+    let old_turn = TurnId::new("turn_old");
+    let new_turn = TurnId::new("turn_new");
+    state
+        .rail
+        .upsert_agent(sub_agent("agt_sub1", AgentStatus::RunningTool));
+    let now = Instant::now();
+    state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 1,
+            event: Event::TurnStarted {
+                agent: id.clone(),
+                turn: old_turn.clone(),
+            },
+        },
+        now,
+    );
+    state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 2,
+            event: Event::TurnStarted {
+                agent: id.clone(),
+                turn: new_turn.clone(),
+            },
+        },
+        now,
+    );
+    state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 3,
+            event: Event::TurnEnded {
+                agent: id.clone(),
+                turn: old_turn.clone(),
+                usage: None,
+                stop: TurnStop::Completed,
+            },
+        },
+        now,
+    );
+    assert!(
+        state
+            .rail
+            .agent(&id)
+            .is_some_and(|info| info.status.is_live())
+    );
+    state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 4,
+            event: Event::TurnEnded {
+                agent: id,
+                turn: new_turn,
+                usage: None,
+                stop: TurnStop::Completed,
+            },
+        },
+        now,
+    );
+    assert_eq!(
+        state
+            .rail
+            .agent(&AgentId::new("agt_sub1"))
+            .map(|info| info.status),
+        Some(AgentStatus::Finished)
+    );
+}
+
 fn perm_request(id: &str) -> pacode_types::PermissionRequest {
     pacode_types::PermissionRequest {
         id: pacode_types::PermissionId::new(id),
@@ -325,6 +786,7 @@ fn permission_event_and_item_added_share_one_prompt_cell() {
 
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 1,
             event: Event::PermissionRequested(req.clone()),
         },
@@ -334,6 +796,7 @@ fn permission_event_and_item_added_share_one_prompt_cell() {
     // it must refresh the prompt, not render a second one.
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 2,
             event: Event::ItemAdded(perm_item(7, &req)),
         },
@@ -354,7 +817,13 @@ fn snapshot_pending_permission_dedupes_against_the_tail_item() {
     snap.transcript = vec![perm_item(9, &req)];
     snap.pending_permissions = vec![req];
 
-    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snap,
+        },
+        now,
+    );
 
     assert_eq!(permission_cell_count(&state), 1);
 }
@@ -365,6 +834,7 @@ fn permission_explained_folds_into_the_pending_prompt() {
     let now = Instant::now();
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 1,
             event: Event::PermissionRequested(perm_request("perm_1")),
         },
@@ -372,6 +842,7 @@ fn permission_explained_folds_into_the_pending_prompt() {
     );
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 2,
             event: Event::PermissionExplained {
                 permission: pacode_types::PermissionId::new("perm_1"),
@@ -399,6 +870,7 @@ fn permission_explained_folds_into_the_pending_prompt() {
     // A re-asked 'e' replaces the answer instead of stacking a second one.
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 3,
             event: Event::PermissionExplained {
                 permission: pacode_types::PermissionId::new("perm_1"),
@@ -429,6 +901,7 @@ fn permission_explained_after_resolve_lands_as_a_notice() {
     let now = Instant::now();
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 1,
             event: Event::PermissionRequested(perm_request("perm_1")),
         },
@@ -436,6 +909,7 @@ fn permission_explained_after_resolve_lands_as_a_notice() {
     );
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 2,
             event: Event::PermissionResolved {
                 permission: pacode_types::PermissionId::new("perm_1"),
@@ -460,6 +934,7 @@ fn permission_explained_after_resolve_lands_as_a_notice() {
     // rather than vanishing.
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 3,
             event: Event::PermissionExplained {
                 permission: pacode_types::PermissionId::new("perm_1"),
@@ -484,6 +959,7 @@ fn permission_explained_without_level_keeps_the_honest_text() {
     let now = Instant::now();
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 1,
             event: Event::PermissionRequested(perm_request("perm_1")),
         },
@@ -491,6 +967,7 @@ fn permission_explained_without_level_keeps_the_honest_text() {
     );
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 2,
             event: Event::PermissionExplained {
                 permission: pacode_types::PermissionId::new("perm_1"),
@@ -531,6 +1008,7 @@ fn session_status_event_updates_the_named_slot() {
 
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 1,
             event: Event::SessionStatus {
                 session: SessionId::new("ses_b"),
@@ -552,6 +1030,7 @@ fn session_status_event_updates_the_named_slot() {
     // An id no slot holds is ignored.
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 2,
             event: Event::SessionStatus {
                 session: SessionId::new("ses_elsewhere"),
@@ -577,6 +1056,7 @@ fn session_status_seq_stays_out_of_session_tracking() {
     // global space and must never forge a session-stream gap.
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 999,
             event: Event::SessionStatus {
                 session: SessionId::new("ses_b"),
@@ -591,6 +1071,7 @@ fn session_status_seq_stays_out_of_session_tracking() {
     // A real session event still tracks normally after it.
     state.apply_client_event(
         ClientEvent::Event {
+            context: event_context(),
             seq: 8,
             event: Event::PlanUpdated(Plan::default()),
         },
@@ -598,6 +1079,33 @@ fn session_status_seq_stays_out_of_session_tracking() {
     );
     assert!(!state.resync_want);
     assert_eq!(state.last_event_seq, Some(8));
+}
+
+#[test]
+fn auth_update_seq_stays_out_of_session_tracking() {
+    let mut state = attached_state();
+    state.last_event_seq = Some(7);
+
+    assert!(state.apply_client_event(
+        ClientEvent::Event {
+            context: event_context(),
+            seq: 999,
+            event: Event::AuthUpdated(pacode_types::ProviderAuthInfo {
+                id: "github".into(),
+                display_name: "GitHub".into(),
+                auth_kind: "oauth".into(),
+                detail: String::new(),
+                recommended: true,
+                state: pacode_types::AuthState::Configured,
+                accounts: Vec::new(),
+                active: None,
+            }),
+        },
+        Instant::now(),
+    ));
+    assert_eq!(state.auth_providers.len(), 1);
+    assert!(!state.resync_want);
+    assert_eq!(state.last_event_seq, Some(7));
 }
 
 #[test]
@@ -656,7 +1164,10 @@ fn attach_snapshot_reseeds_the_slot_status() {
 
     // A quiet attach clears `Done` — the session is being viewed.
     state.apply_client_event(
-        ClientEvent::Snapshot(snapshot(5, PathBuf::from("/tmp"))),
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snapshot(5, PathBuf::from("/tmp")),
+        },
         now,
     );
     assert_eq!(
@@ -667,7 +1178,13 @@ fn attach_snapshot_reseeds_the_slot_status() {
     // A snapshot with a running turn seeds Working.
     let mut snap = snapshot(6, PathBuf::from("/tmp"));
     snap.turn_active = true;
-    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snap,
+        },
+        now,
+    );
     assert_eq!(
         state.slots[0].as_ref().unwrap().status,
         SessionStatusKind::Working
@@ -676,7 +1193,13 @@ fn attach_snapshot_reseeds_the_slot_status() {
     // A snapshot with a pending permission seeds NeedsInput.
     let mut snap = snapshot(7, PathBuf::from("/tmp"));
     snap.pending_permissions = vec![perm_request("perm_9")];
-    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snap,
+        },
+        now,
+    );
     assert_eq!(
         state.slots[0].as_ref().unwrap().status,
         SessionStatusKind::NeedsInput
@@ -686,7 +1209,13 @@ fn attach_snapshot_reseeds_the_slot_status() {
     // and `TurnStarted` is work in flight.
     let mut snap = snapshot(8, PathBuf::from("/tmp"));
     snap.agents = vec![sub_agent("sub_1", AgentStatus::Idle)];
-    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snap,
+        },
+        now,
+    );
     assert_eq!(
         state.slots[0].as_ref().unwrap().status,
         SessionStatusKind::Working
@@ -698,7 +1227,13 @@ fn attach_snapshot_reseeds_the_slot_status() {
     main.kind = AgentKind::Main;
     main.parent = None;
     snap.agents = vec![main];
-    state.apply_client_event(ClientEvent::Snapshot(snap), now);
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: event_context(),
+            snapshot: snap,
+        },
+        now,
+    );
     assert_eq!(
         state.slots[0].as_ref().unwrap().status,
         SessionStatusKind::Idle
@@ -783,6 +1318,78 @@ fn an_idle_subagent_reads_working_and_keeps_the_second_tick() {
     assert!(state.needs_second_tick());
 
     // And it is not quiet: the session-stats debounce must not start.
-    assert!(!state.rail.update_idle(state.turn_active, now));
+    let turn_active = state.turn_active;
+    assert!(!state.rail.update_idle(turn_active, now));
     assert!(state.rail.idle_since.is_none());
+}
+
+#[test]
+fn stale_session_epoch_event_is_dropped_after_rebind() {
+    let mut state = attached_state();
+    state.event_connection_epoch = 3;
+    state.event_session_epoch = 2;
+    state.awaiting_snapshot = false;
+    let context = ClientEventContext {
+        connection_epoch: 3,
+        session_epoch: 1,
+        session: Some(SessionId::new("ses_test")),
+    };
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context,
+            seq: 1,
+            event: Event::Toast {
+                level: ToastLevel::Info,
+                title: "stale".into(),
+                detail: None,
+            },
+        },
+        Instant::now(),
+    ));
+    assert!(state.toasts.is_empty());
+    state.event_connection_epoch = 4;
+    let stale_connection = ClientEventContext {
+        connection_epoch: 3,
+        session_epoch: 2,
+        session: Some(SessionId::new("ses_test")),
+    };
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: stale_connection,
+            seq: 2,
+            event: Event::Toast {
+                level: ToastLevel::Info,
+                title: "stale connection".into(),
+                detail: None,
+            },
+        },
+        Instant::now(),
+    ));
+    assert!(state.toasts.is_empty());
+}
+
+#[test]
+fn login_progress_is_global_and_does_not_write_transcript() {
+    let mut state = attached_state();
+    state.event_connection_epoch = 3;
+    state.event_session_epoch = 2;
+    state.awaiting_snapshot = false;
+    let context = ClientEventContext {
+        connection_epoch: 3,
+        session_epoch: 2,
+        session: Some(SessionId::new("ses_test")),
+    };
+    assert!(state.apply_client_event(
+        ClientEvent::Event {
+            context,
+            seq: 100,
+            event: Event::LoginProgress {
+                provider: "github".into(),
+                stage: pacode_types::LoginStage::Waiting,
+            },
+        },
+        Instant::now(),
+    ));
+    assert!(state.transcript.cells.is_empty());
+    assert!(!state.toasts.is_empty());
 }

@@ -7,6 +7,8 @@
 //! body into one bounded, readable line. The untouched body still goes to
 //! `log::warn!`/`log::trace!` at the call sites (through [`crate::redact`]).
 
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
 
 #[cfg(test)]
@@ -16,6 +18,8 @@ mod error_body_tests;
 /// Cap for the surfaced text — everything that can reach the chat UI or the model
 /// context is bounded (spec §6.4).
 const MAX_ERROR_BODY_CHARS: usize = 300;
+pub(crate) const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Distil an HTTP error response body into a short human-readable message.
 ///
@@ -100,6 +104,61 @@ fn non_empty_str(value: Option<&Value>) -> Option<&str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// Error body for a request with no idle budget of its own (catalogs, auth):
+/// capped in size and in time so a broken endpoint cannot stream forever.
+pub(crate) async fn read_error_body(response: &mut reqwest::Response) -> String {
+    read_response_body_with_limits(response, MAX_ERROR_BODY_BYTES, ERROR_BODY_READ_TIMEOUT).await
+}
+
+pub(crate) async fn read_response_body_with_limits(
+    response: &mut reqwest::Response,
+    max_bytes: usize,
+    read_timeout: Duration,
+) -> String {
+    let mut body = Vec::with_capacity(max_bytes.min(8192));
+    let deadline = Instant::now().checked_add(read_timeout);
+    while body.len() < max_bytes {
+        let next = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, response.chunk()).await {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        } else {
+            response.chunk().await
+        };
+
+        match next {
+            Ok(Some(chunk)) => {
+                append_response_body_chunk(&mut body, &chunk, max_bytes);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let decoded = String::from_utf8_lossy(&body);
+    truncate_bytes(&decoded, max_bytes)
+}
+
+fn truncate_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    input[..end].to_string()
+}
+
+fn append_response_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) {
+    let remaining = max_bytes.saturating_sub(body.len());
+    let take = chunk.len().min(remaining);
+    body.extend_from_slice(&chunk[..take]);
 }
 
 /// Truncate to `max_chars` on a char boundary, appending `…` when truncated.

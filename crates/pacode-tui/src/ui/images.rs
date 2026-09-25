@@ -20,78 +20,129 @@ use crate::state::images::THUMB_SLOT_W;
 #[path = "images_tests.rs"]
 mod images_tests;
 
-pub fn draw(
-    frame: &mut Frame,
+enum PreparedImage {
+    Lines {
+        slot: Rect,
+        lines: Vec<Line<'static>>,
+        wrap: bool,
+    },
+    Escape {
+        slot: Rect,
+    },
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedImages {
+    images: Vec<PreparedImage>,
+}
+
+pub(crate) fn prepare(
     area: Rect,
     input: Rect,
     state: &mut AppState,
     opts: &RenderOptions,
-) {
+) -> PreparedImages {
     state.pending_image_escapes.clear();
     let live = state.live_pasted_images();
     if area.width == 0 || area.height == 0 || live.is_empty() {
         state.image_strip.retain(&[]);
-        return;
+        return PreparedImages::default();
     }
 
-    // (token, label, path) triples — cloned so the thumbs cache can be
-    // mutated below.
     let live: Vec<(usize, String, std::path::PathBuf)> = live
         .iter()
-        .map(|r| (r.token, r.token_label(), r.path.clone()))
+        .map(|record| (record.token, record.token_label(), record.path.clone()))
         .collect();
-    let tokens: Vec<usize> = live.iter().map(|(t, ..)| *t).collect();
+    let tokens: Vec<usize> = live.iter().map(|(token, ..)| *token).collect();
     state.image_strip.retain(&tokens);
-
+    let mut images = Vec::new();
     for (token, path, slot) in layout_slots(state, &live, input, area, opts) {
         if slot.width < 4 || slot.height == 0 {
             continue;
         }
-
         let cached = state
             .image_strip
             .thumbs
             .get(&token)
-            .filter(|t| t.cell_w == slot.width && t.cell_h == slot.height);
+            .filter(|thumb| thumb.cell_w == slot.width && thumb.cell_h == slot.height);
         let Some(thumb) = cached else {
-            // §8.1: `pacode_image::render` does file IO + decode/encode — it
-            // runs on a blocking thread. Record the want and draw a
-            // placeholder until `ThumbReady` lands in `thumbs`.
             state
                 .image_strip
                 .want
                 .push((token, path.clone(), slot.width, slot.height));
-            let label = Line::from(Span::styled(format!("[image {token} …]"), opts.theme.faint));
-            frame.render_widget(Paragraph::new(label), slot);
+            images.push(PreparedImage::Lines {
+                slot,
+                lines: vec![Line::from(Span::styled(
+                    format!("[image {token} …]"),
+                    opts.theme.faint,
+                ))],
+                wrap: false,
+            });
             continue;
         };
-
         match &thumb.preview {
             Some(pacode_image::Preview::Cells(grid)) => {
-                let mut lines = Vec::new();
-                for row in grid.iter().take(slot.height as usize) {
-                    let mut spans = Vec::new();
-                    for cell in row.iter().take(slot.width as usize) {
-                        let style = Style::default()
-                            .fg(Color::Rgb(cell.top.0, cell.top.1, cell.top.2))
-                            .bg(Color::Rgb(cell.bottom.0, cell.bottom.1, cell.bottom.2));
-                        spans.push(Span::styled("▀", style));
-                    }
-                    lines.push(Line::from(spans));
-                }
-                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), slot);
+                let lines = grid
+                    .iter()
+                    .take(slot.height as usize)
+                    .map(|row| {
+                        Line::from(
+                            row.iter()
+                                .take(slot.width as usize)
+                                .map(|cell| {
+                                    Span::styled(
+                                        "▀",
+                                        Style::default()
+                                            .fg(Color::Rgb(cell.top.0, cell.top.1, cell.top.2))
+                                            .bg(Color::Rgb(
+                                                cell.bottom.0,
+                                                cell.bottom.1,
+                                                cell.bottom.2,
+                                            )),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect();
+                images.push(PreparedImage::Lines {
+                    slot,
+                    lines,
+                    wrap: true,
+                });
             }
-            Some(pacode_image::Preview::Escape(esc)) => {
-                frame.render_widget(Clear, slot);
-                state.pending_image_escapes.push((slot, esc.clone()));
+            Some(pacode_image::Preview::Escape(escape)) => {
+                state.pending_image_escapes.push((slot, escape.clone()));
+                images.push(PreparedImage::Escape { slot });
             }
-            None => {
-                let label = Line::from(Span::styled(
+            None => images.push(PreparedImage::Lines {
+                slot,
+                lines: vec![Line::from(Span::styled(
                     format!("[image {token} unreadable]"),
                     opts.theme.faint,
-                ));
-                frame.render_widget(Paragraph::new(label), slot);
+                ))],
+                wrap: false,
+            }),
+        }
+    }
+    PreparedImages { images }
+}
+
+pub(crate) fn draw(frame: &mut Frame, prepared: &PreparedImages) {
+    for image in &prepared.images {
+        match image {
+            PreparedImage::Lines { slot, lines, wrap } => {
+                let paragraph = Paragraph::new(lines.clone());
+                frame.render_widget(
+                    if *wrap {
+                        paragraph.wrap(Wrap { trim: false })
+                    } else {
+                        paragraph
+                    },
+                    *slot,
+                );
             }
+            PreparedImage::Escape { slot } => frame.render_widget(Clear, *slot),
         }
     }
 }

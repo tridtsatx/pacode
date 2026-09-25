@@ -1,18 +1,34 @@
-//! Opaque string identifiers. Generated ids are `<prefix>_<12 hex>`: 40 bits of
-//! microsecond time plus an 8-bit per-process counter, which is unique enough for
-//! one machine and sorts roughly by creation time.
+//! Opaque string identifiers. Generated ids are `<prefix>_<12 hex>`: a 16-bit
+//! per-process nonce followed by a 32-bit counter.
+//!
+//! The nonce is drawn once per process and the counter only ever moves forward,
+//! so ids do not repeat inside a process no matter how coarse the clock is or how
+//! many are handed out, and the nonce keeps two processes from issuing the same
+//! one. Ids are opaque to everything outside this module: nothing parses them,
+//! and nothing relies on their order.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
+/// Nonce in the top 16 bits, counter in the low 32, so a single `fetch_add` walks
+/// the whole 48-bit space exactly once: a counter that would run out moves the
+/// nonce on instead of wrapping back onto a value already issued.
+static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+
+fn next_sequence() -> u64 {
+    SEQUENCE
+        .get_or_init(|| AtomicU64::new(u64::from(rand::random::<u16>()) << 32))
+        .fetch_add(1, Ordering::Relaxed)
+}
 
 fn generate_id(prefix: &str) -> String {
-    let micros = crate::time::now_us() & 0xFF_FFFF_FFFF;
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFF;
-    format!("{prefix}_{micros:010x}{counter:02x}")
+    let sequence = next_sequence();
+    let nonce = (sequence >> 32) as u16;
+    let counter = sequence as u32;
+    format!("{prefix}_{nonce:04x}{counter:08x}")
 }
 
 macro_rules! id_type {
@@ -76,6 +92,9 @@ impl SessionId {
         Self(raw.into())
     }
 
+    /// Random rather than counted: a session id outlives the process that made
+    /// it and a client resumes by naming it, so two sessions must not collide
+    /// across restarts and an id must not be guessable from another one.
     pub fn generate() -> Self {
         use rand::Rng;
         let mut rng = rand::rng();

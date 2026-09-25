@@ -217,3 +217,17 @@ fn test_wrapped_position_of_byte() {
         (1, 12)
     );
 }
+
+#[test]
+fn scroll_reconciliation_depends_only_on_current_cursor_and_viewport() {
+    let mut state = InputState::default();
+    state.insert_str("0\n1\n2\n3\n4\n5");
+    state.input_scroll = 99;
+
+    state.reconcile_scroll(20, 2);
+    assert_eq!(state.input_scroll, 4);
+
+    state.cursor = 0;
+    state.reconcile_scroll(20, 2);
+    assert_eq!(state.input_scroll, 0);
+}

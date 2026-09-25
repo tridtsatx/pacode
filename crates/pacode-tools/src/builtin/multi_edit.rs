@@ -67,8 +67,9 @@ impl Tool for MultiEditTool {
         ToolKind::Edit
     }
 
-    /// Applies `edit::apply_replacement` sequentially in memory; one permission request
-    /// with the combined diff; atomic write; output lists replacements per edit.
+    /// Applies `edit::apply_replacement` sequentially in memory under the path's
+    /// write lock; one permission request with the combined diff; the write lands
+    /// atomically; output lists replacements per edit.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _accept_large_output) = parse_input::<MultiEditInput>(input)?;
         if args.path.is_empty() {
@@ -78,16 +79,11 @@ impl Tool for MultiEditTool {
             return Err(ToolError::invalid("edits cannot be empty"));
         }
         let full_path = ctx.resolve(Path::new(&args.path));
-        let bytes = tokio::fs::read(&full_path).await?;
-        let check_len = bytes.len().min(8192);
-        if bytes[..check_len].contains(&0) {
-            return Err(ToolError::failed(format!(
-                "cannot edit binary file: {}",
-                args.path
-            )));
-        }
-        let original = String::from_utf8(bytes)
-            .map_err(|e| ToolError::failed(format!("file is not valid UTF-8: {e}")))?;
+        let _write_lock = crate::registry::acquire_path_write_lock(&full_path, &ctx.cancel).await?;
+        let original =
+            crate::registry::read_source_file(&full_path, crate::registry::MAX_SOURCE_FILE_BYTES)
+                .await
+                .map_err(|err| ToolError::failed(err.message("edit", &args.path)))?;
 
         let mut current = original.clone();
         let mut counts = Vec::with_capacity(args.edits.len());
@@ -130,12 +126,14 @@ impl Tool for MultiEditTool {
             format!("Edit {rel_path}")
         };
 
-        ctx.require_permission(perm_title, diff.clone(), None)
-            .await?;
+        let detail = crate::registry::cap_output_bytes(
+            diff.as_str(),
+            crate::registry::MAX_PERMISSION_DETAIL_BYTES,
+        )
+        .into_owned();
+        ctx.require_permission(perm_title, detail, None).await?;
 
-        let tmp_path = format!("{}.pacode-tmp", full_path.to_string_lossy());
-        tokio::fs::write(&tmp_path, current.as_bytes()).await?;
-        tokio::fs::rename(&tmp_path, &full_path).await?;
+        crate::registry::write_atomic(&full_path, current.as_bytes()).await?;
         crate::walk::invalidate_path(&full_path);
 
         let preview = preview_body(&diff);

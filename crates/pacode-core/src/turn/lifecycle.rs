@@ -1,12 +1,69 @@
 //! Turn spawning and error notification lifecycle helpers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use pacode_types::{AgentStatus, Event, Role, TurnId, TurnStop, Usage};
+use tokio::sync::OwnedMutexGuard;
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::CoreError;
 use crate::agent::Agent;
 use crate::session::Session;
+
+#[cfg(test)]
+struct LifecycleGate {
+    expected_agent: StdMutex<Option<String>>,
+    reached: Semaphore,
+    release: Semaphore,
+}
+
+#[cfg(test)]
+static LIFECYCLE_GATE: OnceLock<StdMutex<Option<Arc<LifecycleGate>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn install_lifecycle_gate(session: &Session, agent: &Agent) -> Arc<LifecycleGate> {
+    let gate = Arc::new(LifecycleGate {
+        expected_agent: StdMutex::new(Some(format!(
+            "{}:{}",
+            session.id.as_str(),
+            agent.id().as_str()
+        ))),
+        reached: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    *LIFECYCLE_GATE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
+    gate
+}
+
+#[cfg(test)]
+async fn wait_for_lifecycle_gate(session: &Session, agent: &Agent) {
+    let Some(gate) = LIFECYCLE_GATE.get().and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }) else {
+        return;
+    };
+    let expected = format!("{}:{}", session.id.as_str(), agent.id().as_str());
+    let matches = gate
+        .expected_agent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_deref()
+        .is_some_and(|expected_owner| expected_owner == expected);
+    if matches {
+        gate.reached.add_permits(1);
+        let _ = gate.release.acquire().await;
+    }
+}
 
 /// Handles turn interruption: lands the agent on a resting status (main:
 /// `Idle`; subagents: `Stopped` — they have no live state without a turn) and
@@ -156,6 +213,7 @@ fn report_turn_crash(
 /// parent gets an `Injection::AgentFinished` and the agent's history is persisted
 /// and dropped from memory (info + summary stay).
 pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
+    let generation = agent.turn_generation();
     // A stopped subagent stays stopped: `stop_agent` can land while a spawn is
     // still wiring up the token, and a fresh token would outrun the stop. Only
     // `Session::continue_agent` restarts one — it clears the request first.
@@ -181,24 +239,355 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
         return;
     }
 
-    // One turn at a time, claimed BEFORE the cancel token is installed: a
-    // racing `start_turn` must not clobber the running turn's token (the live
-    // turn would go invisible to `is_running` and uncancellable) nor run the
-    // post-block over the winner's state. The guard is owned by the supervisor
-    // task and held until the turn's token is cleared.
-    let Ok(turn_guard) = agent.turn_lock.clone().try_lock_owned() else {
+    if agent.stop_requested() {
+        return;
+    }
+    let Some(turn_guard) = try_claim_turn(&agent) else {
         return;
     };
+    start_claimed_turn(session, agent, turn_guard, generation, None);
+}
 
-    let cancel = CancellationToken::new();
-    *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
-    // A `stop_agent`/`close_session` landing between the check above and the
-    // token install would find nothing to cancel — the flag survives, so
-    // re-check and self-cancel: the turn unwinds through the Interrupted path.
+pub(crate) fn request_turn(session: Arc<Session>, agent: Arc<Agent>) {
     if agent.stop_requested() {
-        cancel.cancel();
+        return;
+    }
+    let generation = agent.turn_generation();
+    let Some(turn_guard) = try_claim_turn(&agent) else {
+        return;
+    };
+    if agent.turn_generation() != generation || agent.stop_requested() {
+        return;
     }
 
+    let queued = agent.injections.drain();
+    let mut seen = HashSet::new();
+    let mut admission = None;
+    let mut remaining = Vec::new();
+    let mut cancelled = Vec::new();
+    for item in queued {
+        match item {
+            crate::inject::Injection::UserSteer {
+                admission: Some(candidate),
+            } => {
+                if !seen.insert(candidate.clone()) {
+                    continue;
+                }
+                if agent.admission_is_cancelled(&candidate) {
+                    cancelled.push(candidate);
+                } else if admission.is_none() {
+                    admission = Some(candidate);
+                } else {
+                    remaining.push(crate::inject::Injection::UserSteer {
+                        admission: Some(candidate),
+                    });
+                }
+            }
+            item => remaining.push(item),
+        }
+    }
+
+    if agent.turn_generation() != generation || agent.stop_requested() {
+        let mut interrupted = cancelled;
+        if let Some(candidate) = admission {
+            interrupted.push(candidate);
+        }
+        let mut retry = Vec::new();
+        let keep_non_admissions = !agent.stop_requested();
+        for item in remaining {
+            match item {
+                crate::inject::Injection::UserSteer {
+                    admission: Some(candidate),
+                } => interrupted.push(candidate),
+                item if keep_non_admissions => retry.push(item),
+                _ => {}
+            }
+        }
+        tokio::spawn(async move {
+            session
+                .mark_admissions_terminal(interrupted, "interrupted")
+                .await;
+            agent.injections.restore(retry);
+            drop(turn_guard);
+            session.emit_session_status();
+        });
+        return;
+    }
+
+    agent.injections.restore(remaining);
+    if admission.is_none() && agent.injections.is_empty() {
+        if !cancelled.is_empty() {
+            tokio::spawn(async move {
+                session
+                    .mark_admissions_terminal(cancelled, "interrupted")
+                    .await;
+                drop(turn_guard);
+                session.emit_session_status();
+            });
+        }
+        return;
+    }
+    spawn_mark_admissions_terminal(&session, cancelled, "interrupted");
+    start_claimed_turn(session, agent, turn_guard, generation, admission);
+}
+
+pub(crate) async fn start_turn_or_steer(
+    session: Arc<Session>,
+    agent: Arc<Agent>,
+    admission: Option<&str>,
+) -> Result<(), crate::CoreError> {
+    if let Some(admission) = admission
+        && agent.admission_is_cancelled(admission)
+    {
+        session
+            .mark_admissions_terminal([admission.to_owned()], "interrupted")
+            .await;
+        return Ok(());
+    }
+    if agent.stop_requested() {
+        if let Some(admission) = admission {
+            session
+                .mark_admissions_terminal([admission.to_owned()], "interrupted")
+                .await;
+        }
+        return Ok(());
+    }
+    let generation = agent.turn_generation();
+    if let Some(turn_guard) = try_claim_turn(&agent) {
+        if agent.turn_generation() != generation
+            || agent.stop_requested()
+            || admission.is_some_and(|id| agent.admission_is_cancelled(id))
+        {
+            if let Some(admission) = admission {
+                session
+                    .mark_admissions_terminal([admission.to_owned()], "interrupted")
+                    .await;
+            }
+            return Ok(());
+        }
+        start_claimed_turn(
+            session,
+            agent,
+            turn_guard,
+            generation,
+            admission.map(str::to_owned),
+        );
+        return Ok(());
+    }
+
+    if agent.turn_generation() == generation
+        && !agent.stop_requested()
+        && !admission.is_some_and(|id| agent.admission_is_cancelled(id))
+    {
+        agent.injections.push(crate::inject::Injection::UserSteer {
+            admission: admission.map(str::to_owned),
+        });
+    } else if let Some(admission) = admission {
+        session
+            .mark_admissions_terminal([admission.to_owned()], "interrupted")
+            .await;
+    }
+    Ok(())
+}
+
+fn try_claim_turn(agent: &Agent) -> Option<OwnedMutexGuard<()>> {
+    agent.turn_lock.clone().try_lock_owned().ok()
+}
+
+async fn claim_admission_for_turn(
+    session: &Session,
+    agent: &Agent,
+    admission: &str,
+) -> Result<Option<pacode_store::MessageAdmission>, pacode_store::StoreError> {
+    let Some(record) = session
+        .store
+        .get_message_admission(&session.id, admission)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let turn_id = TurnId::new(format!("trn_{admission}"));
+    if record.agent != agent.id() {
+        return Ok(None);
+    }
+    if record
+        .turn_id
+        .as_ref()
+        .is_some_and(|persisted| persisted != &turn_id)
+    {
+        log::warn!(
+            "admission {admission} of session {} is recorded under turn {:?} instead of {turn_id}: leaving it unclaimed",
+            session.id,
+            record.turn_id
+        );
+        return Ok(None);
+    }
+    match record.state {
+        pacode_store::MessageAdmissionState::Admitted => {
+            if !session
+                .store
+                .mark_message_admission_running(&session.id, admission, turn_id.as_str())
+                .await?
+            {
+                return Ok(None);
+            }
+            Ok(Some(record))
+        }
+        pacode_store::MessageAdmissionState::Running => Ok(Some(record)),
+        pacode_store::MessageAdmissionState::Terminal => Ok(None),
+    }
+}
+
+async fn restore_admission_message(
+    session: &Session,
+    agent: &Agent,
+    admission: &pacode_store::MessageAdmission,
+) -> Result<(), CoreError> {
+    let Some(seq) = admission.message_seq else {
+        return Ok(());
+    };
+    if agent
+        .history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .message_seqs
+        .contains(&seq)
+    {
+        return Ok(());
+    }
+    if let Some(message) = session.load_message_row(&admission.agent, seq).await? {
+        agent
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .restore_row(seq, message);
+    }
+    Ok(())
+}
+
+fn terminal_stop(stop: &TurnStop) -> &'static str {
+    match stop {
+        TurnStop::Completed => "completed",
+        TurnStop::Interrupted => "interrupted",
+        TurnStop::Failed { .. } => "failed",
+    }
+}
+
+/// A cancel fence outranks whatever the turn reported: the store keeps the
+/// first terminal write, so finalizing a fenced admission as `completed` would
+/// lock in the opposite of what the interrupt asked for.
+fn persisted_terminal_stop(fenced: bool, stop: &TurnStop) -> &'static str {
+    if fenced {
+        "interrupted"
+    } else {
+        terminal_stop(stop)
+    }
+}
+
+fn spawn_mark_admissions_terminal(
+    session: &Session,
+    admissions: Vec<String>,
+    terminal_stop: &'static str,
+) {
+    if admissions.is_empty() {
+        return;
+    }
+    let store = session.store.clone();
+    let session_id = session.id.clone();
+    tokio::spawn(async move {
+        for admission in admissions {
+            let _ = store
+                .mark_message_admission_terminal(&session_id, &admission, Some(terminal_stop))
+                .await;
+        }
+    });
+}
+
+fn remove_user_admission(agent: &Agent, admission: &str) {
+    let remaining = agent
+        .injections
+        .drain()
+        .into_iter()
+        .filter(|item| {
+            !matches!(
+                item,
+                crate::inject::Injection::UserSteer {
+                    admission: Some(candidate)
+                } if candidate.as_str() == admission
+            )
+        })
+        .collect::<Vec<_>>();
+    agent.injections.restore(remaining);
+}
+
+/// Keep an admission this turn could not claim: back onto the head of the
+/// recovery queue, plus a steer so an idle agent is woken instead of leaving
+/// the message parked until the next resume. A stop or a newer turn owns the
+/// agent now, and both drain the recovery queue on their own. The wake follows
+/// the queue insertion, so a store that keeps refusing the claim retries once
+/// and then waits — a steer per attempt would spin turns against a dead store.
+fn park_admission_for_recovery(
+    session: &Session,
+    agent: &Arc<Agent>,
+    generation: u64,
+    admission: &str,
+) {
+    if agent.stop_requested() || agent.turn_generation() != generation {
+        return;
+    }
+    if !session.queue_recovery_admission_first(&agent.id(), admission.to_owned()) {
+        return;
+    }
+    agent.injections.push(crate::inject::Injection::UserSteer {
+        admission: Some(admission.to_owned()),
+    });
+}
+
+/// Shared exit for a turn that never reached `run_turn`: release the turn, and
+/// start the next one when this turn left work behind.
+async fn unwind_unclaimed_turn(
+    session: Arc<Session>,
+    agent: Arc<Agent>,
+    turn_guard: OwnedMutexGuard<()>,
+) {
+    *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    let redrive = !agent.injections.is_empty() && !agent.stop_requested();
+    if !redrive {
+        *agent
+            .history_before_turn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+    drop(turn_guard);
+    session.emit_session_status();
+    if redrive {
+        request_turn(session.clone(), agent.clone());
+    }
+}
+
+fn start_claimed_turn(
+    session: Arc<Session>,
+    agent: Arc<Agent>,
+    turn_guard: OwnedMutexGuard<()>,
+    generation: u64,
+    admission: Option<String>,
+) {
+    debug_assert!(agent.turn_lock.try_lock().is_err());
+
+    let turn_id = admission
+        .as_ref()
+        .map(|admission| TurnId::new(format!("trn_{admission}")))
+        .unwrap_or_else(TurnId::generate);
+    let cancel = CancellationToken::new();
+    *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
+    if agent.turn_generation() != generation
+        || agent.stop_requested()
+        || admission
+            .as_deref()
+            .is_some_and(|admission| agent.admission_is_cancelled(admission))
+    {
+        cancel.cancel();
+    }
     if agent.id().is_main() {
         let mut hbt = agent
             .history_before_turn
@@ -215,31 +604,168 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
         }
     }
 
-    let turn_id = TurnId::generate();
-    let spawned_at = std::time::Instant::now();
-
-    // The turn runs on its own task; the outer task supervises: a panic or
-    // abort inside `run_turn` lands here as a `JoinError` instead of silently
-    // orphaning the agent — `cancel` stuck set, `is_running()` true forever,
-    // no `TurnEnded`, no report to the parent.
-    let turn_task = tokio::spawn({
-        let session = session.clone();
-        let agent = agent.clone();
-        let turn_id = turn_id.clone();
-        async move { super::run_turn(session, agent, cancel, turn_id).await }
-    });
-
     tokio::spawn(async move {
-        let (stop, usage) = match turn_task.await {
-            Ok((stop, usage)) => (stop, Some(usage)),
-            Err(err) => (report_turn_crash(&session, &agent, &err), None),
+        if admission.is_none() {
+            match session
+                .store
+                .max_message_seq(&session.id, &agent.id())
+                .await
+            {
+                Ok(Some(max_seq)) => {
+                    let mut history = agent.history.lock().unwrap_or_else(|p| p.into_inner());
+                    history.next_seq = history.next_seq.max(max_seq.saturating_add(1));
+                }
+                Ok(None) => {}
+                Err(error) => log::warn!(
+                    "failed to synchronize history sequence for session={} agent={}: {error}",
+                    session.id,
+                    agent.id()
+                ),
+            }
+        }
+        if let Some(admission) = admission.as_deref() {
+            let record = match claim_admission_for_turn(&session, &agent, admission).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    let _ = super::hide_other_admission_messages(&session, &agent, None).await;
+                    unwind_unclaimed_turn(session, agent, turn_guard).await;
+                    return;
+                }
+                Err(error) => {
+                    park_admission_for_recovery(&session, &agent, generation, admission);
+                    log::warn!("failed to claim admission {admission}: {error}");
+                    unwind_unclaimed_turn(session, agent, turn_guard).await;
+                    return;
+                }
+            };
+            agent.commit_pending_user_messages();
+            if let Err(error) = restore_admission_message(&session, &agent, &record).await {
+                park_admission_for_recovery(&session, &agent, generation, admission);
+                log::warn!("failed to restore admission {admission}: {error}");
+                unwind_unclaimed_turn(session, agent, turn_guard).await;
+                return;
+            }
+        }
+
+        if cancel.is_cancelled()
+            || agent.turn_generation() != generation
+            || agent.stop_requested()
+            || admission
+                .as_deref()
+                .is_some_and(|admission| agent.admission_is_cancelled(admission))
+        {
+            cancel.cancel();
+        }
+
+        if let Some(admission) = &admission {
+            let _ = agent.begin_admission_turn(admission.clone(), turn_id.clone());
+        }
+        agent.set_current_turn(&turn_id);
+        let spawned_at = std::time::Instant::now();
+        agent.reset_turn_usage();
+
+        // The turn runs on its own task; the outer task supervises: a panic or
+        // abort inside `run_turn` lands here as a `JoinError` instead of silently
+        // orphaning the agent — `cancel` stuck set, `is_running()` true forever,
+        // no `TurnEnded`, no report to the parent.
+        let turn_task = tokio::spawn({
+            let session = session.clone();
+            let agent = agent.clone();
+            let turn_id = turn_id.clone();
+            let admission = admission.clone();
+            async move { super::run_turn(session, agent, cancel, turn_id, admission).await }
+        });
+
+        let (stop, returned_usage, crashed) = match turn_task.await {
+            Ok((stop, usage)) => (stop, Some(usage), false),
+            Err(err) => (report_turn_crash(&session, &agent, &err), None, true),
         };
+        let usage = {
+            let recorded = agent.take_turn_usage();
+            if recorded.is_empty() {
+                returned_usage
+            } else {
+                Some(recorded)
+            }
+        };
+        let completed_admission = agent.finish_admission_turn(&turn_id, &stop);
+        if let Some(admission) = completed_admission {
+            if admission.terminal || agent.stop_requested() {
+                let fenced = agent.admission_is_cancelled(&admission.message_id);
+                if let Err(error) = session
+                    .store
+                    .mark_message_admission_terminal(
+                        &session.id,
+                        &admission.message_id,
+                        Some(persisted_terminal_stop(fenced, &stop)),
+                    )
+                    .await
+                {
+                    log::warn!(
+                        "failed to persist admission {}: {error}",
+                        admission.message_id
+                    );
+                }
+            } else {
+                agent
+                    .injections
+                    .restore(vec![crate::inject::Injection::UserSteer {
+                        admission: Some(admission.message_id),
+                    }]);
+                if crashed {
+                    agent.clear_admission_turn(&turn_id);
+                }
+            }
+        } else if let Some(admission) = admission {
+            if agent.stop_requested() || agent.admission_is_cancelled(&admission) {
+                if let Err(error) = session
+                    .store
+                    .mark_message_admission_terminal(&session.id, &admission, Some("interrupted"))
+                    .await
+                {
+                    log::warn!("failed to persist admission {admission}: {error}");
+                }
+            } else if crashed {
+                agent
+                    .injections
+                    .restore(vec![crate::inject::Injection::UserSteer {
+                        admission: Some(admission.clone()),
+                    }]);
+            } else if let Err(error) = session
+                .store
+                .mark_message_admission_terminal(&session.id, &admission, Some("failed"))
+                .await
+            {
+                log::warn!("failed to persist admission {admission}: {error}");
+            }
+        }
+        agent.set_terminal_turn(&turn_id, &stop);
 
         // A turn that died mid-dispatch (panic/abort) can leave the persisted
         // assistant `tool_use`s unanswered — the next request would 400 on
         // every provider (`tool_use ids found without tool_result`). Stub them
         // before anyone observes the ended turn; an intact tail is a no-op.
         crate::turn::tools::stub_dangling_tool_calls(&session, &agent).await;
+
+        if let Some(usage) = usage {
+            let context_tokens = agent
+                .history
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .estimated_tokens;
+            let turn_number = session
+                .usage
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .turns
+                .saturating_add(1);
+            if let Err(error) = session
+                .record_usage(&agent.id(), &turn_id, turn_number, usage, context_tokens)
+                .await
+            {
+                log::warn!("failed to persist turn usage: {error}");
+            }
+        }
 
         // Always cleared, whatever happened above — this is what was missing
         // when a panic left `cancel` set and the UI stuck on "running".
@@ -250,28 +776,37 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
             .unwrap_or_else(|p| p.into_inner()) = None;
         *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
-        // `TurnEnded` goes out only after the token is cleared, and while the
-        // guard is still held (`is_running` still true): a client reacting to
-        // it can never observe a turn-ended-but-still-running gap, and a fresh
-        // `start_turn` cannot emit `TurnStarted` ahead of this `TurnEnded`.
-        emit_turn_end(&session, &agent, &turn_id, spawned_at, usage, &stop).await;
-        drop(turn_guard);
-        // Now that the guard is gone the badge reads `Done` (or `Working` when
-        // another agent still runs; a queued injection re-drive flips it right
-        // back via that turn's `TurnStarted`).
-        session.emit_session_status();
-
-        // An injection that landed between the last drain and the end of the turn
-        // would otherwise wait for the next user message: run another turn for it.
-        // The stop reason does not matter — a prompt arriving while Ctrl+C or a
-        // provider failure unwound the turn is queued exactly the same way and
-        // must not be orphaned. `stop_requested` (stop_agent / interrupt_all /
-        // close_session) still wins. Bounded: each re-drive needs a queued
-        // injection, so nothing loops without new input.
-        if agent.id().is_main() && !agent.stop_requested() && !agent.injections.is_empty() {
-            start_turn(session.clone(), agent.clone());
-            return;
+        let recovery_generation = agent.turn_generation();
+        let mut recovery_admission = if agent.stop_requested() {
+            None
+        } else {
+            session.take_recovery_admission(&agent.id())
+        };
+        if let Some(admission) = recovery_admission.take() {
+            agent
+                .injections
+                .restore(vec![crate::inject::Injection::UserSteer {
+                    admission: Some(admission.clone()),
+                }]);
+            #[cfg(test)]
+            wait_for_lifecycle_gate(&session, &agent).await;
+            if agent.stop_requested() || agent.turn_generation() != recovery_generation {
+                remove_user_admission(&agent, &admission);
+                if let Err(error) = session
+                    .store
+                    .mark_message_admission_terminal(&session.id, &admission, Some("interrupted"))
+                    .await
+                {
+                    log::warn!("failed to persist admission {admission}: {error}");
+                }
+            } else {
+                recovery_admission = Some(admission);
+            }
         }
+        let has_recovery = recovery_admission.is_some();
+        let should_redrive = !agent.stop_requested()
+            && !agent.injections.is_empty()
+            && (agent.id().is_main() || has_recovery || agent.injections.has_user_admission());
 
         // A stopped subagent keeps `Stopped` and its history so `continue` can
         // re-drive it later. No report is injected into the parent: it learned
@@ -284,6 +819,7 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
         if !agent.id().is_main()
             && !matches!(stop, TurnStop::Interrupted)
             && !agent.stop_requested()
+            && !should_redrive
         {
             // What lands on the agent card and what the parent is told come
             // from this one block: `Completed` earns the last assistant text
@@ -345,15 +881,29 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
                         agent: info,
                         answer: capped_answer,
                     });
-                if parent.id().is_main() && !parent.is_running() {
-                    start_turn(session.clone(), parent);
+                if parent.id().is_main() {
+                    request_turn(session.clone(), parent);
                 }
             }
 
             {
                 let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
-                hist.messages.clear();
+                hist.clear();
             }
+            #[cfg(test)]
+            wait_for_lifecycle_gate(&session, &agent).await;
+        }
+
+        emit_turn_end(&session, &agent, &turn_id, spawned_at, usage, &stop).await;
+        drop(turn_guard);
+        session.emit_session_status();
+
+        if should_redrive {
+            request_turn(session.clone(), agent.clone());
         }
     });
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

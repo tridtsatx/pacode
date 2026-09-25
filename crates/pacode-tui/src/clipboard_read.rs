@@ -325,21 +325,25 @@ impl PastedImages {
             ));
         }
 
-        std::fs::create_dir_all(&self.temp_dir)?;
-
-        // Enforce maximum file count and total byte cap by pruning oldest unsubmitted files.
         while self.records.len() >= PASTED_IMAGES_MAX_COUNT
-            || self.total_bytes() + bytes.len() > PASTED_IMAGES_MAX_TOTAL_BYTES
+            || self.total_bytes().saturating_add(bytes.len()) > PASTED_IMAGES_MAX_TOTAL_BYTES
         {
-            if let Some(pos) = self.records.iter().position(|r| !r.submitted) {
-                let removed = self.records.remove(pos);
-                let _ = std::fs::remove_file(&removed.path);
-            } else {
-                break;
-            }
+            let Some(pos) = self.records.iter().position(|record| !record.submitted) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "pasted image storage cap reached ({} files, {} bytes; submitted images are retained)",
+                        self.records.len(),
+                        self.total_bytes()
+                    ),
+                ));
+            };
+            let removed = self.records.remove(pos);
+            let _ = std::fs::remove_file(&removed.path);
         }
 
-        self.counter += 1;
+        std::fs::create_dir_all(&self.temp_dir)?;
+        self.counter = self.counter.wrapping_add(1);
         let file_name = format!("paste_{}_{}.png", now_ms(), self.counter);
         let file_path = self.temp_dir.join(file_name);
 
@@ -380,7 +384,9 @@ impl PastedImages {
     }
 
     fn total_bytes(&self) -> usize {
-        self.records.iter().map(|r| r.bytes_len).sum()
+        self.records.iter().fold(0usize, |total, record| {
+            total.saturating_add(record.bytes_len)
+        })
     }
 }
 

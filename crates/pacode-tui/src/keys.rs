@@ -4,12 +4,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use pacode_types::state::PermissionDecision;
-use pacode_types::{PermissionRequest, Request, TranscriptKind};
+use pacode_types::{AgentId, PermissionRequest, Request, TranscriptKind};
 
 use crate::binding::Action as KeyAction;
 use crate::commands;
 use crate::state::transcript::{CellKind, PermExplain};
-use crate::state::{AppState, Focus, Overlay, PanelTarget, PendingCopy};
+use crate::state::{AppState, Focus, Overlay, PanelTarget, PendingCopy, PromptBatch};
+use crate::ui::popup::{AcceptedCompletion, PopupId};
 
 #[cfg(test)]
 #[path = "keys_tests.rs"]
@@ -19,6 +20,15 @@ mod keys_tests;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Send(Request),
+    SendSequence {
+        requests: Vec<Request>,
+    },
+    ContinuePromptBatch {
+        id: u64,
+    },
+    SwitchSession {
+        attach: pacode_types::Attach,
+    },
     /// Ask the daemon for the panel's content (agent transcript or task output).
     LoadPanel,
     /// Ask for an older history page for the dialog.
@@ -219,67 +229,37 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return toggle_zdr(state);
     }
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
-        // First check @ completion — read the scan the draw path ordered and
-        // the event loop ran on a blocking thread (§8.1).
-        let byte_cursor =
-            crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
-        if !state.input.at_closed
-            && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
+        if let Some(popup) = crate::ui::popup::resolve_current(state)
+            && let Some(accepted) = popup.accepted()
         {
-            let candidates = at_candidates(state, &q.query, byte_cursor);
-            if !candidates.is_empty() {
-                let sel = state.input.at_index % candidates.len();
-                let cand = candidates[sel].clone();
-                let prefix = state.input.text[..q.at_byte_index].to_string();
-                let suffix = state.input.text[byte_cursor..].to_string();
-                let insert = format!("@{}", cand.path);
-                let new_cursor = prefix.chars().count() + insert.chars().count();
-                state.input.text = format!("{prefix}{insert}{suffix}");
-                state.input.cursor = new_cursor;
-                state.input.vert_goal = None;
-                if cand.is_dir {
-                    state.input.at_closed = false;
-                    state.input.at_index = 0;
-                } else {
-                    state.input.insert_char(' ');
-                    state.input.at_closed = true;
-                }
-                return vec![];
-            }
-        }
-
-        // Second check bash mode Tab completion
-        if state.input.text.starts_with('!') {
-            let candidates = bash_candidates(state);
-            if !candidates.is_empty() {
-                let sel = state.input.bash_complete_index % candidates.len();
-                let cand = &candidates[sel];
-                state.input.text = format!("!{}", cand.replacement);
-                state.input.cursor = state.input.text.chars().count();
-                state.input.vert_goal = None;
-                return vec![];
-            }
-        }
-
-        if complete_slash_command(state) {
-            return vec![];
+            accept_completion(state, accepted);
         }
         return vec![];
     }
 
     // 4. Escape: peel layers one by one
     if action == Some(KeyAction::Cancel) {
-        if !state.input.at_closed {
-            let byte_cursor =
-                crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
-            if pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor).is_some() {
-                state.input.at_closed = true;
-                return vec![];
+        if let Some(popup) = crate::ui::popup::resolve_current(state) {
+            match popup.id() {
+                PopupId::At => {
+                    state.input.at_closed = true;
+                    return vec![];
+                }
+                PopupId::Bash => {
+                    state.input.bash_complete_closed = true;
+                    return vec![];
+                }
+                PopupId::Slash
+                | PopupId::PromptQueue
+                | PopupId::Menu
+                | PopupId::ModelPicker
+                | PopupId::EffortPicker
+                | PopupId::ModePicker
+                | PopupId::QuestionPicker
+                | PopupId::ThemePicker
+                | PopupId::LoginPicker
+                | PopupId::RailOverlay => {}
             }
-        }
-        if state.input.text.starts_with('!') && !state.input.bash_complete_closed {
-            state.input.bash_complete_closed = true;
-            return vec![];
         }
         if state.config.ui.vim && state.focus == Focus::Normal {
             // Handled by vim::handle on the normal prompt
@@ -341,7 +321,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     // (spec §8), so this overlay is the only way to reach the plan and the agent
     // list there; above that width it is a shortcut to the same content.
     if action == Some(KeyAction::RailOverlay) {
-        state.focus = Focus::Overlay(Overlay::RailOverlay);
+        open_rail_overlay(state);
         state.dirty = true;
         return vec![];
     }
@@ -351,7 +331,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     // so agent navigation opens the overlay that holds it instead.
     if action == Some(KeyAction::NextAgent) {
         if rail_is_hidden(state) {
-            state.focus = Focus::Overlay(Overlay::RailOverlay);
+            open_rail_overlay(state);
             state.dirty = true;
             return vec![];
         }
@@ -359,7 +339,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
     if action == Some(KeyAction::PrevAgent) {
         if rail_is_hidden(state) {
-            state.focus = Focus::Overlay(Overlay::RailOverlay);
+            open_rail_overlay(state);
             state.dirty = true;
             return vec![];
         }
@@ -428,14 +408,14 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 8.5 Vim mode handling on normal prompt
     if state.config.ui.vim && state.focus == Focus::Normal {
-        match crate::state::vim::handle(&mut state.vim, &mut state.input, key) {
+        match crate::state::vim::handle(&mut state.session.vim, &mut state.session.input, key) {
             crate::state::vim::VimEffect::Consumed => {
                 // Vim moves/edits write `input.cursor` directly, bypassing
                 // the InputState methods that reset the sticky goal column.
                 state.input.vert_goal = None;
                 return vec![];
             }
-            crate::state::vim::VimEffect::Submit => return submit_prompt(state),
+            crate::state::vim::VimEffect::Submit => return submit_prompt(state, now),
             crate::state::vim::VimEffect::PassThrough => {}
         }
     }
@@ -481,24 +461,33 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
     if action == Some(KeyAction::SubmitNow) {
+        if state.turn_boundary_pending || state.user_msgs_in_flight > 0 {
+            if state.input.is_empty() {
+                return vec![];
+            }
+            return queue_prompt(state, now);
+        }
         if state.input.is_empty() {
-            return vec![];
+            return submit_prompt(state, now);
         }
         if !state.turn_active {
-            return submit_prompt(state);
+            return submit_prompt(state, now);
         }
         // Push the running turn out to a background agent first, so it keeps
         // working on its own transcript, then start the new message on the main
         // agent that takes its place. Nothing in flight is discarded.
         let text = state.input.take();
         state.pasted_images.mark_submitted(&text);
-        return vec![
-            Action::Send(Request::DetachTurn),
-            Action::Send(Request::UserMessage {
-                text,
-                images: Vec::new(),
-            }),
-        ];
+        return vec![Action::SendSequence {
+            requests: vec![
+                Request::DetachTurn,
+                Request::UserMessage {
+                    text,
+                    images: Vec::new(),
+                    message_id: None,
+                },
+            ],
+        }];
     }
 
     // 10. Enter key
@@ -508,68 +497,42 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
 
     if action == Some(KeyAction::Submit) {
-        let byte_cursor =
-            crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
-        if !state.input.at_closed
-            && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
-        {
-            let candidates = at_candidates(state, &q.query, byte_cursor);
-            if !candidates.is_empty() {
-                let sel = state.input.at_index % candidates.len();
-                let cand = candidates[sel].clone();
-                let prefix = state.input.text[..q.at_byte_index].to_string();
-                let suffix = state.input.text[byte_cursor..].to_string();
-                let insert = format!("@{}", cand.path);
-                let new_cursor = prefix.chars().count() + insert.chars().count();
-                state.input.text = format!("{prefix}{insert}{suffix}");
-                state.input.cursor = new_cursor;
-                state.input.vert_goal = None;
-                if cand.is_dir {
-                    state.input.at_closed = false;
-                    state.input.at_index = 0;
-                } else {
-                    state.input.insert_char(' ');
-                    state.input.at_closed = true;
-                }
+        if let Some(popup) = crate::ui::popup::resolve_current(state) {
+            if popup.id() == PopupId::At
+                && let Some(accepted) = popup.accepted()
+            {
+                accept_completion(state, accepted);
                 return vec![];
             }
-        }
-
-        if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-            let query = &state.input.text[1..];
-            let is_complete = commands::find_command(query).is_some();
-            if !is_complete {
-                let matches = commands::matching(query);
-                if !matches.is_empty() {
-                    complete_slash_command(state);
+            if popup.id() == PopupId::Slash {
+                let query = state.input.text.strip_prefix('/').unwrap_or("");
+                if commands::find_command(query).is_none()
+                    && let Some(accepted) = popup.accepted()
+                {
+                    accept_completion(state, accepted);
                     return vec![];
                 }
             }
         }
 
         if !state.input.is_empty() {
-            if state.turn_active {
-                if state.input.queue_is_full() {
-                    state.push_toast(
-                        pacode_types::ToastLevel::Warn,
-                        "Prompt queue full".to_string(),
-                        Some(format!(
-                            "Maximum {} prompts queued",
-                            crate::state::input::PROMPT_QUEUE_CAP
-                        )),
-                        now,
-                    );
-                    return vec![];
-                }
-                let text = state.input.take();
-                state.pasted_images.mark_submitted(&text);
-                state.input.queue_push(text);
-                return vec![];
+            if state.turn_active || state.turn_boundary_pending || state.user_msgs_in_flight > 0 {
+                return queue_prompt(state, now);
             }
-            return submit_prompt(state);
+            return submit_prompt(state, now);
         }
 
         if !state.turn_active
+            && !state.turn_boundary_pending
+            && state.user_msgs_in_flight == 0
+            && state.has_retry_request()
+        {
+            return submit_prompt(state, now);
+        }
+
+        if !state.turn_active
+            && !state.turn_boundary_pending
+            && state.user_msgs_in_flight == 0
             && !state.input.prompt_queue.is_empty()
             && let Some(req) = state.drain_prompt_queue()
         {
@@ -637,7 +600,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             | Focus::Overlay(
                 Overlay::ModePicker { .. }
                 | Overlay::QuestionPicker
-                | Overlay::RailOverlay
+                | Overlay::RailOverlay { .. }
                 | Overlay::ThemePicker { .. }
                 | Overlay::LoginPicker { .. }
                 // Unreachable — an open menu intercepts Enter earlier — but
@@ -692,83 +655,40 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
 
     // 11. Up / Down arrows for history / slash popup / @ popup / bash completion
     if key.code == KeyCode::Up {
-        let byte_cursor =
-            crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
-        if !state.input.at_closed
-            && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
-        {
-            let candidates = at_candidates(state, &q.query, byte_cursor);
-            if !candidates.is_empty() {
-                let n = candidates.len();
-                state.input.at_index = (state.input.at_index + n - 1) % n;
-                return vec![];
-            }
+        if move_popup_selection(state, -1) {
+            return vec![];
         }
         if state.input.text.starts_with('!') {
-            let candidates = bash_candidates(state);
-            if !state.input.bash_complete_closed && !candidates.is_empty() {
-                let n = candidates.len();
-                state.input.bash_complete_index = (state.input.bash_complete_index + n - 1) % n;
-                return vec![];
-            }
             state.input.bash_history_up();
             return vec![];
         }
-        if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-            let matches = commands::matching(&state.input.text[1..]);
-            if !matches.is_empty() {
-                let n = matches.len();
-                state.input.slash_index = (state.input.slash_index + n - 1) % n;
-            }
-        } else if state.input.is_empty() || state.input.history_index.is_some() {
-            state.input.history_up();
-        } else {
-            // Multi-line prompt: Up walks wrapped visual lines (readline
-            // style); already on the first line falls back to history —
-            // `history_up` stashes the text in `draft` for Down to restore.
-            let (input_w, _) = input_view_size(state);
-            if !state.input.move_up(input_w) {
+        if !(state.input.text.starts_with('/') && !state.input.text.contains(' ')) {
+            if state.input.is_empty() || state.input.history_index.is_some() {
                 state.input.history_up();
+            } else {
+                let (input_w, _) = input_view_size(state);
+                if !state.input.move_up(input_w) {
+                    state.input.history_up();
+                }
             }
         }
         return vec![];
     }
     if key.code == KeyCode::Down {
-        let byte_cursor =
-            crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
-        if !state.input.at_closed
-            && let Some(q) = pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
-        {
-            let candidates = at_candidates(state, &q.query, byte_cursor);
-            if !candidates.is_empty() {
-                let n = candidates.len();
-                state.input.at_index = (state.input.at_index + 1) % n;
-                return vec![];
-            }
+        if move_popup_selection(state, 1) {
+            return vec![];
         }
         if state.input.text.starts_with('!') {
-            let candidates = bash_candidates(state);
-            if !state.input.bash_complete_closed && !candidates.is_empty() {
-                let n = candidates.len();
-                state.input.bash_complete_index = (state.input.bash_complete_index + 1) % n;
-                return vec![];
-            }
             state.input.bash_history_down();
             return vec![];
         }
-        if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-            let matches = commands::matching(&state.input.text[1..]);
-            if !matches.is_empty() {
-                let n = matches.len();
-                state.input.slash_index = (state.input.slash_index + 1) % n;
+        if !(state.input.text.starts_with('/') && !state.input.text.contains(' ')) {
+            if state.input.history_index.is_some() {
+                state.input.history_down();
+            } else if !state.input.is_empty() {
+                let (input_w, _) = input_view_size(state);
+                state.input.move_down(input_w);
             }
-        } else if state.input.history_index.is_some() {
-            state.input.history_down();
-        } else if !state.input.is_empty() {
-            // Multi-line prompt: Down walks wrapped visual lines; a single
-            // line or the last line is a no-op.
-            let (input_w, _) = input_view_size(state);
-            state.input.move_down(input_w);
         }
         return vec![];
     }
@@ -847,89 +767,141 @@ fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
     }
 }
 
-/// `@` candidates for the exact current popup context, cloned out of the
-/// scan cache (≤ `MAX_AT_CANDIDATES` small rows, once per keypress). Empty
-/// while the scan the draw path ordered is still running on a blocking
-/// thread — §8.1: the filesystem walk never happens in a key handler.
-fn at_candidates(
-    state: &AppState,
-    query: &str,
-    byte_cursor: usize,
-) -> Vec<crate::at_complete::AtCandidate> {
-    let key = crate::state::input::AtKey {
-        query: query.to_string(),
-        cursor_byte: byte_cursor,
-        cwd: state.cwd(),
+fn move_popup_selection(state: &mut AppState, delta: i32) -> bool {
+    let Some((id, total)) =
+        crate::ui::popup::resolve_current(state).map(|popup| (popup.id(), popup.window().total))
+    else {
+        return false;
     };
-    state
-        .input
-        .at_comp
-        .candidates_for(&key)
-        .map(<[crate::at_complete::AtCandidate]>::to_vec)
-        .unwrap_or_default()
+    if total == 0 {
+        return false;
+    }
+    let current = match id {
+        PopupId::At => state.input.at_index % total,
+        PopupId::Bash => state.input.bash_complete_index % total,
+        PopupId::Slash => state.input.slash_index % total,
+        PopupId::PromptQueue
+        | PopupId::Menu
+        | PopupId::ModelPicker
+        | PopupId::EffortPicker
+        | PopupId::ModePicker
+        | PopupId::QuestionPicker
+        | PopupId::ThemePicker
+        | PopupId::LoginPicker
+        | PopupId::RailOverlay => return false,
+    };
+    let next = if delta < 0 {
+        (current + total - 1) % total
+    } else {
+        (current + 1) % total
+    };
+    match id {
+        PopupId::At => state.input.at_index = next,
+        PopupId::Bash => state.input.bash_complete_index = next,
+        PopupId::Slash => state.input.slash_index = next,
+        _ => {}
+    }
+    true
 }
 
-/// `!` candidates for the exact current input/cursor/history context —
-/// same deferred-scan contract as [`at_candidates`]. Callers must only
-/// invoke it when `state.input.text` starts with `!`.
-fn bash_candidates(state: &AppState) -> Vec<crate::bash::complete::Candidate> {
-    let key = crate::state::input::BashKey {
-        text: state.input.text[1..].to_string(),
-        cursor: state.input.cursor.saturating_sub(1),
-        cwd: state.cwd(),
-        history_len: state.input.bash_history.len(),
-    };
-    state
-        .input
-        .bash_comp
-        .candidates_for(&key)
-        .map(<[crate::bash::complete::Candidate]>::to_vec)
-        .unwrap_or_default()
-}
-
-fn complete_slash_command(state: &mut AppState) -> bool {
-    if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-        let query = &state.input.text[1..];
-        let matches = commands::matching(query);
-        if !matches.is_empty() {
-            let selected = state.input.slash_index % matches.len();
-            let cmd = &matches[selected];
-            let name = &cmd.name;
+fn accept_completion(state: &mut AppState, accepted: AcceptedCompletion) {
+    match accepted {
+        AcceptedCompletion::At {
+            at_byte_index,
+            cursor_byte,
+            candidate,
+        } => {
+            let prefix = state.input.text[..at_byte_index].to_string();
+            let suffix = state.input.text[cursor_byte..].to_string();
+            let insert = format!("@{}", candidate.path);
+            state.input.text = format!("{prefix}{insert}{suffix}");
+            state.input.cursor = prefix.chars().count() + insert.chars().count();
+            state.input.vert_goal = None;
+            if candidate.is_dir {
+                state.input.at_closed = false;
+                state.input.at_index = 0;
+            } else {
+                state.input.insert_char(' ');
+                state.input.at_closed = true;
+            }
+        }
+        AcceptedCompletion::Bash { replacement } => {
+            state.input.text = format!("!{replacement}");
+            state.input.cursor = state.input.text.chars().count();
+            state.input.vert_goal = None;
+        }
+        AcceptedCompletion::Slash { name } => {
             state.input.text = format!("/{name} ");
             state.input.cursor = state.input.text.chars().count();
             state.input.vert_goal = None;
             state.input.slash_index = 0;
-            return true;
         }
     }
-    false
 }
 
-fn submit_prompt(state: &mut AppState) -> Vec<Action> {
-    if !state.input.is_empty() {
-        let text = state.input.take();
-        state.pasted_images.mark_submitted(&text);
-        if text.starts_with('/') {
-            return commands::execute(state, &text);
-        }
-        if let Some(rest) = text.strip_prefix('!') {
-            let cmd = rest.trim().to_string();
-            if cmd.is_empty() {
-                return vec![];
-            }
-            crate::bash::record_history(&mut state.input.bash_history, &cmd);
-            if crate::bash::is_interactive(&cmd) {
-                return vec![Action::RunBashInteractive { command: cmd }];
-            } else {
-                return vec![Action::RunBashCaptured { command: cmd }];
-            }
-        }
-        return vec![Action::Send(Request::UserMessage {
-            text,
-            images: Vec::new(),
-        })];
+fn queue_prompt(state: &mut AppState, now: Instant) -> Vec<Action> {
+    if state.input.queue_is_full() {
+        state.push_toast(
+            pacode_types::ToastLevel::Warn,
+            "Prompt queue full".to_string(),
+            Some(format!(
+                "Maximum {} prompts queued",
+                crate::state::input::PROMPT_QUEUE_CAP
+            )),
+            now,
+        );
+        return vec![];
     }
+    let text = state.input.take();
+    state.pasted_images.mark_submitted(&text);
+    state.input.queue_push(text);
     vec![]
+}
+
+fn submit_prompt(state: &mut AppState, now: Instant) -> Vec<Action> {
+    if state.turn_boundary_pending || state.user_msgs_in_flight > 0 {
+        if state.input.is_empty() {
+            return vec![];
+        }
+        return queue_prompt(state, now);
+    }
+    if state.input.is_empty() {
+        return state
+            .take_retry_batch()
+            .map(prompt_batch_action)
+            .into_iter()
+            .collect();
+    }
+    let text = state.input.take();
+    state.pasted_images.mark_submitted(&text);
+    if text.starts_with('/') {
+        return commands::execute(state, &text);
+    }
+    if let Some(rest) = text.strip_prefix('!') {
+        let cmd = rest.trim().to_string();
+        if cmd.is_empty() {
+            return vec![];
+        }
+        crate::bash::record_history(&mut state.input.bash_history, &cmd);
+        if crate::bash::is_interactive(&cmd) {
+            return vec![Action::RunBashInteractive { command: cmd }];
+        }
+        return vec![Action::RunBashCaptured { command: cmd }];
+    }
+    vec![Action::Send(Request::UserMessage {
+        text,
+        images: Vec::new(),
+        message_id: None,
+    })]
+}
+
+pub(crate) fn prompt_batch_action(batch: PromptBatch) -> Action {
+    match batch.requests.as_slice() {
+        [request] => Action::Send(request.clone()),
+        _ => Action::SendSequence {
+            requests: batch.requests,
+        },
+    }
 }
 
 fn find_pending_permission(state: &AppState) -> Option<PermissionRequest> {
@@ -944,6 +916,23 @@ fn find_pending_permission(state: &AppState) -> Option<PermissionRequest> {
 
 pub use crate::mouse::handle_mouse;
 
+fn open_rail_overlay(state: &mut AppState) {
+    let agents = selectable_agents(state);
+    let selected = state
+        .panel_agent_target()
+        .and_then(|target| match target {
+            PanelTarget::Agent(id) => Some(id),
+            PanelTarget::Task(_)
+            | PanelTarget::McpServer(_)
+            | PanelTarget::FileDiff { .. }
+            | PanelTarget::CommitDiff { .. } => None,
+        })
+        .filter(|id| agents.contains(id))
+        .or_else(|| agents.first().cloned())
+        .unwrap_or_else(AgentId::main);
+    state.focus = Focus::Overlay(Overlay::RailOverlay { selected });
+}
+
 /// Whether the rail is off screen, which below 80 columns it always is (spec §8).
 fn rail_is_hidden(state: &AppState) -> bool {
     crate::layout::WidthTier::for_width(state.cols).rail_width() == 0
@@ -952,20 +941,8 @@ fn rail_is_hidden(state: &AppState) -> bool {
 /// (width, height) of the prompt input rect, recomputed from `state.cols`/`rows`
 /// the same way `layout::compute` derives it — key handling has no frame layout.
 fn input_view_size(state: &AppState) -> (u16, u16) {
-    let cols = state.cols;
-    let rows = state.rows;
-    let rail_w = crate::layout::WidthTier::for_width(cols).rail_width();
-    let input_w = if rail_w > 0 && cols > rail_w + 2 {
-        cols - rail_w - 2
-    } else {
-        cols
-    };
-    let footer_h = crate::layout::FOOTER_LINES.min(rows);
-    let footer_y = rows.saturating_sub(footer_h);
-    let input_bottom_h = u16::from(rows > footer_h);
-    let rem_for_input = footer_y.saturating_sub(input_bottom_h); // area.y == 0
-    let input_h = state.input.wrapped_lines(input_w).min(rem_for_input);
-    (input_w, input_h)
+    let input = crate::layout::current(state).input;
+    (input.width, input.height)
 }
 
 /// Max vertical scroll offset for a multi-line prompt (spec §4): total wrapped

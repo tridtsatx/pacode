@@ -24,7 +24,7 @@ pub const OPENCODE_VERSION: &str = "1.18.29";
 
 /// Fetch the OpenCode model catalog and return only free models.
 pub async fn fetch_free_models(client: &reqwest::Client) -> Result<Vec<ModelInfo>, ProviderError> {
-    let response = client
+    let mut response = client
         .get(OPENCODE_CATALOG_URL)
         .header("User-Agent", format!("opencode/{OPENCODE_VERSION}"))
         .send()
@@ -33,7 +33,9 @@ pub async fn fetch_free_models(client: &reqwest::Client) -> Result<Vec<ModelInfo
 
     let status = response.status().as_u16();
     if status != 200 {
-        let text = response.text().await.unwrap_or_default();
+        let text = crate::error_body::read_error_body(&mut response).await;
+        let redacted = crate::redact(&text);
+        log::warn!("opencode catalog returned {status}: {redacted}");
         return Err(ProviderError::Http {
             status,
             message: crate::error_body_message(&text),

@@ -5,11 +5,12 @@
 //! it is watching becomes true.
 
 use async_trait::async_trait;
-use pacode_types::{CronJobId, CronSchedule, MonitorCondition, MonitorId};
+use pacode_types::{CronJobId, CronSchedule, MonitorCondition, MonitorId, RiskLevel};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{parse_input, preview_body};
+use crate::host::PermissionDraft;
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 #[cfg(test)]
@@ -30,6 +31,35 @@ fn cap(text: &str, max: usize) -> String {
         return text.to_string();
     }
     text.chars().take(max).collect()
+}
+
+/// Baseline risk for an action that changes the session's future behaviour on
+/// its own — a job that fires a prompt later, a watcher that runs a command on
+/// its own. The gate answers `Ask` for it in Build mode instead of letting a
+/// Control tool through unattended, which is why the draft is filed as `Exec`.
+const SCHEDULE_RISK: RiskLevel = RiskLevel::Low;
+
+async fn require_schedule_permission(
+    ctx: &ToolCtx,
+    tool: &str,
+    title: String,
+    detail: String,
+    risk: RiskLevel,
+) -> Result<(), ToolError> {
+    let draft = PermissionDraft::new(
+        ctx.agent.clone(),
+        ctx.agent_name.clone(),
+        ctx.call_id.clone(),
+        title,
+        detail,
+        Some(risk),
+    )
+    .with_tool(tool, ToolKind::Exec);
+    ctx.host
+        .request_permission(draft)
+        .await
+        .into_result("user denied the request")
+        .map(|_| ())
 }
 
 pub struct CronTool;
@@ -53,7 +83,8 @@ impl Tool for CronTool {
     fn description(&self) -> &str {
         "Scheduled prompts. `add` a job that sends `prompt` to this session on a \
          `schedule`, `list` the jobs with the time until each next run, or `remove` \
-         one by id. Jobs survive a daemon restart. Use this for work that should \
+         one by id. Jobs survive a daemon restart and fire without further approval, \
+         so `add` and `remove` ask for permission. Use this for work that should \
          happen again later, not to wait for something to finish."
     }
 
@@ -97,14 +128,18 @@ impl Tool for CronTool {
                     ))
                 })?;
 
-                let job = ctx
-                    .host
-                    .add_cron_job(
-                        cap(&name, NAME_MAX_CHARS),
-                        schedule,
-                        cap(&prompt, PROMPT_MAX_CHARS),
-                    )
-                    .await?;
+                let name = cap(&name, NAME_MAX_CHARS);
+                let prompt = cap(&prompt, PROMPT_MAX_CHARS);
+                require_schedule_permission(
+                    ctx,
+                    CRON_NAME,
+                    format!("cron add {name}"),
+                    format!("runs on {}\n\n{prompt}", schedule.display()),
+                    SCHEDULE_RISK,
+                )
+                .await?;
+
+                let job = ctx.host.add_cron_job(name, schedule, prompt).await?;
 
                 let next = job
                     .next_run_ms
@@ -145,6 +180,25 @@ impl Tool for CronTool {
                     .filter(|id| !id.trim().is_empty())
                     .ok_or_else(|| ToolError::invalid("remove needs a job_id"))?;
                 let id = CronJobId::new(id);
+                let known = ctx
+                    .host
+                    .list_cron_jobs()
+                    .into_iter()
+                    .find(|job| job.id == id);
+                let detail = match &known {
+                    Some(job) => {
+                        format!("stops the job `{}` ({})", job.name, job.schedule.display())
+                    }
+                    None => format!("stops job {id}"),
+                };
+                require_schedule_permission(
+                    ctx,
+                    CRON_NAME,
+                    format!("cron remove {id}"),
+                    detail,
+                    SCHEDULE_RISK,
+                )
+                .await?;
                 ctx.host.remove_cron_job(&id).await?;
                 Ok(ToolOutput::text(format!("removed {id}"))
                     .with_title(format!("cron remove {id}"))
@@ -184,7 +238,8 @@ impl Tool for MonitorTool {
          blocking on a wait. `command_succeeds` = the command exits 0; \
          `process_gone` = nothing matches the `process` pattern any more; \
          `file_matches` = `path` contains `pattern`. A monitor fires at most once \
-         and stops with the session."
+         and stops with the session, but it polls on its own, so `watch` and \
+         `stop` ask for permission."
     }
 
     fn schema(&self) -> Value {
@@ -221,11 +276,28 @@ impl Tool for MonitorTool {
                     .label
                     .filter(|l| !l.trim().is_empty())
                     .unwrap_or_else(|| condition.describe());
-                let info = ctx.host.add_monitor(
-                    cap(&label, NAME_MAX_CHARS),
-                    condition,
-                    args.poll_interval_secs,
-                )?;
+                let label = cap(&label, NAME_MAX_CHARS);
+                let risk = match &condition {
+                    MonitorCondition::CommandSucceeds { command } => {
+                        pacode_risk::classify(command, &ctx.cwd).level
+                    }
+                    _ => SCHEDULE_RISK,
+                };
+                require_schedule_permission(
+                    ctx,
+                    MONITOR_NAME,
+                    format!("monitor watch {label}"),
+                    format!(
+                        "checks {} every {}s until it is true",
+                        condition.describe(),
+                        pacode_types::MonitorInfo::normalize_poll_interval(args.poll_interval_secs)
+                    ),
+                    risk,
+                )
+                .await?;
+                let info = ctx
+                    .host
+                    .add_monitor(label, condition, args.poll_interval_secs)?;
                 let content = format!(
                     "monitor_id: {}\nlabel: {}\nwatching: {}\nchecking every {}s",
                     info.id,
@@ -258,6 +330,27 @@ impl Tool for MonitorTool {
                     .filter(|id| !id.trim().is_empty())
                     .ok_or_else(|| ToolError::invalid("stop needs a monitor_id"))?;
                 let id = MonitorId::new(id);
+                let known = ctx
+                    .host
+                    .list_monitors()
+                    .into_iter()
+                    .find(|monitor| monitor.id == id);
+                let detail = match &known {
+                    Some(monitor) => format!(
+                        "stops the watcher `{}` ({})",
+                        monitor.label,
+                        monitor.condition.describe()
+                    ),
+                    None => format!("stops watcher {id}"),
+                };
+                require_schedule_permission(
+                    ctx,
+                    MONITOR_NAME,
+                    format!("monitor stop {id}"),
+                    detail,
+                    SCHEDULE_RISK,
+                )
+                .await?;
                 ctx.host.stop_monitor(&id)?;
                 Ok(ToolOutput::text(format!("stopped {id}"))
                     .with_title(format!("monitor stop {id}"))

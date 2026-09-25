@@ -9,7 +9,7 @@
 //! The data arrives via `Reply::GitLog` (or the disk snapshot before it,
 //! §8.2); `state.lists` owns the `loading…`/`offline copy` badge, while an
 //! in-flight page append shows `loading more`. Nothing is fetched from the
-//! view or the key handlers: the draw records [`wants`] — the selected
+//! view or the key handlers: frame preparation records [`wants`] — the selected
 //! commit's `--stat` for the detail pane and the next history page when the
 //! cursor rests on the last loaded row — and `dispatch_deferred` turns them
 //! into `Action::GitShow` / `Action::GitLog` (§8.1).
@@ -131,8 +131,8 @@ pub fn on_action(
     crate::keys_menu::descend(state, stack, ui, MenuId::GitBranches)
 }
 
-/// What the level wants fetched for the current cursor — the draw records
-/// the pair into `state.git.show_want` / `more_want`; `dispatch_deferred`
+/// What the level wants fetched for the current cursor — frame preparation
+/// records the pair into `state.git.show_want` / `more_want`; `dispatch_deferred`
 /// turns them into requests (§8.1: no fetch inside the view or a key).
 ///
 /// `detail_wide` says the detail panel (not the two collapsed lines) is on

@@ -15,23 +15,62 @@ use crate::ids::{
 };
 use crate::message::ImageSource;
 use crate::model::{Effort, ModelFlags, ModelInfo, ModelRoute};
-use crate::question::{Question, QuestionAnswer};
+use crate::question::{FREE_TEXT_MAX_CHARS, Question, QuestionAnswer};
 use crate::schedule::{CronJob, CronSchedule, MonitorInfo};
 use crate::state::{
-    AgentInfo, Mode, PermissionDecision, PermissionRequest, Plan, SessionMeta, TaskInfo,
-    ToastLevel, UsageTotals,
+    AgentInfo, ID_MAX_CHARS, LimitError, LimitUnit, Mode, NAME_MAX_CHARS, PATH_MAX_BYTES,
+    PermissionDecision, PermissionRequest, Plan, SessionMeta, TEXT_MAX_CHARS, TITLE_MAX_CHARS,
+    TaskInfo, ToastLevel, UsageTotals, check_bytes, check_chars, check_count, check_route,
+    limit_error,
 };
 use crate::stream::Usage;
 use crate::transcript::TranscriptItem;
 use crate::vcs::{CommitRow, GitStatus};
 
+/// Prompt text in a `UserMessage`: a pasted file plus the images that came with
+/// it. A request travels inside one NDJSON line and the line has its own bound
+/// enforced where lines are read; this is the per-field one, so an oversized
+/// prompt is refused by name instead of being carried and rejected downstream.
+pub const PROMPT_MAX_BYTES: usize = 512 * 1024;
+/// Images pasted into one `UserMessage`; each is capped by the provider layer.
+pub const PROMPT_MAX_IMAGES: usize = 16;
+/// `message_id` the client may attach to its own prompt.
+pub const MESSAGE_ID_MAX_CHARS: usize = 128;
+/// `idempotency_key` of an attach request.
+pub const IDEMPOTENCY_KEY_MAX_CHARS: usize = 128;
+/// Note a client attaches to a `Deny`; it reaches the model verbatim.
+pub const REASON_MAX_CHARS: usize = 2_000;
+/// Provider, MCP server, plugin and marketplace names.
+pub const PROVIDER_MAX_CHARS: usize = 64;
+pub const SERVER_NAME_MAX_CHARS: usize = 120;
+pub const PLUGIN_NAME_MAX_CHARS: usize = 200;
+pub const MARKETPLACE_SOURCE_MAX_CHARS: usize = 500;
+/// Free-text filters over a marketplace listing.
+pub const QUERY_MAX_CHARS: usize = 200;
+/// Tool arguments of a plugin command and of an MCP prompt, summed.
+pub const ARGS_MAX_BYTES: usize = 64 * 1024;
+/// Git revision a request names.
+pub const GIT_HASH_MAX_CHARS: usize = 64;
+/// Page sizes a client may ask for. `0` keeps each store caller's own default.
+pub const MAX_HISTORY_PAGE: u32 = 1_000;
+pub const MAX_SESSION_PAGE: u32 = 1_000;
+pub const MAX_TASK_TAIL_LINES: u32 = 2_000;
+/// Collections one snapshot may carry.
+pub const SNAPSHOT_MAX_AGENTS: usize = 64;
+pub const SNAPSHOT_MAX_TASKS: usize = 256;
+pub const SNAPSHOT_MAX_TRANSCRIPT: usize = 1_000;
+pub const SNAPSHOT_MAX_PENDING_PERMISSIONS: usize = 64;
+
 /// Bumped on any wire-visible change: v2 added `SetZdr`/`SetModelFlag`,
 /// `SessionMeta.zdr` and `ModelInfo.supported_efforts`; v3 added the git
 /// requests (`GitLog`, `GitShow`, `GitDiff`) and their replies; v4 adds
 /// `RefreshModels` + the `ModelsUpdated` broadcast; v5 adds
-/// `ExplainPermission` + the `PermissionExplained` broadcast; v6 adds the
-/// daemon-wide `SessionStatus` event for footer slot badges.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// `ExplainPermission` + the `PermissionExplained` broadcast; v6 adds
+/// the daemon-wide `SessionStatus` event for footer slot badges; v7 makes
+/// `Attach::New` idempotent for one client/envelope id and orders attach
+/// replies before session events; v8 adds the session `Resync` control marker
+/// and separates attach request ids from stable idempotency keys.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -62,12 +101,33 @@ pub enum Attach {
     },
 }
 
+impl Attach {
+    /// Whether the attach request fits the caps the wire contract sets.
+    pub fn validate(&self) -> Result<(), LimitError> {
+        match self {
+            Self::New { cwd, model, .. } => {
+                check_bytes("attach cwd", &cwd.to_string_lossy(), PATH_MAX_BYTES)?;
+                if let Some(route) = model {
+                    check_route(route)?;
+                }
+                Ok(())
+            }
+            Self::Resume { session } => check_id("resumed session", session.as_str()),
+            Self::Latest { cwd } => {
+                check_bytes("attach cwd", &cwd.to_string_lossy(), PATH_MAX_BYTES)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Hello(ClientHello),
     Attach(Attach),
     Detach,
+    /// Close the attached Core session and release its runtime resources.
+    CloseSession,
     /// Starts a turn when idle; queued as a steer injection while a turn runs.
     UserMessage {
         text: String,
@@ -75,6 +135,8 @@ pub enum Request {
         /// appended to the user message as `ContentBlock::Image` blocks.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// Cancel the running turn (history is kept).
     Interrupt,
@@ -122,6 +184,11 @@ pub enum Request {
         task: TaskId,
         tail_lines: u32,
     },
+    /// Read the runtime's own instrumentation: resident sessions and agents,
+    /// transcript bytes, session-open and history-page timings, the single store
+    /// writer, and the provider governors. Read-only and on demand — nothing
+    /// polls these, so an idle daemon pays for them not at all.
+    RuntimeStats,
     ListSessions {
         limit: u32,
     },
@@ -245,6 +312,7 @@ impl Request {
             Request::Hello(_) => "hello",
             Request::Attach(_) => "attach",
             Request::Detach => "detach",
+            Request::CloseSession => "close_session",
             Request::UserMessage { .. } => "user_message",
             Request::Interrupt => "interrupt",
             Request::InterruptAll => "interrupt_all",
@@ -260,6 +328,7 @@ impl Request {
             Request::AckTask(_) => "ack_task",
             Request::GetSnapshot => "get_snapshot",
             Request::GetHistory { .. } => "get_history",
+            Request::RuntimeStats => "runtime_stats",
             Request::GetTaskOutput { .. } => "get_task_output",
             Request::ListSessions { .. } => "list_sessions",
             Request::ListModels => "list_models",
@@ -294,6 +363,176 @@ impl Request {
             Request::GitDiff { .. } => "git_diff",
         }
     }
+
+    /// Whether the request fits the caps the wire contract sets. A daemon calls
+    /// this before it acts: every field here arrives from a client, and one
+    /// unbounded field is enough to blow up a transcript, a pane or the store.
+    pub fn validate(&self) -> Result<(), LimitError> {
+        match self {
+            Self::Hello(hello) => {
+                check_id("hello client id", hello.client_id.as_str())?;
+                check_chars("hello app version", &hello.app_version, NAME_MAX_CHARS)
+            }
+            Self::Attach(attach) => attach.validate(),
+            Self::Detach
+            | Self::CloseSession
+            | Self::Interrupt
+            | Self::InterruptAll
+            | Self::GetSnapshot
+            | Self::ListModels
+            | Self::RefreshModels
+            | Self::Compact
+            | Self::DetachTurn
+            | Self::Ping
+            | Self::ListMcpServers
+            | Self::ListPlugins
+            | Self::ListCronJobs
+            | Self::ListMonitors
+            | Self::ListAuth
+            | Self::Shutdown { .. } => Ok(()),
+            Self::UserMessage {
+                text,
+                images,
+                message_id,
+            } => {
+                check_bytes("prompt text", text, PROMPT_MAX_BYTES)?;
+                check_count("prompt images", images.len(), PROMPT_MAX_IMAGES)?;
+                for image in images {
+                    if let ImageSource::Bytes { mime, .. } = image {
+                        check_chars("image mime", mime, NAME_MAX_CHARS)?;
+                    }
+                }
+                check_chars(
+                    "prompt message id",
+                    message_id.as_deref().unwrap_or(""),
+                    MESSAGE_ID_MAX_CHARS,
+                )
+            }
+            Self::PermissionReply {
+                permission, reason, ..
+            } => {
+                check_id("permission reply", permission.as_str())?;
+                check_chars(
+                    "permission reason",
+                    reason.as_deref().unwrap_or(""),
+                    REASON_MAX_CHARS,
+                )
+            }
+            Self::ExplainPermission { permission } => {
+                check_id("explained permission", permission.as_str())
+            }
+            Self::SetModel(route) => check_route(route),
+            Self::SetEffort(_) | Self::SetMode(_) | Self::SetZdr(_) => Ok(()),
+            Self::SetModelFlag { model, .. } => check_chars("model flag", model, TITLE_MAX_CHARS),
+            Self::StopAgent(agent) => check_id("stopped agent", agent.as_str()),
+            Self::KillTask(task) | Self::AckTask(task) => check_id("task", task.as_str()),
+            Self::GetHistory { agent, limit, .. } => {
+                check_id("history agent", agent.as_str())?;
+                check_page("history page", *limit, MAX_HISTORY_PAGE)
+            }
+            Self::GetTaskOutput { task, tail_lines } => {
+                check_id("task output", task.as_str())?;
+                check_page("task tail lines", *tail_lines, MAX_TASK_TAIL_LINES)
+            }
+            // Carries no caller input: it reads counters the daemon already owns.
+            Self::RuntimeStats => Ok(()),
+            Self::ListSessions { limit } => check_page("session page", *limit, MAX_SESSION_PAGE),
+            Self::RestartMcpServer { server } | Self::SetMcpServerEnabled { server, .. } => {
+                check_chars("mcp server", server, SERVER_NAME_MAX_CHARS)
+            }
+            Self::GetMcpPrompt { server, name, args } => {
+                check_chars("mcp server", server, SERVER_NAME_MAX_CHARS)?;
+                check_chars("mcp prompt", name, PLUGIN_NAME_MAX_CHARS)?;
+                check_args(args)
+            }
+            Self::RunPluginCommand { name, args } => {
+                check_chars("plugin name", name, PLUGIN_NAME_MAX_CHARS)?;
+                check_bytes("plugin args", args, ARGS_MAX_BYTES)
+            }
+            Self::BrowseMarketplace { source, query } => {
+                check_chars("marketplace source", source, MARKETPLACE_SOURCE_MAX_CHARS)?;
+                check_chars("marketplace query", query, QUERY_MAX_CHARS)
+            }
+            Self::InstallPlugin { source, name } => {
+                check_chars("marketplace source", source, MARKETPLACE_SOURCE_MAX_CHARS)?;
+                check_chars("plugin name", name, PLUGIN_NAME_MAX_CHARS)
+            }
+            Self::UninstallPlugin { name } => {
+                check_chars("plugin name", name, PLUGIN_NAME_MAX_CHARS)
+            }
+            Self::AnswerQuestion { question, answer } => {
+                check_id("answered question", question.as_str())?;
+                if let Some(text) = &answer.free_text {
+                    check_chars("typed answer", text, FREE_TEXT_MAX_CHARS)?;
+                }
+                Ok(())
+            }
+            Self::AddCronJob {
+                name,
+                schedule,
+                prompt,
+            } => {
+                check_chars("cron name", name, NAME_MAX_CHARS)?;
+                check_bytes("cron prompt", prompt, TEXT_MAX_CHARS)?;
+                schedule.check_size()
+            }
+            Self::RemoveCronJob(job)
+            | Self::SetCronEnabled { id: job, .. }
+            | Self::RunCronJobNow(job) => check_id("cron job", job.as_str()),
+            Self::StopMonitor(monitor) => check_id("monitor", monitor.as_str()),
+            Self::Login { provider } | Self::SetAuthAccount { provider, .. } => {
+                check_chars("provider", provider, PROVIDER_MAX_CHARS)
+            }
+            Self::Logout { provider, label } => {
+                check_chars("provider", provider, PROVIDER_MAX_CHARS)?;
+                check_chars(
+                    "account label",
+                    label.as_deref().unwrap_or(""),
+                    TITLE_MAX_CHARS,
+                )
+            }
+            Self::GitLog { after } => check_chars(
+                "git revision",
+                after.as_deref().unwrap_or(""),
+                GIT_HASH_MAX_CHARS,
+            ),
+            Self::GitShow { hash } | Self::GitDiff { hash } => {
+                check_chars("git hash", hash, GIT_HASH_MAX_CHARS)
+            }
+        }
+    }
+}
+
+fn check_id(field: &'static str, id: &str) -> Result<(), LimitError> {
+    check_chars(field, id, ID_MAX_CHARS)
+}
+
+fn check_page(field: &'static str, requested: u32, max: u32) -> Result<(), LimitError> {
+    if requested > max {
+        return Err(limit_error(
+            field,
+            requested as usize,
+            max as usize,
+            LimitUnit::Items,
+        ));
+    }
+    Ok(())
+}
+
+fn check_args(args: &BTreeMap<String, String>) -> Result<(), LimitError> {
+    let total: usize = args
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    if total > ARGS_MAX_BYTES {
+        return Err(limit_error(
+            "mcp prompt args",
+            total,
+            ARGS_MAX_BYTES,
+            LimitUnit::Bytes,
+        ));
+    }
+    Ok(())
 }
 
 /// One provider row in the `/login` picker.
@@ -451,6 +690,38 @@ pub struct Envelope {
     pub req: Request,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AttachEnvelope {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+impl AttachEnvelope {
+    pub fn new(id: u64, attach: Attach, idempotency_key: impl Into<String>) -> Self {
+        Self {
+            envelope: Envelope {
+                id,
+                req: Request::Attach(attach),
+            },
+            idempotency_key: Some(idempotency_key.into()),
+        }
+    }
+
+    /// Whether the wrapped request and the idempotency key fit the caps the wire
+    /// contract sets. The key is a client-chosen string a daemon keeps per
+    /// connection, so it is capped like every other free-form field.
+    pub fn validate(&self) -> Result<(), LimitError> {
+        self.envelope.req.validate()?;
+        check_chars(
+            "attach idempotency key",
+            self.idempotency_key.as_deref().unwrap_or(""),
+            IDEMPOTENCY_KEY_MAX_CHARS,
+        )
+    }
+}
+
 /// Everything a client needs to render a session from scratch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -467,6 +738,12 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub pending_questions: Vec<Question>,
     pub turn_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_turn: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_error: Option<String>,
     /// Cron jobs of this session, with `next_run_ms` already computed.
     #[serde(default)]
     pub cron_jobs: Vec<CronJob>,
@@ -475,6 +752,63 @@ pub struct SessionSnapshot {
     pub monitors: Vec<MonitorInfo>,
     /// Last event seq included in this snapshot; later events carry larger seqs.
     pub seq: u64,
+}
+
+impl SessionSnapshot {
+    /// Whether the snapshot fits the caps the wire contract sets, collections
+    /// first and then every entry they hold. A snapshot is what a reconnecting
+    /// client rebuilds a whole session from, so its size is a rendering cost the
+    /// sender has to bound, not something the receiver discovers later.
+    pub fn validate(&self) -> Result<(), LimitError> {
+        check_count("snapshot agents", self.agents.len(), SNAPSHOT_MAX_AGENTS)?;
+        check_count("snapshot tasks", self.tasks.len(), SNAPSHOT_MAX_TASKS)?;
+        check_count(
+            "snapshot transcript",
+            self.transcript.len(),
+            SNAPSHOT_MAX_TRANSCRIPT,
+        )?;
+        check_count(
+            "snapshot permissions",
+            self.pending_permissions.len(),
+            SNAPSHOT_MAX_PENDING_PERMISSIONS,
+        )?;
+        check_count(
+            "snapshot cron jobs",
+            self.cron_jobs.len(),
+            crate::schedule::MAX_CRON_JOBS,
+        )?;
+        check_count(
+            "snapshot monitors",
+            self.monitors.len(),
+            crate::schedule::MAX_MONITORS,
+        )?;
+        self.meta.validate()?;
+        self.plan.validate()?;
+        for agent in &self.agents {
+            agent.validate()?;
+        }
+        for task in &self.tasks {
+            task.validate()?;
+        }
+        for permission in &self.pending_permissions {
+            permission.validate()?;
+        }
+        for job in &self.cron_jobs {
+            job.validate()?;
+        }
+        for monitor in &self.monitors {
+            monitor.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// The payload of `Reply::RuntimeStats`: what the core holds, and what the
+/// provider governors are doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeStatsReply {
+    pub core: crate::metrics::RuntimeStats,
+    pub providers: crate::metrics::ProviderStats,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -511,6 +845,11 @@ pub enum Reply {
         models: Vec<ModelInfo>,
     },
     Pong,
+    /// Boxed: the reading is two large structs, and inlining them would make
+    /// every other `Reply` variant carry that size on every reply.
+    RuntimeStats {
+        stats: Box<RuntimeStatsReply>,
+    },
     McpServers {
         servers: Vec<McpServerInfo>,
     },
@@ -723,11 +1062,35 @@ pub enum Event {
     },
 }
 
+impl Event {
+    pub fn is_lossy_delta(&self) -> bool {
+        matches!(self, Event::TextDelta { .. } | Event::ReasoningDelta { .. })
+    }
+
+    pub fn is_global(&self) -> bool {
+        matches!(
+            self,
+            Event::LoginProgress { .. } | Event::AuthUpdated(_) | Event::SessionStatus { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "channel", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
-    Reply { id: u64, reply: Reply },
-    Event { seq: u64, event: Event },
+    Reply {
+        id: u64,
+        reply: Reply,
+    },
+    Event {
+        seq: u64,
+        event: Event,
+    },
+    Resync {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_seq: Option<u64>,
+    },
 }
 
 #[cfg(test)]
@@ -741,12 +1104,14 @@ mod tests {
             req: Request::UserMessage {
                 text: "hi".into(),
                 images: Vec::new(),
+                message_id: Some("msg-envelope".into()),
             },
         };
         let json = serde_json::to_value(&env).unwrap();
         assert_eq!(json["id"], 7);
         assert_eq!(json["type"], "user_message");
         assert_eq!(json["text"], "hi");
+        assert_eq!(json["message_id"], "msg-envelope");
         let back: Envelope = serde_json::from_value(json).unwrap();
         assert_eq!(back, env);
     }
@@ -774,6 +1139,23 @@ mod tests {
         let back: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
         assert_eq!(back, reply);
+        let resync = ServerMessage::Resync {
+            current_seq: Some(9),
+        };
+        let line = serde_json::to_string(&resync).unwrap();
+        assert!(line.contains("\"channel\":\"resync\""));
+        assert!(line.contains("\"current_seq\":9"));
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&line).unwrap(),
+            resync
+        );
+        let minimal = ServerMessage::Resync { current_seq: None };
+        let line = serde_json::to_string(&minimal).unwrap();
+        assert_eq!(line, r#"{"channel":"resync"}"#);
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&line).unwrap(),
+            minimal
+        );
     }
 
     #[test]
@@ -814,11 +1196,13 @@ mod tests {
                         data: vec![7, 8],
                     },
                 ],
+                message_id: Some("msg-images".into()),
             },
         };
         let json = serde_json::to_value(&env).unwrap();
         assert_eq!(json["type"], "user_message");
         assert_eq!(json["images"].as_array().unwrap().len(), 2);
+        assert_eq!(json["message_id"], "msg-images");
         let back: Envelope = serde_json::from_value(json).unwrap();
         assert_eq!(back, env);
 
@@ -834,8 +1218,11 @@ mod tests {
             Request::UserMessage {
                 text: "hi".into(),
                 images: Vec::new(),
+                message_id: None,
             }
         );
+        let json = serde_json::to_value(&env).unwrap();
+        assert!(json.get("message_id").is_none());
     }
 
     #[test]
@@ -848,6 +1235,75 @@ mod tests {
         assert!(json.contains("\"type\":\"interrupt_all\""));
         let back: Envelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back, env);
+    }
+
+    #[test]
+    fn session_snapshot_optional_turn_fences_are_wire_compatible() {
+        let snapshot = SessionSnapshot {
+            meta: SessionMeta {
+                id: SessionId::new("ses_snapshot"),
+                name: None,
+                cwd: PathBuf::from("/tmp"),
+                git_branch: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                model: ModelRoute::new("mock", "model"),
+                effort: Effort::Low,
+                mode: Mode::Build,
+                first_prompt: None,
+                zdr: false,
+            },
+            agents: Vec::new(),
+            plan: Plan::default(),
+            tasks: Vec::new(),
+            usage: UsageTotals::default(),
+            transcript: Vec::new(),
+            has_more_history: false,
+            pending_permissions: Vec::new(),
+            pending_questions: Vec::new(),
+            turn_active: false,
+            active_turn: None,
+            terminal_turn: None,
+            terminal_error: None,
+            cron_jobs: Vec::new(),
+            monitors: Vec::new(),
+            seq: 1,
+        };
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        assert!(value.get("active_turn").is_none());
+        assert!(value.get("terminal_turn").is_none());
+        assert!(value.get("terminal_error").is_none());
+        let object = value.as_object_mut().unwrap();
+        object.remove("active_turn");
+        object.remove("terminal_turn");
+        object.remove("terminal_error");
+        let legacy: SessionSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.active_turn, None);
+        assert_eq!(legacy.terminal_turn, None);
+        assert_eq!(legacy.terminal_error, None);
+
+        let turn = TurnId::new("trn_snapshot");
+        let snapshot = SessionSnapshot {
+            active_turn: Some(turn.clone()),
+            terminal_turn: Some(turn.clone()),
+            terminal_error: Some("failed".into()),
+            ..snapshot
+        };
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["active_turn"], "trn_snapshot");
+        assert_eq!(value["terminal_turn"], "trn_snapshot");
+        assert_eq!(value["terminal_error"], "failed");
+    }
+
+    #[test]
+    fn close_session_round_trip() {
+        let env = Envelope {
+            id: 14,
+            req: Request::CloseSession,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"close_session\""));
+        assert_eq!(serde_json::from_str::<Envelope>(&json).unwrap(), env);
     }
 
     #[test]
@@ -918,6 +1374,62 @@ mod tests {
     }
 
     #[test]
+    fn attach_new_keeps_legacy_wire_shape() {
+        let env = Envelope {
+            id: 17,
+            req: Request::Attach(Attach::New {
+                cwd: PathBuf::from("/tmp/project"),
+                model: None,
+                effort: None,
+                mode: None,
+            }),
+        };
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["id"], 17);
+        assert_eq!(json["type"], "attach");
+        assert_eq!(json["kind"], "new");
+        assert_eq!(json["cwd"], "/tmp/project");
+        assert!(json.get("session").is_none());
+        assert_eq!(serde_json::from_value::<Envelope>(json).unwrap(), env);
+    }
+
+    #[test]
+    fn attach_idempotency_wrapper_is_wire_compatible() {
+        let env = AttachEnvelope::new(
+            18,
+            Attach::New {
+                cwd: PathBuf::from("/tmp/project"),
+                model: None,
+                effort: None,
+                mode: None,
+            },
+            "logical-attach-1",
+        );
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["id"], 18);
+        assert_eq!(json["type"], "attach");
+        assert_eq!(json["kind"], "new");
+        assert_eq!(json["idempotency_key"], "logical-attach-1");
+        assert_eq!(
+            serde_json::from_value::<AttachEnvelope>(json.clone()).unwrap(),
+            env
+        );
+        assert_eq!(
+            serde_json::from_value::<Envelope>(json).unwrap(),
+            env.envelope
+        );
+
+        let legacy = serde_json::json!({
+            "id": 19,
+            "type": "attach",
+            "kind": "latest",
+            "cwd": "/tmp/project"
+        });
+        let legacy: AttachEnvelope = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.idempotency_key, None);
+    }
+
+    #[test]
     fn explain_level_parses_all_variants() {
         assert_eq!(ExplainLevel::parse("none"), Some(ExplainLevel::None));
         assert_eq!(ExplainLevel::parse("low"), Some(ExplainLevel::Low));
@@ -929,5 +1441,326 @@ mod tests {
         );
         assert_eq!(ExplainLevel::parse("bogus"), None);
         assert_eq!(ExplainLevel::parse(""), None);
+    }
+
+    #[test]
+    fn requests_a_client_can_send_validate() {
+        let cases = [
+            Request::Hello(ClientHello {
+                client_id: ClientId::new("cli_1"),
+                app_version: "1.1.0".into(),
+                protocol: PROTOCOL_VERSION,
+            }),
+            Request::Attach(Attach::New {
+                cwd: PathBuf::from("/tmp/project"),
+                model: Some(ModelRoute::new("mock", "model")),
+                effort: Some(Effort::High),
+                mode: Some(Mode::Build),
+            }),
+            Request::Attach(Attach::Resume {
+                session: SessionId::new("pacode-12345678-abcd"),
+            }),
+            Request::UserMessage {
+                text: "hi".into(),
+                images: vec![ImageSource::Path(PathBuf::from("/tmp/p.png"))],
+                message_id: Some("msg-1".into()),
+            },
+            Request::GetHistory {
+                agent: AgentId::main(),
+                before_seq: None,
+                limit: MAX_HISTORY_PAGE,
+            },
+            Request::GetTaskOutput {
+                task: TaskId::new("tsk_1"),
+                tail_lines: MAX_TASK_TAIL_LINES,
+            },
+            Request::ListSessions { limit: 0 },
+            Request::GitLog {
+                after: Some("abc123".into()),
+            },
+            Request::Login {
+                provider: "mock".into(),
+            },
+            Request::GetMcpPrompt {
+                server: "files".into(),
+                name: "read".into(),
+                args: BTreeMap::from([("path".to_string(), "/tmp/a".to_string())]),
+            },
+        ];
+        for request in cases {
+            assert!(request.validate().is_ok(), "{}", request.name());
+        }
+    }
+
+    #[test]
+    fn a_request_past_a_cap_names_the_field() {
+        let cases: Vec<(Request, &'static str)> = vec![
+            (
+                Request::UserMessage {
+                    text: "x".repeat(PROMPT_MAX_BYTES + 1),
+                    images: Vec::new(),
+                    message_id: None,
+                },
+                "prompt text",
+            ),
+            (
+                Request::UserMessage {
+                    text: "hi".into(),
+                    images: vec![
+                        ImageSource::Path(PathBuf::from("/tmp/p.png"));
+                        PROMPT_MAX_IMAGES + 1
+                    ],
+                    message_id: None,
+                },
+                "prompt images",
+            ),
+            (
+                Request::UserMessage {
+                    text: "hi".into(),
+                    images: Vec::new(),
+                    message_id: Some("m".repeat(MESSAGE_ID_MAX_CHARS + 1)),
+                },
+                "prompt message id",
+            ),
+            (
+                Request::GetHistory {
+                    agent: AgentId::main(),
+                    before_seq: None,
+                    limit: MAX_HISTORY_PAGE + 1,
+                },
+                "history page",
+            ),
+            (
+                Request::ListSessions {
+                    limit: MAX_SESSION_PAGE + 1,
+                },
+                "session page",
+            ),
+            (
+                Request::GetTaskOutput {
+                    task: TaskId::new("tsk_1"),
+                    tail_lines: MAX_TASK_TAIL_LINES + 1,
+                },
+                "task tail lines",
+            ),
+            (
+                Request::PermissionReply {
+                    permission: PermissionId::new("perm_1"),
+                    decision: PermissionDecision::Deny,
+                    reason: Some("r".repeat(REASON_MAX_CHARS + 1)),
+                },
+                "permission reason",
+            ),
+            (
+                Request::SetModel(ModelRoute::new("p", "m".repeat(NAME_MAX_CHARS + 1))),
+                "model name",
+            ),
+            (
+                Request::GetMcpPrompt {
+                    server: "files".into(),
+                    name: "read".into(),
+                    args: BTreeMap::from([("path".to_string(), "x".repeat(ARGS_MAX_BYTES + 1))]),
+                },
+                "mcp prompt args",
+            ),
+            (
+                Request::RunPluginCommand {
+                    name: "p".repeat(PLUGIN_NAME_MAX_CHARS + 1),
+                    args: String::new(),
+                },
+                "plugin name",
+            ),
+            (
+                Request::BrowseMarketplace {
+                    source: "s".repeat(MARKETPLACE_SOURCE_MAX_CHARS + 1),
+                    query: String::new(),
+                },
+                "marketplace source",
+            ),
+            (
+                Request::BrowseMarketplace {
+                    source: "owner/repo".into(),
+                    query: "q".repeat(QUERY_MAX_CHARS + 1),
+                },
+                "marketplace query",
+            ),
+            (
+                Request::Login {
+                    provider: "p".repeat(PROVIDER_MAX_CHARS + 1),
+                },
+                "provider",
+            ),
+            (
+                Request::RestartMcpServer {
+                    server: "s".repeat(SERVER_NAME_MAX_CHARS + 1),
+                },
+                "mcp server",
+            ),
+            (
+                Request::GitShow {
+                    hash: "h".repeat(GIT_HASH_MAX_CHARS + 1),
+                },
+                "git hash",
+            ),
+            (
+                Request::AddCronJob {
+                    name: "n".into(),
+                    schedule: CronSchedule::cron("x".repeat(201)),
+                    prompt: "p".into(),
+                },
+                "cron expression",
+            ),
+            (
+                Request::StopMonitor(MonitorId::new("m".repeat(ID_MAX_CHARS + 1))),
+                "monitor",
+            ),
+            (
+                Request::Attach(Attach::Latest {
+                    cwd: PathBuf::from("/x".repeat(PATH_MAX_BYTES)),
+                }),
+                "attach cwd",
+            ),
+        ];
+        for (request, field) in cases {
+            let error = request.validate().expect_err(request.name());
+            assert_eq!(error.field, field, "{}", request.name());
+        }
+    }
+
+    #[test]
+    fn an_attach_key_is_capped_like_every_other_client_string() {
+        let env = AttachEnvelope::new(
+            1,
+            Attach::New {
+                cwd: PathBuf::from("/tmp"),
+                model: None,
+                effort: None,
+                mode: None,
+            },
+            "k".repeat(IDEMPOTENCY_KEY_MAX_CHARS + 1),
+        );
+        assert_eq!(
+            env.validate().expect_err("overlong key").field,
+            "attach idempotency key"
+        );
+        let env = AttachEnvelope::new(
+            1,
+            Attach::Latest {
+                cwd: PathBuf::from("/tmp"),
+            },
+            "k",
+        );
+        assert!(env.validate().is_ok());
+    }
+
+    #[test]
+    fn a_snapshot_validates_its_collections_and_their_entries() {
+        let mut over = snapshot();
+        assert!(over.validate().is_ok());
+
+        over.agents = vec![AgentInfo {
+            name: "a".repeat(NAME_MAX_CHARS + 1),
+            ..agent_info()
+        }];
+        assert_eq!(
+            over.validate().expect_err("overlong agent").field,
+            "agent name"
+        );
+
+        let mut over = snapshot();
+        over.transcript = vec![transcript_item(); SNAPSHOT_MAX_TRANSCRIPT + 1];
+        assert_eq!(
+            over.validate().expect_err("long transcript").field,
+            "snapshot transcript"
+        );
+
+        let mut over = snapshot();
+        over.cron_jobs = vec![cron_job(); crate::schedule::MAX_CRON_JOBS + 1];
+        assert_eq!(
+            over.validate().expect_err("too many jobs").field,
+            "snapshot cron jobs"
+        );
+    }
+
+    fn session_meta() -> SessionMeta {
+        SessionMeta {
+            id: SessionId::new("ses_1"),
+            name: None,
+            cwd: PathBuf::from("/tmp"),
+            git_branch: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            model: ModelRoute::new("mock", "model"),
+            effort: Effort::High,
+            mode: Mode::Build,
+            first_prompt: None,
+            zdr: false,
+        }
+    }
+
+    fn agent_info() -> AgentInfo {
+        AgentInfo {
+            id: AgentId::new("agt_1"),
+            name: "main".into(),
+            kind: crate::state::AgentKind::Main,
+            status: crate::state::AgentStatus::Idle,
+            activity: None,
+            started_at_ms: 0,
+            finished_at_ms: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            model: ModelRoute::new("mock", "model"),
+            effort: Effort::High,
+            parent: None,
+            summary: None,
+            error: None,
+        }
+    }
+
+    fn transcript_item() -> TranscriptItem {
+        TranscriptItem {
+            agent: AgentId::main(),
+            seq: 1,
+            ts_ms: 0,
+            kind: crate::transcript::TranscriptKind::Notice {
+                level: ToastLevel::Info,
+                text: String::new(),
+            },
+        }
+    }
+
+    fn cron_job() -> CronJob {
+        CronJob {
+            id: CronJobId::new("cron_1"),
+            name: "nightly".into(),
+            schedule: CronSchedule::every(60),
+            prompt: "run the suite".into(),
+            enabled: true,
+            created_at_ms: 0,
+            last_run_ms: None,
+            next_run_ms: None,
+            last_status: None,
+        }
+    }
+
+    fn snapshot() -> SessionSnapshot {
+        SessionSnapshot {
+            meta: session_meta(),
+            agents: vec![agent_info()],
+            plan: Plan::default(),
+            tasks: Vec::new(),
+            usage: UsageTotals::default(),
+            transcript: vec![transcript_item()],
+            has_more_history: false,
+            pending_permissions: Vec::new(),
+            pending_questions: Vec::new(),
+            turn_active: false,
+            active_turn: None,
+            terminal_turn: None,
+            terminal_error: None,
+            cron_jobs: vec![cron_job()],
+            monitors: Vec::new(),
+            seq: 1,
+        }
     }
 }

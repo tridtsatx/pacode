@@ -31,9 +31,9 @@ pub use request::{
     REASONING_KEYWORDS, build_responses_body, deep_merge, model_heuristic_reasoning,
     reasoning_enabled_for,
 };
-pub use stream::{CodexStreamOpener, create_responses_event_stream, retrying_responses_stream};
+pub use stream::{CodexStreamOpener, create_responses_event_stream};
 
-use crate::{CompletionRequest, EventStream, Provider, ProviderError, redact};
+use crate::{CompletionRequest, EventStream, Provider, ProviderError, RetryBudget, redact};
 
 #[cfg(test)]
 #[path = "codex_tests.rs"]
@@ -219,7 +219,7 @@ impl Codex {
             req_builder = req_builder.header(k, v);
         }
 
-        let response = match req_builder.send().await {
+        let mut response = match req_builder.send().await {
             Ok(resp) => resp,
             Err(err) => {
                 if !configured_models.is_empty() {
@@ -236,7 +236,7 @@ impl Codex {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            let text = crate::error_body::read_error_body(&mut response).await;
             let redacted_text = redact(&text);
             log::trace!("models response body: {redacted_text}");
             if !configured_models.is_empty() {
@@ -342,12 +342,10 @@ impl Provider for Codex {
             model: req.model,
             stream_idle_secs: self.defaults.stream_idle_secs,
             effort,
-            max_retries,
             backoff_base: self.backoff_base,
         };
 
-        let inner = opener.open().await?;
-        Ok(retrying_responses_stream(opener, inner))
+        opener.open(RetryBudget::new(max_retries)).await
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

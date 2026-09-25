@@ -105,15 +105,6 @@ fn thinking_colour_without_rgb_flips_at_the_last_threshold() {
 }
 
 #[test]
-fn the_pacman_bar_is_dropped_while_waiting_on_someone_else() {
-    assert!(Phase::Thinking.shows_pacman());
-    assert!(Phase::Responding.shows_pacman());
-    assert!(Phase::Tool("bash cargo test".to_string()).shows_pacman());
-    assert!(!Phase::WaitingAgent("review".to_string()).shows_pacman());
-    assert!(!Phase::WaitingTask(2).shows_pacman());
-}
-
-#[test]
 fn each_phase_words_itself() {
     let g = glyphs();
     let f = 2 * DOT_DIVIDER;
@@ -127,18 +118,6 @@ fn each_phase_words_itself() {
     assert_eq!(
         Phase::Tool("write src/foo.rs".to_string()).label(0, 0, &g),
         "write src/foo.rs"
-    );
-    assert_eq!(
-        Phase::WaitingAgent("review".to_string()).label(0, 0, &g),
-        "waiting for agent review"
-    );
-    assert_eq!(
-        Phase::WaitingTask(1).label(0, 0, &g),
-        "waiting for a background task"
-    );
-    assert_eq!(
-        Phase::WaitingTask(3).label(0, 0, &g),
-        "waiting for 3 background tasks"
     );
 }
 

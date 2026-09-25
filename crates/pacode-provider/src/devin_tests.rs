@@ -1937,8 +1937,12 @@ fn test_conversation_id_is_stable_across_turns_of_one_conversation() {
         max_output_tokens: Some(1024),
     };
     let mut later = first.clone();
-    later.messages.push(Arc::new(Message::assistant_text("looking")));
-    later.messages.push(Arc::new(Message::user("and now delta")));
+    later
+        .messages
+        .push(Arc::new(Message::assistant_text("looking")));
+    later
+        .messages
+        .push(Arc::new(Message::user("and now delta")));
     later.system_dynamic = "changed between turns".to_string();
 
     assert_eq!(

@@ -12,6 +12,7 @@ use pacode_types::{
     TaskProgress, ToastLevel,
 };
 
+use crate::agent::Agent;
 use crate::session::Session;
 
 pub struct SessionHost {
@@ -20,20 +21,62 @@ pub struct SessionHost {
     pub agent: AgentId,
 }
 
-#[async_trait]
-impl ToolHost for SessionHost {
-    /// Applies `permissions::gate` with the session mode and the draft's risk; checks
-    /// the AllowSession cache; otherwise registers the request, emits
-    /// `PermissionRequested` + an `ItemAdded(Permission)` item, sets the agent to
-    /// `WaitingApproval`, awaits the decision (cancel → Deny + "interrupted"),
-    /// emits `PermissionResolved`, caches `AllowSession`.
-    ///
-    /// The `reason` in the outcome is `Some` whenever a `Deny` was not the
-    /// user's refusal: the gate's policy reason, `zdr_blocked: …`,
-    /// `interrupted`, `permission request aborted` (sender dropped), or a
-    /// client-supplied note from `PermissionReply`. `require_permission` uses
-    /// it to tell the model a policy deny apart from a user refusal.
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionOutcome {
+impl SessionHost {
+    fn owner_agent(&self) -> Option<Arc<Agent>> {
+        self.session.agent_for_host(&self.agent)
+    }
+
+    fn owner_id(&self) -> AgentId {
+        self.owner_agent()
+            .map(|agent| agent.id())
+            .unwrap_or_else(|| self.agent.clone())
+    }
+
+    fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {
+        self.session
+            .tasks
+            .info(task)
+            .filter(|info| info.session == self.session.id)
+    }
+}
+
+pub(crate) fn permission_target(tool: &str, title: &str, detail: &str) -> String {
+    if !matches!(tool, "write" | "edit" | "multi_edit") {
+        return detail.trim().to_string();
+    }
+    let title = title.trim();
+    let target = title
+        .split_once(' ')
+        .map(|(_, target)| target.trim())
+        .unwrap_or(title)
+        .strip_suffix(" (outside workspace)")
+        .unwrap_or_else(|| {
+            title
+                .split_once(' ')
+                .map(|(_, target)| target.trim())
+                .unwrap_or(title)
+        })
+        .trim();
+    if target.is_empty() {
+        detail.trim().to_string()
+    } else {
+        target.to_string()
+    }
+}
+
+fn zdr_denied_subagent() -> ToolError {
+    ToolError::Denied(format!(
+        "{}: subagent spawning is disabled while zero-data-retention is active",
+        crate::permissions::ZDR_BLOCKED
+    ))
+}
+
+impl SessionHost {
+    async fn request_permission_inner(
+        &self,
+        draft: PermissionDraft,
+        force_ask: bool,
+    ) -> PermissionOutcome {
         let (tool_name, kind) = {
             let session_tools = self.session.tools.read().unwrap_or_else(|p| p.into_inner());
 
@@ -76,20 +119,22 @@ impl ToolHost for SessionHost {
 
         // ZDR hard isolation for tools that do ask (network tools normally
         // bypass this path; `run_single_tool` denies them before dispatch).
-        if self.session.zdr_active()
-            && (kind == pacode_tools::ToolKind::Network || tool_name.contains("__"))
+        if let Some(reason) =
+            crate::permissions::zdr_tool_violation(&self.session, &tool_name, kind)
         {
             return PermissionOutcome {
                 decision: PermissionDecision::Deny,
-                reason: Some(format!(
-                    "zdr_blocked: {tool_name} is disabled while zero-data-retention is active"
-                )),
+                reason: Some(reason),
             };
         }
 
         let mode = self.session.meta().mode;
         let allow_catastrophic = self.session.config.permissions.allow_catastrophic;
-        let gate_decision = crate::permissions::gate(mode, kind, draft.risk, allow_catastrophic);
+        let gate_decision = if force_ask {
+            crate::permissions::GateDecision::Ask
+        } else {
+            crate::permissions::gate(mode, kind, draft.risk, allow_catastrophic)
+        };
 
         match gate_decision {
             crate::permissions::GateDecision::Allow => PermissionOutcome {
@@ -101,20 +146,30 @@ impl ToolHost for SessionHost {
                 reason: Some(reason),
             },
             crate::permissions::GateDecision::Ask => {
-                let target = draft.detail.lines().next().unwrap_or("").trim();
-                let cache_key = crate::permissions::session_key(&tool_name, target);
-                if self.session.permissions.is_allowed_for_session(&cache_key) {
-                    return PermissionOutcome {
-                        decision: PermissionDecision::AllowSession,
-                        reason: None,
-                    };
-                }
+                let owner = self.owner_agent();
+                let owner_id = owner
+                    .as_ref()
+                    .map(|agent| agent.id())
+                    .unwrap_or_else(|| self.agent.clone());
+                let target = permission_target(&tool_name, &draft.title, &draft.detail);
+                let cache_key = crate::permissions::session_key(&tool_name, &target);
+                let owner_name = owner
+                    .as_ref()
+                    .map(|agent| {
+                        agent
+                            .info
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .name
+                            .clone()
+                    })
+                    .unwrap_or_else(|| draft.agent_name.clone());
 
                 let perm_id = pacode_types::PermissionId::generate();
                 let perm_req = pacode_types::PermissionRequest {
                     id: perm_id.clone(),
-                    agent: draft.agent.clone(),
-                    agent_name: draft.agent_name.clone(),
+                    agent: owner_id.clone(),
+                    agent_name: owner_name,
                     call_id: draft.call_id.clone(),
                     tool: tool_name,
                     title: draft.title.clone(),
@@ -123,18 +178,38 @@ impl ToolHost for SessionHost {
                     created_at_ms: pacode_types::now_ms(),
                 };
 
-                let rx = self.session.permissions.register(perm_req.clone());
+                // One atomic step: the session grant and the queue insert are
+                // decided together, so two concurrent calls for the same target
+                // cannot both miss the cache and raise two prompts.
+                let mut rx = match self
+                    .session
+                    .permissions
+                    .register_or_cached(perm_req.clone(), &cache_key)
+                {
+                    crate::permissions::Registration::Granted => {
+                        return PermissionOutcome {
+                            decision: PermissionDecision::AllowSession,
+                            reason: None,
+                        };
+                    }
+                    crate::permissions::Registration::QueueFull => {
+                        return PermissionOutcome {
+                            decision: PermissionDecision::Deny,
+                            reason: Some(format!(
+                                "permission queue is full (maximum {})",
+                                crate::permissions::MAX_PENDING
+                            )),
+                        };
+                    }
+                    crate::permissions::Registration::Pending(rx) => rx,
+                };
                 self.session
                     .events
                     .emit(pacode_types::Event::PermissionRequested(perm_req.clone()));
                 self.session.emit_session_status();
-                crate::hooks::notification(
-                    &self.session,
-                    &draft.agent,
-                    Some(perm_req.tool.clone()),
-                );
+                crate::hooks::notification(&self.session, &owner_id, Some(perm_req.tool.clone()));
 
-                let agent_opt = self.session.agent(&draft.agent);
+                let agent_opt = owner;
                 let item_seq = agent_opt
                     .as_ref()
                     .map(|a| {
@@ -147,7 +222,7 @@ impl ToolHost for SessionHost {
 
                 let perm_item = pacode_types::TranscriptItem {
                     seq: item_seq,
-                    agent: draft.agent.clone(),
+                    agent: owner_id.clone(),
                     ts_ms: perm_req.created_at_ms,
                     kind: pacode_types::TranscriptKind::Permission(perm_req.clone()),
                 };
@@ -163,11 +238,13 @@ impl ToolHost for SessionHost {
                     .events
                     .emit(pacode_types::Event::ItemAdded(perm_item.clone()));
 
-                let prev_status = agent_opt
+                let (prev_status, prev_activity) = agent_opt
                     .as_ref()
-                    .map(|a| a.status())
-                    .unwrap_or(pacode_types::AgentStatus::Idle);
-                let prev_activity = agent_opt.as_ref().and_then(|a| a.info().activity);
+                    .map(|agent| {
+                        let info = agent.info.read().unwrap_or_else(|p| p.into_inner());
+                        (info.status, info.activity.clone())
+                    })
+                    .unwrap_or((pacode_types::AgentStatus::Idle, None));
 
                 if let Some(agent) = &agent_opt {
                     agent.set_status(
@@ -182,46 +259,86 @@ impl ToolHost for SessionHost {
                 let cancel_token = agent_opt
                     .as_ref()
                     .and_then(|a| a.cancel.lock().unwrap_or_else(|p| p.into_inner()).clone());
+                let normalize = |decision: PermissionDecision, reason: Option<String>| {
+                    if reason.as_deref() == Some(crate::permissions::CANCELLED_BY_AGENT_REASON) {
+                        (
+                            PermissionDecision::Deny,
+                            Some("interrupted".to_string()),
+                            false,
+                        )
+                    } else {
+                        (decision, reason, true)
+                    }
+                };
 
-                // `biased` keeps the interrupt arm in front: when the token
-                // fired AND the sender was dropped by `cancel_for_agent`, the
-                // reason is "interrupted", not "aborted" — matching the
-                // `PermissionResolved` the cancel path already emitted.
-                let (decision, reason) = match cancel_token {
+                let (decision, reason, emit_resolution) = match cancel_token {
                     Some(token) => {
-                        tokio::select! {
-                            biased;
-                            _ = token.cancelled() => {
-                                self.session.permissions.cancel(&perm_id);
+                        let mut received = None;
+                        let cancelled = {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => true,
+                                res = &mut rx => {
+                                    received = Some(res);
+                                    false
+                                }
+                            }
+                        };
+                        if cancelled {
+                            if self.session.permissions.cancel(&perm_id) {
                                 (
                                     PermissionDecision::Deny,
                                     Some("interrupted".to_string()),
+                                    true,
                                 )
-                            }
-                            res = rx => res.unwrap_or_else(|_| {
+                            } else if let Ok((decision, reason)) = rx.try_recv() {
+                                normalize(decision, reason)
+                            } else {
                                 (
                                     PermissionDecision::Deny,
-                                    Some("permission request aborted".to_string()),
+                                    Some("interrupted".to_string()),
+                                    false,
                                 )
-                            }),
+                            }
+                        } else {
+                            match received {
+                                Some(Ok((decision, reason))) => normalize(decision, reason),
+                                Some(Err(_)) if token.is_cancelled() => (
+                                    PermissionDecision::Deny,
+                                    Some("interrupted".to_string()),
+                                    false,
+                                ),
+                                Some(Err(_)) => (
+                                    PermissionDecision::Deny,
+                                    Some("permission request aborted".to_string()),
+                                    true,
+                                ),
+                                None => (
+                                    PermissionDecision::Deny,
+                                    Some("permission request aborted".to_string()),
+                                    true,
+                                ),
+                            }
                         }
                     }
-                    None => rx.await.unwrap_or_else(|_| {
-                        (
+                    None => match rx.await {
+                        Ok((decision, reason)) => normalize(decision, reason),
+                        Err(_) => (
                             PermissionDecision::Deny,
                             Some("permission request aborted".to_string()),
-                        )
-                    }),
+                            true,
+                        ),
+                    },
                 };
 
-                // `PermissionResolved` + the transcript Permission cell →
-                // Notice, shared with `Session::cancel_permissions_for`.
-                self.session.emit_permission_resolution(
-                    &perm_req,
-                    Some(perm_item.seq),
-                    decision,
-                    reason.clone(),
-                );
+                if emit_resolution {
+                    self.session.emit_permission_resolution(
+                        &perm_req,
+                        Some(perm_item.seq),
+                        decision,
+                        reason.clone(),
+                    );
+                }
 
                 if decision == PermissionDecision::AllowSession {
                     self.session.permissions.allow_for_session(cache_key);
@@ -242,6 +359,13 @@ impl ToolHost for SessionHost {
             }
         }
     }
+}
+
+#[async_trait]
+impl ToolHost for SessionHost {
+    async fn request_permission(&self, draft: PermissionDraft) -> PermissionOutcome {
+        self.request_permission_inner(draft, false).await
+    }
 
     async fn ask_question(
         &self,
@@ -251,11 +375,21 @@ impl ToolHost for SessionHost {
         options: Vec<pacode_types::QuestionOption>,
         multi_select: bool,
     ) -> Result<pacode_types::QuestionAnswer, ToolError> {
-        let agent_id = self.agent.clone();
-        let agent_name = self
-            .session
-            .agent(&agent_id)
-            .map(|a| a.info().name)
+        let owner = self.owner_agent();
+        let agent_id = owner
+            .as_ref()
+            .map(|agent| agent.id())
+            .unwrap_or_else(|| self.agent.clone());
+        let agent_name = owner
+            .as_ref()
+            .map(|agent| {
+                agent
+                    .info
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .name
+                    .clone()
+            })
             .unwrap_or_else(|| "main".to_string());
 
         let question = pacode_types::Question::new(
@@ -274,11 +408,19 @@ impl ToolHost for SessionHost {
                 "too many questions are already waiting for an answer".to_string(),
             ));
         };
+        let cancelled_before_publish = owner
+            .as_ref()
+            .and_then(|agent| agent.cancel.lock().ok().and_then(|token| token.clone()))
+            .is_some_and(|token| token.is_cancelled());
+        if cancelled_before_publish {
+            self.session.cancel_questions_for(&agent_id);
+            return Ok(pacode_types::QuestionAnswer::cancelled());
+        }
 
         // The question goes into the transcript so the conversation shows what was
         // asked even after it is answered, and as an event so the client can put a
         // picker in front of the user.
-        let agent_opt = self.session.agent(&agent_id);
+        let agent_opt = owner;
         let item_seq = agent_opt
             .as_ref()
             .map(|a| {
@@ -403,18 +545,28 @@ impl ToolHost for SessionHost {
         Ok(())
     }
 
-    async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError> {
+    async fn spawn_task(&self, mut spec: TaskSpec) -> Result<TaskId, ToolError> {
+        if spec.session != self.session.id {
+            return Err(ToolError::Failed(
+                "task does not belong to this session".to_string(),
+            ));
+        }
+        spec.owner = self.owner_id();
         let info = self
             .session
             .tasks
             .spawn(spec)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
+        if let Err(error) = self.session.store.upsert_task(&info).await {
+            let _ = self.session.tasks.kill(&info.id).await;
+            return Err(ToolError::Failed(error.to_string()));
+        }
         Ok(info.id)
     }
 
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {
-        self.session.tasks.info(task)
+        self.task_info(task)
     }
 
     fn list_tasks(&self) -> Vec<TaskInfo> {
@@ -427,6 +579,9 @@ impl ToolHost for SessionHost {
         timeout: Duration,
         return_on_progress: bool,
     ) -> WaitOutcome {
+        if self.task_info(task).is_none() {
+            return WaitOutcome::Finished;
+        }
         let res = self
             .session
             .tasks
@@ -441,6 +596,9 @@ impl ToolHost for SessionHost {
     }
 
     async fn kill_task(&self, task: &TaskId) -> Result<(), ToolError> {
+        if self.task_info(task).is_none() {
+            return Err(ToolError::Failed("task not found".to_string()));
+        }
         self.session
             .tasks
             .kill(task)
@@ -449,6 +607,9 @@ impl ToolHost for SessionHost {
     }
 
     async fn task_tail(&self, task: &TaskId, lines: usize) -> Result<Vec<String>, ToolError> {
+        if self.task_info(task).is_none() {
+            return Err(ToolError::Failed("task not found".to_string()));
+        }
         self.session
             .tasks
             .tail(task, lines)
@@ -457,19 +618,87 @@ impl ToolHost for SessionHost {
     }
 
     fn report_task_progress(&self, task: &TaskId, progress: TaskProgress) -> Result<(), ToolError> {
+        if self.task_info(task).is_none() {
+            return Err(ToolError::Failed("task not found".to_string()));
+        }
         self.session
             .tasks
             .report_progress(task, progress)
             .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
-    async fn spawn_agent(&self, spec: AgentSpec) -> Result<AgentId, ToolError> {
+    async fn spawn_agent(&self, mut spec: AgentSpec) -> Result<AgentId, ToolError> {
         if self.session.zdr_active() {
-            return Err(ToolError::Denied(
-                "zdr_blocked: subagent spawning is disabled while zero-data-retention is active"
-                    .to_string(),
-            ));
+            return Err(zdr_denied_subagent());
         }
+        let requested_route = spec.model.take();
+        let owner = self
+            .owner_agent()
+            .ok_or_else(|| ToolError::failed("agent not found"))?;
+        let (owner_id, owner_name, owner_route) = {
+            let info = owner.info.read().unwrap_or_else(|p| p.into_inner());
+            (info.id.clone(), info.name.clone(), info.model.clone())
+        };
+        // The pair this spawn will be judged by: the orchestrator route it
+        // departs from, and the route the subagent would actually run on.
+        let authorized_from = owner_route;
+        let asked_route = requested_route
+            .clone()
+            .unwrap_or_else(|| authorized_from.clone());
+        if asked_route != authorized_from {
+            let outcome = self
+                .request_permission_inner(
+                    PermissionDraft {
+                        agent: owner_id.clone(),
+                        agent_name: owner_name,
+                        call_id: CallId::generate(),
+                        title: format!("Authorize subagent route {asked_route}"),
+                        detail: format!(
+                            "Subagent route {asked_route} differs from orchestrator route {authorized_from}"
+                        ),
+                        risk: None,
+                        tool_name: Some("agent.route".to_string()),
+                        tool_kind: Some(pacode_tools::ToolKind::Control),
+                    },
+                    true,
+                )
+                .await;
+            if outcome.decision == PermissionDecision::Deny {
+                return Err(ToolError::Denied(
+                    outcome
+                        .reason
+                        .unwrap_or_else(|| "subagent route change denied".to_string()),
+                ));
+            }
+        }
+
+        // Commit point. The user answers that prompt in their own time, and both
+        // the session route and the ZDR flag can move while it is open, so the
+        // decision above is re-read here — ZDR and route under one guard, with
+        // nothing awaited in between — and anything it does not cover is
+        // refused instead of spawned. A toggle landing after this point still
+        // fails closed downstream: `set_model` propagates to live subagents
+        // still on the old route, and the turn loop re-checks the ZDR flag
+        // before every provider call.
+        let effective_route = {
+            let meta = self.session.meta.read().unwrap_or_else(|p| p.into_inner());
+            if self.session.zdr_active() {
+                return Err(zdr_denied_subagent());
+            }
+            let current_route = meta.model.clone();
+            let effective = requested_route.unwrap_or_else(|| current_route.clone());
+            let covered = effective == current_route
+                || (current_route == authorized_from && effective == asked_route);
+            if !covered {
+                return Err(ToolError::Denied(format!(
+                    "session route changed from {authorized_from} to {current_route} while the \
+                     subagent route {effective} was being authorized; spawn again to confirm it"
+                )));
+            }
+            effective
+        };
+
+        spec.model = Some(effective_route);
         self.session
             .spawn_agent(spec)
             .await
@@ -477,7 +706,7 @@ impl ToolHost for SessionHost {
     }
 
     fn agent_info(&self, agent: &AgentId) -> Option<AgentInfo> {
-        self.session.agent(agent).map(|a| a.info())
+        self.session.agent_for_host(agent).map(|a| a.info())
     }
 
     fn list_agents(&self) -> Vec<AgentInfo> {
@@ -506,9 +735,14 @@ impl ToolHost for SessionHost {
     fn request_agent_status(&self, agent: &AgentId) -> Result<(), ToolError> {
         let target = self
             .session
-            .agent(agent)
+            .agent_for_host(agent)
             .ok_or_else(|| ToolError::failed(format!("agent not found: {agent}")))?;
-        if !target.info().status.is_live() {
+        let is_live = target
+            .info
+            .read()
+            .map(|info| info.status.is_live())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().status.is_live());
+        if !is_live {
             return Err(ToolError::failed(format!("agent {agent} is not running")));
         }
         target
@@ -519,8 +753,7 @@ impl ToolHost for SessionHost {
 
     fn report_status(&self, text: String) -> Result<(), ToolError> {
         let me = self
-            .session
-            .agent(&self.agent)
+            .owner_agent()
             .ok_or_else(|| ToolError::failed("agent not found"))?;
         let info = me.info();
         let parent_id = info
@@ -534,8 +767,8 @@ impl ToolHost for SessionHost {
         parent
             .injections
             .push(crate::inject::Injection::AgentStatus { agent: info, text });
-        if parent.id().is_main() && !parent.is_running() {
-            crate::turn::start_turn(self.session.clone(), parent);
+        if parent.id().is_main() {
+            crate::turn::lifecycle::request_turn(self.session.clone(), parent);
         }
         Ok(())
     }
@@ -567,7 +800,7 @@ impl ToolHost for SessionHost {
     }
 
     fn emit_preview(&self, call_id: &CallId, preview: String) {
-        if let Some(agent) = self.session.agent(&self.agent) {
+        if let Some(agent) = self.owner_agent() {
             let mut transcript = agent.transcript.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(item) = transcript.tool_items.get_mut(call_id) {
                 if let pacode_types::TranscriptKind::ToolCall {
@@ -587,7 +820,7 @@ impl ToolHost for SessionHost {
     }
 
     fn emit_notice(&self, level: ToastLevel, text: String) {
-        if let Some(agent) = self.session.agent(&self.agent) {
+        if let Some(agent) = self.owner_agent() {
             let seq = agent
                 .transcript
                 .lock()
@@ -595,7 +828,7 @@ impl ToolHost for SessionHost {
                 .next_seq();
             let item = pacode_types::TranscriptItem {
                 seq,
-                agent: self.agent.clone(),
+                agent: agent.id(),
                 ts_ms: pacode_types::now_ms(),
                 kind: pacode_types::TranscriptKind::Notice { level, text },
             };

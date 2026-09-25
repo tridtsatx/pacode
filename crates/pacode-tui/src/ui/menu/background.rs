@@ -8,7 +8,7 @@
 //! re-finds it every frame. The redraws those events trigger are the only
 //! refresh the level gets — no timer.
 //!
-//! The detail card's output tail is a §8.1 split: the draw records
+//! The detail card's output tail is a §8.1 split: frame preparation records
 //! [`tail_want`], `dispatch_deferred` runs [`read_tail`] on a blocking
 //! thread, and `view` only paints the `rail.task_tail` cache. `enter` opens
 //! the task's output in the side panel (`PanelTarget::Task`); `k` sends
@@ -58,8 +58,7 @@ pub fn view(state: &AppState, ui: &MenuUiState) -> MenuView {
     let glyphs = pacode_render::Glyphs::new(state.config.ui.ascii_only);
     view.rows = state
         .rail
-        .tasks
-        .iter()
+        .background_tasks()
         .map(|t| task_row(t, now, &glyphs))
         .collect();
 
@@ -111,6 +110,7 @@ pub fn on_row(
         follow: false,
         follow_paused: false,
     };
+    state.panel.scroll = 0;
     vec![Action::LoadPanel]
 }
 
@@ -140,8 +140,8 @@ pub fn on_action(
     vec![Action::Send(Request::KillTask(task.id.clone()))]
 }
 
-/// What the detail card needs for the current selection — recorded by the
-/// draw path into `rail.task_tail_want` (`overlays::draw`); `None` while
+/// What the detail card needs for the current selection — recorded by frame
+/// preparation into `rail.task_tail_want`; `None` while
 /// the cursor rests on nothing or the task reports no output yet.
 /// `output_bytes` doubles as the version: a `TaskUpdated` carrying more
 /// output re-keys the want and re-arms the read by itself.

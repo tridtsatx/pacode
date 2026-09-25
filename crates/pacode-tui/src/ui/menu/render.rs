@@ -36,7 +36,16 @@ pub fn draw(
     ui: &MenuUiState,
     opts: &RenderOptions,
 ) {
-    let rect = overlay_area(area, view, ui);
+    draw_in(frame, overlay_area(area, view, ui), view, ui, opts)
+}
+
+pub fn draw_in(
+    frame: &mut Frame,
+    rect: Rect,
+    view: &MenuView,
+    ui: &MenuUiState,
+    opts: &RenderOptions,
+) {
     if rect.is_empty() {
         return;
     }

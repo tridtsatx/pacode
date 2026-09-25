@@ -8,15 +8,41 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use pacode_render::{RenderOptions, truncate_to_width};
+use pacode_types::AgentId;
 use pacode_types::state::{AgentStatus, PlanStatus};
 use pacode_types::time::{format_duration_ms, format_tokens, now_ms};
 
-use crate::layout::{RailDemand, compute_rail};
-use crate::state::{AppState, Focus};
+use crate::layout::{RailDemand, RailLayout, compute_rail};
+use crate::state::{AppState, Focus, Overlay};
+use crate::ui::overlays::selected_row;
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOptions) {
+enum AgentSelection {
+    Index(usize),
+    Id(AgentId),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedRail {
+    pub(crate) layout: RailLayout,
+    pub(crate) select_mode: bool,
+    pub(crate) show_session: bool,
+    pub(crate) has_subagents: bool,
+    pub(crate) selected_main: bool,
+    pub(crate) selected_subagent: Option<usize>,
+    pub(crate) agents_scroll: usize,
+}
+
+pub(crate) fn resolve(state: &AppState, area: Rect) -> Option<PreparedRail> {
+    resolve_from(state, area, state.rail.agents_scroll)
+}
+
+pub(crate) fn resolve_from(
+    state: &AppState,
+    area: Rect,
+    stored_scroll: usize,
+) -> Option<PreparedRail> {
     if area.width == 0 || area.height == 0 {
-        return;
+        return None;
     }
 
     let plan_lines = if state.rail.plan.is_empty() {
@@ -50,27 +76,110 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
         schedule_lines
     };
 
-    let select_mode = matches!(state.focus, Focus::SelectAgent { .. });
-    let show_session = state.rail.show_session_stats && state.rail.usage.turns > 0;
-    let demand = RailDemand {
-        plan_lines,
-        background_lines: bg_lines,
-        session_lines: 8,
-        agent_select_mode: select_mode,
-        idle: show_session,
-        anchor_y: None,
+    let selection = match &state.focus {
+        Focus::SelectAgent { index } => Some(AgentSelection::Index(*index)),
+        Focus::Overlay(Overlay::RailOverlay { selected }) => {
+            Some(AgentSelection::Id(selected.clone()))
+        }
+        Focus::Normal | Focus::Panel { .. } | Focus::Overlay(_) => None,
     };
+    let select_mode = selection.is_some();
+    let show_session = state.rail.show_session_stats && state.rail.usage.turns > 0;
+    let layout = compute_rail(
+        area,
+        RailDemand {
+            plan_lines,
+            background_lines: bg_lines,
+            session_lines: 8,
+            agent_select_mode: select_mode,
+            idle: show_session,
+            anchor_y: None,
+        },
+    );
+    let subagent_count = state
+        .rail
+        .agents
+        .iter()
+        .filter(|agent| !agent.id.is_main())
+        .count();
+    let (selected_main, selected_subagent) = match &selection {
+        Some(selection) => selected_positions(
+            &crate::nav::selectable_agents(state),
+            selection,
+            subagent_count,
+        ),
+        None => (false, None),
+    };
+    let mut agents_scroll = stored_scroll;
+    if let Some(selected_idx) = selected_subagent
+        && layout.agents.height >= 4
+    {
+        let remaining = (layout.agents.height as usize).saturating_sub(2);
+        let selected_height = 3.min(remaining);
+        if selected_idx < agents_scroll {
+            agents_scroll = selected_idx;
+        } else if selected_idx + selected_height > agents_scroll + remaining {
+            agents_scroll = selected_idx + selected_height - remaining;
+        }
+    }
 
-    let layout = compute_rail(area, demand);
+    Some(PreparedRail {
+        layout,
+        select_mode,
+        show_session,
+        has_subagents: state.rail.agents.iter().any(|a| !a.id.is_main()),
+        selected_main,
+        selected_subagent,
+        agents_scroll,
+    })
+}
 
-    let has_subagents = state.rail.agents.iter().any(|a| !a.id.is_main());
+pub(crate) fn persist(state: &mut AppState, prepared: &PreparedRail) {
+    if prepared.selected_subagent.is_some() && prepared.layout.agents.height >= 4 {
+        state.rail.agents_scroll = prepared.agents_scroll;
+    }
+}
+
+pub(crate) fn draw(
+    frame: &mut Frame,
+    prepared: &PreparedRail,
+    state: &AppState,
+    opts: &RenderOptions,
+) {
+    let PreparedRail {
+        layout,
+        select_mode,
+        show_session,
+        has_subagents,
+        selected_main,
+        selected_subagent,
+        agents_scroll,
+    } = *prepared;
 
     draw_header(frame, layout.header, state, opts);
     draw_plan(frame, layout.plan, state, opts, select_mode);
-    if show_session {
+    if select_mode {
+        draw_agents(
+            frame,
+            layout.agents,
+            state,
+            opts,
+            selected_main,
+            selected_subagent,
+            agents_scroll,
+        );
+    } else if show_session {
         crate::ui::rail_session::draw_session(frame, layout.agents, state, opts);
     } else if has_subagents {
-        draw_agents(frame, layout.agents, state, opts, select_mode);
+        draw_agents(
+            frame,
+            layout.agents,
+            state,
+            opts,
+            false,
+            None,
+            agents_scroll,
+        );
     }
     if layout.background.height > 0 {
         crate::ui::rail_session::draw_background(frame, layout.background, state, opts);
@@ -202,9 +311,11 @@ fn agent_dot(
 fn draw_agents(
     frame: &mut Frame,
     area: Rect,
-    state: &mut AppState,
+    state: &AppState,
     opts: &RenderOptions,
-    select_mode: bool,
+    selected_main: bool,
+    selected_subagent: Option<usize>,
+    agents_scroll: usize,
 ) {
     if area.height == 0 {
         return;
@@ -245,12 +356,18 @@ fn draw_agents(
         Span::styled(opts.glyphs.main_dot, main_dot_style),
     ]));
 
+    let subagents: Vec<_> = state
+        .session
+        .rail
+        .agents
+        .iter()
+        .filter(|a| !a.id.is_main())
+        .collect();
+
     let now = now_ms();
     // The rail says the same thing as the activity line: whatever the main agent
     // is really doing, aged from the same phase start, in whole seconds.
-    let main_line = if let Some((phase, _)) =
-        state.phase.as_ref().filter(|_| state.turn_active)
-    {
+    let main_line = if let Some((phase, _)) = state.phase.as_ref().filter(|_| state.turn_active) {
         let elapsed = state.phase_elapsed_ms;
         let dur_str = crate::state::activity::format_activity_secs(
             crate::state::activity::displayed_secs(elapsed),
@@ -269,30 +386,16 @@ fn draw_agents(
             Span::styled("main", opts.theme.bold),
         ])
     };
-    lines.push(main_line);
-
-    let subagents: Vec<_> = state
-        .rail
-        .agents
-        .iter()
-        .filter(|a| !a.id.is_main())
-        .collect();
+    lines.push(if selected_main {
+        selected_row(main_line, area.width, opts)
+    } else {
+        main_line
+    });
 
     let rem_h = (area.height as usize).saturating_sub(lines.len());
 
-    if select_mode {
-        let selected_idx = match state.focus {
-            Focus::SelectAgent { index } => index,
-            _ => 0,
-        };
-
-        if selected_idx >= state.rail.agents_scroll + rem_h.saturating_sub(3) {
-            state.rail.agents_scroll = selected_idx.saturating_sub(rem_h.saturating_sub(3));
-        } else if selected_idx < state.rail.agents_scroll {
-            state.rail.agents_scroll = selected_idx;
-        }
-
-        for (i, agent) in subagents.iter().enumerate().skip(state.rail.agents_scroll) {
+    if let Some(selected_idx) = selected_subagent {
+        for (i, agent) in subagents.iter().enumerate().skip(agents_scroll) {
             if lines.len() >= area.height as usize {
                 break;
             }
@@ -403,3 +506,29 @@ fn draw_agents(
 
     frame.render_widget(Paragraph::new(lines), area);
 }
+
+fn selected_positions(
+    agents: &[AgentId],
+    selection: &AgentSelection,
+    subagent_count: usize,
+) -> (bool, Option<usize>) {
+    match selection {
+        AgentSelection::Index(index) => (
+            *index == 0,
+            index.checked_sub(1).filter(|index| *index < subagent_count),
+        ),
+        AgentSelection::Id(selected) => {
+            let Some(index) = agents.iter().position(|agent| agent == selected) else {
+                return (false, None);
+            };
+            (
+                selected.is_main(),
+                index.checked_sub(1).filter(|index| *index < subagent_count),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "rail_tests.rs"]
+mod rail_tests;

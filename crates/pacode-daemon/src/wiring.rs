@@ -1,7 +1,8 @@
 //! Build the core from config and paths.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use pacode_core::{Core, CoreDeps};
 use pacode_exec::TaskManager;
@@ -9,11 +10,39 @@ use pacode_mcp::McpPool;
 use pacode_plugin::{PluginHost, UiSink};
 use pacode_provider::mock::MockResponse;
 use pacode_provider::{MockProvider, ProviderRegistry};
-use pacode_store::Store;
+use pacode_store::{Store, StoreError};
 use pacode_tools::builtin_tools;
 use pacode_types::ModelRoute;
 
 use crate::{DaemonError, DaemonOptions};
+
+fn store_registry() -> &'static std::sync::Mutex<HashMap<PathBuf, Store>> {
+    static REGISTRY: OnceLock<std::sync::Mutex<HashMap<PathBuf, Store>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The one [`Store`] worker per database file in this process. The core and the
+/// daemon's attach-admission path both take a handle here instead of opening a
+/// second connection to the same file; `release_store` drops the entry once the
+/// daemon that owns it is gone.
+pub fn shared_store(path: &Path) -> Result<Store, StoreError> {
+    let mut registry = store_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(store) = registry.get(path) {
+        return Ok(store.clone());
+    }
+    let store = Store::open(path)?;
+    registry.insert(path.to_path_buf(), store.clone());
+    Ok(store)
+}
+
+pub fn release_store(path: &Path) {
+    let mut registry = store_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.remove(path);
+}
 
 struct DaemonUiSink {
     core: Arc<std::sync::RwLock<Option<std::sync::Weak<Core>>>>,
@@ -57,6 +86,16 @@ impl UiSink for DaemonUiSink {
 /// route (`mock/mock-model`) — used by `pacode run --json` smoke tests.
 pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> {
     opts.paths.ensure_dirs().map_err(DaemonError::Io)?;
+
+    // The provider governors take their ceiling from a process-wide atomic that
+    // every request reads, so this is the one config limit the daemon applies
+    // for real. `pacode-config` clamps the value into the range the runtime
+    // accepts on load; the runtime stays the authority on what it takes.
+    let concurrency = usize::try_from(opts.config.limits.max_provider_concurrency)
+        .unwrap_or(pacode_provider::DEFAULT_PROVIDER_CONCURRENCY);
+    if let Err(error) = pacode_provider::set_provider_concurrency_ceiling(concurrency) {
+        log::warn!("provider concurrency {concurrency} rejected by the runtime: {error}");
+    }
 
     let mut api_keys = BTreeMap::new();
     for (id, pcfg) in &opts.config.providers {
@@ -152,7 +191,7 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
 
     let mcp = McpPool::new(mcp_servers, Some(opts.paths.mcp_cache_dir()), None);
     mcp.set_idle_timeout_secs(opts.config.mcp.idle_timeout_secs);
-    let store = Store::open(&opts.paths.db_file()).map_err(DaemonError::Store)?;
+    let store = shared_store(&opts.paths.db_file()).map_err(DaemonError::Store)?;
 
     let deps = CoreDeps {
         config: Arc::clone(&opts.config),
@@ -183,4 +222,60 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
     );
 
     Ok(core)
+}
+
+#[cfg(test)]
+mod store_tests {
+    use std::path::Path;
+
+    use pacode_types::SessionId;
+
+    use super::{release_store, shared_store};
+
+    fn open_db_handles(path: &Path) -> Option<usize> {
+        let entries = std::fs::read_dir("/proc/self/fd").ok()?;
+        let target = std::fs::canonicalize(path).ok()?;
+        Some(
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    std::fs::read_link(entry.path())
+                        .ok()
+                        .and_then(|link| std::fs::canonicalize(link).ok())
+                        .is_some_and(|open| open == target)
+                })
+                .count(),
+        )
+    }
+
+    #[tokio::test]
+    async fn shared_store_is_one_worker_per_database_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shared.sqlite");
+        let missing = SessionId::new("missing");
+
+        let first = shared_store(&path).unwrap();
+        let Some(opened) = open_db_handles(&path) else {
+            return;
+        };
+        assert_eq!(opened, 1, "shared_store opened {opened} handles");
+
+        let second = shared_store(&path).unwrap();
+        assert_eq!(
+            open_db_handles(&path),
+            Some(opened),
+            "a second worker was opened on the same file"
+        );
+        assert!(first.get_session(&missing).await.is_ok());
+        assert!(second.get_session(&missing).await.is_ok());
+
+        drop(first);
+        drop(second);
+        release_store(&path);
+        let reopened = shared_store(&path).unwrap();
+        assert!(
+            reopened.get_session(&missing).await.is_ok(),
+            "a released entry handed out a dead worker"
+        );
+    }
 }

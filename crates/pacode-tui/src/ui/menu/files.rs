@@ -115,8 +115,8 @@ pub fn on_action(
     vec![]
 }
 
-/// What the detail card needs for the current selection — recorded by the
-/// draw path into `files.preview_want`; `None` while the cursor rests on
+/// What the detail card needs for the current selection — recorded by frame
+/// preparation into `files.preview_want`; `None` while the cursor rests on
 /// nothing (empty or fully filtered list).
 pub fn preview_want(view: &MenuView, ui: &MenuUiState) -> Option<PreviewKey> {
     let sel = resolve_cursor(&view.rows, &ui.cursor)?;
@@ -183,12 +183,21 @@ fn group_by_dir(rows: &[FileRow]) -> Vec<(String, Vec<&FileRow>)> {
     }
     for files in map.values_mut() {
         files.sort_by(|a, b| {
-            file_name(&a.path)
-                .cmp(file_name(&b.path))
+            b.last_ts_ms
+                .cmp(&a.last_ts_ms)
+                .then_with(|| file_name(&a.path).cmp(file_name(&b.path)))
                 .then_with(|| a.path.cmp(&b.path))
         });
     }
-    map.into_iter().collect()
+    let mut groups: Vec<(String, Vec<&FileRow>)> = map.into_iter().collect();
+    groups.sort_by(|a, b| {
+        b.1.iter()
+            .map(|row| row.last_ts_ms)
+            .max()
+            .cmp(&a.1.iter().map(|row| row.last_ts_ms).max())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    groups
 }
 
 /// Whether a path carries a supported image extension (case-insensitive) —

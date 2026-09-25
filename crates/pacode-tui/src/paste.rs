@@ -5,8 +5,8 @@ use std::time::Instant;
 use pacode_types::ToastLevel;
 
 use crate::clipboard_read::{
-    ClipboardImageResult, ClipboardPlatform, CommandRunner, SystemCommandRunner, read_image_data,
-    read_text_data,
+    ClipboardImageResult, ClipboardPlatform, CommandRunner, IMAGE_PASTE_MAX_BYTES,
+    SystemCommandRunner, read_image_data, read_text_data,
 };
 use crate::keys::Action;
 use crate::state::input::char_to_byte_index;
@@ -42,20 +42,32 @@ pub fn handle_paste_clipboard_with_runner(
     platform: ClipboardPlatform,
     now: Instant,
 ) -> Vec<Action> {
-    if let ClipboardImageResult::Image(_) = read_image_data(runner, platform) {
-        return handle_paste_image_with_runner(state, true, runner, platform, now);
-    }
-    match read_text_data(runner, platform) {
-        Some(text) => handle_paste_with_runner(state, text, runner, platform, now),
-        None => {
-            state.push_toast(
-                ToastLevel::Info,
-                "Clipboard is empty".to_string(),
-                None,
-                now,
-            );
-            vec![]
+    match read_image_data(runner, platform) {
+        ClipboardImageResult::Image(bytes) => {
+            if matches!(state.focus, Focus::Overlay(_)) {
+                log::warn!("paste image rejected: overlay active");
+                state.push_toast(
+                    ToastLevel::Warn,
+                    "Cannot paste image".to_string(),
+                    Some("Close the open overlay before pasting images".to_string()),
+                    now,
+                );
+                return vec![];
+            }
+            handle_paste_image_bytes(state, bytes, now)
         }
+        _ => match read_text_data(runner, platform) {
+            Some(text) => handle_paste_with_runner(state, text, runner, platform, now),
+            None => {
+                state.push_toast(
+                    ToastLevel::Info,
+                    "Clipboard is empty".to_string(),
+                    None,
+                    now,
+                );
+                vec![]
+            }
+        },
     }
 }
 
@@ -113,7 +125,7 @@ pub fn handle_paste_with_runner(
             vec![]
         }
         Focus::Overlay(Overlay::Menu { ui, .. }) if menu_takes_paste => {
-            let flattened = flatten_single_line(&text);
+            let flattened = flatten_single_line(&text, PASTE_MAX_CHARS);
             match &mut ui.mode {
                 crate::ui::menu::MenuMode::Edit { buffer, cursor } => {
                     let count = flattened.chars().count();
@@ -157,28 +169,66 @@ pub fn handle_paste_with_runner(
 
 /// Pastes text into an overlay's single-line filter box.
 fn paste_into_filter(query: &mut String, index: &mut usize, text: &str) {
-    let flattened = flatten_single_line(text);
+    let flattened = flatten_single_line(text, FILTER_MAX_CHARS);
     let available = FILTER_MAX_CHARS.saturating_sub(query.chars().count());
     let to_insert: String = flattened.chars().take(available).collect();
     query.push_str(&to_insert);
     *index = 0;
 }
 
-/// Flattens multi-line text into a single line suitable for filter boxes.
-fn flatten_single_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+fn flatten_single_line(text: &str, cap: usize) -> String {
+    let mut out = String::new();
+    let mut kept = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            if kept == cap {
+                break;
+            }
+            out.push(' ');
+            kept += 1;
+        }
+        for ch in line.chars() {
+            if kept == cap {
+                break;
+            }
+            out.push(ch);
+            kept += 1;
+        }
+    }
+    out
+}
+
+fn normalize_paste_prefix(text: &str, cap: usize) -> (String, usize, bool) {
+    let mut out = String::new();
+    let mut kept = 0usize;
+    let mut total = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let ch = if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            '\n'
+        } else {
+            ch
+        };
+        total += 1;
+        if kept < cap {
+            out.push(ch);
+            kept += 1;
+        }
+    }
+    (out, total, total > cap)
 }
 
 /// Pastes text into `state.input`, enforcing size caps and respecting vim mode.
 fn paste_into_prompt(state: &mut AppState, text: String, now: Instant) {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let total_chars = normalized.chars().count();
-
-    let paste_content = if total_chars > PASTE_MAX_CHARS {
+    let (paste_content, total_chars, truncated) = normalize_paste_prefix(&text, PASTE_MAX_CHARS);
+    if truncated {
         log::warn!("pasted text truncated from {total_chars} to {PASTE_MAX_CHARS} chars");
         state.push_toast(
             ToastLevel::Warn,
@@ -186,13 +236,14 @@ fn paste_into_prompt(state: &mut AppState, text: String, now: Instant) {
             Some(format!("Original was {total_chars} chars")),
             now,
         );
-        normalized.chars().take(PASTE_MAX_CHARS).collect()
-    } else {
-        normalized
-    };
+    }
 
     if state.config.ui.vim && state.focus == Focus::Normal {
-        apply_vim_paste(&mut state.vim, &mut state.input, &paste_content);
+        apply_vim_paste(
+            &mut state.session.vim,
+            &mut state.session.input,
+            &paste_content,
+        );
     } else {
         state.input.insert_str(&paste_content);
     }
@@ -272,7 +323,6 @@ pub fn handle_paste_image_with_runner(
     platform: ClipboardPlatform,
     now: Instant,
 ) -> Vec<Action> {
-    // If an overlay is active, pasting an image into it is invalid.
     if matches!(state.focus, Focus::Overlay(_)) {
         log::warn!("paste image rejected: overlay active");
         if explicit {
@@ -286,39 +336,8 @@ pub fn handle_paste_image_with_runner(
         return vec![];
     }
 
-    let result = read_image_data(runner, platform);
-
-    match result {
-        ClipboardImageResult::Image(bytes) => match state.pasted_images.create_image_file(&bytes) {
-            Ok(record) => {
-                let token = format!("{} ", record.token_label());
-                if state.config.ui.vim && state.focus == Focus::Normal {
-                    apply_vim_paste(&mut state.vim, &mut state.input, &token);
-                } else {
-                    state.input.insert_str(&token);
-                }
-                state.push_toast_linked(
-                    ToastLevel::Info,
-                    format!("Image pasted as {}", record.token_label()),
-                    Some(
-                        "Sent as an image attachment with the prompt; remove the token to discard."
-                            .to_string(),
-                    ),
-                    now,
-                    record.token_label(),
-                );
-                state.dirty = true;
-            }
-            Err(err) => {
-                log::warn!("clipboard image paste failed to save file: {err}");
-                state.push_toast(
-                    ToastLevel::Error,
-                    "Failed to save pasted image".to_string(),
-                    Some(err.to_string()),
-                    now,
-                );
-            }
-        },
+    match read_image_data(runner, platform) {
+        ClipboardImageResult::Image(bytes) => handle_paste_image_bytes(state, bytes, now),
         ClipboardImageResult::NoImage => {
             log::debug!("clipboard image paste: no image found in clipboard");
             if explicit {
@@ -329,6 +348,7 @@ pub fn handle_paste_image_with_runner(
                     now,
                 );
             }
+            vec![]
         }
         ClipboardImageResult::HelperMissing(msg) => {
             log::warn!("clipboard image paste failed: helper missing: {msg}");
@@ -340,9 +360,54 @@ pub fn handle_paste_image_with_runner(
                     now,
                 );
             }
+            vec![]
         }
     }
+}
 
+fn handle_paste_image_bytes(state: &mut AppState, bytes: Vec<u8>, now: Instant) -> Vec<Action> {
+    if bytes.len() > IMAGE_PASTE_MAX_BYTES {
+        state.push_toast(
+            ToastLevel::Warn,
+            "Pasted image is too large".to_string(),
+            Some(format!(
+                "Maximum image size is {} bytes",
+                IMAGE_PASTE_MAX_BYTES
+            )),
+            now,
+        );
+        return vec![];
+    }
+    match state.pasted_images.create_image_file(&bytes) {
+        Ok(record) => {
+            let token = format!("{} ", record.token_label());
+            if state.config.ui.vim && state.focus == Focus::Normal {
+                apply_vim_paste(&mut state.session.vim, &mut state.session.input, &token);
+            } else {
+                state.input.insert_str(&token);
+            }
+            state.push_toast_linked(
+                ToastLevel::Info,
+                format!("Image pasted as {}", record.token_label()),
+                Some(
+                    "Sent as an image attachment with the prompt; remove the token to discard."
+                        .to_string(),
+                ),
+                now,
+                record.token_label(),
+            );
+            state.dirty = true;
+        }
+        Err(err) => {
+            log::warn!("clipboard image paste failed to save file: {err}");
+            state.push_toast(
+                ToastLevel::Error,
+                "Failed to save pasted image".to_string(),
+                Some(err.to_string()),
+                now,
+            );
+        }
+    }
     vec![]
 }
 

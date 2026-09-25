@@ -164,6 +164,14 @@ fn test_apply_diff_accumulates_and_marks_existing() {
 }
 
 #[test]
+fn an_out_of_order_touch_does_not_make_a_file_look_older() {
+    let mut files = FilesState::new();
+    files.observe_tool_item("read", &json!({"path": "a.rs"}), 200);
+    files.observe_tool_item("read", &json!({"path": "a.rs"}), 100);
+    assert_eq!(files.rows[0].last_ts_ms, 200);
+}
+
+#[test]
 fn test_apply_diff_ignores_reads_and_missing_rows() {
     let mut files = FilesState::new();
     files.observe_tool_item("read", &json!({"path": "src/main.rs"}), 100);

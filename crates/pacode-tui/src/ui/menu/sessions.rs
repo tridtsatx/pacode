@@ -148,9 +148,12 @@ pub fn on_row(
     }
     log::debug!("close menu: Sessions → resume {row}");
     while stack.pop().is_some() {}
-    vec![Action::Send(Request::Attach(Attach::Resume {
+    let attach = Attach::Resume {
         session: SessionId::new(row.as_str()),
-    }))]
+    };
+    state.leave_active_slot();
+    state.begin_attach(attach.clone());
+    vec![Action::SwitchSession { attach }]
 }
 
 /// Refresh-on-open — the `ListSessions` the legacy picker sent; `lists`

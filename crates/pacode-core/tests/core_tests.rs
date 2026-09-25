@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,9 +12,11 @@ use pacode_store::Store;
 use pacode_tools::host::PermissionDraft;
 use pacode_tools::{AgentSpec, Tool, ToolCtx, ToolError, ToolKind, ToolOutput, ToolRegistry};
 use pacode_types::{
-    Attach, Config, ContentBlock, Event, Mode, ModelRoute, PermissionDecision, QuestionAnswer,
-    Request, RiskLevel, Role, SessionId, SessionStatusKind, ToolStatus, TranscriptKind, TurnStop,
+    AgentId, Attach, Config, ContentBlock, Event, Mode, ModelRoute, PermissionDecision,
+    ProgressSource, QuestionAnswer, Reply, Request, RiskLevel, Role, SessionId, SessionStatusKind,
+    TaskProgress, ToolStatus, TranscriptKind, TurnStop,
 };
+use tokio::sync::Barrier;
 
 struct StubBash;
 #[async_trait::async_trait]
@@ -324,6 +327,7 @@ async fn test_01_text_only_turn() {
         Request::UserMessage {
             text: "Hello assistant".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -400,6 +404,7 @@ async fn test_02_tool_turn_bypass_mode() {
         Request::UserMessage {
             text: "run bash".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -446,6 +451,168 @@ async fn test_02_tool_turn_bypass_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn user_steer_during_tool_call_commits_after_tool_result() {
+    let (core, mock, tmp) = setup_test_core().await;
+    let session_id = core
+        .open_session(Attach::New {
+            cwd: tmp.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: Some(Mode::Build),
+        })
+        .await
+        .unwrap();
+    core.session(&session_id)
+        .unwrap()
+        .meta
+        .write()
+        .unwrap()
+        .name = Some("Steer test".into());
+
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![(
+            "write".into(),
+            serde_json::json!({"path": "steer.txt", "content": "done"}),
+        )],
+    });
+    mock.push(MockResponse::Text("finished after steer".into()));
+
+    let mut rx = core.subscribe(&session_id).unwrap();
+    assert!(matches!(
+        core.handle(
+            &session_id,
+            Request::UserMessage {
+                text: "start tool call".into(),
+                images: Vec::new(),
+                message_id: Some("msg-tool-call".into()),
+            },
+        )
+        .await,
+        Reply::Ok
+    ));
+
+    let permission_id = {
+        let timeout = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                _ = &mut timeout => panic!("timed out waiting for permission request"),
+                res = rx.recv() => {
+                    if let Ok((_seq, Event::PermissionRequested(request))) = res {
+                        break request.id;
+                    }
+                }
+            }
+        }
+    };
+
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    assert!(matches!(
+        core.handle(
+            &session_id,
+            Request::UserMessage {
+                text: "change direction".into(),
+                images: Vec::new(),
+                message_id: Some("msg-tool-steer".into()),
+            },
+        )
+        .await,
+        Reply::Ok
+    ));
+
+    {
+        let history = main.history.lock().unwrap();
+        assert_eq!(history.messages.len(), 2);
+        assert_eq!(history.messages[0].role, Role::User);
+        assert_eq!(history.messages[1].role, Role::Assistant);
+        assert!(history.messages[1].has_tool_uses());
+        assert!(
+            history
+                .messages
+                .iter()
+                .all(|message| message.text() != "change direction")
+        );
+    }
+    assert!(!main.injections.is_empty());
+
+    assert!(matches!(
+        core.handle(
+            &session_id,
+            Request::PermissionReply {
+                permission: permission_id,
+                decision: PermissionDecision::AllowOnce,
+                reason: None,
+            },
+        )
+        .await,
+        Reply::Ok
+    ));
+
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+    let mut completed_turns = 0;
+    loop {
+        tokio::select! {
+            _ = &mut timeout => panic!("timed out waiting for turn completion"),
+            res = rx.recv() => {
+                if let Ok((_seq, Event::TurnEnded { stop, .. })) = res {
+                    assert_eq!(stop, TurnStop::Completed);
+                    completed_turns += 1;
+                    if completed_turns == 2 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let steer_requests = requests
+        .iter()
+        .filter(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.role == Role::User && message.text() == "change direction")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(steer_requests.len(), 1);
+    let next = steer_requests[0];
+    let tool_use_index = next
+        .messages
+        .iter()
+        .position(|message| message.tool_uses().any(|(_, name, _)| name == "write"))
+        .expect("tool_use must reach the next provider request");
+    let tool_result_index = next
+        .messages
+        .iter()
+        .position(|message| message.role == Role::Tool)
+        .expect("tool_result must reach the next provider request");
+    let steer_index = next
+        .messages
+        .iter()
+        .position(|message| message.role == Role::User && message.text() == "change direction")
+        .expect("steer must reach the next provider request");
+    assert_eq!(tool_result_index, tool_use_index + 1);
+    assert_eq!(steer_index, tool_result_index + 1);
+    assert_eq!(
+        next.messages
+            .iter()
+            .filter(|message| message.role == Role::User && message.text() == "change direction")
+            .count(),
+        1
+    );
+    assert!(
+        next.messages
+            .iter()
+            .all(|message| !message.text().contains("<user_message>"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_03_permission_ask_in_build_mode() {
     let (core, mock, _tmp) = setup_test_core().await;
     let cwd = _tmp.path().to_path_buf();
@@ -479,16 +646,16 @@ async fn test_03_permission_ask_in_build_mode() {
         Request::UserMessage {
             text: "write out.txt".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
 
-    let timeout = tokio::time::sleep(Duration::from_secs(3));
-    tokio::pin!(timeout);
-
     let perm_id = loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for permission request"),
+            _ = &mut deadline => panic!("timed out waiting for permission request"),
             res = rx.recv() => {
                 let (_seq, event) = res.unwrap();
                 if let Event::PermissionRequested(req) = event {
@@ -508,8 +675,10 @@ async fn test_03_permission_ask_in_build_mode() {
     .await;
 
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for turn to finish"),
+            _ = &mut deadline => panic!("timed out waiting for turn to finish"),
             res = rx.recv() => {
                 let (_seq, event) = res.unwrap();
                 if let Event::TurnEnded { .. } = event {
@@ -557,6 +726,7 @@ async fn test_04_injection_at_point_d() {
         Request::UserMessage {
             text: "start background task".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -643,6 +813,7 @@ async fn test_05_subagent_spawn_and_finish() {
         Request::UserMessage {
             text: "delegate work".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -721,16 +892,16 @@ async fn test_06_interrupt_mid_stream() {
         Request::UserMessage {
             text: "long request".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
 
-    let timeout = tokio::time::sleep(Duration::from_secs(2));
-    tokio::pin!(timeout);
-
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => panic!("timed out waiting for delta"),
+            _ = &mut deadline => panic!("timed out waiting for delta"),
             res = rx.recv() => {
                 if let Ok((_seq, Event::TextDelta { .. })) = res {
                     break;
@@ -743,8 +914,10 @@ async fn test_06_interrupt_mid_stream() {
 
     let mut saw_interrupted = false;
     loop {
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
         tokio::select! {
-            _ = &mut timeout => break,
+            _ = &mut deadline => break,
             res = rx.recv() => {
                 if let Ok((_seq, Event::TurnEnded { stop, .. })) = res
                     && stop == TurnStop::Interrupted
@@ -800,6 +973,7 @@ async fn interrupt_during_permission_wait_denies_and_unwinds() {
         Request::UserMessage {
             text: "write a file".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -905,6 +1079,7 @@ async fn explain_permission_runs_detached_and_broadcasts() {
         Request::UserMessage {
             text: "write out.txt".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -1039,6 +1214,7 @@ async fn tool_call_args_stream_into_the_transcript_cell() {
         Request::UserMessage {
             text: "run bash".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -1172,6 +1348,7 @@ async fn session_status_marks_turn_working_then_done() {
         Request::UserMessage {
             text: "go".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -1206,6 +1383,7 @@ async fn session_status_needs_input_on_pending_permission() {
         Request::UserMessage {
             text: "write it".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -1267,6 +1445,7 @@ async fn session_status_needs_input_on_pending_question() {
         Request::UserMessage {
             text: "ask me".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -1323,6 +1502,7 @@ async fn session_status_reports_other_sessions() {
         Request::UserMessage {
             text: "go".into(),
             images: Vec::new(),
+            message_id: None,
         },
     )
     .await;
@@ -1338,4 +1518,304 @@ async fn session_status_reports_other_sessions() {
     );
     // And A stayed silent on the stream.
     assert_ne!(session_a, session_b);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preallocated_new_attach_reuses_the_same_session() {
+    let (core, _mock, tmp) = setup_test_core().await;
+    let attach = Attach::New {
+        cwd: tmp.path().to_path_buf(),
+        model: Some(ModelRoute::new("mock", "mock-model")),
+        effort: None,
+        mode: None,
+    };
+    let session_id = SessionId::new("pacode-attach-test-idempotent");
+
+    let first = core
+        .open_session_with_id(attach.clone(), session_id.clone())
+        .await
+        .unwrap();
+    let second = core
+        .open_session_with_id(attach, session_id.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(first, session_id);
+    assert_eq!(second, session_id);
+    assert_eq!(
+        core.session_ids()
+            .into_iter()
+            .filter(|id| id == &session_id)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preallocated_latest_attach_stays_bound_after_newer_session() {
+    let (core, _mock, tmp) = setup_test_core().await;
+    let first = core
+        .open_session(Attach::New {
+            cwd: tmp.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let identity = SessionId::new("pacode-attach-test-latest-idempotent");
+    let bound = core
+        .open_session_with_id(
+            Attach::Latest {
+                cwd: tmp.path().to_path_buf(),
+            },
+            identity.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, first);
+
+    let first_updated_at = core.session(&first).unwrap().meta().updated_at_ms;
+    while pacode_types::now_ms() <= first_updated_at {
+        tokio::task::yield_now().await;
+    }
+    let newer = core
+        .open_session(Attach::New {
+            cwd: tmp.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        core.open_session(Attach::Latest {
+            cwd: tmp.path().to_path_buf(),
+        })
+        .await
+        .unwrap(),
+        newer
+    );
+
+    let retried = core
+        .open_session_with_id(
+            Attach::Latest {
+                cwd: tmp.path().to_path_buf(),
+            },
+            identity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried, first);
+    assert_eq!(core.session_ids().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_resume_keeps_one_live_session() {
+    let (core, _mock, tmp) = setup_test_core().await;
+    let session_id = core
+        .open_session(Attach::New {
+            cwd: tmp.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    core.close_session(&session_id).await;
+
+    let (first, second) = tokio::join!(
+        core.open_session(Attach::Resume {
+            session: session_id.clone(),
+        }),
+        core.open_session(Attach::Resume {
+            session: session_id.clone(),
+        })
+    );
+
+    assert_eq!(first.unwrap(), session_id);
+    assert_eq!(second.unwrap(), session_id);
+    assert_eq!(core.session_ids().len(), 1);
+    assert!(core.session(&session_id).is_some());
+}
+
+#[tokio::test]
+async fn task_router_recovers_after_lag_and_keeps_routing() {
+    let (core, mock, tmp) = setup_test_core().await;
+    let session_id = core
+        .open_session(Attach::New {
+            cwd: tmp.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    let session = core.session(&session_id).unwrap();
+    let tasks = session.tasks.clone();
+    let mut events = core.subscribe(&session_id).unwrap();
+    let first = tasks
+        .spawn(TaskSpec::new(
+            session_id.clone(),
+            AgentId::main(),
+            "sleep 30",
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    for current in 0..300 {
+        tasks
+            .report_progress(
+                &first.id,
+                TaskProgress {
+                    current: Some(current),
+                    total: Some(300),
+                    percent: None,
+                    message: None,
+                    source: ProgressSource::Reported,
+                    updated_at_ms: pacode_types::now_ms(),
+                },
+            )
+            .unwrap();
+    }
+
+    mock.push(MockResponse::Text("task result received".into()));
+    tasks.kill(&first.id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if mock.requests().iter().any(|request| {
+                request.messages.iter().any(|message| {
+                    message
+                        .text()
+                        .contains(&format!("<task_finished id=\"{}\"", first.id))
+                })
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task router must recover TaskFinished after Lagged");
+
+    let second = tasks
+        .spawn(TaskSpec::new(
+            session_id.clone(),
+            AgentId::main(),
+            "sleep 30",
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                events.recv().await,
+                Ok((_, Event::TaskAdded(info))) if info.id == second.id
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("task router must keep receiving after Lagged");
+    tasks.kill(&second.id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn w128_agent_admission_and_fanout() {
+    const W128: usize = 128;
+
+    let (core, mock, tmp) = setup_test_core().await;
+    let session_id = core
+        .open_session(Attach::New {
+            cwd: tmp.path().to_path_buf(),
+            model: Some(ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: Some(Mode::Bypass),
+        })
+        .await
+        .unwrap();
+    for _ in 0..(W128 * 4) {
+        mock.push(MockResponse::Text("agent finished".into()));
+    }
+
+    let session = core.session(&session_id).unwrap();
+    let barrier = Arc::new(Barrier::new(W128));
+    let mut spawns = Vec::with_capacity(W128);
+    for index in 0..W128 {
+        let session = session.clone();
+        let barrier = barrier.clone();
+        spawns.push(tokio::spawn(async move {
+            barrier.wait().await;
+            session
+                .spawn_agent(AgentSpec {
+                    prompt: format!("w128-{index}"),
+                    name: Some(format!("w128-{index}")),
+                    model: None,
+                    effort: None,
+                    fork: false,
+                    tools: Some(Vec::new()),
+                })
+                .await
+        }));
+    }
+
+    let mut ids = Vec::with_capacity(W128);
+    for spawn in spawns {
+        ids.push(spawn.await.unwrap().unwrap());
+    }
+
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let watcher_notify = finished.clone();
+    let watcher_session = session.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            let infos = watcher_session.agent_infos();
+            let subagents = infos
+                .iter()
+                .filter(|info| !info.id.is_main())
+                .collect::<Vec<_>>();
+            if subagents.len() == W128
+                && subagents
+                    .iter()
+                    .all(|info| info.status == pacode_types::AgentStatus::Finished)
+            {
+                watcher_notify.notify_one();
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), finished.notified())
+        .await
+        .expect("128 agents must finish");
+    watcher.await.unwrap();
+
+    let infos = session.agent_infos();
+    assert_eq!(infos.len(), W128 + 1);
+    assert_eq!(
+        infos
+            .iter()
+            .filter(|info| !info.id.is_main())
+            .filter(|info| info.status == pacode_types::AgentStatus::Finished)
+            .count(),
+        W128
+    );
+    let unique_ids = ids.iter().collect::<HashSet<_>>();
+    assert_eq!(unique_ids.len(), W128);
+    let requests = mock.requests();
+    for index in 0..W128 {
+        let prompt = format!("w128-{index}");
+        assert!(requests.iter().any(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.text() == prompt)
+        }));
+    }
+
+    core.shutdown().await;
 }

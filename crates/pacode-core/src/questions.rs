@@ -75,6 +75,15 @@ impl QuestionState {
         self.pending.lock().ok()?.get(id).map(|(q, _)| q.clone())
     }
 
+    pub(crate) fn reassign_agent(&self, from: &AgentId, to: &AgentId) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        for (question, _) in pending.values_mut() {
+            if &question.agent == from {
+                question.agent = to.clone();
+            }
+        }
+    }
+
     /// Drop every question an agent is waiting on (it stopped or was interrupted).
     /// The waiting tool sees a cancelled answer rather than hanging.
     pub fn cancel_for_agent(&self, agent: &AgentId) -> Vec<Question> {

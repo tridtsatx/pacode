@@ -190,7 +190,7 @@ pub fn on_row(
     match entry.kind {
         SettingKind::Bool => {
             let current = registry::read_value(&state.config, entry.dotted_key).unwrap_or_default();
-            apply_value(
+            return apply_value(
                 state,
                 entry.dotted_key,
                 toml::Value::Boolean(current != "true"),
@@ -200,7 +200,7 @@ pub fn on_row(
             let current = registry::read_value(&state.config, entry.dotted_key).unwrap_or_default();
             let idx = options.iter().position(|&o| o == current).unwrap_or(0);
             let next = options[(idx + 1) % options.len()];
-            apply_value(
+            return apply_value(
                 state,
                 entry.dotted_key,
                 toml::Value::String(next.to_string()),
@@ -250,9 +250,13 @@ pub fn on_action(
         );
     }
     registry::reset_in_config(&mut state.config, entry.dotted_key);
+    state.apply_runtime_config(entry.dotted_key);
     ui.status = None;
+    if entry.dotted_key == "plugins.marketplace" {
+        state.marketplace.clear();
+    }
     state.dirty = true;
-    vec![]
+    runtime_actions(state, entry.dotted_key)
 }
 
 /// `enter` in `MenuMode::Edit` on a `Value` row — validate through the
@@ -270,8 +274,9 @@ pub fn on_edit(
     };
     match registry::validate_candidate(entry, &buffer) {
         Ok(value) => {
-            apply_value(state, entry.dotted_key, value);
+            let actions = apply_value(state, entry.dotted_key, value);
             ui.status = None;
+            return actions;
         }
         Err(err) => {
             ui.mode = MenuMode::Edit { buffer, cursor };
@@ -284,7 +289,7 @@ pub fn on_edit(
 /// Write `key = value` into the owning config file and apply it to the live
 /// `state.config`. A failed write toasts; the in-memory apply runs
 /// regardless, matching the file the next successful save produces.
-fn apply_value(state: &mut AppState, key: &str, value: toml::Value) {
+fn apply_value(state: &mut AppState, key: &str, value: toml::Value) -> Vec<Action> {
     if let Err(e) = pacode_config::update_config_value(&state.paths, key, value.clone()) {
         log::warn!("failed to write config key '{key}': {e}");
         state.push_toast(
@@ -295,8 +300,7 @@ fn apply_value(state: &mut AppState, key: &str, value: toml::Value) {
         );
     }
     registry::apply_to_config(&mut state.config, key, &value);
-    // §8.2: MCP config keys feed the server list and prompt-command cache;
-    // the plugins marketplace key feeds the marketplace cache.
+    state.apply_runtime_config(key);
     if key.starts_with("mcp") {
         state.invalidate_cache(crate::cache::ListKind::McpServers);
         state.invalidate_cache(crate::cache::ListKind::Commands);
@@ -306,7 +310,25 @@ fn apply_value(state: &mut AppState, key: &str, value: toml::Value) {
         state.invalidate_cache(crate::cache::ListKind::Marketplace);
         state.invalidate_cache(crate::cache::ListKind::Commands);
     }
+    if key == "plugins.marketplace" {
+        state.marketplace.clear();
+    }
     state.dirty = true;
+    runtime_actions(state, key)
+}
+
+fn runtime_actions(state: &AppState, key: &str) -> Vec<Action> {
+    if key != "plugins.marketplace" {
+        return vec![];
+    }
+    let source = state.config.plugins.marketplace.clone();
+    if source.is_empty() {
+        return vec![];
+    }
+    vec![Action::Send(pacode_types::Request::BrowseMarketplace {
+        source,
+        query: String::new(),
+    })]
 }
 
 /// `is_modified` minus the `Action` entries: those are commands, not values,

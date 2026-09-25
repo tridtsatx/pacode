@@ -21,11 +21,11 @@ mod stack;
 mod view;
 // `pub(crate)`: `keys_menu` calls each menu's `on_row`/`on_action`/`on_edit`
 // hooks directly — the `view` providers stay behind `view_for`. `files` and
-// `background` are also reached from `app`'s deferred jobs and `overlays`'
-// draw (preview want / tail want).
+// `background` are also reached from `app`'s deferred jobs and overlay
+// preparation (preview want / tail want).
 pub(crate) mod background;
 pub(crate) mod files;
-// `pub(crate)`: `overlays`' draw records the level's wants and `keys_menu`
+// `pub(crate)`: overlay preparation records the level's wants and `keys_menu`
 // calls its `on_row`/`on_action`/`on_open` hooks — same contract as `files`.
 pub(crate) mod git;
 pub(crate) mod git_branches;
@@ -50,7 +50,7 @@ pub use model::{
     Detail, DetailLine, LabelSpan, LabelTone, Mark, MenuRow, RowId, ValueKind, resolve_cursor,
     selectable,
 };
-pub use render::{draw, hint_line};
+pub use render::{draw, draw_in, hint_line};
 // `pub(crate)`: the MCP log panel's header reuses the row glyph table so a
 // server reads the same in the menu and in its log view.
 pub(crate) use rows::mark_glyph;

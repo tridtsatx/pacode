@@ -79,6 +79,24 @@ fn rows_are_keyed_by_task_id() {
 }
 
 #[test]
+fn foreground_tasks_do_not_appear_in_the_background_menu() {
+    let mut s = state();
+    s.rail
+        .upsert_task(task("background", TaskStatus::Running, 100));
+    let mut foreground = task("foreground", TaskStatus::Running, 200);
+    foreground.backgrounded = false;
+    s.rail.upsert_task(foreground);
+
+    let v = view(&s, &MenuUiState::default());
+    let ids: Vec<String> = v
+        .rows
+        .iter()
+        .filter_map(|row| row.id().map(|id| id.as_str().to_string()))
+        .collect();
+    assert_eq!(ids, vec!["background"]);
+}
+
+#[test]
 fn cursor_tracks_the_task_id_across_reorders_and_removals() {
     let mut s = state();
     s.rail.upsert_task(task("t_a", TaskStatus::Running, 100));

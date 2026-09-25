@@ -47,9 +47,10 @@ impl Tool for WriteTool {
     }
 
     /// Permission title `Write <path>` with a unified diff against the current content
-    /// (or `new file, N lines`) as detail; writes atomically (temp file + rename in the
-    /// same dir); output `Wrote <bytes> bytes to <path>`; diff stat from
-    /// `pacode_render::diff_stat`.
+    /// (or `new file, N lines`) as detail; the read of the current content and the
+    /// write itself run under the path's write lock, and the write lands atomically
+    /// (temp file + rename in the same dir) keeping the existing mode; output
+    /// `Wrote <bytes> bytes to <path>`; diff stat from `pacode_render::diff_stat`.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _accept_large_output) = parse_input::<WriteInput>(input)?;
         if args.path.is_empty() {
@@ -59,22 +60,19 @@ impl Tool for WriteTool {
             return Err(ToolError::invalid("content contains NUL byte"));
         }
         let full_path = ctx.resolve(Path::new(&args.path));
+        let _write_lock = crate::registry::acquire_path_write_lock(&full_path, &ctx.cancel).await?;
 
-        let old_content = match tokio::fs::read(&full_path).await {
-            Ok(bytes) => {
-                let check_len = bytes.len().min(8192);
-                if bytes[..check_len].contains(&0) {
-                    return Err(ToolError::failed(format!(
-                        "cannot overwrite binary file: {}",
-                        args.path
-                    )));
-                }
-                Some(String::from_utf8(bytes).map_err(|e| {
-                    ToolError::failed(format!("existing file is not valid UTF-8: {e}"))
-                })?)
+        let old_content = match crate::registry::read_source_file(
+            &full_path,
+            crate::registry::MAX_SOURCE_FILE_BYTES,
+        )
+        .await
+        {
+            Ok(content) => Some(content),
+            Err(err) if err.is_not_found() => None,
+            Err(err) => {
+                return Err(ToolError::failed(err.message("overwrite", &args.path)));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(ToolError::Io(e)),
         };
 
         let rel_path = full_path
@@ -83,20 +81,25 @@ impl Tool for WriteTool {
             .to_string_lossy()
             .to_string();
 
-        let (detail, preview, diff_stat) = match &old_content {
+        let (diff, diff_stat, extra_head) = match &old_content {
             Some(old) => {
                 let diff = pacode_render::unified_diff(old, &args.content, &rel_path, 3);
                 let stat = pacode_render::diff_stat(old, &args.content);
-                (diff.clone(), diff, Some(stat))
+                (diff, Some(stat), None)
             }
             None => {
-                let line_count = args.content.lines().count();
                 let stat = pacode_render::diff_stat("", &args.content);
                 // The all-added diff doubles as the cell body (the written
                 // content itself) and shows the reviewer what lands on disk.
                 let diff = pacode_render::unified_diff("", &args.content, &rel_path, 3);
-                let detail = format!("new file, {line_count} lines\n{diff}");
-                (detail, diff, Some(stat))
+                (
+                    diff,
+                    Some(stat),
+                    Some(format!(
+                        "new file, {} lines\n",
+                        args.content.lines().count()
+                    )),
+                )
             }
         };
 
@@ -107,19 +110,25 @@ impl Tool for WriteTool {
             format!("Write {rel_path}")
         };
 
+        let capped = crate::registry::cap_output_bytes(
+            diff.as_str(),
+            crate::registry::MAX_PERMISSION_DETAIL_BYTES,
+        );
+        let detail = match &extra_head {
+            Some(head) => format!("{head}{capped}"),
+            None => capped.into_owned(),
+        };
         ctx.require_permission(perm_title, detail, None).await?;
 
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let tmp_path = format!("{}.pacode-tmp", full_path.to_string_lossy());
-        tokio::fs::write(&tmp_path, args.content.as_bytes()).await?;
-        tokio::fs::rename(&tmp_path, &full_path).await?;
+        crate::registry::write_atomic(&full_path, args.content.as_bytes()).await?;
         crate::walk::invalidate_path(&full_path);
 
         let content_msg = format!("Wrote {} bytes to {rel_path}", args.content.len());
-        let preview = preview_body(&preview);
+        let preview = preview_body(&diff);
         let title = format!("Write {rel_path}");
 
         let mut out = ToolOutput::text(content_msg)

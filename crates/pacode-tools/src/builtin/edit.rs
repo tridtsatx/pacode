@@ -87,8 +87,9 @@ impl Tool for EditTool {
         ToolKind::Edit
     }
 
-    /// Permission title `Edit <path>`, detail = unified diff (context 3); atomic write;
-    /// output `Edited <path>: N replacement(s)`, diff stat; preview = the diff.
+    /// Permission title `Edit <path>`, detail = unified diff (context 3); the whole
+    /// read-modify-write runs under the path's write lock and the write lands
+    /// atomically; output `Edited <path>: N replacement(s)`, diff stat; preview = the diff.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _accept_large_output) = parse_input::<EditInput>(input)?;
         if args.path.is_empty() {
@@ -98,16 +99,11 @@ impl Tool for EditTool {
             return Err(ToolError::invalid("edit strings cannot contain NUL byte"));
         }
         let full_path = ctx.resolve(Path::new(&args.path));
-        let bytes = tokio::fs::read(&full_path).await?;
-        let check_len = bytes.len().min(8192);
-        if bytes[..check_len].contains(&0) {
-            return Err(ToolError::failed(format!(
-                "cannot edit binary file: {}",
-                args.path
-            )));
-        }
-        let content = String::from_utf8(bytes)
-            .map_err(|e| ToolError::failed(format!("file is not valid UTF-8: {e}")))?;
+        let _write_lock = crate::registry::acquire_path_write_lock(&full_path, &ctx.cancel).await?;
+        let content =
+            crate::registry::read_source_file(&full_path, crate::registry::MAX_SOURCE_FILE_BYTES)
+                .await
+                .map_err(|err| ToolError::failed(err.message("edit", &args.path)))?;
 
         let (mut new_content, count) = apply_replacement(
             &content,
@@ -138,12 +134,14 @@ impl Tool for EditTool {
             format!("Edit {rel_path}")
         };
 
-        ctx.require_permission(perm_title, diff.clone(), None)
-            .await?;
+        let detail = crate::registry::cap_output_bytes(
+            diff.as_str(),
+            crate::registry::MAX_PERMISSION_DETAIL_BYTES,
+        )
+        .into_owned();
+        ctx.require_permission(perm_title, detail, None).await?;
 
-        let tmp_path = format!("{}.pacode-tmp", full_path.to_string_lossy());
-        tokio::fs::write(&tmp_path, new_content.as_bytes()).await?;
-        tokio::fs::rename(&tmp_path, &full_path).await?;
+        crate::registry::write_atomic(&full_path, new_content.as_bytes()).await?;
         crate::walk::invalidate_path(&full_path);
 
         let preview = preview_body(&diff);

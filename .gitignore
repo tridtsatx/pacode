@@ -9,11 +9,42 @@
 *.snap.new
 __pycache__/
 HYGIENE.md
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+!.env.*.example
+!.env.*.sample
+!.env.*.template
+.envrc
+.netrc
+.npmrc
+.pypirc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+credentials.json
+credentials.*.json
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.toml
+service-account*.json
 
 # Local-only: instructions, working specs and helper scripts stay on this machine.
 /CLAUDE.md
 /docs/superpowers/
-/scripts/
+/scripts/*
+!/scripts/scan_tracked_secrets.py
 /TUI1.png
 /TUI2.png
 

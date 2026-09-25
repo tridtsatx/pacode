@@ -25,6 +25,7 @@ mod run;
 mod serve;
 #[path = "sessions.rs"]
 mod sessions;
+mod stats_cmd;
 
 #[cfg(test)]
 #[path = "cli_tests.rs"]
@@ -128,6 +129,15 @@ pub enum Command {
         /// Working directory for execution.
         #[arg(short = 'C', long, value_name = "DIR")]
         dir: Option<PathBuf>,
+    },
+
+    /// Report what the running daemon is holding and what it is paying:
+    /// resident sessions and agents, transcript bytes, store queue and exec
+    /// time, provider admit waits, and session-open cost.
+    Stats {
+        /// Emit the raw reading as JSON instead of a formatted report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List or delete recorded sessions.
@@ -425,6 +435,7 @@ pub fn main() -> anyhow::Result<()> {
             };
             run::run(run_opts)
         }
+        Some(Command::Stats { json }) => stats_cmd::run(Some(socket), paths, json),
         Some(Command::Sessions { action }) => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;

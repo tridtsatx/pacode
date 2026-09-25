@@ -338,9 +338,8 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                 PanelTarget::McpServer(_)
                                 | PanelTarget::FileDiff { .. }
                                 | PanelTarget::CommitDiff { .. } => "esc back · scroll pages",
-                                PanelTarget::Agent(_) | PanelTarget::Task(_) => {
-                                    "esc back · alt+b follow · s stop"
-                                }
+                                PanelTarget::Agent(_) => "esc back · alt+b follow · s stop",
+                                PanelTarget::Task(_) => "esc back · scroll pages · k kill",
                             };
                             (
                                 vec![
@@ -381,7 +380,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     .rail
                                     .agents
                                     .iter()
-                                    .filter(|a| !a.status.is_live())
+                                    .filter(|a| !a.id.is_main() && !a.status.is_live())
                                     .count();
                                 let dur = format_duration_ms(
                                     state

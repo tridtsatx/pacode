@@ -11,6 +11,7 @@ use crate::state::AppState;
 fn make_test_state() -> AppState {
     let config = Config::default();
     let mut state = AppState::new(config, "0.1.0".into(), 120, 34);
+    state.awaiting_snapshot = false;
     let main_agent = AgentInfo {
         id: AgentId::main(),
         name: "main".into(),
@@ -573,7 +574,7 @@ fn test_overlay_files_alt_f_navigation_enter_and_esc() {
     let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
         panic!("menu closed on Down");
     };
-    assert_eq!(ui.cursor, crate::ui::menu::RowId::new("src/second.rs"));
+    assert_eq!(ui.cursor, crate::ui::menu::RowId::new("src/first.rs"));
 
     // 3. Typing letters does NOT leak to input
     let char_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
@@ -588,9 +589,9 @@ fn test_overlay_files_alt_f_navigation_enter_and_esc() {
         Focus::Panel {
             target: PanelTarget::FileDiff { ref path },
             ..
-        } if path == "src/second.rs"
+        } if path == "src/first.rs"
     ));
-    assert_eq!(state.files.diff_want.as_deref(), Some("src/second.rs"));
+    assert_eq!(state.files.diff_want.as_deref(), Some("src/first.rs"));
 
     // 5. Esc on the panel returns to Normal and drops the diff target.
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -794,11 +795,17 @@ fn test_overlay_rail_and_help_navigation_and_esc() {
     let now = Instant::now();
 
     // RailOverlay
-    state.focus = Focus::Overlay(Overlay::RailOverlay);
+    state.focus = Focus::Overlay(Overlay::RailOverlay {
+        selected: AgentId::main(),
+    });
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     handle_key(&mut state, down, now);
-    // Still focused
-    assert_eq!(state.focus, Focus::Overlay(Overlay::RailOverlay));
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::RailOverlay {
+            selected: AgentId::new("agt_1"),
+        })
+    );
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut state, esc, now);
     assert_eq!(state.focus, Focus::Normal);
@@ -820,6 +827,79 @@ fn test_overlay_rail_and_help_navigation_and_esc() {
     // Still focused — the menu owns the key.
     assert!(matches!(state.focus, Focus::Overlay(Overlay::Menu { .. })));
     handle_key(&mut state, esc, now);
+    assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn test_rail_overlay_selects_main_and_subagents() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.focus = Focus::Overlay(Overlay::RailOverlay {
+        selected: AgentId::main(),
+    });
+
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        now,
+    );
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::RailOverlay { ref selected }) if selected == &AgentId::new("agt_1")
+    ));
+
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        now,
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        now,
+    );
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        now,
+    );
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(Overlay::RailOverlay { ref selected }) if selected == &AgentId::main()
+    ));
+
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    assert!(actions.is_empty());
+    assert_eq!(state.focus, Focus::Normal);
+
+    state.focus = Focus::Overlay(Overlay::RailOverlay {
+        selected: AgentId::main(),
+    });
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        now,
+    );
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    assert_eq!(actions, vec![Action::LoadPanel]);
+    assert!(matches!(state.focus, Focus::Panel { .. }));
+
+    state.focus = Focus::Overlay(Overlay::RailOverlay {
+        selected: AgentId::main(),
+    });
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        now,
+    );
     assert_eq!(state.focus, Focus::Normal);
 }
 
@@ -1080,6 +1160,7 @@ fn test_vim_disabled_behavior_is_identical() {
         vec![Action::Send(Request::UserMessage {
             text: "wbdx".into(),
             images: Vec::new(),
+            message_id: None,
         })]
     );
     assert!(state.input.is_empty());
@@ -1157,6 +1238,7 @@ fn test_vim_enabled_keys_routing() {
         vec![Action::Send(Request::UserMessage {
             text: "hello !world".into(),
             images: Vec::new(),
+            message_id: None,
         })]
     );
     assert!(state.input.is_empty());
@@ -1518,7 +1600,7 @@ fn test_session_slot_switching() {
     assert!(actions.is_empty());
     assert_eq!(state.active_slot, 0);
 
-    // Switching to an empty slot (ctrl+alt+2) emits Detach then a new-session attach, in that order
+    // Switching to an empty slot emits one ordered transition action
     let ctrl_alt_2 = KeyEvent::new(
         KeyCode::Char('2'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
@@ -1527,15 +1609,14 @@ fn test_session_slot_switching() {
     assert_eq!(state.active_slot, 1);
     assert_eq!(
         actions,
-        vec![
-            Action::Send(Request::Detach),
-            Action::Send(Request::Attach(pacode_types::Attach::New {
+        vec![Action::SwitchSession {
+            attach: pacode_types::Attach::New {
                 cwd: std::path::PathBuf::from("/test/cwd"),
                 model: None,
                 effort: None,
                 mode: None,
-            })),
-        ]
+            },
+        }]
     );
 
     // Populate slot 3 with an occupied SessionSlot
@@ -1550,7 +1631,7 @@ fn test_session_slot_switching() {
         status: pacode_types::SessionStatusKind::Idle,
     });
 
-    // Switching to an occupied slot (ctrl+alt+3) emits Detach then Resume with the right id
+    // Switching to an occupied slot uses the same ordered transition
     let ctrl_alt_3 = KeyEvent::new(
         KeyCode::Char('3'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
@@ -1559,12 +1640,11 @@ fn test_session_slot_switching() {
     assert_eq!(state.active_slot, 2);
     assert_eq!(
         actions,
-        vec![
-            Action::Send(Request::Detach),
-            Action::Send(Request::Attach(pacode_types::Attach::Resume {
+        vec![Action::SwitchSession {
+            attach: pacode_types::Attach::Resume {
                 session: slot_3_session,
-            })),
-        ]
+            },
+        }]
     );
 }
 
@@ -1888,6 +1968,7 @@ fn test_enter_queues_when_turn_running_and_sends_when_idle() {
         vec![Action::Send(Request::UserMessage {
             text: "idle prompt".into(),
             images: Vec::new(),
+            message_id: None,
         })]
     );
     assert!(state.input.is_empty());
@@ -1907,8 +1988,48 @@ fn test_enter_queues_when_turn_running_and_sends_when_idle() {
 }
 
 #[test]
+fn enter_queues_while_prompt_ack_waits_for_turn_boundary() {
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.turn_boundary_pending = true;
+    state.input.insert_str("next");
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+
+    assert!(actions.is_empty());
+    assert!(state.input.is_empty());
+    assert_eq!(
+        state.input.prompt_queue.front().map(String::as_str),
+        Some("next")
+    );
+}
+
+#[test]
 fn test_queue_drains_in_order_on_turn_finished() {
     let mut state = make_test_state();
+    state.meta = Some(pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_queue"),
+        name: None,
+        cwd: "/tmp".into(),
+        git_branch: None,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::Medium,
+        mode: pacode_types::state::Mode::Build,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        first_prompt: None,
+        zdr: false,
+    });
+    state.event_connection_epoch = 1;
+    state.event_session_epoch = 1;
+    let client_context = pacode_client::ClientEventContext {
+        connection_epoch: 1,
+        session_epoch: 1,
+        session: Some(pacode_types::SessionId::new("ses_queue")),
+    };
     let now = Instant::now();
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
 
@@ -1923,6 +2044,7 @@ fn test_queue_drains_in_order_on_turn_finished() {
     // First turn finishes: TurnEnded event arrives for main agent
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
+            context: client_context.clone(),
             seq: 1,
             event: pacode_types::Event::TurnEnded {
                 agent: AgentId::main(),
@@ -1941,15 +2063,34 @@ fn test_queue_drains_in_order_on_turn_finished() {
         Some(Request::UserMessage {
             text: "first".into(),
             images: Vec::new(),
+            message_id: None,
         })
     );
     assert_eq!(state.input.prompt_queue.len(), 1);
-    assert!(state.turn_active); // Marked active so another turn is not dispatched concurrently
+    assert!(!state.turn_active);
+
+    state.user_msgs_in_flight = 1;
+    assert_eq!(state.drain_prompt_queue(), None);
+    state.user_msgs_in_flight = 0;
+    state.apply_client_event(
+        pacode_client::ClientEvent::Event {
+            context: client_context.clone(),
+            seq: 2,
+            event: pacode_types::Event::TurnStarted {
+                agent: AgentId::main(),
+                turn: pacode_types::TurnId::new("turn_2"),
+            },
+        },
+        now,
+    );
+    assert!(state.turn_active);
+    assert_eq!(state.drain_prompt_queue(), None);
 
     // Second turn finishes
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
-            seq: 2,
+            context: client_context.clone(),
+            seq: 3,
             event: pacode_types::Event::TurnEnded {
                 agent: AgentId::main(),
                 turn: pacode_types::TurnId::new("turn_2"),
@@ -1967,6 +2108,7 @@ fn test_queue_drains_in_order_on_turn_finished() {
         Some(Request::UserMessage {
             text: "second".into(),
             images: Vec::new(),
+            message_id: None,
         })
     );
     assert_eq!(state.input.prompt_queue.len(), 0);
@@ -1974,7 +2116,8 @@ fn test_queue_drains_in_order_on_turn_finished() {
     // Third turn finishes, queue is now empty
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
-            seq: 3,
+            context: client_context.clone(),
+            seq: 4,
             event: pacode_types::Event::TurnEnded {
                 agent: AgentId::main(),
                 turn: pacode_types::TurnId::new("turn_3"),
@@ -2083,6 +2226,7 @@ fn test_ctrl_enter_submit_now_behavior() {
         vec![Action::Send(Request::UserMessage {
             text: "send now when idle".into(),
             images: Vec::new(),
+            message_id: None,
         })]
     );
     assert!(state.input.is_empty());
@@ -2095,18 +2239,40 @@ fn test_ctrl_enter_submit_now_behavior() {
     let actions = handle_key(&mut state, ctrl_enter, now);
     assert_eq!(
         actions,
-        vec![
-            Action::Send(Request::DetachTurn),
-            Action::Send(Request::UserMessage {
-                text: "send now while busy".into(),
-                images: Vec::new(),
-            })
-        ]
+        vec![Action::SendSequence {
+            requests: vec![
+                Request::DetachTurn,
+                Request::UserMessage {
+                    text: "send now while busy".into(),
+                    images: Vec::new(),
+                    message_id: None,
+                },
+            ],
+        }]
     );
     assert!(state.input.is_empty());
     assert!(
         state.input.prompt_queue.is_empty(),
         "ctrl+enter must bypass the queue, not append to it"
+    );
+}
+
+#[test]
+fn submit_now_respects_an_in_flight_prompt_gate() {
+    let mut state = make_test_state();
+    state.turn_active = true;
+    state.user_msgs_in_flight = 1;
+    state.input.insert_str("wait for the gate");
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        Instant::now(),
+    );
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        state.input.prompt_queue.front().map(String::as_str),
+        Some("wait for the gate")
     );
 }
 
@@ -2138,6 +2304,7 @@ fn test_background_completion_renders_a_result_cell_with_exit_code() {
 
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
+            context: pacode_client::ClientEventContext::unscoped(),
             seq: 1,
             event: pacode_types::Event::TaskUpdated(failed_task),
         },
@@ -2197,6 +2364,7 @@ fn test_short_successful_background_task_is_not_reported() {
 
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
+            context: pacode_client::ClientEventContext::unscoped(),
             seq: 1,
             event: pacode_types::Event::TaskUpdated(quick),
         },
@@ -2214,7 +2382,12 @@ fn test_alt_r_opens_the_plan_and_agents_overlay() {
 
     let alt_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
     handle_key(&mut state, alt_r, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::RailOverlay));
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::RailOverlay {
+            selected: AgentId::main(),
+        })
+    );
 
     // Esc closes it again.
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -2231,13 +2404,21 @@ fn test_agent_navigation_opens_the_overlay_when_the_rail_is_hidden() {
     state.cols = 70;
     let alt_down = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT);
     handle_key(&mut state, alt_down, now);
-    assert_eq!(state.focus, Focus::Overlay(Overlay::RailOverlay));
+    assert_eq!(
+        state.focus,
+        Focus::Overlay(Overlay::RailOverlay {
+            selected: AgentId::main(),
+        })
+    );
 
     // Wide enough for the rail: navigation selects in the rail as before.
     state.focus = Focus::Normal;
     state.cols = 120;
     handle_key(&mut state, alt_down, now);
-    assert_ne!(state.focus, Focus::Overlay(Overlay::RailOverlay));
+    assert!(!matches!(
+        state.focus,
+        Focus::Overlay(Overlay::RailOverlay { .. })
+    ));
 }
 
 fn test_question() -> pacode_types::Question {
@@ -2261,9 +2442,11 @@ fn test_question() -> pacode_types::Question {
 }
 
 fn ask(state: &mut AppState, question: pacode_types::Question, now: Instant) {
+    let seq = state.last_event_seq.map(|seq| seq + 1).unwrap_or(1);
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
-            seq: 1,
+            context: pacode_client::ClientEventContext::unscoped(),
+            seq,
             event: pacode_types::Event::QuestionAsked(question),
         },
         now,
@@ -2443,7 +2626,8 @@ fn test_resolving_one_question_keeps_the_picker_for_the_rest() {
 
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
-            seq: 2,
+            context: pacode_client::ClientEventContext::unscoped(),
+            seq: state.last_event_seq.map(|seq| seq + 1).unwrap_or(1),
             event: pacode_types::Event::QuestionResolved {
                 question: pacode_types::QuestionId::new("qst_1"),
                 answer: pacode_types::QuestionAnswer::choice(0),
@@ -2535,7 +2719,8 @@ fn test_submissions_follow_the_queue_cursor_not_a_stale_view() {
     );
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
-            seq: 3,
+            context: pacode_client::ClientEventContext::unscoped(),
+            seq: state.last_event_seq.map(|seq| seq + 1).unwrap_or(1),
             event: pacode_types::Event::QuestionResolved {
                 question: pacode_types::QuestionId::new("qst_1"),
                 answer: pacode_types::QuestionAnswer::choice(0),
@@ -2880,7 +3065,8 @@ fn test_resolving_the_question_elsewhere_closes_the_picker() {
 
     state.apply_client_event(
         pacode_client::ClientEvent::Event {
-            seq: 2,
+            context: pacode_client::ClientEventContext::unscoped(),
+            seq: state.last_event_seq.map(|seq| seq + 1).unwrap_or(1),
             event: pacode_types::Event::QuestionResolved {
                 question: pacode_types::QuestionId::new("qst_1"),
                 answer: pacode_types::QuestionAnswer::choice(0),

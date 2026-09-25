@@ -102,3 +102,39 @@ fn test_enter_in_bash_mode_runs_instead_of_sending() {
         other => panic!("expected Action::RunBashCaptured, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn capture_drains_both_streams_on_normal_exit() {
+    let (_cancel, receiver) = tokio::sync::oneshot::channel();
+    let output = run_captured(
+        "printf out; printf err >&2",
+        std::path::Path::new("."),
+        receiver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.output.contains("out"));
+    assert!(output.output.contains("err"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_terminates_capture_and_closes_readers() {
+    let (cancel, receiver) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(run_captured(
+        "sleep 30",
+        std::path::Path::new("."),
+        receiver,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.send(()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("cancelled capture did not finish")
+        .expect("capture task panicked")
+        .expect("cancelled capture returned an error");
+
+    assert_eq!(result.output, "[cancelled by user]\n");
+    assert_eq!(result.exit_code, Some(130));
+}

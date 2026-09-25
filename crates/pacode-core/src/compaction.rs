@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use pacode_types::Message;
+use pacode_types::{Message, ModelRoute};
 
 use crate::CoreError;
 use crate::agent::Agent;
@@ -43,22 +43,40 @@ pub fn split_for_compaction(
     messages: &[Arc<Message>],
     keep_recent: usize,
 ) -> (Vec<Arc<Message>>, Vec<Arc<Message>>) {
-    if messages.len() <= keep_recent {
-        return (Vec::new(), messages.to_vec());
+    let rows = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (index as u64, message.clone()))
+        .collect::<Vec<_>>();
+    let (summary, keep) = split_rows_for_compaction(&rows, keep_recent);
+    (
+        summary.into_iter().map(|(_, message)| message).collect(),
+        keep.into_iter().map(|(_, message)| message).collect(),
+    )
+}
+
+type HistoryRows = Vec<(u64, Arc<Message>)>;
+
+fn split_rows_for_compaction(
+    rows: &[(u64, Arc<Message>)],
+    keep_recent: usize,
+) -> (HistoryRows, HistoryRows) {
+    if rows.len() <= keep_recent {
+        return (Vec::new(), rows.to_vec());
     }
-    let mut cut = messages.len().saturating_sub(keep_recent);
+    let mut cut = rows.len().saturating_sub(keep_recent);
     while cut > 0 {
-        if messages[cut].role == pacode_types::Role::Tool
-            || (messages[cut - 1].has_tool_uses()
-                && cut < messages.len()
-                && messages[cut].role == pacode_types::Role::Tool)
+        if rows[cut].1.role == pacode_types::Role::Tool
+            || (rows[cut - 1].1.has_tool_uses()
+                && cut < rows.len()
+                && rows[cut].1.role == pacode_types::Role::Tool)
         {
             cut -= 1;
         } else {
             break;
         }
     }
-    (messages[..cut].to_vec(), messages[cut..].to_vec())
+    (rows[..cut].to_vec(), rows[cut..].to_vec())
 }
 
 /// The summarisation prompt: previous summary (if any) + the messages to fold in.
@@ -93,21 +111,67 @@ pub fn build_summary_request(
     out
 }
 
+/// Which route summarizes the folded-in history, and whether a configured
+/// `context.compaction_model` was dropped to keep the conversation inside the
+/// ZDR boundary. The summary request carries the whole prefix of the
+/// conversation, so under ZDR it may only go to a route flagged
+/// `zdr_capable`; a non-capable configured model falls back to the agent's own
+/// route, which the turn loop already validated. Returns the refusal reason
+/// when not even the agent's route is usable.
+fn pick_summary_route(
+    configured: Option<ModelRoute>,
+    agent_route: &ModelRoute,
+    zdr_active: bool,
+    zdr_capable: &dyn Fn(&str) -> bool,
+) -> (ModelRoute, Option<String>) {
+    let violation = |route: &ModelRoute| -> Option<String> {
+        if !zdr_active || zdr_capable(&route.to_string()) {
+            return None;
+        }
+        Some(format!(
+            "{}: {route} is not flagged zdr_capable; the conversation summary would leave the \
+             zero-data-retention boundary",
+            crate::permissions::ZDR_BLOCKED
+        ))
+    };
+
+    let Some(configured) = configured else {
+        return (agent_route.clone(), violation(agent_route));
+    };
+    let Some(reason) = violation(&configured) else {
+        return (configured, None);
+    };
+    if let Some(agent_reason) = violation(agent_route) {
+        return (agent_route.clone(), Some(agent_reason));
+    }
+    log::warn!("{reason}; summarizing with {agent_route} instead of {configured}");
+    (agent_route.clone(), None)
+}
+
 /// Run the summary turn with `context.compaction_model` (or the agent's model), replace
 /// the history, persist, emit a `Notice` item. Returns false when nothing was done.
 pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool, CoreError> {
     use futures::StreamExt;
 
-    let (to_summarize, to_keep, prev_summary, upto_seq) = {
+    let (to_summarize, prev_summary, upto_seq) = {
         let hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
         let keep_recent = session.config.context.keep_recent_messages;
-        let (to_summarize, to_keep) = split_for_compaction(&hist.messages, keep_recent);
+        let (to_summarize, _) = split_rows_for_compaction(&hist.rows(), keep_recent);
         if to_summarize.is_empty() {
             return Ok(false);
         }
-        let start_seq = hist.next_seq.saturating_sub(hist.messages.len() as u64);
-        let upto_seq = start_seq + (to_summarize.len() as u64) - 1;
-        (to_summarize, to_keep, hist.summary.clone(), upto_seq)
+        let upto_seq = to_summarize
+            .last()
+            .map(|(seq, _)| *seq)
+            .expect("non-empty compaction prefix");
+        (
+            to_summarize
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect::<Vec<_>>(),
+            hist.summary.clone(),
+            upto_seq,
+        )
     };
 
     log::info!(
@@ -117,15 +181,23 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
         to_summarize.len()
     );
 
-    let summary_messages = build_summary_request(prev_summary.as_deref(), &to_summarize);
     let agent_info = agent.info();
-    let route = session
-        .config
-        .context
-        .compaction_model
-        .as_deref()
-        .and_then(|m| session.providers.parse_route(m))
-        .unwrap_or_else(|| agent_info.model.clone());
+    let (route, refusal) = pick_summary_route(
+        session
+            .config
+            .context
+            .compaction_model
+            .as_deref()
+            .and_then(|m| session.providers.parse_route(m)),
+        &agent_info.model,
+        session.zdr_active(),
+        &|key| session.model_flags(key).zdr_capable,
+    );
+    if let Some(reason) = refusal {
+        return Err(CoreError::Invalid(reason));
+    }
+
+    let summary_messages = build_summary_request(prev_summary.as_deref(), &to_summarize);
 
     let provider = session.providers.resolve(&route).await?;
     let req = pacode_provider::CompletionRequest {
@@ -170,20 +242,29 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
         summary.len()
     );
 
-    {
-        let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
-        hist.summary = Some(summary.clone());
-        hist.summary_upto = upto_seq;
-        hist.messages = to_keep;
-        let summary_tokens = pacode_types::estimate_tokens(&summary);
-        let kept_tokens: u32 = hist.messages.iter().map(|m| m.estimate_tokens()).sum();
-        hist.estimated_tokens = summary_tokens.saturating_add(kept_tokens);
-    }
-
+    let _message_guard = agent.message_write_lock.clone().lock_owned().await;
     session
         .store
         .save_compaction(&session.id, &agent.id(), &summary, upto_seq)
         .await?;
+
+    {
+        let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
+        let keep = hist
+            .rows()
+            .into_iter()
+            .filter(|(seq, _)| *seq > upto_seq)
+            .collect::<Vec<_>>();
+        hist.summary = Some(summary.clone());
+        hist.summary_upto = hist.summary_upto.max(upto_seq);
+        hist.messages = keep.iter().map(|(_, message)| message.clone()).collect();
+        hist.message_seqs = keep.into_iter().map(|(seq, _)| seq).collect();
+        hist.free_seqs.clear();
+        let summary_tokens = pacode_types::estimate_tokens(&summary);
+        let kept_tokens: u32 = hist.messages.iter().map(|m| m.estimate_tokens()).sum();
+        hist.estimated_tokens = summary_tokens.saturating_add(kept_tokens);
+    }
+    drop(_message_guard);
 
     let notice_item = pacode_types::TranscriptItem {
         seq: agent

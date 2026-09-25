@@ -245,6 +245,121 @@ fn enter_on_an_enum_cycles_and_writes() {
 }
 
 #[test]
+fn live_render_settings_rebuild_context_and_clear_caches() {
+    let mut s = state();
+    s.transcript.cache.insert(
+        pacode_render::cache::CacheKey::cell(1, 0, 80, false, 0),
+        vec![ratatui::text::Line::from("stale")],
+    );
+    s.panel.diff = Some(crate::state::PanelDiff {
+        path: "a.rs".into(),
+        patch: Some("diff".into()),
+        status: None,
+        truncated: false,
+        note: None,
+        rendered: Some((
+            pacode_render::RenderCacheKey::new(80, 0),
+            vec![ratatui::text::Line::from("stale")],
+        )),
+    });
+    s.git.diff = Some(crate::state::git::GitDiffInfo {
+        hash: "abc".into(),
+        patch: Some("diff".into()),
+        truncated: false,
+        note: None,
+        rendered: Some((
+            pacode_render::RenderCacheKey::new(80, 0),
+            vec![ratatui::text::Line::from("stale")],
+        )),
+    });
+    let old_theme = s.theme.clone();
+    s.config.theme.name = "pacode-light".to_string();
+    s.apply_runtime_config("theme.name");
+    assert_ne!(s.theme, old_theme);
+    let old_epoch = s.render_epoch;
+    s.config.ui.ascii_only = true;
+    s.config.ui.thinking = true;
+    s.config.ui.color = "ansi".to_string();
+    s.apply_runtime_config("ui.color");
+
+    assert!(s.render_epoch > old_epoch);
+    assert_eq!(s.render_options(80).color, pacode_render::ColorMode::Ansi);
+    assert!(s.render_options(80).glyphs.ascii);
+    assert!(s.render_options(80).thinking);
+    assert_eq!(s.transcript.cache.total_lines(), 0);
+    assert!(s.panel.diff.as_ref().unwrap().rendered.is_none());
+    assert!(s.git.diff.as_ref().unwrap().rendered.is_none());
+}
+
+#[test]
+fn live_transcript_cap_applies_to_main_and_agent_transcripts() {
+    let mut s = state();
+    for id in 0..3 {
+        s.transcript.upsert(
+            pacode_types::TranscriptItem {
+                seq: id,
+                agent: pacode_types::AgentId::main(),
+                ts_ms: id,
+                kind: pacode_types::TranscriptKind::User {
+                    text: id.to_string(),
+                },
+            },
+            std::time::Instant::now(),
+        );
+        s.panel.agent_transcript.upsert(
+            pacode_types::TranscriptItem {
+                seq: id,
+                agent: pacode_types::AgentId::new("agent"),
+                ts_ms: id,
+                kind: pacode_types::TranscriptKind::User {
+                    text: id.to_string(),
+                },
+            },
+            std::time::Instant::now(),
+        );
+    }
+    s.config.ui.transcript_cells = 2;
+    s.apply_runtime_config("ui.transcript_cells");
+
+    assert_eq!(s.transcript.cells.len(), 2);
+    assert_eq!(s.panel.agent_transcript.cells.len(), 2);
+}
+
+#[test]
+fn marketplace_setting_refreshes_the_active_listing() {
+    let dir = tmpdir("marketplace");
+    let mut s = state_at(&dir);
+    s.marketplace = vec![pacode_types::MarketplacePluginInfo {
+        name: "old".into(),
+        description: String::new(),
+        version: "1".into(),
+        author: String::new(),
+        category: String::new(),
+        marketplace: "old".into(),
+        installed: false,
+        installed_version: None,
+        update_available: false,
+    }];
+    let mut ui = MenuUiState::default();
+    let actions = on_edit(
+        &mut s,
+        &mut ui,
+        &RowId::new("plugins.marketplace"),
+        "owner/new".into(),
+        0,
+    );
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Send(pacode_types::Request::BrowseMarketplace { source, query })]
+            if source == "owner/new" && query.is_empty()
+    ));
+    assert!(s.marketplace.is_empty());
+    assert_eq!(s.config.plugins.marketplace, "owner/new");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_bad_edit_stays_in_edit_mode_and_writes_nothing() {
     let dir = tmpdir("bad-edit");
     let mut s = state_at(&dir);

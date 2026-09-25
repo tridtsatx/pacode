@@ -10,6 +10,7 @@ pub mod input;
 pub mod questions;
 pub mod rail;
 pub mod selection;
+pub mod session;
 pub mod slots;
 pub mod stats;
 pub mod transcript;
@@ -19,10 +20,13 @@ pub mod vim;
 mod picker_tests;
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
+use std::sync::{Arc, atomic::AtomicU64};
 use std::time::Instant;
 
-use pacode_client::ClientEvent;
+use pacode_client::{ClientEvent, ClientEventContext};
+use pacode_render::{ColorMode, Glyphs, RenderOptions};
 use pacode_types::time::now_ms;
 use pacode_types::{
     AgentId, Config, Effort, Event, MarketplacePluginInfo, McpServerInfo, Mode, ModelFlags,
@@ -36,6 +40,10 @@ pub use input::InputState;
 pub use questions::{PendingQuestions, QuestionFocus};
 pub use rail::RailState;
 pub use selection::Selection;
+pub use session::{
+    PanelDiff, PanelState, PendingAttach, PromptBatch, SessionContext, SessionUiState, UiContext,
+    UserMessageInFlight,
+};
 pub use slots::{NUM_SLOTS, SessionSlot};
 pub use transcript::{
     BackgroundKind, BackgroundOutcome, BackgroundResult, Cell, CellKind, PermExplain, Transcript,
@@ -186,7 +194,9 @@ pub enum Overlay {
         user_themes: Vec<String>,
     },
     /// Plan + agents on the `Tiny` tier.
-    RailOverlay,
+    RailOverlay {
+        selected: AgentId,
+    },
     /// The menu base (§3): the stack of levels plus the UI state of the one on
     /// screen. An empty stack means closed — `keys` restores `Focus::Normal`.
     /// Every central submenu (`MenuId`) lives inside this variant.
@@ -234,9 +244,9 @@ pub const PULSE_FRAMES: u64 = 16;
 /// dropped daemon events arms one request, not one per detected seq gap.
 pub const RESYNC_DEBOUNCE_MS: u64 = 500;
 
-/// A selection copy the draw path prepared for the event loop. `clipboard::copy`
-/// writes OSC 52 to stdout and may touch `arboard` — that IO must not run inside
-/// `ui::draw` (§8.1), so draw stashes the text here and the loop performs it.
+/// A selection copy the pre-draw coordinator prepared for the event loop.
+/// `clipboard::copy` writes OSC 52 to stdout and may touch `arboard` — that IO
+/// must stay outside the frame, so preparation stashes the text here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingCopy {
     pub text: String,
@@ -259,6 +269,15 @@ pub enum Connection {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderContext {
+    pub theme: pacode_render::Theme,
+    pub glyphs: Glyphs,
+    pub color: ColorMode,
+    pub thinking: bool,
+    pub expand_hint: String,
+}
+
 pub struct AppState {
     pub config: Config,
     pub theme: pacode_render::Theme,
@@ -268,34 +287,21 @@ pub struct AppState {
     pub plugin_status: Option<(String, String)>,
     pub paths: pacode_config::Paths,
     pub app_version: String,
-    pub meta: Option<SessionMeta>,
     pub connection: Connection,
-    /// Daemon truth only — `TurnStarted`/`TurnEnded`, a snapshot, or the
-    /// optimistic `ctrl+c` clear. Send paths never set it: the prompt queue's
-    /// send gate is `user_msgs_in_flight`, so a `UserMessage` that is rejected
-    /// or lost cannot leave this stuck `true` (which used to swallow every
-    /// later prompt into a queue that never drained).
-    pub turn_active: bool,
-    /// `Request::UserMessage` sends the daemon has not answered yet — the
-    /// prompt queue's send gate (`drain_prompt_queue`). Counted out by
-    /// `dispatch_action`, counted back in when `BgResponse::Reply` arrives.
-    pub user_msgs_in_flight: usize,
-    /// Main agent transcript.
-    pub transcript: Transcript,
-    /// Panel transcript (agent) or task output lines.
-    pub panel: PanelState,
-    pub files: FilesState,
-    /// Git history for the VCS submenu (filled by `Reply::GitLog`; T17 renders).
-    pub git: GitState,
+    pub event_connection_epoch: u64,
+    pub event_session_epoch: u64,
+    pub awaiting_snapshot: bool,
+    snapshot_rebase_allowed: bool,
+    reconnect_snapshot_pending: bool,
+    global_refresh_in_flight: bool,
+    global_refresh_remaining: usize,
+    global_refresh_context: Option<UiContext>,
+    pub session: SessionUiState,
     /// The scan behind the Import submenu (§5.7): what `pacode-import`
     /// discovered plus each entry's conflict status and the apply target.
     /// Filled by `menu::import::on_open`, rebuilt on every open, cleared by a
     /// successful apply; `None` while the menu has never been opened.
     pub import: Option<crate::ui::menu::import::ImportScan>,
-    pub rail: RailState,
-    pub input: InputState,
-    pub vim: VimState,
-    pub focus: Focus,
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
@@ -330,131 +336,77 @@ pub struct AppState {
     /// Terminal size as last seen.
     pub cols: u16,
     pub rows: u16,
-    /// Mouse selection in dialog area.
-    pub selection: Selection,
     /// Whether the OSC 52 remote clipboard hint toast has already been shown this session.
     pub clipboard_warned: bool,
     /// `ctrl+c` pressed once (exit on second within 2 s).
     pub ctrl_c_at: Option<Instant>,
     pub quit: bool,
-    /// When the main agent turn started (for calculating thinking duration and animations).
-    pub turn_started_at: Option<Instant>,
-    /// Frame counter for activity animations and spinners; advanced by the
-    /// animation tick (paced by `ui.animation`, `tick_ms`/`fast_tick_ms`).
-    pub anim_frame: u64,
     /// Mascot shown in the header banner; random per run, fixed for the session.
     pub mascot: crate::ui::mascot::MascotKind,
     /// Whether the terminal takes RGB; decided once from `[ui] color` and the
     /// environment, and reused by the theme and the mascot.
     pub truecolor: bool,
-    /// Pending readline key chord (e.g. `ctrl+x` waiting for `ctrl+e`).
-    pub pending_chord: Option<crossterm::event::KeyEvent>,
+    pub(crate) color_mode: ColorMode,
+    pub(crate) detected_color_mode: ColorMode,
+    pub(crate) render_context: RenderContext,
+    pub(crate) render_epoch: u64,
     /// Double-Shift detector state for the menu hub (§4.2).
     pub double_shift: crate::double_shift::DoubleShift,
     /// Session slot table (1..=9).
     pub slots: [Option<SessionSlot>; NUM_SLOTS],
     /// Currently active slot index (0..8).
     pub active_slot: usize,
-    /// Questions the model asked and still waits on — several can be open at
-    /// once (other agents, replays). The `QuestionPicker` overlay renders the
-    /// one under the queue cursor.
-    pub questions: PendingQuestions,
     /// Working directory for the session.
     pub cwd: PathBuf,
-    /// Cancellation sender for currently running local bash command.
-    pub running_bash: Option<tokio::sync::oneshot::Sender<()>>,
-    /// Temporary files created for pasted images.
-    pub pasted_images: crate::clipboard_read::PastedImages,
-    /// Thumbnail cache for the image preview strip above the input.
-    pub image_strip: images::ImageStripState,
     /// Escape sequences stashed by `ui::images::draw` and flushed to the
     /// terminal post-draw: (terminal area, escape payload).
     pub pending_image_escapes: Vec<(ratatui::layout::Rect, String)>,
-    /// Current activity phase and when it started. The activity line ages from
-    /// this instant, so the thinking wording and its colour reset after every
-    /// tool call instead of drifting with the whole turn.
-    pub phase: Option<(crate::state::activity::Phase, Instant)>,
-    /// Age of `phase`, refreshed by the event loop before each draw so the draw
-    /// path stays a pure function of state.
-    pub phase_elapsed_ms: u64,
-    /// When this session's UI came up; drives the welcome cascade in the
-    /// header. Re-armed on every snapshot so a re-attach replays the cascade.
-    pub started_at: Instant,
-    /// Toggles once per second tick; the 1 s blink phase for pulses that run
-    /// while only the second tick is armed (idle main, background work alive).
-    pub second_parity: bool,
-    /// Focus layer seen by the last draw, as a small key (`ui::focus_key`), so
-    /// a new overlay can restart its unfold without inspecting the enum again.
-    pub last_focus_key: u8,
-    /// When the current overlay/picker focus layer opened (render-side clock
-    /// for the ~140 ms unfold); `None` while the focus layer is not a popup.
-    pub overlay_since: Option<Instant>,
-    /// A copy the draw path prepared for the event loop to perform (§8.1 —
-    /// `clipboard::copy` does IO and must not run inside `ui::draw`).
-    pub pending_copy: Option<PendingCopy>,
-    /// Session-bound requests sent while no session was attached — the
-    /// startup attach runs as a background request, so the event loop is
-    /// already live before the first snapshot lands. Flushed in order when
-    /// it does; `dispatch_action` caps the queue and drops the oldest.
-    pub pending_requests: VecDeque<pacode_types::Request>,
-    /// Seq of the last applied daemon event (`ClientEvent::Event`). A jump
-    /// over `last + 1` means the lossy daemon→client pipe dropped events in
-    /// between (broadcast lag, a full client queue) and the folded state is
-    /// stale until a `GetSnapshot` resync lands — a lost `AgentUpdated`
-    /// leaves a subagent "live" in the rail forever. Rebased to
-    /// `snapshot.seq` whenever a snapshot is applied.
-    pub last_event_seq: Option<u64>,
-    /// A seq gap asked for a snapshot resync. The event loop drains this
-    /// into ONE debounced `Request::GetSnapshot` via
-    /// [`Self::take_resync_request`]; a landing snapshot clears it — any
-    /// gap it was armed by is covered by the fresh state.
-    pub resync_want: bool,
-    /// A `GetSnapshot` resync was sent and no reply landed yet — blocks a
-    /// second send until the reply arrives or the request fails.
-    pub resync_in_flight: bool,
-    /// When the last resync request was sent — rate-limits resends to
-    /// `RESYNC_DEBOUNCE_MS`.
-    pub resync_sent_at: Option<Instant>,
     /// The `-p`/`--prompt` argv text, carried until the startup attach lands
     /// — `BgResponse::AttachFinished` sends it then.
     pub initial_prompt: Option<String>,
     /// Why the startup attach failed — `run` returns it once the loop exits
     /// (the error also sets `quit`, so a failed attach still exits fast).
     pub attach_error: Option<pacode_client::ClientError>,
+    pub pending_attach: Option<PendingAttach>,
+    pub attach_in_flight: bool,
 }
 
-/// What the panel shows.
-pub struct PanelState {
-    pub target: Option<PanelTarget>,
-    pub agent_transcript: Transcript,
-    pub task_lines: Vec<String>,
-    pub task_total_lines: u64,
-    pub scroll: usize,
-    /// The `PanelTarget::FileDiff` payload — written by
-    /// `BgResponse::FileDiffReady`, `None` while the probe runs.
-    pub diff: Option<PanelDiff>,
+impl Deref for AppState {
+    type Target = SessionUiState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
 }
 
-/// The file-diff payload the panel renders for `PanelTarget::FileDiff`.
-/// Owner: `PanelState`.
-/// Cap: one patch ≤ `pacode_vcs::DIFF_CAP_BYTES` plus its rendered lines.
-/// Invalidation: replaced when the target re-arms or the diff job lands.
-pub struct PanelDiff {
-    /// The path this diff is for — a response applies only while it is still
-    /// the panel's target.
-    pub path: String,
-    /// `git diff` output — `None` for a clean worktree, a missing file, or a
-    /// repo-less path (`note` says which).
-    pub patch: Option<String>,
-    /// What the probe's `git status` said — feeds the header label.
-    pub status: Option<crate::state::files::FileStatus>,
-    /// The patch hit the capture cap.
-    pub truncated: bool,
-    /// Why the patch is missing, or where a synthetic one came from.
-    pub note: Option<String>,
-    /// `render_diff_ex` output at the width it was rendered for — rebuilt on
-    /// resize, never per frame (§8.1: no repeat renders).
-    pub rendered: Option<(u16, Vec<ratatui::text::Line<'static>>)>,
+impl DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
+fn attach_matches_snapshot(
+    attach: &pacode_types::Attach,
+    context: &ClientEventContext,
+    snapshot: &pacode_types::SessionSnapshot,
+) -> bool {
+    if context.connection_epoch != 0 && context.session.as_ref() != Some(&snapshot.meta.id) {
+        return false;
+    }
+    match attach {
+        pacode_types::Attach::Resume { session } => &snapshot.meta.id == session,
+        pacode_types::Attach::New { cwd, .. } | pacode_types::Attach::Latest { cwd } => {
+            snapshot.meta.cwd == *cwd
+        }
+    }
+}
+
+fn expand_hint_for(keymap: &crate::binding::Keymap) -> String {
+    keymap
+        .bindings_for(crate::binding::Action::ExpandOutput)
+        .first()
+        .map(crate::binding::format_binding)
+        .unwrap_or_else(|| "click".to_string())
 }
 
 impl AppState {
@@ -474,17 +426,545 @@ impl AppState {
         }
     }
 
+    pub fn agent_is_interesting(&self, agent: &AgentId) -> bool {
+        if agent.is_main() {
+            return true;
+        }
+        if matches!(
+            self.panel_agent_target(),
+            Some(PanelTarget::Agent(ref id)) if id == agent
+        ) {
+            return true;
+        }
+        match &self.focus {
+            Focus::Panel {
+                target: PanelTarget::Agent(id),
+                ..
+            } => id == agent,
+            Focus::SelectAgent { index } => {
+                self.selectable_agent_id(*index).as_ref() == Some(agent)
+            }
+            Focus::Overlay(Overlay::RailOverlay { selected }) => selected == agent,
+            _ => false,
+        }
+    }
+
+    pub fn event_is_interesting(&self, event: &Event) -> bool {
+        match event {
+            Event::TextDelta { agent, .. } | Event::ReasoningDelta { agent, .. } => {
+                self.agent_is_interesting(agent)
+            }
+            Event::ItemAdded(item) | Event::ItemUpdated(item) => {
+                item.agent.is_main()
+                    || self.agent_is_interesting(&item.agent)
+                    || matches!(&item.kind, TranscriptKind::ToolCall { .. })
+            }
+            _ => true,
+        }
+    }
+
+    fn selectable_agent_id(&self, index: usize) -> Option<AgentId> {
+        if self.rail.agents.is_empty() {
+            return None;
+        }
+        let has_main = self.rail.agents.iter().any(|agent| agent.id.is_main());
+        let sub_index = index.saturating_sub(if has_main { 1 } else { 0 });
+        if index == 0 {
+            return Some(AgentId::main());
+        }
+        self.rail
+            .agents
+            .iter()
+            .filter(|agent| !agent.id.is_main())
+            .nth(sub_index)
+            .map(|agent| agent.id.clone())
+    }
+
+    pub fn session_context(&self) -> SessionContext {
+        SessionContext {
+            generation: self.session.generation,
+            deferred_epoch: self.session.deferred_epoch,
+            slot: self.active_slot,
+            session: self.meta.as_ref().map(|meta| meta.id.clone()),
+        }
+    }
+
+    pub fn ui_context(&self) -> UiContext {
+        UiContext {
+            generation: self.session.generation,
+            deferred_epoch: self.session.deferred_epoch,
+            slot: self.active_slot,
+        }
+    }
+
+    pub fn ui_context_is_current(&self, context: &UiContext) -> bool {
+        context.generation == self.session.generation
+            && context.deferred_epoch == self.session.deferred_epoch
+            && context.slot == self.active_slot
+    }
+
+    pub fn pending_attach_token(&self) -> Option<u64> {
+        self.pending_attach.as_ref().map(|pending| pending.token)
+    }
+
+    pub fn set_pending_attach_client_epoch(&mut self, epoch: u64) -> Option<u64> {
+        let pending = self.pending_attach.as_mut()?;
+        pending.set_client_session_epoch(epoch);
+        Some(pending.token)
+    }
+
+    pub fn pending_attach_epoch_signal(&self) -> Option<Arc<AtomicU64>> {
+        self.pending_attach
+            .as_ref()
+            .map(PendingAttach::epoch_signal)
+    }
+
+    pub fn begin_global_refresh(&mut self, count: usize) -> bool {
+        if count == 0 || self.global_refresh_in_flight {
+            return false;
+        }
+        self.global_refresh_in_flight = true;
+        self.global_refresh_remaining = count;
+        true
+    }
+
+    pub fn finish_global_refresh_request(&mut self) {
+        if !self.global_refresh_in_flight {
+            return;
+        }
+        self.global_refresh_remaining = self.global_refresh_remaining.saturating_sub(1);
+        if self.global_refresh_remaining == 0 {
+            self.global_refresh_in_flight = false;
+        }
+    }
+
+    pub fn cancel_global_refresh(&mut self) {
+        self.global_refresh_in_flight = false;
+        self.global_refresh_remaining = 0;
+        self.global_refresh_context = None;
+    }
+
+    pub fn global_refresh_in_flight(&self) -> bool {
+        self.global_refresh_in_flight
+    }
+
+    pub fn global_refresh_context_is_current(&self, context: UiContext) -> bool {
+        self.global_refresh_context == Some(context)
+    }
+
+    pub fn record_global_refresh_context(&mut self, context: UiContext) {
+        self.global_refresh_context = Some(context);
+    }
+
+    pub fn take_reconnect_snapshot_boundary(&mut self) -> bool {
+        std::mem::take(&mut self.reconnect_snapshot_pending)
+    }
+
+    fn cancel_resync_for_attach(&mut self) {
+        self.resync_want = false;
+        self.resync_from_prompt = false;
+        self.resync_in_flight = false;
+        self.resync_sent_at = None;
+    }
+
+    pub fn clear_pending_attach(&mut self, reason: String) {
+        self.pending_attach = None;
+        self.attach_in_flight = false;
+        self.event_session_epoch = 0;
+        self.awaiting_snapshot = false;
+        self.snapshot_rebase_allowed = false;
+        self.reconnect_snapshot_pending = false;
+        self.resync_want = false;
+        self.resync_from_prompt = false;
+        self.resync_in_flight = false;
+        self.resync_sent_at = None;
+        self.cancel_global_refresh();
+        self.session.clear_buffered_events();
+        self.connection = Connection::Disconnected { reason };
+        self.dirty = true;
+    }
+
+    pub fn request_attach_retry(&mut self) -> bool {
+        if self.pending_attach.is_none() {
+            self.attach_in_flight = false;
+            return false;
+        }
+        self.cancel_resync_for_attach();
+        if self.attach_in_flight {
+            return false;
+        }
+        let Some(pending) = self.pending_attach.as_mut() else {
+            return false;
+        };
+        if pending.retry_count >= 2 {
+            pending.retry_requested = false;
+            return false;
+        }
+        pending.retry_count += 1;
+        pending.retry_requested = true;
+        true
+    }
+
+    pub fn take_pending_attach_retry(&mut self) -> Option<PendingAttach> {
+        if self.pending_attach.is_none() {
+            self.attach_in_flight = false;
+            return None;
+        }
+        self.cancel_resync_for_attach();
+        if self.attach_in_flight {
+            return None;
+        }
+        if !self
+            .pending_attach
+            .as_ref()
+            .is_some_and(|pending| pending.retry_requested)
+        {
+            return None;
+        }
+        let client_connected = matches!(self.connection, Connection::Connected)
+            || (matches!(self.connection, Connection::Connecting)
+                && self.event_connection_epoch != 0);
+        if !client_connected {
+            if !matches!(self.connection, Connection::Connecting)
+                && let Some(pending) = self.pending_attach.as_mut()
+            {
+                pending.retry_requested = false;
+            }
+            return None;
+        }
+        self.pending_attach.as_mut()?.retry_requested = false;
+        self.attach_in_flight = true;
+        self.pending_attach.clone()
+    }
+
+    pub fn context_is_current(&self, context: &SessionContext) -> bool {
+        if self.meta.is_none() {
+            return context.slot == self.active_slot
+                && self
+                    .pending_attach
+                    .as_ref()
+                    .is_some_and(|pending| pending.context == *context);
+        }
+        context.matches(
+            self.session.generation,
+            self.session.deferred_epoch,
+            self.active_slot,
+            self.meta.as_ref().map(|meta| &meta.id),
+        )
+    }
+
+    pub fn observe_connection_context(&mut self, context: &ClientEventContext) -> bool {
+        if context.connection_epoch == 0 {
+            return true;
+        }
+        if context.connection_epoch < self.event_connection_epoch {
+            return false;
+        }
+        if context.connection_epoch > self.event_connection_epoch {
+            let initial_connection = self.event_connection_epoch == 0;
+            self.event_connection_epoch = context.connection_epoch;
+            self.session.clear_buffered_events();
+            if !initial_connection {
+                self.session.advance_deferred_epoch();
+                self.session.cancel_deferred_work();
+            }
+            self.awaiting_snapshot = true;
+            self.snapshot_rebase_allowed = false;
+            self.resync_want = false;
+            self.resync_from_prompt = false;
+            self.resync_in_flight = false;
+            self.resync_sent_at = None;
+            if self.pending_attach.is_none() {
+                self.attach_in_flight = false;
+            }
+            if !initial_connection {
+                let attach_token = self
+                    .pending_attach
+                    .as_ref()
+                    .map(|_| self.session.allocate_attach_token());
+                if let (Some(token), Some(pending)) = (attach_token, &mut self.pending_attach) {
+                    pending.token = token;
+                    pending.retry_requested = true;
+                }
+            }
+            self.reconnect_snapshot_pending =
+                !initial_connection && self.meta.is_some() && self.pending_attach.is_none();
+        }
+        true
+    }
+
+    pub fn client_context_matches_current_session(&self, context: &ClientEventContext) -> bool {
+        context.connection_epoch != 0
+            && context.connection_epoch == self.event_connection_epoch
+            && context.session_epoch == self.event_session_epoch
+            && context.session.as_ref() == self.meta.as_ref().map(|meta| &meta.id)
+    }
+
+    pub fn event_context_is_current(&self, context: &ClientEventContext) -> bool {
+        (context.connection_epoch == 0 && self.meta.is_none() && self.pending_attach.is_none())
+            || (!self.awaiting_snapshot && self.client_context_matches_current_session(context))
+    }
+
+    fn event_context_can_buffer(&self, context: &ClientEventContext) -> bool {
+        if context.connection_epoch == 0 || context.connection_epoch != self.event_connection_epoch
+        {
+            return false;
+        }
+        if let Some(pending) = &self.pending_attach {
+            if context.session_epoch != pending.client_session_epoch() {
+                return false;
+            }
+            return match &pending.attach {
+                pacode_types::Attach::Resume { session } => {
+                    context.session.as_ref() == Some(session)
+                }
+                pacode_types::Attach::New { .. } | pacode_types::Attach::Latest { .. } => {
+                    context.session.is_some()
+                }
+            };
+        }
+        self.meta.as_ref().is_some_and(|meta| {
+            context.session.as_ref() == Some(&meta.id)
+                && context.session_epoch == self.event_session_epoch
+        })
+    }
+
+    fn apply_tracked_session_event(&mut self, seq: u64, event: Event, now: Instant) -> bool {
+        if let Some(last) = self.last_event_seq
+            && seq <= last
+        {
+            return false;
+        }
+        if self
+            .last_event_seq
+            .is_some_and(|last| seq != last.wrapping_add(1))
+        {
+            self.resync_want = true;
+        }
+        self.last_event_seq = Some(seq);
+        self.observe_background_completion(&event);
+        self.apply_event(seq, event, now);
+        self.dirty = true;
+        true
+    }
+
+    fn replay_buffered_session_events(&mut self, now: Instant) {
+        let expected = ClientEventContext {
+            connection_epoch: self.event_connection_epoch,
+            session_epoch: self.event_session_epoch,
+            session: self.meta.as_ref().map(|meta| meta.id.clone()),
+        };
+        let (mut buffered, overflowed) = self.session.take_buffered_events();
+        buffered.sort_by_key(|buffered| (buffered.first_seq, buffered.seq));
+        for buffered in buffered {
+            if buffered.context != expected {
+                continue;
+            }
+            if self.last_event_seq.is_some_and(|last| buffered.seq <= last) {
+                continue;
+            }
+            if let Some(event) = buffered.event {
+                match self.last_event_seq {
+                    None => {
+                        self.last_event_seq = Some(buffered.seq);
+                        self.observe_background_completion(&event);
+                        self.apply_event(buffered.seq, event, now);
+                        self.dirty = true;
+                    }
+                    Some(last) if buffered.first_seq <= last => {
+                        self.last_event_seq = Some(buffered.seq);
+                        self.resync_want = true;
+                    }
+                    Some(last) if buffered.first_seq == last.wrapping_add(1) => {
+                        self.last_event_seq = Some(buffered.seq);
+                        self.observe_background_completion(&event);
+                        self.apply_event(buffered.seq, event, now);
+                        self.dirty = true;
+                    }
+                    Some(_) => {
+                        self.apply_tracked_session_event(buffered.seq, event, now);
+                    }
+                }
+            } else {
+                self.last_event_seq = Some(buffered.seq);
+            }
+        }
+        if overflowed {
+            self.resync_want = true;
+            self.dirty = true;
+        }
+    }
+
+    fn invalidate_pending_attach_after_disconnect(&mut self) {
+        let Some(token) = self
+            .pending_attach
+            .as_ref()
+            .map(|_| self.session.allocate_attach_token())
+        else {
+            self.attach_in_flight = false;
+            return;
+        };
+        if let Some(pending) = &mut self.pending_attach {
+            pending.token = token;
+            pending.retry_requested = true;
+        }
+        self.attach_in_flight = false;
+    }
+
+    pub fn accepts_event_snapshot(
+        &mut self,
+        context: &ClientEventContext,
+        snapshot: &pacode_types::SessionSnapshot,
+    ) -> bool {
+        if context.connection_epoch == 0 {
+            if self.pending_attach.is_some() {
+                return false;
+            }
+            return snapshot.seq >= self.last_event_seq.unwrap_or(0)
+                && self
+                    .meta
+                    .as_ref()
+                    .is_none_or(|meta| meta.id == snapshot.meta.id);
+        }
+        if !self.observe_connection_context(context) {
+            return false;
+        }
+        if !self.awaiting_snapshot && snapshot.seq < self.last_event_seq.unwrap_or(0) {
+            return false;
+        }
+        if let Some(pending) = &self.pending_attach {
+            if pending.context.generation != self.session.generation
+                || pending.context.slot != self.active_slot
+                || context.session_epoch != pending.client_session_epoch()
+                || !attach_matches_snapshot(&pending.attach, context, snapshot)
+            {
+                return false;
+            }
+            self.cancel_resync_for_attach();
+            self.session.fail_in_flight_user_messages();
+            self.pending_attach = None;
+            self.attach_in_flight = false;
+
+            self.accept_attach_context(context);
+            return true;
+        }
+        let Some(meta) = &self.meta else {
+            return false;
+        };
+        if context.session.as_ref() != Some(&meta.id)
+            || context.session_epoch != self.event_session_epoch
+        {
+            return false;
+        }
+        self.accept_attach_context(context);
+        true
+    }
+
+    pub fn accept_attach_context(&mut self, context: &ClientEventContext) {
+        if context.connection_epoch != 0 {
+            self.event_connection_epoch = context.connection_epoch;
+        }
+        self.event_session_epoch = context.session_epoch;
+        self.awaiting_snapshot = false;
+        self.snapshot_rebase_allowed = true;
+        if self.pending_attach.is_none() {
+            self.attach_in_flight = false;
+        }
+    }
+
+    pub fn begin_attach(&mut self, attach: pacode_types::Attach) -> SessionContext {
+        let context = self.session_context();
+        let expected_epoch = self.event_session_epoch.wrapping_add(1);
+        let token = self.session.allocate_attach_token();
+        self.cancel_global_refresh();
+        self.reconnect_snapshot_pending = false;
+        self.session.clear_buffered_events();
+        self.event_session_epoch = 0;
+        self.awaiting_snapshot = true;
+        self.snapshot_rebase_allowed = false;
+        self.resync_want = false;
+        self.resync_in_flight = false;
+        self.resync_sent_at = None;
+        self.attach_in_flight = false;
+        self.pending_attach = Some(PendingAttach {
+            context: context.clone(),
+            attach,
+            token,
+            client_session_epoch: Arc::new(AtomicU64::new(expected_epoch)),
+            retry_requested: false,
+            retry_count: 0,
+        });
+        context
+    }
+
+    pub fn accepts_attach(
+        &self,
+        context: &SessionContext,
+        client_context: &ClientEventContext,
+        attach: &pacode_types::Attach,
+        snapshot: &pacode_types::SessionSnapshot,
+    ) -> bool {
+        self.accepts_attach_with_token(
+            context,
+            self.pending_attach_token().unwrap_or_default(),
+            client_context,
+            attach,
+            snapshot,
+        )
+    }
+
+    pub fn accepts_attach_with_token(
+        &self,
+        context: &SessionContext,
+        token: u64,
+        client_context: &ClientEventContext,
+        attach: &pacode_types::Attach,
+        snapshot: &pacode_types::SessionSnapshot,
+    ) -> bool {
+        if !self.context_is_current(context) {
+            return false;
+        }
+        let Some(pending) = &self.pending_attach else {
+            return self
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.id == snapshot.meta.id)
+                && attach_matches_snapshot(attach, client_context, snapshot);
+        };
+        if pending.token != token
+            || pending.context != *context
+            || pending.attach != *attach
+            || !attach_matches_snapshot(attach, client_context, snapshot)
+        {
+            return false;
+        }
+        if client_context.connection_epoch != 0 {
+            if client_context.connection_epoch < self.event_connection_epoch {
+                return false;
+            }
+            if client_context.session_epoch != pending.client_session_epoch() {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn new(config: Config, app_version: String, cols: u16, rows: u16) -> Self {
         let cells = config.ui.transcript_cells;
         let paths = pacode_config::Paths::discover();
-        let truecolor = match config.ui.color.as_str() {
-            "ansi" => false,
-            "truecolor" | "24bit" => true,
-            _ => pacode_render::detect_truecolor(),
-        };
+        let detected_color_mode = ColorMode::detect();
+        let color_mode = ColorMode::from_setting(&config.ui.color, detected_color_mode);
+        let truecolor = color_mode == ColorMode::Truecolor;
         let (palette, _) = pacode_config::theme::load_theme(&paths, &config.theme);
         let theme = pacode_render::Theme::from_palette(&palette, truecolor);
         let (keymap, keymap_warnings) = crate::binding::Keymap::from_config(&config.keys);
+        let render_context = RenderContext {
+            theme: theme.clone(),
+            glyphs: Glyphs::new(config.ui.ascii_only),
+            color: color_mode,
+            thinking: config.ui.thinking,
+            expand_hint: expand_hint_for(&keymap),
+        };
         let model_flags = pacode_config::load_prefs(&paths).model_flags;
         Self {
             config,
@@ -494,27 +974,17 @@ impl AppState {
             plugin_status: None,
             paths,
             app_version,
-            meta: None,
             connection: Connection::Connected,
-            turn_active: false,
-            user_msgs_in_flight: 0,
-            transcript: Transcript::new(cells),
-            panel: PanelState {
-                target: None,
-                agent_transcript: Transcript::new(300),
-                task_lines: Vec::new(),
-                task_total_lines: 0,
-                scroll: 0,
-                diff: None,
-            },
-            files: FilesState::default(),
-            git: GitState::default(),
+            event_connection_epoch: 0,
+            event_session_epoch: 0,
+            awaiting_snapshot: true,
+            snapshot_rebase_allowed: false,
+            reconnect_snapshot_pending: false,
+            global_refresh_in_flight: false,
+            global_refresh_remaining: 0,
+            global_refresh_context: None,
+            session: SessionUiState::new(cells),
             import: None,
-            rail: RailState::default(),
-            input: InputState::default(),
-            vim: VimState::default(),
-            focus: Focus::Normal,
-            questions: PendingQuestions::default(),
             toasts: VecDeque::new(),
             models: Vec::new(),
             model_flags,
@@ -530,38 +1000,83 @@ impl AppState {
             dirty_anim: false,
             cols,
             rows,
-            selection: Selection::default(),
             clipboard_warned: false,
             ctrl_c_at: None,
             quit: false,
-            turn_started_at: None,
-            anim_frame: 0,
             mascot: crate::ui::mascot::MascotKind::random(),
             truecolor,
-            pending_chord: None,
+            color_mode,
+            detected_color_mode,
+            render_context,
+            render_epoch: 0,
             double_shift: crate::double_shift::DoubleShift::default(),
             slots: Default::default(),
             active_slot: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            running_bash: None,
-            pasted_images: crate::clipboard_read::PastedImages::new(),
-            image_strip: images::ImageStripState::default(),
             pending_image_escapes: Vec::new(),
-            phase: None,
-            phase_elapsed_ms: 0,
-            started_at: Instant::now(),
-            second_parity: false,
-            last_focus_key: 0,
-            overlay_since: None,
-            pending_copy: None,
-            pending_requests: VecDeque::new(),
-            last_event_seq: None,
-            resync_want: false,
-            resync_in_flight: false,
-            resync_sent_at: None,
             initial_prompt: None,
             attach_error: None,
+            pending_attach: None,
+            attach_in_flight: false,
         }
+    }
+
+    pub fn render_options(&self, width: u16) -> RenderOptions {
+        RenderOptions::with_theme_color(
+            width,
+            self.config.ui.ascii_only,
+            self.theme.clone(),
+            self.color_mode,
+        )
+        .thinking(self.config.ui.thinking)
+        .expand_hint(expand_hint_for(&self.keymap))
+        .cache_epoch(self.render_epoch)
+    }
+
+    pub fn sync_render_context(&mut self) {
+        let next = RenderContext {
+            theme: self.theme.clone(),
+            glyphs: Glyphs::new(self.config.ui.ascii_only),
+            color: self.color_mode,
+            thinking: self.config.ui.thinking,
+            expand_hint: expand_hint_for(&self.keymap),
+        };
+        if self.render_context == next {
+            return;
+        }
+        self.render_context = next;
+        self.render_epoch = self.render_epoch.wrapping_add(1);
+        let truecolor = self.truecolor;
+        if let Some(header) = &mut self.transcript.header {
+            header.truecolor = truecolor;
+        }
+        self.transcript.cache.clear();
+        self.panel.agent_transcript.cache.clear();
+        if let Some(diff) = &mut self.panel.diff {
+            diff.rendered = None;
+        }
+        if let Some(diff) = &mut self.git.diff {
+            diff.rendered = None;
+        }
+    }
+
+    pub fn rebuild_theme(&mut self) {
+        self.color_mode = ColorMode::from_setting(&self.config.ui.color, self.detected_color_mode);
+        self.truecolor = self.color_mode == ColorMode::Truecolor;
+        let (palette, _) = pacode_config::theme::load_theme(&self.paths, &self.config.theme);
+        self.theme = pacode_render::Theme::from_palette(&palette, self.truecolor);
+    }
+
+    pub fn apply_runtime_config(&mut self, key: &str) {
+        if key == "ui.color" || key.starts_with("theme.") {
+            self.rebuild_theme();
+        }
+        if key == "ui.transcript_cells" {
+            let max_cells = self.config.ui.transcript_cells;
+            self.transcript.set_max_cells(max_cells);
+            self.panel.agent_transcript.set_max_cells(max_cells);
+        }
+        self.sync_render_context();
     }
 
     /// The phase the session is in right now, from what the transcript and the rail
@@ -652,7 +1167,8 @@ impl AppState {
     }
 
     pub fn cleanup_pasted_images(&mut self) {
-        self.pasted_images.cleanup_unreferenced(&self.input.text);
+        let text = self.input.text.clone();
+        self.pasted_images.cleanup_unreferenced(&text);
     }
 
     /// Records whose `[Image N]` token is still referenced by the current
@@ -676,15 +1192,57 @@ impl AppState {
         }
     }
 
+    fn apply_attach_failed(
+        &mut self,
+        context: &ClientEventContext,
+        attach: &pacode_types::Attach,
+        reason: String,
+    ) -> bool {
+        if !self.observe_connection_context(context) {
+            return false;
+        }
+        let relevant = self.pending_attach.as_ref().map_or_else(
+            || {
+                self.meta.as_ref().is_some_and(|meta| {
+                    matches!(attach, pacode_types::Attach::Resume { session } if session == &meta.id)
+                })
+            },
+            |pending| {
+                let target_matches = match (&pending.attach, attach) {
+                    (
+                        pacode_types::Attach::New { .. } | pacode_types::Attach::Latest { .. },
+                        pacode_types::Attach::Resume { .. },
+                    ) => true,
+                    _ => &pending.attach == attach,
+                };
+                target_matches
+                    && (context.connection_epoch == 0
+                        || (context.connection_epoch == self.event_connection_epoch
+                            && context.session_epoch == pending.client_session_epoch()))
+            },
+        );
+        if !relevant {
+            return false;
+        }
+
+        self.clear_pending_attach(reason.clone());
+        self.push_notice_with_level(ToastLevel::Error, format!("attach failed: {reason}"));
+        self.attach_error = Some(pacode_client::ClientError::Daemon(reason));
+        self.quit = true;
+        true
+    }
+
     /// Fold a client event into the state (spec §5 state table, §7 follow rules).
     /// Returns true when a redraw is needed (almost always).
     pub fn apply_client_event(&mut self, event: ClientEvent, now: Instant) -> bool {
         match event {
-            ClientEvent::Connected { .. } => {
-                // While no session is attached — the startup attach is still
-                // in flight, or a slot switch is between Detach and Attach —
-                // the footer keeps saying "connecting…"; the incoming
-                // snapshot is what flips it to Connected.
+            ClientEvent::Connected { context, .. } => {
+                if !self.observe_connection_context(&context) {
+                    return false;
+                }
+                self.awaiting_snapshot = self.awaiting_snapshot
+                    || self.meta.is_none()
+                    || self.reconnect_snapshot_pending;
                 self.connection = if self.meta.is_some() {
                     Connection::Connected
                 } else {
@@ -693,155 +1251,279 @@ impl AppState {
                 self.dirty = true;
                 true
             }
-            ClientEvent::Disconnected { reason } => {
+            ClientEvent::Disconnected { context, reason } => {
+                if !self.observe_connection_context(&context) {
+                    return false;
+                }
+                self.cancel_global_refresh();
+                self.reconnect_snapshot_pending = false;
+                self.session.advance_deferred_epoch();
+                self.session.cancel_deferred_work();
+                self.session.fail_in_flight_user_messages();
+                self.session.drop_pending_detach_turns();
+                self.session.clear_buffered_events();
+                self.invalidate_pending_attach_after_disconnect();
+                self.resync_want = false;
+                self.lists.git.in_flight = false;
+                self.awaiting_snapshot = true;
+                self.snapshot_rebase_allowed = false;
                 self.connection = Connection::Disconnected { reason };
                 self.dirty = true;
                 true
             }
-            ClientEvent::Reconnecting { attempt } => {
+            ClientEvent::Reconnecting { context, attempt } => {
+                if !self.observe_connection_context(&context) {
+                    return false;
+                }
+                self.cancel_global_refresh();
+                self.session.fail_in_flight_user_messages();
+                self.session.drop_pending_detach_turns();
+                self.reconnect_snapshot_pending =
+                    self.meta.is_some() && self.pending_attach.is_none();
+                self.awaiting_snapshot = true;
+                self.snapshot_rebase_allowed = false;
                 self.connection = Connection::Reconnecting { attempt };
                 self.dirty = true;
                 true
             }
-            ClientEvent::Snapshot(snapshot) => {
-                self.connection = Connection::Connected;
-                // `snapshot.seq` is the last event folded into the snapshot —
-                // the tracker must rebase on it, or the first post-snapshot
-                // event looks like a fresh gap and resyncs forever. The landing
-                // snapshot also ends any in-flight resync and settles a want
-                // armed by a pre-snapshot gap (that gap is now covered).
-                self.last_event_seq = Some(snapshot.seq);
-                self.resync_want = false;
-                self.resync_in_flight = false;
-                // One-time config-split migration notice (spec §5): the
-                // daemon leaves a marker when it split `config.toml`; the
-                // first attach to see it toasts the message.
-                if let Some(msg) = pacode_config::take_migration_notice(&self.paths) {
-                    self.push_toast(ToastLevel::Info, msg, None, now);
+            ClientEvent::AttachFailed {
+                context,
+                attach,
+                reason,
+            } => self.apply_attach_failed(&context, &attach, reason),
+            ClientEvent::Snapshot { context, snapshot } => {
+                if !self.accepts_event_snapshot(&context, &snapshot) {
+                    return false;
                 }
-                // Project switch (§8.2): git history, file previews and path
-                // completions are all keyed to the session cwd — a different
-                // one invalidates them. `self.cwd()` already falls back to the
-                // startup cwd before `meta` exists, so this also catches
-                // attaching straight into a session living elsewhere.
-                // The cache file side needs nothing: the git key carries a
-                // cwd fingerprint, so a new project is simply a different file.
-                let project_changed = self.cwd() != snapshot.meta.cwd;
-                if project_changed {
-                    self.git = GitState::default();
-                    self.lists.git = crate::cache::ListHealth::default();
-                    self.files.clear_preview();
-                    self.input.at_comp = Default::default();
-                    self.input.bash_comp = Default::default();
+                self.apply_snapshot(snapshot, now)
+            }
+            ClientEvent::ResyncNeeded { context } => {
+                if !self.observe_connection_context(&context)
+                    || self.pending_attach.is_some()
+                    || !self.client_context_matches_current_session(&context)
+                {
+                    return false;
                 }
-                // The header banner is (re)installed below, so the welcome
-                // cascade re-arms here: a re-attach replays it.
-                self.started_at = now;
-                self.meta = Some(snapshot.meta.clone());
-                self.record_slot(self.active_slot, &snapshot);
-                self.transcript
-                    .reset(snapshot.transcript.clone(), snapshot.has_more_history);
-                let header = crate::state::transcript::HeaderInfo {
-                    version: self.app_version.clone(),
-                    day: crate::ui::phrases::day_index(pacode_types::time::now_ms()),
-                    mascot: self.mascot,
-                    truecolor: self.truecolor,
-                };
-                self.transcript.set_header(header);
-                for item in &snapshot.transcript {
-                    if let TranscriptKind::ToolCall {
-                        name,
-                        title,
-                        call_id,
-                        diff,
-                        ..
-                    } = &item.kind
-                    {
-                        let arg = crate::state::files::title_path_arg(name, title);
-                        let input = serde_json::json!({ "path": arg });
-                        self.files.observe_tool_item(name, &input, item.ts_ms);
-                        // Snapshot items arrive finished — the `DiffStat` is
-                        // already on the item, no `ItemUpdated` follows.
-                        if let Some(d) = diff {
-                            self.files.apply_diff(name, &input, call_id, *d, item.ts_ms);
-                        }
-                    }
+                if !self.resync_in_flight
+                    && (self.awaiting_snapshot || !matches!(self.connection, Connection::Connected))
+                {
+                    return false;
                 }
-                self.turn_active = snapshot.turn_active;
-                if snapshot.turn_active {
-                    if self.turn_started_at.is_none() {
-                        self.turn_started_at = Some(now);
-                    }
-                } else {
-                    self.turn_started_at = None;
-                }
-                self.rail.plan = snapshot.plan;
-                self.rail.agents = snapshot.agents;
-                self.rail.agents.sort_by_key(|a| a.started_at_ms);
-                self.rail.tasks = snapshot.tasks;
-                self.rail.cron_jobs = snapshot.cron_jobs;
-                self.rail.monitors = snapshot.monitors;
-                self.rail.tasks.sort_by_key(|t| t.started_at_ms);
-                self.rail.usage = snapshot.usage;
-                self.rail.update_idle(self.turn_active, now);
-                for (i, perm) in snapshot.pending_permissions.into_iter().enumerate() {
-                    let ts_ms = perm.created_at_ms;
-                    // A pending request also sits in the transcript tail —
-                    // keying on the permission id keeps one prompt, not two.
-                    self.transcript.upsert_permission(
-                        perm,
-                        ts_ms,
-                        snapshot.seq.wrapping_add(1).wrapping_add(i as u64),
-                    );
-                }
-                // The snapshot is authoritative for the question queue:
-                // anything still waiting lands (re-attach must not orphan an
-                // ask), everything else is gone. Focus state survives for
-                // ids that are still queued.
-                if self.questions.replace(snapshot.pending_questions) {
-                    self.focus = Focus::Overlay(Overlay::QuestionPicker);
-                } else if matches!(self.focus, Focus::Overlay(Overlay::QuestionPicker)) {
-                    self.focus = Focus::Normal;
-                }
+                self.resync_want = true;
                 self.dirty = true;
                 true
             }
-            ClientEvent::Event { seq, event } => {
-                // The daemon→client pipe drops events silently under load
-                // (broadcast lag, a full client queue): a jump in `seq` means
-                // the folded state is stale — a lost `AgentUpdated` leaves a
-                // subagent "live" in the rail forever. Arm ONE debounced
-                // `GetSnapshot` resync; skipped pre-attach, where the incoming
-                // snapshot is authoritative anyway.
-                //
-                // `SessionStatus` and `LoginProgress` ride the daemon-wide
-                // stream instead — their `seq` is the GLOBAL seq space, so
-                // folding them into the per-session tracker would forge a gap
-                // and resync on every other session's turn boundary.
-                let session_stream = !matches!(
-                    event,
-                    Event::SessionStatus { .. } | Event::LoginProgress { .. }
-                );
-                if session_stream {
-                    if let Some(last) = self.last_event_seq
-                        && seq != last.wrapping_add(1)
-                        && self.meta.is_some()
-                    {
+            ClientEvent::Event {
+                context,
+                seq,
+                event,
+            } => {
+                if !self.observe_connection_context(&context) {
+                    return false;
+                }
+                if event.is_global() {
+                    self.apply_event(seq, event, now);
+                    self.dirty = true;
+                    return true;
+                }
+                if self.awaiting_snapshot {
+                    if !self.event_context_can_buffer(&context) {
+                        return false;
+                    }
+                    if self.event_is_interesting(&event) {
+                        self.session.buffer_event(context, seq, event);
+                    } else {
+                        self.session.buffer_filtered_event(context, seq);
+                    }
+                    if self.resync_in_flight {
                         self.resync_want = true;
                     }
-                    self.last_event_seq = Some(seq);
+                    return false;
                 }
-                self.observe_background_completion(&event);
-                self.apply_event(seq, event, now);
-                self.dirty = true;
-                true
+                if !self.event_context_is_current(&context) {
+                    return false;
+                }
+                self.apply_tracked_session_event(seq, event, now)
             }
         }
     }
 
+    pub(crate) fn apply_snapshot(
+        &mut self,
+        snapshot: pacode_types::SessionSnapshot,
+        now: Instant,
+    ) -> bool {
+        if snapshot.seq < self.last_event_seq.unwrap_or(0) && !self.snapshot_rebase_allowed {
+            return false;
+        }
+        self.snapshot_rebase_allowed = false;
+        let retry_resync = self.resync_want && self.resync_in_flight;
+        self.connection = Connection::Connected;
+        self.last_event_seq = Some(snapshot.seq);
+        self.resync_want = false;
+        self.resync_in_flight = false;
+        self.resync_sent_at = None;
+        if self.pending_attach.is_none() {
+            self.attach_in_flight = false;
+        }
+        if let Some(msg) = pacode_config::take_migration_notice(&self.paths) {
+            self.push_toast(ToastLevel::Info, msg, None, now);
+        }
+        let project_changed = self.cwd() != snapshot.meta.cwd;
+        if project_changed {
+            self.git = GitState::default();
+            self.lists.git = crate::cache::ListHealth::default();
+            self.files.clear_preview();
+            self.input.at_comp = Default::default();
+            self.input.bash_comp = Default::default();
+        }
+        self.started_at = now;
+        self.meta = Some(snapshot.meta.clone());
+        self.record_slot(self.active_slot, &snapshot);
+        self.transcript
+            .reset(snapshot.transcript.clone(), snapshot.has_more_history);
+        let header = crate::state::transcript::HeaderInfo {
+            version: self.app_version.clone(),
+            day: crate::ui::phrases::day_index(pacode_types::time::now_ms()),
+            mascot: self.mascot,
+            truecolor: self.truecolor,
+        };
+        self.transcript.set_header(header);
+        for item in &snapshot.transcript {
+            if let TranscriptKind::ToolCall {
+                name,
+                title,
+                call_id,
+                diff,
+                ..
+            } = &item.kind
+            {
+                let arg = crate::state::files::title_path_arg(name, title);
+                let input = serde_json::json!({ "path": arg });
+                self.files.observe_tool_item(name, &input, item.ts_ms);
+                if let Some(diff) = diff {
+                    self.files
+                        .apply_diff(name, &input, call_id, *diff, item.ts_ms);
+                }
+            }
+        }
+        let active_turn = snapshot.active_turn.clone();
+        let terminal_turn = snapshot.terminal_turn.clone();
+        self.session.reconcile_turn_fence(
+            snapshot.turn_active,
+            active_turn.as_ref(),
+            terminal_turn.as_ref(),
+        );
+        if snapshot.turn_active {
+            if self.turn_started_at.is_none() {
+                self.turn_started_at = Some(now);
+            }
+        } else {
+            self.turn_started_at = None;
+        }
+        self.rail.plan = snapshot.plan;
+        self.rail.replace_agents(snapshot.agents);
+        self.rail.replace_tasks(snapshot.tasks);
+        self.rail.cron_jobs = snapshot.cron_jobs;
+        self.rail.monitors = snapshot.monitors;
+        self.rail.usage = snapshot.usage;
+        let turn_active = self.turn_active;
+        self.rail.update_idle(turn_active, now);
+        for (i, perm) in snapshot.pending_permissions.into_iter().enumerate() {
+            let ts_ms = perm.created_at_ms;
+            self.transcript.upsert_permission(
+                perm,
+                ts_ms,
+                snapshot.seq.wrapping_add(1).wrapping_add(i as u64),
+            );
+        }
+        if self.questions.replace(snapshot.pending_questions) {
+            self.focus = Focus::Overlay(Overlay::QuestionPicker);
+        } else if matches!(self.focus, Focus::Overlay(Overlay::QuestionPicker)) {
+            self.focus = Focus::Normal;
+        }
+        self.awaiting_snapshot = false;
+        self.replay_buffered_session_events(now);
+        self.resync_want |= retry_resync;
+        self.dirty = true;
+        true
+    }
+
     /// Fold a daemon event (`ClientEvent::Event`) into transcript/rail/panel/toasts.
     pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) {
+        let main_status = match &event {
+            Event::AgentUpdated(info) if info.id.is_main() => Some(info.status),
+            _ => None,
+        };
         events::apply_event(self, seq, event, now);
+        if let Some(status) = main_status {
+            self.session.observe_main_agent_status(status, now);
+        }
+    }
+
+    pub(crate) fn apply_session_status(
+        &mut self,
+        session: pacode_types::SessionId,
+        status: pacode_types::SessionStatusKind,
+    ) {
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.id == session {
+                slot.status = status;
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub(crate) fn apply_login_progress(
+        &mut self,
+        provider: String,
+        stage: pacode_types::LoginStage,
+        now: Instant,
+    ) {
+        match stage {
+            pacode_types::LoginStage::OpenUrl { url, opened } => {
+                let detail = if opened {
+                    format!("Opened browser to sign in to {provider}: {url}")
+                } else {
+                    format!("Open this URL in your browser to sign in to {provider}:\n{url}")
+                };
+                self.push_toast(ToastLevel::Info, "Login".into(), Some(detail), now);
+            }
+            pacode_types::LoginStage::Waiting => {
+                self.push_toast(
+                    ToastLevel::Info,
+                    "Login".into(),
+                    Some(format!("Waiting for authorization from {provider}...")),
+                    now,
+                );
+            }
+            pacode_types::LoginStage::Exchanging => {
+                self.push_toast(
+                    ToastLevel::Info,
+                    "Login".into(),
+                    Some(format!("Exchanging authorization code for {provider}...")),
+                    now,
+                );
+            }
+            pacode_types::LoginStage::Done { label } => {
+                self.push_toast(ToastLevel::Success, "Signed in".into(), Some(label), now);
+                if matches!(self.focus, Focus::Overlay(Overlay::LoginPicker { .. })) {
+                    self.focus = Focus::Normal;
+                }
+            }
+            pacode_types::LoginStage::Failed { message } => {
+                self.push_toast(
+                    ToastLevel::Error,
+                    format!("Login failed: {provider}"),
+                    Some(message),
+                    now,
+                );
+                if matches!(self.focus, Focus::Overlay(Overlay::LoginPicker { .. })) {
+                    self.focus = Focus::Normal;
+                }
+            }
+        }
+        self.dirty = true;
     }
 
     pub fn push_toast(
@@ -893,11 +1575,12 @@ impl AppState {
     /// returns true when something changed.
     pub fn expire_toasts(&mut self, now: Instant) -> bool {
         let before = self.toasts.len();
+        let input_text = self.input.text.clone();
         self.toasts.retain(|t| {
             now.saturating_duration_since(t.shown_at).as_secs() < TOAST_TTL_SECS
                 && t.token_label
                     .as_ref()
-                    .is_none_or(|label| self.input.text.contains(label.as_str()))
+                    .is_none_or(|label| input_text.contains(label.as_str()))
         });
         let changed = self.toasts.len() != before;
         if changed {
@@ -1035,6 +1718,36 @@ impl AppState {
         self.dirty = true;
     }
 
+    pub fn resync_reply_is_current(
+        &self,
+        context: &SessionContext,
+        client_context: &ClientEventContext,
+    ) -> bool {
+        self.resync_in_flight
+            && self.pending_attach.is_none()
+            && matches!(self.connection, Connection::Connected)
+            && self.context_is_current(context)
+            && self.client_context_matches_current_session(client_context)
+    }
+
+    pub fn release_resync_barrier(&mut self, retry: bool, now: Instant) {
+        if self.pending_attach.is_some() {
+            self.cancel_resync_for_attach();
+            self.dirty = true;
+            return;
+        }
+        self.resync_in_flight = false;
+        self.awaiting_snapshot = false;
+        self.snapshot_rebase_allowed = false;
+        self.session.reconcile_turn_boundary(self.turn_active);
+        self.replay_buffered_session_events(now);
+        self.resync_want |= retry && matches!(self.connection, Connection::Connected);
+        if !retry || !matches!(self.connection, Connection::Connected) {
+            self.resync_sent_at = None;
+        }
+        self.dirty = true;
+    }
+
     /// Drain a seq-gap resync want into a `Request::GetSnapshot` — at most
     /// one in flight, and no resend within `RESYNC_DEBOUNCE_MS` of the last
     /// send. While no session is attached or the link is down the want is
@@ -1043,9 +1756,22 @@ impl AppState {
         if !self.resync_want {
             return None;
         }
+        if self.pending_attach.is_some() {
+            self.cancel_resync_for_attach();
+            return None;
+        }
         if self.meta.is_none() || !matches!(self.connection, Connection::Connected) {
             self.resync_want = false;
+            self.resync_in_flight = false;
+            self.resync_sent_at = None;
             return None;
+        }
+        if self.awaiting_snapshot {
+            if self.resync_in_flight || !self.resync_want {
+                return None;
+            }
+            self.awaiting_snapshot = false;
+            self.snapshot_rebase_allowed = false;
         }
         if self.resync_in_flight
             || self.resync_sent_at.is_some_and(|t| {
@@ -1055,29 +1781,77 @@ impl AppState {
             return None;
         }
         self.resync_want = false;
+        self.resync_from_prompt = false;
+        self.session.fail_in_flight_user_messages();
+        self.session.drop_pending_detach_turns();
+        self.cancel_global_refresh();
+        self.session.advance_deferred_epoch();
+        self.session.cancel_deferred_work();
+        self.awaiting_snapshot = true;
+        self.snapshot_rebase_allowed = false;
         self.resync_in_flight = true;
         self.resync_sent_at = Some(now);
         Some(pacode_types::Request::GetSnapshot)
     }
 
-    /// Drain the first queued prompt — only while the main agent is idle and
-    /// no user message is still in flight. The send gate (`user_msgs_in_flight`)
-    /// is what keeps the queue serial: a second queued prompt sent before the
-    /// first one's turn started would steer into that turn instead of getting
-    /// its own. `dispatch_action` counts a send out, `handle_bg_response`
-    /// counts its reply back in — `turn_active` itself stays daemon-truth
-    /// (`TurnStarted`/`TurnEnded`/snapshot) so a failed send can never wedge
-    /// the queue behind a phantom turn.
-    pub fn drain_prompt_queue(&mut self) -> Option<pacode_types::Request> {
-        if self.turn_active || self.user_msgs_in_flight > 0 || self.input.prompt_queue.is_empty()
+    pub fn take_retry_batch(&mut self) -> Option<PromptBatch> {
+        if self.meta.is_none()
+            || !matches!(self.connection, Connection::Connected)
+            || self.awaiting_snapshot
+            || self.resync_want
+            || self.turn_active
+            || self.user_msgs_in_flight > 0
+            || self.turn_boundary_pending
         {
             return None;
+        }
+        self.session.take_retry_batch()
+    }
+
+    pub fn drain_pending_sequence(&mut self) -> Option<PromptBatch> {
+        if self.meta.is_none()
+            || !matches!(self.connection, Connection::Connected)
+            || self.awaiting_snapshot
+            || self.resync_want
+            || self.user_msgs_in_flight > 0
+            || self.turn_boundary_pending
+            || self.initial_prompt.is_some()
+            || self.has_retry_request()
+        {
+            return None;
+        }
+        let sequence = self.session.take_pending_sequence()?;
+        self.dirty = true;
+        Some(sequence)
+    }
+
+    pub fn drain_prompt_queue(&mut self) -> Option<pacode_types::Request> {
+        if self.meta.is_none()
+            || !matches!(self.connection, Connection::Connected)
+            || self.awaiting_snapshot
+            || self.resync_want
+            || self.turn_active
+            || self.user_msgs_in_flight > 0
+            || self.turn_boundary_pending
+            || self.has_retry_request()
+            || self.has_pending_sequence()
+        {
+            return None;
+        }
+        if let Some(text) = self.initial_prompt.take() {
+            self.dirty = true;
+            return Some(pacode_types::Request::UserMessage {
+                text,
+                images: Vec::new(),
+                message_id: None,
+            });
         }
         let text = self.input.prompt_queue.pop_front()?;
         self.dirty = true;
         Some(pacode_types::Request::UserMessage {
             text,
             images: Vec::new(),
+            message_id: None,
         })
     }
 
@@ -1093,10 +1867,8 @@ impl AppState {
             Event::TaskUpdated(info) if info.status.is_terminal() => {
                 let was_terminal = self
                     .rail
-                    .tasks
-                    .iter()
-                    .find(|t| t.id == info.id)
-                    .is_some_and(|t| t.status.is_terminal());
+                    .task(&info.id)
+                    .is_some_and(|task| task.status.is_terminal());
                 if was_terminal {
                     return;
                 }
@@ -1132,10 +1904,8 @@ impl AppState {
             Event::AgentUpdated(info) if !info.id.is_main() && !info.status.is_live() => {
                 let was_finished = self
                     .rail
-                    .agents
-                    .iter()
-                    .find(|a| a.id == info.id)
-                    .is_some_and(|a| !a.status.is_live());
+                    .agent(&info.id)
+                    .is_some_and(|agent| !agent.status.is_live());
                 if was_finished {
                     return;
                 }
@@ -1422,38 +2192,19 @@ impl AppState {
                 status,
             });
         }
-        self.transcript.cells.clear();
-        self.transcript.cache.clear();
-        self.transcript.stream = None;
-        self.transcript.live_cell = None;
-        self.transcript.pending_final = None;
-        self.transcript.scroll_from_bottom = 0;
-        self.transcript.has_more_history = false;
-        self.transcript.loading_history = false;
-
-        self.panel.agent_transcript.cells.clear();
-        self.panel.agent_transcript.cache.clear();
-        self.panel.task_lines.clear();
-        self.panel.task_total_lines = 0;
-        self.panel.target = None;
-
-        self.focus = Focus::Normal;
-        self.meta = None;
-        // The git list belongs to the session's project — leaving the slot
-        // must not show it under another session (§8.2).
-        self.git = GitState::default();
+        self.session.reset(self.config.ui.transcript_cells);
+        self.cancel_global_refresh();
+        self.reconnect_snapshot_pending = false;
+        self.event_session_epoch = 0;
+        self.awaiting_snapshot = true;
+        self.snapshot_rebase_allowed = false;
+        self.pending_image_escapes.clear();
+        self.ctrl_c_at = None;
+        self.pending_attach = None;
+        self.attach_in_flight = false;
         self.lists.git = crate::cache::ListHealth::default();
-        self.files.clear_preview();
-        self.rail.agents.clear();
-        self.rail.tasks.clear();
-        self.rail.plan = pacode_types::state::Plan::default();
-        self.rail.usage = pacode_types::state::UsageTotals::default();
-        // The next attach starts a fresh seq space and lands its own
-        // snapshot — no gap tracking or resync state carries over.
-        self.last_event_seq = None;
-        self.resync_want = false;
-        self.resync_in_flight = false;
-        self.resync_sent_at = None;
+        self.connection = Connection::Connecting;
+        self.dirty = true;
     }
 
     /// Drop a cache file (§8.2 invalidation points: plugin install/remove,
@@ -1463,9 +2214,14 @@ impl AppState {
         let cache = self.cache.clone();
         let stem = kind.stem(&self.cwd()).into_owned();
         let schema = kind.schema();
-        tokio::task::spawn_blocking(move || {
+        let invalidate = move || {
             cache.invalidate(&stem, schema);
-        });
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(invalidate);
+        } else {
+            std::thread::spawn(invalidate);
+        }
     }
 
     /// The deferred clipboard copy finished — post the toasts draw used to

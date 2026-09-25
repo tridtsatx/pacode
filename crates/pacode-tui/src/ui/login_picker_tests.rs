@@ -1,5 +1,5 @@
 use ratatui::Terminal;
-use ratatui::backend::TestBackend;
+use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::Rect;
 
 use pacode_render::RenderOptions;
@@ -169,6 +169,28 @@ fn test_render_three_status_states_ascii() {
     assert!(!output.contains("a switch account"), "{output}");
     assert!(output.contains("ctrl+d logout"), "{output}");
     assert!(output.contains("enter login"), "{output}");
+}
+
+#[test]
+fn unicode_query_cursor_uses_cells_and_stays_inside() {
+    let state = make_state();
+    let opts = RenderOptions::new(10, false);
+    let backend = TestBackend::new(10, 3);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let area = Rect::new(0, 0, 10, 3);
+
+    terminal
+        .draw(|frame| draw(frame, area, &state, "模型", 0, &opts))
+        .expect("draw");
+
+    assert_eq!(
+        terminal
+            .backend_mut()
+            .get_cursor_position()
+            .ok()
+            .map(|position| (position.x, position.y)),
+        Some((6, 1))
+    );
 }
 
 #[test]

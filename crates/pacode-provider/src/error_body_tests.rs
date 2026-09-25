@@ -1,6 +1,6 @@
 //! Tests for [`error_body_message`]: JSON error shapes, plain text, HTML, caps.
 
-use super::error_body_message;
+use super::{append_response_body_chunk, error_body_message, truncate_bytes};
 
 #[test]
 fn test_anthropic_error_shape() {
@@ -147,4 +147,13 @@ fn test_long_extracted_message_capped() {
 fn test_extracted_message_is_trimmed() {
     let body = r#"{"error":{"message":"  spaced out  "}}"#;
     assert_eq!(error_body_message(body), "spaced out");
+}
+
+#[test]
+fn test_response_body_bytes_are_bounded() {
+    let mut body = Vec::new();
+    append_response_body_chunk(&mut body, b"abc", 5);
+    append_response_body_chunk(&mut body, b"defghij", 5);
+    assert_eq!(body, b"abcde");
+    assert!(truncate_bytes("ю", 1).is_empty());
 }

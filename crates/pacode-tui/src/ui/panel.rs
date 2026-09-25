@@ -9,14 +9,28 @@ use pacode_render::{RenderOptions, truncate_to_width};
 use pacode_types::state::TaskStatus;
 use pacode_types::time::{format_duration_ms, format_tokens, now_ms};
 
+use crate::layout::ScreenLayout;
 use crate::state::files::FileStatus;
 use crate::state::{AppState, Focus, PanelTarget};
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOptions) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
+#[cfg(test)]
+#[path = "panel_tests.rs"]
+mod panel_tests;
 
+pub(crate) struct PreparedPanel {
+    target: Option<PanelTarget>,
+    transcript: Option<crate::ui::dialog::PreparedDialog>,
+}
+
+pub(crate) fn prepare(
+    state: &mut AppState,
+    layout: &ScreenLayout,
+    welcome_ms: u64,
+) -> Option<PreparedPanel> {
+    let area = layout.panel?;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
     let (target, follow, follow_paused) = match &state.focus {
         Focus::Panel {
             target,
@@ -25,13 +39,103 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
         } => (Some(target.clone()), *follow, *follow_paused),
         _ => (state.panel.target.clone(), false, false),
     };
+    if area.height > 3
+        && follow
+        && !follow_paused
+        && matches!(target.as_ref(), Some(PanelTarget::Agent(_)))
+    {
+        state.panel.agent_transcript.scroll_to_bottom();
+    }
+    let opts = state.render_options(area.width);
+    let anim_frame = state.anim_frame;
+    let transcript = match target.as_ref() {
+        Some(PanelTarget::Agent(agent)) if area.height > 3 => {
+            let owner = state.panel.agent_transcript_for(agent);
+            Some(crate::ui::dialog::prepare(
+                Rect::new(area.x, area.y + 3, area.width, area.height - 3),
+                owner,
+                &opts,
+                anim_frame,
+                welcome_ms,
+            ))
+        }
+        _ => None,
+    };
+    if let Some(target) = target.as_ref() {
+        state.panel.lines_for(target);
+    }
+    if area.height > 2 {
+        let body = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
+        let mut diff_opts = opts.clone();
+        diff_opts.width = body.width;
+        let cache_key = diff_opts.cache_key();
+        match target.as_ref() {
+            Some(PanelTarget::FileDiff { path }) => {
+                if let Some(diff) = state
+                    .panel
+                    .diff
+                    .as_mut()
+                    .filter(|diff| diff.path == *path && diff.patch.is_some())
+                    && !matches!(&diff.rendered, Some((key, _)) if *key == cache_key)
+                {
+                    diff.rendered = Some((
+                        cache_key,
+                        pacode_render::render_diff_ex(
+                            diff.patch.as_deref().unwrap_or_default(),
+                            &diff_opts,
+                            false,
+                        ),
+                    ));
+                }
+            }
+            Some(PanelTarget::CommitDiff { hash }) => {
+                if let Some(diff) = state
+                    .git
+                    .diff
+                    .as_mut()
+                    .filter(|diff| diff.hash == *hash && diff.patch.is_some())
+                    && !matches!(&diff.rendered, Some((key, _)) if *key == cache_key)
+                {
+                    diff.rendered = Some((
+                        cache_key,
+                        pacode_render::render_diff_ex(
+                            diff.patch.as_deref().unwrap_or_default(),
+                            &diff_opts,
+                            false,
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(PreparedPanel { target, transcript })
+}
 
-    let Some(target) = target else {
+pub(crate) fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    prepared: &PreparedPanel,
+    state: &AppState,
+    opts: &RenderOptions,
+) {
+    if area.width == 0 || area.height == 0 {
         return;
+    }
+    let Some(target) = prepared.target.as_ref() else {
+        return;
+    };
+    let (follow, follow_paused) = match &state.focus {
+        Focus::Panel {
+            follow,
+            follow_paused,
+            ..
+        } => (*follow, *follow_paused),
+        _ => (false, false),
     };
 
     match target {
-        PanelTarget::Agent(ref agent_id) => {
+        PanelTarget::Agent(agent_id) => {
             let now = now_ms();
             let agent = state.rail.agent(agent_id);
             let name = agent.map(|a| a.name.as_str()).unwrap_or("agent");
@@ -67,24 +171,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
             let header_area = Rect::new(area.x, area.y, area.width, 3.min(area.height));
             frame.render_widget(Paragraph::new(header_lines), header_area);
 
-            if area.height > 3 {
+            if area.height > 3
+                && let Some(transcript) = prepared.transcript.as_ref()
+            {
                 let trans_area = Rect::new(area.x, area.y + 3, area.width, area.height - 3);
-                if follow && !follow_paused {
-                    state.panel.agent_transcript.scroll_to_bottom();
-                }
-                crate::ui::dialog::draw(
-                    frame,
-                    trans_area,
-                    &mut state.panel.agent_transcript,
-                    opts,
-                    state.anim_frame,
-                    std::time::Instant::now()
-                        .saturating_duration_since(state.started_at)
-                        .as_millis() as u64,
-                );
+                crate::ui::dialog::draw(frame, trans_area, transcript);
             }
         }
-        PanelTarget::McpServer(ref name) => {
+        PanelTarget::McpServer(name) => {
             // The menu's `l` view (§5.3): a snapshot of the daemon log's tail
             // filtered to this server, already in `panel.task_lines`.
             let status = state
@@ -111,33 +205,28 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
 
             if area.height > 2 {
                 let output_area = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
-                let lines_count = state.panel.task_lines.len();
                 let v_height = output_area.height as usize;
 
                 // For this target `panel.scroll` is an offset from the tail
                 // (nav::handle_scroll) — 0 pins the newest lines to the
                 // bottom edge, like a task that is still running.
-                let max_start = lines_count.saturating_sub(v_height);
-                let start_line = max_start.saturating_sub(state.panel.scroll.min(max_start));
-
-                let visible: Vec<Line<'static>> = state
+                let visible = state
                     .panel
-                    .task_lines
-                    .iter()
-                    .skip(start_line)
-                    .take(v_height)
-                    .map(|l| {
-                        Line::from(Span::styled(
-                            truncate_to_width(l, output_area.width as usize, true),
+                    .owned_lines(target)
+                    .map(|lines| {
+                        visible_lines(
+                            lines,
+                            output_area,
+                            v_height,
+                            state.panel.scroll,
                             opts.theme.fg,
-                        ))
+                        )
                     })
-                    .collect();
-
+                    .unwrap_or_default();
                 frame.render_widget(Paragraph::new(visible), output_area);
             }
         }
-        PanelTarget::FileDiff { ref path } => {
+        PanelTarget::FileDiff { path } => {
             // The Files level's `enter` (§5.5): the worktree diff the
             // deferred `file_diff` job produced — `panel.diff` — painted by
             // `render_diff_ex` and cached per width so a frame never re-does
@@ -173,27 +262,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                 let body = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
                 let current = matches!(&state.panel.diff, Some(d) if d.path == *path);
                 match if current {
-                    state.panel.diff.as_mut()
+                    state.panel.diff.as_ref()
                 } else {
                     None
                 } {
                     Some(d) if d.patch.is_some() => {
-                        if !matches!(&d.rendered, Some((w, _)) if *w == body.width)
-                            && let Some(patch) = d.patch.as_deref()
-                        {
-                            let mut dopts = opts.clone();
-                            dopts.width = body.width;
-                            d.rendered = Some((
-                                body.width,
-                                pacode_render::render_diff_ex(patch, &dopts, false),
-                            ));
-                        }
                         if let Some((_, lines)) = &d.rendered {
                             // `panel.scroll` counts back from the tail like
                             // the log targets — `usize::MAX` (armed on open)
                             // pins the head, where a diff reads from.
-                            let max_start = lines.len().saturating_sub(body.height as usize);
-                            let start = max_start.saturating_sub(scroll.min(max_start));
+                            let start = tail_start(lines.len(), body.height as usize, scroll);
                             let visible: Vec<Line<'static>> = lines
                                 .iter()
                                 .skip(start)
@@ -221,7 +299,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                 }
             }
         }
-        PanelTarget::CommitDiff { ref hash } => {
+        PanelTarget::CommitDiff { hash } => {
             // The Git level's `enter` (§5.10): the commit's patch lives in
             // `state.git.diff`, keyed by hash — a payload for a different
             // commit reads as "loading", never as the wrong diff. Painted by
@@ -250,28 +328,17 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                 let body = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
                 let scroll = state.panel.scroll;
                 let slot = if current {
-                    state.git.diff.as_mut()
+                    state.git.diff.as_ref()
                 } else {
                     None
                 };
                 match slot {
                     Some(d) if d.patch.is_some() => {
-                        if !matches!(&d.rendered, Some((w, _)) if *w == body.width)
-                            && let Some(patch) = d.patch.as_deref()
-                        {
-                            let mut dopts = opts.clone();
-                            dopts.width = body.width;
-                            d.rendered = Some((
-                                body.width,
-                                pacode_render::render_diff_ex(patch, &dopts, false),
-                            ));
-                        }
                         if let Some((_, lines)) = &d.rendered {
                             // `panel.scroll` counts back from the tail like
                             // the log targets — `usize::MAX` (armed on open)
                             // pins the head, where a diff reads from.
-                            let max_start = lines.len().saturating_sub(body.height as usize);
-                            let start = max_start.saturating_sub(scroll.min(max_start));
+                            let start = tail_start(lines.len(), body.height as usize, scroll);
                             let visible: Vec<Line<'static>> = lines
                                 .iter()
                                 .skip(start)
@@ -299,7 +366,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
                 }
             }
         }
-        PanelTarget::Task(ref task_id) => {
+        PanelTarget::Task(task_id) => {
             let now = now_ms();
             let task = state.rail.task(task_id);
             let label = task.map(|t| t.label.as_str()).unwrap_or("task");
@@ -332,31 +399,51 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOp
 
             if area.height > 2 {
                 let output_area = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
-                let lines_count = state.panel.task_lines.len();
                 let v_height = output_area.height as usize;
 
-                let start_line = if status == TaskStatus::Running {
-                    lines_count.saturating_sub(v_height)
-                } else {
-                    state.panel.scroll.min(lines_count.saturating_sub(v_height))
-                };
-
-                let visible: Vec<Line<'static>> = state
+                let visible = state
                     .panel
-                    .task_lines
-                    .iter()
-                    .skip(start_line)
-                    .take(v_height)
-                    .map(|l| {
-                        Line::from(Span::styled(
-                            truncate_to_width(l, output_area.width as usize, true),
+                    .owned_lines(target)
+                    .map(|lines| {
+                        visible_lines(
+                            lines,
+                            output_area,
+                            v_height,
+                            state.panel.scroll,
                             opts.theme.fg,
-                        ))
+                        )
                     })
-                    .collect();
-
+                    .unwrap_or_default();
                 frame.render_widget(Paragraph::new(visible), output_area);
             }
         }
     }
+}
+
+/// The tail-anchored window a log-shaped panel shows: `scroll` counts back from
+/// the newest line, 0 pinning it to the bottom edge.
+fn visible_lines(
+    lines: &[String],
+    area: Rect,
+    viewport: usize,
+    scroll: usize,
+    style: ratatui::style::Style,
+) -> Vec<Line<'static>> {
+    let start_line = tail_start(lines.len(), viewport, scroll);
+    lines
+        .iter()
+        .skip(start_line)
+        .take(viewport)
+        .map(|line| {
+            Line::from(Span::styled(
+                truncate_to_width(line, area.width as usize, true),
+                style,
+            ))
+        })
+        .collect()
+}
+
+fn tail_start(lines: usize, viewport: usize, scroll: usize) -> usize {
+    let max_start = lines.saturating_sub(viewport);
+    max_start.saturating_sub(scroll.min(max_start))
 }

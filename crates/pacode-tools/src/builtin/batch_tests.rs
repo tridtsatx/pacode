@@ -1,6 +1,7 @@
 //! `batch` tool tests: cap, ordering, merged permission, read-only bash gating.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,7 +12,7 @@ use pacode_types::{ExecConfig, Mode, PermissionDecision, WebConfig};
 
 use super::{BatchTool, NAME};
 use crate::builtin::builtin_tools;
-use crate::registry::ToolRegistry;
+use crate::registry::{MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_WORKERS_PER_AGENT, ToolRegistry};
 use crate::test_support::{StubToolHost, stub_ctx};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
@@ -41,6 +42,34 @@ impl Tool for SlowStub {
         tokio::time::sleep(self.delay).await;
         let capped = crate::builtin::helpers::cap_output(&self.text, false, ctx.output_cap_chars);
         Ok(ToolOutput::text(capped))
+    }
+}
+
+struct CountingStub {
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CountingStub {
+    fn name(&self) -> &str {
+        "read"
+    }
+    fn description(&self) -> &str {
+        "stub"
+    }
+    fn schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+    async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("ok"))
     }
 }
 
@@ -339,4 +368,134 @@ async fn per_op_output_gets_fair_share_of_cap() {
 fn batch_is_registered_as_builtin() {
     let registry = builtin_tools(&WebConfig::default());
     assert!(registry.get(NAME).is_some());
+}
+
+#[tokio::test]
+async fn oversized_single_op_still_obeys_hard_byte_cap() {
+    let registry = ToolRegistry::new().with(Arc::new(SlowStub {
+        name: "read",
+        delay: Duration::ZERO,
+        text: "界".repeat(MAX_TOOL_OUTPUT_BYTES / 3 + 32),
+    }));
+    let mut ctx = ctx_with(
+        Arc::new(StubToolHost::default()),
+        std::env::current_dir().unwrap(),
+        registry,
+    );
+    ctx.output_cap_chars = 1_000_000;
+
+    let out = BatchTool
+        .call(
+            json!({"ops": [{"tool": "read", "input": {"path": "a"}}]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.len() <= MAX_TOOL_OUTPUT_BYTES);
+    assert!(out.content.contains("output truncated"));
+}
+
+#[tokio::test]
+async fn batch_workers_are_bounded_per_agent() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let registry = ToolRegistry::new().with(Arc::new(CountingStub {
+        active: active.clone(),
+        max_active: max_active.clone(),
+    }));
+    let ctx = ctx_with(
+        Arc::new(StubToolHost::default()),
+        std::env::current_dir().unwrap(),
+        registry,
+    );
+    let ops = (0..8)
+        .map(|index| json!({"tool": "read", "input": {"path": index.to_string()}}))
+        .collect::<Vec<_>>();
+
+    let out = BatchTool.call(json!({"ops": ops}), &ctx).await.unwrap();
+
+    assert!(!out.is_error);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(max_active.load(Ordering::SeqCst) <= MAX_TOOL_WORKERS_PER_AGENT);
+}
+
+#[tokio::test]
+async fn an_oversized_ops_payload_is_refused_before_any_op_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let registry = ToolRegistry::new().with(Arc::new(SlowStub {
+        name: "read",
+        delay: Duration::ZERO,
+        text: "unused".to_string(),
+    }));
+    let host = Arc::new(StubToolHost::default());
+    let ctx = ctx_with(host, tmp.path().to_path_buf(), registry);
+
+    let filler = "x".repeat(300 * 1024);
+    let ops: Vec<Value> = (0..2)
+        .map(|_| json!({"tool": "read", "input": {"path": filler.clone()}}))
+        .collect();
+
+    let err = BatchTool
+        .call(json!({"ops": ops}), &ctx)
+        .await
+        .expect_err("oversized payload");
+    match err {
+        ToolError::InvalidInput(msg) => assert!(msg.contains("bytes of operations"), "{msg}"),
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn the_body_stays_inside_the_call_budget_when_ops_overfill_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chunk = "y".repeat(8_000);
+    let registry = ToolRegistry::new()
+        .with(Arc::new(SlowStub {
+            name: "read",
+            delay: Duration::ZERO,
+            text: chunk.clone(),
+        }))
+        .with(Arc::new(SlowStub {
+            name: "grep",
+            delay: Duration::ZERO,
+            text: chunk,
+        }));
+    let host = Arc::new(StubToolHost::default());
+    let mut ctx = ctx_with(host, tmp.path().to_path_buf(), registry);
+    ctx.output_cap_chars = 20_000;
+
+    let ops: Vec<Value> = (0..8)
+        .map(|index| {
+            if index % 2 == 0 {
+                json!({"tool": "read", "input": {"path": "a"}})
+            } else {
+                json!({"tool": "grep", "input": {"pattern": "x"}})
+            }
+        })
+        .collect();
+
+    let out = BatchTool
+        .call(json!({"ops": ops}), &ctx)
+        .await
+        .expect("batch");
+
+    assert!(
+        out.content.len() <= 20_000,
+        "body of {} bytes escaped the budget",
+        out.content.len()
+    );
+    assert!(
+        out.content
+            .contains("operation(s) dropped by the batch output budget"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("Batch: 8 succeeded, 0 failed"),
+        "the tally must survive the cut: {}",
+        out.content
+    );
 }

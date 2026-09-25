@@ -89,14 +89,26 @@ fn file_names_do_not_repeat_the_dir_prefix() {
         sections(&v),
         vec![("src/nested/deep".to_string(), Some("2 · +1 −2".to_string()))]
     );
-    assert_eq!(item_labels(&v), vec!["a.rs", "b.rs"]);
+    assert_eq!(item_labels(&v), vec!["b.rs", "a.rs"]);
     // …while the row id and the search text keep the full path.
     let ids: Vec<String> = v
         .rows
         .iter()
         .filter_map(|r| r.id().map(|id| id.as_str().to_string()))
         .collect();
-    assert_eq!(ids, vec!["src/nested/deep/a.rs", "src/nested/deep/b.rs"]);
+    assert_eq!(ids, vec!["src/nested/deep/b.rs", "src/nested/deep/a.rs"]);
+}
+
+#[test]
+fn files_and_directories_are_ordered_by_latest_touch() {
+    let mut s = state();
+    write_with_diff(&mut s, "old/a.rs", 1, 0, "c1", 100);
+    write_with_diff(&mut s, "new/b.rs", 1, 0, "c2", 300);
+    write_with_diff(&mut s, "new/c.rs", 1, 0, "c3", 200);
+
+    let v = view(&s, &MenuUiState::default());
+    assert_eq!(sections(&v)[0].0, "new");
+    assert_eq!(item_labels(&v), vec!["b.rs", "c.rs", "a.rs"]);
 }
 
 #[test]
@@ -114,7 +126,7 @@ fn sections_are_not_selectable() {
     }
     // The unset cursor lands on the first file, not the "." header.
     let sel = resolve_cursor(&v.rows, &RowId::default()).unwrap();
-    assert_eq!(v.rows[sel].id().unwrap().as_str(), "a.rs");
+    assert_eq!(v.rows[sel].id().unwrap().as_str(), "src/c.rs");
 }
 
 #[test]
@@ -129,8 +141,8 @@ fn j_moves_past_sections() {
         panic!("menu did not open");
     };
     crate::keys_menu::handle_menu_key(&mut s, &mut stack, &mut ui, key(KeyCode::Char('j')));
-    // `a.rs` → past the `src` header → `b.rs`.
-    assert_eq!(ui.cursor.as_str(), "src/b.rs");
+    // `src/b.rs` → past the `src` header → `a.rs`.
+    assert_eq!(ui.cursor.as_str(), "a.rs");
 }
 
 #[test]
@@ -157,9 +169,9 @@ fn status_labels_replace_numbers_where_numbers_lie() {
     assert_eq!(
         rights,
         vec![
-            Some("deleted".to_string()), // gone.rs — numbers would lie
+            Some("renamed · +1 −1".to_string()),
             Some("new · +5 −0".to_string()),
-            Some("renamed · +1 −1".to_string())
+            Some("deleted".to_string())
         ]
     );
 }
@@ -225,16 +237,16 @@ fn preview_want_follows_the_cursor() {
     assert_eq!(
         preview_want(&v, &ui),
         Some(PreviewKey {
-            raw: "a.rs".to_string(),
+            raw: "src/b.rs".to_string(),
         })
     );
 
-    ui.cursor = RowId::new("src/b.rs");
+    ui.cursor = RowId::new("a.rs");
     let v = view(&s, &ui);
     assert_eq!(
         preview_want(&v, &ui),
         Some(PreviewKey {
-            raw: "src/b.rs".to_string(),
+            raw: "a.rs".to_string(),
         })
     );
 }

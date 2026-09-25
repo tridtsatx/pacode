@@ -355,7 +355,7 @@ pub fn apply_snapshot(state: &mut AppState, snap: CacheSnapshot, session_start_m
     let catalog_ttl = state.config.provider.catalog_ttl_secs;
     let now = pacode_types::time::now_ms();
     let mut applied = false;
-    let mut mark = |kind: ListKind, written_at_ms: u64| {
+    let mark = |state: &mut AppState, kind: ListKind, written_at_ms: u64| {
         let stale = is_stale(kind, written_at_ms, now, session_start_ms, catalog_ttl);
         state.lists.apply_cached(kind, stale);
     };
@@ -367,35 +367,35 @@ pub fn apply_snapshot(state: &mut AppState, snap: CacheSnapshot, session_start_m
     if let Some(e) = snap.plugins {
         crate::commands::register_plugins(&e.data);
         state.plugins = e.data;
-        mark(ListKind::Plugins, e.written_at_ms);
+        mark(state, ListKind::Plugins, e.written_at_ms);
         applied = true;
     }
     if let Some(e) = snap.mcp_servers {
         crate::commands::register_mcp_servers(&e.data);
         state.mcp_servers = e.data;
-        mark(ListKind::McpServers, e.written_at_ms);
+        mark(state, ListKind::McpServers, e.written_at_ms);
         applied = true;
     }
     if let Some(e) = snap.marketplace {
         state.marketplace = e.data;
-        mark(ListKind::Marketplace, e.written_at_ms);
+        mark(state, ListKind::Marketplace, e.written_at_ms);
         applied = true;
     }
     if let Some(e) = snap.sessions {
         state.sessions = e.data;
-        mark(ListKind::Sessions, e.written_at_ms);
+        mark(state, ListKind::Sessions, e.written_at_ms);
         applied = true;
     }
     if let Some(e) = snap.models {
         state.models = e.data;
-        mark(ListKind::Models, e.written_at_ms);
+        mark(state, ListKind::Models, e.written_at_ms);
         applied = true;
     }
     if let Some(e) = snap.git {
         state
             .git
             .apply_cached(e.data.commits, e.data.has_more, e.data.status);
-        mark(ListKind::GitLog, e.written_at_ms);
+        mark(state, ListKind::GitLog, e.written_at_ms);
         applied = true;
     }
 

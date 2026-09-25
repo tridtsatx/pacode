@@ -1,5 +1,7 @@
 //! Mouse handling for the TUI.
 
+use std::time::Instant;
+
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use crate::keys::{Action, handle_navigate_down, handle_navigate_up};
@@ -16,6 +18,7 @@ fn scroll_panel(state: &mut AppState, delta: i32) {
             PanelTarget::McpServer(_)
                 | PanelTarget::FileDiff { .. }
                 | PanelTarget::CommitDiff { .. }
+                | PanelTarget::Task(_)
         )
     ) {
         state.panel.scroll = if delta > 0 {
@@ -70,10 +73,24 @@ fn visible_transcript(state: &AppState) -> &crate::state::Transcript {
     }
 }
 
-pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent, layout: &ScreenLayout) -> Vec<Action> {
+pub fn handle_mouse(
+    state: &mut AppState,
+    mouse: MouseEvent,
+    _layout: &ScreenLayout,
+) -> Vec<Action> {
     state.dirty = true;
     let col = mouse.column;
     let row = mouse.row;
+    let layout = crate::layout::current(state);
+    let popup = crate::ui::popup::resolve(state, &layout, Instant::now());
+    if popup.as_ref().is_some_and(|popup| {
+        popup.is_full()
+            || popup
+                .area()
+                .contains(ratatui::layout::Position::new(col, row))
+    }) {
+        return vec![];
+    }
 
     // Shift+drag is left to the terminal (mouse capture already grabs plain drag).
     if mouse

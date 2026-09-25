@@ -13,71 +13,84 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
 use pacode_render::RenderOptions;
 
-use crate::state::{AppState, Focus, Overlay};
+use crate::state::AppState;
 
-pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &RenderOptions) {
-    if dialog_area.width < 20 || dialog_area.height < 6 {
+#[derive(Default)]
+pub(crate) struct PreparedOverlay {
+    rail: Option<crate::ui::rail::PreparedRail>,
+}
+
+pub(crate) fn prepare(
+    state: &mut AppState,
+    popup: Option<&crate::ui::popup::FullPopup>,
+    base_rail_scroll: Option<usize>,
+) -> PreparedOverlay {
+    let menu = popup
+        .filter(|popup| popup.id == crate::ui::popup::PopupId::Menu)
+        .and_then(|popup| popup.menu.as_ref());
+    state.session.files.preview_want = menu
+        .filter(|menu| menu.view.id == crate::ui::menu::MenuId::Files)
+        .and_then(|menu| crate::ui::menu::files::preview_want(&menu.view, &menu.ui));
+    state.session.rail.task_tail_want = menu
+        .filter(|menu| menu.view.id == crate::ui::menu::MenuId::Background)
+        .and_then(|menu| crate::ui::menu::background::tail_want(state, &menu.view, &menu.ui));
+    let (show_want, more_want) = menu
+        .filter(|menu| menu.view.id == crate::ui::menu::MenuId::Git)
+        .map_or((None, None), |menu| {
+            let inner_w = popup.map_or(0, |popup| popup.area.width.saturating_sub(2));
+            let detail_wide = crate::ui::menu::detail_panel_width(inner_w).is_some();
+            crate::ui::menu::git::wants(state, &menu.view, &menu.ui, detail_wide)
+        });
+    state.session.git.show_want = show_want;
+    state.session.git.more_want = more_want;
+    let rail = popup
+        .filter(|popup| popup.id == crate::ui::popup::PopupId::RailOverlay)
+        .and_then(|popup| {
+            let area = rail_overlay_inner(popup.area);
+            let stored_scroll = base_rail_scroll.unwrap_or(state.rail.agents_scroll);
+            let rail = crate::ui::rail::resolve_from(state, area, stored_scroll);
+            if let Some(rail) = rail.as_ref() {
+                crate::ui::rail::persist(state, rail);
+            }
+            rail
+        });
+    PreparedOverlay { rail }
+}
+
+pub(crate) fn draw(
+    frame: &mut Frame,
+    popup: Option<&crate::ui::popup::FullPopup>,
+    prepared: &PreparedOverlay,
+    state: &AppState,
+    opts: &RenderOptions,
+) {
+    let Some(popup) = popup else {
+        return;
+    };
+    if popup.area.width == 0 || popup.area.height == 0 {
         return;
     }
-
-    // Bottom pickers (effort/mode/model/login/question/theme) are drawn by
-    // `picker`, not here.
-    if !matches!(state.focus, Focus::Overlay(_)) || state.is_bottom_picker() {
-        return;
-    }
-
-    // The menu base owns its geometry (§3.3): 80 % wide, height from the
-    // `MenuView`.
-    if let Focus::Overlay(Overlay::Menu { stack, ui }) = &state.focus {
-        if !stack.is_empty() {
-            let view = crate::ui::menu::view_for(stack, state, ui);
-            // §8.1: the Files detail card's file read runs on the deferred
-            // preview job — the draw only records what it wants. Any other
-            // level on top arms nothing.
-            state.files.preview_want = if view.id == crate::ui::menu::MenuId::Files {
-                crate::ui::menu::files::preview_want(&view, ui)
-            } else {
-                None
+    match popup.id {
+        crate::ui::popup::PopupId::Menu => {
+            let Some(menu) = popup.menu.as_ref() else {
+                return;
             };
-            // Same split for the Background card's output tail (§5.9): the
-            // draw records the selected `(task, output_bytes)`; the blocking
-            // spool read runs in `dispatch_deferred`.
-            state.rail.task_tail_want = if view.id == crate::ui::menu::MenuId::Background {
-                crate::ui::menu::background::tail_want(state, &view, ui)
-            } else {
-                None
-            };
-            // Git level (§5.10): the selected commit's `--stat` want (only
-            // where the detail pane is wide enough to show it) and the
-            // end-of-list page trigger. `dispatch_deferred` turns them into
-            // `Action::GitShow` / `Action::GitLog`.
-            let (show_want, more_want) = if view.id == crate::ui::menu::MenuId::Git {
-                let inner_w = crate::ui::menu::overlay_area(dialog_area, &view, ui)
-                    .width
-                    .saturating_sub(2);
-                let detail_wide = crate::ui::menu::detail_panel_width(inner_w).is_some();
-                crate::ui::menu::git::wants(state, &view, ui, detail_wide)
-            } else {
-                (None, None)
-            };
-            state.git.show_want = show_want;
-            state.git.more_want = more_want;
-            crate::ui::menu::draw(frame, dialog_area, &view, ui, opts);
+            crate::ui::menu::draw_in(frame, popup.area, &menu.view, &menu.ui, opts);
         }
-        return;
-    }
-
-    // The rail overlay is the only centred overlay left — every other
-    // `Focus::Overlay` variant is a bottom picker or a menu.
-    if matches!(state.focus, Focus::Overlay(Overlay::RailOverlay)) {
-        let w = ((dialog_area.width as u32 * 78) / 100).max(20) as u16;
-        let h = dialog_area.height.saturating_sub(4).max(6);
-        let x = dialog_area.x + (dialog_area.width.saturating_sub(w)) / 2;
-        let y = dialog_area.y + 2;
-        let area = Rect::new(x, y, w, h);
-
-        frame.render_widget(Clear, area);
-        draw_rail_overlay(frame, area, state, opts);
+        crate::ui::popup::PopupId::RailOverlay => {
+            frame.render_widget(Clear, popup.area);
+            draw_rail_overlay(frame, popup.area, prepared, state, opts);
+        }
+        crate::ui::popup::PopupId::Slash
+        | crate::ui::popup::PopupId::At
+        | crate::ui::popup::PopupId::Bash
+        | crate::ui::popup::PopupId::PromptQueue
+        | crate::ui::popup::PopupId::ModelPicker
+        | crate::ui::popup::PopupId::EffortPicker
+        | crate::ui::popup::PopupId::ModePicker
+        | crate::ui::popup::PopupId::QuestionPicker
+        | crate::ui::popup::PopupId::ThemePicker
+        | crate::ui::popup::PopupId::LoginPicker => {}
     }
 }
 
@@ -159,14 +172,27 @@ pub(crate) fn age_ago(ts_ms: u64, now: u64) -> String {
 /// `~/rel/path` when under HOME, else the path as written.
 /// `pub(crate)`: the Sessions menu's detail card shows the same shape.
 pub(crate) fn short_path(path: &std::path::Path) -> String {
-    let raw = path.to_string_lossy();
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = std::path::Path::new(&home);
-        if let Ok(rel) = path.strip_prefix(home_path) {
-            return format!("~/{}", rel.display());
-        }
+    if let Some(home) = home_dir()
+        && let Ok(rel) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rel.display());
     }
-    raw.into_owned()
+    path.to_string_lossy().into_owned()
+}
+
+thread_local! {
+    static HOME: std::cell::RefCell<Option<Option<std::path::PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    HOME.with(|cell| {
+        let mut cached = cell.borrow_mut();
+        if cached.is_none() {
+            *cached = Some(std::env::var_os("HOME").map(std::path::PathBuf::from));
+        }
+        cached.clone().flatten()
+    })
 }
 
 /// The `… — loading…` / `… — offline copy` title suffix a picker gets from
@@ -179,13 +205,27 @@ pub(crate) fn title_with_badge(title: &str, badge: Option<crate::cache::Badge>) 
     }
 }
 
-fn draw_rail_overlay(frame: &mut Frame, area: Rect, state: &mut AppState, opts: &RenderOptions) {
+fn draw_rail_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    prepared: &PreparedOverlay,
+    state: &AppState,
+    opts: &RenderOptions,
+) {
     let block = menu_block("Plan & Agents", " esc close ", opts);
-
-    let inner = block.inner(area);
     frame.render_widget(block, area);
+    if let Some(rail) = prepared.rail.as_ref() {
+        crate::ui::rail::draw(frame, rail, state, opts);
+    }
+}
 
-    crate::ui::rail::draw(frame, inner, state, opts);
+fn rail_overlay_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
 }
 
 #[cfg(test)]
@@ -236,5 +276,18 @@ mod tests {
         assert_eq!(age_ago(now - 5 * 60_000, now), "5m ago");
         assert_eq!(age_ago(now - 3 * 3_600_000, now), "3h ago");
         assert_eq!(age_ago(now - 2 * 86_400_000, now), "2d ago");
+    }
+
+    #[test]
+    fn short_path_keeps_the_home_prefix_and_answers_repeatedly() {
+        if let Some(home) = home_dir() {
+            let inside = home.join("code/pacode");
+            assert_eq!(short_path(&inside), "~/code/pacode");
+            assert_eq!(short_path(&inside), "~/code/pacode");
+        }
+        assert_eq!(
+            short_path(std::path::Path::new("relative/path")),
+            "relative/path"
+        );
     }
 }

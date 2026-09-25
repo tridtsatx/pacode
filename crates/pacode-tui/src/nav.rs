@@ -1,7 +1,7 @@
 //! Navigation helpers: agent selection, session slot switching, panel target changes, and rail navigation.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use pacode_types::{AgentId, Request};
+use pacode_types::AgentId;
 
 use crate::binding::Action as KeyAction;
 use crate::keys::Action;
@@ -56,6 +56,7 @@ pub fn switch_to_session_slot(state: &mut AppState, slot_idx: usize) -> Vec<Acti
         return vec![];
     }
 
+    let cwd = state.cwd();
     state.leave_active_slot();
     state.active_slot = slot_idx;
 
@@ -65,7 +66,7 @@ pub fn switch_to_session_slot(state: &mut AppState, slot_idx: usize) -> Vec<Acti
         }
     } else {
         pacode_types::Attach::New {
-            cwd: state.cwd(),
+            cwd,
             model: None,
             effort: None,
             mode: None,
@@ -78,11 +79,9 @@ pub fn switch_to_session_slot(state: &mut AppState, slot_idx: usize) -> Vec<Acti
         pacode_types::Attach::Latest { .. } => "latest",
     };
     log::debug!("switch session slot to {slot_idx} (session: {session_id_str})");
+    state.begin_attach(attach.clone());
 
-    vec![
-        Action::Send(Request::Detach),
-        Action::Send(Request::Attach(attach)),
-    ]
+    vec![Action::SwitchSession { attach }]
 }
 
 pub fn overlay_name(o: &Overlay) -> &'static str {
@@ -91,7 +90,7 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
         Overlay::ModePicker { .. } => "ModePicker",
         Overlay::ModelPicker { .. } => "ModelPicker",
         Overlay::LoginPicker { .. } => "LoginPicker",
-        Overlay::RailOverlay => "RailOverlay",
+        Overlay::RailOverlay { .. } => "RailOverlay",
         Overlay::ThemePicker { .. } => "ThemePicker",
         Overlay::QuestionPicker => "QuestionPicker",
         // The level on screen names the menu in the log (§3.1).
@@ -204,7 +203,7 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
         | Focus::Overlay(
             Overlay::ModePicker { .. }
             | Overlay::QuestionPicker
-            | Overlay::RailOverlay
+            | Overlay::RailOverlay { .. }
             | Overlay::ThemePicker { .. }
             // Unreachable — an open menu intercepts keys before `nav` — but
             // the match stays exhaustive.
@@ -242,7 +241,7 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
             | Overlay::QuestionPicker
-            | Overlay::RailOverlay
+            | Overlay::RailOverlay { .. }
             | Overlay::ThemePicker { .. }
             | Overlay::Menu { .. },
         ) => {}
@@ -261,7 +260,8 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             Focus::Panel {
                 target: PanelTarget::McpServer(_)
                     | PanelTarget::FileDiff { .. }
-                    | PanelTarget::CommitDiff { .. },
+                    | PanelTarget::CommitDiff { .. }
+                    | PanelTarget::Task(_),
                 ..
             }
         ) {

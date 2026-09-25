@@ -11,7 +11,11 @@
 //! └──────────────────────────────┴────────────┘
 //! ```
 
+use std::time::Instant;
+
 use ratatui::layout::Rect;
+
+use crate::state::AppState;
 
 /// Width tiers from spec §8.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,6 +70,7 @@ pub const TOAST_STRIP_MAX: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScreenLayout {
+    pub screen: Rect,
     pub tier: WidthTier,
     /// Dialog transcript area (left column, above the input).
     pub dialog: Rect,
@@ -90,6 +95,29 @@ pub struct ScreenLayout {
     /// input separator, borrowing rows from the dialog like the preview strip.
     /// Zero-height when no toast is live.
     pub toast: Rect,
+}
+
+pub fn current(state: &AppState) -> ScreenLayout {
+    compute_for_state(
+        Rect::new(0, 0, state.cols, state.rows),
+        state,
+        Instant::now(),
+    )
+}
+
+pub fn compute_for_state(area: Rect, state: &AppState, now: Instant) -> ScreenLayout {
+    let panel_open = (state.panel.target.is_some()
+        || matches!(state.focus, crate::state::Focus::Panel { .. }))
+        && !state.agent_replaces_dialog();
+    let temporary = compute(area, 1, panel_open, 0, 0);
+    let input_lines = state.input.wrapped_lines(temporary.input.width);
+    let preview_lines = if state.is_bottom_picker() {
+        0
+    } else {
+        state.image_strip_rows()
+    };
+    let toast_lines = crate::ui::toast::live_toasts(state, now).len() as u16;
+    compute(area, input_lines, panel_open, preview_lines, toast_lines)
 }
 
 /// Compute the layout for a terminal of `area` with `input_lines` lines of input,
@@ -199,6 +227,7 @@ pub fn compute(
     };
 
     ScreenLayout {
+        screen: area,
         tier,
         dialog,
         panel,

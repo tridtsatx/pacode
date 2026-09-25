@@ -10,6 +10,7 @@
 //! them into `Action::GitShow` / `Action::GitLog` — never a fetch inside the
 //! key handler or the draw.
 
+use pacode_render::RenderCacheKey;
 use pacode_types::vcs::{CommitRow, GitStatus};
 
 /// Cap on retained rows: paging beyond this drops the oldest page boundary,
@@ -35,9 +36,8 @@ pub struct GitDiffInfo {
     pub patch: Option<String>,
     pub truncated: bool,
     pub note: Option<String>,
-    /// `render_diff_ex` output at the width it was rendered for — rebuilt on
-    /// resize, never per frame (§8.1, same contract as `PanelDiff::rendered`).
-    pub rendered: Option<(u16, Vec<ratatui::text::Line<'static>>)>,
+    /// `render_diff_ex` output for a width and render-context epoch.
+    pub rendered: Option<(RenderCacheKey, Vec<ratatui::text::Line<'static>>)>,
 }
 
 #[derive(Clone, Debug, Default)]

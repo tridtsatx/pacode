@@ -31,11 +31,11 @@ pub use connect::{
     CONNECT_FLAG_END_STREAM, ConnectClient, ConnectFrameDecoder, DecodedFrame, encode_connect_frame,
 };
 pub use proto::{ProtoError, Reader, WireType, WireValue, Writer, decode_varint, encode_varint};
-pub use stream::{DevinStreamOpener, create_devin_event_stream, devin_retrying_stream};
+pub use stream::{DevinStreamOpener, create_devin_event_stream};
 pub use tool_parser::{InlineToolCallParser, find_json_object_end};
 pub use wire::*;
 
-use crate::{CompletionRequest, EventStream, Provider, ProviderError, redact};
+use crate::{CompletionRequest, EventStream, Provider, ProviderError, RetryBudget, redact};
 
 #[cfg(test)]
 #[path = "../devin_tests.rs"]
@@ -402,13 +402,13 @@ impl Provider for Devin {
             cfg: self.cfg.clone(),
             stream_idle_secs: self.defaults.stream_idle_secs,
             effort,
-            max_retries: self.defaults.max_retries,
             backoff_base: self.backoff_base,
             assignment_jwt,
         };
 
-        let inner = opener.open().await?;
-        Ok(devin_retrying_stream(opener, inner))
+        opener
+            .open(RetryBudget::new(self.defaults.max_retries))
+            .await
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

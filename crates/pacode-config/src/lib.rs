@@ -112,6 +112,81 @@ fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
     }
 }
 
+const DEPRECATED_AGENT_KEYS: &[&str] = &["default_model", "default_effort"];
+
+/// Keys the runtime never read, grouped by the table they lived in. serde drops
+/// them silently, which is not enough: a user who set one still believes the
+/// cap is in force, so each is worth a line in the log.
+const DEAD_LIMITS: &[(&str, &[&str])] = &[
+    (
+        "limits",
+        &[
+            "max_logical_agents",
+            "max_provider_queue_items",
+            "max_provider_queue_bytes",
+            "max_exec_calls_per_turn",
+            "max_tool_calls_per_turn",
+        ],
+    ),
+    ("agents", &["max_live", "max_turns"]),
+];
+
+fn migrate_deprecated_agent_keys(table: &mut toml::Table) {
+    let Some(agents) = table.get_mut("agents").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+    let removed = DEPRECATED_AGENT_KEYS
+        .iter()
+        .copied()
+        .filter(|key| agents.remove(*key).is_some())
+        .collect::<Vec<_>>();
+    if !removed.is_empty() {
+        log::warn!(
+            "deprecated [agents] keys ignored: {}; subagents inherit the parent model and effort",
+            removed.join(", ")
+        );
+    }
+}
+
+fn warn_about_dead_limits(table: &toml::Table) {
+    let present = DEAD_LIMITS
+        .iter()
+        .flat_map(|(section, keys)| {
+            let section_table = table.get(*section).and_then(toml::Value::as_table);
+            keys.iter()
+                .filter(move |key| {
+                    section_table.is_some_and(|table| table.contains_key::<str>(*key))
+                })
+                .map(move |key| format!("{section}.{key}"))
+        })
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        return;
+    }
+    log::warn!(
+        "no-op settings ignored: {}; pacode caps no agents, no provider queue and no per-turn calls",
+        present.join(", ")
+    );
+}
+
+/// A value out of the registry's range is repaired to the nearest working one
+/// and reported, never refused: a config written against an older pacode, or
+/// against bounds that have since moved, must still boot.
+fn deserialize_config(mut table: toml::Table) -> Result<Config, String> {
+    migrate_deprecated_agent_keys(&mut table);
+    warn_about_dead_limits(&table);
+    let mut config =
+        Config::deserialize(toml::Value::Table(table)).map_err(|error| error.to_string())?;
+    for repair in registry::repair_config(&mut config) {
+        log::warn!(
+            "config {} out of range ({}); using a working value until the file is edited",
+            repair.key,
+            repair.message
+        );
+    }
+    Ok(config)
+}
+
 /// One-time migration: a legacy `config.toml` carrying `[providers]` and/or
 /// `[keys]` tables is split into `providers.toml`/`keybindings.toml` next to it.
 /// The original is preserved as `config.toml.bak`; values already present in the
@@ -215,11 +290,10 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, ConfigError> {
         }
     }
 
-    let mut cfg =
-        Config::deserialize(toml::Value::Table(merged)).map_err(|e| ConfigError::Parse {
-            path: path.to_path_buf(),
-            message: e.to_string(),
-        })?;
+    let mut cfg = deserialize_config(merged).map_err(|message| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message,
+    })?;
 
     let env_vars = std::env::vars().collect::<Vec<_>>();
     apply_env_overrides(
@@ -237,7 +311,8 @@ pub fn load(paths: &Paths) -> Result<Config, ConfigError> {
 
 /// Parse TOML text into a `Config` (used by `load` and by tests).
 pub fn parse(text: &str) -> Result<Config, String> {
-    toml::from_str::<Config>(text).map_err(|e| e.to_string())
+    let table = toml::from_str::<toml::Table>(text).map_err(|error| error.to_string())?;
+    deserialize_config(table)
 }
 
 /// Apply `PACODE_MODEL` / `PACODE_EFFORT` / `PACODE_MODE` from `vars` (an iterator of

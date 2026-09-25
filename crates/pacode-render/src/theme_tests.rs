@@ -1,4 +1,5 @@
 use super::*;
+use crate::RenderOptions;
 
 #[test]
 fn test_parse_color_hex() {
@@ -38,6 +39,14 @@ fn test_parse_color_garbage() {
     assert_eq!(parse_color("#xyz"), None);
     assert_eq!(parse_color("#1234"), None);
     assert_eq!(parse_color("#1234567"), None);
+}
+
+#[test]
+fn mono_render_options_replace_all_theme_colors() {
+    let opts = RenderOptions::with_theme_color(80, false, Theme::truecolor(), ColorMode::Mono);
+    assert_eq!(opts.theme, Theme::mono());
+    assert_eq!(opts.theme.accent.fg, None);
+    assert_eq!(opts.theme.selected_bg.bg, None);
 }
 
 #[test]

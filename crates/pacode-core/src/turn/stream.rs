@@ -329,6 +329,7 @@ pub async fn consume_stream(
                             }
                             Ok(StreamEvent::MessageStart { .. }) => {}
                             Ok(StreamEvent::Usage(u)) => {
+                                agent.set_stream_usage(u);
                                 turn_usage = u;
                             }
                             Ok(StreamEvent::MessageEnd { .. }) => {}
@@ -423,8 +424,7 @@ pub async fn consume_stream(
                 .unwrap_or_else(|p| p.into_inner())
                 .push(msg);
             let _ = session
-                .store
-                .append_message(&session.id, &agent.id(), seq, &arc_msg)
+                .append_agent_message(agent.as_ref(), seq, &arc_msg)
                 .await;
         }
         return Ok(StreamOutcome {

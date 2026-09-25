@@ -115,8 +115,7 @@ pub fn overlay_area(dialog: Rect, view: &MenuView, ui: &MenuUiState) -> Rect {
     let detail_inline = detail_panel_width(inner_w).is_none();
     let max_h = dialog.height.saturating_sub(4).max(6);
     let h = (inner_height(view, ui, detail_inline) as u16 + 2).min(max_h);
-    let x = dialog.x + dialog.width.saturating_sub(w) / 2;
-    Rect::new(x, dialog.y + TOP_OFFSET, w, h)
+    crate::ui::popup::top_area(dialog, w, h, TOP_OFFSET)
 }
 
 /// First row of a window over variable-height rows such that the selected row

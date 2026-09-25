@@ -4,14 +4,19 @@ use pacode_render::RenderOptions;
 use pacode_types::Config;
 use pacode_types::TranscriptKind;
 use pacode_types::state::ToastLevel;
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
+use ratatui::{Frame, Terminal};
 
 use super::*;
 use crate::state::AppState;
 use crate::state::selection::CopyRequest;
 use crate::state::transcript::{Cell, CellKind};
+
+fn prepare_and_draw_frame(frame: &mut Frame<'_>, state: &mut AppState) {
+    let prepared = crate::ui::prepare_frame(frame.area(), state, Instant::now());
+    crate::ui::draw(frame, state, &prepared);
+}
 
 /// Render the strip into `area` on a `cols`×`rows` backend; return one string
 /// per terminal row, read straight from the buffer (no Display quoting).
@@ -282,7 +287,7 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
     // Render once to populate the buffer
     terminal
         .draw(|f| {
-            crate::ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -296,7 +301,7 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
 
     terminal
         .draw(|f| {
-            crate::ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -323,7 +328,7 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
     // Render again to draw the pushed toast into the strip
     terminal
         .draw(|f| {
-            crate::ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -354,7 +359,7 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
 
     terminal
         .draw(|f| {
-            crate::ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 

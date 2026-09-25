@@ -528,8 +528,7 @@ fn tab_step(ui: &mut MenuUiState, view: &menu::MenuView, dir: isize) {
 /// occupy (§3.4). The dialog column is the terminal minus the input/footer
 /// chrome; being a row off is invisible — paging is approximate by nature.
 fn page_rows(state: &AppState, view: &menu::MenuView, ui: &MenuUiState) -> usize {
-    let dialog = Rect::new(0, 0, state.cols, state.rows.saturating_sub(6));
-    let area = menu::overlay_area(dialog, view, ui);
+    let area = menu_area(state, view, ui);
     (area.height as usize)
         .saturating_sub(2 + usize::from(shows_tabs(view)) + usize::from(shows_filter(view)))
         .max(1)
@@ -538,8 +537,7 @@ fn page_rows(state: &AppState, view: &menu::MenuView, ui: &MenuUiState) -> usize
 /// Keep `ui.scroll` a valid window anchor for the cursor (§3.5): the window
 /// start a level remembers survives the descent and the return.
 fn sync_scroll(state: &AppState, ui: &mut MenuUiState, view: &menu::MenuView) {
-    let dialog = Rect::new(0, 0, state.cols, state.rows.saturating_sub(6));
-    let area = menu::overlay_area(dialog, view, ui);
+    let area = menu_area(state, view, ui);
     let inner_w = area.width.saturating_sub(2);
     let detail_inline = menu::detail_panel_width(inner_w).is_none();
     let sel = resolve_cursor(&view.rows, &ui.cursor).unwrap_or(0);
@@ -553,4 +551,12 @@ fn sync_scroll(state: &AppState, ui: &mut MenuUiState, view: &menu::MenuView) {
         .saturating_sub(2 + usize::from(shows_tabs(view)) + usize::from(shows_filter(view)))
         .saturating_sub(usize::from(view.status.is_some()));
     ui.scroll = menu::resolve_window(&heights, sel, budget, ui.scroll);
+}
+
+fn menu_area(state: &AppState, view: &menu::MenuView, ui: &MenuUiState) -> Rect {
+    menu::overlay_area(
+        crate::ui::popup::overlay_container(&crate::layout::current(state)),
+        view,
+        ui,
+    )
 }

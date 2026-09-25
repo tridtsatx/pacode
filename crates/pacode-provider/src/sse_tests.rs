@@ -1,7 +1,9 @@
 use pacode_types::{StopReason, StreamEvent, Usage};
 use serde_json::json;
 
-use crate::sse::{ChunkState, SseParser, chunk_to_events};
+use crate::sse::{
+    ChunkState, ResponseReadBudget, SseParser, chunk_to_events, retry_after_from_error,
+};
 
 #[test]
 fn test_sse_parser_crlf_and_single_line() {
@@ -451,4 +453,53 @@ fn test_chunk_to_events_error_raw_equal_to_message_not_duplicated() {
         crate::ProviderError::Malformed(msg) => assert_eq!(msg, "same text"),
         other => panic!("expected Malformed error, got {other:?}"),
     }
+}
+
+#[test]
+fn test_sse_parser_reports_event_budget() {
+    let mut parser = SseParser::with_max_buffer_bytes(4);
+    assert!(
+        parser
+            .feed_checked(b"data")
+            .expect("within budget")
+            .is_empty()
+    );
+    match parser.feed_checked(b"!") {
+        Err(crate::ProviderError::Malformed(message)) => {
+            assert!(message.contains("4-byte"), "got {message}");
+        }
+        other => panic!("expected a bounded parser error, got {other:?}"),
+    }
+
+    let mut compatible = SseParser::with_max_buffer_bytes(4);
+    assert!(compatible.feed(b"data!").is_empty());
+}
+
+#[test]
+fn test_sse_response_budget_is_cumulative() {
+    let mut budget = ResponseReadBudget::new(4);
+    budget.consume(3).expect("within budget");
+    match budget.consume(2) {
+        Err(crate::ProviderError::Malformed(message)) => {
+            assert!(message.contains("4-byte"), "got {message}");
+        }
+        other => panic!("expected a response budget error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_stream_retry_after_metadata_is_bounded() {
+    let direct = json!({ "retry_after": 2 });
+    assert_eq!(
+        retry_after_from_error(&direct),
+        Some(std::time::Duration::from_secs(2))
+    );
+
+    let headers = json!({
+        "response_headers": { "Retry-After": "3" }
+    });
+    assert_eq!(
+        retry_after_from_error(&headers),
+        Some(std::time::Duration::from_secs(3))
+    );
 }

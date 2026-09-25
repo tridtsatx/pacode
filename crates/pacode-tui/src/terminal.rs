@@ -31,6 +31,18 @@ const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 /// frozen in synchronized mode with later output never presented.
 const SYNC_END: &[u8] = b"\x1b[?2026l";
 
+struct EnterGuard {
+    active: bool,
+}
+
+impl Drop for EnterGuard {
+    fn drop(&mut self) {
+        if self.active {
+            restore_on_panic();
+        }
+    }
+}
+
 pub struct TerminalGuard {
     pub terminal: Terminal<CrosstermBackend<Stdout>>,
     mouse: bool,
@@ -39,6 +51,7 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     pub fn enter(mouse: bool) -> std::io::Result<Self> {
         enable_raw_mode()?;
+        let mut enter_guard = EnterGuard { active: true };
         let mut stdout = std::io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
 
@@ -75,12 +88,27 @@ impl TerminalGuard {
 
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
+        enter_guard.active = false;
 
         Ok(Self { terminal, mouse })
     }
 
     pub fn mouse_enabled(&self) -> bool {
         self.mouse
+    }
+
+    pub fn set_mouse(&mut self, enabled: bool) -> std::io::Result<()> {
+        if enabled == self.mouse {
+            return Ok(());
+        }
+        let mut stdout = std::io::stdout();
+        if enabled {
+            execute!(stdout, EnableMouseCapture)?;
+        } else {
+            execute!(stdout, DisableMouseCapture)?;
+        }
+        self.mouse = enabled;
+        Ok(())
     }
 
     /// Open a DEC 2026 synchronized update around the next `terminal.draw`.
@@ -170,6 +198,7 @@ pub fn restore_on_panic() {
 
 /// Suspend the TUI: leave alternate screen and raw mode so child processes (e.g. editor) can run.
 pub fn suspend(mouse: bool) -> std::io::Result<()> {
+    let mut guard = EnterGuard { active: true };
     let mut stdout = std::io::stdout();
     // SYNC_END first: suspend may run while a synchronized update is open,
     // and the child's output must reach the screen.
@@ -182,12 +211,14 @@ pub fn suspend(mouse: bool) -> std::io::Result<()> {
     }
     execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen)?;
     disable_raw_mode()?;
+    guard.active = false;
     Ok(())
 }
 
 /// Resume the TUI: re-enter raw mode and alternate screen after child process finishes.
 pub fn resume(mouse: bool) -> std::io::Result<()> {
     enable_raw_mode()?;
+    let mut guard = EnterGuard { active: true };
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     if mouse {
@@ -205,6 +236,7 @@ pub fn resume(mouse: bool) -> std::io::Result<()> {
     if push {
         let _ = execute!(stdout, PushKeyboardEnhancementFlags(flags));
     }
+    guard.active = false;
     Ok(())
 }
 
@@ -232,7 +264,7 @@ where
         active: true,
     };
     let result = f();
-    guard.active = false;
     resume(mouse)?;
+    guard.active = false;
     Ok(result)
 }

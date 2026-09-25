@@ -21,6 +21,10 @@ pub const THUMB_SLOT_W: u16 = 20;
 pub const STRIP_ROWS: u16 = 6;
 /// Spec cap: the strip never exceeds 8 rows.
 pub const STRIP_MAX_ROWS: u16 = 8;
+/// Maximum number of image decoders that may run at once.
+pub const IMAGE_RENDER_MAX_IN_FLIGHT: usize = 4;
+/// Maximum number of pending render requests retained between frames.
+pub const IMAGE_RENDER_MAX_WANTS: usize = 16;
 
 /// A rendered thumbnail for one pasted image.
 #[derive(Clone, Debug)]
@@ -51,6 +55,10 @@ pub struct ImageStripState {
 }
 
 impl ImageStripState {
+    pub fn can_start_render(&self) -> bool {
+        self.in_flight.len() < IMAGE_RENDER_MAX_IN_FLIGHT
+    }
+
     /// Drop cached thumbs for tokens that are no longer referenced by the
     /// input. In-flight renders for dead tokens are dropped too — their
     /// replies land in `thumbs` and get evicted on the next `retain`.
@@ -58,6 +66,17 @@ impl ImageStripState {
         self.thumbs.retain(|token, _| live.contains(token));
         self.in_flight.retain(|(token, _, _)| live.contains(token));
         self.want.retain(|(token, ..)| live.contains(token));
+
+        let mut seen = HashSet::new();
+        let mut latest: Vec<_> = self
+            .want
+            .drain(..)
+            .rev()
+            .filter(|want| seen.insert(want.0))
+            .take(IMAGE_RENDER_MAX_WANTS)
+            .collect();
+        latest.reverse();
+        self.want = latest;
     }
 }
 

@@ -32,8 +32,8 @@ pub use types::{
     OAUTH_BETA, map_tool_name_for_oauth, map_tool_name_from_oauth,
 };
 
-use self::retry::{AnthropicStreamOpener, anthropic_retrying_stream};
-use crate::{CompletionRequest, EventStream, Provider, ProviderError, redact};
+use self::retry::AnthropicStreamOpener;
+use crate::{CompletionRequest, EventStream, Provider, ProviderError, RetryBudget, redact};
 
 #[cfg(test)]
 #[path = "../anthropic_tests.rs"]
@@ -267,7 +267,7 @@ impl Anthropic {
             }
         }
 
-        let response = match req_builder.send().await {
+        let mut response = match req_builder.send().await {
             Ok(resp) => resp,
             Err(err) => {
                 if !configured_models.is_empty() {
@@ -284,7 +284,7 @@ impl Anthropic {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            let text = crate::error_body::read_error_body(&mut response).await;
             let redacted_text = redact(&text);
             log::trace!("models response body: {redacted_text}");
             if !configured_models.is_empty() {
@@ -385,13 +385,11 @@ impl Provider for Anthropic {
             model: req.model,
             stream_idle_secs: self.defaults.stream_idle_secs,
             effort,
-            max_retries,
             backoff_base: self.backoff_base,
             is_oauth: self.is_oauth(),
         };
 
-        let inner = opener.open().await?;
-        Ok(anthropic_retrying_stream(opener, inner))
+        opener.open(RetryBudget::new(max_retries)).await
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

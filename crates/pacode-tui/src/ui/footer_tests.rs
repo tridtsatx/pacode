@@ -188,6 +188,71 @@ fn test_footer_vim_mode_badges() {
 }
 
 #[test]
+fn task_panel_footer_names_task_actions() {
+    let mut state = make_test_state();
+    state.focus = Focus::Panel {
+        target: PanelTarget::Task(pacode_types::TaskId::new("task-1")),
+        follow: false,
+        follow_paused: false,
+    };
+    let opts = RenderOptions::new(120, false);
+    let text: String = render_row2(120, &state, &opts)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(text.contains("esc back · scroll pages · k kill"), "{text}");
+}
+
+#[test]
+fn completed_main_agent_is_not_counted_as_a_subagent() {
+    let mut state = make_test_state();
+    state.rail.show_session_stats = true;
+    state.rail.usage.turns = 1;
+    state.rail.usage.last_activity_ms = 1;
+    state.rail.agents.push(AgentInfo {
+        id: AgentId::main(),
+        name: "main".into(),
+        kind: AgentKind::Main,
+        status: AgentStatus::Finished,
+        activity: None,
+        started_at_ms: 0,
+        finished_at_ms: Some(1),
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: None,
+        summary: None,
+        error: None,
+    });
+    state.rail.agents.push(AgentInfo {
+        id: AgentId::new("sub-1"),
+        name: "sub".into(),
+        kind: AgentKind::Sub,
+        status: AgentStatus::Finished,
+        activity: None,
+        started_at_ms: 0,
+        finished_at_ms: Some(1),
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("p", "m"),
+        effort: Effort::High,
+        parent: Some(AgentId::main()),
+        summary: None,
+        error: None,
+    });
+    let opts = RenderOptions::new(120, false);
+    let text: String = render_row2(120, &state, &opts)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(text.contains("1 agents done"), "{text}");
+    assert!(!text.contains("2 agents done"), "{text}");
+}
+
+#[test]
 fn slots_spans_color_by_status() {
     use pacode_types::SessionStatusKind as Kind;
 

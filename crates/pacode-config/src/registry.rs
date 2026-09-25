@@ -17,6 +17,7 @@ pub enum ApplyMode {
     Immediate,
     NextTurn,
     Restart,
+    RestartClient,
 }
 
 impl ApplyMode {
@@ -25,6 +26,7 @@ impl ApplyMode {
             Self::Immediate => "immediate",
             Self::NextTurn => "next turn",
             Self::Restart => "restart",
+            Self::RestartClient => "restart client",
         }
     }
 }
@@ -78,10 +80,18 @@ pub enum ValidationError {
     NotDirectlyEditable { key: String, command: String },
 }
 
+#[derive(Debug, thiserror::Error, PartialEq)]
+#[error("invalid {key}: {message}")]
+pub struct ConfigValidationError {
+    pub key: &'static str,
+    pub message: String,
+}
+
 /// Explicit, named skip list for collection-valued fields that cannot be edited in a simple list UI.
 pub const SKIP_LIST: &[&str] = &[
     "providers",
     "pricing",
+    "agents",
     "plugins.dirs",
     "skills.dirs",
     "hooks.pre_tool_use",
@@ -95,7 +105,7 @@ pub const SECTIONS: &[&str] = &[
     "provider",
     "ui",
     "exec",
-    "agents",
+    "limits",
     "daemon",
     "context",
     "permissions",
@@ -128,7 +138,6 @@ macro_rules! tool_toggle {
 }
 
 const EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const SUBAGENT_EFFORT_OPTIONS: &[&str] = &["", "low", "medium", "high", "xhigh", "max"];
 const COLOR_OPTIONS: &[&str] = &["auto", "truecolor", "ansi"];
 const IMAGE_OPTIONS: &[&str] = &["auto", "off"];
 const AGENT_VIEW_OPTIONS: &[&str] = &["replace", "panel"];
@@ -136,6 +145,10 @@ const ANIMATION_OPTIONS: &[&str] = &["smooth", "balanced", "eco"];
 const PERM_OPTIONS: &[&str] = &["build", "auto", "plan", "bypass"];
 const FONT_WEIGHT_OPTIONS: &[&str] = &["", "normal", "bold"];
 const ZDR_OPTIONS: &[&str] = &["always", "session", "off"];
+
+/// The numbers `ui.ups` accepts. Validation and repair both read it, so a
+/// clamped frame rate is the same one an edit would have accepted.
+const UPS_RANGE: std::ops::RangeInclusive<i64> = 1..=240;
 
 #[rustfmt::skip]
 pub static SETTINGS: &[SettingEntry] = &[
@@ -150,7 +163,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "ui.hints.model", label: "Model Hint", description: "Show model route hint in prompt area", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.hints.effort", label: "Effort Hint", description: "Show reasoning effort hint in prompt area", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.ascii_only", label: "ASCII Only", description: "Render plain ASCII box drawing and icons", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
-    SettingEntry { dotted_key: "ui.mouse", label: "Mouse Support", description: "Enable terminal mouse tracking and scrolling", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.mouse", label: "Mouse Support", description: "Enable terminal mouse tracking and scrolling; applied to the live terminal", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.auto_copy", label: "Auto Copy", description: "Automatically copy mouse selections to clipboard", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.ups", label: "Updates Per Second", description: "Render update rate: auto, dynamic, or fixed 1..=240", section: "ui", default_value: "10", kind: SettingKind::String, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.animation", label: "Animation Mode", description: "Animation clock preset: smooth, balanced, or eco", section: "ui", default_value: "smooth", kind: SettingKind::Enum { options: ANIMATION_OPTIONS }, apply: ApplyMode::Immediate },
@@ -171,9 +184,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "exec.max_tasks", label: "Max Tasks", description: "Maximum concurrent background tasks", section: "exec", default_value: "64", kind: SettingKind::Integer { min: 1, max: 1024 }, apply: ApplyMode::Restart },
     SettingEntry { dotted_key: "exec.default_timeout_secs", label: "Default Timeout Seconds", description: "Hard timeout in seconds for foreground command", section: "exec", default_value: "3600", kind: SettingKind::Integer { min: 1, max: 604800 }, apply: ApplyMode::Restart },
 
-    // agents
-    SettingEntry { dotted_key: "agents.default_model", label: "Subagent Model", description: "provider/model for subagents when unspecified", section: "agents", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.default_effort", label: "Subagent Effort", description: "Reasoning effort for subagents: low, medium, high, xhigh, max", section: "agents", default_value: "", kind: SettingKind::Enum { options: SUBAGENT_EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
+        SettingEntry { dotted_key: "limits.max_provider_concurrency", label: "Provider Concurrency", description: "Ceiling on in-flight provider requests per provider+credential; the runtime rejects anything outside 1..=1024", section: "limits", default_value: "128", kind: SettingKind::Integer { min: 1, max: 1024 }, apply: ApplyMode::Restart },
 
     // daemon
     SettingEntry { dotted_key: "daemon.idle_timeout_secs", label: "Idle Timeout Seconds", description: "Seconds of inactivity before daemon shuts down (0 to disable)", section: "daemon", default_value: "600", kind: SettingKind::Integer { min: 0, max: 2592000 }, apply: ApplyMode::Restart },
@@ -196,9 +207,11 @@ pub static SETTINGS: &[SettingEntry] = &[
 
     // mcp
     SettingEntry { dotted_key: "mcp.servers", label: "MCP Servers", description: "Configured MCP servers (manage with /mcp or /import)", section: "mcp", default_value: "/mcp", kind: SettingKind::Action { command: "/mcp" }, apply: ApplyMode::Restart },
-    SettingEntry { dotted_key: "mcp.sampling", label: "MCP Sampling", description: "Enable MCP client sampling capabilities", section: "mcp", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
-    SettingEntry { dotted_key: "mcp.sampling_max_tokens", label: "MCP Sampling Max Tokens", description: "Maximum tokens allowed per MCP sampling request", section: "mcp", default_value: "2048", kind: SettingKind::Integer { min: 1, max: 1000000 }, apply: ApplyMode::Immediate },
-    SettingEntry { dotted_key: "mcp.idle_timeout_secs", label: "MCP Idle Timeout Seconds", description: "Seconds of inactivity before an MCP server goes to sleep (0 to disable)", section: "mcp", default_value: "300", kind: SettingKind::Integer { min: 0, max: 86400 }, apply: ApplyMode::Immediate },
+    // The pool is built once from the config at daemon startup; a later edit
+    // reaches the pool only through a daemon restart.
+    SettingEntry { dotted_key: "mcp.sampling", label: "MCP Sampling", description: "Enable MCP client sampling capabilities", section: "mcp", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "mcp.sampling_max_tokens", label: "MCP Sampling Max Tokens", description: "Maximum tokens allowed per MCP sampling request", section: "mcp", default_value: "2048", kind: SettingKind::Integer { min: 1, max: 1000000 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "mcp.idle_timeout_secs", label: "MCP Idle Timeout Seconds", description: "Seconds of inactivity before an MCP server goes to sleep (0 to disable)", section: "mcp", default_value: "300", kind: SettingKind::Integer { min: 0, max: 86400 }, apply: ApplyMode::Restart },
 
     // session
     SettingEntry { dotted_key: "session.title_model", label: "Session Title Model", description: "Model used to name sessions after first reply", section: "session", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
@@ -221,8 +234,8 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "theme.overrides", label: "Theme Overrides", description: "Per-role color overrides (customize with /theme)", section: "theme", default_value: "/theme", kind: SettingKind::Action { command: "/theme" }, apply: ApplyMode::Immediate },
 
     // font
-    SettingEntry { dotted_key: "font.family", label: "Font Family", description: "Terminal font family request (best effort)", section: "font", default_value: "", kind: SettingKind::String, apply: ApplyMode::Immediate },
-    SettingEntry { dotted_key: "font.size", label: "Font Size", description: "Terminal font size in points (best effort)", section: "font", default_value: "", kind: SettingKind::Integer { min: 4, max: 72 }, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "font.family", label: "Font Family", description: "Terminal font family request; takes effect after restarting the client", section: "font", default_value: "", kind: SettingKind::String, apply: ApplyMode::RestartClient },
+    SettingEntry { dotted_key: "font.size", label: "Font Size", description: "Terminal font size in points; takes effect after restarting the client", section: "font", default_value: "", kind: SettingKind::Integer { min: 4, max: 72 }, apply: ApplyMode::RestartClient },
     SettingEntry { dotted_key: "font.weight", label: "Font Weight", description: "Terminal font weight: normal or bold", section: "font", default_value: "", kind: SettingKind::Enum { options: FONT_WEIGHT_OPTIONS }, apply: ApplyMode::Immediate },
 
     // keys
@@ -324,14 +337,9 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "exec.kill_grace_secs" => Some(config.exec.kill_grace_secs.to_string()),
         "exec.max_tasks" => Some(config.exec.max_tasks.to_string()),
         "exec.default_timeout_secs" => Some(config.exec.default_timeout_secs.to_string()),
-        "agents.default_model" => Some(config.agents.default_model.clone().unwrap_or_default()),
-        "agents.default_effort" => Some(
-            config
-                .agents
-                .default_effort
-                .map(|e| e.as_str().to_string())
-                .unwrap_or_default(),
-        ),
+        "limits.max_provider_concurrency" => {
+            Some(config.limits.max_provider_concurrency.to_string())
+        }
         "daemon.idle_timeout_secs" => Some(config.daemon.idle_timeout_secs.to_string()),
         "daemon.socket" => Some(
             config
@@ -520,7 +528,7 @@ pub fn validate_candidate(
                 if trimmed == "auto" || trimmed == "dynamic" {
                     Ok(toml::Value::String(trimmed.to_string()))
                 } else if let Ok(n) = trimmed.parse::<i64>() {
-                    if (1..=240).contains(&n) {
+                    if UPS_RANGE.contains(&n) {
                         Ok(toml::Value::Integer(n))
                     } else {
                         Err(ValidationError::InvalidUps {
@@ -551,6 +559,159 @@ pub fn validate(dotted_key: &str, candidate: &str) -> Result<toml::Value, Valida
         key: dotted_key.to_string(),
     })?;
     validate_candidate(entry, candidate)
+}
+
+/// `(key, ceiling_key)` pairs whose order matters: each value is legal on its
+/// own, yet breaks the one it is measured against. The registry table describes
+/// ranges, these describe agreements between two of them, so they live beside
+/// it rather than in it. Every `ceiling_key` is never a `key` — the repair loop
+/// lowers keys only, so lowering always terminates.
+const CROSS_FIELD_RULES: &[(&str, &str)] = &[
+    // A tool result larger than the whole window can never be sent: the turn
+    // compacts forever without making progress.
+    (
+        "context.tool_output_cap_chars",
+        "context.default_context_window",
+    ),
+    // An MCP sampling completion asking for more tokens than the window holds
+    // fails at the provider every time it is used.
+    ("mcp.sampling_max_tokens", "context.default_context_window"),
+    // The in-RAM tail mirrors the spool file; a tail above the spool cap is
+    // memory nothing can ever fill.
+    ("exec.tail_bytes", "exec.max_spool_bytes"),
+];
+
+/// The number a cross-field key carries, read wide enough to compare a byte
+/// count with a token count.
+fn cross_field_value(config: &Config, key: &str) -> u64 {
+    match key {
+        "context.tool_output_cap_chars" => config.context.tool_output_cap_chars as u64,
+        "context.default_context_window" => config.context.default_context_window as u64,
+        "mcp.sampling_max_tokens" => config.mcp.sampling_max_tokens as u64,
+        "exec.tail_bytes" => config.exec.tail_bytes as u64,
+        "exec.max_spool_bytes" => config.exec.max_spool_bytes,
+        _ => 0,
+    }
+}
+
+pub fn cross_field_violation(config: &Config) -> Option<ConfigValidationError> {
+    CROSS_FIELD_RULES.iter().find_map(|(key, ceiling_key)| {
+        let value = cross_field_value(config, key);
+        let ceiling = cross_field_value(config, ceiling_key);
+        (value > ceiling).then(|| ConfigValidationError {
+            key,
+            message: format!("{value} exceeds {ceiling_key}={ceiling}"),
+        })
+    })
+}
+
+pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
+    for entry in SETTINGS {
+        if matches!(entry.kind, SettingKind::Action { .. }) {
+            continue;
+        }
+        let value = read_value(config, entry.dotted_key).ok_or_else(|| ConfigValidationError {
+            key: entry.dotted_key,
+            message: ValidationError::UnknownKey {
+                key: entry.dotted_key.to_string(),
+            }
+            .to_string(),
+        })?;
+        validate_candidate(entry, &value).map_err(|error| ConfigValidationError {
+            key: entry.dotted_key,
+            message: error.to_string(),
+        })?;
+    }
+
+    cross_field_violation(config).map_or(Ok(()), Err)
+}
+
+/// The nearest in-range value for a setting [`validate_candidate`] rejected: a
+/// number is pulled to the bound it crossed, a value that is not a number at
+/// all (an `ups` written as a word) falls back to the registry default.
+/// `None` for `Action` rows, which hold no value.
+fn repaired_value(entry: &'static SettingEntry, current: &str) -> Option<toml::Value> {
+    let trimmed = current.trim();
+    match entry.kind {
+        SettingKind::Integer { min, max } => Some(match trimmed.parse::<i64>() {
+            Ok(value) => toml::Value::Integer(value.clamp(min, max)),
+            Err(_) => toml::Value::Integer(entry.default_value.parse::<i64>().unwrap_or(min)),
+        }),
+        SettingKind::Float { min, max } => Some(match trimmed.parse::<f64>() {
+            Ok(value) => toml::Value::Float(value.clamp(min, max)),
+            Err(_) => toml::Value::Float(entry.default_value.parse::<f64>().unwrap_or(min)),
+        }),
+        SettingKind::Enum { options } => Some(toml::Value::String(
+            options
+                .iter()
+                .find(|option| **option == trimmed)
+                .copied()
+                .unwrap_or(entry.default_value)
+                .to_string(),
+        )),
+        SettingKind::String => {
+            if entry.dotted_key == "ui.ups" {
+                return Some(match trimmed.parse::<i64>() {
+                    Ok(value) => {
+                        toml::Value::Integer(value.clamp(*UPS_RANGE.start(), *UPS_RANGE.end()))
+                    }
+                    Err(_) => validate_candidate(entry, entry.default_value).ok()?,
+                });
+            }
+            validate_candidate(entry, entry.default_value).ok()
+        }
+        SettingKind::Bool | SettingKind::Action { .. } => None,
+    }
+}
+
+/// Bring every out-of-range or disagreeing value in `config` back into what the
+/// runtime accepts and report what moved. Loading calls this instead of
+/// refusing the file: a stale out-of-range number is a wrong value, not a
+/// reason to leave the user without a working pacode. Nothing is written back
+/// to disk — the file keeps the number the user typed until they next edit it
+/// through `/config`.
+pub fn repair_config(config: &mut Config) -> Vec<ConfigValidationError> {
+    let mut repairs = Vec::new();
+    for entry in SETTINGS {
+        if matches!(entry.kind, SettingKind::Action { .. }) {
+            continue;
+        }
+        let Some(current) = read_value(config, entry.dotted_key) else {
+            continue;
+        };
+        let Err(error) = validate_candidate(entry, &current) else {
+            continue;
+        };
+        let Some(value) = repaired_value(entry, &current) else {
+            continue;
+        };
+        apply_to_config(config, entry.dotted_key, &value);
+        repairs.push(ConfigValidationError {
+            key: entry.dotted_key,
+            message: error.to_string(),
+        });
+    }
+
+    while let Some(violation) = cross_field_violation(config) {
+        let Some((_, ceiling_key)) = CROSS_FIELD_RULES
+            .iter()
+            .find(|(key, _)| *key == violation.key)
+        else {
+            break;
+        };
+        let ceiling = cross_field_value(config, ceiling_key);
+        apply_to_config(
+            config,
+            violation.key,
+            &toml::Value::Integer(i64::try_from(ceiling).unwrap_or(i64::MAX)),
+        );
+        repairs.push(ConfigValidationError {
+            key: violation.key,
+            message: format!("exceeded {ceiling_key}={ceiling}"),
+        });
+    }
+
+    repairs
 }
 
 pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Value) {
@@ -708,14 +869,9 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 config.exec.default_timeout_secs = *n as u64;
             }
         }
-        "agents.default_model" => {
-            if let toml::Value::String(s) = value {
-                config.agents.default_model = if s.is_empty() { None } else { Some(s.clone()) };
-            }
-        }
-        "agents.default_effort" => {
-            if let toml::Value::String(s) = value {
-                config.agents.default_effort = Effort::parse(s);
+        "limits.max_provider_concurrency" => {
+            if let toml::Value::Integer(value) = value {
+                config.limits.max_provider_concurrency = *value as u32;
             }
         }
         "daemon.idle_timeout_secs" => {

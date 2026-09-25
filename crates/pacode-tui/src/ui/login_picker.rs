@@ -181,7 +181,7 @@ pub fn draw(
 
     frame.render_widget(Paragraph::new(lines), area);
 
-    // Set cursor on query input
-    let cursor_x = area.x + 2 + (query.len() as u16).min(area.width.saturating_sub(3));
-    frame.set_cursor_position((cursor_x, area.y + 1));
+    if let Some(position) = crate::ui::popup::query_cursor(area, query, 2, 1) {
+        frame.set_cursor_position(position);
+    }
 }

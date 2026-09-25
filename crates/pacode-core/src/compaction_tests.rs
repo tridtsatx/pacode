@@ -158,3 +158,94 @@ fn test_split_for_compaction_keeps_tool_pairs() {
     assert_eq!(to_keep[0].role, Role::Assistant);
     assert_eq!(to_keep[1].role, Role::Tool);
 }
+
+// ---------------------------------------------------------------------------
+// ZDR: the summary request carries the whole conversation prefix, so the route
+// that produces it has to be inside the retention boundary.
+// ---------------------------------------------------------------------------
+
+mod zdr {
+    use super::*;
+
+    fn route(provider: &str, model: &str) -> ModelRoute {
+        ModelRoute::new(provider, model)
+    }
+
+    fn capable(keys: &[&str]) -> impl Fn(&str) -> bool {
+        let keys: Vec<String> = keys.iter().map(|k| (*k).to_string()).collect();
+        move |key: &str| keys.iter().any(|k| k == key)
+    }
+
+    #[test]
+    fn without_zdr_the_configured_model_wins() {
+        let agent_route = route("mock", "agent-model");
+        let (picked, refusal) = pick_summary_route(
+            Some(route("other", "cheap")),
+            &agent_route,
+            false,
+            &capable(&[]),
+        );
+        assert_eq!(picked, route("other", "cheap"));
+        assert!(refusal.is_none());
+    }
+
+    #[test]
+    fn without_zdr_a_route_nobody_flagged_is_still_used() {
+        let (picked, refusal) =
+            pick_summary_route(None, &route("mock", "agent-model"), false, &capable(&[]));
+        assert_eq!(picked, route("mock", "agent-model"));
+        assert!(refusal.is_none());
+    }
+
+    #[test]
+    fn under_zdr_a_flagged_compaction_model_is_used() {
+        let (picked, refusal) = pick_summary_route(
+            Some(route("other", "cheap")),
+            &route("mock", "agent-model"),
+            true,
+            &capable(&["mock/agent-model", "other/cheap"]),
+        );
+        assert_eq!(picked, route("other", "cheap"));
+        assert!(refusal.is_none());
+    }
+
+    #[test]
+    fn under_zdr_an_unflagged_compaction_model_falls_back_to_the_agent_route() {
+        let (picked, refusal) = pick_summary_route(
+            Some(route("other", "cheap")),
+            &route("mock", "agent-model"),
+            true,
+            &capable(&["mock/agent-model"]),
+        );
+        assert_eq!(
+            picked,
+            route("mock", "agent-model"),
+            "the summary must not go to a route outside the ZDR boundary"
+        );
+        assert!(refusal.is_none());
+    }
+
+    #[test]
+    fn under_zdr_an_unflagged_agent_route_refuses_instead_of_leaking() {
+        let (picked, refusal) =
+            pick_summary_route(None, &route("mock", "agent-model"), true, &capable(&[]));
+        assert_eq!(picked, route("mock", "agent-model"));
+        let reason = refusal.expect("compaction must be refused, not leaked");
+        assert!(
+            reason.starts_with("zdr_blocked:"),
+            "reason must be recognisable as policy: {reason}"
+        );
+    }
+
+    #[test]
+    fn under_zdr_no_route_at_all_is_usable_refuses() {
+        let (picked, refusal) = pick_summary_route(
+            Some(route("other", "cheap")),
+            &route("mock", "agent-model"),
+            true,
+            &capable(&[]),
+        );
+        assert_eq!(picked, route("mock", "agent-model"));
+        assert!(refusal.is_some());
+    }
+}

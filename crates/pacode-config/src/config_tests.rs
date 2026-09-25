@@ -37,6 +37,9 @@ effort = true
 yield_after_secs = 10
 stall_secs = 120
 
+[limits]
+max_provider_concurrency = 512
+
 [daemon]
 idle_timeout_secs = 600
 
@@ -90,6 +93,8 @@ fn parse_spec_example() {
     assert_eq!(cfg.exec.yield_after_secs, 10);
     assert_eq!(cfg.exec.stall_secs, 120);
 
+    assert_eq!(cfg.limits.max_provider_concurrency, 512);
+
     assert_eq!(cfg.daemon.idle_timeout_secs, 600);
 
     assert!((cfg.context.compaction_threshold - 0.85).abs() < 1e-6);
@@ -135,6 +140,8 @@ fn defaults_from_empty_text() {
     assert_eq!(cfg.exec.max_tasks, 64);
     assert_eq!(cfg.exec.default_timeout_secs, 3600);
 
+    assert_eq!(cfg.limits.max_provider_concurrency, 128);
+
     assert_eq!(cfg.daemon.idle_timeout_secs, 600);
 
     assert!((cfg.context.compaction_threshold - 0.85).abs() < 1e-6);
@@ -153,6 +160,79 @@ fn defaults_from_empty_text() {
     assert_eq!(cfg.ui.transcript_cells, 500);
     assert!(!cfg.ui.hints.model);
     assert!(cfg.ui.hints.effort);
+}
+
+#[test]
+fn deprecated_agent_keys_load_without_overriding_inherited_defaults() {
+    let cfg = parse("[agents]\ndefault_model = \"legacy/model\"\ndefault_effort = \"max\"\n")
+        .expect("deprecated agent keys must remain loadable");
+
+    assert_eq!(cfg.agents.default_model, None);
+    assert_eq!(cfg.agents.default_effort, None);
+}
+
+#[test]
+fn dead_limit_keys_load_as_no_ops() {
+    // pacode caps no agents, no provider queue and no per-turn calls; a config
+    // still carrying those keys must load, and must fall back to the defaults.
+    let cfg = parse(
+        "[limits]\n\
+         max_logical_agents = 32\n\
+         max_provider_queue_items = 8192\n\
+         max_provider_queue_bytes = 134217728\n\
+         max_exec_calls_per_turn = 64\n\
+         max_tool_calls_per_turn = 512\n\
+         [agents]\n\
+         max_live = 24\n\
+         max_turns = 10000\n",
+    )
+    .expect("dead limit keys must remain loadable");
+
+    assert_eq!(cfg.limits.max_provider_concurrency, 128);
+}
+
+#[test]
+fn load_repairs_out_of_range_values_instead_of_refusing_the_file() {
+    // A config written against older bounds must still boot, with the value
+    // pulled to the nearest one the runtime accepts.
+    let cfg = parse(
+        "[limits]\nmax_provider_concurrency = 4096\n\
+         [provider]\nmax_retries = 101\n\
+         [exec]\nmax_tasks = 0\n\
+         [ui]\nups = 900\n\
+         [context]\ntool_output_cap_chars = 500000\n",
+    )
+    .expect("out-of-range values must be repaired, not rejected");
+
+    assert_eq!(cfg.limits.max_provider_concurrency, 1_024);
+    assert_eq!(cfg.provider.max_retries, 100);
+    assert_eq!(cfg.exec.max_tasks, 1);
+    assert_eq!(cfg.ui.ups, pacode_types::Ups::Fixed(240));
+    assert_eq!(cfg.context.tool_output_cap_chars, 128_000);
+
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+    fs::write(
+        &paths.config_file,
+        "[limits]\nmax_provider_concurrency = 0\n",
+    )
+    .expect("write stale config");
+    let loaded = load(&paths).expect("a stale value must not stop the daemon from booting");
+    assert_eq!(loaded.limits.max_provider_concurrency, 1);
+}
+
+#[test]
+fn load_still_rejects_a_config_it_cannot_read() {
+    // Repairing a number is not the same as accepting a broken file: a value
+    // with the wrong type is a typo, and the user needs to hear about it.
+    for source in [
+        "[provider]\nmax_retries = \"many\"\n",
+        "[exec]\nmax_tasks = \"lots\"\n",
+        "[ui]\nups = 10.5\n",
+        "[ui]\nanimation = \"wobbly\"\n",
+    ] {
+        assert!(parse(source).is_err(), "source must be rejected: {source}");
+    }
 }
 
 #[test]

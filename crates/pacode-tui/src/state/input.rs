@@ -1,10 +1,10 @@
 //! Prompt input: text with a cursor, history, slash-command popup.
 //!
 //! Completion state for the `@` and `!` popups lives here as *data*, not
-//! calls: the draw path records which candidates it wants (`want`), the event
-//! loop runs the filesystem scan on a blocking thread, and the reply lands in
-//! `ready`. Draw and key handlers only ever read `ready` — a miss shows no
-//! popup for a frame instead of blocking the frame on a directory walk
+//! calls: the pre-draw coordinator records which candidates it wants (`want`),
+//! the event loop runs the filesystem scan on a blocking thread, and the reply
+//! lands in `ready`. Draw and key handlers only ever read `ready`; a miss shows
+//! no popup for a frame instead of blocking the frame on a directory walk
 //! (§8.1 clean-frame audit).
 
 use std::collections::VecDeque;
@@ -94,8 +94,8 @@ impl<K: PartialEq + Clone, C> CompletionState<K, C> {
         }
     }
 
-    /// Record what the popup wants now. Called from draw — it only mutates
-    /// this cache, never runs the scan.
+    /// Record what the popup wants now. Called from the pre-draw coordinator —
+    /// it only mutates this cache, never runs the scan.
     pub fn set_want(&mut self, want: Option<K>) {
         self.want = want;
     }
@@ -112,13 +112,12 @@ impl<K: PartialEq + Clone, C> CompletionState<K, C> {
         Some(want)
     }
 
-    /// Fold a finished scan in. `key` is the context it ran for — a stale
-    /// reply simply becomes the new `ready`; `candidates_for` keeps it from
-    /// being misused for a different context.
+    /// Fold a finished scan in only when it answers the current in-flight key.
     pub fn finish_scan(&mut self, key: K, candidates: Vec<C>) {
-        if self.in_flight.as_ref() == Some(&key) {
-            self.in_flight = None;
+        if self.in_flight.as_ref() != Some(&key) {
+            return;
         }
+        self.in_flight = None;
         self.ready_key = Some(key);
         self.ready = candidates;
     }
@@ -294,6 +293,13 @@ impl InputState {
 
     pub fn queue_clear(&mut self) {
         self.prompt_queue.clear();
+    }
+
+    pub fn restore_text(&mut self, text: String) {
+        self.cursor = self.cursor.min(self.text.chars().count());
+        self.insert_str(&text);
+        self.history_index = None;
+        self.draft.clear();
     }
 
     pub fn insert_str(&mut self, s: &str) {
@@ -621,6 +627,23 @@ impl InputState {
     pub fn wrap_lines(&self, width: u16) -> Vec<String> {
         let text_w = (width as usize).saturating_sub(2).max(1);
         wrap_text_non_trimming(&self.text, text_w)
+    }
+
+    pub fn reconcile_scroll(&mut self, width: u16, height: u16) {
+        if height == 0 {
+            return;
+        }
+        let height = height as usize;
+        let max_scroll = self.wrap_lines(width).len().saturating_sub(height);
+        self.input_scroll = self.input_scroll.min(max_scroll);
+        let cursor_line = self.cursor_position(width).0 as usize;
+        self.input_scroll = if cursor_line < self.input_scroll {
+            cursor_line
+        } else if cursor_line >= self.input_scroll + height {
+            cursor_line.saturating_sub(height.saturating_sub(1))
+        } else {
+            self.input_scroll
+        };
     }
 
     /// Cursor position as (line, column) after wrapping at `width`.

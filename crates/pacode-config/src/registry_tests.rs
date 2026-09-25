@@ -62,8 +62,6 @@ fn test_drift_guard_fully_populated_config() {
     let mut cfg = Config::default();
     // Populate all Option fields to Some(...) so serde outputs their keys
     cfg.provider.default = Some("test/model".to_string());
-    cfg.agents.default_model = Some("test/subagent".to_string());
-    cfg.agents.default_effort = Some(Effort::High);
     cfg.daemon.socket = Some(PathBuf::from("/tmp/pacode.sock"));
     cfg.context.compaction_model = Some("test/compact".to_string());
     cfg.session.title_model = Some("test/title".to_string());
@@ -320,6 +318,175 @@ fn test_apply_and_reset_in_config() {
 }
 
 #[test]
+fn limits_settings_round_trip_and_validate() {
+    let mut cfg = Config::default();
+    assert!(validate_config(&cfg).is_ok());
+    assert_eq!(
+        read_value(&cfg, "limits.max_provider_concurrency"),
+        Some("128".to_string())
+    );
+
+    let entry = find_entry("limits.max_provider_concurrency").unwrap();
+    assert_eq!(entry.default_value, "128");
+    assert_eq!(entry.apply, ApplyMode::Restart);
+    assert_eq!(entry.kind, SettingKind::Integer { min: 1, max: 1024 });
+
+    let parsed = validate_candidate(entry, "512").unwrap();
+    apply_to_config(&mut cfg, "limits.max_provider_concurrency", &parsed);
+    assert_eq!(cfg.limits.max_provider_concurrency, 512);
+    assert!(validate_config(&cfg).is_ok());
+
+    // The runtime rejects 0 and anything above its own ceiling, so the registry
+    // refuses them before the value can reach it.
+    assert!(validate_candidate(entry, "0").is_err());
+    assert!(validate_candidate(entry, "1024").is_ok());
+    assert!(validate_candidate(entry, "1025").is_err());
+}
+
+#[test]
+fn dead_limits_are_gone_from_the_registry() {
+    // Each of these was configurable and read by nothing; a setting row would
+    // promise a cap the runtime does not enforce.
+    for key in [
+        "limits.max_logical_agents",
+        "limits.max_provider_queue_items",
+        "limits.max_provider_queue_bytes",
+        "limits.max_exec_calls_per_turn",
+        "limits.max_tool_calls_per_turn",
+    ] {
+        assert!(find_entry(key).is_none(), "{key} must not be a setting");
+        assert!(validate(key, "1").is_err(), "{key} must be unknown");
+    }
+    let cfg = Config::default();
+    for key in [
+        "limits.max_logical_agents",
+        "limits.max_provider_queue_items",
+        "limits.max_provider_queue_bytes",
+        "limits.max_exec_calls_per_turn",
+        "limits.max_tool_calls_per_turn",
+    ] {
+        assert!(read_value(&cfg, key).is_none(), "{key} must not read back");
+    }
+}
+
+#[test]
+fn cross_field_rules_flag_and_repair() {
+    // A tool result bigger than the window can never be sent.
+    let mut cfg = Config::default();
+    cfg.context.tool_output_cap_chars = 500_000;
+    let error = validate_config(&cfg).expect_err("tool cap cannot exceed the window");
+    assert_eq!(error.key, "context.tool_output_cap_chars");
+    assert!(
+        error
+            .message
+            .contains("context.default_context_window=128000")
+    );
+
+    let repairs = repair_config(&mut cfg);
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].key, "context.tool_output_cap_chars");
+    assert_eq!(cfg.context.tool_output_cap_chars, 128_000);
+    assert!(validate_config(&cfg).is_ok());
+
+    // An MCP sampling budget above the window fails at the provider.
+    let mut cfg = Config::default();
+    cfg.context.default_context_window = 4_000;
+    cfg.context.tool_output_cap_chars = 2_000;
+    cfg.mcp.sampling_max_tokens = 9_000;
+    assert_eq!(
+        validate_config(&cfg)
+            .expect_err("sampling cannot exceed the window")
+            .key,
+        "mcp.sampling_max_tokens"
+    );
+    repair_config(&mut cfg);
+    assert_eq!(cfg.mcp.sampling_max_tokens, 4_000);
+    assert!(validate_config(&cfg).is_ok());
+
+    // Two rules broken at once are both repaired in one pass.
+    let mut cfg = Config::default();
+    cfg.context.default_context_window = 1_000;
+    cfg.context.tool_output_cap_chars = 9_000;
+    cfg.mcp.sampling_max_tokens = 9_000;
+    let repairs = repair_config(&mut cfg);
+    assert_eq!(repairs.len(), 2, "{repairs:?}");
+    assert_eq!(cfg.context.tool_output_cap_chars, 1_000);
+    assert_eq!(cfg.mcp.sampling_max_tokens, 1_000);
+    assert!(validate_config(&cfg).is_ok());
+
+    // A tail above the spool cap is RAM nothing can fill.
+    let mut cfg = Config::default();
+    cfg.exec.max_spool_bytes = 4_096;
+    cfg.exec.tail_bytes = 65_536;
+    assert_eq!(
+        validate_config(&cfg)
+            .expect_err("tail cannot exceed the spool")
+            .key,
+        "exec.tail_bytes"
+    );
+    repair_config(&mut cfg);
+    assert_eq!(cfg.exec.tail_bytes, 4_096);
+    assert!(validate_config(&cfg).is_ok());
+
+    // Defaults hold every rule, and repairing them changes nothing.
+    let mut cfg = Config::default();
+    assert!(cross_field_violation(&cfg).is_none());
+    assert!(repair_config(&mut cfg).is_empty());
+}
+
+#[test]
+fn repair_config_clamps_out_of_range_values_instead_of_failing() {
+    let mut cfg = Config::default();
+    // Values an older pacode accepted: a wider provider ceiling than the
+    // runtime has, a `max_retries` above the registry range, an `ups` past the
+    // frame clock's range, a colour that is no longer a colour, and an `ups`
+    // that is not a number at all.
+    cfg.limits.max_provider_concurrency = 4_096;
+    cfg.provider.max_retries = 101;
+    cfg.ui.ups = pacode_types::Ups::Fixed(900);
+    cfg.ui.color = "sepia".to_string();
+    cfg.ui.animation = pacode_types::config::AnimationMode::Eco;
+    cfg.mcp.sampling_max_tokens = 5_000_000;
+    cfg.context.default_context_window = 2_000;
+
+    let repairs = repair_config(&mut cfg);
+    let keys: Vec<&str> = repairs.iter().map(|r| r.key).collect();
+    assert!(
+        keys.contains(&"limits.max_provider_concurrency"),
+        "{keys:?}"
+    );
+    assert!(keys.contains(&"provider.max_retries"), "{keys:?}");
+    assert!(keys.contains(&"ui.ups"), "{keys:?}");
+    assert!(keys.contains(&"ui.color"), "{keys:?}");
+    assert!(keys.contains(&"mcp.sampling_max_tokens"), "{keys:?}");
+
+    assert_eq!(cfg.limits.max_provider_concurrency, 1_024);
+    assert_eq!(cfg.provider.max_retries, 100);
+    assert_eq!(cfg.ui.ups, pacode_types::Ups::Fixed(240));
+    assert_eq!(cfg.ui.color, "auto");
+    assert_eq!(cfg.mcp.sampling_max_tokens, 2_000);
+    // A value inside its own range is left alone.
+    assert_eq!(cfg.ui.animation, pacode_types::config::AnimationMode::Eco);
+    assert!(validate_config(&cfg).is_ok());
+
+    // A `ui.ups` that is not a number at all falls back to the default.
+    let mut cfg = Config::default();
+    cfg.ui.ups = pacode_types::Ups::Dynamic;
+    cfg.ui.color = "sepia".to_string();
+    let repairs = repair_config(&mut cfg);
+    assert!(repairs.iter().any(|r| r.key == "ui.color"));
+    assert_eq!(cfg.ui.ups, pacode_types::Ups::Dynamic);
+    assert_eq!(cfg.ui.color, "auto");
+}
+
+#[test]
+fn deprecated_agent_keys_are_not_active_registry_settings() {
+    assert!(find_entry("agents.default_model").is_none());
+    assert!(find_entry("agents.default_effort").is_none());
+    assert!(!SECTIONS.contains(&"agents"));
+}
+
+#[test]
 fn test_catalog_ttl_secs_round_trip() {
     let mut cfg = Config::default();
     assert_eq!(cfg.provider.catalog_ttl_secs, 86400);
@@ -471,6 +638,7 @@ fn test_live_restart_classification_present_for_every_entry() {
             ApplyMode::Immediate => assert_eq!(entry.apply.as_str(), "immediate"),
             ApplyMode::NextTurn => assert_eq!(entry.apply.as_str(), "next turn"),
             ApplyMode::Restart => assert_eq!(entry.apply.as_str(), "restart"),
+            ApplyMode::RestartClient => assert_eq!(entry.apply.as_str(), "restart client"),
         }
     }
 }
@@ -499,6 +667,32 @@ fn test_live_restart_classification_spot_checks() {
         find_entry("exec.stall_secs").unwrap().apply,
         ApplyMode::Restart
     );
+    // The provider governor ceiling is set once, at daemon startup.
+    assert_eq!(
+        find_entry("limits.max_provider_concurrency").unwrap().apply,
+        ApplyMode::Restart
+    );
+    // So is everything the MCP pool reads when it is built.
+    assert_eq!(
+        find_entry("mcp.sampling").unwrap().apply,
+        ApplyMode::Restart
+    );
+    assert_eq!(
+        find_entry("mcp.sampling_max_tokens").unwrap().apply,
+        ApplyMode::Restart
+    );
+    assert_eq!(
+        find_entry("mcp.idle_timeout_secs").unwrap().apply,
+        ApplyMode::Restart
+    );
+    assert_eq!(
+        find_entry("font.family").unwrap().apply,
+        ApplyMode::RestartClient
+    );
+    assert_eq!(
+        find_entry("font.size").unwrap().apply,
+        ApplyMode::RestartClient
+    );
 
     // Immediate: read on render / keypress / atomic update live
     assert_eq!(
@@ -510,14 +704,7 @@ fn test_live_restart_classification_spot_checks() {
         find_entry("theme.name").unwrap().apply,
         ApplyMode::Immediate
     );
-    assert_eq!(
-        find_entry("mcp.sampling").unwrap().apply,
-        ApplyMode::Immediate
-    );
-    assert_eq!(
-        find_entry("mcp.idle_timeout_secs").unwrap().apply,
-        ApplyMode::Immediate
-    );
+    assert_eq!(find_entry("ui.mouse").unwrap().apply, ApplyMode::Immediate);
 
     // NextTurn: read during turn execution / prompt building / agent spawning
     assert_eq!(

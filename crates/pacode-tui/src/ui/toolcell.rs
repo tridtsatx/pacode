@@ -300,7 +300,14 @@ fn preferred_keys(tool: &str) -> &'static [&'static str] {
         "report_status" => &["text"],
         "skill" => &["name"],
         _ => &[
-            "command", "pattern", "query", "path", "file_path", "file", "url", "uri",
+            "command",
+            "pattern",
+            "query",
+            "path",
+            "file_path",
+            "file",
+            "url",
+            "uri",
         ],
     }
 }
@@ -327,7 +334,10 @@ fn arg_summary(tool: &str, args: &str) -> Option<String> {
         return pick_salient(tool, obj.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
     let pairs = scan_json_object(args);
-    pick_salient(tool, pairs.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))))
+    pick_salient(
+        tool,
+        pairs.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))),
+    )
 }
 
 /// Preferred keys in order, then the first non-empty string field that is
@@ -340,10 +350,7 @@ fn pick_salient<'a>(
 ) -> Option<String> {
     let fields: Vec<(&'a str, Option<&'a str>)> = fields.collect();
     for key in preferred_keys(tool) {
-        if let Some(value) = fields
-            .iter()
-            .find(|(k, _)| k == key)
-            .and_then(|(_, v)| *v)
+        if let Some(value) = fields.iter().find(|(k, _)| k == key).and_then(|(_, v)| *v)
             && !value.trim().is_empty()
         {
             return Some(value.trim().chars().take(60).collect());

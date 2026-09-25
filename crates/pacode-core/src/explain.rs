@@ -59,11 +59,8 @@ async fn run(session: &Arc<Session>, req: &PermissionRequest) -> (Option<Explain
     };
 
     // A pending command must not leak to a non-ZDR route while retention is on.
-    if session.zdr_active() && !session.model_flags(&route.to_string()).zdr_capable {
-        return (
-            None,
-            "explain unavailable under zero-data-retention".to_string(),
-        );
+    if let Some(reason) = crate::permissions::zdr_route_violation(session, &route.to_string()) {
+        return (None, reason);
     }
 
     let provider = match session.providers.resolve(&route).await {
@@ -73,6 +70,13 @@ async fn run(session: &Arc<Session>, req: &PermissionRequest) -> (Option<Explain
             return (None, format!("explain failed: {e}"));
         }
     };
+
+    // Re-checked at the resolve point: resolving a provider is an await, and the
+    // pending command in `req.detail` is exactly the kind of content ZDR exists
+    // to keep out of a retaining endpoint.
+    if let Some(reason) = crate::permissions::zdr_route_violation(session, &route.to_string()) {
+        return (None, reason);
+    }
 
     let detail = truncate_head_tail(&req.detail, DETAIL_CAP_CHARS);
     let user = format!("Tool: {}\nTitle: {}\n\n{}", req.tool, req.title, detail);

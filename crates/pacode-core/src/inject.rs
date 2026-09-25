@@ -10,7 +10,9 @@ use tokio::sync::Notify;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Injection {
     /// The user typed while a turn was running.
-    UserSteer(String),
+    UserSteer {
+        admission: Option<String>,
+    },
     /// A background task ended; `tail` is the last lines of its output.
     TaskFinished {
         task: TaskInfo,
@@ -56,6 +58,29 @@ impl InjectionQueue {
             .unwrap_or_default()
     }
 
+    pub fn restore(&self, items: Vec<Injection>) {
+        if items.is_empty() {
+            return;
+        }
+        if let Ok(mut queue) = self.queue.lock() {
+            for item in items.into_iter().rev() {
+                queue.push_front(item);
+            }
+        }
+        self.notify.notify_one();
+    }
+
+    pub fn has_user_admission(&self) -> bool {
+        self.queue
+            .lock()
+            .map(|queue| {
+                queue
+                    .iter()
+                    .any(|item| matches!(item, Injection::UserSteer { admission: Some(_) }))
+            })
+            .unwrap_or(false)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.queue.lock().map(|q| q.is_empty()).unwrap_or(true)
     }
@@ -78,7 +103,6 @@ impl InjectionQueue {
 /// <agent_finished id="agt_…" name="general-purpose">
 /// …answer…
 /// </agent_finished>
-/// <user_message>…</user_message>
 /// <notice>…</notice>
 /// ```
 pub fn render_injections(items: &[Injection], cap_chars: usize) -> Message {
@@ -87,10 +111,7 @@ pub fn render_injections(items: &[Injection], cap_chars: usize) -> Message {
 
     for item in items {
         match item {
-            Injection::UserSteer(text) => {
-                let capped = pacode_types::truncate_head_tail(text, cap_chars);
-                parts.push(format!("<user_message>{capped}</user_message>"));
-            }
+            Injection::UserSteer { .. } => {}
             Injection::TaskFinished { task, tail } => {
                 let exit_str = task
                     .exit_code
@@ -210,7 +231,6 @@ mod tests {
         };
 
         let items = vec![
-            Injection::UserSteer("please do this first".into()),
             Injection::TaskFinished {
                 task: task.clone(),
                 tail: "test passed completely".into(),
@@ -225,7 +245,6 @@ mod tests {
         let msg = render_injections(&items, 1000);
         assert_eq!(msg.meta.kind, MessageKind::Injected);
         let text = msg.text();
-        assert!(text.contains("<user_message>please do this first</user_message>"));
         assert!(text.contains("<task_finished id="));
         assert!(text.contains("label=\"cargo test\""));
         assert!(text.contains("test passed completely"));
@@ -236,8 +255,13 @@ mod tests {
 
         // Test capping
         let overlong = "A".repeat(500);
-        let capped_msg = render_injections(&[Injection::UserSteer(overlong)], 100);
+        let capped_msg = render_injections(&[Injection::SystemNotice(overlong)], 100);
         let capped_text = capped_msg.text();
         assert!(capped_text.contains("characters truncated"));
+        assert!(
+            render_injections(&[Injection::UserSteer { admission: None }], 100)
+                .text()
+                .is_empty()
+        );
     }
 }

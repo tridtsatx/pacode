@@ -22,6 +22,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub exec: ExecConfig,
     pub agents: AgentsConfig,
+    pub limits: LimitsConfig,
     pub daemon: DaemonConfig,
     pub context: ContextConfig,
     pub permissions: PermissionsConfig,
@@ -462,11 +463,39 @@ impl Default for ExecConfig {
     }
 }
 
+/// Default and hard ceiling for `limits.max_provider_concurrency`. The values
+/// mirror the provider runtime's own governor (`DEFAULT_PROVIDER_CONCURRENCY`
+/// / `MAX_PROVIDER_CONCURRENCY`), which rejects anything outside them — the
+/// daemon hands the config value to `set_provider_concurrency_ceiling` and
+/// keeps the runtime's answer.
+pub const DEFAULT_PROVIDER_CONCURRENCY: u32 = 128;
+pub const MAX_PROVIDER_CONCURRENCY: u32 = 1024;
+
+/// `[limits]`: the ceilings the runtime really enforces. Every field here is
+/// applied by `pacode-daemon`'s wiring at startup; a limit nothing reads would
+/// be a lie, so there are none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// In-flight provider requests allowed per (base url, credential)
+    /// governor; the daemon sets it as the runtime ceiling.
+    pub max_provider_concurrency: u32,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_provider_concurrency: DEFAULT_PROVIDER_CONCURRENCY,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsConfig {
-    /// `provider/model` for subagents when the spawn call does not name one.
+    #[serde(skip)]
     pub default_model: Option<String>,
+    #[serde(skip)]
     pub default_effort: Option<Effort>,
 }
 
@@ -725,6 +754,7 @@ mod tests {
     fn empty_toml_gives_defaults() {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.exec.yield_after_secs, 5);
+        assert_eq!(cfg.limits.max_provider_concurrency, 128);
         assert_eq!(cfg.provider.catalog_ttl_secs, 86400);
         assert!(cfg.provider.proxy.is_none());
         assert_eq!(cfg.permissions.default_mode, Mode::Build);
@@ -748,6 +778,31 @@ mod tests {
         assert!(cfg.hooks.session_end.is_empty());
         assert!(cfg.hooks.notification.is_empty());
         assert!(cfg.tools.is_empty());
+    }
+
+    #[test]
+    fn removed_limits_are_ignored_rather_than_fatal() {
+        // Every key the old `[limits]` table carried is gone from the schema.
+        // An old config.toml must still load, whatever it put there.
+        let stale: Config = serde_json::from_value(serde_json::json!({
+            "limits": {
+                "max_logical_agents": "many",
+                "max_provider_queue_items": 8192,
+                "max_provider_queue_bytes": 134217728,
+                "max_exec_calls_per_turn": 64,
+                "max_tool_calls_per_turn": 512,
+            }
+        }))
+        .expect("unknown [limits] keys must not fail deserialization");
+        assert_eq!(stale.limits, LimitsConfig::default());
+
+        // A stale concurrency value out of the runtime's range is kept as read
+        // here; the load path (`pacode-config`) is what clamps it.
+        let stale: Config = serde_json::from_value(
+            serde_json::json!({ "limits": { "max_provider_concurrency": 4096 } }),
+        )
+        .expect("out-of-range concurrency must still deserialize");
+        assert_eq!(stale.limits.max_provider_concurrency, 4096);
     }
 
     #[test]

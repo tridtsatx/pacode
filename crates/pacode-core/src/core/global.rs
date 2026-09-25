@@ -9,6 +9,14 @@ impl Core {
     /// Used by the daemon for unattached connections too.
     pub async fn handle_global(&self, req: &Request) -> Option<Reply> {
         match req {
+            // A daemon-level reading, so it answers on an unattached connection
+            // too: the point is to inspect a busy daemon from outside it.
+            Request::RuntimeStats => {
+                let (core, providers) = self.stats();
+                Some(Reply::RuntimeStats {
+                    stats: Box::new(pacode_types::RuntimeStatsReply { core, providers }),
+                })
+            }
             Request::ListSessions { limit } => Some(
                 match self
                     .deps

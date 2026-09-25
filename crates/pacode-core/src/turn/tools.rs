@@ -1,18 +1,131 @@
 //! Tool execution for the turn loop: concurrent/sequential grouping, permissions, cancellation.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use pacode_tools::ToolKind;
+use pacode_tools::registry::{MAX_TOOL_OUTPUT_BYTES, cap_output_bytes};
 use pacode_types::{
-    AgentStatus, CallId, ContentBlock, Event, Message, Role, ToolStatus, TranscriptItem,
-    TranscriptKind,
+    AgentId, AgentStatus, CallId, ContentBlock, Event, Message, Role, SessionId, ToolStatus,
+    TranscriptItem, TranscriptKind, TurnId,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
 use crate::session::Session;
 use crate::turn::stream::PendingToolCall;
+
+/// Turns whose budget counters are still held, before the oldest is dropped.
+/// Dropping an entry only costs that turn its counters (it restarts from zero),
+/// never its lock — the map is a ledger, not a guard.
+const MAX_TRACKED_TURN_BUDGETS: usize = 1024;
+
+/// Per-turn allowances, and the two knobs they were read from. `[limits]
+/// .max_tool_calls_per_turn` / `max_exec_calls_per_turn` carried these until the
+/// limits table was cut down to the provider ceiling; the values below are the
+/// ones those keys defaulted to, and `turn_budget_limits` is the single place to
+/// read them again once the keys are back.
+const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u32 = 1024;
+const DEFAULT_MAX_EXEC_CALLS_PER_TURN: u32 = 128;
+
+fn turn_budget_limits(_session: &Session) -> BudgetLimits {
+    BudgetLimits {
+        tool_calls: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+        exec_calls: DEFAULT_MAX_EXEC_CALLS_PER_TURN,
+    }
+}
+
+#[derive(Default)]
+struct TurnBudget {
+    tool_calls: AtomicU32,
+    exec_calls: AtomicU32,
+}
+
+#[derive(Clone, Copy)]
+struct BudgetLimits {
+    tool_calls: u32,
+    exec_calls: u32,
+}
+
+/// A turn's spend against `[limits]`. The counters live for the turn: a new turn
+/// of the same agent gets a fresh pair, and the old one is dropped the moment
+/// that agent dispatches again.
+struct BudgetedTurn {
+    budget: Arc<TurnBudget>,
+    created: u64,
+}
+
+type TurnBudgetKey = (SessionId, AgentId, Option<TurnId>);
+
+static TURN_BUDGETS: LazyLock<Mutex<HashMap<TurnBudgetKey, BudgetedTurn>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TURN_BUDGET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+impl TurnBudget {
+    /// Charge one model-requested call to this turn. Every call is charged, the
+    /// refused ones included, so a model cannot spend the budget by retrying a
+    /// call that was cut off. `0` in a limit means no limit.
+    fn reserve(&self, limits: BudgetLimits, is_exec: bool) -> Result<(), String> {
+        if limits.tool_calls > 0 {
+            let used = self.tool_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if used > limits.tool_calls {
+                return Err(format!(
+                    "per-turn tool call budget of {} is spent; this call was refused \
+                     automatically, not refused by the user — do not retry it; finish the turn \
+                     and report what you have so far",
+                    limits.tool_calls
+                ));
+            }
+        }
+        if is_exec && limits.exec_calls > 0 {
+            let used = self.exec_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if used > limits.exec_calls {
+                return Err(format!(
+                    "per-turn exec budget of {} is spent; this call was refused automatically, not \
+                     refused by the user — do not retry it; finish the turn and report what you \
+                     have so far",
+                    limits.exec_calls
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The spending counters of the turn this dispatch belongs to. The agent's
+/// current turn id is the epoch: a fresh id means a fresh budget, and a
+/// dispatch outside a turn (only tests do that) gets one of its own.
+fn turn_budget(session: &Session, agent: &Agent) -> Arc<TurnBudget> {
+    let key = (session.id.clone(), agent.id(), agent.current_turn());
+    let mut budgets = TURN_BUDGETS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    budgets.retain(|held, _| held.0 != key.0 || held.1 != key.1 || held.2 == key.2);
+    if let Some(held) = budgets.get(&key) {
+        return Arc::clone(&held.budget);
+    }
+    let budget = Arc::new(TurnBudget::default());
+    budgets.insert(
+        key,
+        BudgetedTurn {
+            budget: Arc::clone(&budget),
+            created: TURN_BUDGET_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        },
+    );
+    while budgets.len() > MAX_TRACKED_TURN_BUDGETS {
+        let Some(oldest) = budgets
+            .iter()
+            .min_by_key(|(_, held)| held.created)
+            .map(|(held, _)| held.clone())
+        else {
+            break;
+        };
+        budgets.remove(&oldest);
+    }
+    budget
+}
 
 struct ToolCallInfo {
     call_id: CallId,
@@ -24,15 +137,51 @@ struct ToolCallInfo {
     intent: Option<String>,
 }
 
-enum ToolExecutionStatus {
-    Ok,
-    Cancelled,
+struct ToolOutcome {
+    result: Message,
+    interrupted: bool,
 }
 
-impl ToolExecutionStatus {
-    fn is_cancelled(&self) -> bool {
-        matches!(self, ToolExecutionStatus::Cancelled)
+fn cancelled_outcome(session: &Arc<Session>, agent: &Agent, call: ToolCallInfo) -> ToolOutcome {
+    let result = Message::tool_result(call.call_id.clone(), "cancelled", true);
+    let item = TranscriptItem {
+        seq: call.item_seq,
+        agent: agent.id(),
+        ts_ms: pacode_types::now_ms(),
+        kind: TranscriptKind::ToolCall {
+            call_id: call.call_id,
+            name: call.name,
+            title: call.title,
+            intent: call.intent,
+            status: ToolStatus::Error,
+            preview: "cancelled".to_string(),
+            diff: None,
+            duration_ms: None,
+            task: None,
+        },
+    };
+    agent
+        .transcript
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .upsert(item.clone());
+    session.events.emit(Event::ItemUpdated(item));
+    ToolOutcome {
+        result,
+        interrupted: true,
     }
+}
+
+async fn commit_tool_outcome(session: &Arc<Session>, agent: &Arc<Agent>, outcome: ToolOutcome) {
+    agent.commit_pending_user_messages();
+    let (seq, message) = agent
+        .history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(outcome.result);
+    let _ = session
+        .append_agent_message(agent.as_ref(), seq, &message)
+        .await;
 }
 
 enum ToolChunk {
@@ -76,8 +225,11 @@ async fn run_single_tool(
     session: Arc<Session>,
     agent: Arc<Agent>,
     cancel: CancellationToken,
+    registry_snapshot: pacode_tools::ToolRegistry,
+    budget: Arc<TurnBudget>,
+    limits: BudgetLimits,
     mut call: ToolCallInfo,
-) -> ToolExecutionStatus {
+) -> ToolOutcome {
     log::debug!(
         "tool call start: session={} agent={} tool={} call_id={}",
         session.id,
@@ -89,51 +241,30 @@ async fn run_single_tool(
     session.events.emit(Event::AgentUpdated(agent.info()));
 
     if cancel.is_cancelled() {
-        let stub = Message::tool_result(call.call_id.clone(), "cancelled", true);
-        let (seq, arc_stub) = agent
-            .history
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(stub);
-        let _ = session
-            .store
-            .append_message(&session.id, &agent.id(), seq, &arc_stub)
-            .await;
-        let item = TranscriptItem {
-            seq: call.item_seq,
-            agent: agent.id(),
-            ts_ms: pacode_types::now_ms(),
-            kind: TranscriptKind::ToolCall {
-                call_id: call.call_id,
-                name: call.name,
-                title: call.title,
-                intent: call.intent,
-                status: ToolStatus::Error,
-                preview: "cancelled".to_string(),
-                diff: None,
-                duration_ms: None,
-                task: None,
-            },
-        };
-        agent
-            .transcript
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .upsert(item.clone());
-        session.events.emit(Event::ItemUpdated(item));
-        return ToolExecutionStatus::Cancelled;
+        return cancelled_outcome(&session, &agent, call);
     }
 
+    let tool_opt = registry_snapshot.get(&call.name);
+    let budget_denied = budget
+        .reserve(
+            limits,
+            tool_opt.as_ref().map(|tool| tool.kind()) == Some(ToolKind::Exec),
+        )
+        .err();
+
     let mut hook_denied = None;
-    if call.parse_err.is_none() {
-        match session
-            .plugins
-            .run_hooks(&pacode_plugin::HookEvent::PreToolCall {
-                name: call.name.clone(),
-                input: call.input.clone(),
-            })
-            .await
-        {
+    if budget_denied.is_none() && call.parse_err.is_none() {
+        let event = pacode_plugin::HookEvent::PreToolCall {
+            name: call.name.clone(),
+            input: call.input.clone(),
+        };
+        let hook = session.plugins.run_hooks(&event);
+        let hook_result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return cancelled_outcome(&session, &agent, call),
+            result = hook => result,
+        };
+        match hook_result {
             Ok(pacode_plugin::HookResult::Deny { reason }) => {
                 hook_denied = Some(reason);
             }
@@ -151,21 +282,18 @@ async fn run_single_tool(
     // input; skipped when the call is already dead. Exit code 2 blocks the
     // call and the hook's stderr goes back to the model as the tool error.
     let mut user_hook_block = None;
-    if hook_denied.is_none() && call.parse_err.is_none() {
-        match crate::hooks::pre_tool_use(&session, &agent, &call.name, &call.input).await {
+    if budget_denied.is_none() && hook_denied.is_none() && call.parse_err.is_none() {
+        let hook = crate::hooks::pre_tool_use(&session, &agent, &call.name, &call.input);
+        let decision = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return cancelled_outcome(&session, &agent, call),
+            decision = hook => decision,
+        };
+        match decision {
             crate::hooks::PreToolDecision::Allow => {}
             crate::hooks::PreToolDecision::Block(reason) => user_hook_block = Some(reason),
         }
     }
-
-    // One snapshot serves both the dispatch lookup and `ctx.tools`, which
-    // `batch` uses to resolve its ops.
-    let registry_snapshot = agent
-        .tools
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let tool_opt = registry_snapshot.get(&call.name);
 
     // ZDR hard isolation: network tools (webfetch/websearch bypass the
     // permission gate) and every MCP call (`<server>__<tool>`, `__resource`)
@@ -205,7 +333,16 @@ async fn run_single_tool(
     };
 
     let start = Instant::now();
-    let (content, is_error, preview, diff, task, status) = if let Some(reason) = hook_denied {
+    let (content, is_error, preview, diff, task, status) = if let Some(reason) = &budget_denied {
+        (
+            reason.clone(),
+            true,
+            denied_preview(reason),
+            None,
+            None,
+            ToolStatus::Error,
+        )
+    } else if let Some(reason) = hook_denied {
         (
             format!("Permission denied: {reason}"),
             true,
@@ -238,10 +375,34 @@ async fn run_single_tool(
     } else {
         match tool_opt {
             Some(tool) => {
-                let call_fut = tool.call(call.input.clone(), &ctx);
-                let tool_res = tokio::select! {
-                    _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
-                    res = call_fut => res,
+                let workers = if call.name == pacode_tools::builtin::batch::NAME {
+                    None
+                } else {
+                    Some(
+                        ctx.tools
+                            .acquire_worker(&ctx.session, &ctx.agent, &ctx.cancel)
+                            .await,
+                    )
+                };
+                let tool_res = match workers {
+                    Some(Ok(workers)) => {
+                        let _workers = workers;
+                        let call_fut = tool.call(call.input.clone(), &ctx);
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
+                            res = call_fut => res,
+                        }
+                    }
+                    Some(Err(err)) => Err(err),
+                    None => {
+                        let call_fut = tool.call(call.input.clone(), &ctx);
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
+                            res = call_fut => res,
+                        }
+                    }
                 };
                 match tool_res {
                     Ok(output) => {
@@ -276,39 +437,7 @@ async fn run_single_tool(
                         )
                     }
                     Err(pacode_tools::ToolError::Cancelled) => {
-                        let stub = Message::tool_result(call.call_id.clone(), "cancelled", true);
-                        let (seq, arc_stub) = agent
-                            .history
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push(stub);
-                        let _ = session
-                            .store
-                            .append_message(&session.id, &agent.id(), seq, &arc_stub)
-                            .await;
-                        let item = TranscriptItem {
-                            seq: call.item_seq,
-                            agent: agent.id(),
-                            ts_ms: pacode_types::now_ms(),
-                            kind: TranscriptKind::ToolCall {
-                                call_id: call.call_id,
-                                name: call.name,
-                                title: call.title,
-                                intent: call.intent,
-                                status: ToolStatus::Error,
-                                preview: "cancelled".to_string(),
-                                diff: None,
-                                duration_ms: None,
-                                task: None,
-                            },
-                        };
-                        agent
-                            .transcript
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .upsert(item.clone());
-                        session.events.emit(Event::ItemUpdated(item));
-                        return ToolExecutionStatus::Cancelled;
+                        return cancelled_outcome(&session, &agent, call);
                     }
                     Err(pacode_tools::ToolError::Denied(reason)) => (
                         format!("Permission denied: {reason}"),
@@ -339,6 +468,8 @@ async fn run_single_tool(
         }
     };
 
+    let content = cap_output_bytes(content, MAX_TOOL_OUTPUT_BYTES).into_owned();
+    let preview = cap_output_bytes(preview, MAX_TOOL_OUTPUT_BYTES).into_owned();
     let duration_ms = start.elapsed().as_millis() as u64;
     log::debug!(
         "tool call result: session={} agent={} tool={} call_id={} status={:?} duration={}ms is_error={is_error}",
@@ -354,18 +485,31 @@ async fn run_single_tool(
         "content": content,
         "is_error": is_error,
     });
-    let _ = session
-        .plugins
-        .run_hooks(&pacode_plugin::HookEvent::PostToolCall {
+    if !cancel.is_cancelled() {
+        let event = pacode_plugin::HookEvent::PostToolCall {
             name: call.name.clone(),
             input: call.input.clone(),
             output: output_val.clone(),
-        })
-        .await;
+        };
+        let hook = session.plugins.run_hooks(&event);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            _ = hook => {},
+        }
+    }
 
     // `[hooks].post_tool_use` observes the outcome (denied and errored calls
     // included); it never blocks and hook stdout is ignored.
-    crate::hooks::post_tool_use(&session, &agent, &call.name, &call.input, &output_val).await;
+    if !cancel.is_cancelled() {
+        let hook =
+            crate::hooks::post_tool_use(&session, &agent, &call.name, &call.input, &output_val);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            _ = hook => {},
+        }
+    }
 
     let item = TranscriptItem {
         seq: call.item_seq,
@@ -386,22 +530,13 @@ async fn run_single_tool(
     agent
         .transcript
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .upsert(item.clone());
     session.events.emit(Event::ItemUpdated(item));
-
-    let res_msg = Message::tool_result(call.call_id, content, is_error);
-    let (seq, arc_msg) = agent
-        .history
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push(res_msg);
-    let _ = session
-        .store
-        .append_message(&session.id, &agent.id(), seq, &arc_msg)
-        .await;
-
-    ToolExecutionStatus::Ok
+    ToolOutcome {
+        result: Message::tool_result(call.call_id, content, is_error),
+        interrupted: cancel.is_cancelled(),
+    }
 }
 
 /// The preview the streamed cell already shows (raw args so far), kept across
@@ -426,6 +561,13 @@ pub async fn execute_tool_calls(
     cancel: &CancellationToken,
     tool_calls: Vec<PendingToolCall>,
 ) -> bool {
+    let registry_snapshot = agent
+        .tools
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot();
+    let budget = turn_budget(session, agent);
+    let limits = turn_budget_limits(session);
     let mut prepared_calls = Vec::new();
     for call in tool_calls {
         let title = tool_title(&call.name, &call.input);
@@ -488,12 +630,9 @@ pub async fn execute_tool_calls(
 
     let mut chunks: Vec<ToolChunk> = Vec::new();
     for call in prepared_calls {
-        let is_concurrent = agent
-            .tools
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
+        let is_concurrent = registry_snapshot
             .get(&call.name)
-            .map(|t| matches!(t.kind(), ToolKind::ReadOnly | ToolKind::Network))
+            .map(|tool| matches!(tool.kind(), ToolKind::ReadOnly | ToolKind::Network))
             .unwrap_or(false);
 
         if is_concurrent {
@@ -507,14 +646,24 @@ pub async fn execute_tool_calls(
     }
 
     let mut interrupted = false;
-    let mut remaining_calls_to_cancel = Vec::new();
-
     for chunk in chunks {
         if cancel.is_cancelled() {
             interrupted = true;
             match chunk {
-                ToolChunk::Concurrent(list) => remaining_calls_to_cancel.extend(list),
-                ToolChunk::Sequential(call) => remaining_calls_to_cancel.push(call),
+                ToolChunk::Concurrent(list) => {
+                    for call in list {
+                        commit_tool_outcome(
+                            session,
+                            agent,
+                            cancelled_outcome(session, agent, call),
+                        )
+                        .await;
+                    }
+                }
+                ToolChunk::Sequential(call) => {
+                    commit_tool_outcome(session, agent, cancelled_outcome(session, agent, call))
+                        .await;
+                }
             }
             continue;
         }
@@ -525,59 +674,32 @@ pub async fn execute_tool_calls(
                     let session = session.clone();
                     let agent = agent.clone();
                     let cancel = cancel.clone();
-                    async move { run_single_tool(session, agent, cancel, call).await }
-                });
-                let results = futures::future::join_all(futures).await;
-                for res in results {
-                    if res.is_cancelled() {
-                        interrupted = true;
+                    let registry = registry_snapshot.clone();
+                    let budget = Arc::clone(&budget);
+                    async move {
+                        run_single_tool(session, agent, cancel, registry, budget, limits, call)
+                            .await
                     }
+                });
+                for outcome in futures::future::join_all(futures).await {
+                    interrupted |= outcome.interrupted;
+                    commit_tool_outcome(session, agent, outcome).await;
                 }
             }
             ToolChunk::Sequential(call) => {
-                let res =
-                    run_single_tool(session.clone(), agent.clone(), cancel.clone(), call).await;
-                if res.is_cancelled() {
-                    interrupted = true;
-                }
-            }
-        }
-    }
-
-    if interrupted {
-        for call in remaining_calls_to_cancel {
-            let stub = Message::tool_result(call.call_id.clone(), "cancelled", true);
-            let (seq, arc_stub) = agent
-                .history
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(stub);
-            let _ = session
-                .store
-                .append_message(&session.id, &agent.id(), seq, &arc_stub)
+                let outcome = run_single_tool(
+                    session.clone(),
+                    agent.clone(),
+                    cancel.clone(),
+                    registry_snapshot.clone(),
+                    Arc::clone(&budget),
+                    limits,
+                    call,
+                )
                 .await;
-            let item = TranscriptItem {
-                seq: call.item_seq,
-                agent: agent.id(),
-                ts_ms: pacode_types::now_ms(),
-                kind: TranscriptKind::ToolCall {
-                    call_id: call.call_id,
-                    name: call.name,
-                    title: call.title,
-                    intent: call.intent,
-                    status: ToolStatus::Error,
-                    preview: "cancelled".to_string(),
-                    diff: None,
-                    duration_ms: None,
-                    task: None,
-                },
-            };
-            agent
-                .transcript
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .upsert(item.clone());
-            session.events.emit(Event::ItemUpdated(item));
+                interrupted |= outcome.interrupted;
+                commit_tool_outcome(session, agent, outcome).await;
+            }
         }
     }
 
@@ -633,19 +755,15 @@ pub(crate) async fn stub_dangling_tool_calls(session: &Arc<Session>, agent: &Arc
         agent.id()
     );
     for (call_id, name) in missing {
-        let stub = Message::tool_result(
-            call_id.clone(),
-            crate::agent::INTERRUPTED_TOOL_RESULT,
-            true,
-        );
+        let stub =
+            Message::tool_result(call_id.clone(), crate::agent::INTERRUPTED_TOOL_RESULT, true);
         let (seq, arc_stub) = agent
             .history
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(stub);
         let _ = session
-            .store
-            .append_message(&session.id, &agent.id(), seq, &arc_stub)
+            .append_agent_message(agent.as_ref(), seq, &arc_stub)
             .await;
         // The cell allocated at `ToolCallStart` must not stay `Running`.
         let prev = agent
@@ -688,3 +806,7 @@ pub(crate) async fn stub_dangling_tool_calls(session: &Arc<Session>, agent: &Arc
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tools_tests.rs"]
+mod tools_tests;

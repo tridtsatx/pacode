@@ -1,11 +1,13 @@
 //! `Agent`: history, status and transcript bookkeeping for the main agent and each
 //! subagent.
 
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
 use pacode_tools::ToolRegistry;
 use pacode_types::{
-    AgentId, AgentInfo, AgentStatus, CallId, ContentBlock, Message, Role, TranscriptItem,
+    AgentId, AgentInfo, AgentStatus, CallId, ContentBlock, Message, Role, TranscriptItem, TurnId,
+    TurnStop, Usage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -18,11 +20,106 @@ use crate::transcript::TranscriptState;
 /// adapters can mark it as a failed call.
 pub(crate) const INTERRUPTED_TOOL_RESULT: &str = "[interrupted]";
 
+pub(crate) struct MessageReservation {
+    seq: u64,
+    message: Arc<Message>,
+    persisted: std::sync::atomic::AtomicBool,
+    finalized: std::sync::atomic::AtomicBool,
+    admission: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TurnAdmission {
+    pub(crate) message_id: String,
+    pub(crate) turn: TurnId,
+    pub(crate) stop: Option<TurnStop>,
+    progressed: bool,
+    cancelled: bool,
+}
+
+pub(crate) struct AdmissionFinish {
+    pub(crate) message_id: String,
+    pub(crate) terminal: bool,
+}
+
+#[derive(Default)]
+struct TurnFenceState {
+    current: Option<TurnId>,
+    terminal: Option<TurnId>,
+    terminal_error: Option<String>,
+}
+
+const MAX_CANCELLED_ADMISSIONS: usize = 1024;
+
+#[derive(Default)]
+struct CancelledAdmissions {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl CancelledAdmissions {
+    fn insert(&mut self, message_id: &str) {
+        if !self.ids.insert(message_id.to_owned()) {
+            return;
+        }
+        self.order.push_back(message_id.to_owned());
+        if self.order.len() > MAX_CANCELLED_ADMISSIONS
+            && let Some(expired) = self.order.pop_front()
+        {
+            self.ids.remove(&expired);
+        }
+    }
+
+    fn contains(&self, message_id: &str) -> bool {
+        self.ids.contains(message_id)
+    }
+}
+
+impl MessageReservation {
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub(crate) fn message(&self) -> &Arc<Message> {
+        &self.message
+    }
+
+    pub(crate) fn persist(&self) {
+        self.persisted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_admission(&self, admission: String) {
+        *self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(admission);
+    }
+
+    pub(crate) fn admission(&self) -> Option<String> {
+        self.admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn is_persisted(&self) -> bool {
+        self.persisted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn discard(&self) {
+        self.finalized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The model-visible history of one agent: a compaction summary (if any) plus the
 /// messages after it. Messages are `Arc` so a forked subagent shares them.
 #[derive(Clone, Default)]
 pub struct History {
     pub messages: Vec<Arc<Message>>,
+    pub(crate) message_seqs: Vec<u64>,
+    pub(crate) free_seqs: BTreeSet<u64>,
     /// Seq of the next message (per session+agent, persisted with the message).
     pub next_seq: u64,
     pub summary: Option<String>,
@@ -35,12 +132,198 @@ pub struct History {
 impl History {
     /// Append and return the assigned seq.
     pub fn push(&mut self, msg: Message) -> (u64, Arc<Message>) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        self.estimated_tokens = self.estimated_tokens.saturating_add(msg.estimate_tokens());
-        let msg = Arc::new(msg);
-        self.messages.push(msg.clone());
-        (seq, msg)
+        let reservation = self.reserve(msg);
+        let seq = reservation.seq();
+        let message = reservation.message().clone();
+        self.commit_reserved(&reservation);
+        (seq, message)
+    }
+
+    pub(crate) fn reserve(&mut self, msg: Message) -> Arc<MessageReservation> {
+        let seq = self.free_seqs.pop_first().unwrap_or_else(|| {
+            let seq = self.next_seq;
+            self.next_seq = self.next_seq.saturating_add(1);
+            seq
+        });
+        Arc::new(MessageReservation {
+            seq,
+            message: Arc::new(msg),
+            persisted: std::sync::atomic::AtomicBool::new(false),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            admission: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn commit_reserved(&mut self, reservation: &MessageReservation) {
+        if reservation
+            .finalized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let seq = reservation.seq;
+        if self.message_seqs.last().is_none_or(|last| *last < seq) {
+            self.estimated_tokens = self
+                .estimated_tokens
+                .saturating_add(reservation.message.estimate_tokens());
+            self.message_seqs.push(seq);
+            self.messages.push(reservation.message.clone());
+            return;
+        }
+        let index = match self.message_seqs.binary_search(&seq) {
+            Ok(index) => {
+                let previous_tokens = self.messages[index].estimate_tokens();
+                self.messages[index] = reservation.message.clone();
+                self.estimated_tokens = self
+                    .estimated_tokens
+                    .saturating_sub(previous_tokens)
+                    .saturating_add(reservation.message.estimate_tokens());
+                return;
+            }
+            Err(index) => index,
+        };
+        self.estimated_tokens = self
+            .estimated_tokens
+            .saturating_add(reservation.message.estimate_tokens());
+        self.message_seqs.insert(index, seq);
+        self.messages.insert(index, reservation.message.clone());
+    }
+
+    pub(crate) fn rollback_reserved(&mut self, reservation: &MessageReservation) {
+        if reservation
+            .finalized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        if reservation.is_persisted() {
+            return;
+        }
+        let seq = reservation.seq;
+        if self.message_seqs.binary_search(&seq).is_ok() {
+            return;
+        }
+        self.free_seqs.insert(seq);
+        while self.free_seqs.contains(&self.next_seq.saturating_sub(1)) && self.next_seq > 0 {
+            self.free_seqs.remove(&self.next_seq.saturating_sub(1));
+            self.next_seq -= 1;
+        }
+    }
+
+    pub(crate) fn restore_row(&mut self, seq: u64, message: Arc<Message>) {
+        self.free_seqs.remove(&seq);
+        self.next_seq = self.next_seq.max(seq.saturating_add(1));
+        if self.message_seqs.last().is_none_or(|last| *last < seq) {
+            self.message_seqs.push(seq);
+            self.messages.push(message.clone());
+            self.estimated_tokens = self
+                .estimated_tokens
+                .saturating_add(message.estimate_tokens());
+            return;
+        }
+        let index = match self.message_seqs.binary_search(&seq) {
+            Ok(_) => return,
+            Err(index) => index,
+        };
+        self.message_seqs.insert(index, seq);
+        self.messages.insert(index, message.clone());
+        self.estimated_tokens = self
+            .estimated_tokens
+            .saturating_add(message.estimate_tokens());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_rows(&mut self, mut rows: Vec<(u64, Arc<Message>)>) {
+        if rows.is_empty() {
+            return;
+        }
+        rows.sort_unstable_by_key(|(seq, _)| *seq);
+        rows.dedup_by(|left, right| left.0 == right.0);
+        for (seq, _) in &rows {
+            self.free_seqs.remove(seq);
+            self.next_seq = self.next_seq.max(seq.saturating_add(1));
+        }
+
+        if self
+            .message_seqs
+            .last()
+            .is_none_or(|last| rows[0].0 > *last)
+        {
+            self.message_seqs.reserve(rows.len());
+            self.messages.reserve(rows.len());
+            for (seq, message) in rows {
+                self.message_seqs.push(seq);
+                self.messages.push(message);
+            }
+            self.recompute_token_estimate();
+            return;
+        }
+
+        let old_seqs = std::mem::take(&mut self.message_seqs);
+        let old_messages = std::mem::take(&mut self.messages);
+        let total = old_seqs.len().saturating_add(rows.len());
+        let mut merged_seqs = Vec::with_capacity(total);
+        let mut merged_messages = Vec::with_capacity(total);
+        let old = old_seqs.into_iter().zip(old_messages);
+        let mut restored = rows.into_iter().peekable();
+        for (old_seq, old_message) in old {
+            if let Some(&(restored_seq, _)) = restored.peek() {
+                if old_seq < restored_seq {
+                    merged_seqs.push(old_seq);
+                    merged_messages.push(old_message);
+                    continue;
+                }
+                if old_seq > restored_seq {
+                    if let Some((seq, message)) = restored.next() {
+                        merged_seqs.push(seq);
+                        merged_messages.push(message);
+                    }
+                    continue;
+                }
+                drop(restored.next());
+            }
+            merged_seqs.push(old_seq);
+            merged_messages.push(old_message);
+        }
+        for (seq, message) in restored {
+            merged_seqs.push(seq);
+            merged_messages.push(message);
+        }
+        self.message_seqs = merged_seqs;
+        self.messages = merged_messages;
+        self.recompute_token_estimate();
+    }
+
+    #[cfg(test)]
+    fn recompute_token_estimate(&mut self) {
+        self.estimated_tokens = self
+            .summary
+            .as_deref()
+            .map(pacode_types::estimate_tokens)
+            .unwrap_or(0)
+            .saturating_add(
+                self.messages
+                    .iter()
+                    .map(|message| message.estimate_tokens())
+                    .sum::<u32>(),
+            );
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.messages = Vec::new();
+        self.message_seqs = Vec::new();
+        self.free_seqs = BTreeSet::new();
+        self.summary = None;
+        self.summary_upto = 0;
+        self.estimated_tokens = 0;
+    }
+
+    pub fn rows(&self) -> Vec<(u64, Arc<Message>)> {
+        self.message_seqs
+            .iter()
+            .copied()
+            .zip(self.messages.iter().cloned())
+            .collect()
     }
 
     /// Messages sent to the model: summary (as a user message) then the rest.
@@ -115,11 +398,7 @@ fn sanitize_tool_pairing_into(messages: &[Arc<Message>], out: &mut Vec<Arc<Messa
             ));
             i += 1;
         }
-        for id in uses
-            .iter()
-            .copied()
-            .filter(|id| !answered.contains(*id))
-        {
+        for id in uses.iter().copied().filter(|id| !answered.contains(*id)) {
             out.push(Arc::new(Message::tool_result(
                 id.clone(),
                 INTERRUPTED_TOOL_RESULT,
@@ -219,6 +498,13 @@ pub struct Agent {
     id: RwLock<Arc<AgentId>>,
     pub info: RwLock<AgentInfo>,
     pub history: Mutex<History>,
+    pending_user_messages: Mutex<VecDeque<Arc<MessageReservation>>>,
+    discarded_message_seqs: Mutex<HashSet<u64>>,
+    admission_turn: Mutex<Option<TurnAdmission>>,
+    cancelled_admissions: Mutex<CancelledAdmissions>,
+    turn_fence: Mutex<TurnFenceState>,
+    turn_usage: Mutex<Usage>,
+    stream_usage: Mutex<Usage>,
     pub injections: InjectionQueue,
     /// Tools this agent may call (main: all; subagent: subset without `agent`).
     pub tools: RwLock<ToolRegistry>,
@@ -232,13 +518,33 @@ pub struct Agent {
     /// finished-report path. Survives status flaps mid-unwind. Cleared by
     /// `Session::continue_agent`.
     pub stop_requested: std::sync::atomic::AtomicBool,
+    turn_generation: std::sync::atomic::AtomicU64,
     /// One turn at a time — and what `is_running` reads. `Arc` so
     /// `start_turn` can claim it with an owned guard and move it into the
     /// supervisor task, which holds it across the spawned turn's whole
     /// lifetime: run, token cleanup, `TurnEnded` emission, and the post-block
     /// (re-drive check + terminal landing).
     pub turn_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) message_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub transcript: Mutex<TranscriptState>,
+    /// Where the in-memory tail ends and the store begins, in **message** seqs.
+    ///
+    /// `Some(seq)` means the tail's oldest message is `seq` and everything older
+    /// lives in the store, so a history page continues with `seq < this`.
+    /// `None` means the tail already covers the whole conversation and there is
+    /// nothing older to page. This is deliberately not derived from a
+    /// `TranscriptItem::seq`: those are numbered by `TranscriptState` and have
+    /// no arithmetic relation to message seqs (one message can become several
+    /// items, and message seqs have gaps), so deriving one from the other walks
+    /// the cursor into the wrong window.
+    history_floor: Mutex<Option<u64>>,
+    /// Next item seq to hand out for history read back from the store.
+    ///
+    /// Store pages are older than everything in the tail, so their items are
+    /// numbered *downwards* from the tail's lowest seq. Numbering them upwards
+    /// from a message seq (the old behaviour) let a page's items collide with
+    /// the tail's, and the client keys cells and de-duplicates on that seq.
+    older_item_seq: std::sync::atomic::AtomicU64,
     /// The prompt a subagent was spawned with (persisted).
     pub prompt: RwLock<Option<String>>,
     /// History snapshot as it stood before the current turn began (for turn detach).
@@ -260,12 +566,23 @@ impl Agent {
             id: RwLock::new(Arc::new(id)),
             info: RwLock::new(info),
             history: Mutex::new(history),
+            pending_user_messages: Mutex::new(VecDeque::new()),
+            discarded_message_seqs: Mutex::new(HashSet::new()),
+            admission_turn: Mutex::new(None),
+            cancelled_admissions: Mutex::new(CancelledAdmissions::default()),
+            turn_fence: Mutex::new(TurnFenceState::default()),
+            turn_usage: Mutex::new(Usage::default()),
+            stream_usage: Mutex::new(Usage::default()),
             injections: InjectionQueue::default(),
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
+            turn_generation: std::sync::atomic::AtomicU64::new(0),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            message_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             transcript: Mutex::new(TranscriptState::new(history_page as usize * 2)),
+            history_floor: Mutex::new(None),
+            older_item_seq: std::sync::atomic::AtomicU64::new(crate::transcript::HISTORY_ITEM_BASE),
             prompt: RwLock::new(prompt),
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
@@ -284,16 +601,371 @@ impl Agent {
             id: RwLock::new(Arc::new(id)),
             info: RwLock::new(info),
             history: Mutex::new(history),
+            pending_user_messages: Mutex::new(VecDeque::new()),
+            discarded_message_seqs: Mutex::new(HashSet::new()),
+            admission_turn: Mutex::new(None),
+            cancelled_admissions: Mutex::new(CancelledAdmissions::default()),
+            turn_fence: Mutex::new(TurnFenceState::default()),
+            turn_usage: Mutex::new(Usage::default()),
+            stream_usage: Mutex::new(Usage::default()),
             injections: InjectionQueue::default(),
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
+            turn_generation: std::sync::atomic::AtomicU64::new(0),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            message_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             transcript: Mutex::new(transcript),
+            history_floor: Mutex::new(None),
+            older_item_seq: std::sync::atomic::AtomicU64::new(crate::transcript::HISTORY_ITEM_BASE),
             prompt: RwLock::new(prompt),
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn reserve_user_message(&self, msg: Message) -> Arc<MessageReservation> {
+        let mut pending = self
+            .pending_user_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reservation = history.reserve(msg);
+        pending.push_back(reservation.clone());
+        reservation
+    }
+
+    pub(crate) fn reserve_user_message_with_admission(
+        &self,
+        msg: Message,
+        admission: String,
+    ) -> Arc<MessageReservation> {
+        let reservation = self.reserve_user_message(msg);
+        reservation.set_admission(admission);
+        reservation
+    }
+
+    pub(crate) fn rollback_user_message(&self, reservation: &Arc<MessageReservation>) {
+        let mut pending = self
+            .pending_user_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = pending
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, reservation))
+        {
+            pending.remove(index);
+        }
+        self.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .rollback_reserved(reservation);
+    }
+
+    pub(crate) fn commit_pending_user_messages(&self) -> bool {
+        let mut pending = self
+            .pending_user_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ready = pending
+            .iter()
+            .take_while(|reservation| reservation.is_persisted())
+            .cloned()
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return false;
+        }
+        pending.drain(..ready.len());
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for reservation in &ready {
+            history.commit_reserved(reservation);
+        }
+        true
+    }
+
+    pub(crate) fn discard_pending_user_messages(&self) -> Vec<String> {
+        let mut pending_user_messages = self
+            .pending_user_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut discarded_message_seqs = self
+            .discarded_message_seqs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pending = pending_user_messages.drain(..).collect::<Vec<_>>();
+        for reservation in &pending {
+            reservation.discard();
+            discarded_message_seqs.extend([reservation.seq()]);
+        }
+        pending
+            .iter()
+            .filter_map(|reservation| reservation.admission())
+            .collect()
+    }
+
+    pub(crate) fn discarded_message_seqs(&self) -> HashSet<u64> {
+        self.discarded_message_seqs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn discard_injections(&self) -> usize {
+        self.injections.drain().len()
+    }
+
+    pub(crate) fn begin_admission_turn(&self, message_id: String, turn: TurnId) -> bool {
+        let mut admission = self
+            .admission_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cancelled = self
+            .cancelled_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cancelled.contains(&message_id) {
+            return false;
+        }
+        *admission = Some(TurnAdmission {
+            message_id,
+            turn,
+            stop: None,
+            progressed: false,
+            cancelled: false,
+        });
+        true
+    }
+
+    pub(crate) fn reset_turn_usage(&self) {
+        *self
+            .turn_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Usage::default();
+        *self
+            .stream_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Usage::default();
+    }
+
+    pub(crate) fn set_stream_usage(&self, usage: Usage) {
+        *self
+            .stream_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = usage;
+    }
+
+    pub(crate) fn take_stream_usage(&self) -> Usage {
+        std::mem::take(
+            &mut *self
+                .stream_usage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    pub(crate) fn record_turn_usage(&self, usage: Usage) {
+        let mut total = self
+            .turn_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *total += usage;
+    }
+
+    pub(crate) fn take_turn_usage(&self) -> Usage {
+        let mut total = std::mem::take(
+            &mut *self
+                .turn_usage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        total += self.take_stream_usage();
+        total
+    }
+
+    pub(crate) fn mark_admission_progressed(&self, message_id: &str, turn: &TurnId) {
+        let mut admission = self
+            .admission_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cancelled = self
+            .cancelled_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(admission) = admission
+            .as_mut()
+            .filter(|admission| admission.message_id == message_id && &admission.turn == turn)
+            && !cancelled.contains(message_id)
+        {
+            admission.progressed = true;
+        }
+    }
+
+    pub(crate) fn cancel_admission_turn(&self) -> Option<String> {
+        let mut admission = self
+            .admission_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cancelled = self
+            .cancelled_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission = admission.as_mut()?;
+        admission.cancelled = true;
+        cancelled.insert(&admission.message_id);
+        Some(admission.message_id.clone())
+    }
+
+    pub(crate) fn cancel_admission(&self, message_id: &str) {
+        let mut admission = self
+            .admission_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cancelled = self
+            .cancelled_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(current) = admission
+            .as_mut()
+            .filter(|current| current.message_id == message_id)
+        {
+            current.cancelled = true;
+        }
+        cancelled.insert(message_id);
+    }
+
+    pub(crate) fn admission_is_cancelled(&self, message_id: &str) -> bool {
+        self.cancelled_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(message_id)
+    }
+
+    pub(crate) fn finish_admission_turn(
+        &self,
+        turn: &TurnId,
+        stop: &TurnStop,
+    ) -> Option<AdmissionFinish> {
+        let mut admission = self
+            .admission_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cancelled = self
+            .cancelled_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let finish = {
+            let current = admission
+                .as_mut()
+                .filter(|admission| &admission.turn == turn)?;
+            current.stop = Some(stop.clone());
+            AdmissionFinish {
+                message_id: current.message_id.clone(),
+                terminal: current.progressed
+                    || current.cancelled
+                    || cancelled.contains(&current.message_id),
+            }
+        };
+        if finish.terminal {
+            admission.take();
+        }
+        Some(finish)
+    }
+
+    pub(crate) fn clear_admission_turn(&self, turn: &TurnId) {
+        let mut admission = self
+            .admission_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission
+            .as_ref()
+            .is_some_and(|admission| &admission.turn == turn)
+        {
+            admission.take();
+        }
+    }
+
+    pub(crate) fn admission_turn(&self, message_id: &str) -> Option<TurnAdmission> {
+        self.admission_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|admission| admission.message_id == message_id)
+            .cloned()
+    }
+
+    pub(crate) fn set_current_turn(&self, turn: &TurnId) {
+        let mut fence = self
+            .turn_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fence.current = Some(turn.clone());
+        fence.terminal_error = None;
+    }
+
+    pub(crate) fn set_terminal_turn(&self, turn: &TurnId, stop: &TurnStop) {
+        let mut fence = self
+            .turn_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fence.current = None;
+        fence.terminal = Some(turn.clone());
+        fence.terminal_error = match stop {
+            TurnStop::Failed { message } => Some(message.clone()),
+            TurnStop::Completed | TurnStop::Interrupted => None,
+        };
+    }
+
+    pub(crate) fn seed_terminal_turn(&self, turn: &TurnId, stop: &TurnStop) {
+        self.set_terminal_turn(turn, stop);
+    }
+
+    pub(crate) fn current_turn(&self) -> Option<TurnId> {
+        self.turn_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current
+            .clone()
+    }
+
+    pub(crate) fn terminal_turn(&self) -> Option<TurnId> {
+        self.turn_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminal
+            .clone()
+    }
+
+    pub(crate) fn terminal_error(&self) -> Option<String> {
+        self.turn_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminal_error
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_user_messages(&self) -> bool {
+        !self
+            .pending_user_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
+    pub(crate) fn persisted_pending_user_messages(&self) -> Vec<(u64, Arc<Message>)> {
+        self.pending_user_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|reservation| reservation.is_persisted())
+            .map(|reservation| (reservation.seq(), reservation.message().clone()))
+            .collect()
     }
 
     pub fn id(&self) -> AgentId {
@@ -357,8 +1029,20 @@ impl Agent {
     }
 
     pub fn request_stop(&self) {
+        self.turn_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.stop_requested
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn turn_generation(&self) -> u64 {
+        self.turn_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn invalidate_turn_generation(&self) {
+        self.turn_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     pub fn stop_requested(&self) -> bool {
@@ -399,13 +1083,157 @@ impl Agent {
         }
     }
 
+    pub(crate) fn clear_error(&self) {
+        self.info.write().unwrap_or_else(|p| p.into_inner()).error = None;
+    }
+
+    /// Record where the in-memory tail ends and the store begins, in message
+    /// seqs. `None` means the tail already covers the whole conversation.
+    ///
+    /// Called right after the tail is built at resume or detach.
+    pub(crate) fn seed_history_floor(&self, floor: Option<u64>) {
+        *self
+            .history_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = floor;
+    }
+
+    /// The store boundary: `seq < floor` are the messages older than the tail.
+    pub fn history_floor(&self) -> Option<u64> {
+        *self
+            .history_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Next item seq for a store page, counting down from the tail's lowest so
+    /// store items are always strictly older than tail items. `fetch_update`
+    /// hands back the *previous* value, so the seq returned here is that value
+    /// less one — returning it as-is would hand the first page the very seq the
+    /// tail starts at. Saturates at 0 rather than wrapping: a wrapped seq would
+    /// collide with a live item.
+    fn next_older_item_seq(&self) -> u64 {
+        self.older_item_seq
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| Some(current.saturating_sub(1)),
+            )
+            .map(|previous| previous.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
+    /// Read up to `max_items` transcript items older than the in-memory tail out
+    /// of the store, and report whether anything older is left.
+    ///
+    /// Paging is driven by `history_floor` — a message-seq cursor the agent
+    /// owns — and never by the caller's item cursor, so the two domains cannot
+    /// be confused no matter what the client echoes back.
+    ///
+    /// Messages are the unit the store pages in, but `max_items` is a budget in
+    /// items, and one message can project into several items. A page is
+    /// therefore never split mid-message: cutting between a `tool_use` and its
+    /// `tool_result` would strand a tool call that never resolves, and cutting
+    /// anywhere else would either overrun the budget or drop items the next
+    /// page could not reproduce. So the last message that does not fit is held
+    /// back whole and `history_floor` stops in front of it.
+    pub async fn load_older_history(
+        &self,
+        store: &pacode_store::Store,
+        session_id: &pacode_types::SessionId,
+        max_items: usize,
+    ) -> (Vec<TranscriptItem>, bool) {
+        use std::sync::Arc;
+
+        let Some(mut cursor) = self.history_floor() else {
+            // The tail already covers everything; there is no older window.
+            return (Vec::new(), false);
+        };
+        if max_items == 0 {
+            return (Vec::new(), cursor > 0);
+        }
+
+        let agent_id = self.id();
+        let mut items: Vec<TranscriptItem> = Vec::new();
+        let mut more = true;
+
+        while more && items.len() < max_items {
+            let want = max_items - items.len();
+            // How many messages to ask for. Starts optimistic (one item per
+            // message) and shrinks when a message turns out to be wider.
+            let mut read_limit = want.min(u32::MAX as usize) as u32;
+
+            loop {
+                let rows = match store
+                    .load_messages_before(session_id, &agent_id, Some(cursor), read_limit)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        log::warn!("history page read failed for {agent_id}: {error}");
+                        return (items, false);
+                    }
+                };
+                if rows.is_empty() {
+                    more = false;
+                    break;
+                }
+
+                let first_seq = rows[0].seq;
+                let tuples: Vec<(u64, Arc<pacode_types::Message>)> = rows
+                    .iter()
+                    .map(|row| (row.seq, Arc::new(row.message.clone())))
+                    .collect();
+                let projected = crate::transcript::history_to_items(&agent_id, &tuples);
+
+                if projected.len() > want {
+                    // Overran the item budget. Re-read proportionally fewer
+                    // messages, using the ratio this window just revealed. Each
+                    // retry strictly shrinks the read, so this terminates.
+                    let shrunk =
+                        ((rows.len() as u64 * want as u64) / projected.len() as u64).max(1);
+                    let shrunk = u32::try_from(shrunk).unwrap_or(1);
+                    if shrunk < read_limit {
+                        read_limit = shrunk;
+                        continue;
+                    }
+                    // Cannot shrink: one message is wider than the whole
+                    // budget. Take it whole — a bounded overrun beats dropping
+                    // the message or looping forever.
+                } else if projected.is_empty() {
+                    // A window of hidden messages projects to nothing. Consume
+                    // it so the cursor still moves, then read further back.
+                    cursor = first_seq;
+                    break;
+                }
+
+                for entry in projected {
+                    let mut item = entry.item;
+                    item.seq = self.next_older_item_seq();
+                    items.push(item);
+                }
+                cursor = first_seq;
+                break;
+            }
+        }
+
+        // The boundary is the oldest message actually consumed; anything below
+        // it is still unread.
+        *self
+            .history_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cursor);
+        (items, more && cursor > 0)
+    }
+
     /// Last `limit` transcript items before `before_seq` from the in-memory tail;
-    /// older items come from the store (see `transcript::history_to_items`).
+    /// older items come from the store (see `load_older_history`).
     pub fn transcript_tail(
         &self,
         before_seq: Option<u64>,
         limit: usize,
     ) -> (Vec<TranscriptItem>, bool) {
+        let has_older_in_store = self.history_floor().is_some();
         let transcript = match self.transcript.lock() {
             Ok(t) => t,
             Err(e) => e.into_inner(),
@@ -424,11 +1252,10 @@ impl Agent {
         let skip = total.saturating_sub(limit);
         let items: Vec<TranscriptItem> = filtered.into_iter().skip(skip).collect();
 
-        let has_more = if let Some(first) = items.first() {
-            first.seq > 0 || skip > 0
-        } else {
-            before_seq.is_some_and(|b| b > 0)
-        };
+        // Either the tail itself has older items, or the store does. The old
+        // `first.seq > 0` guess conflated the two and reported `has_more` for
+        // a session whose oldest item happened to sit at seq 0.
+        let has_more = skip > 0 || has_older_in_store;
 
         (items, has_more)
     }

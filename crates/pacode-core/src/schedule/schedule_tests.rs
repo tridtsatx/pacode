@@ -342,3 +342,92 @@ async fn a_process_condition_holds_once_nothing_matches_the_pattern() {
     };
     assert!(check_condition(&gone, &cwd).await.expect("check"));
 }
+
+#[test]
+fn terminal_monitor_retention_is_bounded() {
+    let s = scheduler();
+    for index in 0..(MAX_MONITORS * 3) {
+        let monitor = s
+            .add_monitor(
+                format!("m{index}"),
+                MonitorCondition::FileExists {
+                    path: "x".to_string(),
+                },
+                Some(5),
+                NOW,
+            )
+            .expect("add");
+        s.stop_monitor(&monitor.id).expect("stop");
+    }
+
+    let monitors = s.monitors();
+    assert_eq!(monitors.len(), TERMINAL_MONITOR_RETENTION);
+    assert!(monitors.iter().all(|monitor| monitor.status.is_terminal()));
+}
+
+#[test]
+fn stopping_a_monitor_cancels_and_fences_its_due_check() {
+    let s = scheduler();
+    let monitor = s
+        .add_monitor(
+            "build".to_string(),
+            MonitorCondition::FileExists {
+                path: "x".to_string(),
+            },
+            Some(5),
+            NOW,
+        )
+        .expect("add");
+    let check = s
+        .due_monitor_checks(NOW)
+        .into_iter()
+        .find(|check| check.info.id == monitor.id)
+        .expect("due check");
+
+    s.stop_monitor(&monitor.id).expect("stop");
+
+    assert!(check.cancel.is_cancelled());
+    assert!(s.record_check(&monitor.id, NOW, true).is_none());
+    assert!(s.record_failure(&monitor.id, NOW).is_none());
+    assert_eq!(s.monitors()[0].status, MonitorStatus::Stopped);
+}
+
+#[tokio::test]
+async fn a_file_check_stops_waiting_at_its_budget() {
+    let pending = std::future::pending::<Result<(), monitor::CheckError>>();
+    let result =
+        monitor::with_file_check_timeout(std::time::Duration::from_millis(1), pending).await;
+    assert!(matches!(result, Err(monitor::CheckError::Timeout(_))));
+}
+
+#[tokio::test]
+async fn an_idle_scheduler_task_does_not_pin_its_scheduler() {
+    let s = scheduler();
+    let weak = Arc::downgrade(&s);
+    let task = tokio::spawn(run(weak.clone(), Weak::<Session>::new()));
+    tokio::task::yield_now().await;
+
+    drop(s);
+
+    assert!(weak.upgrade().is_none());
+    task.abort();
+    let _ = task.await;
+}
+
+#[test]
+fn cron_fire_admission_id_is_stable_per_occurrence() {
+    let s = scheduler();
+    s.add_job(
+        "nightly".to_string(),
+        CronSchedule::every(60),
+        "x".to_string(),
+        NOW,
+    )
+    .expect("add");
+    let mut job = s.jobs().remove(0);
+    job.last_run_ms = Some(NOW);
+
+    let first = cron_fire_id(&job, NOW);
+    assert_eq!(first, cron_fire_id(&job, NOW));
+    assert_ne!(first, cron_fire_id(&job, NOW + 1));
+}

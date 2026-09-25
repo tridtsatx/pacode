@@ -45,6 +45,20 @@ pub fn project_memory_path(cwd: &Path) -> PathBuf {
     cwd.join(".pacode").join("memory.md")
 }
 
+/// Memory stores are bullet lists; a file past this is not one, and reading it
+/// whole would put an unbounded blob into the context.
+const MEMORY_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+async fn read_store(path: &Path) -> Result<String, ToolError> {
+    match crate::registry::read_source_file(path, MEMORY_FILE_MAX_BYTES).await {
+        Ok(text) => Ok(text),
+        Err(err) if err.is_not_found() => Ok(String::new()),
+        Err(err) => Err(ToolError::failed(
+            err.message("read", &path.display().to_string()),
+        )),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryScope {
     Global,
@@ -140,11 +154,12 @@ impl Tool for MemoryWriteTool {
             MemoryScope::Project => project_memory_path(&ctx.cwd),
         };
 
-        let existing = match tokio::fs::read_to_string(&target_file).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(ToolError::Io(e)),
-        };
+        // The duplicate check and the append are one read-modify-write: under
+        // the lock two concurrent notes cannot both read the same prefix and
+        // drop one of the two bullets.
+        let _write_lock =
+            crate::registry::acquire_path_write_lock(&target_file, &ctx.cancel).await?;
+        let existing = read_store(&target_file).await?;
 
         // Check exact duplicate lines
         let already_stored = existing.lines().any(|l| l.trim() == bullet_line);
@@ -180,7 +195,7 @@ impl Tool for MemoryWriteTool {
             format!("{existing}\n{bullet_line}\n")
         };
 
-        tokio::fs::write(&target_file, new_content.as_bytes()).await?;
+        crate::registry::write_atomic(&target_file, new_content.as_bytes()).await?;
         // Project memory lives inside the walked tree; global is outside every
         // root and the call is a no-op there.
         crate::walk::invalidate_path(&target_file);
@@ -233,26 +248,16 @@ impl Tool for MemoryReadTool {
         let (args, accept_large_output) = parse_input::<MemoryReadInput>(input)?;
 
         let raw = match args.scope.as_deref() {
-            Some("global") => {
-                let path = global_memory_path();
-                tokio::fs::read_to_string(path).await.unwrap_or_default()
-            }
-            Some("project") => {
-                let path = project_memory_path(&ctx.cwd);
-                tokio::fs::read_to_string(path).await.unwrap_or_default()
-            }
+            Some("global") => read_store(&global_memory_path()).await?,
+            Some("project") => read_store(&project_memory_path(&ctx.cwd)).await?,
             Some(other) => {
                 return Err(ToolError::invalid(format!(
                     "invalid scope '{other}', expected 'global' or 'project'"
                 )));
             }
             None => {
-                let global = tokio::fs::read_to_string(global_memory_path())
-                    .await
-                    .unwrap_or_default();
-                let project = tokio::fs::read_to_string(project_memory_path(&ctx.cwd))
-                    .await
-                    .unwrap_or_default();
+                let global = read_store(&global_memory_path()).await?;
+                let project = read_store(&project_memory_path(&ctx.cwd)).await?;
 
                 let mut parts = Vec::new();
                 if !global.trim().is_empty() {

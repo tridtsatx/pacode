@@ -113,7 +113,8 @@ fn test_live_pasted_images_and_strip_rows() {
 
     // Submitted record is not live even while its token lingers.
     state.input.text = format!("again [Image {token}]");
-    state.pasted_images.mark_submitted(&state.input.text);
+    let text = state.input.text.clone();
+    state.pasted_images.mark_submitted(&text);
     assert!(state.live_pasted_images().is_empty());
     assert_eq!(state.image_strip_rows(), 0);
 }
@@ -142,4 +143,28 @@ fn test_strip_cache_retains_only_live_tokens() {
     strip.retain(&[2]);
     assert!(strip.thumbs.contains_key(&2));
     assert_eq!(strip.thumbs.len(), 1);
+}
+
+#[test]
+fn strip_render_wants_are_deduplicated_and_bounded() {
+    let mut strip = ImageStripState::default();
+    for height in 1..=100 {
+        strip
+            .want
+            .push((1, format!("/tmp/{height}.png").into(), 20, height as u16));
+    }
+    strip.retain(&[1]);
+    assert!(strip.want.len() <= IMAGE_RENDER_MAX_WANTS);
+    assert_eq!(strip.want.last().map(|want| want.3), Some(100));
+}
+
+#[test]
+fn strip_render_capacity_is_bounded() {
+    let mut strip = ImageStripState::default();
+    for index in 0..IMAGE_RENDER_MAX_IN_FLIGHT {
+        strip.in_flight.insert((index, 20, 6));
+    }
+    assert!(!strip.can_start_render());
+    strip.in_flight.clear();
+    assert!(strip.can_start_render());
 }

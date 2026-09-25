@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use pacode_client::ClientEvent;
+use pacode_client::{ClientEvent, ClientEventContext};
 use pacode_tui::layout::ScreenLayout;
-use pacode_tui::state::{AppState, Focus, PanelTarget};
+use pacode_tui::state::{AppState, CellKind, Focus, PanelTarget, PromptBatch};
 use pacode_tui::ui;
 use pacode_types::ids::{AgentId, SessionId, TaskId};
 use pacode_types::model::{Effort, ModelRoute};
@@ -12,11 +12,11 @@ use pacode_types::state::{
 };
 use pacode_types::transcript::{DiffStat, ToolStatus};
 use pacode_types::{
-    AgentInfo, Config, Plan, PlanItem, SessionMeta, SessionSnapshot, TaskInfo, TranscriptItem,
-    TranscriptKind, UsageTotals,
+    AgentInfo, Attach, Config, Plan, PlanItem, Request, SessionMeta, SessionSnapshot, TaskInfo,
+    TranscriptItem, TranscriptKind, UsageTotals,
 };
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::{Frame, Terminal};
 
 fn make_task(
     id: &str,
@@ -261,6 +261,9 @@ fn make_base_snapshot() -> SessionSnapshot {
         transcript,
         has_more_history: false,
         turn_active: true,
+        active_turn: None,
+        terminal_turn: None,
+        terminal_error: None,
         plan,
         agents,
         tasks,
@@ -277,7 +280,13 @@ fn create_state(cols: u16, rows: u16, snapshot: SessionSnapshot) -> AppState {
     // The mascot is random per run; pin it so snapshots stay deterministic.
     state.mascot = pacode_tui::ui::mascot::MascotKind::Pacman;
     let now = Instant::now();
-    state.apply_client_event(ClientEvent::Snapshot(snapshot), now);
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: ClientEventContext::unscoped(),
+            snapshot,
+        },
+        now,
+    );
     state.turn_started_at = None;
     // The phrase of the day rotates daily; pin it so snapshots stay deterministic.
     if let Some(header) = state.transcript.header.as_mut() {
@@ -299,6 +308,11 @@ fn settle_focus(state: &mut AppState) {
     state.last_focus_key = pacode_tui::ui::focus_key(&state.focus);
 }
 
+fn prepare_and_draw_frame(frame: &mut Frame<'_>, state: &mut AppState) -> ScreenLayout {
+    let prepared = ui::prepare_frame(frame.area(), state, Instant::now());
+    ui::draw(frame, state, &prepared)
+}
+
 #[test]
 fn test_mockup_state_01_120x34() {
     let snapshot = make_base_snapshot();
@@ -309,7 +323,7 @@ fn test_mockup_state_01_120x34() {
     let mut layout = ScreenLayout::default();
     terminal
         .draw(|f| {
-            layout = ui::draw(f, &mut state);
+            layout = prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -340,7 +354,7 @@ fn test_mockup_state_01_100x30() {
     let mut layout = ScreenLayout::default();
     terminal
         .draw(|f| {
-            layout = ui::draw(f, &mut state);
+            layout = prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -370,7 +384,7 @@ fn test_mockup_state_01_80x24() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -387,7 +401,7 @@ fn test_mockup_state_01_60x20() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -406,7 +420,7 @@ fn test_mockup_state_02_select_agent() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -471,7 +485,7 @@ fn test_mockup_state_03_panel() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -485,7 +499,7 @@ fn test_mockup_state_03_panel() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
     let view = format!("{}", terminal.backend());
@@ -560,7 +574,7 @@ fn test_mockup_state_05_bglist() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -589,7 +603,7 @@ fn test_mockup_state_06_idle() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -609,7 +623,7 @@ fn test_no_subagents_hides_agents_zone() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -646,7 +660,7 @@ fn test_turn_ended_response_stats_rendered() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            ui::draw(f, &mut state);
+            prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
 
@@ -708,7 +722,230 @@ fn test_snapshot_seeds_the_question_queue() {
     // A later snapshot with the queue empty closes the picker again.
     let mut snapshot = make_base_snapshot();
     snapshot.pending_questions = Vec::new();
-    state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+    state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: ClientEventContext::unscoped(),
+            snapshot,
+        },
+        Instant::now(),
+    );
     assert!(state.questions.is_empty());
     assert_eq!(state.focus, Focus::Normal);
+}
+
+#[test]
+fn w128_tui_prompt_and_recovery_queues_are_bounded() {
+    let mut state = AppState::new(Config::default(), "test".into(), 100, 30);
+    for index in 0..128 {
+        assert_eq!(
+            state.input.queue_push(format!("prompt-{index}")),
+            index < pacode_tui::state::input::PROMPT_QUEUE_CAP
+        );
+    }
+    assert_eq!(
+        state.input.prompt_queue.len(),
+        pacode_tui::state::input::PROMPT_QUEUE_CAP
+    );
+    assert_eq!(
+        state.input.prompt_queue.front().map(String::as_str),
+        Some("prompt-0")
+    );
+    assert_eq!(
+        state.input.prompt_queue.back().map(String::as_str),
+        Some("prompt-15")
+    );
+
+    for index in 0..17 {
+        let request = Request::UserMessage {
+            text: format!("sequence-{index}"),
+            images: Vec::new(),
+            message_id: None,
+        };
+        assert_eq!(
+            state.session.queue_sequence(PromptBatch::single(request)),
+            index < 16
+        );
+    }
+    assert_eq!(state.session.pending_sequences.len(), 16);
+
+    let context = state.session_context();
+    for index in 0..17 {
+        state.session.begin_user_message(
+            context.clone(),
+            Request::UserMessage {
+                text: format!("retry-{index}"),
+                images: Vec::new(),
+                message_id: None,
+            },
+        );
+    }
+    state.session.fail_in_flight_user_messages();
+    assert_eq!(state.session.retry_requests.len(), 16);
+    let first = state
+        .session
+        .retry_requests
+        .front()
+        .and_then(|batch| batch.requests.first());
+    assert!(matches!(
+        first,
+        Some(Request::UserMessage { text, .. }) if text == "retry-1"
+    ));
+}
+
+#[test]
+fn w128_restart_recovery_orders_snapshot_and_discards_old_events() {
+    let target = SessionId::new("ses_w128_restart");
+    let mut snapshot = make_base_snapshot();
+    snapshot.meta.id = target.clone();
+    snapshot.seq = 0;
+    snapshot.transcript.clear();
+    snapshot.turn_active = false;
+    snapshot.active_turn = None;
+    snapshot.terminal_turn = None;
+    snapshot.terminal_error = None;
+
+    let mut state = AppState::new(Config::default(), "test".into(), 100, 30);
+    let _pending_context = state.begin_attach(Attach::Resume {
+        session: target.clone(),
+    });
+    state.set_pending_attach_client_epoch(1).unwrap();
+    let old_context = ClientEventContext {
+        connection_epoch: 1,
+        session_epoch: 1,
+        session: Some(target.clone()),
+    };
+    let now = Instant::now();
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: old_context.clone(),
+            seq: 1,
+            event: pacode_types::Event::Toast {
+                level: pacode_types::ToastLevel::Info,
+                title: "stale".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert_eq!(state.session.buffered_event_count(), 1);
+    assert!(state.apply_client_event(
+        ClientEvent::Disconnected {
+            context: old_context.clone(),
+            reason: "lost".into(),
+        },
+        now,
+    ));
+    assert!(state.apply_client_event(
+        ClientEvent::Reconnecting {
+            context: old_context.clone(),
+            attempt: 1,
+        },
+        now,
+    ));
+    let new_context = ClientEventContext {
+        connection_epoch: 2,
+        session_epoch: 1,
+        session: Some(target.clone()),
+    };
+    assert!(state.apply_client_event(
+        ClientEvent::Connected {
+            context: new_context.clone(),
+            daemon_version: "test".into(),
+            pid: 1,
+            version_mismatch: false,
+        },
+        now,
+    ));
+    let mut fresh_snapshot = snapshot;
+    fresh_snapshot.seq = 1;
+    assert!(state.apply_client_event(
+        ClientEvent::Snapshot {
+            context: new_context.clone(),
+            snapshot: fresh_snapshot,
+        },
+        now,
+    ));
+    assert!(state.pending_attach_token().is_none());
+    assert!(!state.toasts.iter().any(|toast| toast.title == "stale"));
+    assert_eq!(state.last_event_seq, Some(1));
+    assert!(state.apply_client_event(
+        ClientEvent::Event {
+            context: new_context,
+            seq: 2,
+            event: pacode_types::Event::Toast {
+                level: pacode_types::ToastLevel::Info,
+                title: "fresh".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert_eq!(state.last_event_seq, Some(2));
+    assert!(!state.apply_client_event(
+        ClientEvent::Event {
+            context: old_context,
+            seq: 3,
+            event: pacode_types::Event::Toast {
+                level: pacode_types::ToastLevel::Info,
+                title: "late".into(),
+                detail: None,
+            },
+        },
+        now,
+    ));
+    assert_eq!(state.last_event_seq, Some(2));
+}
+
+#[test]
+fn w128_tui_delta_burst_coalesces_into_one_cell() {
+    let mut snapshot = make_base_snapshot();
+    snapshot.seq = 10;
+    snapshot.turn_active = true;
+    snapshot.transcript = vec![TranscriptItem {
+        seq: 11,
+        agent: AgentId::main(),
+        ts_ms: 0,
+        kind: TranscriptKind::Assistant {
+            text: String::new(),
+            complete: false,
+        },
+    }];
+    let mut state = create_state(120, 34, snapshot);
+    let session = state.meta.as_ref().unwrap().id.clone();
+    state.event_connection_epoch = 1;
+    state.event_session_epoch = 1;
+    let context = ClientEventContext {
+        connection_epoch: 1,
+        session_epoch: 1,
+        session: Some(session),
+    };
+    let mut expected = String::new();
+    for index in 0..128 {
+        let text = format!("d{index}");
+        expected.push_str(&text);
+        assert!(state.apply_client_event(
+            ClientEvent::Event {
+                context: context.clone(),
+                seq: 11 + index as u64,
+                event: pacode_types::Event::TextDelta {
+                    agent: AgentId::main(),
+                    item_seq: 11,
+                    text,
+                },
+            },
+            Instant::now(),
+        ));
+    }
+    state.transcript.flush_stream();
+    let cell = state
+        .transcript
+        .cells
+        .iter()
+        .find(|cell| cell.id == 11)
+        .unwrap();
+    let CellKind::Item(TranscriptKind::Assistant { text, .. }) = &cell.kind else {
+        panic!("delta burst did not stay in the assistant cell")
+    };
+    assert_eq!(text, &expected);
+    assert_eq!(state.last_event_seq, Some(138));
 }

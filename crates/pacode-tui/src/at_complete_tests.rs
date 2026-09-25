@@ -77,6 +77,8 @@ fn test_accepting_directory_keeps_popup_open() {
         cwd: root.to_path_buf(),
     };
     let cands = complete_at_path(&key.query, &key.cwd);
+    state.input.at_comp.set_want(Some(key.clone()));
+    assert_eq!(state.input.at_comp.claim_want(), Some(key.clone()));
     state.input.at_comp.finish_scan(key, cands);
 
     // Press Tab to accept candidate 'subdir/'

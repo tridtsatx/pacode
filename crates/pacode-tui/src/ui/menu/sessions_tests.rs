@@ -245,9 +245,11 @@ fn enter_resumes_and_closes_the_stack() {
     let actions = handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Enter));
     assert_eq!(
         actions,
-        vec![Action::Send(Request::Attach(Attach::Resume {
-            session: SessionId::new("pacode-42"),
-        }))]
+        vec![Action::SwitchSession {
+            attach: Attach::Resume {
+                session: SessionId::new("pacode-42"),
+            },
+        }]
     );
     assert!(stack.is_empty());
 }

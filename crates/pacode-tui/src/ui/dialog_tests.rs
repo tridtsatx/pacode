@@ -1,4 +1,13 @@
+use std::time::Instant;
+
 use super::*;
+
+fn whole() -> super::PlainWindow {
+    super::PlainWindow {
+        lines: None,
+        max_bytes: MAX_SELECTION_BYTES,
+    }
+}
 
 fn question_cell(answer: Option<pacode_types::QuestionAnswer>) -> TranscriptKind {
     let question = pacode_types::Question::new(
@@ -222,6 +231,53 @@ fn non_error_notices_stay_plain_but_wrap() {
 }
 
 #[test]
+fn plain_lines_stop_at_the_selection_hard_cap() {
+    let opts = pacode_render::RenderOptions::new(20, false);
+    let mut t = Transcript::new(MAX_SELECTION_LINES + 1);
+    for id in 0..=MAX_SELECTION_LINES as u64 {
+        t.cells.push_back(Cell {
+            id,
+            kind: CellKind::Gap,
+            version: 0,
+            ts_ms: id,
+            stats: None,
+            perm_explain: None,
+        });
+    }
+
+    let lines = super::plain_lines(&mut t, 20, &opts, 0, 0, whole());
+    assert_eq!(lines.lines.len(), MAX_SELECTION_LINES);
+}
+
+#[test]
+fn live_stable_prefix_cache_survives_tail_growth() {
+    let opts = pacode_render::RenderOptions::new(80, false);
+    let mut t = Transcript::new(16);
+    t.upsert(
+        pacode_types::TranscriptItem {
+            seq: 1,
+            agent: pacode_types::AgentId::main(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: "first\n\nsecond".into(),
+                complete: false,
+            },
+        },
+        Instant::now(),
+    );
+    t.flush_stream();
+    let first = super::plain_lines(&mut t, 80, &opts, 0, 0, whole());
+    let lines = t.cache.total_lines();
+
+    t.push_delta(1, " tail", false, Instant::now());
+    t.flush_stream();
+    let second = super::plain_lines(&mut t, 80, &opts, 1, 0, whole());
+
+    assert_ne!(first.lines, second.lines);
+    assert_eq!(t.cache.total_lines(), lines);
+}
+
+#[test]
 fn a_second_render_at_the_same_width_is_served_from_the_cache() {
     let opts = pacode_render::RenderOptions::new(80, false);
     let mut t = Transcript::new(16);
@@ -238,14 +294,14 @@ fn a_second_render_at_the_same_width_is_served_from_the_cache() {
         });
     }
 
-    let first = super::plain_lines(&mut t, 80, &opts, 0, 0);
+    let first = super::plain_lines(&mut t, 80, &opts, 0, 0, whole());
     let cached_after_first = t.cache.total_lines();
     assert!(cached_after_first > 0, "the first render fills the cache");
 
     // A fresh anim frame (a spinner tick) must not re-render anything: the
     // cache contents are byte-identical and nothing new lands in it.
-    let second = super::plain_lines(&mut t, 80, &opts, 7, 0);
-    assert_eq!(first, second, "a cached render is identical");
+    let second = super::plain_lines(&mut t, 80, &opts, 7, 0, whole());
+    assert_eq!(first.lines, second.lines, "a cached render is identical");
     assert_eq!(
         t.cache.total_lines(),
         cached_after_first,
@@ -344,4 +400,88 @@ fn an_honest_explain_failure_has_no_rating_word() {
         joined.contains("explain unavailable under zero-data-retention"),
         "{joined}"
     );
+}
+
+#[test]
+fn a_copy_materializes_only_the_window_it_reads() {
+    let opts = pacode_render::RenderOptions::new(40, false);
+    let mut t = Transcript::new(4_000);
+    let now = Instant::now();
+    for seq in 0..500 {
+        t.upsert(
+            pacode_types::TranscriptItem {
+                seq,
+                agent: pacode_types::AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::User {
+                    text: format!("row {seq}"),
+                },
+            },
+            now,
+        );
+    }
+
+    let whole = super::plain_lines(&mut t, 40, &opts, 0, 0, whole());
+    assert!(whole.lines.len() >= 1_000, "{}", whole.lines.len());
+
+    let tail = super::plain_lines(
+        &mut t,
+        40,
+        &opts,
+        0,
+        0,
+        super::PlainWindow::for_lines(whole.lines.len() - 3..=whole.lines.len() - 1),
+    );
+    assert_eq!(tail.first_line, whole.lines.len() - 3);
+    assert!(tail.lines.len() <= 4, "{}", tail.lines.len());
+    assert!(tail.lines.iter().all(|line| !line.contains("row 0 ")));
+
+    // A window that starts inside a row still reports where its first line
+    // stands, or the copy would slice the wrong text.
+    let inside = super::plain_lines(
+        &mut t,
+        40,
+        &opts,
+        0,
+        0,
+        super::PlainWindow::for_lines(5..=7),
+    );
+    assert_eq!(inside.first_line, 5);
+    assert_eq!(inside.lines.len(), 3);
+    assert_eq!(inside.lines, whole.lines[5..8]);
+}
+
+#[test]
+fn a_copy_stops_at_the_byte_cap_rather_than_growing_without_bound() {
+    let opts = pacode_render::RenderOptions::new(200, false);
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    for seq in 0..8 {
+        t.upsert(
+            pacode_types::TranscriptItem {
+                seq,
+                agent: pacode_types::AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::User {
+                    text: "z".repeat(200_000),
+                },
+            },
+            now,
+        );
+    }
+
+    let lines = super::plain_lines(
+        &mut t,
+        200,
+        &opts,
+        0,
+        0,
+        super::PlainWindow {
+            lines: None,
+            max_bytes: 64 * 1024,
+        },
+    );
+    let bytes: usize = lines.lines.iter().map(String::len).sum();
+    assert!(bytes <= 64 * 1024 + 1_000, "{bytes}");
+    assert!(!lines.lines.is_empty());
 }

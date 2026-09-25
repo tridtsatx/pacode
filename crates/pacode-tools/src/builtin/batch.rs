@@ -12,14 +12,24 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::bash::{BashInput, run_authorized};
-use super::helpers::{cap_output, parse_input, preview_body};
+use super::helpers::{parse_input, preview_body};
 use crate::host::PermissionDraft;
+use crate::registry::{MAX_TOOL_OUTPUT_BYTES, cap_output_bytes};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "batch";
 
 /// Hard cap on ops per call.
 const MAX_OPS: usize = 8;
+
+/// Hard cap on the serialized `ops` array. Eight ops of a few hundred bytes are
+/// the normal shape; a model that ships megabytes of inline payloads is not
+/// exploring, and each op is cloned per dispatch.
+const MAX_OPS_BYTES: usize = 256 * 1024;
+
+/// Headroom kept inside the call's output budget for the closing note and the
+/// tally line, so the last op is never dropped just to make room for them.
+const CUT_NOTE_RESERVE: usize = 96;
 
 /// Read-only tools an op may invoke. `bash` is further restricted to commands
 /// passing `pacode_risk::is_read_only` (the same check Plan mode applies).
@@ -111,6 +121,20 @@ impl Tool for BatchTool {
                 args.ops.len()
             )));
         }
+        let mut ops_bytes = 0usize;
+        for raw in &args.ops {
+            ops_bytes = ops_bytes.saturating_add(
+                serde_json::to_vec(raw)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0),
+            );
+            if ops_bytes > MAX_OPS_BYTES {
+                return Err(ToolError::invalid(format!(
+                    "batch accepts at most {MAX_OPS_BYTES} bytes of operations, got more; \
+                     call the tools one by one"
+                )));
+            }
+        }
 
         let ops: Vec<PreparedOp> = args.ops.iter().map(|raw| prepare(raw, ctx)).collect();
 
@@ -125,35 +149,68 @@ impl Tool for BatchTool {
         }
 
         // Fair share of the output budget per op; the op's own
-        // `accept_large_output` still applies inside its share.
+        // `accept_large_output` still applies inside its share. Ops that were
+        // rejected produce no output, so they do not take a share.
+        let runnable = ops
+            .iter()
+            .filter(|op| matches!(op, PreparedOp::Ready { .. }))
+            .count()
+            .max(1);
         let per_op_cap = if accept_large {
             ctx.output_cap_chars
         } else {
-            (ctx.output_cap_chars / ops.len()).max(1)
+            (ctx.output_cap_chars / runnable).max(1)
         };
 
         let futures = ops.into_iter().map(|op| {
             let ctx = ctx.clone();
             async move { run_op(op, &ctx, per_op_cap).await }
         });
-        let results = futures::future::join_all(futures).await;
+        let results = futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
 
         let total = results.len();
         let succeeded = results.iter().filter(|r| r.ok).count();
         let failed = total - succeeded;
 
+        // The body is filled against the whole-call budget as results arrive:
+        // joining eight per-op caps first would build a megabyte and a half of
+        // string only to have it cut back to the cap.
+        let total_cap = if accept_large {
+            MAX_TOOL_OUTPUT_BYTES
+        } else {
+            ctx.output_cap_chars.min(MAX_TOOL_OUTPUT_BYTES)
+        };
+        let summary = format!("\nBatch: {succeeded} succeeded, {failed} failed");
+        let body_cap = total_cap.saturating_sub(summary.len() + CUT_NOTE_RESERVE);
         let mut body = String::new();
+        let mut dropped = 0usize;
         for (index, result) in results.iter().enumerate() {
+            let header = format!("--- [{}] {} ---\n", index + 1, result.label);
+            if body.len() + header.len() >= body_cap {
+                dropped = results.len() - index;
+                break;
+            }
+            body.push_str(&header);
+            let room = body_cap - body.len();
+            if result.text.len() > room {
+                body.push_str(cap_output_bytes(result.text.as_str(), room).as_ref());
+                dropped = results.len() - index;
+                break;
+            }
+            body.push_str(&result.text);
+            body.push('\n');
+        }
+        if dropped > 0 {
             body.push_str(&format!(
-                "--- [{}] {} ---\n{}\n",
-                index + 1,
-                result.label,
-                result.text
+                "\n[{dropped} more operation(s) dropped by the batch output budget]\n"
             ));
         }
-        body.push_str(&format!("\nBatch: {succeeded} succeeded, {failed} failed"));
+        body.push_str(&summary);
 
-        let content = cap_output(&body, accept_large, ctx.output_cap_chars);
+        let content = cap_output_bytes(body.as_str(), total_cap).into_owned();
         let mut out = ToolOutput::text(content)
             .with_title(format!("Batch {total} ops"))
             .with_preview(format!(
@@ -341,49 +398,65 @@ async fn ask_batch_permission(ops: &[PreparedOp], ctx: &ToolCtx) -> Result<(), T
         .map(|_| ())
 }
 
-async fn run_op(op: PreparedOp, ctx: &ToolCtx, per_op_cap: usize) -> OpResult {
+async fn run_op(op: PreparedOp, ctx: &ToolCtx, per_op_cap: usize) -> Result<OpResult, ToolError> {
     match op {
-        PreparedOp::Rejected { label, reason } => OpResult {
+        PreparedOp::Rejected { label, reason } => Ok(OpResult {
             label,
             ok: false,
-            text: format!("Error: {reason}"),
-        },
+            text: cap_output_bytes(format!("Error: {reason}"), MAX_TOOL_OUTPUT_BYTES).into_owned(),
+        }),
         PreparedOp::Ready {
             label, name, input, ..
         } => {
+            let _workers = ctx
+                .tools
+                .acquire_worker(&ctx.session, &ctx.agent, &ctx.cancel)
+                .await?;
             let tool = ctx.tools.get(&name);
             let kind = tool
                 .as_ref()
-                .map(|t| t.kind())
+                .map(|tool| tool.kind())
                 .unwrap_or(ToolKind::ReadOnly);
             let mut sub_ctx = ctx.clone().with_tool(name.clone(), kind);
             sub_ctx.output_cap_chars = per_op_cap;
-            // Bash ops take `run_authorized` directly: classification and the
-            // (combined) permission were settled in `prepare`/`ask_batch_permission`.
             let result = if name == "bash" {
                 match parse_input::<BashInput>(input) {
-                    Ok((args, accept)) => run_authorized(args, accept, &sub_ctx).await,
+                    Ok((args, accept)) => {
+                        tokio::select! {
+                            biased;
+                            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                            result = run_authorized(args, accept, &sub_ctx) => result,
+                        }
+                    }
                     Err(err) => Err(err),
                 }
             } else {
                 match tool {
-                    Some(tool) => tool.call(input, &sub_ctx).await,
+                    Some(tool) => {
+                        tokio::select! {
+                            biased;
+                            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                            result = tool.call(input, &sub_ctx) => result,
+                        }
+                    }
                     None => Err(ToolError::failed(format!(
                         "tool `{name}` became unavailable"
                     ))),
                 }
             };
             match result {
-                Ok(out) => OpResult {
+                Ok(out) => Ok(OpResult {
                     label,
                     ok: !out.is_error,
-                    text: out.content,
-                },
-                Err(err) => OpResult {
+                    text: cap_output_bytes(out.content, MAX_TOOL_OUTPUT_BYTES).into_owned(),
+                }),
+                Err(ToolError::Cancelled) => Err(ToolError::Cancelled),
+                Err(err) => Ok(OpResult {
                     label,
                     ok: false,
-                    text: format!("Error: {err}"),
-                },
+                    text: cap_output_bytes(format!("Error: {err}"), MAX_TOOL_OUTPUT_BYTES)
+                        .into_owned(),
+                }),
             }
         }
     }

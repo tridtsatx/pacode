@@ -1,6 +1,6 @@
 use super::*;
 use crate::state::IDLE_DEBOUNCE_MS;
-use pacode_types::{AgentKind, AgentStatus, Effort, ModelRoute};
+use pacode_types::{AgentKind, AgentStatus, Effort, ModelRoute, TurnId, TurnStop};
 use std::time::Duration;
 
 fn agent(id: AgentId, status: AgentStatus) -> AgentInfo {
@@ -168,6 +168,59 @@ fn a_terminal_subagent_is_not_live() {
 }
 
 #[test]
+fn direct_agent_vector_edits_do_not_break_indexed_lookup() {
+    let mut rail = RailState::default();
+    let id = AgentId::new("sub_1");
+    rail.agents
+        .push(agent(id.clone(), AgentStatus::RunningTool));
+    assert!(rail.agent(&id).is_some());
+
+    rail.agents[0].id = AgentId::new("sub_2");
+    assert!(rail.agent(&id).is_none());
+    assert!(rail.agent(&AgentId::new("sub_2")).is_some());
+}
+
+#[test]
+fn stale_agent_turn_end_cannot_finish_the_new_turn() {
+    let mut rail = RailState::default();
+    let id = AgentId::new("sub_1");
+    let old_turn = TurnId::new("turn_old");
+    let new_turn = TurnId::new("turn_new");
+    rail.upsert_agent(agent(id.clone(), AgentStatus::RunningTool));
+    rail.begin_agent_turn(&id, &old_turn);
+    rail.begin_agent_turn(&id, &new_turn);
+
+    assert_eq!(
+        rail.finish_agent_turn(&id, &old_turn, &TurnStop::Completed, 1),
+        TurnEndMatch::Stale
+    );
+    assert!(rail.agent(&id).is_some_and(|info| info.status.is_live()));
+    assert_eq!(
+        rail.finish_agent_turn(&id, &new_turn, &TurnStop::Completed, 2),
+        TurnEndMatch::Current
+    );
+    assert_eq!(
+        rail.agent(&id).map(|info| info.status),
+        Some(AgentStatus::Finished)
+    );
+    assert_eq!(
+        rail.finish_agent_turn(
+            &id,
+            &new_turn,
+            &TurnStop::Failed {
+                message: "late".into(),
+            },
+            3
+        ),
+        TurnEndMatch::Duplicate
+    );
+    assert_eq!(
+        rail.agent(&id).map(|info| info.status),
+        Some(AgentStatus::Finished)
+    );
+}
+
+#[test]
 fn the_schedule_countdown_ticks_at_the_resolution_it_shows() {
     use pacode_types::{CronJob, CronJobId, CronSchedule};
 
@@ -255,4 +308,69 @@ fn cron_jobs_and_monitors_are_upserted_by_id() {
     assert_eq!(rail.monitors.len(), 1);
     // A monitor that fired is no longer waiting for anything.
     assert!(!rail.has_schedule_rows());
+}
+
+#[test]
+fn a_row_lookup_survives_a_list_changed_behind_the_index() {
+    let mut rail = RailState::default();
+    let first = AgentId::new("agt_first");
+    let second = AgentId::new("agt_second");
+    rail.upsert_agent(agent(first.clone(), AgentStatus::RunningTool));
+    rail.upsert_agent(agent(second.clone(), AgentStatus::RunningTool));
+
+    // A snapshot replaces the list without going through the index: the same
+    // length, different rows. A lookup that trusted the old positions would
+    // answer with the wrong agent.
+    rail.agents = vec![
+        agent(AgentId::new("agt_other"), AgentStatus::Finished),
+        agent(first.clone(), AgentStatus::Finished),
+    ];
+    assert_eq!(
+        rail.agent(&first).map(|agent| agent.id.clone()),
+        Some(first)
+    );
+    assert!(rail.agent(&second).is_none());
+    assert!(rail.agent(&AgentId::new("agt_missing")).is_none());
+}
+
+#[test]
+fn a_lookup_for_a_row_the_rail_does_not_list_keeps_the_index_usable() {
+    let mut rail = RailState::default();
+    let known = AgentId::new("agt_known");
+    rail.upsert_agent(agent(known.clone(), AgentStatus::RunningTool));
+    let version = rail.agents_version;
+    let index_version = rail.agent_index_version;
+    assert_eq!(version, index_version);
+
+    for _ in 0..4 {
+        assert!(rail.agent(&AgentId::new("agt_gone")).is_none());
+    }
+    assert_eq!(
+        rail.agent_index_version, index_version,
+        "a miss must not invalidate the index it just proved current"
+    );
+    assert_eq!(
+        rail.agent(&known).map(|agent| agent.id.clone()),
+        Some(known)
+    );
+}
+
+#[test]
+fn a_newer_row_still_updates_in_place_after_an_upsert() {
+    let mut rail = RailState::default();
+    let id = AgentId::new("agt_first");
+    rail.upsert_agent(agent(id.clone(), AgentStatus::RunningTool));
+    let mut done = agent(id.clone(), AgentStatus::Finished);
+    done.finished_at_ms = Some(42);
+    rail.upsert_agent(done);
+
+    assert_eq!(rail.agents.len(), 1);
+    assert_eq!(
+        rail.agent(&id).map(|agent| agent.status),
+        Some(AgentStatus::Finished)
+    );
+    assert_eq!(
+        rail.agent(&id).and_then(|agent| agent.finished_at_ms),
+        Some(42)
+    );
 }

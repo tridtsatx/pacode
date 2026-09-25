@@ -23,62 +23,76 @@ pub use theme::{
 };
 pub use wrap::{display_width, truncate_spans, truncate_to_width, wrap_line, wrap_text};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RenderCacheKey {
+    pub width: u16,
+    pub context: u64,
+}
+
+impl RenderCacheKey {
+    pub fn new(width: u16, context: u64) -> Self {
+        Self { width, context }
+    }
+}
+
 /// Rendering parameters shared by all renderers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderOptions {
     pub width: u16,
     pub theme: Theme,
     pub glyphs: Glyphs,
-    /// Terminal colour fidelity (`[ui] color` / `COLORTERM` / `NO_COLOR`).
-    /// Controls degradation steps such as diff background bands.
     pub color: ColorMode,
-    /// Draw the model's reasoning line (`[ui] thinking`). Off by default.
     pub thinking: bool,
-    /// The chord that expands a folded tool call — shown in fold markers
-    /// (`… N more lines · ctrl+o to expand`). Falls back to "click" when the
-    /// action is unbound.
     pub expand_hint: String,
+    pub cache_epoch: u64,
 }
 
 impl RenderOptions {
     pub fn new(width: u16, ascii_only: bool) -> Self {
-        Self {
-            width,
-            thinking: false,
-            color: ColorMode::detect(),
-            theme: Theme::default(),
-            glyphs: Glyphs::new(ascii_only),
-            expand_hint: "ctrl+o".to_string(),
-        }
+        Self::with_theme(width, ascii_only, Theme::default())
     }
 
     pub fn with_theme(width: u16, ascii_only: bool, theme: Theme) -> Self {
+        Self::with_theme_color(width, ascii_only, theme, ColorMode::detect())
+    }
+
+    pub fn with_theme_color(width: u16, ascii_only: bool, theme: Theme, color: ColorMode) -> Self {
+        let theme = match color {
+            ColorMode::Mono => Theme::mono(),
+            _ => theme,
+        };
         Self {
             width,
             theme,
             glyphs: Glyphs::new(ascii_only),
-            color: ColorMode::detect(),
+            color,
             thinking: false,
             expand_hint: "ctrl+o".to_string(),
+            cache_epoch: 0,
         }
     }
 
-    /// Force a colour mode (the `ui.color` setting flows in through
-    /// `PACODE_COLOR`; tests set it explicitly).
     pub fn color_mode(mut self, color: ColorMode) -> Self {
         self.color = color;
         self
     }
 
-    /// Draw the model's reasoning line, per `[ui] thinking`.
     pub fn thinking(mut self, thinking: bool) -> Self {
         self.thinking = thinking;
         self
     }
 
-    /// Name the expand chord in fold markers.
     pub fn expand_hint(mut self, hint: impl Into<String>) -> Self {
         self.expand_hint = hint.into();
         self
+    }
+
+    pub fn cache_epoch(mut self, epoch: u64) -> Self {
+        self.cache_epoch = epoch;
+        self
+    }
+
+    pub fn cache_key(&self) -> RenderCacheKey {
+        RenderCacheKey::new(self.width, self.cache_epoch)
     }
 }

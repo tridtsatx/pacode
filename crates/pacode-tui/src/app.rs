@@ -22,22 +22,25 @@
 //! `initial_prompt` plus the post-attach list batch. On `quit`: leave the alt
 //! screen and close the client (the daemon and its sessions keep running).
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use pacode_client::{Client, ClientEvent};
+use pacode_client::{Client, ClientEvent, ClientEventContext};
 use pacode_types::state::ToastLevel;
 use pacode_types::time::now_ms;
-use pacode_types::{AgentId, PluginCommandOutcome, Reply, Request, TranscriptKind};
+use pacode_types::{AgentId, Attach, PluginCommandOutcome, Reply, Request, TranscriptKind};
 
-use crate::keys::{Action, handle_key, handle_mouse};
+use crate::keys::{Action, handle_key, handle_mouse, prompt_batch_action};
 use crate::layout::ScreenLayout;
 use crate::state::transcript::{Cell, CellKind};
-use crate::state::{AppState, PanelTarget, TOAST_EXIT_MS, TOAST_TTL_SECS};
+use crate::state::{
+    AppState, PanelTarget, PromptBatch, SessionContext, TOAST_EXIT_MS, TOAST_TTL_SECS,
+    UserMessageInFlight,
+};
 use crate::terminal::TerminalGuard;
 use crate::ui;
 use crate::{TuiError, TuiOptions};
@@ -46,89 +49,360 @@ use crate::{TuiError, TuiOptions};
 /// past it the oldest is dropped; a user cannot out-type a snapshot.
 const PENDING_REQUESTS_CAP: usize = 16;
 
+/// Ceiling on the file an inline thumbnail decodes: a kitty/sixel escape
+/// carries the encoded image, so an unbounded paste would put megabytes into
+/// the frame path's per-frame clone. Over the cap the slot keeps its
+/// placeholder; the prompt still attaches the original file to the message.
+const IMAGE_THUMB_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameClock {
+    ups: pacode_types::Ups,
+    detected_hz: Option<u16>,
+    probe_generation: u64,
+    interval: Option<Duration>,
+}
+
+impl FrameClock {
+    fn new(ups: pacode_types::Ups) -> Self {
+        Self {
+            ups,
+            detected_hz: None,
+            probe_generation: 0,
+            interval: match ups {
+                pacode_types::Ups::Auto | pacode_types::Ups::Dynamic => None,
+                pacode_types::Ups::Fixed(_) => ups.frame_interval(None),
+            },
+        }
+    }
+
+    fn set_ups(&mut self, ups: pacode_types::Ups) -> bool {
+        if self.ups == ups {
+            return false;
+        }
+        self.ups = ups;
+        self.probe_generation = self.probe_generation.wrapping_add(1);
+        self.interval = match ups {
+            pacode_types::Ups::Auto | pacode_types::Ups::Dynamic => None,
+            pacode_types::Ups::Fixed(_) => ups.frame_interval(self.detected_hz),
+        };
+        true
+    }
+
+    fn accept_probe(&mut self, generation: u64, hz: Option<u16>) -> bool {
+        if generation != self.probe_generation || self.ups != pacode_types::Ups::Auto {
+            return false;
+        }
+        self.detected_hz = hz;
+        self.interval = self.ups.frame_interval(hz);
+        true
+    }
+}
+
+fn spawn_refresh_probe(tx: mpsc::UnboundedSender<(u64, Option<u16>)>, generation: u64) {
+    std::thread::spawn(move || {
+        let _ = tx.send((generation, pacode_config::display::detect_refresh_hz()));
+    });
+}
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod app_tests;
+
+#[derive(Clone, Copy)]
+enum AttachRequestKind {
+    Attach,
+    Switch,
+    Retry,
+}
+
+struct AttachRequest {
+    context: SessionContext,
+    token: u64,
+    request_client_context: ClientEventContext,
+    attach: Attach,
+    kind: AttachRequestKind,
+    timing_started: Option<Instant>,
+}
+
+enum ReplyScope {
+    Global {
+        context: crate::state::UiContext,
+    },
+    Ui {
+        context: crate::state::UiContext,
+    },
+    Session {
+        context: SessionContext,
+        client_context: ClientEventContext,
+    },
+}
+
 enum BgResponse {
-    /// The startup `client.attach()` resolved — `Ok` carries the session
-    /// snapshot; `Err` is fatal (fail-fast, like the old synchronous attach).
-    AttachFinished(Result<pacode_types::SessionSnapshot, pacode_client::ClientError>),
+    AttachFinished {
+        context: SessionContext,
+        token: u64,
+        request_client_context: ClientEventContext,
+        client_context: ClientEventContext,
+        attach: Attach,
+        result: Result<pacode_types::SessionSnapshot, pacode_client::ClientError>,
+    },
     Reply {
-        /// Which cached list the request refreshed — `None` for non-list
-        /// requests. Drives `state.lists` freshness/in-flight tracking (§8.2).
+        scope: ReplyScope,
         kind: Option<crate::cache::ListKind>,
+        global_refresh: bool,
         res: Result<Reply, pacode_client::ClientError>,
     },
-    /// The seq-gap `GetSnapshot` resync finished — clears the in-flight mark
-    /// so a later gap may re-arm. `Ok(Reply::Snapshot)` folds as usual.
-    ResyncDone(Result<Reply, pacode_client::ClientError>),
+    ResyncDone {
+        context: SessionContext,
+        client_context: ClientEventContext,
+        result: Result<Reply, pacode_client::ClientError>,
+    },
+    UserMessageDone {
+        ticket: UserMessageInFlight,
+        client_context: ClientEventContext,
+        result: Result<Reply, pacode_client::ClientError>,
+    },
+    UserMessageStepDone {
+        ticket: UserMessageInFlight,
+        client_context: ClientEventContext,
+        request: Request,
+        result: Result<Reply, pacode_client::ClientError>,
+    },
     LoadPanelReply {
+        context: SessionContext,
+        client_context: ClientEventContext,
         target: PanelTarget,
+        token: u64,
         result: Result<Reply, pacode_client::ClientError>,
     },
     LoadHistoryReply {
+        context: SessionContext,
+        client_context: ClientEventContext,
+        before_seq: Option<u64>,
         result: Result<Reply, pacode_client::ClientError>,
     },
-    BashCompleted(Result<crate::bash::BashOutput, String>),
-    /// An `@` path-completion scan finished — the popup reads `ready`.
+    BashCompleted {
+        run_id: u64,
+        context: SessionContext,
+        client_context: ClientEventContext,
+        result: Result<crate::bash::BashOutput, String>,
+    },
     AtCompleted {
+        context: SessionContext,
+        client_context: ClientEventContext,
         key: crate::state::input::AtKey,
         candidates: Vec<crate::at_complete::AtCandidate>,
     },
-    /// A `!` bash-completion scan finished.
     BashCompletionDone {
+        context: SessionContext,
+        client_context: ClientEventContext,
         key: crate::state::input::BashKey,
         candidates: Vec<crate::bash::complete::Candidate>,
     },
-    /// A files preview finished (§8.1: the read + lex ran on a blocking
-    /// thread, never in draw).
     FilePreviewReady {
+        context: SessionContext,
+        client_context: ClientEventContext,
         key: crate::state::files::PreviewKey,
         resolved: std::path::PathBuf,
         text: Option<crate::state::files::TextPreview>,
     },
-    /// The Files level's deferred `git status` scan landed — the
-    /// `new`/`deleted`/`renamed` labels (§5.5). `at_version` is the
-    /// `files.rows_version` the scan described; a later row change rescans.
     FileStatusesReady {
+        context: SessionContext,
+        client_context: ClientEventContext,
         statuses: std::collections::BTreeMap<String, pacode_vcs::FileStatus>,
         at_version: u64,
     },
-    /// The Files level's `enter` probe landed — applies only while its path
-    /// is still the panel's `FileDiff` target (a stale one drops).
     FileDiffReady {
+        context: SessionContext,
+        client_context: ClientEventContext,
         path: String,
         diff: pacode_vcs::FileDiff,
     },
-    /// `Request::GitShow` finished (§5.10). Carries the request's hash so a
-    /// `Reply::Error` — which names no commit — still lands on the right row:
-    /// a hover-driven fetch must not spam the transcript, it folds into the
-    /// detail slot instead.
     GitShowReady {
+        context: SessionContext,
+        client_context: ClientEventContext,
         hash: String,
         res: Result<Reply, pacode_client::ClientError>,
     },
-    /// `Request::GitDiff` finished — the commit-diff panel's payload, keyed
-    /// by the request's hash for the same reason as [`Self::GitShowReady`].
     GitDiffReady {
+        context: SessionContext,
+        client_context: ClientEventContext,
         hash: String,
         res: Result<Reply, pacode_client::ClientError>,
     },
-    /// The Background level's output-tail read finished (§5.9): the last ≤
-    /// `ui::menu::background::TAIL_CAP_BYTES` of the task's spool file, read
-    /// on a blocking thread — never in the draw path (§8.1).
     TaskTailReady {
+        context: SessionContext,
+        client_context: ClientEventContext,
         tail: crate::state::rail::TaskTail,
     },
-    /// A pasted-image strip thumbnail finished rendering.
     ThumbReady {
+        context: SessionContext,
+        client_context: ClientEventContext,
         token: usize,
         cell_w: u16,
         cell_h: u16,
         preview: Option<pacode_image::Preview>,
     },
-    /// The clipboard copy `ui::draw` stashed in `state.pending_copy` ran.
     CopyDone {
+        context: SessionContext,
+        client_context: ClientEventContext,
         auto: bool,
         chars: usize,
     },
+}
+
+fn spawn_attach_request(
+    state: &mut AppState,
+    client: &Arc<Client>,
+    bg_tx: &mpsc::UnboundedSender<BgResponse>,
+    request: AttachRequest,
+) {
+    state.attach_in_flight = true;
+    let cl = Arc::clone(client);
+    let tx = bg_tx.clone();
+    tokio::spawn(async move {
+        let result = match request.kind {
+            AttachRequestKind::Attach => cl.attach(request.attach.clone()).await,
+            AttachRequestKind::Switch => cl.switch_session(request.attach.clone()).await,
+            AttachRequestKind::Retry => cl.retry_attach(request.attach.clone()).await,
+        };
+        if let Some(started) = request.timing_started {
+            crate::timing::mark(crate::timing::enabled(), "attach_snapshot", started);
+        }
+        let client_context = cl.event_context();
+        let _ = tx.send(BgResponse::AttachFinished {
+            context: request.context,
+            token: request.token,
+            request_client_context: request.request_client_context,
+            client_context,
+            attach: request.attach,
+            result,
+        });
+    });
+}
+
+fn dispatch_pending_attach_retry(
+    state: &mut AppState,
+    client: &Arc<Client>,
+    bg_tx: &mpsc::UnboundedSender<BgResponse>,
+) {
+    let Some(pending) = state.take_pending_attach_retry() else {
+        return;
+    };
+    spawn_attach_request(
+        state,
+        client,
+        bg_tx,
+        AttachRequest {
+            context: pending.context,
+            token: pending.token,
+            request_client_context: client.event_context(),
+            attach: pending.attach,
+            kind: AttachRequestKind::Retry,
+            timing_started: None,
+        },
+    );
+}
+
+fn spawn_prompt_batch_step(
+    client: &Arc<Client>,
+    bg_tx: &mpsc::UnboundedSender<BgResponse>,
+    ticket: UserMessageInFlight,
+    request: Request,
+    client_context: ClientEventContext,
+) {
+    let cl = Arc::clone(client);
+    let tx = bg_tx.clone();
+    tokio::spawn(async move {
+        let result = cl
+            .request_sequence(client_context.clone(), [request.clone()])
+            .await
+            .and_then(|mut replies| {
+                replies
+                    .pop()
+                    .ok_or(pacode_client::ClientError::UnexpectedReply {
+                        request: request.name().to_string(),
+                        reply: "empty sequence reply".into(),
+                    })
+            });
+        let _ = tx.send(BgResponse::UserMessageStepDone {
+            ticket,
+            client_context,
+            request,
+            result,
+        });
+    });
+}
+
+struct PanelLoads {
+    next: u64,
+    in_flight: Option<(SessionContext, PanelTarget, u64)>,
+    applied: u64,
+}
+
+thread_local! {
+    static PANEL_LOADS: std::cell::RefCell<PanelLoads> = const {
+        std::cell::RefCell::new(PanelLoads { next: 0, in_flight: None, applied: 0 })
+    };
+}
+
+/// One panel load per (session, target): navigation emits `Action::LoadPanel`
+/// per step, so without this a held arrow key runs a `GetHistory` page per
+/// agent and the replies race into the same panel. Returns the token the reply
+/// must carry.
+fn begin_panel_load(context: &SessionContext, target: &PanelTarget) -> Option<u64> {
+    PANEL_LOADS.with(|cell| {
+        let mut loads = cell.borrow_mut();
+        if loads
+            .in_flight
+            .as_ref()
+            .is_some_and(|(pending, panel, _)| pending == context && panel == target)
+        {
+            return None;
+        }
+        loads.next = loads.next.wrapping_add(1);
+        let token = loads.next;
+        loads.in_flight = Some((context.clone(), target.clone(), token));
+        Some(token)
+    })
+}
+
+/// Whether this reply is the newest load of its target. A page that a newer
+/// load already replaced is dropped instead of overwriting the panel, and the
+/// slot is released either way — a load left behind would refuse every later
+/// request for the same target.
+fn panel_load_reply_is_current(context: &SessionContext, target: &PanelTarget, token: u64) -> bool {
+    PANEL_LOADS.with(|cell| {
+        let mut loads = cell.borrow_mut();
+        if loads
+            .in_flight
+            .as_ref()
+            .is_none_or(|(pending, panel, sent)| {
+                pending != context || panel != target || *sent != token
+            })
+        {
+            return false;
+        }
+        loads.in_flight = None;
+        if token <= loads.applied {
+            return false;
+        }
+        loads.applied = token;
+        true
+    })
+}
+
+fn fail_prompt_batch(state: &mut AppState, id: u64) {
+    if state.session.finish_user_message(id, true).is_none() {
+        return;
+    }
+    state.push_toast(
+        ToastLevel::Warn,
+        "prompt not sent".into(),
+        Some("press Enter to retry".into()),
+        Instant::now(),
+    );
 }
 
 /// `None` when the loop exited before a session attached (the attach is a
@@ -187,7 +461,8 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     crate::timing::mark(timing, "cache_load", t);
 
     term_guard.terminal.draw(|f| {
-        ui::draw(f, &mut state);
+        let prepared = ui::prepare_frame(f.area(), &mut state, Instant::now());
+        ui::draw(f, &state, &prepared);
         crate::font::apply_weight_to_frame(f, &state.config.font);
     })?;
     crate::timing::mark(timing, "first_frame", t_start);
@@ -207,16 +482,31 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     // and fires the §8.2 post-attach list batch. `client.attach` (not a raw
     // `request`) keeps the remembered session populated for reconnects.
     let t_attach = Instant::now();
-    {
-        let cl = Arc::clone(&client);
-        let attach = opts.attach.clone();
-        let tx = bg_tx.clone();
-        tokio::spawn(async move {
-            let res = cl.attach(attach).await;
-            crate::timing::mark(timing, "attach_snapshot", t_attach);
-            let _ = tx.send(BgResponse::AttachFinished(res));
-        });
-    }
+    let attach_context = state.begin_attach(opts.attach.clone());
+    let attach_client_context = client.event_context();
+    let attach_token = state
+        .set_pending_attach_client_epoch(attach_client_context.session_epoch.wrapping_add(1))
+        .expect("pending attach must exist");
+    let attach_epoch = state
+        .pending_attach_epoch_signal()
+        .expect("pending attach epoch must exist");
+    attach_epoch.store(
+        attach_client_context.session_epoch.wrapping_add(1),
+        Ordering::Release,
+    );
+    spawn_attach_request(
+        &mut state,
+        &client,
+        &bg_tx,
+        AttachRequest {
+            context: attach_context,
+            token: attach_token,
+            request_client_context: attach_client_context,
+            attach: opts.attach.clone(),
+            kind: AttachRequestKind::Attach,
+            timing_started: Some(t_attach),
+        },
+    );
 
     let t = Instant::now();
     let font_outcome = term_guard.apply_font(&opts.config.font);
@@ -242,18 +532,13 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     // pends forever once the probe result is consumed (a closed channel would
     // return `None` instantly and spin the select loop).
     let t_probe = Instant::now();
-    let ups = opts.config.ui.ups;
-    let (hz_tx, mut hz_rx) = mpsc::unbounded_channel::<Option<u16>>();
+    let (hz_tx, mut hz_rx) = mpsc::unbounded_channel::<(u64, Option<u16>)>();
     let _hz_keepalive = hz_tx.clone();
-    let mut frame_interval = match ups {
-        pacode_types::Ups::Auto => {
-            std::thread::spawn(move || {
-                let _ = hz_tx.send(pacode_config::display::detect_refresh_hz());
-            });
-            None
-        }
-        pacode_types::Ups::Fixed(_) | pacode_types::Ups::Dynamic => ups.frame_interval(None),
-    };
+    let mut frame_clock = FrameClock::new(state.config.ui.ups);
+    if frame_clock.ups == pacode_types::Ups::Auto {
+        spawn_refresh_probe(hz_tx.clone(), frame_clock.probe_generation);
+    }
+    let mut frame_interval = frame_clock.interval;
     crate::timing::mark(timing, "refresh_hz_spawn", t_probe);
 
     let mut last_draw = Instant::now() - frame_interval.unwrap_or(Duration::from_millis(33));
@@ -264,9 +549,6 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     // only when the wanted period changes, so stream events can never reset the
     // timer's phase mid-cycle (the jitter the old per-iteration sleep caused).
     let mut anim_tick: Option<tokio::time::Interval> = None;
-    // The refresh rate the auto-probe reported — `None` until it lands
-    // (`frame_budget` then budgets for the 60 Hz floor).
-    let mut detected_hz: Option<u16> = None;
     let mut last_layout = ScreenLayout::default();
     // Input image-strip escapes currently on screen (spec §1): tracked so the
     // post-draw flush can diff and never re-send tens of MB of kitty/sixel
@@ -277,6 +559,18 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     let mut needs_image_repaint = false;
 
     loop {
+        if term_guard.mouse_enabled() != state.config.ui.mouse
+            && let Err(error) = term_guard.set_mouse(state.config.ui.mouse)
+        {
+            log::warn!("failed to update terminal mouse capture: {error}");
+            state.config.ui.mouse = term_guard.mouse_enabled();
+        }
+        if frame_clock.set_ups(state.config.ui.ups) {
+            frame_interval = frame_clock.interval;
+            if frame_clock.ups == pacode_types::Ups::Auto {
+                spawn_refresh_probe(hz_tx.clone(), frame_clock.probe_generation);
+            }
+        }
         let files_view = files_view_on_screen(&state);
         if !files_view {
             if state.files.cached_preview.is_some() {
@@ -334,7 +628,8 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             let draw_res = term_guard
                 .terminal
                 .draw(|f| {
-                    last_layout = ui::draw(f, &mut state);
+                    let prepared = ui::prepare_frame(f.area(), &mut state, Instant::now());
+                    last_layout = ui::draw(f, &state, &prepared);
                     crate::font::apply_weight_to_frame(f, &state.config.font);
                 })
                 .map(|_| ());
@@ -344,7 +639,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             crate::timing::warn_frame_over_budget(
                 timing,
                 t_frame.elapsed(),
-                crate::timing::frame_budget(detected_hz),
+                crate::timing::frame_budget(frame_clock.detected_hz),
             );
             state.dirty = false;
             state.dirty_anim = false;
@@ -368,11 +663,11 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             }
         }
 
-        // Deferred work the draw path recorded: completion scans, image
+        // Deferred work recorded before paint: completion scans, image
         // renders, the stashed clipboard copy — all of it runs on blocking
         // threads, replies land back through `bg_rx` (§8.1). Daemon-bound
         // wants come back as actions and go through `dispatch_action`.
-        for act in dispatch_deferred(&mut state, &bg_tx) {
+        for act in dispatch_deferred(&mut state, &bg_tx, &client) {
             dispatch_action(act, &mut state, &client, &bg_tx);
         }
 
@@ -532,7 +827,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         // in-flight case wakes via `BgResponse::ResyncDone`), firing at the
         // debounce boundary, at most `RESYNC_DEBOUNCE_MS` out.
         let resync_sleep = async {
-            if !state.resync_want || state.resync_in_flight {
+            if !state.resync_want || state.resync_in_flight || state.awaiting_snapshot {
                 return std::future::pending::<()>().await;
             }
             let wait = match state.resync_sent_at {
@@ -547,25 +842,50 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             client_ev = events.recv() => {
                 match client_ev {
                     Some(ev) => {
-                        let snapshot_landed = matches!(ev, ClientEvent::Snapshot(_));
+                        let global_resync = matches!(&ev, ClientEvent::ResyncNeeded { .. });
+                        let snapshot_landed = matches!(&ev, ClientEvent::Snapshot { .. });
+                        let reset_deferred = matches!(
+                            &ev,
+                            ClientEvent::Disconnected { .. } | ClientEvent::Reconnecting { .. }
+                        );
+                        let pending_attach = state.pending_attach.is_some();
                         let now = Instant::now();
-                        state.apply_client_event(ev, now);
-                        // A dropped daemon event leaves the rail stale — the
-                        // debounced snapshot resync is the heal (at most one
-                        // in flight; see `take_resync_request`).
-                        if let Some(req) = state.take_resync_request(now) {
-                            dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                        let snapshot_applied = state.apply_client_event(ev, now);
+                        if reset_deferred && snapshot_applied {
+                            state.session.cancel_deferred_work();
+                            clear_list_loading(&mut state);
+                        }
+                        dispatch_pending_attach_retry(&mut state, &client, &bg_tx);
+                        let reconnect_boundary = snapshot_landed
+                            && snapshot_applied
+                            && state.take_reconnect_snapshot_boundary();
+                        if let Some(action) = take_resync_action(&mut state, now) {
+                            dispatch_action(action, &mut state, &client, &bg_tx);
+                        }
+                        for action in take_global_resync_actions(
+                            &mut state,
+                            (global_resync && snapshot_applied) || reconnect_boundary,
+                        ) {
+                            dispatch_global_refresh_action(action, &mut state, &client, &bg_tx);
+                        }
+                        for action in snapshot_actions_after_apply(
+                            &mut state,
+                            pending_attach,
+                            snapshot_landed,
+                            snapshot_applied,
+                        ) {
+                            dispatch_action(action, &mut state, &client, &bg_tx);
                         }
                         if let Some(req) = state.drain_prompt_queue() {
                             dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
                         }
-                        if snapshot_landed {
-                            // A reconnect snapshot can land while requests
-                            // sat queued behind a missing session — flush
-                            // them now that one is attached.
-                            while let Some(req) = state.pending_requests.pop_front() {
-                                dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
-                            }
+                        if let Some(sequence) = state.drain_pending_sequence() {
+                            dispatch_action(
+                                prompt_batch_action(sequence),
+                                &mut state,
+                                &client,
+                                &bg_tx,
+                            );
                         }
                     }
                     None => {
@@ -579,7 +899,9 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
                         Event::Key(key) => handle_key(&mut state, key, Instant::now()),
                         Event::Mouse(mouse) => handle_mouse(&mut state, mouse, &last_layout),
                         Event::Paste(text) => {
-                            crate::paste::handle_paste(&mut state, text, Instant::now())
+                            let now = Instant::now();
+                            let text = bound_paste(&mut state, text, now);
+                            crate::paste::handle_paste(&mut state, text, now)
                         }
                         Event::Resize(w, h) => {
                             state.cols = w;
@@ -597,16 +919,29 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             bg_res = bg_rx.recv() => {
                 if let Some(res) = bg_res {
                     let actions = handle_bg_response(res, &mut state);
+                    dispatch_pending_attach_retry(&mut state, &client, &bg_tx);
                     for act in actions {
                         dispatch_action(act, &mut state, &client, &bg_tx);
+                    }
+                    if let Some(req) = state.drain_prompt_queue() {
+                        dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                    }
+                    if let Some(sequence) = state.drain_pending_sequence() {
+                        dispatch_action(
+                            prompt_batch_action(sequence),
+                            &mut state,
+                            &client,
+                            &bg_tx,
+                        );
                     }
                 }
             }
             detected = hz_rx.recv() => {
-                if let Some(hz) = detected {
+                if let Some((generation, hz)) = detected
+                    && frame_clock.accept_probe(generation, hz)
+                {
                     crate::timing::mark(timing, "refresh_hz_detect", t_probe);
-                    detected_hz = hz;
-                    frame_interval = ups.frame_interval(hz);
+                    frame_interval = frame_clock.interval;
                 }
             }
             _ = stream_sleep => {
@@ -620,7 +955,8 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
                 if state.rail.has_live_agents() || state.rail.has_running_tasks() {
                     state.dirty = true;
                 }
-                if state.rail.update_idle(state.turn_active, now) {
+                let turn_active = state.turn_active;
+                if state.rail.update_idle(turn_active, now) {
                     state.dirty = true;
                 }
                 // Marks the frame dirty itself when the whole-second reading changed.
@@ -650,8 +986,8 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             _ = resync_sleep => {
                 // The debounce window closed with a want still armed — the
                 // send gate inside re-checks attachment and connection.
-                if let Some(req) = state.take_resync_request(Instant::now()) {
-                    dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                if let Some(action) = take_resync_action(&mut state, Instant::now()) {
+                    dispatch_action(action, &mut state, &client, &bg_tx);
                 }
             }
         }
@@ -670,15 +1006,121 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     }
     drop(events);
     drop(bg_rx);
-    if let Ok(c) = Arc::try_unwrap(client) {
-        c.close().await;
+    match Arc::try_unwrap(client) {
+        Ok(client) => client.close().await,
+        Err(client) => {
+            log::warn!(
+                "client close skipped: {} outstanding Arc clone(s)",
+                Arc::strong_count(&client).saturating_sub(1)
+            );
+            drop(client);
+        }
     }
     // A failed startup attach propagated through `state.attach_error` — the
     // CLI prints it the same way the old synchronous `?` did.
     if let Some(err) = state.attach_error.take() {
         return Err(err.into());
     }
+    if matches!(
+        state.connection,
+        crate::state::Connection::Disconnected { .. }
+    ) {
+        return Err(pacode_client::ClientError::Disconnected.into());
+    }
     Ok(attached_session)
+}
+
+fn prompt_gate_open(state: &AppState) -> bool {
+    state.meta.is_some()
+        && matches!(state.connection, crate::state::Connection::Connected)
+        && !state.awaiting_snapshot
+        && !state.resync_want
+        && !state.turn_active
+        && state.user_msgs_in_flight == 0
+        && !state.turn_boundary_pending
+}
+
+/// A terminal hands over a bracketed paste of any size in one event, and every
+/// step downstream — the prompt's normalize pass, vim's `Vec<char>` — walks
+/// the whole payload. Cut it at the prompt's own cap here, so the loop never
+/// touches more than the cap and the loss is reported instead of silent.
+fn bound_paste(state: &mut AppState, text: String, now: Instant) -> String {
+    let cap = crate::paste::PASTE_MAX_CHARS;
+    if text.chars().nth(cap).is_none() {
+        return text;
+    }
+    log::warn!(
+        "pasted text truncated to {cap} chars ({} bytes)",
+        text.len()
+    );
+    state.push_toast(
+        ToastLevel::Warn,
+        format!("Pasted text truncated to {cap} chars"),
+        Some(format!("{} bytes received", text.len())),
+        now,
+    );
+    text.chars().take(cap).collect()
+}
+
+fn resolve_request(state: &mut AppState, request: Request) -> Request {
+    match request {
+        Request::UserMessage {
+            text,
+            images,
+            message_id,
+        } => {
+            let (text, resolved) =
+                crate::state::images::resolve_image_tokens(&state.pasted_images, &text);
+            if !resolved.is_empty() {
+                state.pasted_images.mark_submitted(&text);
+            }
+            let mut images = images;
+            images.extend(resolved);
+            Request::UserMessage {
+                text,
+                images,
+                message_id,
+            }
+        }
+        other => other,
+    }
+}
+
+fn queue_user_message_request(state: &mut AppState, request: Request) {
+    let Request::UserMessage { text, .. } = request else {
+        return;
+    };
+    if state.input.queue_push(text.clone()) {
+        state.dirty = true;
+        return;
+    }
+    state.input.restore_text(text);
+    state.push_toast(
+        ToastLevel::Warn,
+        "Prompt queue full".to_string(),
+        Some(format!(
+            "Maximum {} prompts queued",
+            crate::state::input::PROMPT_QUEUE_CAP
+        )),
+        Instant::now(),
+    );
+}
+
+fn queue_sequence(state: &mut AppState, requests: Vec<Request>, text: String) {
+    if state.session.queue_sequence(PromptBatch { requests }) {
+        state.dirty = true;
+        return;
+    }
+    state.input.restore_text(text);
+    state.push_toast(
+        ToastLevel::Warn,
+        "Prompt queue full".to_string(),
+        Some(format!(
+            "Maximum {} prompts queued",
+            crate::state::input::PROMPT_QUEUE_CAP
+        )),
+        Instant::now(),
+    );
 }
 
 fn dispatch_action(
@@ -687,45 +1129,165 @@ fn dispatch_action(
     client: &Arc<Client>,
     bg_tx: &mpsc::UnboundedSender<BgResponse>,
 ) {
+    dispatch_action_inner(act, state, client, bg_tx, false);
+}
+
+fn dispatch_global_refresh_action(
+    act: Action,
+    state: &mut AppState,
+    client: &Arc<Client>,
+    bg_tx: &mpsc::UnboundedSender<BgResponse>,
+) {
+    dispatch_action_inner(act, state, client, bg_tx, true);
+}
+
+fn dispatch_action_inner(
+    act: Action,
+    state: &mut AppState,
+    client: &Arc<Client>,
+    bg_tx: &mpsc::UnboundedSender<BgResponse>,
+    global_refresh: bool,
+) {
     match act {
         Action::Quit => {
-            // Nothing queued behind the attach will ever be sent.
             state.pending_requests.clear();
+            state.pending_attach = None;
+            state.attach_in_flight = false;
+            state.invalidate_bash_run();
             state.quit = true;
         }
-        Action::Send(req) => {
-            // Resolve `[Image N]` paste tokens into `@<path>` text refs plus
-            // `ImageSource` entries (spec §1). This intercept covers every
-            // submit path: direct submit, `drain_prompt_queue`, plugin sends.
-            let req = match req {
-                Request::UserMessage { text, images } => {
-                    let (text, resolved) =
-                        crate::state::images::resolve_image_tokens(&state.pasted_images, &text);
-                    if !resolved.is_empty() {
-                        state.pasted_images.mark_submitted(&text);
-                    }
-                    let mut images = images;
-                    images.extend(resolved);
-                    Request::UserMessage { text, images }
-                }
-                other => other,
+        Action::SwitchSession { attach } => {
+            if state.pending_attach.as_ref().is_some_and(|pending| {
+                pending.attach == attach && (pending.retry_requested || state.attach_in_flight)
+            }) {
+                return;
+            }
+            if state.meta.is_some() {
+                state.leave_active_slot();
+            }
+            if state
+                .pending_attach
+                .as_ref()
+                .is_none_or(|pending| pending.attach != attach)
+            {
+                state.begin_attach(attach.clone());
+            }
+            if state.attach_in_flight {
+                return;
+            }
+            let attach_client_context = client.event_context();
+            let token = state
+                .set_pending_attach_client_epoch(
+                    attach_client_context.session_epoch.wrapping_add(1),
+                )
+                .expect("pending attach must exist");
+            let attach_epoch = state
+                .pending_attach_epoch_signal()
+                .expect("pending attach epoch must exist");
+            attach_epoch.store(
+                attach_client_context.session_epoch.wrapping_add(1),
+                Ordering::Release,
+            );
+            let context = state.session_context();
+            spawn_attach_request(
+                state,
+                client,
+                bg_tx,
+                AttachRequest {
+                    context,
+                    token,
+                    request_client_context: attach_client_context,
+                    attach,
+                    kind: AttachRequestKind::Switch,
+                    timing_started: None,
+                },
+            );
+        }
+        Action::SendSequence { requests } => {
+            let user_text = match requests.as_slice() {
+                [Request::DetachTurn, Request::UserMessage { text, .. }] => text.clone(),
+                _ => return,
             };
-            // While no session is attached there is nothing for a
-            // session-bound request to land on — it waits in
-            // `pending_requests` and flushes when the snapshot arrives.
-            // Global requests (lists, auth, MCP, a second `Attach`) fly now.
-            if state.meta.is_none() && request_needs_session(&req) {
+            if state.meta.is_none()
+                || !matches!(state.connection, crate::state::Connection::Connected)
+                || state.awaiting_snapshot
+                || state.resync_want
+                || state.user_msgs_in_flight > 0
+                || state.turn_boundary_pending
+                || state.initial_prompt.is_some()
+                || state.has_retry_request()
+            {
+                queue_sequence(state, requests, user_text);
+                return;
+            }
+            let client_context = client.event_context();
+            if client_context.session.is_none() {
+                queue_sequence(state, requests, user_text);
+                return;
+            }
+            let requests = requests
+                .into_iter()
+                .map(|request| resolve_request(state, request))
+                .collect::<Vec<_>>();
+            let context = state.session_context();
+            let Some(ticket) = state
+                .session
+                .begin_user_message_sequence(context, PromptBatch { requests })
+            else {
+                state.input.restore_text(user_text);
+                return;
+            };
+            let Some(request) = ticket.sequence.requests.first().cloned() else {
+                fail_prompt_batch(state, ticket.id);
+                return;
+            };
+            spawn_prompt_batch_step(client, bg_tx, ticket, request, client_context);
+        }
+        Action::ContinuePromptBatch { id } => {
+            let Some(ticket) = state.session.user_message_ticket(id) else {
+                return;
+            };
+            if state.meta.is_none()
+                || !matches!(state.connection, crate::state::Connection::Connected)
+                || state.awaiting_snapshot
+                || state.resync_want
+            {
+                fail_prompt_batch(state, id);
+                return;
+            }
+            let client_context = client.event_context();
+            if client_context.session.is_none() {
+                fail_prompt_batch(state, id);
+                return;
+            }
+            let Some(request) = ticket.sequence.requests.first().cloned() else {
+                fail_prompt_batch(state, id);
+                return;
+            };
+            spawn_prompt_batch_step(client, bg_tx, ticket, request, client_context);
+        }
+        Action::Send(req) => {
+            let is_user_message = matches!(&req, Request::UserMessage { .. });
+            let is_resync = matches!(&req, Request::GetSnapshot);
+            let session_bound = request_needs_session(&req);
+            if is_user_message && (state.initial_prompt.is_some() || !prompt_gate_open(state)) {
+                queue_user_message_request(state, req);
+                return;
+            }
+            if session_bound && (state.meta.is_none() || (state.awaiting_snapshot && !is_resync)) {
                 queue_pending_request(state, req);
                 return;
             }
-            // §8.2: a list request marks its section in-flight (the pickers
-            // show `loading…` until the reply clears it).
+            let client_context = client.event_context();
+            if session_bound && client_context.session.is_none() {
+                defer_unbound_request(state, req);
+                return;
+            }
+            let mut req = resolve_request(state, req);
             let kind = crate::cache::ListKind::for_request(&req);
             if let Some(kind) = kind {
                 state.lists.mark_sent(kind);
             }
-            // §8.2 invalidation: a mutation drops the affected list's file
-            // now; the follow-up `ListX` reply rewrites it.
             match &req {
                 Request::InstallPlugin { .. } | Request::UninstallPlugin { .. } => {
                     state.invalidate_cache(crate::cache::ListKind::Plugins);
@@ -735,20 +1297,65 @@ fn dispatch_action(
                     state.invalidate_cache(crate::cache::ListKind::McpServers);
                     state.invalidate_cache(crate::cache::ListKind::Commands);
                 }
+                // A git request that waited in the pending queue arrives here
+                // instead of through `Action::GitLog`, so it takes the same
+                // loading flags — a page must not be applied as a first page.
+                Request::GitLog { after } => state.git.begin_log(after.as_deref()),
                 _ => {}
             }
-            // `GetSnapshot` only ever flies as a seq-gap resync — it reports
-            // on its own variant so a failed one clears `resync_in_flight`
-            // instead of sticking it forever.
-            let is_resync = matches!(req, Request::GetSnapshot);
+            let session_context = state.session_context();
+            let scope = (!is_user_message).then(|| {
+                reply_scope(
+                    &req,
+                    session_context.clone(),
+                    client_context.clone(),
+                    state.ui_context(),
+                )
+            });
+            let ticket = match &req {
+                Request::UserMessage { .. } => Some(
+                    state
+                        .session
+                        .begin_user_message(session_context, req.clone()),
+                ),
+                _ => None,
+            };
+            if let Some(ticket) = ticket.as_ref() {
+                req = ticket.request.clone();
+            }
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
-                let res = cl.request(req).await;
-                if is_resync {
-                    let _ = tx.send(BgResponse::ResyncDone(res));
+                let res = if session_bound {
+                    cl.request_session_for(client_context.clone(), req).await
                 } else {
-                    let _ = tx.send(BgResponse::Reply { kind, res });
+                    cl.request(req).await
+                };
+                if let Some(ticket) = ticket {
+                    let _ = tx.send(BgResponse::UserMessageDone {
+                        ticket,
+                        client_context,
+                        result: res,
+                    });
+                } else if is_resync {
+                    if let Some(ReplyScope::Session {
+                        context,
+                        client_context,
+                    }) = scope
+                    {
+                        let _ = tx.send(BgResponse::ResyncDone {
+                            context,
+                            client_context,
+                            result: res,
+                        });
+                    }
+                } else if let Some(scope) = scope {
+                    let _ = tx.send(BgResponse::Reply {
+                        scope,
+                        kind,
+                        global_refresh,
+                        res,
+                    });
                 }
             });
         }
@@ -797,22 +1404,39 @@ fn dispatch_action(
             state.dirty = true;
         }
         Action::RunBashCaptured { command } => {
+            if state.awaiting_snapshot {
+                return;
+            }
             log::info!("bash-mode captured start: {command}");
+            let context = state.session_context();
+            let client_context = client.event_context();
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-            state.running_bash = Some(cancel_tx);
+            let run_id = state.start_bash_run(cancel_tx);
             state.dirty = true;
             let tx = bg_tx.clone();
             let cwd = state.cwd();
             tokio::spawn(async move {
-                let res = crate::bash::run_captured(&command, &cwd, cancel_rx).await;
-                let _ = tx.send(BgResponse::BashCompleted(res));
+                let result = crate::bash::run_captured(&command, &cwd, cancel_rx).await;
+                let _ = tx.send(BgResponse::BashCompleted {
+                    run_id,
+                    context,
+                    client_context,
+                    result,
+                });
             });
         }
         Action::GitLog { after } => {
+            if state.awaiting_snapshot {
+                queue_pending_request(state, Request::GitLog { after });
+                return;
+            }
             if state.meta.is_none() {
-                // No session yet — the fetch would only earn "not attached".
-                // The post-attach batch sends a fresh `GitLog` anyway, and a
-                // page want re-arms on the next `dispatch_deferred` pass.
+                return;
+            }
+            let context = state.session_context();
+            let client_context = client.event_context();
+            if client_context.session.is_none() {
+                queue_pending_request(state, Request::GitLog { after });
                 return;
             }
             state.git.begin_log(after.as_deref());
@@ -821,84 +1445,134 @@ fn dispatch_action(
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
-                let res = cl.request(Request::GitLog { after }).await;
+                let res = cl
+                    .request_session_for(client_context.clone(), Request::GitLog { after })
+                    .await;
                 let _ = tx.send(BgResponse::Reply {
+                    scope: ReplyScope::Session {
+                        context,
+                        client_context,
+                    },
                     kind: Some(crate::cache::ListKind::GitLog),
+                    global_refresh: false,
                     res,
                 });
             });
         }
         Action::GitShow { hash } => {
+            if state.awaiting_snapshot {
+                state.git.show_in_flight = None;
+                return;
+            }
             if state.meta.is_none() {
-                // `dispatch_deferred` already marked the want in flight —
-                // undo so it re-arms and refires once a session exists.
+                state.git.show_in_flight = None;
+                return;
+            }
+            let context = state.session_context();
+            let client_context = client.event_context();
+            if client_context.session.is_none() {
                 state.git.show_in_flight = None;
                 return;
             }
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
-                let res = cl.request(Request::GitShow { hash: hash.clone() }).await;
-                let _ = tx.send(BgResponse::GitShowReady { hash, res });
+                let res = cl
+                    .request_session_for(
+                        client_context.clone(),
+                        Request::GitShow { hash: hash.clone() },
+                    )
+                    .await;
+                let _ = tx.send(BgResponse::GitShowReady {
+                    context,
+                    client_context,
+                    hash,
+                    res,
+                });
             });
         }
         Action::GitDiff { hash } => {
-            if state.meta.is_none() {
-                // A deliberate `enter` — queue it: the `Reply::GitDiff`
-                // lands via `handle_reply` and fills the commit-diff panel.
+            if state.meta.is_none() || state.awaiting_snapshot {
+                queue_pending_request(state, Request::GitDiff { hash });
+                return;
+            }
+            let context = state.session_context();
+            let client_context = client.event_context();
+            if client_context.session.is_none() {
                 queue_pending_request(state, Request::GitDiff { hash });
                 return;
             }
             let cl = Arc::clone(client);
             let tx = bg_tx.clone();
             tokio::spawn(async move {
-                let res = cl.request(Request::GitDiff { hash: hash.clone() }).await;
-                let _ = tx.send(BgResponse::GitDiffReady { hash, res });
+                let res = cl
+                    .request_session_for(
+                        client_context.clone(),
+                        Request::GitDiff { hash: hash.clone() },
+                    )
+                    .await;
+                let _ = tx.send(BgResponse::GitDiffReady {
+                    context,
+                    client_context,
+                    hash,
+                    res,
+                });
             });
         }
         Action::LoadPanel => {
-            if state.meta.is_none() {
-                // Panel targets only exist once a session is attached.
+            if state.meta.is_none() || state.awaiting_snapshot {
                 return;
             }
-            if let Some(ref target) = state.panel.target {
-                let target = target.clone();
-                // The MCP log is read locally off the daemon log file by
-                // `menu::mcp` — there is no daemon request behind the target.
-                let request = match &target {
-                    PanelTarget::Agent(id) => Some(Request::GetHistory {
-                        agent: id.clone(),
-                        before_seq: None,
-                        limit: 300,
-                    }),
-                    PanelTarget::Task(id) => Some(Request::GetTaskOutput {
-                        task: id.clone(),
-                        tail_lines: 300,
-                    }),
-                    // The MCP log and the file diff are produced locally; the
-                    // commit diff was already requested by the Git level's
-                    // `enter` — `LoadPanel` fires for neither.
-                    PanelTarget::McpServer(_)
-                    | PanelTarget::FileDiff { .. }
-                    | PanelTarget::CommitDiff { .. } => None,
-                };
-                if let Some(request) = request {
-                    let cl = Arc::clone(client);
-                    let tx = bg_tx.clone();
-                    tokio::spawn(async move {
-                        let res = cl.request(request).await;
-                        let _ = tx.send(BgResponse::LoadPanelReply {
-                            target,
-                            result: res,
-                        });
-                    });
-                }
+            let context = state.session_context();
+            let client_context = client.event_context();
+            if client_context.session.is_none() {
+                return;
             }
+            let Some(target) = state.panel.target.clone() else {
+                return;
+            };
+            let request = match &target {
+                PanelTarget::Agent(id) => Some(Request::GetHistory {
+                    agent: id.clone(),
+                    before_seq: None,
+                    limit: 300,
+                }),
+                PanelTarget::Task(id) => Some(Request::GetTaskOutput {
+                    task: id.clone(),
+                    tail_lines: 300,
+                }),
+                PanelTarget::McpServer(_)
+                | PanelTarget::FileDiff { .. }
+                | PanelTarget::CommitDiff { .. } => None,
+            };
+            let Some(request) = request else {
+                return;
+            };
+            let Some(token) = begin_panel_load(&context, &target) else {
+                return;
+            };
+            let cl = Arc::clone(client);
+            let tx = bg_tx.clone();
+            tokio::spawn(async move {
+                let result = cl
+                    .request_session_for(client_context.clone(), request)
+                    .await;
+                let _ = tx.send(BgResponse::LoadPanelReply {
+                    context,
+                    client_context,
+                    target,
+                    token,
+                    result,
+                });
+            });
         }
         Action::LoadHistory => {
-            if state.meta.is_none() {
-                // `has_more_history` only ever comes from a snapshot, so this
-                // cannot fire pre-attach anyway — defensive early return.
+            if state.meta.is_none() || state.awaiting_snapshot || state.transcript.loading_history {
+                return;
+            }
+            let context = state.session_context();
+            let client_context = client.event_context();
+            if client_context.session.is_none() {
                 return;
             }
             let cl = Arc::clone(client);
@@ -908,14 +1582,22 @@ fn dispatch_action(
             log::debug!("history page requested: before_seq={first_cell_id:?}, limit={limit}");
             state.transcript.loading_history = true;
             tokio::spawn(async move {
-                let res = cl
-                    .request(Request::GetHistory {
-                        agent: AgentId::main(),
-                        before_seq: first_cell_id,
-                        limit,
-                    })
+                let result = cl
+                    .request_session_for(
+                        client_context.clone(),
+                        Request::GetHistory {
+                            agent: AgentId::main(),
+                            before_seq: first_cell_id,
+                            limit,
+                        },
+                    )
                     .await;
-                let _ = tx.send(BgResponse::LoadHistoryReply { result: res });
+                let _ = tx.send(BgResponse::LoadHistoryReply {
+                    context,
+                    client_context,
+                    before_seq: first_cell_id,
+                    result,
+                });
             });
         }
     }
@@ -935,6 +1617,7 @@ fn request_needs_session(req: &Request) -> bool {
         | Request::Ping
         // `Core::handle_global` — no session needed.
         | Request::ListSessions { .. }
+        | Request::RuntimeStats
         | Request::ListModels
         | Request::RefreshModels
         | Request::ListMcpServers
@@ -953,6 +1636,7 @@ fn request_needs_session(req: &Request) -> bool {
         Request::UserMessage { .. }
         | Request::Interrupt
         | Request::InterruptAll
+        | Request::CloseSession
         | Request::PermissionReply { .. }
         | Request::ExplainPermission { .. }
         | Request::SetModel(_)
@@ -982,9 +1666,131 @@ fn request_needs_session(req: &Request) -> bool {
     }
 }
 
-/// Queue a session-bound request until a session attaches. Bounded: a flood
-/// drops the oldest entry rather than growing without limit.
+fn request_needs_reply_ui_context(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::GetMcpPrompt { .. } | Request::RunPluginCommand { .. }
+    )
+}
+
+fn reply_scope(
+    req: &Request,
+    session_context: SessionContext,
+    client_context: ClientEventContext,
+    ui_context: crate::state::UiContext,
+) -> ReplyScope {
+    if request_needs_session(req) {
+        return ReplyScope::Session {
+            context: session_context,
+            client_context,
+        };
+    }
+    if request_needs_reply_ui_context(req) {
+        return ReplyScope::Ui {
+            context: ui_context,
+        };
+    }
+    ReplyScope::Global {
+        context: ui_context,
+    }
+}
+
+fn session_reply_is_current(
+    state: &AppState,
+    context: &SessionContext,
+    client_context: &ClientEventContext,
+) -> bool {
+    state.context_is_current(context) && state.event_context_is_current(client_context)
+}
+
+fn deferred_reply_is_current(
+    state: &AppState,
+    context: &SessionContext,
+    client_context: &ClientEventContext,
+) -> bool {
+    state.context_is_current(context)
+        && (client_context.session.is_none() || state.event_context_is_current(client_context))
+}
+
+fn reply_scope_is_current(state: &AppState, scope: &ReplyScope) -> bool {
+    match scope {
+        ReplyScope::Global { context } | ReplyScope::Ui { context } => {
+            state.ui_context_is_current(context)
+        }
+        ReplyScope::Session {
+            context,
+            client_context,
+        } => session_reply_is_current(state, context, client_context),
+    }
+}
+
+fn clear_list_loading(state: &mut AppState) {
+    state.lists.models.in_flight = false;
+    state.lists.plugins.in_flight = false;
+    state.lists.marketplace.in_flight = false;
+    state.lists.mcp.in_flight = false;
+    state.lists.sessions.in_flight = false;
+    state.lists.git.in_flight = false;
+}
+
+fn take_resync_action(state: &mut AppState, now: Instant) -> Option<Action> {
+    let request = state.take_resync_request(now)?;
+    clear_list_loading(state);
+    Some(Action::Send(request))
+}
+
+fn take_global_resync_actions(state: &mut AppState, requested: bool) -> Vec<Action> {
+    if !requested
+        || state.meta.is_none()
+        || state.pending_attach.is_some()
+        || !matches!(state.connection, crate::state::Connection::Connected)
+    {
+        return Vec::new();
+    }
+    let context = state.ui_context();
+    if state.global_refresh_context_is_current(context) {
+        return Vec::new();
+    }
+    // A list already waiting in the pending queue is about to be asked for by
+    // the attach/snapshot flush, so the refresh must not ask a second time.
+    let queued: Vec<crate::cache::ListKind> = state
+        .pending_requests
+        .iter()
+        .filter_map(crate::cache::ListKind::for_request)
+        .collect();
+    let actions = global_resync_actions()
+        .into_iter()
+        .filter(|action| match action {
+            Action::Send(request) => crate::cache::ListKind::for_request(request)
+                .is_none_or(|kind| !queued.contains(&kind) && !state.lists.get(kind).in_flight),
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if !state.begin_global_refresh(actions.len()) {
+        return Vec::new();
+    }
+    state.record_global_refresh_context(context);
+    actions
+}
+
+fn release_failed_resync(state: &mut AppState, now: Instant) -> Vec<Action> {
+    state.release_resync_barrier(true, now);
+    state
+        .drain_prompt_queue()
+        .map(Action::Send)
+        .into_iter()
+        .collect()
+}
+
+fn attach_error_is_transient(error: &pacode_client::ClientError) -> bool {
+    matches!(error, pacode_client::ClientError::Disconnected)
+}
+
 fn queue_pending_request(state: &mut AppState, req: Request) {
+    if state.pending_requests.contains(&req) {
+        log::debug!("pending request already queued: {}", req.name());
+        return;
+    }
     if state.pending_requests.len() >= PENDING_REQUESTS_CAP {
         let dropped = state.pending_requests.pop_front();
         log::warn!(
@@ -994,6 +1800,41 @@ fn queue_pending_request(state: &mut AppState, req: Request) {
     state.pending_requests.push_back(req);
 }
 
+/// A request the daemon cannot serve yet: the client holds no session for it,
+/// so it waits for the next attach instead of vanishing. Losing it silently
+/// strands whatever the user is blocked on — a permission reply, a question
+/// answer, a cron edit.
+fn defer_unbound_request(state: &mut AppState, req: Request) {
+    let is_user_message = matches!(&req, Request::UserMessage { .. });
+    let is_resync = matches!(&req, Request::GetSnapshot);
+    if is_user_message {
+        queue_user_message_request(state, req);
+    } else if is_resync {
+        state.release_resync_barrier(false, Instant::now());
+    } else {
+        queue_pending_request(state, req);
+    }
+}
+
+/// Actions dispatched as one batch: the same request twice in a batch is one
+/// request, not two. Post-attach flushes drain the pending queue and then ask
+/// for the same lists again, and a plugin command can repeat its own send.
+fn dedup_actions(actions: Vec<Action>) -> Vec<Action> {
+    let mut seen: Vec<Request> = Vec::new();
+    let mut out: Vec<Action> = Vec::with_capacity(actions.len());
+    for action in actions {
+        if let Action::Send(ref request) = action {
+            if seen.contains(request) {
+                log::debug!("duplicate request in one batch: {}", request.name());
+                continue;
+            }
+            seen.push(request.clone());
+        }
+        out.push(action);
+    }
+    out
+}
+
 /// Fold an attach/snapshot reply into state: record the slot, apply the
 /// snapshot, flush requests queued while no session existed, and re-fetch
 /// the git list on a project switch (§8.2). Shared by `Reply::Attached`/
@@ -1001,21 +1842,70 @@ fn queue_pending_request(state: &mut AppState, req: Request) {
 fn apply_attach_snapshot(
     state: &mut AppState,
     snapshot: pacode_types::SessionSnapshot,
+    context: &SessionContext,
+    token: u64,
+    client_context: &ClientEventContext,
+    attach: &Attach,
+) -> Option<Vec<Action>> {
+    if !state.accepts_attach_with_token(context, token, client_context, attach, &snapshot) {
+        return None;
+    }
+    state.pending_attach = None;
+    state.accept_attach_context(client_context);
+    Some(apply_snapshot_and_actions(state, snapshot))
+}
+
+fn apply_scoped_snapshot(
+    state: &mut AppState,
+    snapshot: pacode_types::SessionSnapshot,
+    context: &SessionContext,
 ) -> Vec<Action> {
-    // §8.2 project switch: a new cwd means the old project's git list must
-    // not linger — `apply_client_event` resets the state and the
-    // per-project cache key does the file side. Re-fetch for the new
-    // project so the submenu is populated when opened.
+    if !state.context_is_current(context)
+        || state
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.id != snapshot.meta.id)
+    {
+        return Vec::new();
+    }
+    apply_snapshot_and_actions(state, snapshot)
+}
+
+fn apply_resync_snapshot(
+    state: &mut AppState,
+    snapshot: pacode_types::SessionSnapshot,
+    context: &SessionContext,
+    client_context: &ClientEventContext,
+) -> Option<Vec<Action>> {
+    if !state.context_is_current(context)
+        || snapshot.seq < state.last_event_seq.unwrap_or(0)
+        || !state.accepts_event_snapshot(client_context, &snapshot)
+    {
+        return None;
+    }
     let project_changed = state
         .meta
         .as_ref()
-        .is_some_and(|m| m.cwd != snapshot.meta.cwd);
-    // The slot summary is recorded inside the `Snapshot` fold.
-    state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
-    state.dirty = true;
-    // Session-bound requests queued while `meta` was empty — the startup
-    // attach gap, or between Detach and Attach on a slot switch — go out
-    // in order now that a session exists.
+        .is_some_and(|meta| meta.cwd != snapshot.meta.cwd);
+    if !state.apply_snapshot(snapshot, Instant::now()) {
+        return None;
+    }
+    let mut actions: Vec<Action> = state.pending_requests.drain(..).map(Action::Send).collect();
+    if project_changed {
+        actions.push(Action::GitLog { after: None });
+    }
+    Some(actions)
+}
+
+fn apply_snapshot_and_actions(
+    state: &mut AppState,
+    snapshot: pacode_types::SessionSnapshot,
+) -> Vec<Action> {
+    let project_changed = state
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.cwd != snapshot.meta.cwd);
+    state.apply_snapshot(snapshot, Instant::now());
     let mut actions: Vec<Action> = state.pending_requests.drain(..).map(Action::Send).collect();
     if project_changed {
         actions.push(Action::GitLog { after: None });
@@ -1023,32 +1913,110 @@ fn apply_attach_snapshot(
     actions
 }
 
-/// Service the work items the draw path recorded this pass: completion scans,
-/// image preview/thumbnail renders, the stashed clipboard copy. Everything
+fn global_resync_actions() -> Vec<Action> {
+    vec![
+        Action::Send(Request::ListPlugins),
+        Action::Send(Request::ListMcpServers),
+        Action::Send(Request::ListSessions { limit: 50 }),
+        Action::Send(Request::ListModels),
+        Action::Send(Request::ListAuth),
+    ]
+}
+
+fn post_attach_actions(state: &mut AppState) -> Vec<Action> {
+    let mut actions = Vec::new();
+    if prompt_gate_open(state)
+        && let Some(prompt) = state.initial_prompt.take()
+    {
+        actions.push(Action::Send(Request::UserMessage {
+            text: prompt,
+            images: Vec::new(),
+            message_id: None,
+        }));
+    }
+    actions.extend([
+        Action::Send(Request::ListPlugins),
+        Action::Send(Request::ListMcpServers),
+        Action::Send(Request::ListSessions { limit: 50 }),
+        Action::Send(Request::ListModels),
+        Action::GitLog { after: None },
+    ]);
+    if !state.config.plugins.marketplace.is_empty() {
+        let source = state.config.plugins.marketplace.clone();
+        actions.push(Action::Send(Request::BrowseMarketplace {
+            source,
+            query: String::new(),
+        }));
+    }
+    actions
+}
+
+fn flush_completed_attach(state: &mut AppState, had_pending_attach: bool) -> Vec<Action> {
+    if !had_pending_attach || state.pending_attach.is_some() {
+        return Vec::new();
+    }
+    let mut actions: Vec<Action> = state.pending_requests.drain(..).map(Action::Send).collect();
+    actions.extend(post_attach_actions(state));
+    actions
+}
+
+fn snapshot_actions_after_apply(
+    state: &mut AppState,
+    had_pending_attach: bool,
+    snapshot_landed: bool,
+    snapshot_applied: bool,
+) -> Vec<Action> {
+    if !snapshot_landed || !snapshot_applied {
+        return Vec::new();
+    }
+    if had_pending_attach && state.pending_attach.is_none() {
+        return flush_completed_attach(state, true);
+    }
+    state.pending_requests.drain(..).map(Action::Send).collect()
+}
+
+/// Service the work items recorded before paint: completion scans, image
+/// preview/thumbnail renders, the stashed clipboard copy. Everything
 /// lands on `spawn_blocking` — the frame path itself stays clean (§8.1).
 /// Daemon-bound wants return as actions for `dispatch_action` instead — they
 /// share the request's bookkeeping (`begin_log`, `mark_sent`).
 fn dispatch_deferred(
     state: &mut AppState,
     bg_tx: &mpsc::UnboundedSender<BgResponse>,
+    client: &Client,
 ) -> Vec<Action> {
+    if state.awaiting_snapshot {
+        return Vec::new();
+    }
     if let Some(key) = state.input.at_comp.claim_want() {
+        let context = state.session_context();
+        let client_context = client.event_context();
         let tx = bg_tx.clone();
         tokio::task::spawn_blocking(move || {
             let candidates = crate::at_complete::complete_at_path(&key.query, &key.cwd);
-            let _ = tx.send(BgResponse::AtCompleted { key, candidates });
+            let _ = tx.send(BgResponse::AtCompleted {
+                context,
+                client_context,
+                key,
+                candidates,
+            });
         });
     }
 
     if let Some(key) = state.input.bash_comp.claim_want() {
-        // The history snapshot rides along — the scan must not see the deque
-        // grow mid-read, and the key's `history_len` invalidates anyway.
+        let context = state.session_context();
+        let client_context = client.event_context();
         let history = state.input.bash_history.clone();
         let tx = bg_tx.clone();
         tokio::task::spawn_blocking(move || {
             let candidates =
                 crate::bash::complete::complete(&key.text, key.cursor, &history, &key.cwd);
-            let _ = tx.send(BgResponse::BashCompletionDone { key, candidates });
+            let _ = tx.send(BgResponse::BashCompletionDone {
+                context,
+                client_context,
+                key,
+                candidates,
+            });
         });
     }
 
@@ -1059,12 +2027,16 @@ fn dispatch_deferred(
         && state.files.cached_preview.as_ref().map(|c| &c.key) != Some(&want)
     {
         state.files.preview_in_flight = Some(want.clone());
+        let context = state.session_context();
+        let client_context = client.event_context();
         let cwd = state.cwd();
         let tx = bg_tx.clone();
         tokio::task::spawn_blocking(move || {
             let resolved = resolve_preview_path(&want.raw, &cwd);
             let text = crate::ui::menu::files::text_preview(&resolved);
             let _ = tx.send(BgResponse::FilePreviewReady {
+                context,
+                client_context,
                 key: want,
                 resolved,
                 text,
@@ -1080,18 +2052,19 @@ fn dispatch_deferred(
         && !state.files.statuses_in_flight
     {
         state.files.statuses_in_flight = true;
+        let context = state.session_context();
+        let client_context = client.event_context();
         let at_version = state.files.rows_version;
         let cwd = state.cwd();
         let paths: Vec<String> = state.files.rows.iter().map(|r| r.path.clone()).collect();
         let tx = bg_tx.clone();
         tokio::spawn(async move {
-            // A failed scan applies as an empty map — the labels simply stay
-            // off until the next row change (git missing / not a repo /
-            // timeout all look the same to the rows).
             let statuses = pacode_vcs::worktree_statuses(&cwd, &paths)
                 .await
                 .unwrap_or_default();
             let _ = tx.send(BgResponse::FileStatusesReady {
+                context,
+                client_context,
                 statuses,
                 at_version,
             });
@@ -1110,11 +2083,18 @@ fn dispatch_deferred(
         } else if state.files.diff_in_flight.is_none() {
             state.files.diff_want = None;
             state.files.diff_in_flight = Some(path.clone());
+            let context = state.session_context();
+            let client_context = client.event_context();
             let cwd = state.cwd();
             let tx = bg_tx.clone();
             tokio::spawn(async move {
                 let diff = pacode_vcs::file_diff(&cwd, &path).await;
-                let _ = tx.send(BgResponse::FileDiffReady { path, diff });
+                let _ = tx.send(BgResponse::FileDiffReady {
+                    context,
+                    client_context,
+                    path,
+                    diff,
+                });
             });
         }
     }
@@ -1132,10 +2112,14 @@ fn dispatch_deferred(
         // read — the want dies with the next draw's re-record.
         if let Some(path) = state.rail.task(&want.task).map(|t| t.output_path.clone()) {
             state.rail.task_tail_in_flight = Some(want.clone());
+            let context = state.session_context();
+            let client_context = client.event_context();
             let tx = bg_tx.clone();
             tokio::task::spawn_blocking(move || {
                 let (text, truncated) = crate::ui::menu::background::read_tail(&path);
                 let _ = tx.send(BgResponse::TaskTailReady {
+                    context,
+                    client_context,
                     tail: crate::state::rail::TaskTail {
                         task: want.task,
                         output_bytes: want.output_bytes,
@@ -1148,26 +2132,36 @@ fn dispatch_deferred(
     }
 
     // Pasted-image strip thumbnails: one job per missing/mismatched slot.
-    for (token, path, cell_w, cell_h) in std::mem::take(&mut state.image_strip.want) {
-        let k = (token, cell_w, cell_h);
+    let context = state.session_context();
+    let client_context = client.event_context();
+    let render_wants = std::mem::take(&mut state.image_strip.want);
+    let mut pending_wants = Vec::new();
+    for want in render_wants {
+        let k = (want.0, want.2, want.3);
         let already = state
             .image_strip
             .thumbs
-            .get(&token)
-            .is_some_and(|t| t.cell_w == cell_w && t.cell_h == cell_h);
+            .get(&want.0)
+            .is_some_and(|thumb| thumb.cell_w == want.2 && thumb.cell_h == want.3);
         if already || state.image_strip.in_flight.contains(&k) {
             continue;
         }
+        if !state.image_strip.can_start_render() {
+            if pending_wants.len() < crate::state::images::IMAGE_RENDER_MAX_WANTS {
+                pending_wants.push(want);
+            }
+            continue;
+        }
+        let (token, path, cell_w, cell_h) = want;
         state.image_strip.in_flight.insert(k);
+        let job_context = context.clone();
+        let job_client_context = client_context.clone();
         let tx = bg_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let req = pacode_image::PreviewRequest {
-                path,
-                cell_w,
-                cell_h,
-            };
-            let preview = pacode_image::render(&req, pacode_image::detect()).ok();
+            let preview = render_thumbnail(&path, cell_w, cell_h);
             let _ = tx.send(BgResponse::ThumbReady {
+                context: job_context,
+                client_context: job_client_context,
                 token,
                 cell_w,
                 cell_h,
@@ -1175,15 +2169,28 @@ fn dispatch_deferred(
             });
         });
     }
+    state.image_strip.want = pending_wants;
 
-    // The selection copy `ui::draw` prepared — OSC 52 + arboard, off-thread.
-    if let Some(copy) = state.pending_copy.take() {
+    // The selection copy prepared before paint — OSC 52 + arboard, off-thread.
+    if let Some(mut copy) = state.pending_copy.take() {
+        let original_chars = copy.text.chars().count();
+        if original_chars > crate::ui::COPY_MAX_CHARS {
+            copy.text = copy.text.chars().take(crate::ui::COPY_MAX_CHARS).collect();
+            log::warn!(
+                "clipboard copy truncated from {original_chars} to {} chars",
+                crate::ui::COPY_MAX_CHARS
+            );
+        }
+        let context = state.session_context();
+        let client_context = client.event_context();
         let tx = bg_tx.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = crate::clipboard::copy(&copy.text) {
                 log::warn!("clipboard copy failed: {e}");
             }
             let _ = tx.send(BgResponse::CopyDone {
+                context,
+                client_context,
                 auto: copy.auto,
                 chars: copy.text.chars().count(),
             });
@@ -1278,121 +2285,317 @@ fn resolve_preview_path(raw: &str, cwd: &std::path::Path) -> std::path::PathBuf 
     }
 }
 
-fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
-    match res {
-        BgResponse::AttachFinished(res) => match res {
-            Ok(snapshot) => {
-                let session_id = snapshot.meta.id.clone();
-                log::info!("TUI attached to session {session_id}");
-                let mut actions = apply_attach_snapshot(state, snapshot);
-                // Order matters: what the user typed during the gap first,
-                // then the `-p` prompt, then the §8.2 list batch — all only
-                // now that a session exists for them to land on.
-                if let Some(prompt) = state.initial_prompt.take() {
-                    actions.push(Action::Send(Request::UserMessage {
-                        text: prompt,
-                        images: Vec::new(),
-                    }));
-                }
-                // §8.2: every post-attach list refresh runs in parallel —
-                // none may block a frame. Each reply folds in independently,
-                // replaces its state section wholesale and rewrites its
-                // cache file. (`ListSkills` does not exist in the protocol:
-                // skills ride inside `PluginInfo.skill_dirs`.)
-                actions.extend([
-                    Action::Send(Request::ListPlugins),
-                    Action::Send(Request::ListMcpServers),
-                    Action::Send(Request::ListSessions { limit: 50 }),
-                    Action::Send(Request::ListModels),
-                    Action::GitLog { after: None },
-                ]);
-                if !state.config.plugins.marketplace.is_empty() {
-                    let source = state.config.plugins.marketplace.clone();
-                    actions.push(Action::Send(Request::BrowseMarketplace {
-                        source,
-                        query: String::new(),
-                    }));
-                }
-                actions
-            }
-            Err(err) => {
-                log::error!("startup attach failed: {err}");
-                state.push_notice_with_level(ToastLevel::Error, format!("attach failed: {err}"));
-                // Fail fast, exactly like the old synchronous attach: the
-                // loop exits on `quit` and `run` returns the error for the
-                // CLI to print.
-                state.attach_error = Some(err);
-                state.quit = true;
-                vec![]
-            }
+/// Decode one inline thumbnail, bounded by file size: a kitty/sixel escape
+/// carries the encoded image, and the frame path clones that payload on every
+/// frame, so a huge paste would cost megabytes per frame for a slot. Past the
+/// cap the slot answers `None` — the strip paints its placeholder and never
+/// re-arms — while the prompt still attaches the original file.
+fn render_thumbnail(
+    path: &std::path::Path,
+    cell_w: u16,
+    cell_h: u16,
+) -> Option<pacode_image::Preview> {
+    let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if size > IMAGE_THUMB_MAX_BYTES {
+        log::info!(
+            "inline thumbnail skipped: {} is {size} bytes (cap {IMAGE_THUMB_MAX_BYTES})",
+            path.display()
+        );
+        return None;
+    }
+    pacode_image::render(
+        &pacode_image::PreviewRequest {
+            path: path.to_path_buf(),
+            cell_w,
+            cell_h,
         },
-        BgResponse::Reply { kind, res } => {
-            // §8.2: the reply ends the in-flight mark; a successful one
-            // promotes the section to `Fresh`, a failed one leaves the cached
-            // copy — and its `offline copy` badge — alone.
+        pacode_image::detect(),
+    )
+    .ok()
+}
+
+fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
+    dedup_actions(fold_bg_response(res, state))
+}
+
+fn fold_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
+    match res {
+        BgResponse::AttachFinished {
+            context,
+            token,
+            request_client_context,
+            client_context,
+            attach,
+            result,
+        } => {
+            if request_client_context.connection_epoch > client_context.connection_epoch
+                || request_client_context.session_epoch > client_context.session_epoch
+            {
+                return Vec::new();
+            }
+            if !state.context_is_current(&context)
+                || state.pending_attach.as_ref().is_none_or(|pending| {
+                    pending.context != context || pending.attach != attach || pending.token != token
+                })
+            {
+                return Vec::new();
+            }
+            match result {
+                Ok(snapshot) => {
+                    let had_pending_attach = state.pending_attach.is_some();
+                    let Some(actions) = apply_attach_snapshot(
+                        state,
+                        snapshot,
+                        &context,
+                        token,
+                        &client_context,
+                        &attach,
+                    ) else {
+                        return Vec::new();
+                    };
+                    state.attach_in_flight = false;
+                    log::info!(
+                        "TUI attached to session {}",
+                        state
+                            .meta
+                            .as_ref()
+                            .map(|meta| meta.id.as_str())
+                            .unwrap_or("")
+                    );
+                    let mut ordered_actions = actions;
+                    ordered_actions.extend(flush_completed_attach(state, had_pending_attach));
+                    ordered_actions
+                }
+                Err(pacode_client::ClientError::Timeout(err)) => {
+                    state.attach_in_flight = false;
+                    if state.request_attach_retry() {
+                        log::warn!("session attach timed out; retrying the pending attempt: {err}");
+                        Vec::new()
+                    } else {
+                        log::error!("session attach retry limit reached: {err}");
+                        state.clear_pending_attach(format!("attach failed: {err}"));
+                        if context.generation == 0 && context.slot == 0 {
+                            state.attach_error = Some(pacode_client::ClientError::Timeout(err));
+                            state.quit = true;
+                        }
+                        Vec::new()
+                    }
+                }
+                Err(err) => {
+                    state.attach_in_flight = false;
+                    if attach_error_is_transient(&err) {
+                        log::warn!("session attach will retry after reconnect: {err}");
+                        return Vec::new();
+                    }
+                    let reason = err.to_string();
+                    state.clear_pending_attach(reason.clone());
+                    log::error!("session attach failed: {err}");
+                    state.push_notice_with_level(
+                        ToastLevel::Error,
+                        format!("attach failed: {reason}"),
+                    );
+                    if context.generation == 0 && context.slot == 0 {
+                        state.attach_error = Some(err);
+                        state.quit = true;
+                    }
+                    Vec::new()
+                }
+            }
+        }
+        BgResponse::Reply {
+            scope,
+            kind,
+            global_refresh,
+            res,
+        } => {
+            if !reply_scope_is_current(state, &scope) {
+                return Vec::new();
+            }
+            if global_refresh {
+                state.finish_global_refresh_request();
+            }
             if let Some(kind) = kind {
                 let ok = matches!(&res, Ok(r) if !matches!(r, Reply::Error { .. }));
                 state.lists.on_reply(kind, ok);
-                // A failed `GitLog` never reaches `apply_log`, so its
-                // loading flags would stick — the menu would badge "loading"
-                // forever and the page want would never refire (§5.10).
                 if !ok && matches!(kind, crate::cache::ListKind::GitLog) {
                     state.git.fail_log();
                     state.dirty = true;
                 }
             }
-            handle_reply(res, state)
+            let context = match &scope {
+                ReplyScope::Session { context, .. } => Some(context),
+                ReplyScope::Global { .. } | ReplyScope::Ui { .. } => None,
+            };
+            handle_reply(res, state, context)
         }
-        BgResponse::ResyncDone(res) => {
-            // The in-flight mark clears whatever the outcome; a landing
-            // `Reply::Snapshot` additionally rebases `last_event_seq` and
-            // settles `resync_want` inside `apply_attach_snapshot`.
-            state.resync_in_flight = false;
-            match res {
-                // Best-effort heal, no transcript noise: a dead link recovers
-                // through the reconnect's own snapshot, so only a live one
-                // re-arms the want — the retry still waits out
-                // `RESYNC_DEBOUNCE_MS` (`resync_sleep`).
-                Ok(Reply::Error { message }) => {
-                    log::warn!("snapshot resync answered with error: {message}");
-                    state.resync_want =
-                        matches!(state.connection, crate::state::Connection::Connected);
-                    vec![]
-                }
-                Ok(reply) => {
-                    // A resync that did not deliver a snapshot leaves the
-                    // recorded gap unhealed — re-arm so the retry runs.
-                    let landed_snapshot = matches!(reply, Reply::Attached(_) | Reply::Snapshot(_));
-                    let actions = handle_reply(Ok(reply), state);
-                    if !landed_snapshot {
-                        state.resync_want =
-                            matches!(state.connection, crate::state::Connection::Connected);
-                    }
+        BgResponse::ResyncDone {
+            context,
+            client_context,
+            result,
+        } => {
+            if !state.resync_reply_is_current(&context, &client_context) {
+                return Vec::new();
+            }
+            let mut actions = match result {
+                Ok(Reply::Attached(snapshot) | Reply::Snapshot(snapshot)) => {
+                    let Some(actions) =
+                        apply_resync_snapshot(state, snapshot, &context, &client_context)
+                    else {
+                        log::warn!("snapshot resync returned a stale snapshot");
+                        return release_failed_resync(state, Instant::now());
+                    };
                     actions
                 }
-                Err(e) => {
-                    log::warn!("snapshot resync failed: {e}");
-                    state.resync_want =
-                        matches!(state.connection, crate::state::Connection::Connected);
-                    vec![]
+                Ok(Reply::Error { message }) => {
+                    log::warn!("snapshot resync answered with error: {message}");
+                    return release_failed_resync(state, Instant::now());
                 }
+                Ok(reply) => {
+                    log::warn!("snapshot resync returned an unexpected reply: {reply:?}");
+                    return release_failed_resync(state, Instant::now());
+                }
+                Err(error) => {
+                    log::warn!("snapshot resync failed: {error}");
+                    return release_failed_resync(state, Instant::now());
+                }
+            };
+            if let Some(request) = state.drain_prompt_queue() {
+                actions.push(Action::Send(request));
             }
+            actions
         }
-        BgResponse::AtCompleted { key, candidates } => {
+        BgResponse::UserMessageDone {
+            ticket,
+            client_context,
+            result,
+        } => {
+            if !session_reply_is_current(state, &ticket.context, &client_context) {
+                return Vec::new();
+            }
+            let failed = !matches!(&result, Ok(Reply::Ok));
+            if state
+                .session
+                .finish_user_message(ticket.id, failed)
+                .is_none()
+            {
+                return Vec::new();
+            }
+            let mut actions = handle_reply(result, state, Some(&ticket.context));
+            if failed {
+                state.push_toast(
+                    ToastLevel::Warn,
+                    "prompt not sent".into(),
+                    Some("press Enter to retry".into()),
+                    Instant::now(),
+                );
+            }
+            if !failed
+                && !state.turn_boundary_pending
+                && let Some(req) = state.drain_prompt_queue()
+            {
+                actions.push(Action::Send(req));
+            }
+            actions
+        }
+        BgResponse::UserMessageStepDone {
+            ticket,
+            client_context,
+            request,
+            result,
+        } => {
+            if !session_reply_is_current(state, &ticket.context, &client_context) {
+                return Vec::new();
+            }
+            let succeeded = matches!(
+                (&request, &result),
+                (Request::DetachTurn, Ok(Reply::TurnDetached { .. }))
+                    | (Request::UserMessage { .. }, Ok(Reply::Ok))
+            );
+            if succeeded {
+                let Some(remaining) = state
+                    .session
+                    .complete_user_message_step(ticket.id, &request)
+                else {
+                    return Vec::new();
+                };
+                if !remaining.requests.is_empty() {
+                    return vec![Action::ContinuePromptBatch { id: ticket.id }];
+                }
+                if state
+                    .session
+                    .finish_user_message(ticket.id, false)
+                    .is_none()
+                {
+                    return Vec::new();
+                }
+                let mut actions = handle_reply(result, state, Some(&ticket.context));
+                if !state.turn_boundary_pending
+                    && let Some(req) = state.drain_prompt_queue()
+                {
+                    actions.push(Action::Send(req));
+                }
+                return actions;
+            }
+            if state.session.finish_user_message(ticket.id, true).is_none() {
+                return Vec::new();
+            }
+            let actions = match result {
+                Ok(reply) => handle_reply(
+                    Err(pacode_client::ClientError::UnexpectedReply {
+                        request: request.name().into(),
+                        reply: format!("{reply:?}"),
+                    }),
+                    state,
+                    Some(&ticket.context),
+                ),
+                Err(err) => handle_reply(Err(err), state, Some(&ticket.context)),
+            };
+            state.push_toast(
+                ToastLevel::Warn,
+                "prompt not sent".into(),
+                Some("press Enter to retry".into()),
+                Instant::now(),
+            );
+            actions
+        }
+        BgResponse::AtCompleted {
+            context,
+            client_context,
+            key,
+            candidates,
+        } => {
+            if !deferred_reply_is_current(state, &context, &client_context) {
+                return Vec::new();
+            }
             state.input.at_comp.finish_scan(key, candidates);
             state.dirty = true;
             vec![]
         }
-        BgResponse::BashCompletionDone { key, candidates } => {
+        BgResponse::BashCompletionDone {
+            context,
+            client_context,
+            key,
+            candidates,
+        } => {
+            if !deferred_reply_is_current(state, &context, &client_context) {
+                return Vec::new();
+            }
             state.input.bash_comp.finish_scan(key, candidates);
             state.dirty = true;
             vec![]
         }
         BgResponse::FilePreviewReady {
+            context,
+            client_context,
             key,
             resolved,
             text,
         } => {
+            if !deferred_reply_is_current(state, &context, &client_context)
+                || state.files.preview_in_flight.as_ref() != Some(&key)
+            {
+                return Vec::new();
+            }
             state.files.preview_in_flight = None;
             state.files.cached_preview = Some(crate::state::files::CachedPreview {
                 key,
@@ -1403,17 +2606,35 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             vec![]
         }
         BgResponse::FileStatusesReady {
+            context,
+            client_context,
             statuses,
             at_version,
         } => {
+            if !deferred_reply_is_current(state, &context, &client_context) {
+                return Vec::new();
+            }
+            if at_version != state.files.rows_version {
+                state.files.statuses_in_flight = false;
+                return Vec::new();
+            }
             state.files.apply_statuses(statuses, at_version);
             state.dirty = true;
             vec![]
         }
-        BgResponse::GitShowReady { hash, res } => {
+        BgResponse::GitShowReady {
+            context,
+            client_context,
+            hash,
+            res,
+        } => {
+            if !session_reply_is_current(state, &context, &client_context)
+                || state.git.show_in_flight.as_deref() != Some(hash.as_str())
+            {
+                return Vec::new();
+            }
             match res {
                 Ok(Reply::GitShow { hash: h, stat }) => state.git.apply_show(h, stat),
-                // `Reply::Error` names no commit — the request's hash keys it.
                 Ok(Reply::Error { message }) => state.git.fail_show(hash, message),
                 Ok(_) => state.git.fail_show(hash, "unexpected reply".to_string()),
                 Err(e) => state.git.fail_show(hash, e.to_string()),
@@ -1421,7 +2642,20 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             state.dirty = true;
             vec![]
         }
-        BgResponse::GitDiffReady { hash, res } => {
+        BgResponse::GitDiffReady {
+            context,
+            client_context,
+            hash,
+            res,
+        } => {
+            if !session_reply_is_current(state, &context, &client_context)
+                || !matches!(
+                    &state.panel.target,
+                    Some(PanelTarget::CommitDiff { hash: current }) if current == &hash
+                )
+            {
+                return Vec::new();
+            }
             match res {
                 Ok(Reply::GitDiff {
                     hash: h,
@@ -1435,42 +2669,67 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             state.dirty = true;
             vec![]
         }
-        BgResponse::TaskTailReady { tail } => {
+        BgResponse::TaskTailReady {
+            context,
+            client_context,
+            tail,
+        } => {
+            if !deferred_reply_is_current(state, &context, &client_context)
+                || state.rail.task_tail_in_flight.as_ref() != Some(&tail.key())
+            {
+                return Vec::new();
+            }
             state.rail.task_tail_in_flight = None;
-            // Applies while the level still wants this task at this size —
-            // a moved cursor or a `TaskUpdated` re-keys the want and the
-            // next `dispatch_deferred` pass re-arms the read.
             state.rail.task_tail = Some(tail);
             state.dirty = true;
             vec![]
         }
-        BgResponse::FileDiffReady { path, diff } => {
+        BgResponse::FileDiffReady {
+            context,
+            client_context,
+            path,
+            diff,
+        } => {
+            if !deferred_reply_is_current(state, &context, &client_context) {
+                return Vec::new();
+            }
+            if state.files.diff_in_flight.as_deref() != Some(path.as_str()) {
+                return Vec::new();
+            }
             state.files.diff_in_flight = None;
-            // Applies only while the panel still targets this file — a
-            // response for a since-unselected path drops (§5.5).
-            if matches!(
+            if !matches!(
                 &state.panel.target,
                 Some(PanelTarget::FileDiff { path: p }) if *p == path
             ) {
-                state.panel.diff = Some(crate::state::PanelDiff {
-                    path,
-                    patch: diff.patch,
-                    status: diff.status,
-                    truncated: diff.truncated,
-                    note: diff.note,
-                    rendered: None,
-                });
+                // The panel moved off the file while the read ran: release the
+                // marker, or re-entering that file's diff would never re-arm.
+                return Vec::new();
             }
+            state.panel.diff = Some(crate::state::PanelDiff {
+                path,
+                patch: diff.patch,
+                status: diff.status,
+                truncated: diff.truncated,
+                note: diff.note,
+                rendered: None,
+            });
             state.dirty = true;
             vec![]
         }
         BgResponse::ThumbReady {
+            context,
+            client_context,
             token,
             cell_w,
             cell_h,
             preview,
         } => {
-            state.image_strip.in_flight.remove(&(token, cell_w, cell_h));
+            if !deferred_reply_is_current(state, &context, &client_context) {
+                return Vec::new();
+            }
+            if !state.image_strip.in_flight.remove(&(token, cell_w, cell_h)) {
+                return Vec::new();
+            }
             state.image_strip.thumbs.insert(
                 token,
                 crate::state::images::CachedThumb {
@@ -1482,16 +2741,37 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             state.dirty = true;
             vec![]
         }
-        BgResponse::CopyDone { auto, chars } => {
+        BgResponse::CopyDone {
+            context,
+            client_context,
+            auto,
+            chars,
+        } => {
+            if !deferred_reply_is_current(state, &context, &client_context) {
+                return Vec::new();
+            }
             state.on_copy_done(auto, chars);
             vec![]
         }
-        BgResponse::LoadPanelReply { target, result } => {
+        BgResponse::LoadPanelReply {
+            context,
+            client_context,
+            target,
+            token,
+            result,
+        } => {
+            if !panel_load_reply_is_current(&context, &target, token) {
+                return Vec::new();
+            }
+            if !session_reply_is_current(state, &context, &client_context) {
+                return Vec::new();
+            }
+            let shown = state.panel.target.as_ref() == Some(&target);
             match result {
                 Ok(Reply::History {
                     items, has_more, ..
                 }) => {
-                    if state.panel.target == Some(target) {
+                    if shown {
                         state.panel.agent_transcript.reset(items, has_more);
                         state.dirty = true;
                     }
@@ -1499,21 +2779,23 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                 Ok(Reply::TaskOutput {
                     lines, total_lines, ..
                 }) => {
-                    if state.panel.target == Some(target) {
+                    if shown {
                         state.panel.task_lines = lines;
                         state.panel.task_total_lines = total_lines;
                         state.dirty = true;
                     }
                 }
                 Ok(Reply::Error { message }) => {
-                    state.push_toast(
-                        ToastLevel::Error,
-                        "Panel load error".into(),
-                        Some(message),
-                        Instant::now(),
-                    );
+                    if shown {
+                        state.push_toast(
+                            ToastLevel::Error,
+                            "Panel load error".into(),
+                            Some(message),
+                            Instant::now(),
+                        );
+                    }
                 }
-                Err(e) => {
+                Err(e) if shown => {
                     state.push_toast(
                         ToastLevel::Error,
                         "Panel load error".into(),
@@ -1525,7 +2807,21 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             }
             vec![]
         }
-        BgResponse::LoadHistoryReply { result } => {
+        BgResponse::LoadHistoryReply {
+            context,
+            client_context,
+            before_seq,
+            result,
+        } => {
+            if !session_reply_is_current(state, &context, &client_context) {
+                return Vec::new();
+            }
+            if state.transcript.oldest_seq() != before_seq {
+                // A page that no longer answers the oldest row would wedge the
+                // flag: the next scroll would never ask for history again.
+                state.transcript.loading_history = false;
+                return Vec::new();
+            }
             match result {
                 Ok(Reply::History {
                     items, has_more, ..
@@ -1534,7 +2830,10 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                         "history page loaded: {} items, has_more={has_more}",
                         items.len()
                     );
-                    state.transcript.prepend(items, has_more);
+                    let shift = state.transcript.prepend(items, has_more);
+                    if !state.agent_replaces_dialog() {
+                        state.selection.rebase_lines(shift);
+                    }
                     state.dirty = true;
                 }
                 _ => {
@@ -1544,10 +2843,19 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             }
             vec![]
         }
-        BgResponse::BashCompleted(res) => {
-            state.running_bash = None;
+        BgResponse::BashCompleted {
+            run_id,
+            context,
+            client_context,
+            result,
+        } => {
+            if !deferred_reply_is_current(state, &context, &client_context)
+                || !state.finish_bash_run(run_id)
+            {
+                return Vec::new();
+            }
             state.dirty = true;
-            match res {
+            match result {
                 Ok(out) => {
                     log::debug!(
                         "bash-mode captured completed: exit_code={:?}, truncated={}",
@@ -1597,6 +2905,7 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
 fn handle_reply(
     res: Result<Reply, pacode_client::ClientError>,
     state: &mut AppState,
+    context: Option<&SessionContext>,
 ) -> Vec<Action> {
     use crate::cache::ListKind;
     match res {
@@ -1701,13 +3010,14 @@ fn handle_reply(
                 vec![Action::Send(Request::UserMessage {
                     text,
                     images: Vec::new(),
+                    message_id: None,
                 })]
             }
             PluginCommandOutcome::Nothing => vec![],
         },
-        Ok(Reply::Attached(snapshot)) | Ok(Reply::Snapshot(snapshot)) => {
-            apply_attach_snapshot(state, snapshot)
-        }
+        Ok(Reply::Attached(snapshot)) | Ok(Reply::Snapshot(snapshot)) => context
+            .map(|context| apply_scoped_snapshot(state, snapshot, context))
+            .unwrap_or_default(),
         Ok(_) => vec![],
         Err(err) => {
             let now = now_ms();

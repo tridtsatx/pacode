@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
@@ -12,6 +13,11 @@ use pacode_types::{
 use super::connect::ConnectClient;
 use super::tool_parser::InlineToolCallParser;
 use super::wire::{decode_get_chat_message_response, encode_get_chat_message_request};
+use crate::governor::{ProviderGovernor, governor_for, hold_permit};
+use crate::retry::{
+    MIN_429_COOLDOWN, OpenedStream, RetryAfterSignal, RetryBudget, StreamTransport, retry_delay,
+    sleep_delay,
+};
 use crate::{CompletionRequest, EventStream, ProviderError};
 
 /// Create an [`EventStream`] decoding Devin protobuf frames into [`StreamEvent`]s.
@@ -263,6 +269,7 @@ pub fn create_devin_event_stream(
 }
 
 /// Owned configuration for opening (and reopening) a Devin streaming completion.
+#[derive(Clone)]
 pub struct DevinStreamOpener {
     pub connect_client: ConnectClient,
     pub session_token: String,
@@ -271,22 +278,47 @@ pub struct DevinStreamOpener {
     pub cfg: ProviderConfig,
     pub stream_idle_secs: u64,
     pub effort: Effort,
-    pub max_retries: u32,
     pub backoff_base: Duration,
     pub assignment_jwt: Option<String>,
 }
 
 impl DevinStreamOpener {
     /// Execute GetChatMessage directly, selecting the model via request field 21.
-    pub async fn open(&self) -> Result<EventStream, ProviderError> {
-        let mut attempt = 0;
-        let timeout_secs = self.stream_idle_secs * self.effort.idle_timeout_factor();
-        let idle_duration = Duration::from_secs(timeout_secs.max(1));
-        let idle_timeout = if self.stream_idle_secs > 0 {
-            Some((idle_duration, timeout_secs))
-        } else {
-            None
-        };
+    pub async fn open(&self, mut budget: RetryBudget) -> Result<EventStream, ProviderError> {
+        let governor = self.governor();
+        let opened = self.open_once(&governor, &mut budget).await?;
+        Ok(crate::retry::retrying_transport_stream(
+            self.clone(),
+            governor,
+            opened,
+            budget,
+        ))
+    }
+}
+
+impl StreamTransport for DevinStreamOpener {
+    fn governor(&self) -> Arc<ProviderGovernor> {
+        governor_for(
+            self.connect_client.api_server_url(),
+            Some(self.connect_client.api_key()),
+            &[],
+        )
+    }
+
+    fn backoff_base(&self) -> Duration {
+        self.backoff_base
+    }
+
+    async fn open_once(
+        &self,
+        governor: &Arc<ProviderGovernor>,
+        budget: &mut RetryBudget,
+    ) -> Result<OpenedStream, ProviderError> {
+        let timeout_secs = self
+            .stream_idle_secs
+            .saturating_mul(self.effort.idle_timeout_factor());
+        let idle_timeout = (self.stream_idle_secs > 0)
+            .then_some((Duration::from_secs(timeout_secs.max(1)), timeout_secs));
 
         // The request is identical across retries — encode the proto once and
         // resend the same bytes instead of re-walking the message history.
@@ -296,124 +328,42 @@ impl DevinStreamOpener {
             &self.cfg,
             self.assignment_jwt.as_deref(),
         );
+        let queued_bytes = req_bytes.len() as u64;
 
         loop {
-            let stream_result = self
+            let permit = governor.acquire(queued_bytes).await?;
+            match self
                 .connect_client
-                .server_stream_with_idle_timeout(
+                .server_stream(
                     "/exa.api_server_pb.ApiServerService/GetChatMessage",
                     &req_bytes,
                     idle_timeout,
                 )
-                .await;
-
-            match stream_result {
+                .await
+            {
                 Ok(inner_stream) => {
-                    return Ok(create_devin_event_stream(
-                        inner_stream,
-                        self.req.model.clone(),
-                    ));
+                    let retry_after = RetryAfterSignal::default();
+                    let inner = create_devin_event_stream(inner_stream, self.req.model.clone());
+                    return Ok(OpenedStream {
+                        stream: hold_permit(inner, permit),
+                        retry_after,
+                    });
                 }
-                Err(err) => {
-                    if err.is_retryable() && attempt < self.max_retries {
-                        crate::retry::sleep_backoff(attempt, self.backoff_base).await;
-                        attempt += 1;
+                Err(failure) => {
+                    let delay = retry_delay(self.backoff_base, budget.used, failure.retry_after);
+                    if failure.retry_after.is_some()
+                        || matches!(&failure.error, ProviderError::RateLimited(_))
+                    {
+                        governor.start_cooldown(delay.max(MIN_429_COOLDOWN));
+                    }
+                    drop(permit);
+                    if failure.error.is_retryable() && budget.reserve() {
+                        sleep_delay(delay).await;
                         continue;
                     }
-                    return Err(err);
+                    return Err(failure.error);
                 }
             }
         }
     }
-}
-
-fn is_committing(event: &StreamEvent) -> bool {
-    match event {
-        StreamEvent::TextDelta { .. }
-        | StreamEvent::ReasoningDelta { .. }
-        | StreamEvent::ReasoningSignature { .. }
-        | StreamEvent::ToolCallStart { .. }
-        | StreamEvent::ToolCallArgsDelta { .. }
-        | StreamEvent::Usage(_)
-        | StreamEvent::MessageEnd { .. } => true,
-        StreamEvent::MessageStart { .. } => false,
-    }
-}
-
-struct DevinRetryState {
-    opener: DevinStreamOpener,
-    inner: Option<EventStream>,
-    attempt: u32,
-    max_retries: u32,
-    committed: bool,
-    done: bool,
-}
-
-/// Wrap `initial` event stream so that a retryable error before any output reopens the request.
-pub fn devin_retrying_stream(opener: DevinStreamOpener, initial: EventStream) -> EventStream {
-    let max_retries = opener.max_retries;
-    let state = DevinRetryState {
-        opener,
-        inner: Some(initial),
-        attempt: 0,
-        max_retries,
-        committed: false,
-        done: false,
-    };
-
-    let stream = futures::stream::unfold(state, |mut state| async move {
-        loop {
-            if state.done {
-                return None;
-            }
-
-            if state.inner.is_none() {
-                match state.opener.open().await {
-                    Ok(inner) => state.inner = Some(inner),
-                    Err(err) => {
-                        if err.is_retryable() && state.attempt < state.max_retries {
-                            crate::retry::sleep_backoff(state.attempt, state.opener.backoff_base)
-                                .await;
-                            state.attempt += 1;
-                            continue;
-                        }
-                        state.done = true;
-                        return Some((Err(err), state));
-                    }
-                }
-            }
-
-            let next = match state.inner.as_mut() {
-                Some(inner) => inner.next().await,
-                None => return None,
-            };
-
-            match next {
-                Some(Ok(event)) => {
-                    if is_committing(&event) {
-                        state.committed = true;
-                    }
-                    return Some((Ok(event), state));
-                }
-                Some(Err(err)) => {
-                    if !state.committed && err.is_retryable() && state.attempt < state.max_retries {
-                        let redacted = crate::redact(&err.to_string());
-                        let attempt = state.attempt;
-                        log::warn!(
-                            "devin stream failed before output (attempt {attempt}), reopening: {redacted}"
-                        );
-                        crate::retry::sleep_backoff(state.attempt, state.opener.backoff_base).await;
-                        state.attempt += 1;
-                        state.inner = None;
-                        continue;
-                    }
-                    state.done = true;
-                    return Some((Err(err), state));
-                }
-                None => return None,
-            }
-        }
-    });
-
-    Box::pin(stream)
 }
