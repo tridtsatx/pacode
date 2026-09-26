@@ -7,6 +7,8 @@
 //! - `layout`: rects per width tier (spec §8)
 //! - `ui`: widgets — rail, dialog, panel, input, footer, overlays, toasts
 //! - `keys`: key bindings and the interaction mode machine (spec §5–§7)
+//! - `lock`: the `alt+l` notice lock — hold orchestrator-bound notices, release
+//!   them paced (`offer` / `tick`), and say so in a badge
 //! - `commands`: slash commands
 //! - `terminal`: raw mode / alt screen / mouse capture / panic hook
 //! - `backpressure`: frame scheduler — nominal cadence, measured degradation,
@@ -28,6 +30,7 @@ pub mod font;
 pub mod keys;
 pub mod keys_menu;
 pub mod keys_picker;
+pub mod lock;
 pub mod layout;
 pub mod mouse;
 pub mod nav;

@@ -60,6 +60,9 @@ pub enum Action {
     RailOverlay,
     /// Toggle zero-data-retention for the session (only `zdr = "session"`).
     ToggleZdr,
+    /// Hold the notifications bound for the orchestrator, then release them
+    /// paced instead of in one burst.
+    ToggleLock,
     /// Open the menu hub — the `ctrl+,` half of the entry (§4.2); double-Shift
     /// is the other.
     Menu,
@@ -196,6 +199,7 @@ impl Action {
             Self::PasteClipboard => "paste_clipboard",
             Self::RailOverlay => "rail_overlay",
             Self::ToggleZdr => "toggle_zdr",
+            Self::ToggleLock => "toggle_lock",
             Self::Menu => "menu",
             Self::Help => "help",
             Self::ModelPickerFavorite => "model_picker_favorite",
@@ -258,6 +262,7 @@ impl Action {
             Self::PasteClipboard => "Paste from clipboard (image or text)",
             Self::RailOverlay => "Show plan and agents",
             Self::ToggleZdr => "Toggle ZDR mode",
+            Self::ToggleLock => "Toggle the notice lock (hold notifications)",
             Self::Menu => "Open the menu hub",
             Self::Help => "Open help menu",
             Self::ModelPickerFavorite => "Model picker: mark model as favorite",
@@ -284,6 +289,7 @@ impl Action {
             | Self::RailOverlay
             | Self::ToggleZdr
             | Self::CycleMode
+            | Self::ToggleLock
             | Self::ScrollUp
             | Self::ScrollDown
             | Self::ScrollTop
@@ -571,6 +577,7 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("paste_clipboard", Action::PasteClipboard),
     ("rail_overlay", Action::RailOverlay),
     ("toggle_zdr", Action::ToggleZdr),
+    ("toggle_lock", Action::ToggleLock),
     ("menu", Action::Menu),
     ("help", Action::Help),
     ("expand_output", Action::ExpandOutput),
@@ -901,6 +908,15 @@ impl Keymap {
             Action::ToggleZdr,
             vec![Binding {
                 code: KeyCode::Char('z'),
+                mods: KeyModifiers::ALT,
+            }],
+        );
+        // alt+l — the notice lock. Global scope: the lock is worth flipping
+        // from anywhere, and no other `alt+<letter>` chord claims the `l`.
+        bindings.insert(
+            Action::ToggleLock,
+            vec![Binding {
+                code: KeyCode::Char('l'),
                 mods: KeyModifiers::ALT,
             }],
         );

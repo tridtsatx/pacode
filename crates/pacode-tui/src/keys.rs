@@ -228,6 +228,14 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     if action == Some(KeyAction::ToggleZdr) {
         return toggle_zdr(state);
     }
+
+    // Alt+L: the notice lock. The toggle only flips the switch — a release
+    // that comes due later is picked up by the event loop's tick, not here.
+    if action == Some(KeyAction::ToggleLock) {
+        let on = state.notice_lock.toggle(now);
+        log::debug!("notice lock: {}", if on { "on" } else { "off" });
+        return vec![];
+    }
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
         if let Some(popup) = crate::ui::popup::resolve_current(state)
             && let Some(accepted) = popup.accepted()

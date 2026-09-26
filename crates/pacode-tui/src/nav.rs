@@ -341,6 +341,7 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::PasteClipboard
             | KeyAction::RailOverlay
             | KeyAction::ToggleZdr
+            | KeyAction::ToggleLock
             | KeyAction::Menu
             | KeyAction::Help
             | KeyAction::ExpandOutput
@@ -402,6 +403,7 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::PasteClipboard
             | KeyAction::RailOverlay
             | KeyAction::ToggleZdr
+            | KeyAction::ToggleLock
             | KeyAction::Menu
             | KeyAction::Help
             | KeyAction::ExpandOutput
