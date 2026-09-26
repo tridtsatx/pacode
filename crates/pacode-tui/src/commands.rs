@@ -602,15 +602,12 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
 
 /// `/model` with no argument — the bottom picker. Also the hub's `Model` row
 /// (`ui/menu/root.rs`): the picker is bottom chrome, not a menu level.
+/// `/model` with no argument, and the hub's model row. The full picker:
+/// providers with live counts, the models under the highlighted one, and the
+/// effort ladder that greys out the levels a model does not accept.
 pub fn open_model_picker(state: &mut AppState) -> Vec<Action> {
-    log::debug!("open overlay: ModelPicker");
-    state.focus = Focus::Overlay(Overlay::ModelPicker {
-        query: String::new(),
-        index: 0,
-        for_zdr: false,
-    });
-    state.dirty = true;
-    vec![Action::Send(Request::ListModels)]
+    log::debug!("open overlay: model picker page");
+    crate::ui::model_picker_page::open(state)
 }
 
 /// `/theme` with no argument — the bottom picker, pre-selected on the active

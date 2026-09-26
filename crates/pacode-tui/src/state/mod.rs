@@ -205,6 +205,12 @@ pub enum Overlay {
         stack: crate::ui::menu::MenuStack,
         ui: crate::ui::menu::MenuUiState,
     },
+    /// The model picker: providers on the left with live counts, models on the
+    /// right with context, price and capabilities, and an effort ladder that
+    /// greys out the levels a model does not accept.
+    ModelPickerPage {
+        picker: crate::ui::model_picker::ModelPicker,
+    },
     /// The settings page: sections across the top, `setting → value` rows, a
     /// description line for the highlighted row, and a search that filters
     /// across every section.

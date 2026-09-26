@@ -413,7 +413,7 @@ fn the_effort_cursor_skips_levels_the_model_does_not_accept() {
 }
 
 #[test]
-fn test_overlay_model_picker_navigation_and_esc() {
+fn test_the_model_picker_page_opens_navigates_and_escapes() {
     let mut state = make_test_state();
     let now = Instant::now();
     state.models = vec![
@@ -437,34 +437,33 @@ fn test_overlay_model_picker_navigation_and_esc() {
         },
     ];
 
-    // Open via slash command `/model` + Enter
+    // `/model` opens the full page: providers on the left, models on the right.
     state.input.insert_str("/model");
-    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-    handle_key(&mut state, enter, now);
-    assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::ModelPicker {
-            query: String::new(),
-            index: 0,
-            for_zdr: false,
-        })
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
     );
+    let Focus::Overlay(Overlay::ModelPickerPage { picker }) = &state.focus else {
+        panic!("expected the model picker page, got {:?}", state.focus);
+    };
+    assert_eq!(picker.row, 0, "it opens on the first model");
 
-    // Down key changes index to 1 and keeps focus on overlay
-    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-    handle_key(&mut state, down, now);
-    assert_eq!(
-        state.focus,
-        Focus::Overlay(Overlay::ModelPicker {
-            query: String::new(),
-            index: 1,
-            for_zdr: false,
-        })
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        now,
     );
+    let Focus::Overlay(Overlay::ModelPickerPage { picker }) = &state.focus else {
+        panic!("the page closed on a move");
+    };
+    assert_eq!(picker.row, 1, "Down moves to the next model");
 
-    // Esc closes it
-    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-    handle_key(&mut state, esc, now);
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        now,
+    );
     assert_eq!(state.focus, Focus::Normal);
 }
 

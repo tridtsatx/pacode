@@ -12,6 +12,7 @@ pub mod login_picker;
 pub mod mascot;
 pub mod menu;
 pub mod model_picker;
+pub mod model_picker_page;
 pub mod model_picker_view;
 pub mod notice;
 pub mod overlays;
@@ -64,6 +65,7 @@ pub fn focus_key(focus: &Focus) -> u8 {
             // Its own key: the settings page is a full screen, not a menu level,
             // and reusing a menu key would replay the menu's unfold.
             Overlay::Settings { .. } => 41,
+            Overlay::ModelPickerPage { .. } => 42,
             // Menu levels key off `MenuId` — the table lives in the menu base
             // (§3.1); 25..=36 here are the `focus_key` range it owns.
             Overlay::Menu { stack, .. } => stack

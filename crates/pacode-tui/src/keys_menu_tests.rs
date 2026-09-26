@@ -181,19 +181,16 @@ fn right_descends_like_enter() {
 fn right_on_an_item_row_runs_it_like_enter() {
     let mut state = make_test_state();
     let mut stack = MenuStack::root(MenuId::Root);
+    // The theme row, for the same reason as the Enter test above.
     let mut ui = MenuUiState {
-        cursor: RowId::new("model"),
+        cursor: RowId::new("theme"),
         ..MenuUiState::default()
     };
-    let actions = handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Right));
+    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Right));
     assert!(matches!(
         state.focus,
-        Focus::Overlay(Overlay::ModelPicker { .. })
+        Focus::Overlay(Overlay::ThemePicker { .. })
     ));
-    assert_eq!(
-        actions,
-        vec![Action::Send(pacode_types::Request::ListModels)]
-    );
 }
 
 #[test]
@@ -522,19 +519,18 @@ fn ctrl_c_in_edit_mode_still_closes_the_whole_stack() {
 fn enter_on_a_hub_item_row_opens_the_bottom_picker() {
     let mut state = make_test_state();
     let mut stack = MenuStack::root(MenuId::Root);
+    // The theme row, not the model row: this is about the *mechanism* — a hub
+    // row runs on Enter — and the model row now opens the full page, so it would
+    // make a mechanism test depend on which screen a row happens to open.
     let mut ui = MenuUiState {
-        cursor: RowId::new("model"),
+        cursor: RowId::new("theme"),
         ..MenuUiState::default()
     };
-    let actions = handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Enter));
+    handle_menu_key(&mut state, &mut stack, &mut ui, key(KeyCode::Enter));
     assert!(matches!(
         state.focus,
-        Focus::Overlay(Overlay::ModelPicker { .. })
+        Focus::Overlay(Overlay::ThemePicker { .. })
     ));
-    assert_eq!(
-        actions,
-        vec![Action::Send(pacode_types::Request::ListModels)]
-    );
 }
 
 #[test]

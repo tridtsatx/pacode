@@ -714,6 +714,12 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 }
             }
         }
+        // The model picker owns its keys: navigation, the search field, the
+        // effort ladder and the commit all live in one place, and a chord it
+        // does not recognise falls through to the app.
+        Focus::Overlay(Overlay::ModelPickerPage { .. }) => {
+            crate::ui::model_picker_page::handle_key(state, key)
+        }
         Focus::Overlay(Overlay::RailOverlay { .. }) => vec![],
         // Unreachable — `keys::handle_key` routes a menu to `keys_menu` before
         // the overlay dispatch — but the match stays exhaustive.

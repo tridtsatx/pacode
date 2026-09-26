@@ -81,6 +81,13 @@ pub(crate) fn draw(
             frame.render_widget(Clear, popup.area);
             draw_rail_overlay(frame, popup.area, prepared, state, opts);
         }
+        crate::ui::popup::PopupId::ModelPickerPage => {
+            let Focus::Overlay(Overlay::ModelPickerPage { picker }) = &state.focus else {
+                return;
+            };
+            frame.render_widget(Clear, popup.area);
+            crate::ui::model_picker_page::draw(frame, popup.area, state, picker, opts);
+        }
         crate::ui::popup::PopupId::Settings => {
             let (Focus::Overlay(Overlay::Settings { ui }), Some(_)) =
                 (&state.focus, state.overlay_since)

@@ -149,7 +149,6 @@ fn row_line(
     // name is truncated, never the count — a count clipped to `12…` would be a
     // different number.
     let name = provider.map_or("", |row| row.key.as_deref().unwrap_or("all"));
-    let count = provider.map_or(0, |row| row.count);
     spans.push(Span::styled(
         cell(name, provider_width.saturating_sub(4)),
         if provider_selected {
@@ -158,8 +157,14 @@ fn row_line(
             opts.theme.fg
         },
     ));
+    // The count belongs to a *provider*. On a model row it is not zero, it is
+    // absent, and printing `0` there put a column of zeros down the model list.
+    // The cell is still padded, so the two columns stay aligned.
     spans.push(Span::styled(
-        format!(" {count:>2} "),
+        match provider {
+            Some(row) => format!(" {:>2} ", row.count),
+            None => "    ".to_string(),
+        },
         if provider_selected {
             opts.theme.bold
         } else {

@@ -261,7 +261,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 }
                 // A reading, not a chooser: Escape closes the page and there is
                 // nothing underneath to peel back to.
-                PopupId::Analyze | PopupId::Settings => {
+                PopupId::Analyze | PopupId::Settings | PopupId::ModelPickerPage => {
                     state.focus = Focus::Normal;
                     state.dirty = true;
                     return vec![];
@@ -621,9 +621,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | Overlay::ThemePicker { .. }
                 | Overlay::LoginPicker { .. }
                 // A reading has no selection to confirm, and the settings page
-                // handles its own keys; Enter does nothing here.
+                // and the model picker handle their own keys; Enter does
+                // nothing here.
                 | Overlay::Analyze { .. }
                 | Overlay::Settings { .. }
+                | Overlay::ModelPickerPage { .. }
                 // Unreachable — an open menu intercepts Enter earlier — but
                 // the match stays exhaustive.
                 | Overlay::Menu { .. },
@@ -811,6 +813,7 @@ fn move_popup_selection(state: &mut AppState, delta: i32) -> bool {
         | PopupId::LoginPicker
         | PopupId::Analyze
         | PopupId::Settings
+        | PopupId::ModelPickerPage
         | PopupId::RailOverlay => return false,
     };
     let next = if delta < 0 {
