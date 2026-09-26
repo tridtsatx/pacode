@@ -30,7 +30,13 @@ use crate::ui::settings::{self, SettingsOutcome, SettingsState};
 /// `area` is whatever the host reserved; the overlay fills it and never asks
 /// for a different one, so a narrow terminal gets a narrower overlay rather
 /// than a request to resize.
-pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, ui: &SettingsState, opts: &RenderOptions) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    ui: &SettingsState,
+    opts: &RenderOptions,
+) {
     settings::draw(frame, area, &state.config, ui, opts);
 }
 
@@ -57,13 +63,22 @@ pub fn rows_visible(area: Rect) -> usize {
 ///
 /// A commit only the daemon can apply — a new plugin marketplace — comes back
 /// as an action for the host to dispatch rather than as a local edit.
-pub fn commit(state: &mut AppState, ui: &mut SettingsState, key: KeyEvent, area: Rect) -> SettingsResult {
+pub fn commit(
+    state: &mut AppState,
+    ui: &mut SettingsState,
+    key: KeyEvent,
+    area: Rect,
+) -> SettingsResult {
     match settings::on_key(ui, key, &state.config, rows_visible(area)) {
         SettingsOutcome::Consumed => SettingsResult::Stay(vec![]),
         SettingsOutcome::Close => SettingsResult::Close,
-        SettingsOutcome::Commit { key, value } => SettingsResult::Stay(apply_value(state, key, value)),
+        SettingsOutcome::Commit { key, value } => {
+            SettingsResult::Stay(apply_value(state, key, value))
+        }
         SettingsOutcome::Reset { key } => SettingsResult::Stay(reset_value(state, key)),
-        SettingsOutcome::Run { command } => SettingsResult::Stay(crate::commands::execute(state, command)),
+        SettingsOutcome::Run { command } => {
+            SettingsResult::Stay(crate::commands::execute(state, command))
+        }
     }
 }
 

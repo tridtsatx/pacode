@@ -205,6 +205,12 @@ pub enum Overlay {
         stack: crate::ui::menu::MenuStack,
         ui: crate::ui::menu::MenuUiState,
     },
+    /// The settings page: sections across the top, `setting → value` rows, a
+    /// description line for the highlighted row, and a search that filters
+    /// across every section.
+    Settings {
+        ui: crate::ui::settings::SettingsState,
+    },
     /// The `/analyze` page. Reachable only when the client was started with
     /// `--analyze-mode`: the report is a reading of work the daemon did, and
     /// offering it unconditionally would put a scorecard in front of someone

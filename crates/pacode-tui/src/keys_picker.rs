@@ -634,6 +634,37 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             state.dirty = true;
             vec![]
         }
+        // The settings page owns every key it recognises and reports the rest
+        // as unhandled, so a chord that belongs to the app still works with the
+        // page open.
+        Focus::Overlay(Overlay::Settings { ui: _ }) => {
+            // The area is read before the mutable borrow of the focus the match
+            // is holding: the view lives inside it.
+            let area = crate::ui::popup::resolve_current(state)
+                .map_or_else(ratatui::layout::Rect::default, |popup| popup.area());
+            // Taken out and put back: the view is part of the state the commit
+            // needs mutably, and holding both borrows at once is not allowed.
+            let Focus::Overlay(Overlay::Settings { ui }) = &mut state.session.focus else {
+                return vec![];
+            };
+            let mut view = std::mem::take(ui);
+            #[allow(clippy::mem_replace_with_default)]
+            let result = crate::ui::settings_ui::commit(state, &mut view, key, area);
+            if let Focus::Overlay(Overlay::Settings { ui }) = &mut state.session.focus {
+                *ui = view;
+            }
+            match result {
+                crate::ui::settings_ui::SettingsResult::Stay(actions) => {
+                    state.dirty = true;
+                    actions
+                }
+                crate::ui::settings_ui::SettingsResult::Close => {
+                    state.focus = Focus::Normal;
+                    state.dirty = true;
+                    vec![]
+                }
+            }
+        }
         Focus::Overlay(Overlay::RailOverlay { .. }) => vec![],
         // Unreachable — `keys::handle_key` routes a menu to `keys_menu` before
         // the overlay dispatch — but the match stays exhaustive.

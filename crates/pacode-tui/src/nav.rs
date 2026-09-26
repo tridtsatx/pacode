@@ -94,6 +94,7 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
         Overlay::ThemePicker { .. } => "ThemePicker",
         Overlay::QuestionPicker => "QuestionPicker",
         Overlay::Analyze { .. } => "Analyze",
+        Overlay::Settings { .. } => "Settings",
         // The level on screen names the menu in the log (§3.1).
         Overlay::Menu { stack, .. } => stack.current().map_or("Menu", |l| l.id.title()),
     }
@@ -217,6 +218,9 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
             | Overlay::QuestionPicker
             | Overlay::RailOverlay { .. }
             | Overlay::ThemePicker { .. }
+            // The settings page scrolls with its own keys, and a global
+            // navigate must not turn that into "select the first agent".
+            | Overlay::Settings { .. }
             // Unreachable — an open menu intercepts keys before `nav` — but
             // the match stays exhaustive.
             | Overlay::Menu { .. },
@@ -251,6 +255,9 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
                 view.scroll_by(-1, rows, visible);
             }
         }
+        // The settings page scrolls with its own keys; a global navigate
+        // must not turn that into "select the first agent".
+        Focus::Overlay(Overlay::Settings { .. }) => {}
         Focus::Normal
         | Focus::Panel { .. }
         | Focus::Overlay(

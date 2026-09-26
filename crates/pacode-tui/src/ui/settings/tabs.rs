@@ -29,12 +29,17 @@ impl Tab {
     /// Cells this tab costs: a leading separator, the icon, and the name on the
     /// active one.
     pub fn width(&self) -> usize {
-        1 + display_width(self.icon) + if self.active { 1 + display_width(self.name) } else { 0 }
+        1 + display_width(self.icon)
+            + if self.active {
+                1 + display_width(self.name)
+            } else {
+                0
+            }
     }
 }
 
 /// The visible slice of the tab row, and whether either end is cut off.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabBar {
     pub range: Range<usize>,
     pub clipped_left: bool,
@@ -150,10 +155,14 @@ fn try_window(
     while start > 0 && head + span(&tabs[start - 1..end]) + tail <= width {
         start -= 1;
     }
+    // A clip is claimed only where its marker was *reserved*: the four passes
+    // above try reserving on neither, tail, head or both ends, and a pass that
+    // reserved nothing cannot draw a cut indicator. Claiming a cut the row has
+    // no cell for is how a bar overflows by exactly one.
     let bar = TabBar {
         range: start..end,
-        clipped_left: start > 0,
-        clipped_right: end < count,
+        clipped_left: start > 0 && head > 0,
+        clipped_right: end < count && tail > 0,
     };
     let drawn = if bar.clipped_left { head } else { 0 }
         + span(&tabs[bar.range.clone()])

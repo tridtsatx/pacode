@@ -71,9 +71,17 @@ fn sections_follow_the_registry_order_and_cover_every_setting() {
         .copied()
         .filter(|s| order.contains(s))
         .collect();
-    assert_eq!(&order[..declared.len()], &declared[..], "declared order is kept");
+    assert_eq!(
+        &order[..declared.len()],
+        &declared[..],
+        "declared order is kept"
+    );
     for entry in registry::SETTINGS {
-        assert!(order.contains(&entry.section), "{} has no tab", entry.section);
+        assert!(
+            order.contains(&entry.section),
+            "{} has no tab",
+            entry.section
+        );
         assert!(
             section_entries(entry.section).any(|e| e.dotted_key == entry.dotted_key),
             "{} is in no section list",
@@ -111,7 +119,10 @@ fn esc_clears_the_search_before_it_closes_the_overlay() {
         section_entries(section_order()[state.section()]).count()
     );
 
-    assert_eq!(press(&mut state, &config, KeyCode::Esc), SettingsOutcome::Close);
+    assert_eq!(
+        press(&mut state, &config, KeyCode::Esc),
+        SettingsOutcome::Close
+    );
 }
 
 #[test]
@@ -126,12 +137,18 @@ fn search_spans_sections_and_lands_on_the_first_match() {
     );
     assert_eq!(state.cursor(), 0);
     assert_eq!(state.row(0).map(|e| e.dotted_key), Some(hits[0].dotted_key));
-    assert_eq!(state.section(), section_index(&section_order(), hits[0].section));
+    assert_eq!(
+        state.section(),
+        section_index(&section_order(), hits[0].section)
+    );
 
     // Backspace narrows the filter instead of leaving anything behind.
     press(&mut state, &config, KeyCode::Backspace);
     assert_eq!(state.query(), "mode");
-    assert_eq!(state.row(0).map(|e| e.dotted_key), Some(search_matches("mode")[0].dotted_key));
+    assert_eq!(
+        state.row(0).map(|e| e.dotted_key),
+        Some(search_matches("mode")[0].dotted_key)
+    );
 }
 
 #[test]
@@ -145,7 +162,10 @@ fn a_search_that_matches_nothing_leaves_no_rows_and_stays_open() {
         press(&mut state, &config, KeyCode::Esc),
         SettingsOutcome::Consumed
     );
-    assert_eq!(press(&mut state, &config, KeyCode::Esc), SettingsOutcome::Close);
+    assert_eq!(
+        press(&mut state, &config, KeyCode::Esc),
+        SettingsOutcome::Close
+    );
 }
 
 #[test]
@@ -200,7 +220,10 @@ fn an_out_of_range_value_says_why_and_keeps_the_editor_open() {
     );
     let err = state.error().unwrap_or_default().to_string();
     assert!(err.contains("out of range"), "{err}");
-    assert!(err.contains("100"), "the bound belongs in the message: {err}");
+    assert!(
+        err.contains("100"),
+        "the bound belongs in the message: {err}"
+    );
     // Still editing with the refused text intact, and the config untouched.
     assert_eq!(state.editing().map(|(b, _)| b), Some("999"));
     assert_eq!(
@@ -228,8 +251,14 @@ fn an_unparseable_value_is_refused_rather_than_written() {
     );
     let err = state.error().unwrap_or_default().to_string();
     assert!(err.contains("fast"), "{err}");
-    assert!(err.contains("240"), "the accepted values belong in it: {err}");
-    assert_eq!(registry::read_value(&config, "ui.ups").as_deref(), Some("10"));
+    assert!(
+        err.contains("240"),
+        "the accepted values belong in it: {err}"
+    );
+    assert_eq!(
+        registry::read_value(&config, "ui.ups").as_deref(),
+        Some("10")
+    );
 }
 
 #[test]
@@ -287,7 +316,10 @@ fn tabs_wrap_around_the_section_list() {
     let config = Config::default();
     let mut state = SettingsState::new();
     let count = section_order().len();
-    assert_eq!(press(&mut state, &config, KeyCode::Tab), SettingsOutcome::Consumed);
+    assert_eq!(
+        press(&mut state, &config, KeyCode::Tab),
+        SettingsOutcome::Consumed
+    );
     assert_eq!(state.section(), 1);
     for _ in 0..(count - 1) {
         press(&mut state, &config, KeyCode::Tab);
@@ -336,5 +368,8 @@ fn the_editor_owns_the_keyboard_while_it_is_open() {
     );
     assert!(state.editing().is_none());
     assert_eq!(state.query(), "");
-    assert_eq!(press(&mut state, &config, KeyCode::Esc), SettingsOutcome::Close);
+    assert_eq!(
+        press(&mut state, &config, KeyCode::Esc),
+        SettingsOutcome::Close
+    );
 }

@@ -119,7 +119,10 @@ fn frame_block(title: String, hint: &'static str, opts: &RenderOptions) -> Block
         .borders(Borders::ALL)
         .border_type(border)
         .border_style(opts.theme.dim)
-        .title(Span::styled(title, opts.theme.bold.patch(opts.theme.accent)))
+        .title(Span::styled(
+            title,
+            opts.theme.bold.patch(opts.theme.accent),
+        ))
         .title_bottom(Span::styled(hint, opts.theme.dim))
 }
 
@@ -180,7 +183,10 @@ fn draw_tabs(
         }
     }
     if window.clipped_right {
-        spans.push(Span::styled(format!(" {}", opts.glyphs.ellipsis), opts.theme.dim));
+        spans.push(Span::styled(
+            format!(" {}", opts.glyphs.ellipsis),
+            opts.theme.dim,
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -233,6 +239,7 @@ fn draw_body(
     let total = ui.row_count();
     let window = ui.window(total, area.height as usize);
     let editing = ui.editing();
+    let window_start = window.start;
     let lines: Vec<Line> = window
         .filter_map(|index| ui.row(index).map(|entry| (index, entry)))
         .map(|(index, entry)| {
@@ -252,7 +259,7 @@ fn draw_body(
     );
 
     let mut scrollbar = ScrollbarState::new(total.max(1))
-        .position(window.start)
+        .position(window_start)
         .viewport_content_length(area.height as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -287,7 +294,11 @@ fn row_line(
     if is_modified(config, entry) {
         label.insert_str(0, "* ");
     }
-    let label = truncate_to_width(&label, width.saturating_sub(value_w + 1), !opts.glyphs.ascii);
+    let label = truncate_to_width(
+        &label,
+        width.saturating_sub(value_w + 1),
+        !opts.glyphs.ascii,
+    );
     let label_style = if selected {
         opts.theme.bold.patch(opts.theme.fg)
     } else {
@@ -296,7 +307,11 @@ fn row_line(
     let mut spans = vec![
         Span::styled(
             if selected { opts.glyphs.pointer } else { " " },
-            if selected { opts.theme.accent } else { opts.theme.dim },
+            if selected {
+                opts.theme.accent
+            } else {
+                opts.theme.dim
+            },
         ),
         Span::styled(format!(" {label}"), label_style),
     ];

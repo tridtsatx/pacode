@@ -81,6 +81,15 @@ pub(crate) fn draw(
             frame.render_widget(Clear, popup.area);
             draw_rail_overlay(frame, popup.area, prepared, state, opts);
         }
+        crate::ui::popup::PopupId::Settings => {
+            let (Focus::Overlay(Overlay::Settings { ui }), Some(_)) =
+                (&state.focus, state.overlay_since)
+            else {
+                return;
+            };
+            frame.render_widget(Clear, popup.area);
+            crate::ui::settings_ui::draw(frame, popup.area, state, ui, opts);
+        }
         crate::ui::popup::PopupId::Analyze => {
             let (Some(report), Focus::Overlay(Overlay::Analyze { view })) =
                 (state.analyze_report.as_ref(), &state.focus)

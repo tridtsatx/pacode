@@ -427,30 +427,27 @@ fn test_overlay_mode_picker_navigation_and_esc() {
 }
 
 #[test]
-fn test_overlay_config_picker_navigation_and_esc() {
+fn test_settings_page_opens_navigates_and_escapes() {
     let mut state = make_test_state();
     let now = Instant::now();
 
-    // Open via slash command `/config` + Enter — the shared menu's Settings
-    // level now answers it (§5.1; the legacy overlay lives on until T19).
+    // `/config` and `/settings` both open the settings page — the full one with
+    // sections, search and a description line, not the hub's level. Two
+    // settings screens is one too many.
     state.input.insert_str("/config");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     handle_key(&mut state, enter, now);
-    let Focus::Overlay(Overlay::Menu { stack, .. }) = &state.focus else {
-        panic!("expected the Settings menu level, got {:?}", state.focus);
+    let Focus::Overlay(Overlay::Settings { .. }) = &state.focus else {
+        panic!("expected the settings page, got {:?}", state.focus);
     };
-    assert_eq!(
-        stack.current().map(|l| l.id),
-        Some(crate::ui::menu::MenuId::Settings)
-    );
 
-    // Down key moves the cursor off the first setting.
+    // Down moves the cursor to the second row of the first section.
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     handle_key(&mut state, down, now);
-    let Focus::Overlay(Overlay::Menu { ui, .. }) = &state.focus else {
-        panic!("expected the menu overlay, got {:?}", state.focus);
+    let Focus::Overlay(Overlay::Settings { ui }) = &state.focus else {
+        panic!("expected the settings page, got {:?}", state.focus);
     };
-    assert_eq!(ui.cursor, crate::ui::menu::RowId::new("provider.effort"));
+    assert_eq!(ui.cursor(), 1, "the cursor did not move off the first row");
 
     // Esc closes it
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);

@@ -22,6 +22,8 @@ pub mod popup;
 pub mod question_picker;
 pub mod rail;
 pub mod rail_session;
+pub mod settings;
+pub mod settings_ui;
 pub mod theme_picker;
 pub mod toast;
 pub mod toolcell;
@@ -59,6 +61,9 @@ pub fn focus_key(focus: &Focus) -> u8 {
             // Its own key: the page is a reading, not a menu level, and reusing a
             // menu key would replay the menu's unfold when it opens.
             Overlay::Analyze { .. } => 40,
+            // Its own key: the settings page is a full screen, not a menu level,
+            // and reusing a menu key would replay the menu's unfold.
+            Overlay::Settings { .. } => 41,
             // Menu levels key off `MenuId` — the table lives in the menu base
             // (§3.1); 25..=36 here are the `focus_key` range it owns.
             Overlay::Menu { stack, .. } => stack

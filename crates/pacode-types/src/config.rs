@@ -722,6 +722,10 @@ fn default_images() -> String {
     "auto".to_string()
 }
 
+fn default_tool_memory_split() -> bool {
+    true
+}
+
 fn default_tool_memory_percent() -> u8 {
     TOOL_MEMORY_DEFAULT_PERCENT
 }
@@ -773,7 +777,12 @@ pub struct UiConfig {
     /// Split the ceiling between concurrent sessions instead of applying it to
     /// each one: two sessions get half each, so the machine as a whole stays
     /// inside the ceiling.
-    #[serde(default)]
+    ///
+    /// The default is named rather than `#[serde(default)]`: a bare
+    /// `#[serde(default)]` on a `bool` field resolves to `false`, not to the
+    /// container's default, so a config that omits the key would silently
+    /// un-split the ceiling.
+    #[serde(default = "default_tool_memory_split")]
     pub tool_memory_split_sessions: bool,
     /// Planner/implementer pair. `None` = no fusion: one model per turn.
     #[serde(default)]
@@ -1326,7 +1335,16 @@ mod tests {
         assert!(cfg.skills.enabled);
         assert!(cfg.skills.dirs.is_empty());
         assert_eq!(cfg.skills.max_body_bytes, 16384);
-        assert_eq!(cfg.skills.max_listed, 100);
+        assert_eq!(cfg.ui.animation, AnimationMode::Smooth);
+        // Named serde defaults, checked through a *parse*: a bare
+        // `#[serde(default)]` on these would resolve to the field type's zero
+        // and never reach the container's default, which is how a configured
+        // ceiling silently stopped being split.
+        assert_eq!(cfg.ui.shimmer, ShimmerMode::Classic);
+        assert_eq!(cfg.ui.tool_memory_percent, TOOL_MEMORY_DEFAULT_PERCENT);
+        assert!(cfg.ui.tool_memory_split_sessions);
+        assert_eq!(cfg.ui.analyze_checkpoint_every, ANALYZE_CHECKPOINT_DEFAULT);
+        assert!(cfg.ui.fusion.is_none());
         assert_eq!(cfg.web.default_num_results, 8);
         assert_eq!(cfg.web.request_timeout_secs, 15);
         assert_eq!(cfg.mcp.idle_timeout_secs, 300);

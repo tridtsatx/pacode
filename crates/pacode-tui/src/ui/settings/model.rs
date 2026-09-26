@@ -69,7 +69,9 @@ fn has_entries(section: &str) -> bool {
 
 /// The registry entries one section owns, in table order.
 pub fn section_entries(section: &str) -> impl Iterator<Item = &'static SettingEntry> {
-    registry::SETTINGS.iter().filter(move |e| e.section == section)
+    registry::SETTINGS
+        .iter()
+        .filter(move |e| e.section == section)
 }
 
 /// Registry entries matching `query`, across every section, in table order.
@@ -86,9 +88,9 @@ pub fn search_matches(query: &str) -> Vec<&'static SettingEntry> {
     registry::SETTINGS
         .iter()
         .filter(|entry| {
-            entry.label.contains_ignore_ascii_case(needle)
-                || entry.dotted_key.contains_ignore_ascii_case(needle)
-                || entry.description.contains_ignore_ascii_case(needle)
+            entry.label.to_ascii_lowercase().contains(needle)
+                || entry.dotted_key.to_ascii_lowercase().contains(needle)
+                || entry.description.to_ascii_lowercase().contains(needle)
         })
         .collect()
 }
@@ -104,6 +106,10 @@ pub fn section_index(order: &[&'static str], section: &str) -> usize {
 /// The scroll offset is sticky rather than derived: it survives a resize and
 /// only moves on a page key, while [`SettingsState::window`] re-clamps it to
 /// the space actually available on every frame.
+// Derived because the overlay is held by value in `AppState`, which is
+// `Clone + Debug + PartialEq`: a selection the user can go back to is part of
+// the state, and a page that cannot be cloned cannot be snapshotted.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SettingsState {
     section: usize,
     /// The section `section` names, resolved once per move: the row lookup runs
@@ -140,7 +146,7 @@ impl Default for SettingsState {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Edit {
     buffer: String,
     cursor: usize,
@@ -196,7 +202,6 @@ impl SettingsState {
     pub fn section_name(&self) -> &'static str {
         self.section_name
     }
-
 
     /// The half-open range of section names a body `height` rows tall shows.
     ///

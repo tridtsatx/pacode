@@ -19,7 +19,7 @@ mod tabs;
 
 pub use draw::draw;
 pub use model::{
-    on_key, search_matches, section_entries, section_index, section_order, visible_range,
-    SettingsOutcome, SettingsState,
+    SettingsOutcome, SettingsState, on_key, search_matches, section_entries, section_index,
+    section_order, visible_range,
 };
-pub use tabs::{section_icon, Tab, TabBar};
+pub use tabs::{Tab, TabBar, section_icon};

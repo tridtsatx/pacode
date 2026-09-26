@@ -438,8 +438,14 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Root)
         }
         "config" | "settings" => {
-            log::debug!("open overlay: Settings menu");
-            crate::keys_menu::open(state, crate::ui::menu::MenuId::Settings)
+            // The full page, not the hub's level: the hub row is a shortcut into
+            // the same settings, and two settings screens is one too many.
+            log::debug!("open overlay: settings page");
+            state.focus = Focus::Overlay(Overlay::Settings {
+                ui: crate::ui::settings::SettingsState::new(),
+            });
+            state.dirty = true;
+            vec![]
         }
         "sessions" => {
             log::debug!("open menu: sessions");
