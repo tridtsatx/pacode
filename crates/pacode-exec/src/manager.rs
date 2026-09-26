@@ -28,6 +28,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::broadcast;
 
 use crate::buffer::HeadTailBuffer;
+use crate::memcap::MemoryPolicy;
+use crate::memlimit::{MemoryLimiter, SpawnSetup};
 use crate::progress::ProgressParser;
 use crate::spec::TaskSpec;
 use crate::state::{ManagedSpool, SharedState, TaskEntry};
@@ -59,10 +61,16 @@ pub enum ExecError {
     Spawn(std::io::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("tool memory limit: {0}")]
+    MemoryLimit(#[source] std::io::Error),
 }
 
 pub struct TaskManager {
     state: Arc<SharedState>,
+    /// The machine-level memory policy every spawn of this daemon goes
+    /// through. One per daemon, shared with the tools so that a raise is
+    /// visible to every later spawn.
+    memory: MemoryLimiter,
 }
 
 const MIN_TAIL_SPOOL_BYTES: usize = 64 * 1024;
@@ -104,7 +112,23 @@ impl Drop for AdmissionGuard<'_> {
 }
 
 impl TaskManager {
+    /// Build a manager with no tool memory cap.
+    ///
+    /// The daemon does not use this; it supplies the user's
+    /// `ui.tool_memory_percent` and `ui.tool_memory_split_sessions` through
+    /// [`TaskManager::with_memory`]. A caller that reaches for `new` without a
+    /// policy gets an uncapped manager rather than a guessed one — a cap
+    /// derived from a default nobody chose is a cap nobody can debug.
     pub fn new(spool_dir: PathBuf, config: ExecConfig) -> Arc<Self> {
+        Self::with_memory(
+            spool_dir,
+            config,
+            MemoryLimiter::new(MemoryPolicy::disabled()),
+        )
+    }
+
+    /// Build a manager that caps what a spawned process may use.
+    pub fn with_memory(spool_dir: PathBuf, config: ExecConfig, memory: MemoryLimiter) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
         Arc::new(Self {
             state: Arc::new(SharedState {
@@ -114,7 +138,13 @@ impl TaskManager {
                 pending_admissions: Mutex::new(0),
                 events,
             }),
+            memory,
         })
+    }
+
+    /// The memory policy: ceilings, the live-session division, and raises.
+    pub fn memory(&self) -> &MemoryLimiter {
+        &self.memory
     }
 
     fn try_admit(&self) -> Result<AdmissionGuard<'_>, ExecError> {
@@ -145,7 +175,7 @@ impl TaskManager {
     }
 
     /// Start the process. Returns immediately with the initial `TaskInfo`.
-    pub async fn spawn(&self, spec: TaskSpec) -> Result<TaskInfo, ExecError> {
+    pub async fn spawn(&self, mut spec: TaskSpec) -> Result<TaskInfo, ExecError> {
         tokio::fs::create_dir_all(&self.state.spool_dir)
             .await
             .map_err(ExecError::Spawn)?;
@@ -166,17 +196,34 @@ impl TaskManager {
             tokio::fs::File::from_std(std_file)
         };
 
+        // The tool memory ceiling is decided before the process exists, so the
+        // child is already inside its limit by the time its first instruction
+        // runs. The environment travels with the command, so a script and the
+        // model both see the ceiling they are working under.
+        let plan = self.memory.plan_spawn(&spec.session);
+        let mut env = std::mem::take(&mut spec.env);
+        if let Some(ceiling) = &plan.ceiling {
+            env.extend(ceiling.environment());
+        }
+
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
         let mut cmd = tokio::process::Command::new(shell);
         cmd.arg("-c").arg(&spec.command);
         cmd.current_dir(&spec.cwd);
-        cmd.envs(spec.env.iter().cloned());
+        cmd.envs(env.iter().cloned());
         #[cfg(unix)]
         cmd.process_group(0);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(false);
+        if plan.setup != SpawnSetup::None {
+            let setup = plan.setup.clone();
+            // SAFETY: `SpawnSetup::install` is documented and implemented as
+            // bare syscalls on memory allocated before the fork — no
+            // allocator, no locks, no Rust runtime state.
+            unsafe { cmd.pre_exec(move || setup.install()) };
+        }
 
         let child = match cmd.spawn() {
             Ok(child) => child,

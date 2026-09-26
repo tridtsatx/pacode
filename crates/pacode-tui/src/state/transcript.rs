@@ -6,8 +6,14 @@ use std::time::Instant;
 
 use pacode_render::{LineCache, RenderOptions, StreamBuffer, StreamKind, StreamOp};
 use pacode_types::{
-    ExplainLevel, PermissionId, PermissionRequest, Question, TranscriptItem, TranscriptKind,
+    ExplainLevel, PermissionId, PermissionRequest, Question, ToolStatus, TranscriptItem,
+    TranscriptKind,
 };
+
+#[path = "tool_stream.rs"]
+mod tool_stream;
+
+pub use tool_stream::{MAX_TOOL_STREAM_CHARS, MAX_TOOL_STREAMS, ToolStreamView, ToolStreams};
 
 #[cfg(test)]
 #[path = "transcript_tests.rs"]
@@ -270,6 +276,10 @@ pub struct Transcript {
     /// Streaming reveal buffer for the live assistant cell (`live_cell`).
     pub stream: Option<StreamBuffer>,
     pub live_cell: Option<u64>,
+    /// Output received so far for each running tool call, keyed by cell id.
+    /// The wire item carries no partial output, so the live body of a running
+    /// call lives here until that call's final item replaces it.
+    pub tool_streams: ToolStreams,
     /// Final item received while the paced reveal still has backlog: applied when the
     /// backlog drains so the tail of an answer does not pop in at once.
     pub pending_final: Option<TranscriptItem>,
@@ -303,6 +313,7 @@ impl Transcript {
             render_profile: None,
             stream: None,
             live_cell: None,
+            tool_streams: ToolStreams::default(),
             pending_final: None,
             has_more_history: false,
             loading_history: false,
@@ -321,6 +332,7 @@ impl Transcript {
         self.render_profile = None;
         self.stream = None;
         self.live_cell = None;
+        self.tool_streams.clear();
         self.pending_final = None;
         self.expanded.clear();
         self.cell_lines.clear();
@@ -442,6 +454,7 @@ impl Transcript {
         self.expanded.remove(&cell_id);
         self.stable_revisions.remove(&cell_id);
         self.cache.invalidate_cell(cell_id);
+        self.tool_streams.remove(cell_id);
         let size = self.forget_bytes(cell_id);
         if !is_client_id(cell_id) {
             self.evicted_floor = Some(
@@ -578,6 +591,7 @@ impl Transcript {
             expanded,
             cache,
             render_profile,
+            tool_streams,
             ..
         } = self;
         render_profile.as_ref().map_or(0, |profile| {
@@ -585,6 +599,7 @@ impl Transcript {
                 cells.iter().take(retained_prefix),
                 expanded,
                 cache,
+                tool_streams,
                 &profile.options,
                 profile.width,
                 profile.anim_frame,
@@ -818,6 +833,22 @@ impl Transcript {
     }
 
     fn insert_or_replace(&mut self, seq: u64, kind: TranscriptKind, ts_ms: u64) {
+        // A call that is no longer running owns its body: the daemon's final
+        // preview replaces the live bytes, and keeping them would hold output
+        // that is no longer on screen.
+        if matches!(
+            kind,
+            TranscriptKind::ToolCall {
+                status: ToolStatus::Ok
+                    | ToolStatus::Error
+                    | ToolStatus::Backgrounded
+                    | ToolStatus::Denied,
+                ..
+            }
+        ) {
+            self.tool_streams.remove(seq);
+        }
+
         // A permission item is the same prompt `PermissionRequested` already
         // rendered — keyed by request id so the daemon's double emission
         // lands on one cell instead of prompting twice. When the prompt is not
@@ -892,6 +923,30 @@ impl Transcript {
                 let cell = &mut self.cells[index];
                 cell.version = cell.version.wrapping_add(1);
             }
+        }
+    }
+
+    /// Output a running tool call has produced, for the cell at `cell_id`.
+    ///
+    /// Anything that is not a tool cell still `Running` is refused, and clears
+    /// the cell's buffer if it had one: a delta that outlives its call (a
+    /// chunk in flight when the final item lands) must not leave a live body
+    /// behind that nothing ever draws and nothing ever frees.
+    pub fn push_tool_output(&mut self, cell_id: u64, chunk: &str) {
+        let running = self.cell_index(cell_id).is_some_and(|index| {
+            matches!(
+                &self.cells[index].kind,
+                CellKind::Item(TranscriptKind::ToolCall {
+                    status: ToolStatus::Running,
+                    ..
+                })
+            )
+        });
+
+        if running {
+            self.tool_streams.push(cell_id, chunk);
+        } else {
+            self.tool_streams.remove(cell_id);
         }
     }
 

@@ -27,6 +27,9 @@ use pacode_render::{
 use pacode_types::time::format_duration_ms;
 use pacode_types::transcript::{DiffStat, ToolStatus};
 
+#[path = "toolcell_stream.rs"]
+mod stream;
+
 #[cfg(test)]
 #[path = "toolcell_tests.rs"]
 mod toolcell_tests;
@@ -47,6 +50,10 @@ pub struct ToolCallView<'a> {
     pub preview: &'a str,
     pub diff: Option<&'a DiffStat>,
     pub duration_ms: Option<u64>,
+    /// Output the call has produced while it is still running. `None` when
+    /// nothing has arrived yet; the transcript keeps it (capped) until the
+    /// call's final item brings the real preview.
+    pub streamed: Option<crate::state::transcript::ToolStreamView<'a>>,
 }
 
 /// Header + body on the outcome gutter + the blank separator every cell ends with.
@@ -103,6 +110,21 @@ pub fn render(
                 gutter(opts, gutter_style),
                 Span::styled(marker.to_string(), opts.theme.faint),
             ]));
+        }
+        // Output the call has produced so far, on the rows a finished body
+        // uses. It arrives with the same escapes the finished preview has, so
+        // it is stripped here too — a live body must never restyle the gutter.
+        if let Some(streamed) = call.streamed {
+            let text = strip_ansi(streamed.text);
+            stream::push_live_body(
+                &mut out,
+                &text,
+                streamed.dropped,
+                body_w,
+                gutter_style,
+                opts,
+                expanded,
+            );
         }
     } else if is_diff_preview(&preview) {
         // A diff preview goes through the diff renderer at body width so its
@@ -642,6 +664,10 @@ fn marker_line(hidden: usize, gutter_style: Style, opts: &RenderOptions) -> Line
 }
 
 /// Collapsed caps (§6): ok = first 6 + last 3 around the marker; failure = tail 8.
+///
+/// Returns the index in `out` of the last *output* row pushed, or `None` when
+/// the body was empty — a live body marks that row as still arriving, and a
+/// marker row is not one.
 fn push_collapsed(
     out: &mut Vec<Line<'static>>,
     status: ToolStatus,
@@ -649,7 +675,7 @@ fn push_collapsed(
     body_w: usize,
     gutter_style: Style,
     opts: &RenderOptions,
-) {
+) -> Option<usize> {
     let total = lines.len();
     if status == ToolStatus::Error && total > ERROR_TAIL_LINES {
         let hidden = total - ERROR_TAIL_LINES;
@@ -657,7 +683,7 @@ fn push_collapsed(
         for l in &lines[hidden..] {
             out.push(body_line(l, body_w, gutter_style, opts));
         }
-        return;
+        return last_index(out);
     }
     if status != ToolStatus::Error && total > COLLAPSED_HEAD_LINES + COLLAPSED_TAIL_LINES {
         let hidden = total - COLLAPSED_HEAD_LINES - COLLAPSED_TAIL_LINES;
@@ -668,22 +694,30 @@ fn push_collapsed(
         for l in &lines[total - COLLAPSED_TAIL_LINES..] {
             out.push(body_line(l, body_w, gutter_style, opts));
         }
-        return;
+        return last_index(out);
     }
+    let first = out.len();
     for l in lines {
         out.push(body_line(l, body_w, gutter_style, opts));
     }
+    if first == out.len() {
+        return None;
+    }
+    Some(out.len() - 1)
 }
 
 /// Expanded: the whole output wrapped, still bounded at `EXPANDED_MAX_LINES`.
+/// Returns the index of the last output row, as [`push_collapsed`] does — the
+/// truncation marker that may follow it is not one.
 fn push_expanded(
     out: &mut Vec<Line<'static>>,
     lines: &[&str],
     body_w: usize,
     gutter_style: Style,
     opts: &RenderOptions,
-) {
+) -> Option<usize> {
     let mut drawn = 0usize;
+    let mut last = None;
     'lines: for l in lines {
         for wrapped in wrap_text(l, body_w.max(1)) {
             out.push(Line::from(vec![
@@ -691,6 +725,7 @@ fn push_expanded(
                 Span::styled(wrapped, opts.theme.dim),
             ]));
             drawn += 1;
+            last = Some(out.len() - 1);
             if drawn >= EXPANDED_MAX_LINES {
                 out.push(Line::from(vec![
                     gutter(opts, gutter_style),
@@ -700,6 +735,12 @@ fn push_expanded(
             }
         }
     }
+    last
+}
+
+/// Index of the last row of `out`, or `None` when there is none.
+fn last_index(out: &[Line<'static>]) -> Option<usize> {
+    out.len().checked_sub(1)
 }
 
 /// `✓`, `✗`, `◍ background`, `<spinner> running`, `denied` — the status glyph

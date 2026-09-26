@@ -1,6 +1,7 @@
 //! Widgets. [`prepare_frame`](prepare_frame) reconciles render state before
 //! [`draw`](draw), which paints one frame from an immutable `AppState`.
 
+pub mod analyze;
 pub mod anim;
 pub mod dialog;
 pub mod footer;
@@ -10,6 +11,8 @@ pub mod input;
 pub mod login_picker;
 pub mod mascot;
 pub mod menu;
+pub mod model_picker;
+pub mod model_picker_view;
 pub mod notice;
 pub mod overlays;
 pub mod panel;

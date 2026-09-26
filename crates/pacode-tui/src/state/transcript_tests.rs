@@ -1456,3 +1456,69 @@ fn a_repeated_permission_in_a_history_page_does_not_prompt_twice() {
         .count();
     assert_eq!(prompts, 1);
 }
+
+/// The same tool item once its call is over: the daemon's preview is the body.
+fn finished_tool_item(seq: u64, preview: &str) -> TranscriptItem {
+    let mut item = tool_item(seq, &AgentId::main());
+    if let TranscriptKind::ToolCall {
+        status,
+        preview: body,
+        ..
+    } = &mut item.kind
+    {
+        *status = pacode_types::ToolStatus::Ok;
+        *body = preview.to_string();
+    }
+    item
+}
+
+/// A live body belongs to the cell that is running. When the call finishes
+/// the daemon's preview is the body, and a chunk that lands afterwards must
+/// not resurrect the old one.
+#[test]
+fn a_tool_output_chunk_after_the_call_finished_is_dropped() {
+    let mut t = Transcript::new(8);
+    let now = Instant::now();
+    t.upsert(tool_item(1, &AgentId::main()), now);
+    t.push_tool_output(1, "Compiling\n");
+    assert_eq!(t.tool_streams.get(1).map(|s| s.text), Some("Compiling\n"));
+
+    t.upsert(finished_tool_item(1, "Compiled"), now);
+    assert_eq!(t.tool_streams.get(1), None);
+
+    t.push_tool_output(1, "late chunk\n");
+    assert_eq!(
+        t.tool_streams.get(1),
+        None,
+        "a finished cell keeps no live body"
+    );
+}
+
+/// An evicted cell's live body goes with it: the buffer is capped, but a
+/// session that runs and scrolls thousands of calls must not sit on the
+/// bodies of calls that left the screen.
+#[test]
+fn evicting_a_running_tool_cell_frees_its_live_body() {
+    let mut t = Transcript::new(1);
+    let now = Instant::now();
+    t.upsert(tool_item(1, &AgentId::main()), now);
+    t.push_tool_output(1, "one\n");
+    t.upsert(tool_item(2, &AgentId::main()), now);
+    t.push_tool_output(2, "two\n");
+
+    assert_eq!(
+        t.tool_streams.get(1),
+        None,
+        "the evicted call's body is gone"
+    );
+    assert_eq!(t.tool_streams.get(2).map(|s| s.text), Some("two\n"));
+}
+
+/// A delta for a cell that is not on screen at all (evicted, or a different
+/// agent's transcript) is refused rather than buffered.
+#[test]
+fn a_tool_output_chunk_for_an_unknown_cell_is_refused() {
+    let mut t = Transcript::new(8);
+    t.push_tool_output(99, "orphan\n");
+    assert_eq!(t.tool_streams.get(99), None);
+}

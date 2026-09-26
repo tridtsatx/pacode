@@ -2329,7 +2329,7 @@ fn test_background_completion_renders_a_result_cell_with_exit_code() {
     assert!(state.toasts.is_empty(), "the duplicate toast must be gone");
 
     let opts = pacode_render::RenderOptions::new(80, false);
-    let lines = crate::ui::dialog::render_cell_for_test(cell, 80, &opts);
+    let lines = crate::ui::dialog::render_cell_for_test(cell, &opts);
     assert_eq!(lines.len(), 1);
     let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(rendered.contains("101"), "exit code missing: {rendered}");

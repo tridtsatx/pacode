@@ -18,7 +18,8 @@ use pacode_types::{ExplainLevel, RiskLevel, ToastLevel, TranscriptKind};
 
 use crate::state::selection::{MAX_SELECTION_BYTES, MAX_SELECTION_LINES};
 use crate::state::transcript::{
-    Cell, CellKind, HeaderInfo, PermExplain, StableRevision, Transcript,
+    Cell, CellKind, HeaderInfo, PermExplain, StableRevision, ToolStreamView, ToolStreams,
+    Transcript,
 };
 
 #[cfg(test)]
@@ -128,6 +129,7 @@ pub(crate) fn prepare(
         scroll_from_bottom,
         first_visible_line,
         live_cell,
+        tool_streams,
         ..
     } = transcript;
 
@@ -138,6 +140,7 @@ pub(crate) fn prepare(
             stable_revisions,
             header: header.as_ref(),
             live_id: *live_cell,
+            tool_streams,
             width,
             anim_frame,
             welcome_ms,
@@ -300,6 +303,8 @@ struct CellsSource<'a> {
     stable_revisions: &'a HashMap<u64, StableRevision>,
     header: Option<&'a HeaderInfo>,
     live_id: Option<u64>,
+    /// Output received so far for the running tool calls among `cells`.
+    tool_streams: &'a ToolStreams,
     width: u16,
     anim_frame: u64,
     welcome_ms: u64,
@@ -327,6 +332,7 @@ fn build_cell_lines<'a>(
         stable_revisions,
         header,
         live_id,
+        tool_streams,
         width,
         anim_frame,
         welcome_ms,
@@ -366,7 +372,7 @@ fn build_cell_lines<'a>(
             expanded.contains(&cell.id),
             opts,
             cache,
-            width,
+            tool_streams,
             anim_frame,
         ));
     }
@@ -412,7 +418,9 @@ fn plan_cell(
 
     if !is_live {
         if cache.get(key).is_none() {
-            let rendered = render_cell(cell, width, opts, anim_frame, expanded);
+            // `None`: a running tool call returned `CellPlan::Fresh` above and
+            // never reaches the cache, so no live body can be cached here.
+            let rendered = render_cell(cell, None, opts, anim_frame, expanded);
             cache.insert(key, rendered);
         }
         return CellPlan::Cached(key);
@@ -437,7 +445,7 @@ fn plan_cell(
     // A live cell that is not an answer still caches; the version in the key
     // keeps pace with its updates.
     if cache.get(key).is_none() {
-        let rendered = render_cell(cell, width, opts, anim_frame, expanded);
+        let rendered = render_cell(cell, None, opts, anim_frame, expanded);
         cache.insert(key, rendered);
     }
     CellPlan::Cached(key)
@@ -451,15 +459,16 @@ fn cell_block<'a>(
     expanded: bool,
     opts: &RenderOptions,
     cache: &'a LineCache,
-    width: u16,
+    tool_streams: &ToolStreams,
     anim_frame: u64,
 ) -> Block<'a> {
+    let streamed = tool_streams.get(cell.id);
     match plan {
         CellPlan::Cached(key) => match cache.peek(*key) {
             Some(lines) => Block::Cached(lines),
             // Phase one inserted it, so a miss cannot happen — render anyway
             // rather than panic if the invariant is ever broken.
-            None => Block::Owned(render_cell(cell, width, opts, anim_frame, expanded)),
+            None => Block::Owned(render_cell(cell, streamed, opts, anim_frame, expanded)),
         },
         CellPlan::LiveAssistant(stable_key) => {
             if let CellKind::Item(TranscriptKind::Assistant { text, .. }) = &cell.kind {
@@ -482,9 +491,11 @@ fn cell_block<'a>(
             }
             // A live non-assistant cell is planned Cached, so this is
             // unreachable — still render rather than panic.
-            Block::Owned(render_cell(cell, width, opts, anim_frame, expanded))
+            Block::Owned(render_cell(cell, streamed, opts, anim_frame, expanded))
         }
-        CellPlan::Fresh => Block::Owned(render_cell(cell, width, opts, anim_frame, expanded)),
+        // A running tool call: its body grows without the cell changing, so it
+        // can never come from the cache — the same route the spinner takes.
+        CellPlan::Fresh => Block::Owned(render_cell(cell, streamed, opts, anim_frame, expanded)),
     }
 }
 
@@ -493,18 +504,28 @@ fn render_cell_block<'a>(
     state: CellRenderState,
     opts: &RenderOptions,
     cache: &'a mut LineCache,
+    tool_streams: &ToolStreams,
     width: u16,
     anim_frame: u64,
 ) -> Block<'a> {
     let plan = plan_cell(cell, state, opts, cache, width, anim_frame);
     let cache: &'a LineCache = cache;
-    cell_block(cell, &plan, state.expanded, opts, cache, width, anim_frame)
+    cell_block(
+        cell,
+        &plan,
+        state.expanded,
+        opts,
+        cache,
+        tool_streams,
+        anim_frame,
+    )
 }
 
 pub(crate) fn measure_cell_lines<'a>(
     cells: impl Iterator<Item = &'a Cell>,
     expanded: &HashSet<u64>,
     cache: &mut LineCache,
+    tool_streams: &ToolStreams,
     opts: &RenderOptions,
     width: u16,
     anim_frame: u64,
@@ -516,7 +537,7 @@ pub(crate) fn measure_cell_lines<'a>(
             expanded: expanded.contains(&cell.id),
             stable_revision: (0, 0),
         };
-        let block = render_cell_block(cell, state, opts, cache, width, anim_frame);
+        let block = render_cell_block(cell, state, opts, cache, tool_streams, width, anim_frame);
         lines = lines.saturating_add(block.lines().len());
     }
     lines
@@ -538,6 +559,7 @@ pub(crate) fn plain_lines(
         stable_revisions,
         header,
         live_cell,
+        tool_streams,
         ..
     } = &mut *transcript;
     let mut sink = PlainSink::new(window);
@@ -562,7 +584,7 @@ pub(crate) fn plain_lines(
             expanded: expanded.contains(&cell.id),
             stable_revision: stable_revisions.get(&cell.id).copied().unwrap_or((0, 0)),
         };
-        let block = render_cell_block(cell, state, opts, cache, width, anim_frame);
+        let block = render_cell_block(cell, state, opts, cache, tool_streams, width, anim_frame);
         let rendered: Vec<String> = block.lines().iter().map(line_text).collect();
         sink.push(&rendered, line);
         line += rendered.len();
@@ -579,28 +601,29 @@ fn line_text(line: &Line<'_>) -> String {
 
 /// Test-only entry point: render one cell exactly as the transcript would.
 #[cfg(test)]
-pub(crate) fn render_cell_for_test(
-    cell: &Cell,
-    width: u16,
-    opts: &RenderOptions,
-) -> Vec<Line<'static>> {
-    render_cell(cell, width, opts, 0, false)
+pub(crate) fn render_cell_for_test(cell: &Cell, opts: &RenderOptions) -> Vec<Line<'static>> {
+    render_cell(cell, None, opts, 0, false)
 }
 
+/// `streamed` is the output a running tool call has produced so far; `None`
+/// for every other cell, and for a running call that has produced nothing yet.
 fn render_cell(
     cell: &Cell,
-    width: u16,
+    streamed: Option<ToolStreamView<'_>>,
     opts: &RenderOptions,
     anim_frame: u64,
     expanded: bool,
 ) -> Vec<Line<'static>> {
+    // The width comes from the options rather than beside them: `RenderOptions`
+    // carries it, and a second copy is a second answer to "how wide is this".
+    let width = opts.width;
     match &cell.kind {
         CellKind::Gap => vec![Line::default()],
         CellKind::Item(kind) => render_item_inner(
             kind,
             cell.perm_explain.as_ref(),
             cell.stats.as_deref(),
-            width,
+            streamed,
             opts,
             anim_frame,
             expanded,
@@ -656,25 +679,29 @@ fn render_background_result(
 pub(crate) fn render_item(
     kind: &TranscriptKind,
     stats: Option<&str>,
-    width: u16,
     opts: &RenderOptions,
     anim_frame: u64,
 ) -> Vec<Line<'static>> {
-    render_item_inner(kind, None, stats, width, opts, anim_frame, false)
+    render_item_inner(kind, None, stats, None, opts, anim_frame, false)
 }
 
 /// `expanded` shows a tool call's whole output, wrapped, instead of its first
 /// few lines cut to the width. `perm_explain` rides along for permission
 /// cells — the `e`-key answer is cell state, not part of the wire item.
+/// `streamed` carries the output a tool call has produced while it is still
+/// running; only a `Running` tool call reads it.
 fn render_item_inner(
     kind: &TranscriptKind,
     perm_explain: Option<&PermExplain>,
     stats: Option<&str>,
-    width: u16,
+    streamed: Option<ToolStreamView<'_>>,
     opts: &RenderOptions,
     anim_frame: u64,
     expanded: bool,
 ) -> Vec<Line<'static>> {
+    // The width comes from the options rather than beside them: `RenderOptions`
+    // carries it, and a second copy is a second answer to "how wide is this".
+    let width = opts.width;
     match kind {
         TranscriptKind::User { text } => {
             let bar = if opts.glyphs.ascii { "|" } else { "▎" };
@@ -750,6 +777,7 @@ fn render_item_inner(
                 preview,
                 diff: diff.as_ref(),
                 duration_ms: *duration_ms,
+                streamed,
             },
             width,
             opts,

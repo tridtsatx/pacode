@@ -16,6 +16,33 @@ fn call<'a>(
         preview,
         diff: None,
         duration_ms: None,
+        streamed: None,
+    }
+}
+
+/// A running call with the output it has produced so far.
+fn running<'a>(name: &'a str, title: &'a str, streamed: &'a str) -> ToolCallView<'a> {
+    ToolCallView {
+        name,
+        title,
+        status: ToolStatus::Running,
+        preview: "",
+        diff: None,
+        duration_ms: None,
+        streamed: Some(crate::state::transcript::ToolStreamView {
+            text: streamed,
+            dropped: 0,
+        }),
+    }
+}
+
+fn running_capped<'a>(streamed: &'a str, dropped: usize) -> ToolCallView<'a> {
+    ToolCallView {
+        streamed: Some(crate::state::transcript::ToolStreamView {
+            text: streamed,
+            dropped,
+        }),
+        ..running("bash", "bash cargo build", streamed)
     }
 }
 
@@ -531,4 +558,135 @@ fn title_arg_survives_a_multibyte_title() {
     // A title genuinely starting with the name still strips it.
     let c = call("read", "read src/main.rs", ToolStatus::Ok, "");
     assert_eq!(title_arg(&c), "src/main.rs");
+}
+
+#[test]
+fn a_running_call_shows_the_output_it_has_produced() {
+    let opts = RenderOptions::new(80, false);
+    let c = running(
+        "bash",
+        "bash cargo build",
+        "Compiling pacode-tui\nFinished dev\n",
+    );
+    let text = text_of(&render(&c, 80, &opts, 0, false));
+    let body = body_rows(&text, &opts);
+
+    // The bytes received so far — not zero of them, and not the finished
+    // cell's all-at-once body. The first row is the `$` input line.
+    assert_eq!(body.len(), 4, "{body:?}");
+    assert!(body[1].contains("Compiling pacode-tui"), "{body:?}");
+    assert!(body[2].contains("Finished dev"), "{body:?}");
+}
+
+#[test]
+fn a_live_body_marks_its_last_line_as_still_arriving() {
+    let opts = RenderOptions::new(80, false);
+    let out = "first\nsecond line of output";
+    let live_text = text_of(&render(
+        &running("read", "read x.rs", out),
+        80,
+        &opts,
+        0,
+        false,
+    ));
+    let live = body_rows(&live_text, &opts);
+    let done_text = text_of(&render(
+        &call("read", "read x.rs", ToolStatus::Ok, out),
+        80,
+        &opts,
+        0,
+        false,
+    ));
+    let done = body_rows(&done_text, &opts);
+
+    let cursor = stream::live_cursor(&opts);
+    let live_tail = live.last().copied().unwrap_or_default();
+    let done_tail = done.last().copied().unwrap_or_default();
+    assert!(done_tail.contains("second line of output"), "{done_tail:?}");
+    assert!(
+        live_tail.ends_with(cursor),
+        "the live tail is marked: {live_tail:?}"
+    );
+    assert_ne!(live_tail, done_tail);
+    assert!(
+        !done_tail.ends_with(cursor),
+        "a finished body must not look live"
+    );
+}
+
+#[test]
+fn a_trailing_newline_puts_the_cursor_on_the_line_being_written() {
+    let opts = RenderOptions::new(80, false);
+    let c = running("bash", "bash make", "line one\n");
+    let text = text_of(&render(&c, 80, &opts, 0, false));
+    let body = body_rows(&text, &opts);
+    let g = format!("{} ", opts.glyphs.vline);
+
+    // "line one" is done; the cursor stands on the empty line after it, not
+    // on the row above.
+    assert_eq!(body.len(), 3, "{body:?}");
+    assert!(body[1].contains("line one"), "{body:?}");
+    assert_eq!(body[2], format!("{g}{}", stream::live_cursor(&opts)));
+}
+
+#[test]
+fn the_streaming_cap_is_shown_on_the_cell() {
+    let opts = RenderOptions::new(80, false);
+    let c = running_capped("tail of the log\n", 3_200);
+    let text = text_of(&render(&c, 80, &opts, 0, false));
+    let body = body_rows(&text, &opts);
+    let cap = crate::state::transcript::MAX_TOOL_STREAM_CHARS;
+
+    // A silently shortened body is indistinguishable from the whole of it.
+    assert!(
+        body[1].contains(&format!("3200 characters above the {cap}-character")),
+        "{body:?}"
+    );
+    assert!(body[2].contains("tail of the log"), "{body:?}");
+}
+
+#[test]
+fn ctrl_o_expands_a_live_body_the_same_way_it_expands_a_finished_one() {
+    let opts = RenderOptions::new(80, false);
+    let log = lines_preview(20);
+    // The rows come back owned: they borrow the rendered text, and a closure
+    // cannot hand a borrow of its own local back to the caller.
+    let cells = |expanded: bool| {
+        let text = text_of(&render(
+            &running("bash", "bash make", &log),
+            80,
+            &opts,
+            0,
+            expanded,
+        ));
+        body_rows(&text, &opts)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<String>>()
+    };
+    let (collapsed, expanded) = (cells(false), cells(true));
+
+    let hidden = 20 - COLLAPSED_HEAD_LINES - COLLAPSED_TAIL_LINES;
+    assert!(
+        collapsed
+            .iter()
+            .any(|l| l.contains(&rtext::more_lines(hidden, &opts))),
+        "{collapsed:?}"
+    );
+    assert!(
+        !expanded
+            .iter()
+            .any(|l| l.contains(&rtext::more_lines(hidden, &opts))),
+        "{expanded:?}"
+    );
+    assert!(
+        expanded.len() > collapsed.len(),
+        "{} vs {}",
+        expanded.len(),
+        collapsed.len()
+    );
+    assert!(
+        expanded.iter().any(|l| l.contains("output line 19")),
+        "{expanded:?}"
+    );
 }

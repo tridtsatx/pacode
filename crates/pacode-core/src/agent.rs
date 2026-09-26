@@ -12,6 +12,7 @@ use pacode_types::{
 use tokio_util::sync::CancellationToken;
 
 use crate::inject::InjectionQueue;
+use crate::notice_lock::{DueOrigin, Taken};
 use crate::transcript::TranscriptState;
 
 /// Content of a synthesized `tool_result` answering a `tool_use` that never
@@ -506,6 +507,11 @@ pub struct Agent {
     turn_usage: Mutex<Usage>,
     stream_usage: Mutex<Usage>,
     pub injections: InjectionQueue,
+    /// The notice lock: the switch, and the backlog it parks instead of
+    /// delivering. It sits next to `injections` because both drain sites
+    /// (`request_turn` and `drain_injections`) read from one and put back into
+    /// the other, and a take they later undo must not have spent a release.
+    pub notice_lock: crate::notice_lock::NoticeLock,
     /// Tools this agent may call (main: all; subagent: subset without `agent`).
     pub tools: RwLock<ToolRegistry>,
     /// Cancellation token of the running turn, if any. Bookkeeping for the
@@ -556,6 +562,11 @@ pub struct Agent {
     /// The turn loop needs it to report time-to-first-token, which is the one
     /// launch stage that belongs to neither the spawn path nor the turn alone.
     spawned_at: Mutex<Option<std::time::Instant>>,
+    /// Fusion attribution for the running or last turn: which model each half
+    /// ran on and what it cost. `None` when fusion is off — which is every
+    /// agent in a session with no `[ui] fusion` pair. Replaced wholesale at
+    /// turn start, the same point that invalidates `prompt_cache`.
+    pub fusion: Mutex<Option<crate::fusion::FusionTrace>>,
 }
 
 impl Agent {
@@ -579,6 +590,7 @@ impl Agent {
             turn_usage: Mutex::new(Usage::default()),
             stream_usage: Mutex::new(Usage::default()),
             injections: InjectionQueue::default(),
+            notice_lock: crate::notice_lock::NoticeLock::new(),
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
@@ -592,6 +604,7 @@ impl Agent {
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
             spawned_at: Mutex::new(None),
+            fusion: Mutex::new(None),
         }
     }
 
@@ -631,6 +644,7 @@ impl Agent {
             turn_usage: Mutex::new(Usage::default()),
             stream_usage: Mutex::new(Usage::default()),
             injections: InjectionQueue::default(),
+            notice_lock: crate::notice_lock::NoticeLock::new(),
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
@@ -644,6 +658,7 @@ impl Agent {
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
             spawned_at: Mutex::new(None),
+            fusion: Mutex::new(None),
         }
     }
 
@@ -739,8 +754,67 @@ impl Agent {
             .clone()
     }
 
+    /// Everything queued or parked for a turn that is not coming. A stopped or
+    /// closed agent must not release notices into whatever runs next, and the
+    /// backlog it cannot drain must not keep the count the badge shows.
     pub(crate) fn discard_injections(&self) -> usize {
-        self.injections.drain().len()
+        let queued = self.injections.drain().len();
+        self.notice_lock.discard_held();
+        queued
+    }
+
+    /// Release the injections whose turn has come, and nothing earlier.
+    ///
+    /// The parked backlog drains first — a held item that arrived earlier must
+    /// be delivered earlier — and at most one of them per
+    /// [`DRAIN_INTERVAL_MS`](crate::notice_lock::DRAIN_INTERVAL_MS). Live
+    /// traffic is never paced: a steer typed while the lock is on is the user
+    /// waiting, not a backlog, and it drains at full speed behind the parked
+    /// item.
+    ///
+    /// `None` means nothing was due. Everything returned must come back through
+    /// [`Self::restore_due`] if the caller does not deliver it, or the release
+    /// is spent on an item that never reached the model.
+    pub fn take_due(&self, now: std::time::Instant) -> Option<Taken> {
+        let mut items = Vec::new();
+        let mut prev_due = None;
+        if let Some(release) = self.notice_lock.take_held_due(now) {
+            prev_due = release.prev_due;
+            items.push(crate::notice_lock::TakenItem::held(release.entry));
+        }
+        for injection in self.injections.drain() {
+            items.push(crate::notice_lock::TakenItem::queued(injection));
+        }
+        if items.is_empty() {
+            return None;
+        }
+        Some(Taken::new(items, prev_due))
+    }
+
+    /// Put a [`Self::take_due`] batch back where it came from, deadline
+    /// included. The exact inverse: a caller that declines a batch must leave
+    /// the agent as if it had never looked.
+    pub fn restore_due(&self, taken: Taken) {
+        let mut queued = Vec::new();
+        let mut parked = Vec::new();
+        // Reversed, so each `push_front` below rebuilds the original order.
+        for item in taken.items.into_iter().rev() {
+            match item.origin {
+                DueOrigin::Held => parked.push(item),
+                DueOrigin::Queue => queued.push(item.injection),
+            }
+        }
+        for item in parked {
+            if let Some(entry) = item.entry {
+                self.notice_lock.restore_held_due(entry, taken.prev_due);
+            }
+        }
+        self.injections.restore(queued);
+    }
+
+    /// How long until the next paced release, `None` when none is scheduled.
+    pub fn next_release_in(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.notice_lock.next_release_in(now)
     }
 
     pub(crate) fn begin_admission_turn(&self, message_id: String, turn: TurnId) -> bool {
@@ -1039,6 +1113,15 @@ impl Agent {
 
     pub fn status(&self) -> AgentStatus {
         self.info().status
+    }
+    /// What the last (or running) fusion turn cost, per half. `None` when
+    /// fusion is off for this agent — the common case, and the one a client
+    /// must render exactly as it rendered before fusion existed.
+    pub fn fusion_trace(&self) -> Option<crate::fusion::FusionTrace> {
+        self.fusion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// A turn (or its post-block) currently owns this agent: `start_turn`'s

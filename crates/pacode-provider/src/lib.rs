@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod catalog_cache;
+pub mod catalog_efforts;
 pub mod codex;
 pub mod devin;
 pub mod dialect;

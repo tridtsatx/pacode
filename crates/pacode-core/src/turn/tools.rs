@@ -225,7 +225,7 @@ fn denied_preview(reason: &str) -> String {
 /// the whole call unless the tool takes its own (`holds_own_workers`). A turn
 /// asking for a hundred reads must not open a hundred fds at once; the slot is
 /// released as soon as the call returns or the turn is cancelled.
-async fn call_bounded(
+pub(crate) async fn call_bounded(
     tool: &Arc<dyn pacode_tools::Tool>,
     input: serde_json::Value,
     ctx: &pacode_tools::ToolCtx,

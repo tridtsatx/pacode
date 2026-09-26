@@ -290,7 +290,15 @@ impl Codex {
                 if let Some(id) = id_opt
                     && seen.insert(id.to_string())
                 {
-                    all_models.push(self.model_info(id));
+                    let mut info = self.model_info(id);
+                    if info.supported_efforts.is_none() {
+                        // This backend's catalog enumerates the levels each
+                        // model accepts (`supported_reasoning_levels`); a
+                        // providers.toml `efforts` list still wins. A catalog
+                        // that names none leaves the ladder unrestricted.
+                        info.supported_efforts = crate::catalog_efforts::efforts(item);
+                    }
+                    all_models.push(info);
                 }
             }
         }

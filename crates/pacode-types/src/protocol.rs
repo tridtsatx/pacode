@@ -69,8 +69,9 @@ pub const SNAPSHOT_MAX_PENDING_PERMISSIONS: usize = 64;
 /// the daemon-wide `SessionStatus` event for footer slot badges; v7 makes
 /// `Attach::New` idempotent for one client/envelope id and orders attach
 /// replies before session events; v8 adds the session `Resync` control marker
-/// and separates attach request ids from stable idempotency keys.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// and separates attach request ids from stable idempotency keys; v9 adds
+/// `SetNoticeLock` and the `NoticeLockChanged` broadcast.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -163,6 +164,11 @@ pub enum Request {
     SetMode(Mode),
     /// Toggle zero-data-retention for the session (`zdr = "session"` config).
     SetZdr(bool),
+    /// Hold the injections the orchestrator would otherwise receive, then let
+    /// them out one at a time. Session-wide like `SetZdr`, with the held
+    /// backlog kept per agent underneath it; `Event::NoticeLockChanged` carries
+    /// the badge numbers back on the flip and on every count that moves.
+    SetNoticeLock(bool),
     /// Update user flags for one model route (`provider/model` key); the session
     /// keeps them in memory, the TUI persists them to `prefs.toml`.
     SetModelFlag {
@@ -322,6 +328,7 @@ impl Request {
             Request::SetEffort(_) => "set_effort",
             Request::SetMode(_) => "set_mode",
             Request::SetZdr(_) => "set_zdr",
+            Request::SetNoticeLock(_) => "set_notice_lock",
             Request::SetModelFlag { .. } => "set_model_flag",
             Request::StopAgent(_) => "stop_agent",
             Request::KillTask(_) => "kill_task",
@@ -422,7 +429,9 @@ impl Request {
                 check_id("explained permission", permission.as_str())
             }
             Self::SetModel(route) => check_route(route),
-            Self::SetEffort(_) | Self::SetMode(_) | Self::SetZdr(_) => Ok(()),
+            Self::SetEffort(_) | Self::SetMode(_) | Self::SetZdr(_) | Self::SetNoticeLock(_) => {
+                Ok(())
+            }
             Self::SetModelFlag { model, .. } => check_chars("model flag", model, TITLE_MAX_CHARS),
             Self::StopAgent(agent) => check_id("stopped agent", agent.as_str()),
             Self::KillTask(task) | Self::AckTask(task) => check_id("task", task.as_str()),
@@ -1059,6 +1068,18 @@ pub enum Event {
     SessionStatus {
         session: SessionId,
         status: SessionStatusKind,
+    },
+    /// The session's notice lock moved: the switch flipped, or the parked
+    /// backlog changed size. Fired on transitions only — a twenty-notice
+    /// backlog costs two events, not twenty — so a client can render the badge
+    /// from the wire without polling for it.
+    NoticeLockChanged {
+        session: SessionId,
+        locked: bool,
+        /// Injections parked across the session's resident agents.
+        held: usize,
+        /// Injections a cap refused since the daemon started.
+        dropped: u64,
     },
 }
 

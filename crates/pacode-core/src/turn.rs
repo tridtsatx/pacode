@@ -11,14 +11,15 @@
 //!   emit ItemUpdated(assistant complete)
 //!   if no tool calls {
 //!     // point B
-//!     match injections.drain() { empty → break; items → push render_injections; continue }
+//!     match agent.take_due(now) { None → break; taken → push render_injections; continue }
+//!     // taken, not yet delivered → agent.restore_due(taken), unchanged
 //!   }
 //!   run tool calls: ReadOnly/Network in parallel (join_all), others sequentially, each:
 //!     gate → maybe ask permission (WaitingApproval) → call → cap output → history.push(tool_result) (persist)
 //!     emit ItemAdded/ItemUpdated(ToolCall …); cancel → stub tool results ("cancelled") then Interrupted
 //!   // point C: urgent interrupt only (cancel token)
 //!   // point D
-//!   history.extend(render_injections(injections.drain()))
+//!   history.extend(render_injections(agent.take_due(now)))
 //!   if needs_compaction → compaction::compact
 //! }
 //! ```
@@ -36,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::CoreError;
 use crate::agent::Agent;
+use crate::notice_lock::{DueOrigin, Taken};
 use crate::prompt::DynamicContext;
 use crate::session::Session;
 
@@ -118,6 +120,14 @@ pub async fn run_turn(
 
     let mut turn_usage = Usage::default();
     let mut last_input_tokens: Option<u64>;
+    // The implementer half's own spend. `turn_usage` carries both halves
+    // (that is what the user is billed and what `TurnEnded` reports); the
+    // fusion trace needs the split, so the two are accumulated apart.
+    let mut implementer_usage = Usage::default();
+    // Fusion is a property of the turn, resolved once here: `Off` runs the
+    // pre-fusion path untouched, `Pending` runs the planner on the first
+    // iteration and then becomes `Planned` or `Degraded` for good.
+    let mut phase = crate::fusion::start_phase(&session, &agent);
 
     loop {
         if cancel.is_cancelled() {
@@ -157,8 +167,70 @@ pub async fn run_turn(
             crate::prompt::system_dynamic(&dyn_ctx)
         };
         let system_static = crate::prompt::system_static().to_string();
+        // The fusion seam. Inside the loop, after the injection drain and
+        // before the request is built: the planner must see the same history
+        // and the same environment block the implementer is about to see, and
+        // the plan must land in history before the first implementer request
+        // so it is part of the conversation, not a retroactive annotation.
+        if let Some(routes) = phase.take_pending() {
+            crate::fusion::begin_trace(&agent, &routes);
+            match crate::fusion::run_planner(
+                &session,
+                &agent,
+                &cancel,
+                &routes,
+                &system_static,
+                &system_dynamic,
+            )
+            .await
+            {
+                crate::fusion::PlanOutcome::Planned(artifact) => {
+                    // The planner's call was made and paid for whatever
+                    // happens to the plan, so it lands in the turn's usage
+                    // before the plan is committed.
+                    agent.record_turn_usage(artifact.usage);
+                    turn_usage += artifact.usage;
+                    crate::fusion::record_planner_usage(&agent, artifact.usage);
+                    if let Err(error) =
+                        crate::fusion::commit_plan(&session, &agent, &artifact).await
+                    {
+                        return (
+                            lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
+                            turn_usage,
+                        );
+                    }
+                    let implementing = crate::fusion::implementer_activity(&routes.implementer);
+                    phase = crate::fusion::Phase::Planned(routes);
+                    agent.set_status(AgentStatus::Thinking, Some(implementing));
+                    session.events.emit(Event::AgentUpdated(agent.info()));
+                }
+                crate::fusion::PlanOutcome::Skipped { reason, usage } => {
+                    // Nothing was written: the plan is the first thing this
+                    // module persists, so a failed planner leaves history as
+                    // the user left it and the turn below is the ordinary one.
+                    // What it did spend is still the user's money.
+                    agent.record_turn_usage(usage);
+                    turn_usage += usage;
+                    log::warn!(
+                        "fusion planner skipped, running the turn on {}: {reason}",
+                        agent.info().model
+                    );
+                    crate::fusion::mark_planner_failed(&agent, usage);
+                    // The planner may have labelled the agent before failing;
+                    // the turn that follows is an ordinary one and must look
+                    // like it.
+                    agent.set_status(AgentStatus::Thinking, Some("thinking".to_string()));
+                    session.events.emit(Event::AgentUpdated(agent.info()));
+                }
+            }
+        }
 
         let agent_info = agent.info();
+        // The model this request goes to. `Off` and `Degraded` both resolve to
+        // the agent's own route, which is what makes the no-fusion path
+        // byte-for-byte what it was.
+        let model_route = phase.model(&agent_info.model);
+
         let history_msgs = agent
             .history
             .lock()
@@ -171,7 +243,7 @@ pub async fn run_turn(
             .definitions();
 
         let req = pacode_provider::CompletionRequest {
-            model: agent_info.model.model.clone(),
+            model: model_route.model.clone(),
             system_static,
             system_dynamic,
             messages: history_msgs,
@@ -183,23 +255,24 @@ pub async fn run_turn(
         // Re-check the ZDR flag at the resolve point: `SetZdr`/`SetModel`/
         // `SetModelFlag` guards cover the request path, but a turn re-driven
         // by injections or `continue_agent` reaches here without them.
-        let provider = if session.zdr_active()
-            && !session
-                .model_flags(&agent_info.model.to_string())
-                .zdr_capable
-        {
-            Err(pacode_provider::ProviderError::Config(format!(
-                "zdr_blocked: {} is not flagged zdr_capable",
-                agent_info.model
-            )))
-        } else {
-            session.providers.resolve(&agent_info.model).await
-        };
+        let provider =
+            if session.zdr_active() && !session.model_flags(&model_route.to_string()).zdr_capable {
+                Err(pacode_provider::ProviderError::Config(format!(
+                    "zdr_blocked: {} is not flagged zdr_capable",
+                    model_route
+                )))
+            } else {
+                session.providers.resolve(&model_route).await
+            };
         let provider = match provider {
             Ok(p) => p,
             Err(e) => {
                 return (
-                    lifecycle::finish_failed_turn(&session, &agent, e.to_string()),
+                    lifecycle::finish_failed_turn(
+                        &session,
+                        &agent,
+                        crate::fusion::failure_message(&phase, &e.to_string()),
+                    ),
                     turn_usage,
                 );
             }
@@ -223,7 +296,11 @@ pub async fn run_turn(
             Ok(s) => s,
             Err(e) => {
                 return (
-                    lifecycle::finish_failed_turn(&session, &agent, e.to_string()),
+                    lifecycle::finish_failed_turn(
+                        &session,
+                        &agent,
+                        crate::fusion::failure_message(&phase, &e.to_string()),
+                    ),
                     turn_usage,
                 );
             }
@@ -235,9 +312,11 @@ pub async fn run_turn(
                 // `consume_stream` yields only `Failed` today; a `Failed`
                 // still wants the notice + status exit, the rest unwinds as-is.
                 let stop = match stop {
-                    TurnStop::Failed { message } => {
-                        lifecycle::finish_failed_turn(&session, &agent, message)
-                    }
+                    TurnStop::Failed { message } => lifecycle::finish_failed_turn(
+                        &session,
+                        &agent,
+                        crate::fusion::failure_message(&phase, &message),
+                    ),
                     TurnStop::Completed | TurnStop::Interrupted => stop,
                 };
                 return (stop, turn_usage);
@@ -254,6 +333,8 @@ pub async fn run_turn(
             (provider_usage.input_tokens > 0).then_some(provider_usage.input_tokens);
         agent.record_turn_usage(provider_usage);
         turn_usage += outcome.usage;
+        implementer_usage += outcome.usage;
+        crate::fusion::record_implementer_usage(&agent, implementer_usage);
 
         if outcome.interrupted {
             *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -376,7 +457,9 @@ pub async fn run_turn(
         // Spec §6.4: trigger based on last observed usage.input_tokens (or est_tokens if none)
         // against the active model's context window.
         let last_input_tokens = compaction_input_tokens(last_input_tokens, est_tokens);
-        let model_info = provider.model_info(&agent_info.model.model);
+        // The window of the model that is actually carrying this turn. Off
+        // fusion that is the agent's own model, as before.
+        let model_info = provider.model_info(&model_route.model);
         let context_window = crate::compaction::resolve_context_window(
             Some(&model_info),
             session.config.context.default_context_window,
@@ -391,6 +474,13 @@ pub async fn run_turn(
                 agent.id()
             );
         }
+    }
+
+    // The turn finished on the implementer: the trace can say so. A turn that
+    // broke out early (deferred admission) leaves the phase where it stopped,
+    // which is the truth about what the client was shown.
+    if phase.planned() {
+        crate::fusion::complete_trace(&agent, implementer_usage);
     }
 
     let final_status = if agent.id().is_main() {
@@ -427,43 +517,52 @@ async fn drain_injections(
     admission: Option<&str>,
     defer_admissions: bool,
 ) -> Result<DrainOutcome, CoreError> {
-    let drained = agent.injections.drain();
-    if defer_admissions
-        && drained.iter().any(|item| {
-            matches!(
-                item,
-                crate::inject::Injection::UserSteer {
-                    admission: Some(candidate)
-                } if Some(candidate.as_str()) != admission
-            )
-        })
+    let Some(taken) = agent.take_due(std::time::Instant::now()) else {
+        return Ok(DrainOutcome::Idle);
+    };
+    if taken
+        .items
+        .iter()
+        .any(|item| item.origin == DueOrigin::Held)
     {
-        agent.injections.restore(drained);
-        return Ok(DrainOutcome::DeferredAdmission);
+        session.emit_notice_lock(agent, agent.notice_lock.held());
     }
-
-    let mut deferred = Vec::new();
-    let mut active = Vec::new();
-    for item in drained {
-        if matches!(
-            &item,
+    let is_foreign_admission = |item: &crate::inject::Injection| {
+        matches!(
+            item,
             crate::inject::Injection::UserSteer {
                 admission: Some(candidate)
             } if Some(candidate.as_str()) != admission
-        ) {
+        )
+    };
+    if defer_admissions
+        && taken
+            .items
+            .iter()
+            .any(|item| is_foreign_admission(&item.injection))
+    {
+        agent.restore_due(taken);
+        return Ok(DrainOutcome::DeferredAdmission);
+    }
+
+    let prev_due = taken.prev_due;
+    let mut deferred = Vec::new();
+    let mut active = Vec::new();
+    for item in taken.items {
+        if is_foreign_admission(&item.injection) {
             deferred.push(item);
         } else {
-            active.push(item);
+            active.push(item.injection);
         }
     }
 
     if let Err(error) = hide_other_admission_messages(session, agent, admission).await {
-        agent.injections.restore(deferred);
+        agent.restore_due(Taken::new(deferred, prev_due));
         return Err(error);
     }
 
     if active.is_empty() {
-        agent.injections.restore(deferred);
+        agent.restore_due(Taken::new(deferred, prev_due));
         return Ok(DrainOutcome::Idle);
     }
 
@@ -475,7 +574,7 @@ async fn drain_injections(
         .filter(|item| !matches!(item, crate::inject::Injection::UserSteer { .. }))
         .collect::<Vec<_>>();
     if renderable.is_empty() {
-        agent.injections.restore(deferred);
+        agent.restore_due(Taken::new(deferred, prev_due));
         return Ok(if has_user_steer {
             DrainOutcome::Continue
         } else {
@@ -486,10 +585,10 @@ async fn drain_injections(
     let injection_msg =
         crate::inject::render_injections(&renderable, session.config.context.injection_cap_chars);
     if let Err(error) = persist_history_message(session, agent, injection_msg).await {
-        agent.injections.restore(deferred);
+        agent.restore_due(Taken::new(deferred, prev_due));
         return Err(error);
     }
-    agent.injections.restore(deferred);
+    agent.restore_due(Taken::new(deferred, prev_due));
     Ok(DrainOutcome::Continue)
 }
 
@@ -539,7 +638,7 @@ async fn hide_other_admission_messages(
     Ok(())
 }
 
-async fn persist_history_message(
+pub(crate) async fn persist_history_message(
     session: &Session,
     agent: &Agent,
     message: Message,

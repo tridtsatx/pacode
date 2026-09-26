@@ -499,7 +499,18 @@ impl OpenAiCompat {
                 if let Some(id) = item.get("id").and_then(|v| v.as_str())
                     && seen.insert(id.to_string())
                 {
-                    all_models.push(self.model_info(id));
+                    let mut info = self.model_info(id);
+                    if info.supported_efforts.is_none() {
+                        // Most OpenAI-compatible `/models` payloads name no
+                        // levels at all — not even OpenRouter's
+                        // `supported_parameters`, which names the parameter and
+                        // not its values. The few that do enumerate them
+                        // (GitHub Copilot, gateways fronting the ChatGPT
+                        // catalog) are the only honest source of an
+                        // unsupported list; everything else stays `None`.
+                        info.supported_efforts = crate::catalog_efforts::efforts(item);
+                    }
+                    all_models.push(info);
                 }
             }
         }
@@ -892,10 +903,11 @@ impl Provider for OpenAiCompat {
             context_window,
             supports_reasoning,
             supports_vision: self.vision_for(model),
-            // providers.toml `efforts` wins; `/models` responses (incl.
-            // OpenRouter `supported_parameters`) do not enumerate effort
-            // levels, so there is nothing else to merge yet.
-            // TODO(zdr-batch): api effort metadata
+            // providers.toml `efforts` wins. A `/models` entry that names its
+            // own levels overrides nothing and fills the gap in `fetch_models`;
+            // one that names none leaves the ladder unrestricted, because
+            // OpenRouter's `supported_parameters` says which parameter exists,
+            // not which values it takes.
             supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
             pricing,
         }

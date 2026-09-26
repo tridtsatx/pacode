@@ -779,9 +779,13 @@ impl ToolHost for SessionHost {
             .session
             .agent(&parent_id)
             .ok_or_else(|| ToolError::failed("parent agent is gone"))?;
-        parent
-            .injections
-            .push(crate::inject::Injection::AgentStatus { agent: info, text });
+        let injection = crate::inject::Injection::AgentStatus { agent: info, text };
+        // A parked report starts no turn: the parent would spend a model round
+        // trip reading an empty injection set.
+        if self.session.hold_notice(&parent, &injection) {
+            return Ok(());
+        }
+        parent.injections.push(injection);
         if parent.id().is_main() {
             crate::turn::lifecycle::request_turn(self.session.clone(), parent);
         }

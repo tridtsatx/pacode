@@ -4,7 +4,7 @@
 //! filters only free models (`cost.input == 0`), and provides the headers
 //! required by the Zen API (`x-opencode-*`, `User-Agent`).
 
-use pacode_types::{Effort, ModelInfo, ModelRoute, Pricing};
+use pacode_types::{ModelInfo, ModelRoute, Pricing};
 use rand::Rng;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -110,7 +110,7 @@ fn map_model(model: &Value) -> Option<ModelInfo> {
             .and_then(|v| v.as_array())
             .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("image")));
 
-    let supported_efforts = parse_efforts(model);
+    let supported_efforts = crate::catalog_efforts::efforts(model);
 
     let cache_read = model
         .get("cost")
@@ -131,23 +131,6 @@ fn map_model(model: &Value) -> Option<ModelInfo> {
             cache_write_per_m: None,
         }),
     })
-}
-
-fn parse_efforts(model: &Value) -> Option<Vec<Effort>> {
-    let options = model.get("reasoning_options")?.as_array()?;
-    for opt in options {
-        if opt.get("type").and_then(|v| v.as_str()) == Some("effort") {
-            let values = opt.get("values")?.as_array()?;
-            let efforts: Vec<Effort> = values
-                .iter()
-                .filter_map(|v| v.as_str().and_then(Effort::parse))
-                .collect();
-            if !efforts.is_empty() {
-                return Some(efforts);
-            }
-        }
-    }
-    None
 }
 
 /// Build opencode-specific HTTP headers for Zen API requests.

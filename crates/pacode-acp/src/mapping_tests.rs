@@ -989,6 +989,7 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::SetEffort(_)
         | Request::SetMode(_)
         | Request::SetZdr(_)
+        | Request::SetNoticeLock(_)
         | Request::SetModelFlag { .. }
         | Request::StopAgent(_)
         | Request::KillTask(_)

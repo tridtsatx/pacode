@@ -421,6 +421,14 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
         Event::SessionStatus { session, status } => {
             state.apply_session_status(session, status);
         }
+        Event::NoticeLockChanged {
+            session,
+            locked,
+            held,
+            dropped,
+        } => {
+            state.notice_lock.apply(session, locked, held, dropped);
+        }
     }
     let turn_active = state.turn_active;
     state.rail.update_idle(turn_active, now);

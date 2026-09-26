@@ -37,6 +37,20 @@ pub enum Injection {
     },
 }
 
+impl Injection {
+    /// What the notice lock may park. Everything that reports work *back* to
+    /// the orchestrator is holdable; what the user or the orchestrator is
+    /// waiting on is not.
+    ///
+    /// The rule is stated as an exclusion on purpose: a new variant is
+    /// holdable by default, and the ones that must never wait in a backlog are
+    /// the ones that hang a turn — a held steer is a turn the user believes is
+    /// running and is not.
+    pub fn is_holdable(&self) -> bool {
+        !matches!(self, Injection::UserSteer { .. } | Injection::StatusRequest)
+    }
+}
+
 #[derive(Default)]
 pub struct InjectionQueue {
     queue: Mutex<VecDeque<Injection>>,

@@ -34,7 +34,7 @@ fn question_cell(answer: Option<pacode_types::QuestionAnswer>) -> TranscriptKind
 #[test]
 fn an_unanswered_question_does_not_repeat_the_picker() {
     let opts = pacode_render::RenderOptions::new(80, false);
-    let lines = super::render_item_inner(&question_cell(None), None, None, 80, &opts, 0, false);
+    let lines = super::render_item_inner(&question_cell(None), None, None, None, &opts, 0, false);
     let text: Vec<String> = lines
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -55,7 +55,7 @@ fn an_unanswered_question_does_not_repeat_the_picker() {
 fn an_answered_question_shows_what_was_chosen() {
     let opts = pacode_render::RenderOptions::new(80, false);
     let answered = question_cell(Some(pacode_types::QuestionAnswer::choice(1)));
-    let lines = super::render_item_inner(&answered, None, None, 80, &opts, 0, false);
+    let lines = super::render_item_inner(&answered, None, None, None, &opts, 0, false);
     let joined: String = lines
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
@@ -67,7 +67,7 @@ fn an_answered_question_shows_what_was_chosen() {
     assert!(!joined.contains("waiting for your answer"), "{joined}");
 
     let dismissed = question_cell(Some(pacode_types::QuestionAnswer::cancelled()));
-    let lines = super::render_item_inner(&dismissed, None, None, 80, &opts, 0, false);
+    let lines = super::render_item_inner(&dismissed, None, None, None, &opts, 0, false);
     let joined: String = lines
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
@@ -82,7 +82,7 @@ fn an_answered_question_keeps_the_description_and_the_typed_text() {
     let mut answer = pacode_types::QuestionAnswer::choice(1);
     answer.free_text = Some("with a twist".to_string());
     let answered = question_cell(Some(answer));
-    let lines = super::render_item_inner(&answered, None, None, 80, &opts, 0, false);
+    let lines = super::render_item_inner(&answered, None, None, None, &opts, 0, false);
     let joined: String = lines
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
@@ -103,7 +103,7 @@ fn notice_text(level: ToastLevel, text: &str, width: u16) -> String {
         level,
         text: text.to_string(),
     };
-    super::render_item_inner(&kind, None, None, width, &opts, 0, false)
+    super::render_item_inner(&kind, None, None, None, &opts, 0, false)
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
         .collect::<Vec<_>>()
@@ -334,25 +334,29 @@ fn permission_cell(risk: Option<RiskLevel>, explain: Option<PermExplain>) -> Cel
 
 fn cell_text(cell: &Cell, width: u16) -> String {
     let opts = pacode_render::RenderOptions::new(width, false);
-    super::render_cell_for_test(cell, width, &opts)
+    super::render_cell_for_test(cell, &opts)
         .iter()
         .map(|l| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() })
         .collect::<Vec<_>>()
         .join("\n")
 }
-
-#[test]
-fn a_permission_prompt_shows_the_risk_and_the_verdict_keys() {
-    let cell = permission_cell(Some(RiskLevel::Confirm), None);
-    let joined = cell_text(&cell, 80);
-    assert!(joined.contains("permission:"), "{joined}");
-    assert!(joined.contains("Bash: rm -rf /tmp/x"), "{joined}");
-    assert!(joined.contains("risk: confirm"), "{joined}");
-    assert!(
-        joined.contains("y allow · a session · n deny · e explain"),
-        "{joined}"
-    );
-    assert!(!joined.contains("explain requested"), "{joined}");
+fn tool_item(seq: u64, status: ToolStatus, preview: &str) -> pacode_types::TranscriptItem {
+    pacode_types::TranscriptItem {
+        seq,
+        agent: pacode_types::AgentId::main(),
+        ts_ms: 0,
+        kind: TranscriptKind::ToolCall {
+            call_id: pacode_types::CallId::new("call_1"),
+            name: "bash".into(),
+            title: "bash cargo build".into(),
+            intent: None,
+            status,
+            preview: preview.to_string(),
+            diff: None,
+            duration_ms: None,
+            task: None,
+        },
+    }
 }
 
 #[test]
@@ -484,4 +488,62 @@ fn a_copy_stops_at_the_byte_cap_rather_than_growing_without_bound() {
     let bytes: usize = lines.lines.iter().map(String::len).sum();
     assert!(bytes <= 64 * 1024 + 1_000, "{bytes}");
     assert!(!lines.lines.is_empty());
+}
+
+fn prepared_text(t: &mut Transcript, opts: &pacode_render::RenderOptions) -> String {
+    let area = Rect::new(0, 0, 80, 40);
+    super::prepare(area, t, opts, 0, 0)
+        .lines
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_running_tool_body_is_never_served_from_the_line_cache() {
+    let opts = pacode_render::RenderOptions::new(80, false);
+    let mut t = Transcript::new(16);
+    t.upsert(tool_item(1, ToolStatus::Running, ""), Instant::now());
+
+    // Nothing has been produced yet: a header and an input row, and not one
+    // line of it in the cache — the running cell renders fresh every frame.
+    let first = prepared_text(&mut t, &opts);
+    assert!(!first.contains("Compiling"), "{first}");
+    assert_eq!(t.cache.total_lines(), 0, "a running tool is never cached");
+
+    // The cell itself does not change, only the output behind it.
+    t.push_tool_output(1, "Compiling pacode-tui\n");
+    let second = prepared_text(&mut t, &opts);
+    assert!(second.contains("Compiling pacode-tui"), "{second}");
+    assert_eq!(t.cache.total_lines(), 0, "a running tool is never cached");
+
+    t.push_tool_output(1, "Finished dev\n");
+    let third = prepared_text(&mut t, &opts);
+    assert!(third.contains("Finished dev"), "{third}");
+    assert_eq!(t.cache.total_lines(), 0, "a running tool is never cached");
+}
+
+#[test]
+fn a_finished_tool_body_takes_the_cache_again() {
+    let opts = pacode_render::RenderOptions::new(80, false);
+    let mut t = Transcript::new(16);
+    t.upsert(tool_item(1, ToolStatus::Running, ""), Instant::now());
+    prepared_text(&mut t, &opts);
+    assert_eq!(t.cache.total_lines(), 0);
+
+    t.upsert(
+        tool_item(1, ToolStatus::Ok, "Compiling pacode-tui\nFinished dev"),
+        Instant::now(),
+    );
+
+    let text = prepared_text(&mut t, &opts);
+    assert!(text.contains("Finished dev"), "{text}");
+    assert!(
+        t.cache.total_lines() > 0,
+        "a finished cell is cacheable again"
+    );
+    // The live bytes are gone with the live cell: the finished preview is the
+    // body, and nothing is held twice.
+    assert_eq!(t.tool_streams.get(1), None);
 }

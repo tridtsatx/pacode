@@ -3440,7 +3440,18 @@ async fn reconnect_protocol_mismatch_is_terminal() {
     })
     .await
     .unwrap();
-    assert!(terminal.contains("daemon speaks 7"));
+    // Both numbers derived: the scripted daemon above answers with
+    // `PROTOCOL_VERSION - 1`, and a version spelled out here would fail on
+    // every protocol bump for a reason that has nothing to do with
+    // reconnection.
+    assert!(
+        terminal.contains(&format!("daemon speaks {}", PROTOCOL_VERSION - 1)),
+        "{terminal}"
+    );
+    assert!(
+        terminal.contains(&format!("client {PROTOCOL_VERSION}")),
+        "{terminal}"
+    );
     assert!(matches!(
         tokio::time::timeout(Duration::from_millis(200), events.recv()).await,
         Err(_) | Ok(None)

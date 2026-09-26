@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::CoreError;
 use crate::agent::Agent;
+use crate::notice_lock::{DueOrigin, Taken};
 use crate::session::Session;
 
 #[cfg(test)]
@@ -268,16 +269,32 @@ pub(crate) fn request_turn(session: Arc<Session>, agent: Arc<Agent>) {
         return;
     }
 
-    let queued = agent.injections.drain();
+    let Some(taken) = agent.take_due(std::time::Instant::now()) else {
+        return;
+    };
+    if taken
+        .items
+        .iter()
+        .any(|item| item.origin == DueOrigin::Held)
+    {
+        session.emit_notice_lock(&agent, agent.notice_lock.held());
+    }
+    let prev_due = taken.prev_due;
     let mut seen = HashSet::new();
     let mut admission = None;
-    let mut remaining = Vec::new();
+    let mut remaining: Vec<crate::notice_lock::TakenItem> = Vec::new();
+
     let mut cancelled = Vec::new();
-    for item in queued {
-        match item {
+    for item in taken.items {
+        // Matched by reference: `restore_due` has to put an item back in the
+        // deque it came from, and moving the injection out of the wrapper would
+        // leave only half of it — the origin is what says whether the item was
+        // paced or live.
+        match &item.injection {
             crate::inject::Injection::UserSteer {
                 admission: Some(candidate),
             } => {
+                let candidate = candidate.clone();
                 if !seen.insert(candidate.clone()) {
                     continue;
                 }
@@ -286,12 +303,14 @@ pub(crate) fn request_turn(session: Arc<Session>, agent: Arc<Agent>) {
                 } else if admission.is_none() {
                     admission = Some(candidate);
                 } else {
-                    remaining.push(crate::inject::Injection::UserSteer {
-                        admission: Some(candidate),
-                    });
+                    remaining.push(crate::notice_lock::TakenItem::queued(
+                        crate::inject::Injection::UserSteer {
+                            admission: Some(candidate),
+                        },
+                    ));
                 }
             }
-            item => remaining.push(item),
+            _ => remaining.push(item),
         }
     }
 
@@ -303,11 +322,11 @@ pub(crate) fn request_turn(session: Arc<Session>, agent: Arc<Agent>) {
         let mut retry = Vec::new();
         let keep_non_admissions = !agent.stop_requested();
         for item in remaining {
-            match item {
+            match item.injection {
                 crate::inject::Injection::UserSteer {
                     admission: Some(candidate),
                 } => interrupted.push(candidate),
-                item if keep_non_admissions => retry.push(item),
+                _ if keep_non_admissions => retry.push(item),
                 _ => {}
             }
         }
@@ -315,15 +334,19 @@ pub(crate) fn request_turn(session: Arc<Session>, agent: Arc<Agent>) {
             session
                 .mark_admissions_terminal(interrupted, "interrupted")
                 .await;
-            agent.injections.restore(retry);
+            agent.restore_due(Taken::new(retry, prev_due));
             drop(turn_guard);
             session.emit_session_status();
         });
         return;
     }
 
-    agent.injections.restore(remaining);
-    if admission.is_none() && agent.injections.is_empty() {
+    // A parked backlog that is *not* in this batch is not work: it is the
+    // user's own backlog, and a turn started for one burns a model round trip
+    // to learn nothing. What this batch released is.
+    let has_work = !remaining.is_empty();
+    agent.restore_due(Taken::new(remaining, prev_due));
+    if admission.is_none() && !has_work && agent.injections.is_empty() {
         if !cancelled.is_empty() {
             tokio::spawn(async move {
                 session
@@ -337,6 +360,33 @@ pub(crate) fn request_turn(session: Arc<Session>, agent: Arc<Agent>) {
     }
     spawn_mark_admissions_terminal(&session, cancelled, "interrupted");
     start_claimed_turn(session, agent, turn_guard, generation, admission);
+}
+
+/// Re-drive the agent for a parked backlog.
+///
+/// A parked notice is the user's own backlog: a turn started for one burns a
+/// model round trip to learn nothing, and the pacing is the promise the badge
+/// shows. So the wake is a timer, not a push — raced against a push, because a
+/// steer the user is waiting on must never sit behind that backlog. When
+/// nothing is parked this is an ordinary re-drive, which is what every other
+/// caller of [`request_turn`] already does.
+fn spawn_locked_redrive(session: Arc<Session>, agent: Arc<Agent>) {
+    if !agent.notice_lock.wants_work() {
+        request_turn(session, agent);
+        return;
+    }
+    tokio::spawn(async move {
+        match agent.next_release_in(std::time::Instant::now()) {
+            Some(remaining) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => {}
+                    _ = agent.injections.wait_nonempty() => {}
+                }
+            }
+            None => agent.injections.wait_nonempty().await,
+        }
+        request_turn(session, agent);
+    });
 }
 
 pub(crate) async fn start_turn_or_steer(
@@ -559,7 +609,8 @@ async fn unwind_unclaimed_turn(
     turn_guard: OwnedMutexGuard<()>,
 ) {
     *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    let redrive = !agent.injections.is_empty() && !agent.stop_requested();
+    let redrive =
+        (!agent.injections.is_empty() || agent.notice_lock.wants_work()) && !agent.stop_requested();
     if !redrive {
         *agent
             .history_before_turn
@@ -569,7 +620,7 @@ async fn unwind_unclaimed_turn(
     drop(turn_guard);
     session.emit_session_status();
     if redrive {
-        request_turn(session.clone(), agent.clone());
+        spawn_locked_redrive(session.clone(), agent.clone());
     }
 }
 
@@ -889,14 +940,17 @@ fn start_claimed_turn(
             if let Some(parent_id) = &info.parent
                 && let Some(parent) = session.agent(parent_id)
             {
-                parent
-                    .injections
-                    .push(crate::inject::Injection::AgentFinished {
-                        agent: info,
-                        answer: capped_answer,
-                    });
-                if parent.id().is_main() {
-                    request_turn(session.clone(), parent);
+                let injection = crate::inject::Injection::AgentFinished {
+                    agent: info,
+                    answer: capped_answer,
+                };
+                // A parked report starts no turn: the parent would spend a
+                // model round trip reading an empty injection set.
+                if !session.hold_notice(&parent, &injection) {
+                    parent.injections.push(injection);
+                    if parent.id().is_main() {
+                        request_turn(session.clone(), parent);
+                    }
                 }
             }
 
@@ -933,6 +987,8 @@ fn start_claimed_turn(
         // returns without doing anything) or will do so itself.
         if owes_turn(&agent, has_recovery) {
             request_turn(session.clone(), agent.clone());
+        } else if agent.notice_lock.wants_work() {
+            spawn_locked_redrive(session.clone(), agent.clone());
         }
     });
 }

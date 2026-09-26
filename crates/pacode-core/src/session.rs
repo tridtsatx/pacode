@@ -172,11 +172,49 @@ impl Session {
         agent: &Arc<Agent>,
         injection: crate::inject::Injection,
     ) {
+        if self.hold_notice(agent, &injection) {
+            return;
+        }
         let wake = agent.id().is_main();
         agent.injections.push(injection);
         if wake && !agent.is_running() && !agent.stop_requested() {
             crate::turn::lifecycle::request_turn(self.clone(), agent.clone());
         }
+    }
+
+    /// Park `injection` in `agent`'s notice lock when the lock is on. `true`
+    /// means the caller must *not* push it to the live queue and must not start
+    /// a turn for it — a turn woken by a parked notice delivers nothing and
+    /// costs a whole model round trip.
+    ///
+    /// The badge event fires only when the count actually moved: a twenty-notice
+    /// backlog must not cost twenty events.
+    pub(crate) fn hold_notice(
+        &self,
+        agent: &Arc<Agent>,
+        injection: &crate::inject::Injection,
+    ) -> bool {
+        let before = agent.notice_lock.held();
+        if !agent.notice_lock.hold_if_locked(injection) {
+            return false;
+        }
+        let held = agent.notice_lock.held();
+        if held != before {
+            self.emit_notice_lock(agent, held);
+        }
+        true
+    }
+
+    /// The badge numbers for `agent`'s lock, as the wire carries them. Emitted
+    /// on a transition only — the flip, an arrival that moved the count, or a
+    /// release that took one off — never once per drain step.
+    pub(crate) fn emit_notice_lock(&self, agent: &Arc<Agent>, held: usize) {
+        self.events.emit(pacode_types::Event::NoticeLockChanged {
+            session: self.id.clone(),
+            locked: agent.notice_lock.is_locked(),
+            held,
+            dropped: agent.notice_lock.dropped(),
+        });
     }
 
     pub fn main_agent(&self) -> Option<Arc<Agent>> {
@@ -1166,6 +1204,57 @@ impl Session {
         }
         self.touch();
         Ok(())
+    }
+
+    /// Session-wide notice lock: while it is on, every resident agent parks the
+    /// injections it would otherwise deliver. The held deques live per agent
+    /// under this one switch — a per-agent lock would need an `AgentId` in the
+    /// request and give the user a control they have no use for.
+    ///
+    /// Unlocking re-drives whatever is holding, and that re-drive is the only
+    /// wake available: the toggle arrived over the wire with no push behind it,
+    /// so without this the first release would wait for the next unrelated
+    /// event. `true` when the switch actually moved.
+    pub async fn set_notice_lock(self: &Arc<Self>, locked: bool) -> bool {
+        let now = std::time::Instant::now();
+        let agents: Vec<Arc<Agent>> = self
+            .agents
+            .read()
+            .map(|agents| agents.values().cloned().collect())
+            .unwrap_or_default();
+        // `|=` on purpose: `any` would stop at the first agent that moved the
+        // switch and leave the rest of the session locked.
+        let mut changed = false;
+        for agent in &agents {
+            changed |= agent.notice_lock.set_locked(locked, now);
+        }
+        if !changed {
+            return false;
+        }
+        let held: usize = agents.iter().map(|agent| agent.notice_lock.held()).sum();
+        let dropped: u64 = agents.iter().map(|agent| agent.notice_lock.dropped()).sum();
+        self.events.emit(pacode_types::Event::NoticeLockChanged {
+            session: self.id.clone(),
+            locked,
+            held,
+            dropped,
+        });
+        if !locked {
+            for agent in &agents {
+                if agent.notice_lock.held() == 0 || agent.stop_requested() {
+                    continue;
+                }
+                // A stopped subagent is resumed, not re-driven: `request_turn`
+                // refuses it, and `continue_agent` is what the user already uses
+                // to bring it back.
+                if !agent.id().is_main() && agent.status() == pacode_types::AgentStatus::Stopped {
+                    let _ = self.continue_agent(&agent.id()).await;
+                } else {
+                    crate::turn::lifecycle::request_turn(self.clone(), agent.clone());
+                }
+            }
+        }
+        true
     }
 
     /// Flags for one `provider/model` key; absent entry means all-false.

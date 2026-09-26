@@ -74,7 +74,7 @@ fn test_non_zero_exit_is_visible() {
         exit_code: Some(1),
         truncated: false,
     };
-    let lines = crate::ui::dialog::render_item(&kind, None, 80, &opts, 0);
+    let lines = crate::ui::dialog::render_item(&kind, None, &opts, 0);
     let full_rendered: String = lines
         .iter()
         .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))

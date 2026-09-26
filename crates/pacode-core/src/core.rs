@@ -736,6 +736,10 @@ impl Core {
                     message: e.to_string(),
                 },
             },
+            Request::SetNoticeLock(locked) => {
+                session.set_notice_lock(locked).await;
+                Reply::Ok
+            }
             Request::SetModelFlag { model, flags } => match session.set_model_flags(model, flags) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error {

@@ -5,6 +5,7 @@
 //! - every type here is a wire or storage contract, so serde shape changes are breaking;
 //! - helpers are small and pure (formatting, arithmetic over the DTOs).
 
+pub mod analyze;
 pub mod at_ref;
 pub mod config;
 pub mod cron_expr;
@@ -21,6 +22,7 @@ pub mod time;
 pub mod transcript;
 pub mod vcs;
 
+pub use analyze::*;
 pub use at_ref::*;
 pub use config::*;
 pub use ids::*;

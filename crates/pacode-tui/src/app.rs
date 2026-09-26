@@ -1833,6 +1833,7 @@ fn request_needs_session(req: &Request) -> bool {
         | Request::SetEffort(_)
         | Request::SetMode(_)
         | Request::SetZdr(_)
+        | Request::SetNoticeLock(_)
         | Request::SetModelFlag { .. }
         | Request::StopAgent(_)
         | Request::KillTask(_)

@@ -66,6 +66,15 @@ pub fn render_slots_spans(state: &AppState, opts: &RenderOptions) -> Vec<Span<'s
 fn context_right_spans(state: &AppState, opts: &RenderOptions) -> Vec<Span<'static>> {
     let tokens = state.rail.usage.context_tokens as u64;
     let mut spans = render_slots_spans(state, opts);
+    // The notice lock leads the right side, before the slot digits: a held
+    // notice changes what the numbers below it mean, and it is the only piece
+    // here that is not chrome. Empty when the lock is off and nothing is
+    // parked, so the ordinary case costs nothing.
+    let lock = state.notice_lock.footer_spans(&opts.theme);
+    if !lock.is_empty() {
+        spans.extend(lock);
+        spans.push(Span::styled(" · ", opts.theme.faint));
+    }
     spans.push(Span::styled(" · ", opts.theme.faint));
     if tokens > 0 {
         spans.push(Span::styled(format_tokens_upper(tokens), opts.theme.faint));

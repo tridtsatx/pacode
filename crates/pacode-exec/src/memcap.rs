@@ -29,6 +29,7 @@
 use std::fmt;
 
 use pacode_types::UiConfig;
+use pacode_types::config::TOOL_MEMORY_MIN_PERCENT;
 
 /// Kernel page size used for rounding and for cgroup byte maths. cgroup v2
 /// expresses `memory.max` in bytes and rounds internally to pages, so anything
@@ -103,33 +104,57 @@ impl MemoryPolicy {
     pub fn is_enabled(&self) -> bool {
         self.percent > 0 && self.machine_ram_bytes > 0
     }
-
-    /// The hard limit: what a live process's soft limit may be raised *to*.
-    /// The whole machine's RAM, because a request for more than the machine
-    /// physically has is not a request, it is a mistake.
-    pub fn hard_max_bytes(&self) -> Option<u64> {
-        self.is_enabled().then_some(self.machine_ram_bytes)
-    }
-
     /// Ceiling for one process while `live_sessions` sessions are live.
     ///
-    /// `None` means "no cap". `live_sessions == 0` is the moment before the
-    /// first session opens, and is treated as one: the session that is about to
-    /// start gets the full ceiling, not a fraction of nothing.
+    /// `None` means "no cap".
     pub fn ceiling_for(&self, live_sessions: usize) -> Option<u64> {
         if !self.is_enabled() {
             return None;
         }
-        let sessions = if self.split_sessions {
-            live_sessions.max(1)
-        } else {
-            1
-        };
         let total = self
             .machine_ram_bytes
             .saturating_mul(u64::from(self.percent))
             / 100;
-        Some(round_down_to_page(total / sessions as u64).max(PAGE_BYTES))
+        if !self.split_sessions {
+            return Some(round_down_to_page(total).max(PAGE_BYTES));
+        }
+        // Zero live sessions is the moment before the first one opens: the
+        // session about to start gets the full ceiling, not a share of nothing.
+        let share = total / live_sessions.max(1) as u64;
+        Some(round_down_to_page(share.max(self.division_floor())).max(PAGE_BYTES))
+    }
+
+    /// The share a session may not be divided below, in bytes. Division
+    /// continues to shrink until it reaches `TOOL_MEMORY_MIN_PERCENT` of the
+    /// machine, the same floor the settings registry uses, because below that
+    /// a "ceiling" stops being a safety limit and starts being an outage: a
+    /// daemon with a hundred idle sessions open would otherwise hand every new
+    /// process 0.8% of RAM and nothing would run at all. The sessions above the
+    /// floor take proportionally less, so the sum can exceed the ceiling once
+    /// there are more than `percent / TOOL_MEMORY_MIN_PERCENT` of them — the
+    /// machine, not the arithmetic, is then the limit, which is what the hard
+    /// limit and the OOM killer are for.
+    pub fn division_floor(&self) -> u64 {
+        round_down_to_page(
+            self.machine_ram_bytes
+                .saturating_mul(u64::from(TOOL_MEMORY_MIN_PERCENT))
+                / 100,
+        )
+    }
+
+    /// The ceiling a soft limit may be raised to: the machine's physical RAM.
+    ///
+    /// This is the hard half of the soft/hard split. The soft limit is the
+    /// session's share from [`Self::ceiling_for`]; a granted raise moves it
+    /// anywhere up to here on a process that is already running, with no
+    /// re-exec and no privilege — which is the whole reason the hard limit is
+    /// the physical size rather than a second policy number. `None` when the
+    /// cap is off: with no soft limit there is nothing to raise.
+    pub fn hard_max_bytes(&self) -> Option<u64> {
+        if !self.is_enabled() {
+            return None;
+        }
+        Some(self.machine_ram_bytes)
     }
 }
 

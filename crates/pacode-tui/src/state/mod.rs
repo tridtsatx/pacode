@@ -347,6 +347,10 @@ pub struct AppState {
     /// Whether the terminal takes RGB; decided once from `[ui] color` and the
     /// environment, and reused by the theme and the mascot.
     pub truecolor: bool,
+    /// The last notice-lock state the daemon reported for this session. A view,
+    /// not a switch: the lock itself is the daemon's, and this exists so the
+    /// footer can say how much is parked.
+    pub notice_lock: crate::lock::LockView,
     pub(crate) color_mode: ColorMode,
     pub(crate) detected_color_mode: ColorMode,
     pub(crate) render_context: RenderContext,
@@ -1006,6 +1010,7 @@ impl AppState {
             quit: false,
             mascot: crate::ui::mascot::MascotKind::random(),
             truecolor,
+            notice_lock: crate::lock::LockView::default(),
             color_mode,
             detected_color_mode,
             render_context,

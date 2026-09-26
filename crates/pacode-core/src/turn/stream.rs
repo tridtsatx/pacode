@@ -19,7 +19,7 @@ use crate::transcript::DeltaCoalescer;
 /// Raw argument bytes kept per in-flight call — a provider emitting unbounded
 /// args must not grow memory without bound. Past it the buffer stops growing
 /// and the cell preview carries a truncation note.
-pub(super) const RAW_ARGS_CAP: usize = 1024 * 1024;
+pub(crate) const RAW_ARGS_CAP: usize = 1024 * 1024;
 /// The same cap in MiB, for the error text a capped call returns.
 const RAW_ARGS_CAP_MIB: usize = RAW_ARGS_CAP / (1024 * 1024);
 /// The streamed-args cell preview shows head+tail only; the parsed tool
@@ -74,7 +74,7 @@ pub struct StreamOutcome {
 ///    output was malformed. The input is `{}` and no tool ever sees it.
 /// 2. Complete args that do not parse — a real error, reported as one.
 /// 3. Complete args that parse.
-fn finish_args(args: &str, args_capped: bool) -> (Option<String>, serde_json::Value) {
+pub(crate) fn finish_args(args: &str, args_capped: bool) -> (Option<String>, serde_json::Value) {
     if args_capped {
         return (
             Some(format!(

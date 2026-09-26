@@ -229,12 +229,14 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return toggle_zdr(state);
     }
 
-    // Alt+L: the notice lock. The toggle only flips the switch — a release
-    // that comes due later is picked up by the event loop's tick, not here.
+    // Alt+L: the notice lock. The switch lives in the daemon — the queue it
+    // guards is the daemon's injection queue — so the key sends a request and
+    // waits for `Event::NoticeLockChanged` to say what happened. Flipping a
+    // local flag here would draw a badge for a lock that holds nothing.
     if action == Some(KeyAction::ToggleLock) {
-        let on = state.notice_lock.toggle(now);
-        log::debug!("notice lock: {}", if on { "on" } else { "off" });
-        return vec![];
+        let on = !state.notice_lock.locked();
+        log::debug!("notice lock: asking for {}", if on { "on" } else { "off" });
+        return vec![Action::Send(Request::SetNoticeLock(on))];
     }
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
         if let Some(popup) = crate::ui::popup::resolve_current(state)
