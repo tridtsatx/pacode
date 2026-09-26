@@ -437,6 +437,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         size.height,
     );
     state.cwd = opts.cwd.clone();
+    state.analyze_mode = opts.analyze_mode;
     state.paths = opts.client.paths.clone();
     state.cache = crate::cache::DiskCache::new(state.paths.cache_dir.clone());
     state.connection = crate::state::Connection::Connecting;
@@ -1823,6 +1824,9 @@ fn request_needs_session(req: &Request) -> bool {
         | Request::Login { .. }
         | Request::Logout { .. }
         | Request::SetAuthAccount { .. } => false,
+        // Session-scoped: the report is this session's, so it waits for an
+        // attach rather than flying early and reading an empty ledger.
+        Request::Analyze => true,
         Request::UserMessage { .. }
         | Request::Interrupt
         | Request::InterruptAll
@@ -3113,6 +3117,14 @@ fn handle_reply(
                 stats: None,
                 perm_explain: None,
             });
+            state.dirty = true;
+            vec![]
+        }
+        Ok(Reply::Analyze { report }) => {
+            // Drawn from this copy, so scrolling never re-asks and a client that
+            // reconnects mid-read keeps what it was reading.
+            state.analyze_report = Some(*report);
+            state.open_analyze();
             state.dirty = true;
             vec![]
         }

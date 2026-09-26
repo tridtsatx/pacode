@@ -513,6 +513,10 @@ async fn run_single_tool(
         }
     }
 
+    // Taken before the transcript item below moves the name out of `call`: the
+    // result message knows the call id and not the tool, and the per-tool
+    // ranking on `/analyze` is worthless without it.
+    let tool_name = call.name.clone();
     let item = TranscriptItem {
         seq: call.item_seq,
         agent: agent.id(),
@@ -535,8 +539,15 @@ async fn run_single_tool(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .upsert(item.clone());
     session.events.emit(Event::ItemUpdated(item));
+    let result = Message::tool_result(call.call_id, content, is_error);
+    // Charged to the tool that produced it, on the model-facing copy: the
+    // ranking on `/analyze` is about what the model had to read back, and the
+    // hook payload is a different text.
+    session
+        .accounting
+        .record_tool_call(&tool_name, u64::from(result.estimate_tokens()));
     ToolOutcome {
-        result: Message::tool_result(call.call_id, content, is_error),
+        result,
         interrupted: cancel.is_cancelled(),
     }
 }

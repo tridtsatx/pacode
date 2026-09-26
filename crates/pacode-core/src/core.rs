@@ -268,6 +268,10 @@ pub struct Core {
     /// Atomics updated on the path that does the work — nothing polls them.
     resume_hist: pacode_types::LatencyHist,
     history_pages: AtomicU64,
+    /// One held lease per live session, keeping that session's share of the tool
+    /// memory ceiling. The lease is the ownership: dropping it ends the
+    /// division, so there is no "close" call to forget on an error path.
+    memory_leases: RwLock<BTreeMap<SessionId, pacode_exec::memlimit::SessionLease>>,
 }
 
 impl Core {
@@ -297,6 +301,7 @@ impl Core {
             global_events: crate::transcript::EventSink::new(),
             resume_hist: pacode_types::LatencyHist::new(),
             history_pages: AtomicU64::new(0),
+            memory_leases: RwLock::new(BTreeMap::new()),
         });
 
         let core_weak = Arc::downgrade(&core);
@@ -374,7 +379,16 @@ impl Core {
     /// history (compaction summary + messages after it) from the store; `Latest`
     /// resumes the most recently updated session for `cwd` or creates one.
     pub async fn open_session(&self, attach: Attach) -> Result<SessionId, CoreError> {
-        open::open_session(self, attach).await
+        let id = open::open_session(self, attach).await?;
+        // Held for as long as the session is open, and given back by
+        // `close_session`. Re-opening replaces the lease, so a reconnecting
+        // client does not claim two shares of the ceiling.
+        let lease = self.deps.tasks.memory().session_opened(&id);
+        self.memory_leases
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.clone(), lease);
+        Ok(id)
     }
 
     pub fn providers(&self) -> Arc<ProviderRegistry> {
@@ -668,6 +682,15 @@ impl Core {
             // Handled above, before a session is resolved: the caller does not
             // have to be attached to ask.
             Request::RuntimeStats => unreachable!("runtime stats are answered globally"),
+            Request::Analyze => Reply::Analyze {
+                // A point-in-time copy: the page outlives the borrow, and a
+                // client reading an older report is reading history, not a
+                // half-updated ledger.
+                report: Box::new(match self.session(id) {
+                    Some(session) => session.accounting.report(),
+                    None => pacode_types::analyze::AnalyzeReport::default(),
+                }),
+            },
             Request::CloseSession => {
                 self.close_session(id).await;
                 Reply::Ok
@@ -1308,6 +1331,18 @@ impl Core {
 
     /// Stop agents, kill the session's tasks, persist, drop from memory.
     pub async fn close_session(&self, id: &SessionId) {
+        // The share goes back first, before anything that can return early: a
+        // division held by a session that is closing is the exact leak the
+        // lease exists to make impossible, and the "already gone" return below
+        // must not skip it.
+        if let Some(lease) = self
+            .memory_leases
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id)
+        {
+            drop(lease);
+        }
         let lifecycle_lock = self.session_lock(id);
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let Some(session) = self.session(id) else {

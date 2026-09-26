@@ -259,6 +259,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     state.input.bash_complete_closed = true;
                     return vec![];
                 }
+                // A reading, not a chooser: Escape closes the page and there is
+                // nothing underneath to peel back to.
+                PopupId::Analyze => {
+                    state.focus = Focus::Normal;
+                    state.dirty = true;
+                    return vec![];
+                }
                 PopupId::Slash
                 | PopupId::PromptQueue
                 | PopupId::Menu
@@ -613,6 +620,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | Overlay::RailOverlay { .. }
                 | Overlay::ThemePicker { .. }
                 | Overlay::LoginPicker { .. }
+                // A reading has no selection to confirm; Enter does nothing.
+                | Overlay::Analyze { .. }
                 // Unreachable — an open menu intercepts Enter earlier — but
                 // the match stays exhaustive.
                 | Overlay::Menu { .. },
@@ -798,6 +807,7 @@ fn move_popup_selection(state: &mut AppState, delta: i32) -> bool {
         | PopupId::QuestionPicker
         | PopupId::ThemePicker
         | PopupId::LoginPicker
+        | PopupId::Analyze
         | PopupId::RailOverlay => return false,
     };
     let next = if delta < 0 {

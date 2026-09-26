@@ -56,6 +56,9 @@ pub fn focus_key(focus: &Focus) -> u8 {
             Overlay::ThemePicker { .. } => 15,
             Overlay::RailOverlay { .. } => 22,
             Overlay::LoginPicker { .. } => 24,
+            // Its own key: the page is a reading, not a menu level, and reusing a
+            // menu key would replay the menu's unfold when it opens.
+            Overlay::Analyze { .. } => 40,
             // Menu levels key off `MenuId` — the table lives in the menu base
             // (§3.1); 25..=36 here are the `focus_key` range it owns.
             Overlay::Menu { stack, .. } => stack

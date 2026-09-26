@@ -170,7 +170,24 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
         )));
     }
 
-    let tasks = TaskManager::new(opts.paths.spool_dir(), opts.config.exec.clone());
+    // The tool memory ceiling. Built once, here, from the user's percentage and
+    // the machine it is actually running on: a cap derived from a total nobody
+    // measured would be a guess, and a guessed cap is worse than none because
+    // it fails unpredictably under load. A machine whose RAM cannot be read
+    // gets no cap, which `MemoryPolicy` treats as "unknown", not as "zero".
+    let memory =
+        pacode_exec::memlimit::MemoryLimiter::new(pacode_exec::memcap::MemoryPolicy::from_ui(
+            &opts.config.ui,
+            pacode_exec::memrlimit::machine_ram_bytes().unwrap_or(0),
+        ));
+    if let Some(ceiling) = memory.ceiling() {
+        log::info!(
+            "tool memory: {:?} at {} for one session",
+            ceiling.kind,
+            pacode_exec::memcap::human_bytes(ceiling.bytes)
+        );
+    }
+    let tasks = TaskManager::with_memory(opts.paths.spool_dir(), opts.config.exec.clone(), memory);
     // MCP servers declared by installed plugins join the configured ones under a
     // `<plugin>/<server>` name, so two plugins cannot collide on `github`.
     let mut mcp_servers = opts.config.mcp.servers.clone();

@@ -610,6 +610,30 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
+        // The page owns only its scroll: every other key is the app's, so a
+        // reader can copy from it and the usual chords keep working.
+        Focus::Overlay(Overlay::Analyze { .. }) => {
+            let (rows, visible) = state.analyze_geometry();
+            let delta = match key.code {
+                KeyCode::PageDown => i32::try_from(visible).unwrap_or(1),
+                KeyCode::PageUp => -(i32::try_from(visible).unwrap_or(1)),
+                KeyCode::Down | KeyCode::Char('j') => 1,
+                KeyCode::Up | KeyCode::Char('k') => -1,
+                KeyCode::Home => {
+                    if let Focus::Overlay(Overlay::Analyze { view }) = &mut state.focus {
+                        view.scroll_to_top();
+                    }
+                    state.dirty = true;
+                    return vec![];
+                }
+                _ => return vec![],
+            };
+            if let Focus::Overlay(Overlay::Analyze { view }) = &mut state.focus {
+                view.scroll_by(delta, rows, visible);
+            }
+            state.dirty = true;
+            vec![]
+        }
         Focus::Overlay(Overlay::RailOverlay { .. }) => vec![],
         // Unreachable — `keys::handle_key` routes a menu to `keys_menu` before
         // the overlay dispatch — but the match stays exhaustive.

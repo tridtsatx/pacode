@@ -242,6 +242,17 @@ pub async fn run_turn(
             .unwrap_or_else(|p| p.into_inner())
             .definitions();
 
+        // Taken here because this is the last point where the parts the split
+        // needs are still owned: the request below moves all of them, and the
+        // reported counts only arrive once the model has answered. The cost is
+        // a walk over the definitions and the history, both of which are
+        // walked again to build the request.
+        let attribution = crate::analyze::RequestAttribution::from_request(
+            &system_static,
+            &system_dynamic,
+            &tools_def,
+            &history_msgs,
+        );
         let req = pacode_provider::CompletionRequest {
             model: model_route.model.clone(),
             system_static,
@@ -281,6 +292,7 @@ pub async fn run_turn(
         // A provider that accepted the request but never streams back must not
         // hold the turn: cancelling here takes the same path as
         // `outcome.interrupted` below.
+        let request_started = std::time::Instant::now();
         let complete_res = tokio::select! {
             _ = cancel.cancelled() => {
                 *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -331,7 +343,19 @@ pub async fn run_turn(
         };
         last_input_tokens =
             (provider_usage.input_tokens > 0).then_some(provider_usage.input_tokens);
+        // The agent's own turn usage, and the session's accounting, are two
+        // different questions: this is what the turn cost the budget, the
+        // record below is what the request cost in tokens by category. Both
+        // happen here, after the provider has reported, and neither replaces
+        // the other.
         agent.record_turn_usage(provider_usage);
+        session.accounting.record_request(
+            attribution.with_usage(&provider_usage),
+            Some(crate::analyze::RequestLatency {
+                ttft: outcome.first_token_ms.map(std::time::Duration::from_millis),
+                total: request_started.elapsed(),
+            }),
+        );
         turn_usage += outcome.usage;
         implementer_usage += outcome.usage;
         crate::fusion::record_implementer_usage(&agent, implementer_usage);

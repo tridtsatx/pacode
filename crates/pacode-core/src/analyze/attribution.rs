@@ -7,6 +7,8 @@
 //! use, so the page cannot disagree with the thing it is measuring. Only
 //! `reply` is a real count: it is the provider's own `output_tokens`.
 
+use std::sync::Arc;
+
 use pacode_types::{
     CategoryTotals, ContentBlock, Message, ToolDefinition, Usage, estimate_tokens_for_chars,
 };
@@ -32,12 +34,17 @@ impl RequestAttribution {
     ///
     /// `reply` folds reasoning into the reply, matching how `ModelInfo::cost`
     /// bills a request.
+    ///
+    /// The split itself needs nothing but the request, so it can be taken
+    /// *before* the call — which is the only place the caller's copy of the
+    /// history still exists. The reported counts are then attached by
+    /// [`Self::with_usage`], because they are only known once the model has
+    /// answered and the request has been consumed.
     pub fn from_request(
         system_static: &str,
         system_dynamic: &str,
         tools: &[ToolDefinition],
-        history: &[Message],
-        usage: &Usage,
+        history: &[Arc<Message>],
     ) -> Self {
         let (result_chars, conversation_chars) = split_history(history);
         let categories = CategoryTotals {
@@ -48,15 +55,38 @@ impl RequestAttribution {
                 .fold(0, u64::saturating_add),
             history: estimate(conversation_chars),
             tool_results: estimate(result_chars),
-            // Reasoning is output the model wrote, so it counts as reply.
-            reply: usage.output_tokens.saturating_add(usage.reasoning_tokens),
+            reply: 0,
         };
         Self {
             categories,
-            reported_input: usage.input_tokens,
-            reported_output: usage.output_tokens,
-            cache_read: usage.cache_read_tokens,
+            reported_input: 0,
+            reported_output: 0,
+            cache_read: 0,
         }
+    }
+
+    /// Attach what the provider reported, and fold reasoning into the reply.
+    pub fn with_usage(mut self, usage: &Usage) -> Self {
+        self.categories.reply = usage.output_tokens.saturating_add(usage.reasoning_tokens);
+        self.reported_input = usage.input_tokens;
+        self.reported_output = usage.output_tokens;
+        self.cache_read = usage.cache_read_tokens;
+        self
+    }
+}
+
+/// Kept for a caller that has both halves at once — a test, or a provider that
+/// reports usage before the request is dropped.
+impl RequestAttribution {
+    #[allow(dead_code)]
+    pub fn from_request_with_usage(
+        system_static: &str,
+        system_dynamic: &str,
+        tools: &[ToolDefinition],
+        history: &[Arc<Message>],
+        usage: &Usage,
+    ) -> Self {
+        Self::from_request(system_static, system_dynamic, tools, history).with_usage(usage)
     }
 }
 
@@ -76,7 +106,7 @@ fn estimate(char_count: usize) -> u64 {
 /// rounding. The char count itself comes from [`Message::char_len`] rather than
 /// a second copy of its block table, so the page cannot drift from the number
 /// the compaction budget uses.
-fn split_history(history: &[Message]) -> (usize, usize) {
+fn split_history(history: &[Arc<Message>]) -> (usize, usize) {
     let mut result_chars = 0usize;
     let mut conversation_chars = 0usize;
     for message in history {

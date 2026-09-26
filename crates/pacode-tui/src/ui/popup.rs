@@ -31,6 +31,7 @@ pub enum PopupId {
     ThemePicker,
     LoginPicker,
     RailOverlay,
+    Analyze,
 }
 
 impl PopupId {
@@ -222,6 +223,7 @@ pub(crate) fn resolve_full(
         Overlay::ThemePicker { .. } => PopupId::ThemePicker,
         Overlay::LoginPicker { .. } => PopupId::LoginPicker,
         Overlay::RailOverlay { .. } => PopupId::RailOverlay,
+        Overlay::Analyze { .. } => PopupId::Analyze,
         // A menu with nothing on its stack has no level to draw, and reporting
         // it as a full overlay would suppress the inline completions the
         // reader's own prompt is showing.

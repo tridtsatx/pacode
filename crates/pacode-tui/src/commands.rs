@@ -148,6 +148,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
+        name: Cow::Borrowed("analyze"),
+        usage: Cow::Borrowed("/analyze"),
+        help: Cow::Borrowed("where the tokens went, and whether the context held up"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
         name: Cow::Borrowed("compact"),
         usage: Cow::Borrowed("/compact"),
         help: Cow::Borrowed("compact the context now"),
@@ -472,6 +478,16 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
         "import" => {
             log::debug!("open menu: import");
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Import)
+        }
+        "analyze" => {
+            // Opens the page and asks for the reading in the same breath: the
+            // overlay is the answer, and an overlay with nothing in it is a
+            // frame of "loading" that never resolves.
+            state.open_analyze();
+            if state.analyze_mode {
+                return vec![Action::Send(Request::Analyze)];
+            }
+            vec![]
         }
         "compact" => vec![Action::Send(Request::Compact)],
         "clear" => {

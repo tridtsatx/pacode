@@ -112,6 +112,12 @@ pub struct Session {
     /// publishes `Event::SessionStatus` to clients attached to other sessions.
     pub global_events: EventSink,
     pub(crate) idle_watch: crate::core::IdleWatch,
+    /// Where this session's tokens went. Fed on the paths that already know the
+    /// numbers — one record per provider request, one per tool call — so the
+    /// accounting costs a read of what was computed rather than a second
+    /// estimate. Shared, because the report is built for a client that may not
+    /// be the one whose turn produced the records.
+    pub accounting: Arc<crate::analyze::SessionAccounting>,
 }
 
 impl Session {

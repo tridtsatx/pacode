@@ -87,6 +87,13 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 
+    /// Enable `/analyze`: the per-session reading of where the tokens went and
+    /// whether the model's context held up. Off by default because the records
+    /// behind it are fed on the turn path, and a client that never opens the
+    /// page should not pay to build them.
+    #[arg(long)]
+    pub analyze_mode: bool,
+
     /// Subcommand to execute instead of launching the interactive TUI.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -535,6 +542,7 @@ pub fn main() -> anyhow::Result<()> {
                 initial_prompt: cli.prompt,
                 cwd,
                 app_version: pacode_config::APP_VERSION.to_string(),
+                analyze_mode: cli.analyze_mode,
             };
 
             let rt = tokio::runtime::Builder::new_current_thread()

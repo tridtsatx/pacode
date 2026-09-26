@@ -22,7 +22,6 @@ const BAR_CELLS: usize = 10;
 /// Right-aligned token column.
 const VALUE_W: usize = 9;
 /// Right-aligned share column, `nnn%` at its widest.
-const SHARE_W: usize = 5;
 /// Tool rows shown before the rest is left to the scrollback. A session with
 /// 64 tool names is pathological; showing all of them would bury every other
 /// section under a wall of names.
@@ -98,9 +97,15 @@ fn spend(report: &AnalyzeReport, width: usize, opts: &RenderOptions, out: &mut V
             vec![
                 Span::styled(pad(category.label(), LABEL_W), opts.theme.dim),
                 Span::styled(bar(share, opts), bar_style(category, opts)),
-                Span::raw(format!("{:>VALUE_W$}", format_tokens(tokens))),
+                // A space between the count and its share: right-aligned next
+                // to each other they read as one number, and `550.1` followed by
+                // `83.9%` is not a number anyone can read.
+                Span::raw(format!("{:>VALUE_W$} ", format_tokens(tokens))),
                 Span::styled(
-                    format!("{share:>width$}%", width = SHARE_W - 1),
+                    // One decimal: the share of a 30k-token request is not
+                    // known to thirteen places, and printing it that way
+                    // buries the number that is.
+                    format!("{share:.1}%"),
                     opts.theme.faint.patch(if share >= 50.0 {
                         opts.theme.yellow
                     } else {

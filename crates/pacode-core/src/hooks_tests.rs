@@ -91,6 +91,7 @@ fn test_session(config: Config) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>)
             temp.path().join("spool"),
             pacode_types::ExecConfig::default(),
         ),
+        accounting: std::sync::Arc::new(crate::analyze::SessionAccounting::new()),
         store: pacode_store::Store::open_in_memory().unwrap(),
         submit_lock: tokio::sync::Mutex::new(()),
         closed: std::sync::atomic::AtomicBool::new(false),

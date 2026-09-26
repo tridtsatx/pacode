@@ -71,7 +71,7 @@ pub const SNAPSHOT_MAX_PENDING_PERMISSIONS: usize = 64;
 /// replies before session events; v8 adds the session `Resync` control marker
 /// and separates attach request ids from stable idempotency keys; v9 adds
 /// `SetNoticeLock` and the `NoticeLockChanged` broadcast.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -195,6 +195,11 @@ pub enum Request {
     /// writer, and the provider governors. Read-only and on demand — nothing
     /// polls these, so an idle daemon pays for them not at all.
     RuntimeStats,
+    /// Where this session's tokens went: by category, per tool, with latency
+    /// quantiles and the context-quality scorecard. Session-scoped and read-only.
+    /// The records behind it are fed on the turn path, so a client that never
+    /// looks at them pays for the page it does not read.
+    Analyze,
     ListSessions {
         limit: u32,
     },
@@ -336,6 +341,7 @@ impl Request {
             Request::GetSnapshot => "get_snapshot",
             Request::GetHistory { .. } => "get_history",
             Request::RuntimeStats => "runtime_stats",
+            Request::Analyze => "analyze",
             Request::GetTaskOutput { .. } => "get_task_output",
             Request::ListSessions { .. } => "list_sessions",
             Request::ListModels => "list_models",
@@ -444,7 +450,7 @@ impl Request {
                 check_page("task tail lines", *tail_lines, MAX_TASK_TAIL_LINES)
             }
             // Carries no caller input: it reads counters the daemon already owns.
-            Self::RuntimeStats => Ok(()),
+            Self::RuntimeStats | Self::Analyze => Ok(()),
             Self::ListSessions { limit } => check_page("session page", *limit, MAX_SESSION_PAGE),
             Self::RestartMcpServer { server } | Self::SetMcpServerEnabled { server, .. } => {
                 check_chars("mcp server", server, SERVER_NAME_MAX_CHARS)
@@ -858,6 +864,12 @@ pub enum Reply {
     /// every other `Reply` variant carry that size on every reply.
     RuntimeStats {
         stats: Box<RuntimeStatsReply>,
+    },
+    /// The reading behind `/analyze`. Boxed for the same reason as
+    /// `RuntimeStats`: it carries up to `REQUEST_RECORD_CAP` per-request rows
+    /// and inlining that would make every other reply carry the size.
+    Analyze {
+        report: Box<crate::analyze::AnalyzeReport>,
     },
     McpServers {
         servers: Vec<McpServerInfo>,

@@ -59,6 +59,11 @@ pub struct StreamOutcome {
     pub tool_calls: Vec<PendingToolCall>,
     pub usage: Usage,
     pub interrupted: bool,
+    /// Milliseconds from the request going out to the first token of *content*
+    /// arriving. `None` when the model answered with no text and no reasoning —
+    /// a tool call has no first token, and reporting zero for it would put a
+    /// perfect latency at the bottom of the chart.
+    pub first_token_ms: Option<u64>,
 }
 
 /// Decide the dispatchable input for a finished streaming call.
@@ -178,6 +183,11 @@ pub async fn consume_stream(
     // measurable only here: only the stream loop sees the first event, and only
     // the agent knows when it was spawned.
     let mut first_event_recorded = false;
+    // Started here rather than at the call site: the wait that matters to a
+    // reader is "how long until the first thing appeared", and the call site
+    // cannot see the stream begin.
+    let stream_started = Instant::now();
+    let mut first_token_ms: Option<u64> = None;
 
     let stream_interrupted = loop {
         tokio::select! {
@@ -224,6 +234,9 @@ pub async fn consume_stream(
                         }
                         match event_res {
                             Ok(StreamEvent::TextDelta { text }) => {
+                                first_token_ms.get_or_insert_with(|| {
+                                    stream_started.elapsed().as_millis() as u64
+                                });
                                 if assistant_item_seq.is_none() {
                                     let item_seq = agent
                                         .transcript
@@ -477,6 +490,7 @@ pub async fn consume_stream(
             tool_calls: Vec::new(),
             usage: turn_usage,
             interrupted: true,
+            first_token_ms,
         });
     }
 
@@ -499,6 +513,7 @@ pub async fn consume_stream(
         tool_calls,
         usage: turn_usage,
         interrupted: false,
+        first_token_ms,
     })
 }
 

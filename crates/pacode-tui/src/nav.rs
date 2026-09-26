@@ -93,6 +93,7 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
         Overlay::RailOverlay { .. } => "RailOverlay",
         Overlay::ThemePicker { .. } => "ThemePicker",
         Overlay::QuestionPicker => "QuestionPicker",
+        Overlay::Analyze { .. } => "Analyze",
         // The level on screen names the menu in the log (§3.1).
         Overlay::Menu { stack, .. } => stack.current().map_or("Menu", |l| l.id.title()),
     }
@@ -198,6 +199,17 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
         | Focus::Overlay(Overlay::EffortPicker { index }) => {
             *index += 1;
         }
+        // The page scrolls, and its length is only known once its rows are
+        // built — so the key asks the page rather than guessing a bound.
+        Focus::Overlay(Overlay::Analyze { .. }) => {
+            // The geometry is read before the mutable borrow, because the view
+            // lives inside the focus this match is holding.
+            let (rows, visible) = state.analyze_geometry();
+            if let Focus::Overlay(Overlay::Analyze { view }) = &mut state.focus {
+                view.scroll_by(1, rows, visible);
+            }
+        }
+
         Focus::Normal
         | Focus::Panel { .. }
         | Focus::Overlay(
@@ -232,6 +244,12 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
             if *index > 0 =>
         {
             *index -= 1;
+        }
+        Focus::Overlay(Overlay::Analyze { .. }) => {
+            let (rows, visible) = state.analyze_geometry();
+            if let Focus::Overlay(Overlay::Analyze { view }) = &mut state.focus {
+                view.scroll_by(-1, rows, visible);
+            }
         }
         Focus::Normal
         | Focus::Panel { .. }

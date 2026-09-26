@@ -42,13 +42,13 @@ fn a_huge_tool_result_is_charged_to_results_and_not_to_history() {
     // must not disappear into the `history` row, which would leave the user
     // staring at a large-but-unremarkable conversation number.
     let flood = "match\n".repeat(40_000);
-    let history = vec![
-        Message::user("find the needle"),
-        assistant_call("grep"),
-        tool_result(&flood),
+    let history: Vec<std::sync::Arc<Message>> = vec![
+        std::sync::Arc::new(Message::user("find the needle")),
+        std::sync::Arc::new(assistant_call("grep")),
+        std::sync::Arc::new(tool_result(&flood)),
     ];
 
-    let attribution = RequestAttribution::from_request("sys", "", &[], &history, &Usage::default());
+    let attribution = RequestAttribution::from_request("sys", "", &[], &history);
 
     assert_eq!(
         attribution.categories.tool_results,
@@ -72,10 +72,10 @@ fn the_split_sums_to_the_total_it_was_derived_from() {
     let static_prompt = "you are pacode".repeat(10);
     let dynamic_prompt = "cwd: /tmp\nbranch: main".to_string();
     let tools = vec![tool("grep", 4_000), tool("read", 1_000)];
-    let history = vec![
-        Message::user("hello"),
-        assistant_call("read"),
-        tool_result("file body"),
+    let history: Vec<std::sync::Arc<Message>> = vec![
+        std::sync::Arc::new(Message::user("hello")),
+        std::sync::Arc::new(assistant_call("read")),
+        std::sync::Arc::new(tool_result("file body")),
     ];
     let usage = Usage {
         input_tokens: 4_321,
@@ -86,7 +86,8 @@ fn the_split_sums_to_the_total_it_was_derived_from() {
     };
 
     let attribution =
-        RequestAttribution::from_request(&static_prompt, &dynamic_prompt, &tools, &history, &usage);
+        RequestAttribution::from_request(&static_prompt, &dynamic_prompt, &tools, &history)
+            .with_usage(&usage);
 
     assert_eq!(
         attribution.categories.instructions,
@@ -133,7 +134,7 @@ fn a_mixed_message_does_not_lose_its_prose_to_the_results_row() {
         ],
     );
 
-    let attribution = RequestAttribution::from_request("", "", &[], &[merged], &Usage::default());
+    let attribution = RequestAttribution::from_request("", "", &[], &[std::sync::Arc::new(merged)]);
 
     assert_eq!(attribution.categories.tool_results, 100);
     assert_eq!(attribution.categories.history, 100);

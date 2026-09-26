@@ -43,7 +43,8 @@ use pacode_types::{SessionId, TaskId};
 
 use crate::manager::ExecError;
 use crate::memcap::{LimitKind, MemoryCeiling, MemoryPolicy};
-use crate::memsessions::{SessionLease, SessionRegistry};
+pub use crate::memsessions::SessionLease;
+use crate::memsessions::SessionRegistry;
 
 /// What the child has to do between fork and exec. Kept as data rather than as
 /// a closure so the decision is inspectable and testable without a process.

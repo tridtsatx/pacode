@@ -171,6 +171,7 @@ async fn test_session(
             temp.path().join("spool"),
             pacode_types::ExecConfig::default(),
         ),
+        accounting: std::sync::Arc::new(crate::analyze::SessionAccounting::new()),
         store,
         submit_lock: tokio::sync::Mutex::new(()),
         closed: std::sync::atomic::AtomicBool::new(false),

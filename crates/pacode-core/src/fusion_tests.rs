@@ -277,6 +277,7 @@ async fn harness(fusion: Option<(&str, &str)>, cast: Cast) -> (Harness, Provider
             temp.path().join("spool"),
             pacode_types::ExecConfig::default(),
         ),
+        accounting: std::sync::Arc::new(crate::analyze::SessionAccounting::new()),
         store,
         submit_lock: tokio::sync::Mutex::new(()),
         closed: std::sync::atomic::AtomicBool::new(false),

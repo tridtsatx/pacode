@@ -63,6 +63,10 @@ pub struct TuiOptions {
     pub initial_prompt: Option<String>,
     pub cwd: PathBuf,
     pub app_version: String,
+    /// Whether `/analyze` is available. A flag rather than a setting: the page is
+    /// a reading of one run, and leaving it on across sessions would keep
+    /// feeding records nobody reads.
+    pub analyze_mode: bool,
 }
 
 #[derive(Debug, thiserror::Error)]

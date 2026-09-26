@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
 use pacode_render::RenderOptions;
 
-use crate::state::AppState;
+use crate::state::{AppState, Focus, Overlay};
 
 #[derive(Default)]
 pub(crate) struct PreparedOverlay {
@@ -80,6 +80,17 @@ pub(crate) fn draw(
         crate::ui::popup::PopupId::RailOverlay => {
             frame.render_widget(Clear, popup.area);
             draw_rail_overlay(frame, popup.area, prepared, state, opts);
+        }
+        crate::ui::popup::PopupId::Analyze => {
+            let (Some(report), Focus::Overlay(Overlay::Analyze { view })) =
+                (state.analyze_report.as_ref(), &state.focus)
+            else {
+                // Opened before the report landed, or after it was cleared. A
+                // blank frame beats a page reading someone else's session.
+                return;
+            };
+            frame.render_widget(Clear, popup.area);
+            crate::ui::analyze::draw(frame, popup.area, report, view, opts);
         }
         crate::ui::popup::PopupId::Slash
         | crate::ui::popup::PopupId::At

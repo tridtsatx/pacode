@@ -295,6 +295,14 @@ pub struct SessionUiState {
     /// cells on a degraded cadence, which is the stutter the degraded cadence
     /// exists to prevent.
     pub anim: pacode_render::AnimClock,
+    /// The last `/analyze` reading. Held on the state rather than inside the
+    /// overlay so a scroll does not re-ask the daemon, and so a client that
+    /// reconnects while the page is open keeps what it was reading.
+    pub analyze_report: Option<pacode_types::analyze::AnalyzeReport>,
+    /// Whether this client was started with `--analyze-mode`. The page is
+    /// gated on it: the reading is a scorecard, and a scorecard nobody asked
+    /// for is noise on a screen someone is trying to work in.
+    pub analyze_mode: bool,
     pub phase: Option<(Phase, Instant)>,
     pub phase_elapsed_ms: u64,
     pub started_at: Instant,
@@ -353,6 +361,8 @@ impl SessionUiState {
             turn_started_at: None,
             anim_frame: 0,
             anim: pacode_render::AnimClock::default(),
+            analyze_report: None,
+            analyze_mode: false,
             phase: None,
             phase_elapsed_ms: 0,
             started_at: Instant::now(),

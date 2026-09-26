@@ -205,6 +205,13 @@ pub enum Overlay {
         stack: crate::ui::menu::MenuStack,
         ui: crate::ui::menu::MenuUiState,
     },
+    /// The `/analyze` page. Reachable only when the client was started with
+    /// `--analyze-mode`: the report is a reading of work the daemon did, and
+    /// offering it unconditionally would put a scorecard in front of someone
+    /// who never asked for one.
+    Analyze {
+        view: crate::ui::analyze::AnalyzeView,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1025,6 +1032,37 @@ impl AppState {
             pending_attach: None,
             attach_in_flight: false,
         }
+    }
+
+    /// How long the `/analyze` page is and how much of it fits, for the scroll
+    /// keys. Built here rather than in the key handler because the row count
+    /// needs the report *and* the width, and both live on the state.
+    pub fn analyze_geometry(&self) -> (usize, usize) {
+        let Some(report) = &self.analyze_report else {
+            return (0, 0);
+        };
+        // The page is a centred overlay; approximating it with the full screen
+        // is close enough for a scroll bound and avoids threading a `Rect`
+        // through the key handler.
+        let area = ratatui::layout::Rect::new(0, 0, self.cols, self.rows);
+        let width = usize::from(area.width.saturating_sub(2));
+        let rows =
+            crate::ui::analyze::rows::build(report, width, &self.render_options(area.width)).len();
+        (rows, crate::ui::analyze::visible_rows(area))
+    }
+
+    /// Open the `/analyze` page. Gated on `--analyze-mode`, and saying so when
+    /// it is off is the whole point: a command that silently does nothing is
+    /// worse than one that explains itself.
+    pub fn open_analyze(&mut self) {
+        if !self.analyze_mode {
+            self.push_notice("/analyze needs --analyze-mode at startup".to_string());
+            return;
+        }
+        self.focus = Focus::Overlay(Overlay::Analyze {
+            view: crate::ui::analyze::AnalyzeView::default(),
+        });
+        self.dirty = true;
     }
 
     pub fn render_options(&self, width: u16) -> RenderOptions {
