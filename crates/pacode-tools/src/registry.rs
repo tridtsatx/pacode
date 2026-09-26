@@ -14,8 +14,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Tool, ToolError, ToolKind};
 
-pub const MAX_TOOL_WORKERS_PER_AGENT: usize = 4;
-pub const MAX_TOOL_WORKERS_GLOBAL: usize = 16;
+/// Ceiling on one agent's in-flight tool calls. The only remaining worker cap:
+/// it bounds a single agent's fd/process/output footprint without throttling the
+/// session, so 128 agents can each run this many calls at once. There is
+/// deliberately no process-wide counterpart — a global cap would make a fleet of
+/// agents queue behind each other, and the parent's own `agent spawn` call would
+/// queue behind the children it just spawned.
+pub const MAX_TOOL_WORKERS_PER_AGENT: usize = 8;
 const OUTPUT_TRUNCATION_MARKER: &str = "\n\n[... output truncated to hard byte cap ...]\n\n";
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 512 * 1024;
@@ -35,8 +40,6 @@ const MAX_TRACKED_WRITE_PATHS: usize = 4096;
 type AgentSemaphoreMap = HashMap<(SessionId, AgentId), Weak<Semaphore>>;
 type PathWriteLockMap = HashMap<PathBuf, (Weak<AsyncMutex<()>>, u64)>;
 
-static GLOBAL_TOOL_WORKER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_TOOL_WORKERS_GLOBAL)));
 static AGENT_TOOL_WORKER_SEMAPHORES: LazyLock<Mutex<AgentSemaphoreMap>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PATH_WRITE_LOCKS: LazyLock<Mutex<PathWriteLockMap>> =
@@ -188,12 +191,16 @@ impl ToolRegistry {
         out
     }
 
+    /// Take one of this agent's `MAX_TOOL_WORKERS_PER_AGENT` slots, waiting for
+    /// a free one or for `cancel`. The permit lives as long as the returned
+    /// guard, so callers must hold it across the whole call. Nothing here is
+    /// process-wide: agents do not queue behind each other.
     pub async fn acquire_worker(
         &self,
         session: &SessionId,
         agent: &AgentId,
         cancel: &CancellationToken,
-    ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), ToolError> {
+    ) -> Result<OwnedSemaphorePermit, ToolError> {
         let key = (session.clone(), agent.clone());
         let agent_semaphore = {
             let mut agents = AGENT_TOOL_WORKER_SEMAPHORES
@@ -209,22 +216,13 @@ impl ToolRegistry {
             }
         };
 
-        let agent_permit = tokio::select! {
+        tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(ToolError::Cancelled),
+            _ = cancel.cancelled() => Err(ToolError::Cancelled),
             permit = agent_semaphore.acquire_owned() => {
-                permit.map_err(|_| ToolError::failed("per-agent tool worker pool closed"))?
+                permit.map_err(|_| ToolError::failed("per-agent tool worker pool closed"))
             }
-        };
-        let global = Arc::clone(&GLOBAL_TOOL_WORKER_SEMAPHORE);
-        let global_permit = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-            permit = global.acquire_owned() => {
-                permit.map_err(|_| ToolError::failed("global tool worker pool closed"))?
-            }
-        };
-        Ok((agent_permit, global_permit))
+        }
     }
 }
 

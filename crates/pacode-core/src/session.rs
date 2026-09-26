@@ -1254,18 +1254,40 @@ impl Session {
             format!("agent-{count}")
         });
 
-        let tools = if let Some(tool_names) = spec.tools {
-            let filtered: Vec<&str> = tool_names
+        // The default is parity: a subagent starts from the orchestrator's own
+        // tool set, so nothing has to be restated to give it working tools.
+        // `tools` narrows that to an include list and `exclude_tools` subtracts
+        // from whichever applies — which is the cheap direction, because at 128
+        // subagents every tool schema is re-sent on every step, and dropping the
+        // handful a subagent cannot use costs a short list rather than a
+        // near-complete one. Exclude wins where both name the same tool.
+        let tools = {
+            let g = self.tools.read().unwrap_or_else(|p| p.into_inner());
+            let mut names: Vec<String> = match &spec.tools {
+                Some(allowed) => allowed
+                    .iter()
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .collect(),
+                None => pacode_tools::subagent_tool_names(&g),
+            };
+            if let Some(dropped) = &spec.exclude_tools {
+                let dropped: std::collections::HashSet<&str> = dropped
+                    .iter()
+                    .map(|n| n.trim())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                names.retain(|n| !dropped.contains(n.as_str()));
+            }
+            // Depth 1 is structural, not a preference, so it is enforced after
+            // both lists have been applied: no combination of arguments can
+            // hand a subagent the means to spawn one.
+            let names: Vec<&str> = names
                 .iter()
                 .map(String::as_str)
-                .filter(|n| *n != "agent")
+                .filter(|n| *n != pacode_tools::builtin::agent::NAME)
                 .collect();
-            let g = self.tools.read().unwrap_or_else(|p| p.into_inner());
-            g.subset(filtered)
-        } else {
-            let g = self.tools.read().unwrap_or_else(|p| p.into_inner());
-            let default_names = pacode_tools::subagent_tool_names(&g);
-            g.subset(default_names.iter().map(String::as_str))
+            g.subset(names)
         };
 
         let model = spec.model.unwrap_or_else(|| parent_info.model.clone());
@@ -1303,14 +1325,21 @@ impl Session {
             error: None,
         };
 
-        self.store
+        // `session_open`: the store write and the in-memory registration — the
+        // stage whose cost grows with what the session already holds, and so the
+        // one that would show a fleet degrading as it fills.
+        let open_started = std::time::Instant::now();
+        let persisted = self
+            .store
             .create_agent_with_history(
                 &self.id,
                 &info,
                 Some(spec.prompt.as_str()),
                 &persisted_history,
             )
-            .await?;
+            .await;
+        pacode_types::record_launch_session_open(open_started.elapsed());
+        persisted?;
 
         if self.closed.load(Ordering::SeqCst) || parent.stop_requested() {
             let mut stopped = info;
@@ -1345,6 +1374,10 @@ impl Session {
             return Err(CoreError::Invalid("session is closed".into()));
         }
         agents.insert(id.clone(), agent.clone());
+        // Starts the clock the turn loop reads for time-to-first-token. Set
+        // right after registration — as late as possible while still preceding
+        // the provider call.
+        agent.mark_spawned_at(std::time::Instant::now());
         drop(agents);
 
         self.events.emit(pacode_types::Event::AgentAdded(info));

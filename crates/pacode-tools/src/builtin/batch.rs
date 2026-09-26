@@ -408,7 +408,7 @@ async fn run_op(op: PreparedOp, ctx: &ToolCtx, per_op_cap: usize) -> Result<OpRe
         PreparedOp::Ready {
             label, name, input, ..
         } => {
-            let _workers = ctx
+            let _worker = ctx
                 .tools
                 .acquire_worker(&ctx.session, &ctx.agent, &ctx.cancel)
                 .await?;

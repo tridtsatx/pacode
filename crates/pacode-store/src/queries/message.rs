@@ -4,13 +4,14 @@ use std::collections::HashSet;
 
 use pacode_types::{AgentId, ContentBlock, Message, Role, SessionId, TurnId};
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::{
     AdmissionCursor, MessageAdmission, MessageAdmissionPage, MessageAdmissionResult,
     MessageAdmissionState, MessagePage, MessageRow, SearchHit,
 };
 use crate::StoreError;
+use crate::txn::Txn;
 
 pub const DEFAULT_MESSAGE_PAGE: u32 = 200;
 pub const DEFAULT_ADMISSION_PAGE: u32 = 1000;
@@ -48,7 +49,7 @@ pub(crate) fn message_plain_text(msg: &Message) -> String {
 /// session or a detach tail never holds more than [`MESSAGE_PURGE_CHUNK`] ids in
 /// memory and never re-reads a row it already deleted.
 pub(crate) fn purge_messages(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     predicate: &str,
     binds: &[Value],
 ) -> Result<u64, StoreError> {
@@ -56,7 +57,7 @@ pub(crate) fn purge_messages(
     let mut removed = 0u64;
     loop {
         let cursor_index = binds.len() + 1;
-        let mut stmt = tx.prepare(&format!(
+        let mut stmt = conn.prepare(&format!(
             "DELETE FROM messages
              WHERE id IN (
                  SELECT id FROM messages
@@ -84,15 +85,19 @@ pub(crate) fn purge_messages(
     }
 }
 
-pub(crate) fn append_message_in_transaction(
-    tx: &Transaction<'_>,
+/// Appends inside a unit of work the caller already owns: a transaction of its
+/// own, or a savepoint inside the writer's batch transaction. Either way this
+/// function must not open one, or the group commit would nest `BEGIN` in
+/// `BEGIN`; the atomicity it needs is the one it was handed.
+pub(crate) fn append_message_in_unit_of_work(
+    conn: &Connection,
     session: &SessionId,
     agent: &AgentId,
     seq: u64,
     msg: &Message,
 ) -> Result<(), StoreError> {
     let content_json = serde_json::to_string(msg)?;
-    let existing: Option<String> = tx
+    let existing: Option<String> = conn
         .query_row(
             "SELECT content_json FROM messages WHERE session_id = ?1 AND agent_id = ?2 AND seq = ?3;",
             params![session.as_str(), agent.as_str(), seq as i64],
@@ -114,7 +119,7 @@ pub(crate) fn append_message_in_transaction(
     let hidden = if msg.meta.hidden { 1 } else { 0 };
     let role = role_to_str(msg.role);
 
-    tx.execute(
+    conn.execute(
         r#"
         INSERT INTO messages (session_id, agent_id, seq, role, content_json, text, hidden, created_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -146,8 +151,8 @@ pub fn append_message(
     seq: u64,
     msg: &Message,
 ) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
-    append_message_in_transaction(&tx, session, agent, seq, msg)?;
+    let tx = Txn::open(conn)?;
+    append_message_in_unit_of_work(&tx, session, agent, seq, msg)?;
     tx.commit()?;
     Ok(())
 }
@@ -184,7 +189,7 @@ pub fn append_user_message_with_turn(
     turn_id: Option<&str>,
     msg: &Message,
 ) -> Result<MessageAdmissionResult, StoreError> {
-    let tx = conn.transaction()?;
+    let tx = Txn::open(conn)?;
     let inserted = tx.execute(
         "INSERT INTO message_admissions (session_id, message_id, fingerprint, agent_id, message_seq, state, turn_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'admitted', ?6, ?7) ON CONFLICT(session_id, message_id) DO NOTHING;",
         params![
@@ -211,7 +216,7 @@ pub fn append_user_message_with_turn(
         });
     }
 
-    append_message_in_transaction(&tx, session, agent, seq, msg)?;
+    append_message_in_unit_of_work(&tx, session, agent, seq, msg)?;
     tx.commit()?;
     Ok(MessageAdmissionResult::Appended)
 }

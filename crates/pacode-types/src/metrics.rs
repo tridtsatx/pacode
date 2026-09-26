@@ -112,6 +112,13 @@ impl HistogramSnapshot {
         for (index, count) in self.buckets.iter().enumerate() {
             seen += count;
             if seen >= target {
+                // The overflow bucket is "everything above the last bound", and
+                // `u64::MAX` is not a duration anyone can act on. The observed
+                // maximum is the honest thing to report, which is what this
+                // method's own doc says it does.
+                if index + 1 >= HISTOGRAM_BUCKETS {
+                    return self.max_micros;
+                }
                 return bucket_upper_micros(index);
             }
         }
@@ -216,22 +223,33 @@ mod tests {
 }
 
 /// The single store writer behind every session: how much work it has done, how
-/// deep its queue got, and how long callers waited versus how long the work
-/// took. `exec` is the number that settles "is the database the bottleneck" —
-/// for a write it is dominated by the fsync that `synchronous=FULL` asks for.
+/// deep its queue got, and how long callers waited versus how long the work and
+/// the commit took.
+///
+/// The writer groups concurrent calls into batches, so `exec` is the call's own
+/// statements and `commit` is the one commit they shared — the only part of the
+/// path that touches the disk. Read together they are a caller's whole wait:
+/// `completed / batches` says how deep the grouping actually got, and
+/// `commit.total_micros / completed` is what each call actually paid for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoreStats {
     pub enqueued: u64,
     pub completed: u64,
     pub refused: u64,
     pub faults: u64,
+    /// Commits run, whatever their depth. `completed / batches` is the mean batch
+    /// size: at 1 the grouping is not happening, and the store is back to paying
+    /// a commit per call.
+    pub batches: u64,
     /// Calls waiting for the writer right now.
     pub queue_depth: u64,
     pub queue_high_water: u64,
     /// Time from enqueue to the writer picking the call up.
     pub wait: HistogramSnapshot,
-    /// Time the writer spent on the call, fsync included.
+    /// Time the writer spent on the call's own statements, commit excluded.
     pub exec: HistogramSnapshot,
+    /// One sample per batch: the commit that carried it.
+    pub commit: HistogramSnapshot,
 }
 
 /// One provider governor: a (base url, credential) pair with its own ceiling
@@ -289,4 +307,155 @@ pub struct RuntimeStats {
     /// History pages served out of the store.
     pub history_pages: u64,
     pub store: StoreStats,
+    /// Subagent launch cost, split by stage. See [`AgentLaunchStats`].
+    pub launches: AgentLaunchStats,
+}
+
+/// What a subagent costs to bring up, split into the stages that can each be
+/// the slow one.
+///
+/// "Subagents start slowly" is one symptom with three different causes, and
+/// until these existed the only honest answer was a guess: local work measures
+/// cheap in isolation, so the suspicion always fell on the provider. The split
+/// is what settles it.
+///
+/// - `resolve` — the `agent` call through kind lookup and tool selection. This
+///   is where an uncached directory scan or a per-spawn registry copy shows up.
+/// - `session_open` — the store write and in-memory registration, i.e. the part
+///   that grows with what is already in the session.
+/// - `ready` — spawn call start through the turn being scheduled.
+/// - `prompt_to_first` — spawn call start through the first event from the
+///   provider. Nearly all of it is the model round-trip and any permit wait
+///   ahead of it, which is why it is reported separately rather than folded
+///   into `ready`: a large `prompt_to_first` beside a small `ready` is the
+///   provider queueing, and no local tuning moves that.
+///
+/// Process-wide per daemon, matching the store's own instrumentation, so an
+/// idle daemon pays one atomic add per spawn and nothing otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentLaunchStats {
+    pub spawns: u64,
+    pub refused: u64,
+    /// `agent` call start through the kind lookup and tool selection.
+    pub resolve: HistogramSnapshot,
+    /// Store write plus registration, i.e. the part that grows with the session.
+    pub session_open: HistogramSnapshot,
+    /// Spawn call start through the turn being scheduled.
+    pub ready: HistogramSnapshot,
+    /// Spawn call start through the first provider event.
+    pub prompt_to_first: HistogramSnapshot,
+}
+
+/// Live counters behind [`AgentLaunchStats`]. A histogram per stage, updated
+/// on the path that owns that stage's boundary and read only when someone asks
+/// for stats, so a daemon that never spawns a subagent pays nothing.
+///
+/// Process-wide because the stages are recorded from different crates — kind
+/// lookup in `pacode-tools`, the store write and the turn in `pacode-core` —
+/// and neither is a natural owner of the whole set. This crate is what both
+/// already depend on.
+#[derive(Debug, Default)]
+pub struct LaunchMetrics {
+    spawns: AtomicU64,
+    refused: AtomicU64,
+    resolve: LatencyHist,
+    session_open: LatencyHist,
+    ready: LatencyHist,
+    prompt_to_first: LatencyHist,
+}
+
+static LAUNCH: std::sync::LazyLock<LaunchMetrics> =
+    std::sync::LazyLock::new(LaunchMetrics::default);
+
+/// Kind lookup and tool selection: the part of the `agent` call that happens
+/// before a subagent exists.
+pub fn record_launch_resolve(elapsed: std::time::Duration) {
+    LAUNCH.resolve.record_duration(elapsed);
+}
+
+/// The store write and the in-memory registration — the stage whose cost grows
+/// with what the session already holds.
+pub fn record_launch_session_open(elapsed: std::time::Duration) {
+    LAUNCH.session_open.record_duration(elapsed);
+}
+
+/// The whole `agent` call, first line to the turn being scheduled. `refused` is
+/// a real counter rather than an inference from the sample count, so a spawn
+/// that fails before it can be timed is still visible.
+pub fn record_launch_ready(elapsed: std::time::Duration, refused: bool) {
+    if refused {
+        LAUNCH.refused.fetch_add(1, Ordering::Relaxed);
+    } else {
+        LAUNCH.spawns.fetch_add(1, Ordering::Relaxed);
+        LAUNCH.ready.record_duration(elapsed);
+    }
+}
+
+/// Spawn start through the first event from the provider. Nearly all of it is
+/// the model round-trip and any permit wait ahead of it.
+pub fn record_launch_prompt_to_first(elapsed: std::time::Duration) {
+    LAUNCH.prompt_to_first.record_duration(elapsed);
+}
+
+/// Snapshot of the launch counters, read only by `pacode stats`.
+pub fn agent_launch_stats() -> AgentLaunchStats {
+    AgentLaunchStats {
+        spawns: LAUNCH.spawns.load(Ordering::Relaxed),
+        refused: LAUNCH.refused.load(Ordering::Relaxed),
+        resolve: LAUNCH.resolve.snapshot(),
+        session_open: LAUNCH.session_open.snapshot(),
+        ready: LAUNCH.ready.snapshot(),
+        prompt_to_first: LAUNCH.prompt_to_first.snapshot(),
+    }
+}
+
+#[cfg(test)]
+mod overflow_quantile_tests {
+    use super::{HISTOGRAM_BUCKETS, LatencyHist};
+
+    /// A quantile that lands in the overflow bucket must report the observed
+    /// maximum. It used to report `u64::MAX`, which is not a duration — it
+    /// showed up in `pacode stats` as `p99=18446744073709551615us` on a real
+    /// 128-subagent run, where p99 genuinely exceeded the top bucket.
+    #[test]
+    fn a_quantile_past_the_last_bucket_reports_the_observed_max() {
+        let hist = LatencyHist::new();
+        // Comfortably above the last real bound (2^23 µs ≈ 8.4s).
+        let huge = 20_000_000u64;
+        hist.record(huge);
+        let snapshot = hist.snapshot();
+
+        assert_eq!(
+            snapshot.quantile_micros(0.99),
+            huge,
+            "p99 in the overflow bucket must be the max, not u64::MAX"
+        );
+        assert!(
+            snapshot.quantile_micros(0.99) < u64::MAX,
+            "a duration anyone can read"
+        );
+    }
+
+    /// The fix must not move a quantile that fits in a real bucket.
+    #[test]
+    fn a_quantile_inside_a_real_bucket_is_unaffected() {
+        let hist = LatencyHist::new();
+        for _ in 0..100 {
+            hist.record(64);
+        }
+        let snapshot = hist.snapshot();
+        assert_eq!(snapshot.quantile_micros(0.50), 128);
+        assert_eq!(snapshot.quantile_micros(0.99), 128);
+    }
+
+    #[test]
+    fn the_last_bucket_index_is_the_overflow_one() {
+        // Pins where a huge value lands and that the recorded duration survives
+        // the trip — the assumption the quantile fix rests on.
+        let huge = u64::MAX / 2;
+        let hist = LatencyHist::new();
+        hist.record(huge);
+        assert_eq!(LatencyHist::bucket_of(huge), HISTOGRAM_BUCKETS - 1);
+        assert_eq!(hist.snapshot().max_micros, huge);
+    }
 }

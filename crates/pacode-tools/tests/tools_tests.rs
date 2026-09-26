@@ -784,8 +784,14 @@ async fn test_agent_spawn_with_named_kind() {
     assert_eq!(spec.tools, Some(vec!["ls".to_string()]));
 }
 
+/// An unknown `kind` must not cost the spawn. pacode ships no built-in kinds,
+/// so a model naming a plausible one is ordinary, not a mistake — and when it
+/// *was* an error the model retried the same name for several turns, which read
+/// as "subagents are slow to start". The contract here is: the agent exists,
+/// it got the default tool set, and the model is told what was ignored and
+/// what does exist so it can correct itself in one step.
 #[tokio::test]
-async fn test_agent_spawn_unknown_kind_lists_available() {
+async fn test_agent_spawn_unknown_kind_warns_instead_of_refusing() {
     let tmp = tempfile::tempdir().unwrap();
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     host.agent_kinds
@@ -795,20 +801,38 @@ async fn test_agent_spawn_unknown_kind_lists_available() {
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
     let tool = AgentTool;
-    let err = tool
+    let out = tool
         .call(
-            json!({"action": "spawn", "kind": "nope", "prompt": "do work"}),
+            json!({"action": "spawn", "kind": "explore", "prompt": "do work"}),
             &ctx,
         )
-        .await;
-    match err {
-        Err(ToolError::InvalidInput(msg)) => {
-            assert!(msg.contains("unknown agent kind 'nope'"), "got: {msg}");
-            assert!(msg.contains("reviewer"), "should list available: {msg}");
-        }
-        other => panic!("expected InvalidInput, got {other:?}"),
-    }
-    assert!(host.spawned_specs.lock().unwrap().is_empty());
+        .await
+        .expect("an unknown kind must not fail the spawn");
+
+    let text = out.content.clone();
+    assert!(
+        text.contains("Spawned agent"),
+        "the spawn must still happen: {text}"
+    );
+    assert!(
+        text.contains("'explore'") && text.contains("reviewer"),
+        "the note must name what was ignored and what exists: {text}"
+    );
+    assert!(
+        !out.is_error,
+        "this is a note, not a failed call the model has to recover from"
+    );
+
+    let specs = host.spawned_specs.lock().unwrap();
+    assert_eq!(
+        specs.len(),
+        1,
+        "exactly one subagent was spawned: {specs:?}"
+    );
+    assert_eq!(
+        specs[0].tools, None,
+        "with no matching kind there is no kind file to restrict tools"
+    );
 }
 
 #[tokio::test]
@@ -854,6 +878,29 @@ async fn test_agent_list_shows_kinds_without_agents() {
         out.content
     );
     assert!(out.content.contains("reviewer"));
+}
+
+/// With no kinds defined, `list` has to say so. The old output listed agents
+/// and stopped, leaving the model to guess whether `kind` was usable at all —
+/// which is how it ended up inventing names and burning turns on rejected
+/// spawns. The sentence has to tell it to omit the field.
+#[tokio::test]
+async fn test_agent_list_says_to_omit_kind_when_none_are_defined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    assert!(
+        host.agent_kinds.lock().unwrap().is_empty(),
+        "this test is about the empty case"
+    );
+
+    let tool = AgentTool;
+    let out = tool.call(json!({"action": "list"}), &ctx).await.unwrap();
+    assert!(
+        out.content.contains("omit `kind`"),
+        "the empty case must tell the model what to do instead: {}",
+        out.content
+    );
 }
 
 #[test]

@@ -713,6 +713,86 @@ async fn deferred_admission_is_hidden_then_restored() {
     assert_eq!(restored, vec!["first".to_owned(), "second".to_owned()]);
 }
 
+/// An injection that lands in the window between a turn deciding it has
+/// nothing to redrive and that turn releasing its lock must still be delivered.
+///
+/// The window is real: `should_redrive` is computed before the end-of-turn
+/// store write, and the lock is only released after it. An injector that
+/// arrives in between sees the agent as running — which is exactly what
+/// `is_running` reports, because the turn still holds the lock — and skips the
+/// wake. If the finished turn then trusts its own earlier `should_redrive`,
+/// the injection is stranded: the queue is non-empty, the agent is idle, and
+/// nothing will start a turn until some unrelated event happens to.
+///
+/// At 128 subagents this is the difference between a slow session and a stuck
+/// one, so the fix belongs in the turn, not in the injector.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_injection_landing_in_the_teardown_window_is_not_stranded() {
+    let _serial = LIFECYCLE_GATE_TEST_LOCK.lock().await;
+    let provider = BlockingProvider::new(true);
+    let (_temp, session, agent, _session_id) = test_session(provider.clone()).await;
+    let mut events = session.events.subscribe();
+
+    start_turn(session.clone(), agent.clone());
+    barrier_wait(&provider.entered).await;
+    let turn = wait_for_turn_start(&mut events, &AgentId::main()).await;
+    // Park the turn inside its own teardown, holding the lock: this is the
+    // window, made deterministic.
+    let gate = install_lifecycle_gate(&session, agent.as_ref());
+    barrier_wait(&provider.release).await;
+    timeout(Duration::from_secs(3), gate.reached.acquire())
+        .await
+        .unwrap()
+        .expect("lifecycle gate semaphore closed")
+        .forget();
+
+    // The turn is now deciding, lock still held, `should_redrive` already false.
+    session.inject_and_wake(
+        &agent,
+        Injection::SystemNotice("landed during teardown".into()),
+    );
+
+    gate.release.add_permits(1);
+    wait_for_turn_end(&mut events, &AgentId::main(), &turn).await;
+
+    // The stranded case is an idle agent holding an undelivered injection.
+    // The delivered case is a second turn that starts and drains it.
+    let mut delivered = None;
+    for _ in 0..2 {
+        match tokio::time::timeout(Duration::from_millis(400), events.recv()).await {
+            Ok(Ok((
+                _,
+                Event::TurnStarted {
+                    agent: id,
+                    turn: next,
+                },
+            ))) if id == AgentId::main() => {
+                delivered = Some(next);
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let Some(next) = delivered else {
+        panic!(
+            "injection was stranded: the agent is idle holding an undelivered \
+             injection. A turn must re-check its queue after releasing the lock"
+        );
+    };
+    // Delivery, not merely a second turn: the notice has to reach the model.
+    // The provider only parks its first call, so this turn runs straight
+    // through and its request is the record of what the agent was told.
+    wait_for_turn_end(&mut events, &AgentId::main(), &next).await;
+    assert!(
+        provider.requests().iter().any(|request| request
+            .messages
+            .iter()
+            .any(|message| message.text().contains("landed during teardown"))),
+        "the second turn started but the stranded injection was not delivered to it"
+    );
+}
+
 #[test]
 fn terminal_stop_mapping_is_exhaustive() {
     assert_eq!(terminal_stop(&TurnStop::Completed), "completed");

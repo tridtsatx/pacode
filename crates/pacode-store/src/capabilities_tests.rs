@@ -6,7 +6,7 @@ fn complete_capabilities() -> StorageCapabilities {
         dialect: StorageDialect::Sqlite,
         fts5: true,
         journal_mode: JournalMode::Wal,
-        synchronous: SynchronousMode::Full,
+        synchronous: SynchronousMode::Normal,
         transactions: true,
         keyset_pagination: true,
     }
@@ -17,7 +17,7 @@ fn pacode_requirements_pin_the_storage_dialect_contract() {
     let requirements = DialectRequirements::PACODE;
 
     assert!(requirements.fts5);
-    assert!(requirements.wal_full);
+    assert!(requirements.wal);
     assert!(requirements.transactions);
     assert!(requirements.keyset_pagination);
 }
@@ -28,10 +28,10 @@ fn capability_validation_reports_each_missing_requirement() {
     assert!(capabilities.satisfies(&DialectRequirements::PACODE));
     assert!(capabilities.gaps(&DialectRequirements::PACODE).is_empty());
 
-    capabilities.synchronous = SynchronousMode::Normal;
+    capabilities.journal_mode = JournalMode::Delete;
     assert_eq!(
         capabilities.gaps(&DialectRequirements::PACODE),
-        vec![CapabilityGap::WalFull]
+        vec![CapabilityGap::Wal]
     );
 
     capabilities = complete_capabilities();
@@ -46,6 +46,27 @@ fn capability_validation_reports_each_missing_requirement() {
             CapabilityGap::KeysetPagination,
         ]
     );
+}
+
+#[test]
+fn durability_level_is_reported_rather_than_required() {
+    // The store picks its own `synchronous` level, and it picked NORMAL: a
+    // requirement that demanded FULL would report every pacode store as
+    // short of its own contract. What still has to hold is WAL itself.
+    for synchronous in [
+        SynchronousMode::Off,
+        SynchronousMode::Normal,
+        SynchronousMode::Full,
+        SynchronousMode::Extra,
+    ] {
+        let mut capabilities = complete_capabilities();
+        capabilities.synchronous = synchronous;
+        assert_eq!(
+            capabilities.synchronous, synchronous,
+            "it is reported as read"
+        );
+        assert!(capabilities.satisfies(&DialectRequirements::PACODE));
+    }
 }
 
 #[test]

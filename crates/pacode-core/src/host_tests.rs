@@ -639,6 +639,7 @@ mod zdr {
                 effort: None,
                 fork: false,
                 tools: None,
+                exclude_tools: None,
             })
             .await;
         match res {
@@ -718,6 +719,7 @@ mod zdr {
             effort: None,
             fork: false,
             tools: None,
+            exclude_tools: None,
         }
     }
 

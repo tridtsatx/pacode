@@ -12,6 +12,9 @@ pub mod queries;
 pub mod schema;
 pub mod worker;
 
+mod batch;
+mod txn;
+
 pub use queries::{
     AdmissionCursor, MessageAdmission, MessageAdmissionPage, MessageAdmissionResult,
     MessageAdmissionState, MessagePage, MessageRow, SearchHit, SessionCursor, SessionFilter,

@@ -361,6 +361,89 @@ impl SessionHost {
     }
 }
 
+impl SessionHost {
+    /// The body of [`ToolHost::spawn_agent`], split out so the trait method can
+    /// time the whole call. Takes the spec by value so the route can be resolved
+    /// in place without cloning the prompt.
+    async fn spawn_agent_inner(&self, mut spec: AgentSpec) -> Result<AgentId, ToolError> {
+        if self.session.zdr_active() {
+            return Err(zdr_denied_subagent());
+        }
+        let requested_route = spec.model.take();
+        let owner = self
+            .owner_agent()
+            .ok_or_else(|| ToolError::failed("agent not found"))?;
+        let (owner_id, owner_name, owner_route) = {
+            let info = owner.info.read().unwrap_or_else(|p| p.into_inner());
+            (info.id.clone(), info.name.clone(), info.model.clone())
+        };
+        // The pair this spawn will be judged by: the orchestrator route it
+        // departs from, and the route the subagent would actually run on.
+        let authorized_from = owner_route;
+        let asked_route = requested_route
+            .clone()
+            .unwrap_or_else(|| authorized_from.clone());
+        if asked_route != authorized_from {
+            let outcome = self
+                .request_permission_inner(
+                    PermissionDraft {
+                        agent: owner_id.clone(),
+                        agent_name: owner_name,
+                        call_id: CallId::generate(),
+                        title: format!("Authorize subagent route {asked_route}"),
+                        detail: format!(
+                            "Subagent route {asked_route} differs from orchestrator route {authorized_from}"
+                        ),
+                        risk: None,
+                        tool_name: Some("agent.route".to_string()),
+                        tool_kind: Some(pacode_tools::ToolKind::Control),
+                    },
+                    true,
+                )
+                .await;
+            if outcome.decision == PermissionDecision::Deny {
+                return Err(ToolError::Denied(
+                    outcome
+                        .reason
+                        .unwrap_or_else(|| "subagent route change denied".to_string()),
+                ));
+            }
+        }
+
+        // Commit point. The user answers that prompt in their own time, and both
+        // the session route and the ZDR flag can move while it is open, so the
+        // decision above is re-read here — ZDR and route under one guard, with
+        // nothing awaited in between — and anything it does not cover is
+        // refused instead of spawned. A toggle landing after this point still
+        // fails closed downstream: `set_model` propagates to live subagents
+        // still on the old route, and the turn loop re-checks the ZDR flag
+        // before every provider call.
+        let effective_route = {
+            let meta = self.session.meta.read().unwrap_or_else(|p| p.into_inner());
+            if self.session.zdr_active() {
+                return Err(zdr_denied_subagent());
+            }
+            let current_route = meta.model.clone();
+            let effective = requested_route.unwrap_or_else(|| current_route.clone());
+            let covered = effective == current_route
+                || (current_route == authorized_from && effective == asked_route);
+            if !covered {
+                return Err(ToolError::Denied(format!(
+                    "session route changed from {authorized_from} to {current_route} while the \
+                     subagent route {effective} was being authorized; spawn again to confirm it"
+                )));
+            }
+            effective
+        };
+
+        spec.model = Some(effective_route);
+        self.session
+            .spawn_agent(spec)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
+    }
+}
+
 #[async_trait]
 impl ToolHost for SessionHost {
     async fn request_permission(&self, draft: PermissionDraft) -> PermissionOutcome {
@@ -627,82 +710,14 @@ impl ToolHost for SessionHost {
             .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
-    async fn spawn_agent(&self, mut spec: AgentSpec) -> Result<AgentId, ToolError> {
-        if self.session.zdr_active() {
-            return Err(zdr_denied_subagent());
-        }
-        let requested_route = spec.model.take();
-        let owner = self
-            .owner_agent()
-            .ok_or_else(|| ToolError::failed("agent not found"))?;
-        let (owner_id, owner_name, owner_route) = {
-            let info = owner.info.read().unwrap_or_else(|p| p.into_inner());
-            (info.id.clone(), info.name.clone(), info.model.clone())
-        };
-        // The pair this spawn will be judged by: the orchestrator route it
-        // departs from, and the route the subagent would actually run on.
-        let authorized_from = owner_route;
-        let asked_route = requested_route
-            .clone()
-            .unwrap_or_else(|| authorized_from.clone());
-        if asked_route != authorized_from {
-            let outcome = self
-                .request_permission_inner(
-                    PermissionDraft {
-                        agent: owner_id.clone(),
-                        agent_name: owner_name,
-                        call_id: CallId::generate(),
-                        title: format!("Authorize subagent route {asked_route}"),
-                        detail: format!(
-                            "Subagent route {asked_route} differs from orchestrator route {authorized_from}"
-                        ),
-                        risk: None,
-                        tool_name: Some("agent.route".to_string()),
-                        tool_kind: Some(pacode_tools::ToolKind::Control),
-                    },
-                    true,
-                )
-                .await;
-            if outcome.decision == PermissionDecision::Deny {
-                return Err(ToolError::Denied(
-                    outcome
-                        .reason
-                        .unwrap_or_else(|| "subagent route change denied".to_string()),
-                ));
-            }
-        }
-
-        // Commit point. The user answers that prompt in their own time, and both
-        // the session route and the ZDR flag can move while it is open, so the
-        // decision above is re-read here — ZDR and route under one guard, with
-        // nothing awaited in between — and anything it does not cover is
-        // refused instead of spawned. A toggle landing after this point still
-        // fails closed downstream: `set_model` propagates to live subagents
-        // still on the old route, and the turn loop re-checks the ZDR flag
-        // before every provider call.
-        let effective_route = {
-            let meta = self.session.meta.read().unwrap_or_else(|p| p.into_inner());
-            if self.session.zdr_active() {
-                return Err(zdr_denied_subagent());
-            }
-            let current_route = meta.model.clone();
-            let effective = requested_route.unwrap_or_else(|| current_route.clone());
-            let covered = effective == current_route
-                || (current_route == authorized_from && effective == asked_route);
-            if !covered {
-                return Err(ToolError::Denied(format!(
-                    "session route changed from {authorized_from} to {current_route} while the \
-                     subagent route {effective} was being authorized; spawn again to confirm it"
-                )));
-            }
-            effective
-        };
-
-        spec.model = Some(effective_route);
-        self.session
-            .spawn_agent(spec)
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))
+    async fn spawn_agent(&self, spec: AgentSpec) -> Result<AgentId, ToolError> {
+        // `ready` is bounded right here: the whole `agent` call, from its first
+        // line to the turn being scheduled. Recorded at the boundary that owns
+        // it, which is the only place the number means what its name says.
+        let spawn_started = std::time::Instant::now();
+        let outcome = self.spawn_agent_inner(spec).await;
+        pacode_types::record_launch_ready(spawn_started.elapsed(), outcome.is_err());
+        outcome
     }
 
     fn agent_info(&self, agent: &AgentId) -> Option<AgentInfo> {

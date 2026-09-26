@@ -444,6 +444,12 @@ pub struct ExecConfig {
     /// In-RAM tail per task.
     pub tail_bytes: usize,
     pub kill_grace_secs: u64,
+    /// Simultaneous processes one session may run. Unlike the per-agent tool
+    /// worker cap this is a real OS budget — every task holds a live process
+    /// group, three descriptors and ~80 KiB of RAM — so it is a ceiling on
+    /// concurrency, not a queue length. It does bind a fleet: 128 subagents that
+    /// all reach for `bash` at once will hit it, and the rest get
+    /// `TooManyTasks` rather than waiting. Raise it for such a session.
     pub max_tasks: usize,
     /// Hard cap for a foreground command without `background`.
     pub default_timeout_secs: u64,

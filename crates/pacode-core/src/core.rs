@@ -1257,6 +1257,7 @@ impl Core {
             }
         }
         stats.resume = self.resume_hist.snapshot();
+        stats.launches = pacode_types::agent_launch_stats();
         stats.history_pages = self.history_pages.load(AtomicOrdering::Relaxed);
         stats.store = self.deps.store.stats();
         stats

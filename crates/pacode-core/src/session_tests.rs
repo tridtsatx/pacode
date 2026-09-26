@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::session::Session;
 use pacode_config::Paths;
 use pacode_exec::{TaskManager, TaskSpec};
 use pacode_mcp::McpPool;
@@ -227,6 +228,7 @@ async fn close_fences_spawn_and_continue_agent_operations() {
                 name: Some("late".into()),
                 prompt: "must not spawn".into(),
                 tools: None,
+                exclude_tools: None,
                 fork: false,
                 model: None,
                 effort: None,
@@ -606,6 +608,7 @@ async fn subagent_prompt_and_fork_history_survive_reopen() {
             name: Some("forked".into()),
             prompt: "fork prompt".into(),
             tools: None,
+            exclude_tools: None,
             fork: true,
             model: None,
             effort: None,
@@ -670,6 +673,7 @@ async fn test_detach_with_live_subagents_succeeds() {
             name: Some("sub1".into()),
             prompt: "work 1".into(),
             tools: None,
+            exclude_tools: None,
             fork: false,
             model: None,
             effort: None,
@@ -682,6 +686,7 @@ async fn test_detach_with_live_subagents_succeeds() {
             name: Some("sub2".into()),
             prompt: "work 2".into(),
             tools: None,
+            exclude_tools: None,
             fork: false,
             model: None,
             effort: None,
@@ -726,6 +731,7 @@ async fn test_spawn_agent_has_no_live_cap() {
                 name: Some(format!("sub{i}")),
                 prompt: format!("work {i}"),
                 tools: None,
+                exclude_tools: None,
                 fork: false,
                 model: None,
                 effort: None,
@@ -738,6 +744,96 @@ async fn test_spawn_agent_has_no_live_cap() {
     assert_eq!(ids.len(), SPAWNS);
     let unique: std::collections::HashSet<_> = ids.iter().collect();
     assert_eq!(unique.len(), SPAWNS, "spawned agent ids must be unique");
+}
+
+/// The W128 target, as a single session: a hundred and twenty-eight subagents
+/// must all come up, and they must come up fast. The two halves fail
+/// differently, so they are checked separately.
+///
+/// Speed is checked as growth, not as a wall-clock number, because a fixed
+/// threshold would be a flaky test on a loaded machine. What must not happen is
+/// spawn *N* costing more than spawn 1 by a factor that climbs with *N* — the
+/// shape an O(n²) registry, a per-spawn full scan, or a store write per agent
+/// leaves behind. Half again the mean is a ceiling that still catches quadratic
+/// growth (128× would be far past it) and leaves headroom for a slow disk.
+///
+/// The prompt is deliberately not `fork: true`: forking copies the parent's
+/// whole history into the child, which is a different cost from creating the
+/// agent, and mixing the two would make a slow run unattributable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_spawns_128_subagents_without_quadratic_slowdown() {
+    const SPAWNS: usize = 128;
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+
+    // Every agent gets a slow provider so none of them finishes (and frees its
+    // slot) while the fleet is being built: the test measures creation under
+    // the load it is meant to survive.
+    for index in 0..SPAWNS {
+        mock.push(MockResponse::Slow {
+            delay: Duration::from_secs(30),
+            text: format!("subagent {index} working"),
+        });
+    }
+
+    let mut ids = Vec::with_capacity(SPAWNS);
+    let mut first_quartile = std::time::Duration::ZERO;
+    let mut last_quartile = std::time::Duration::ZERO;
+    let started = std::time::Instant::now();
+    for index in 0..SPAWNS {
+        let tick = std::time::Instant::now();
+        let id = session
+            .spawn_agent(pacode_tools::AgentSpec {
+                name: Some(format!("w{index}")),
+                prompt: format!("work {index}"),
+                tools: None,
+                exclude_tools: None,
+                fork: false,
+                model: None,
+                effort: None,
+            })
+            .await;
+        assert!(id.is_ok(), "spawn {index} failed: {:?}", id.err());
+        ids.push(id.unwrap());
+        let elapsed = tick.elapsed();
+        if index < SPAWNS / 4 {
+            first_quartile += elapsed;
+        } else if index >= SPAWNS * 3 / 4 {
+            last_quartile += elapsed;
+        }
+    }
+    let total = started.elapsed();
+
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        SPAWNS,
+        "every spawn must produce its own agent id"
+    );
+    {
+        // The map holds the main agent alongside the fleet, so the count is one
+        // larger than the number of spawns.
+        let agents = session.agents.read().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            agents.len(),
+            SPAWNS + 1,
+            "all {SPAWNS} subagents must be live in the session at once"
+        );
+    }
+
+    let per_first = first_quartile / (SPAWNS / 4) as u32;
+    let per_last = last_quartile / (SPAWNS - SPAWNS * 3 / 4) as u32;
+    assert!(
+        per_last <= per_first * 3 / 2,
+        "spawning got slower as the session filled: first {per_first:?} per spawn, \
+         last {per_last:?} per spawn ({} total). That is what an O(n^2) registry or a \
+         per-spawn full scan looks like",
+        humantime(total)
+    );
+}
+
+/// A short, readable rendering of a duration for failure messages.
+fn humantime(duration: std::time::Duration) -> String {
+    format!("{:.1?}", duration)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1312,6 +1408,7 @@ async fn test_set_model_propagates_to_agents() {
             name: Some("inherited".into()),
             prompt: "work".into(),
             tools: None,
+            exclude_tools: None,
             fork: false,
             model: None,
             effort: None,
@@ -1325,6 +1422,7 @@ async fn test_set_model_propagates_to_agents() {
             name: Some("pinned".into()),
             prompt: "work".into(),
             tools: None,
+            exclude_tools: None,
             fork: false,
             model: Some(pinned_route.clone()),
             effort: None,
@@ -1417,6 +1515,7 @@ async fn test_set_effort_propagates_to_agents() {
             name: Some("inherited".into()),
             prompt: "work".into(),
             tools: None,
+            exclude_tools: None,
             fork: false,
             model: None,
             effort: None,
@@ -1429,6 +1528,7 @@ async fn test_set_effort_propagates_to_agents() {
             name: Some("pinned".into()),
             prompt: "work".into(),
             tools: None,
+            exclude_tools: None,
             fork: false,
             model: None,
             effort: Some(Effort::Low),
@@ -3085,6 +3185,7 @@ fn sub_spec(name: &str) -> pacode_tools::AgentSpec {
         name: Some(name.into()),
         prompt: "work".into(),
         tools: None,
+        exclude_tools: None,
         fork: false,
         model: None,
         effort: None,
@@ -4275,4 +4376,151 @@ fn optimistic_snapshot_retries_when_event_seq_changes() {
     assert_eq!(boundary, Some(1));
     assert_eq!(state, 2);
     assert_eq!(attempts, 2);
+}
+
+/// What a subagent's tool set ends up being, so the selection rules can be
+/// asserted without reaching through the registry.
+async fn spawned_tool_names(session: &std::sync::Arc<Session>, id: &AgentId) -> Vec<String> {
+    let agent = session.agent(id).expect("spawned agent is in the session");
+    agent
+        .tools
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .names()
+        .map(str::to_string)
+        .collect()
+}
+
+fn spec(tools: Option<&[&str]>, exclude_tools: Option<&[&str]>) -> pacode_tools::AgentSpec {
+    pacode_tools::AgentSpec {
+        prompt: "work".to_string(),
+        name: None,
+        model: None,
+        effort: None,
+        fork: false,
+        tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+        exclude_tools: exclude_tools.map(|t| t.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+    }
+}
+
+/// The default has to be parity: a subagent that needs a list to become useful
+/// is a subagent the orchestrator has to think about on every spawn, which is
+/// exactly the friction that made fan-out feel expensive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_starts_with_the_orchestrators_own_tool_set() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let parent_tools: Vec<String> = session
+        .tools
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .names()
+        .map(str::to_string)
+        .collect();
+    mock.push(MockResponse::Slow {
+        delay: std::time::Duration::from_millis(100),
+        text: "done".into(),
+    });
+
+    let id = session.spawn_agent(spec(None, None)).await.unwrap();
+    let child = spawned_tool_names(&session, &id).await;
+
+    assert_eq!(
+        child, parent_tools,
+        "omitting both lists must hand the subagent the same set the orchestrator has"
+    );
+}
+
+/// `exclude_tools` exists so trimming costs a short list instead of restating
+/// the whole one — at 128 subagents every schema is re-sent on every step.
+#[tokio::test(flavor = "multi_thread")]
+async fn exclude_tools_drops_those_tools_and_keeps_the_rest() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let parent_tools: Vec<String> = session
+        .tools
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .names()
+        .map(str::to_string)
+        .collect();
+    let dropped = parent_tools
+        .first()
+        .cloned()
+        .expect("the harness registers at least one tool");
+    mock.push(MockResponse::Slow {
+        delay: std::time::Duration::from_millis(100),
+        text: "done".into(),
+    });
+
+    let id = session
+        .spawn_agent(spec(None, Some(&[dropped.as_str()])))
+        .await
+        .unwrap();
+    let child = spawned_tool_names(&session, &id).await;
+
+    assert!(
+        !child.contains(&dropped),
+        "{dropped} should be gone: {child:?}"
+    );
+    assert_eq!(
+        child.len(),
+        parent_tools.len() - 1,
+        "exactly one tool should have been dropped: {child:?}"
+    );
+}
+
+/// Both lists at once: the include decides the set, the exclude subtracts from
+/// it. Exclude wins on a name that appears in both, so a preset can refine a
+/// wider set without having to know what it does not contain.
+#[tokio::test(flavor = "multi_thread")]
+async fn include_and_exclude_compose_with_exclude_winning() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: std::time::Duration::from_millis(100),
+        text: "done".into(),
+    });
+
+    // The harness registers exactly these two, so they are what the include
+    // list is built from — naming a tool the session does not have is ignored,
+    // and a test that invented names would pass on an empty set.
+    let id = session
+        .spawn_agent(spec(
+            Some(&["panic_tool", "block_tool"]),
+            Some(&["block_tool"]),
+        ))
+        .await
+        .unwrap();
+    let child = spawned_tool_names(&session, &id).await;
+
+    assert_eq!(
+        child,
+        vec!["panic_tool".to_string()],
+        "include picks the set and exclude subtracts from it, winning on overlap"
+    );
+}
+
+/// Depth 1 is structural. No combination of arguments may hand a subagent the
+/// means to spawn one, because a fleet that fans out recursively has no bound
+/// the orchestrator can reason about.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_tool_cannot_be_granted_to_a_subagent() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.push(MockResponse::Slow {
+        delay: std::time::Duration::from_millis(100),
+        text: "done".into(),
+    });
+
+    let id = session
+        .spawn_agent(spec(Some(&["ls", "agent"]), None))
+        .await
+        .unwrap();
+    let child = spawned_tool_names(&session, &id).await;
+
+    assert!(
+        !child.contains(&"agent".to_string()),
+        "a subagent must never be able to spawn one: {child:?}"
+    );
 }

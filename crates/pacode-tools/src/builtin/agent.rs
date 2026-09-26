@@ -13,6 +13,13 @@ pub const NAME: &str = "agent";
 
 pub struct AgentTool;
 
+/// What `agent list` says when no kinds are defined. Shared by both list paths
+/// so the empty case reads the same whether or not agents exist: the model has
+/// to be told to omit `kind`, because silence here is what made it invent
+/// names and then retry the same rejected spawn for several turns.
+const NO_KINDS_HINT: &str = "No agent kinds are defined — omit `kind` and the subagent gets the \
+     default tool set. `kind` only works for types declared in `agents/*.md`.";
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct AgentInput {
@@ -24,6 +31,7 @@ struct AgentInput {
     effort: Option<String>,
     context: Option<String>,
     tools: Option<Vec<String>>,
+    exclude_tools: Option<Vec<String>>,
     agent_id: Option<String>,
 }
 
@@ -55,7 +63,8 @@ impl Tool for AgentTool {
                 "model": {"type": "string", "description": "`provider/model` override."},
                 "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
                 "context": {"type": "string", "enum": ["fresh", "fork"], "default": "fresh", "description": "`fork` copies your conversation so far."},
-                "tools": {"type": "array", "items": {"type": "string"}, "description": "Restrict the subagent to these tools."},
+                "tools": {"type": "array", "items": {"type": "string"}, "description": "Narrow the subagent to exactly these tools. Omit to give it the same set you have."},
+                "exclude_tools": {"type": "array", "items": {"type": "string"}, "description": "Drop these tools, keeping the rest. Cheaper than `tools` when you only need to trim: every tool schema is re-sent on every step of every subagent, so a subagent that edits files gains nothing from the browser tools. Applied after `tools`; `agent` is never grantable."},
                 "agent_id": {"type": "string"}
             }
         })
@@ -67,10 +76,26 @@ impl Tool for AgentTool {
 
     /// `spawn` → `host.spawn_agent(AgentSpec{..})` → output `Spawned agent <id>
     /// (<name>)`; a `kind` merges the discovered file's prompt/tools/model unless the
-    /// call overrides them, an unknown `kind` fails listing the available kinds.
+    /// call overrides them. An unknown `kind` is a note, not a refusal: the
+    /// spawn goes ahead on the default tool set and the output names what was
+    /// ignored and which kinds do exist.
     /// `stop`; `list` → one line per agent `<id> <name> <status> <duration>
     /// ↓<tokens>` plus the available kinds.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        self.call_inner(input, ctx, std::time::Instant::now()).await
+    }
+}
+
+impl AgentTool {
+    /// The body of [`Tool::call`]. `started` is stamped by the caller so the
+    /// `resolve` stage can be cut at the handoff rather than after it, which is
+    /// the only way the stage can be smaller than the call that contains it.
+    async fn call_inner(
+        &self,
+        input: Value,
+        ctx: &ToolCtx,
+        started: std::time::Instant,
+    ) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<AgentInput>(input)?;
         match args.action.as_str() {
             "spawn" => {
@@ -78,13 +103,23 @@ impl Tool for AgentTool {
                     .prompt
                     .filter(|p| !p.trim().is_empty())
                     .ok_or_else(|| ToolError::invalid("prompt is required for spawn"))?;
+                let mut kind_note = None;
                 let kind = match args
                     .kind
                     .as_deref()
                     .map(str::trim)
                     .filter(|k| !k.is_empty())
                 {
-                    Some(kind_name) => Some(resolve_kind(ctx, kind_name)?),
+                    Some(kind_name) => {
+                        let (found, available) = resolve_kind(ctx, kind_name);
+                        if found.is_none() {
+                            kind_note = Some(format!(
+                                "Note: agent kind '{kind_name}' is not defined, so this \
+                                 subagent got the default tool set. Available kinds: {available}"
+                            ));
+                        }
+                        found
+                    }
                     None => None,
                 };
                 let mut model = args
@@ -123,13 +158,23 @@ impl Tool for AgentTool {
                         .tools
                         .clone()
                         .or_else(|| kind.as_ref().and_then(|k| k.tools.clone())),
+                    exclude_tools: args.exclude_tools.clone(),
                 };
+                // `resolve` stops here, at the handoff — not after it. Wrapping
+                // the whole call would make this stage *larger* than the
+                // `ready` stage that contains it, and a stage that exceeds its
+                // own total is not a measurement.
+                pacode_types::record_launch_resolve(started.elapsed());
                 let id = ctx.host.spawn_agent(spec).await?;
                 let agent_name = args
                     .name
                     .or_else(|| kind.map(|k| k.name))
                     .unwrap_or_else(|| id.to_string());
-                let content = format!("Spawned agent {id} ({agent_name})");
+                let mut content = format!("Spawned agent {id} ({agent_name})");
+                if let Some(note) = kind_note {
+                    content.push_str("\n\n");
+                    content.push_str(&note);
+                }
                 let title = format!("Spawn agent {agent_name}");
                 Ok(ToolOutput::text(content)
                     .with_title(title)
@@ -173,7 +218,13 @@ impl Tool for AgentTool {
                 let agents = ctx.host.list_agents();
                 let kinds = ctx.host.agent_kinds();
                 if agents.is_empty() && kinds.is_empty() {
-                    return Ok(ToolOutput::text("No subagents.").with_title("agent list"));
+                    // The hint about `kind` belongs here too: this is the state
+                    // a fresh session starts in, and returning a bare "No
+                    // subagents." is what left the model inventing kind names.
+                    return Ok(
+                        ToolOutput::text(format!("No subagents.\n\n{}", NO_KINDS_HINT))
+                            .with_title("agent list"),
+                    );
                 }
                 let now_ms = pacode_types::now_ms();
                 let mut lines = Vec::new();
@@ -185,7 +236,16 @@ impl Tool for AgentTool {
                         a.id, a.name, status_str, dur_s, a.tokens_out
                     ));
                 }
-                if !kinds.is_empty() {
+                if kinds.is_empty() {
+                    // Say it even when there are none. Silence here left the
+                    // model guessing whether `kind` was a usable argument at
+                    // all, and it kept inventing names; naming the empty case
+                    // is what tells it to omit the field.
+                    if !lines.is_empty() {
+                        lines.push(String::new());
+                    }
+                    lines.push(NO_KINDS_HINT.to_string());
+                } else {
                     if !lines.is_empty() {
                         lines.push(String::new());
                     }
@@ -207,13 +267,21 @@ impl Tool for AgentTool {
     }
 }
 
-/// Look up `name` among the host's discovered agent kinds; an unknown name
-/// fails with the available list so the model can self-correct.
-fn resolve_kind(ctx: &ToolCtx, name: &str) -> Result<AgentKindDef, ToolError> {
+/// Look up `name` among the host's discovered agent kinds, returning it
+/// alongside the names that do exist.
+///
+/// A name that isn't there is deliberately *not* an error. pacode ships no
+/// built-in kinds — every one comes from an `agents/*.md` file — while the
+/// tool schema takes `kind` as a free-form string, so a model reaching for a
+/// plausible one (`explore`, `reviewer`) is expected, not a mistake. Failing
+/// the spawn outright cost several turns of the model retrying the same name
+/// before it gave up, which read as "subagents are slow to start". Returning
+/// `None` lets the spawn proceed on the default tool set while the output
+/// tells the model what was ignored and what does exist, so it can correct
+/// itself in one step.
+fn resolve_kind(ctx: &ToolCtx, name: &str) -> (Option<AgentKindDef>, String) {
     let kinds = ctx.host.agent_kinds();
-    if let Some(def) = kinds.iter().find(|k| k.name == name) {
-        return Ok(def.clone());
-    }
+    let found = kinds.iter().find(|k| k.name == name).cloned();
     let available = if kinds.is_empty() {
         "(none)".to_string()
     } else {
@@ -223,7 +291,5 @@ fn resolve_kind(ctx: &ToolCtx, name: &str) -> Result<AgentKindDef, ToolError> {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    Err(ToolError::invalid(format!(
-        "unknown agent kind '{name}', available kinds: {available}"
-    )))
+    (found, available)
 }

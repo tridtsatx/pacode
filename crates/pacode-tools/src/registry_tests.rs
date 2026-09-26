@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use pacode_types::{AgentId, SessionId};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    MAX_PERMISSION_DETAIL_BYTES, MAX_SOURCE_FILE_BYTES, MAX_TOOL_OUTPUT_BYTES, SourceReadError,
-    ToolRegistry, acquire_path_write_lock, cap_output_bytes, read_source_file, write_atomic,
+    MAX_PERMISSION_DETAIL_BYTES, MAX_SOURCE_FILE_BYTES, MAX_TOOL_OUTPUT_BYTES,
+    MAX_TOOL_WORKERS_PER_AGENT, SourceReadError, ToolRegistry, acquire_path_write_lock,
+    cap_output_bytes, read_source_file, write_atomic,
 };
 use crate::ToolError;
 use crate::builtin::glob::GlobTool;
@@ -245,4 +247,75 @@ fn permission_detail_cap_keeps_head_and_tail_of_a_long_diff() {
     assert!(capped.contains("output truncated"));
     assert!(capped.starts_with('+'));
     assert!(capped.ends_with('!'));
+}
+
+/// How many agents the fleet test below runs. It must stay above the 16 that
+/// used to be the process-wide cap, otherwise the test would pass even with the
+/// cap back in place.
+const FLEET_SIZE: usize = 24;
+
+/// A worker cap that is per-agent, not per-process. The global cap this guards
+/// against was 16: with 128 concurrent subagents, 112 of them could not run a
+/// single tool — and the parent's own `agent spawn` call queued behind the
+/// children it had just spawned, which is what made agents crawl to a start.
+///
+/// All 24 permits are still held after `join_all` returns, so the calls are
+/// genuinely in flight at the same time; under a process-wide cap the join would
+/// never finish and the timeout would fail instead of hanging the suite.
+#[tokio::test]
+async fn workers_from_different_agents_are_handed_out_in_parallel() {
+    let registry = ToolRegistry::new();
+    let session = SessionId::new("ses_fleet");
+    let cancel = CancellationToken::new();
+
+    let permits = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::join_all((0..FLEET_SIZE).map(|index| {
+            let registry = registry.clone();
+            let session = session.clone();
+            let cancel = cancel.clone();
+            async move {
+                let agent = AgentId::new(format!("agt_{index}"));
+                registry.acquire_worker(&session, &agent, &cancel).await
+            }
+        })),
+    )
+    .await
+    .expect("agents queued behind each other: a process-wide worker cap is back")
+    .into_iter()
+    .collect::<Vec<_>>();
+
+    assert_eq!(permits.len(), FLEET_SIZE);
+    for (index, permit) in permits.iter().enumerate() {
+        assert!(permit.is_ok(), "agent {index} never got a worker");
+    }
+}
+
+/// The remaining cap is per agent: one agent fills its own slots and then waits,
+/// which is what keeps a single agent from exhausting fds and processes.
+#[tokio::test]
+async fn one_agent_is_capped_at_its_own_slot_count() {
+    let registry = ToolRegistry::new();
+    let session = SessionId::new("ses_cap");
+    let agent = AgentId::main();
+
+    let held = futures::future::join_all((0..MAX_TOOL_WORKERS_PER_AGENT).map(|_| {
+        let registry = registry.clone();
+        let session = session.clone();
+        let agent = agent.clone();
+        let cancel = CancellationToken::new();
+        async move { registry.acquire_worker(&session, &agent, &cancel).await }
+    }))
+    .await;
+    assert!(held.iter().all(|permit| permit.is_ok()));
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(50),
+        registry.acquire_worker(&session, &agent, &CancellationToken::new()),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "a full per-agent pool must make the next call wait"
+    );
 }

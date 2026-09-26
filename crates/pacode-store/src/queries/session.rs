@@ -12,6 +12,7 @@ use super::{
 };
 use crate::StoreError;
 use crate::queries::message::purge_messages;
+use crate::txn::Txn;
 
 pub const DEFAULT_SESSION_PAGE: u32 = 200;
 
@@ -212,7 +213,7 @@ pub fn admit_attach(
     session_id: &SessionId,
     allow_create: bool,
 ) -> Result<AttachAdmissionResult, StoreError> {
-    let tx = conn.transaction()?;
+    let tx = Txn::open(conn)?;
     let inserted = tx.execute(
         "INSERT INTO attach_admissions (client_id, idempotency_key, session_id, fingerprint, allow_create, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(client_id, idempotency_key) DO NOTHING;",
         params![
@@ -302,7 +303,7 @@ pub fn admit_task(
     task_id: &TaskId,
     owner: &AgentId,
 ) -> Result<TaskAdmissionResult, StoreError> {
-    let tx = conn.transaction()?;
+    let tx = Txn::open(conn)?;
     let inserted = tx.execute(
         "INSERT INTO task_admissions (session_id, idempotency_key, task_id, owner_agent, fingerprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(session_id, idempotency_key) DO NOTHING;",
         params![
@@ -333,7 +334,7 @@ pub fn admit_task(
 }
 
 pub fn delete_session(conn: &mut Connection, id: &SessionId) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
+    let tx = Txn::open(conn)?;
     purge_messages(
         &tx,
         "session_id = ?1",

@@ -26,10 +26,17 @@ pub enum SynchronousMode {
     Other,
 }
 
+/// What a backend has to offer for pacode to run on it. These are capabilities,
+/// not settings: `synchronous` is deliberately not one of them, because how
+/// durable a commit is a choice pacode makes for itself (see
+/// [`StorageCapabilities::synchronous`]) and pinning it here would only mean the
+/// store can no longer pick the durability level its throughput needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DialectRequirements {
     pub fts5: bool,
-    pub wal_full: bool,
+    /// Write-ahead logging, which is what lets the store's single writer commit
+    /// without blocking the readers.
+    pub wal: bool,
     pub transactions: bool,
     pub keyset_pagination: bool,
 }
@@ -37,7 +44,7 @@ pub struct DialectRequirements {
 impl DialectRequirements {
     pub const PACODE: Self = Self {
         fts5: true,
-        wal_full: true,
+        wal: true,
         transactions: true,
         keyset_pagination: true,
     };
@@ -46,7 +53,7 @@ impl DialectRequirements {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapabilityGap {
     Fts5,
-    WalFull,
+    Wal,
     Transactions,
     KeysetPagination,
 }
@@ -56,6 +63,10 @@ pub struct StorageCapabilities {
     pub dialect: StorageDialect,
     pub fts5: bool,
     pub journal_mode: JournalMode,
+    /// Reported, not required: the live `synchronous` setting of the connection.
+    /// Under WAL this is what decides whether a commit reaches the disk
+    /// (`Full`) or the WAL (`Normal`), and pacode runs at `Normal` because the
+    /// cost of `Full` is paid by every caller in the store's batch.
     pub synchronous: SynchronousMode,
     pub transactions: bool,
     pub keyset_pagination: bool,
@@ -71,10 +82,8 @@ impl StorageCapabilities {
         if requirements.fts5 && !self.fts5 {
             gaps.push(CapabilityGap::Fts5);
         }
-        if requirements.wal_full
-            && (self.journal_mode != JournalMode::Wal || self.synchronous != SynchronousMode::Full)
-        {
-            gaps.push(CapabilityGap::WalFull);
+        if requirements.wal && self.journal_mode != JournalMode::Wal {
+            gaps.push(CapabilityGap::Wal);
         }
         if requirements.transactions && !self.transactions {
             gaps.push(CapabilityGap::Transactions);

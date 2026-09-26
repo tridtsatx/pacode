@@ -221,6 +221,33 @@ fn denied_preview(reason: &str) -> String {
     format!("Denied: {short}")
 }
 
+/// Call `tool` under `ctx.cancel`, holding one of the agent's worker slots for
+/// the whole call unless the tool takes its own (`holds_own_workers`). A turn
+/// asking for a hundred reads must not open a hundred fds at once; the slot is
+/// released as soon as the call returns or the turn is cancelled.
+async fn call_bounded(
+    tool: &Arc<dyn pacode_tools::Tool>,
+    input: serde_json::Value,
+    ctx: &pacode_tools::ToolCtx,
+    holds_own_workers: bool,
+) -> Result<pacode_tools::ToolOutput, pacode_tools::ToolError> {
+    let _worker = if holds_own_workers {
+        None
+    } else {
+        Some(
+            ctx.tools
+                .acquire_worker(&ctx.session, &ctx.agent, &ctx.cancel)
+                .await?,
+        )
+    };
+    let call_fut = tool.call(input, ctx);
+    tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
+        res = call_fut => res,
+    }
+}
+
 async fn run_single_tool(
     session: Arc<Session>,
     agent: Arc<Agent>,
@@ -375,35 +402,12 @@ async fn run_single_tool(
     } else {
         match tool_opt {
             Some(tool) => {
-                let workers = if call.name == pacode_tools::builtin::batch::NAME {
-                    None
-                } else {
-                    Some(
-                        ctx.tools
-                            .acquire_worker(&ctx.session, &ctx.agent, &ctx.cancel)
-                            .await,
-                    )
-                };
-                let tool_res = match workers {
-                    Some(Ok(workers)) => {
-                        let _workers = workers;
-                        let call_fut = tool.call(call.input.clone(), &ctx);
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
-                            res = call_fut => res,
-                        }
-                    }
-                    Some(Err(err)) => Err(err),
-                    None => {
-                        let call_fut = tool.call(call.input.clone(), &ctx);
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
-                            res = call_fut => res,
-                        }
-                    }
-                };
+                // `batch` takes one worker per op inside its own `run_op`, so
+                // the outer call must not take one: it would hold a permit for
+                // the whole batch while the batch's ops wait for permits.
+                let holds_own_workers = call.name == pacode_tools::builtin::batch::NAME;
+                let tool_res =
+                    call_bounded(&tool, call.input.clone(), &ctx, holds_own_workers).await;
                 match tool_res {
                     Ok(output) => {
                         let status = if let Some(task_id) = output.task.as_ref() {

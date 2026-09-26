@@ -151,6 +151,7 @@ impl Tool for StubAgent {
                 name,
                 prompt: prompt.to_string(),
                 tools: None,
+                exclude_tools: None,
                 fork: false,
                 model: None,
                 effort: None,
@@ -1758,6 +1759,7 @@ async fn w128_agent_admission_and_fanout() {
                     effort: None,
                     fork: false,
                     tools: Some(Vec::new()),
+                    exclude_tools: None,
                 })
                 .await
         }));

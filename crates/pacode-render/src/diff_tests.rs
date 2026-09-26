@@ -1,12 +1,18 @@
 use super::*;
 use crate::{ColorMode, RenderOptions, Theme};
 
+// The colour mode is passed explicitly rather than left to detection:
+// `with_theme` resolves the mode from the ambient terminal and, in `Mono`,
+// *replaces the whole theme with `Theme::mono()`* — after which a later
+// `color_mode(..)` flips the flag back but cannot bring the colours with it.
+// These helpers therefore used to pass or fail depending on the terminal the
+// suite happened to run in, while never actually testing truecolor.
 fn truecolor_opts(width: u16) -> RenderOptions {
-    RenderOptions::with_theme(width, false, Theme::truecolor()).color_mode(ColorMode::Truecolor)
+    RenderOptions::with_theme_color(width, false, Theme::truecolor(), ColorMode::Truecolor)
 }
 
 fn ansi_opts(width: u16) -> RenderOptions {
-    RenderOptions::with_theme(width, false, Theme::ansi()).color_mode(ColorMode::Ansi)
+    RenderOptions::with_theme_color(width, false, Theme::ansi(), ColorMode::Ansi)
 }
 
 fn line_text(l: &Line) -> String {

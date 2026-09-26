@@ -551,6 +551,11 @@ pub struct Agent {
     pub history_before_turn: Mutex<Option<History>>,
     /// Turn-scoped prompt cache (invalidation point: turn start).
     pub prompt_cache: Mutex<Option<crate::prompt::TurnPromptCache>>,
+    /// When this agent was created, monotonic. `None` for the main agent and for
+    /// a subagent resumed on reopen, where there is no spawn to measure from.
+    /// The turn loop needs it to report time-to-first-token, which is the one
+    /// launch stage that belongs to neither the spawn path nor the turn alone.
+    spawned_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl Agent {
@@ -586,7 +591,24 @@ impl Agent {
             prompt: RwLock::new(prompt),
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
+            spawned_at: Mutex::new(None),
         }
+    }
+
+    /// Mark this agent as freshly spawned, which starts the clock the turn loop
+    /// reads to report time-to-first-token. Only the spawn path calls it: a
+    /// resumed subagent has no spawn to measure, and measuring from its reopen
+    /// would report resume cost as launch cost.
+    pub(crate) fn mark_spawned_at(&self, at: std::time::Instant) {
+        *self.spawned_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(at);
+    }
+
+    /// How long ago this agent was spawned, if it was.
+    pub(crate) fn since_spawn(&self) -> Option<std::time::Duration> {
+        self.spawned_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|at| at.elapsed())
     }
 
     pub fn new_with_transcript(
@@ -621,6 +643,7 @@ impl Agent {
             prompt: RwLock::new(prompt),
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
+            spawned_at: Mutex::new(None),
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Implementation: `std::sync::mpsc` of boxed closures `FnOnce(&mut Connection) ->
 //! Result<..>` with a `tokio::sync::oneshot` for the reply; the thread opens the
-//! connection (WAL, `synchronous=FULL`, `cache_size=-2000`, `foreign_keys=ON`),
+//! connection (WAL, `synchronous=NORMAL`, `cache_size=-2000`, `foreign_keys=ON`),
 //! runs `schema::migrate`, then loops. `Store` is `Clone` (cheap); dropping the last
 //! clone stops the thread.
 //!
@@ -10,7 +10,25 @@
 //! process-wide worker registry keyed by the canonical file path, so a second open
 //! of the same file joins the running writer instead of opening a second
 //! connection to it.
+//!
+//! The loop is a group commit. Whatever has already queued up is taken as one
+//! batch, runs inside one transaction with a savepoint per call, and is committed
+//! once — and only after that commit is anyone told "done". The commit is the only
+//! step that reaches the disk, so a hundred concurrent calls pay for it once
+//! instead of a hundred times. That matters because the writer is a single thread
+//! and everything in the daemon queues behind it: with 128 agents writing at once,
+//! one fsync per call is the difference between a store that keeps up and a daemon
+//! that is serialized behind the disk.
+//!
+//! `synchronous=NORMAL` is the other half of it, and the reason the batching is
+//! worth having. Under `FULL` every commit fsyncs, so a batch of 64 still pays a
+//! full fsync and grouping buys statement round-trips only. Under `NORMAL` in WAL
+//! mode the commit is a write to the WAL and the fsync is paid at the next
+//! checkpoint, across every write since. The trade is deliberate: a power cut can
+//! lose the tail of the transcript, and a crash of the process cannot lose a byte
+//! that was reported as done.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -29,6 +47,7 @@ use pacode_types::{
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::batch::{self, Answer, Batch, Command, Execution};
 use crate::capabilities::{JournalMode, StorageCapabilities, StorageDialect, SynchronousMode};
 use crate::queries::{
     AdmissionCursor, AttachAdmission, AttachAdmissionResult, MessageAdmission,
@@ -37,16 +56,22 @@ use crate::queries::{
 };
 use crate::{StoreError, queries, schema};
 
+/// How many calls may be waiting for the writer before a send has to wait for
+/// room. Two batches' worth, deliberately: a saturated queue then always has a
+/// full batch waiting for the next commit, so no call waits behind a queue that
+/// is being drained one commit at a time.
 const QUEUE_CAPACITY: usize = 128;
-const BUSY_TIMEOUT_MS: u64 = 5_000;
-const CHECKPOINT_TIMEOUT_MS: u64 = 100;
-const CHECKPOINT_ATTEMPTS: usize = 3;
-const CHECKPOINT_BACKOFF_MS: u64 = 25;
+
+/// How long a statement waits for a lock the writer does not hold — a reader on
+/// another connection, or a second process with the same file open.
+pub(crate) const BUSY_TIMEOUT_MS: u64 = 5_000;
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
-const SQLITE_SYNCHRONOUS_FULL: i64 = 2;
 
-type Task = Box<dyn FnOnce(&mut Connection) + Send>;
+/// `PRAGMA synchronous` as SQLite reports it. `NORMAL` is the level the store
+/// runs at, and the readback in [`Store::init_db`] is what makes sure the
+/// connection is really there rather than merely asked to be.
+const SQLITE_SYNCHRONOUS_NORMAL: i64 = 1;
 
 /// Per-worker instrumentation. Everything here is an atomic updated on the
 /// request path — no poller, no background thread — so an idle daemon pays
@@ -57,43 +82,42 @@ type Task = Box<dyn FnOnce(&mut Connection) + Send>;
 /// the fsync that `synchronous=FULL` asks for), `wait` is how long a caller
 /// queued behind other callers.
 #[derive(Debug, Default)]
-struct StoreMetrics {
-    wait: LatencyHist,
-    exec: LatencyHist,
-    enqueued: AtomicU64,
-    completed: AtomicU64,
+pub(crate) struct StoreMetrics {
+    pub(crate) wait: LatencyHist,
+    pub(crate) exec: LatencyHist,
+    /// One sample per batch: the commit that carried it.
+    pub(crate) commit: LatencyHist,
+    pub(crate) enqueued: AtomicU64,
+    pub(crate) completed: AtomicU64,
     /// Sends that found the queue closed or full.
-    refused: AtomicU64,
-    faults: AtomicU64,
-    queue_depth: AtomicU64,
-    queue_high_water: AtomicU64,
+    pub(crate) refused: AtomicU64,
+    pub(crate) faults: AtomicU64,
+    /// Commits run, whatever their depth. Divided into `completed` it is the
+    /// mean batch size, which is the number that says whether grouping is
+    /// actually happening.
+    pub(crate) batches: AtomicU64,
+    pub(crate) queue_depth: AtomicU64,
+    pub(crate) queue_high_water: AtomicU64,
 }
 
 impl StoreMetrics {
-    fn enqueued(&self) {
+    pub(crate) fn enqueued(&self) {
         self.enqueued.fetch_add(1, Ordering::Relaxed);
         let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         self.queue_high_water.fetch_max(depth, Ordering::Relaxed);
     }
 
-    fn dequeued(&self) {
+    pub(crate) fn dequeued(&self) {
         self.queue_depth.fetch_sub(1, Ordering::Relaxed);
         self.completed.fetch_add(1, Ordering::Relaxed);
     }
 }
-
-enum Command {
-    Execute(Task),
-    Close,
-}
-
 struct Inner {
     sender: mpsc::Sender<Command>,
     closing: AtomicBool,
     joined: watch::Receiver<bool>,
     joined_tx: watch::Sender<bool>,
     handle: Mutex<Option<JoinHandle<()>>>,
-    is_memory: bool,
     shared_key: Option<PathBuf>,
     fault: AtomicBool,
     metrics: Arc<StoreMetrics>,
@@ -251,18 +275,21 @@ impl Store {
             joined: joined_rx,
             joined_tx,
             handle: Mutex::new(None),
-            is_memory,
             shared_key: shared_key.clone(),
             fault: AtomicBool::new(false),
             metrics: Arc::new(StoreMetrics::default()),
         });
 
         let worker_inner = Arc::downgrade(&inner);
+        // A handle on the instrumentation, not on `Inner`: holding `Inner` here
+        // would keep the sender — and so this very thread — alive for as long as
+        // the writer runs.
+        let worker_metrics = Arc::clone(&inner.metrics);
         let builder = std::thread::Builder::new().name("pacode-store".to_string());
         let handle = builder
             .spawn(move || {
                 let _ = catch_unwind(AssertUnwindSafe(|| {
-                    Self::run_worker(path, is_memory, worker_inner, init_tx, rx);
+                    Self::run_worker(path, is_memory, worker_inner, init_tx, rx, worker_metrics);
                 }));
             })
             .map_err(StoreError::Io)?;
@@ -286,6 +313,7 @@ impl Store {
         inner: Weak<Inner>,
         init_tx: std_mpsc::SyncSender<Result<(), StoreError>>,
         mut rx: mpsc::Receiver<Command>,
+        metrics: Arc<StoreMetrics>,
     ) {
         let conn_res = if is_memory {
             Connection::open_in_memory()
@@ -310,13 +338,15 @@ impl Store {
             return;
         }
 
-        while let Some(command) = rx.blocking_recv() {
-            match command {
-                Command::Execute(task) => task(&mut conn),
-                Command::Close => {
-                    rx.close();
-                    break;
-                }
+        while let Some(first) = rx.blocking_recv() {
+            let Batch {
+                executions,
+                close_after,
+            } = batch::collect_batch(&mut rx, first);
+            batch::run_batch(&mut conn, executions, is_memory, &metrics);
+            if close_after {
+                rx.close();
+                break;
             }
         }
 
@@ -342,17 +372,20 @@ impl Store {
         }
         conn.execute_batch(&format!(
             r#"
-            PRAGMA synchronous = FULL;
+            PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -2000;
             PRAGMA foreign_keys = ON;
             PRAGMA wal_autocheckpoint = {WAL_AUTOCHECKPOINT_PAGES};
             PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES};
             "#,
         ))?;
+        // Read back rather than trust the pragma: a build of SQLite that refused
+        // it would otherwise silently run the store at the durability level the
+        // pragma asked for before this line, with nothing reporting the gap.
         let synchronous: i64 = conn.query_row("PRAGMA synchronous;", [], |row| row.get(0))?;
-        if !is_memory && synchronous != SQLITE_SYNCHRONOUS_FULL {
+        if !is_memory && synchronous != SQLITE_SYNCHRONOUS_NORMAL {
             return Err(StoreError::Invalid(format!(
-                "sqlite refused synchronous = FULL: synchronous = {synchronous}"
+                "sqlite refused synchronous = NORMAL: synchronous = {synchronous}"
             )));
         }
         schema::migrate(conn)?;
@@ -389,10 +422,16 @@ impl Store {
         .await
     }
 
-    fn call<T: Send + 'static>(
+    /// The future this hands back owns a clone of the writer's handle and the
+    /// call itself — the precise-capture list says so, which is what lets a
+    /// caller queue a call, drop its `Store`, and still get an answer.
+    fn call<T: Send + 'static, F>(
         &self,
-        f: impl FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
-    ) -> impl std::future::Future<Output = Result<T, StoreError>> {
+        f: F,
+    ) -> impl std::future::Future<Output = Result<T, StoreError>> + use<T, F>
+    where
+        F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
+    {
         let inner = self.inner.clone();
         async move {
             if inner.closing.load(Ordering::Acquire) {
@@ -402,42 +441,14 @@ impl Store {
                 return Err(StoreError::Invalid("injected store failure".into()));
             }
 
-            let (tx, rx) = oneshot::channel();
-            let is_memory = inner.is_memory;
-            let metrics = Arc::clone(&inner.metrics);
-            // Stamped here, read inside the worker: the gap between the two is
-            // exactly the time this caller spent queued behind other callers.
-            let enqueued_at = std::time::Instant::now();
-            let command = Command::Execute(Box::new(move |conn| {
-                let started = std::time::Instant::now();
-                metrics
-                    .wait
-                    .record_duration(started.duration_since(enqueued_at));
-                metrics.dequeued();
-                let result = match catch_unwind(AssertUnwindSafe(|| f(conn))) {
-                    Ok(result) => {
-                        if let Err(error) = &result {
-                            let _ = catch_unwind(AssertUnwindSafe(|| {
-                                Self::recover_error(conn, error, is_memory);
-                            }));
-                        }
-                        result
-                    }
-                    Err(_) => {
-                        let _ = catch_unwind(AssertUnwindSafe(|| {
-                            Self::rollback_if_needed(conn);
-                        }));
-                        Err(StoreError::Invalid(
-                            "store worker task panicked".to_string(),
-                        ))
-                    }
-                };
-                metrics.exec.record_duration(started.elapsed());
-                if result.is_err() {
-                    metrics.faults.fetch_add(1, Ordering::Relaxed);
-                }
-                let _ = tx.send(result);
-            }));
+            let (tx, rx) = oneshot::channel::<Answer>();
+            let command = Command::Execute(Execution {
+                // Stamped here, read inside the writer: the gap between the two
+                // is exactly the time this caller spent queued behind others.
+                enqueued_at: std::time::Instant::now(),
+                task: Box::new(move |conn| Ok(Box::new(f(conn)?) as Box<dyn Any + Send>)),
+                reply: tx,
+            });
 
             inner.metrics.enqueued();
             if inner.sender.send(command).await.is_err() {
@@ -445,7 +456,10 @@ impl Store {
                 inner.metrics.refused.fetch_add(1, Ordering::Relaxed);
                 return Err(StoreError::Closed);
             }
-            rx.await.map_err(|_| StoreError::Closed)?
+            let value = rx.await.map_err(|_| StoreError::Closed)??;
+            Ok(*value.downcast::<T>().map_err(|_| {
+                StoreError::Invalid("store writer returned another call's answer".to_string())
+            })?)
         }
     }
 
@@ -458,86 +472,22 @@ impl Store {
             completed: metrics.completed.load(Ordering::Relaxed),
             refused: metrics.refused.load(Ordering::Relaxed),
             faults: metrics.faults.load(Ordering::Relaxed),
+            batches: metrics.batches.load(Ordering::Relaxed),
             queue_depth: metrics.queue_depth.load(Ordering::Relaxed),
             queue_high_water: metrics.queue_high_water.load(Ordering::Relaxed),
             wait: metrics.wait.snapshot(),
             exec: metrics.exec.snapshot(),
+            commit: metrics.commit.snapshot(),
         }
-    }
-
-    fn is_recoverable_error(error: &StoreError) -> bool {
-        matches!(error, StoreError::Sqlite(error) if Self::is_recoverable_sqlite(error))
-    }
-
-    fn is_recoverable_sqlite(error: &rusqlite::Error) -> bool {
-        matches!(
-            error.sqlite_error().map(|error| error.code),
-            Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
-                | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
-                | Some(rusqlite::ffi::ErrorCode::DiskFull)
-        )
-    }
-
-    fn is_full_error(error: &StoreError) -> bool {
-        matches!(
-            error,
-            StoreError::Sqlite(error)
-                if matches!(
-                    error.sqlite_error().map(|error| error.code),
-                    Some(rusqlite::ffi::ErrorCode::DiskFull)
-                )
-        )
-    }
-
-    fn recover_error(conn: &mut Connection, error: &StoreError, is_memory: bool) {
-        if !Self::is_recoverable_error(error) {
-            return;
-        }
-        Self::rollback_if_needed(conn);
-        if !is_memory {
-            Self::checkpoint_wal(conn, Self::is_full_error(error));
-        }
-    }
-
-    fn rollback_if_needed(conn: &mut Connection) {
-        if !conn.is_autocommit() {
-            let _ = conn.execute_batch("ROLLBACK;");
-        }
-    }
-
-    fn checkpoint_wal(conn: &mut Connection, truncate: bool) -> bool {
-        let sql = if truncate {
-            "PRAGMA wal_checkpoint(TRUNCATE);"
-        } else {
-            "PRAGMA wal_checkpoint(PASSIVE);"
-        };
-        let _ = conn.busy_timeout(Duration::from_millis(CHECKPOINT_TIMEOUT_MS));
-        let mut checkpointed = false;
-        for attempt in 0..CHECKPOINT_ATTEMPTS {
-            match conn.query_row(sql, [], |row| row.get::<_, i64>(0)) {
-                Ok(0) => {
-                    checkpointed = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(error) if Self::is_recoverable_sqlite(&error) => {}
-                Err(_) => break,
-            }
-            if attempt + 1 < CHECKPOINT_ATTEMPTS {
-                std::thread::sleep(Duration::from_millis(CHECKPOINT_BACKOFF_MS));
-            }
-        }
-        let _ = conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
-        checkpointed
     }
 
     fn finish_db(conn: &mut Connection, is_memory: bool) {
         if is_memory {
             return;
         }
-        Self::rollback_if_needed(conn);
-        if !Self::checkpoint_wal(conn, true) {
-            Self::checkpoint_wal(conn, false);
+        batch::rollback_if_needed(conn);
+        if !batch::checkpoint_wal(conn, true) {
+            batch::checkpoint_wal(conn, false);
         }
     }
 
@@ -1171,226 +1121,5 @@ impl Store {
 }
 
 #[cfg(test)]
-mod worker_tests {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use pacode_types::{Effort, Mode, ModelRoute, SessionId, SessionMeta};
-
-    use super::{QUEUE_CAPACITY, Store, StoreError};
-    use pacode_types::AgentId;
-
-    /// The instrumentation is only worth anything if it moves with real work.
-    /// A call that goes through the writer must show up in both histograms and
-    /// in the queue counters.
-    #[tokio::test]
-    async fn store_stats_count_the_calls_that_went_through_the_writer() {
-        let store = Store::open_in_memory().unwrap();
-        let before = store.stats();
-        assert_eq!(before.completed, 0, "a fresh worker has done nothing");
-
-        for index in 0..5 {
-            store
-                .max_message_seq(&SessionId::new("s"), &AgentId::main())
-                .await
-                .unwrap();
-            let _ = index;
-        }
-
-        let after = store.stats();
-        assert!(
-            after.completed >= 5,
-            "every call must be counted, got {}",
-            after.completed
-        );
-        assert_eq!(
-            after.queue_depth, 0,
-            "the queue must drain back to empty once the calls land"
-        );
-        assert!(after.queue_high_water >= 1);
-        assert_eq!(after.faults, 0, "a successful call is not a fault");
-        assert!(
-            after.wait.count >= 5 && after.exec.count >= 5,
-            "wait={} exec={} — both histograms must see every call",
-            after.wait.count,
-            after.exec.count
-        );
-        assert!(
-            after.exec.max_micros > 0,
-            "a real call takes measurable time"
-        );
-    }
-
-    fn sample_meta(id: &str) -> SessionMeta {
-        SessionMeta {
-            id: SessionId::new(id),
-            name: None,
-            cwd: PathBuf::from("/tmp"),
-            git_branch: None,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            model: ModelRoute::new("mock", "mock-model"),
-            effort: Effort::Low,
-            mode: Mode::Build,
-            first_prompt: None,
-            zdr: false,
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bounded_queue_applies_backpressure() {
-        let store = Store::open_in_memory().unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let first_store = store.clone();
-        let first = tokio::spawn(async move {
-            first_store
-                .call(move |_| {
-                    started_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    Ok::<(), StoreError>(())
-                })
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-
-        let mut queued = Vec::with_capacity(QUEUE_CAPACITY);
-        for _ in 0..QUEUE_CAPACITY {
-            let queued_store = store.clone();
-            queued.push(tokio::spawn(async move {
-                queued_store.call(|_| Ok::<(), StoreError>(())).await
-            }));
-        }
-
-        // The store writer is a dedicated OS thread, so polling the queue from this
-        // task only has to wait for the runtime to poll the senders.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while store.inner.sender.capacity() > 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert_eq!(store.inner.sender.capacity(), 0);
-
-        let extra_store = store.clone();
-        let extra =
-            tokio::spawn(async move { extra_store.call(|_| Ok::<(), StoreError>(())).await });
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        assert!(!extra.is_finished());
-
-        release_tx.send(()).unwrap();
-        first.await.unwrap().unwrap();
-        for task in queued {
-            task.await.unwrap().unwrap();
-        }
-        extra.await.unwrap().unwrap();
-        store.close().await;
-    }
-
-    #[tokio::test]
-    async fn worker_survives_task_panic() {
-        let store = Store::open_in_memory().unwrap();
-        let result = store
-            .call(|_| -> Result<(), StoreError> { panic!("task panic") })
-            .await;
-
-        assert!(matches!(result, Err(StoreError::Invalid(_))));
-        store
-            .call(|conn| {
-                let value: i64 = conn.query_row("SELECT 1", [], |row| row.get(0))?;
-                assert_eq!(value, 1);
-                Ok(())
-            })
-            .await
-            .unwrap();
-        store.close().await;
-    }
-
-    #[tokio::test]
-    async fn one_file_gets_one_writer_and_memory_stores_stay_private() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("one-writer.db");
-        let other_path = dir.path().join("other-writer.db");
-
-        let first = Store::open(&path).unwrap();
-        let second = Store::open(&path).unwrap();
-        assert!(
-            Arc::ptr_eq(&first.inner, &second.inner),
-            "a second open of the same file must join the running writer"
-        );
-
-        let other = Store::open(&other_path).unwrap();
-        assert!(!Arc::ptr_eq(&first.inner, &other.inner));
-
-        let memory_first = Store::open_in_memory().unwrap();
-        let memory_second = Store::open_in_memory().unwrap();
-        assert!(!Arc::ptr_eq(&memory_first.inner, &memory_second.inner));
-        assert!(!Arc::ptr_eq(&memory_first.inner, &first.inner));
-
-        let meta = sample_meta("ses_shared");
-        first.upsert_session(&meta).await.unwrap();
-        assert_eq!(
-            second.get_session(&meta.id).await.unwrap(),
-            Some(meta.clone())
-        );
-
-        other.close().await;
-        memory_first.close().await;
-        memory_second.close().await;
-        second.close().await;
-        assert!(first.get_session(&meta.id).await.unwrap().is_some());
-        first.close().await;
-    }
-
-    #[tokio::test]
-    async fn a_reopened_file_store_does_not_inherit_a_closed_writer() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reopen.db");
-        let meta = sample_meta("ses_reopen");
-
-        let first = Store::open(&path).unwrap();
-        first.upsert_session(&meta).await.unwrap();
-        first.close().await;
-
-        let second = Store::open(&path).unwrap();
-        assert_eq!(
-            second.get_session(&meta.id).await.unwrap(),
-            Some(meta.clone())
-        );
-        let updated = SessionMeta {
-            updated_at_ms: meta.updated_at_ms + 7,
-            ..meta
-        };
-        second.upsert_session(&updated).await.unwrap();
-        assert_eq!(
-            second.get_session(&updated.id).await.unwrap(),
-            Some(updated)
-        );
-        second.close().await;
-    }
-
-    #[tokio::test]
-    async fn a_file_store_meets_the_durability_contract_and_memory_reports_its_gap() {
-        use crate::capabilities::{CapabilityGap, DialectRequirements};
-
-        let dir = tempfile::tempdir().unwrap();
-        let file_store = Store::open(&dir.path().join("durability.db")).unwrap();
-        let capabilities = file_store.storage_capabilities().await.unwrap();
-        assert_eq!(
-            capabilities.gaps(&DialectRequirements::PACODE),
-            Vec::<CapabilityGap>::new(),
-            "a file store must satisfy the pacode storage contract"
-        );
-        file_store.close().await;
-
-        let memory_store = Store::open_in_memory().unwrap();
-        let memory_capabilities = memory_store.storage_capabilities().await.unwrap();
-        assert_eq!(
-            memory_capabilities.gaps(&DialectRequirements::PACODE),
-            vec![CapabilityGap::WalFull]
-        );
-        memory_store.close().await;
-    }
-}
+#[path = "worker_tests.rs"]
+mod worker_tests;

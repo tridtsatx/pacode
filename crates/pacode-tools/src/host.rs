@@ -175,8 +175,16 @@ pub struct AgentSpec {
     pub effort: Option<Effort>,
     /// `true` = copy of the parent's history at spawn time.
     pub fork: bool,
-    /// Tool names allowed for the subagent; `None` = the default subagent set.
+    /// Tool names allowed for the subagent; `None` = the default subagent set,
+    /// which is the orchestrator's own set. Purely a narrowing: naming a tool
+    /// that does not exist is ignored, never an error.
     pub tools: Option<Vec<String>>,
+    /// Tool names to drop, applied after [`Self::tools`]. This is how an
+    /// orchestrator trims a subagent without restating the tools it wants: a
+    /// subagent that edits files gains nothing from every browser schema in
+    /// the set, and at 128 subagents those schemas are sent on every step.
+    /// Exclude wins where both lists name the same tool.
+    pub exclude_tools: Option<Vec<String>>,
 }
 
 /// Result of waiting on tasks.
@@ -228,14 +236,20 @@ pub enum AgentKindWarning {
     Invalid { path: PathBuf, reason: String },
 }
 
-/// Load agent kinds from `*.md` files in `dirs`. On a name clash the file from
-/// the earlier dir wins, so pass the project dir before the global one.
-/// Missing directories are normal; unreadable or invalid files are skipped and
-/// reported as [`AgentKindWarning`]s.
+/// Load agent kinds: the built-in ones first, then `*.md` files from `dirs`. On
+/// a name clash the earlier source wins, so a file replaces a built-in of the
+/// same name outright and the project dir beats the global one. Missing
+/// directories are normal; unreadable or invalid files are skipped and reported
+/// as [`AgentKindWarning`]s.
 pub fn discover_agent_kinds(dirs: &[PathBuf]) -> (Vec<AgentKindDef>, Vec<AgentKindWarning>) {
     let mut kinds = Vec::new();
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
+    // Files are collected first and win every name clash, so a project file
+    // beats a global one and either beats a built-in of the same name. The
+    // built-ins go in afterwards as the fallback for names nothing claimed —
+    // which is the whole point: a fresh install with no `agents/` directory
+    // still has kinds to offer, instead of every spawn being a refusal.
 
     for dir in dirs {
         let entries = match std::fs::read_dir(dir) {
@@ -290,10 +304,68 @@ pub fn discover_agent_kinds(dirs: &[PathBuf]) -> (Vec<AgentKindDef>, Vec<AgentKi
             }
         }
     }
-
+    // Built-ins last, and only for names no file claimed: the file is the more
+    // specific statement of intent and wins the name outright rather than
+    // contributing field by field to a built-in.
+    for (name, description, tools, prompt) in BUILTIN_AGENT_KINDS {
+        if !seen.insert((*name).to_string()) {
+            continue;
+        }
+        kinds.push(AgentKindDef {
+            name: (*name).to_string(),
+            description: (*description).to_string(),
+            tools: Some(tools.iter().map(|t| (*t).to_string()).collect()),
+            model: None,
+            prompt: (*prompt).to_string(),
+            path: PathBuf::from(format!("<builtin>/{name}")),
+        });
+    }
     kinds.sort_by(|a, b| a.name.cmp(&b.name));
     (kinds, warnings)
 }
+
+/// The kinds that ship with pacode, as `(name, description, tools, brief)`.
+///
+/// These exist because the tool schema takes `kind` as a free-form string: a
+/// model asked for a subagent reaches for a plausible name, and with nothing on
+/// offer every such call was either a refusal or a guess. Two names cover
+/// nearly all of it — `explore` for finding things, `implement` for changing
+/// them — and both pin a *narrow* tool list, which is the other half of the
+/// reason to have them: every tool schema is re-sent on every step of every
+/// subagent, so a fleet of readers stops paying for write and browser tools it
+/// has no use for.
+///
+/// An explicit list rather than `None` (which would mean "the orchestrator's
+/// full set") is the point. A user file of the same name replaces a built-in
+/// whole, not field by field — a half-overridden kind is worse than either.
+const BUILTIN_AGENT_KINDS: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "explore",
+        "Read-only search of the codebase. Cannot edit, cannot run commands.",
+        &[
+            "read",
+            "grep",
+            "glob",
+            "ls",
+            "symbols",
+            "webfetch",
+            "websearch",
+        ],
+        "You are exploring a codebase on someone's behalf. Search widely before \
+         concluding, cite file:line for every claim, and report what you found \
+         rather than what you would change. You cannot edit anything.",
+    ),
+    (
+        "implement",
+        "Makes changes: edits files, runs tests, iterates until the task is done.",
+        &[
+            "read", "edit", "write", "grep", "glob", "ls", "symbols", "bash", "plan",
+        ],
+        "You are implementing a change. Read enough to be sure of the shape \
+         before editing, then make the change and verify it. Report what you did \
+         and what you verified, and say so plainly if you could not.",
+    ),
+];
 
 /// Flat frontmatter of an `agents/*.md` file; every field is optional at this
 /// stage and validated in [`parse_agent_kind`].

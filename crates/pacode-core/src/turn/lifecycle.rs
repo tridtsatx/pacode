@@ -20,6 +20,11 @@ struct LifecycleGate {
     expected_agent: StdMutex<Option<String>>,
     reached: Semaphore,
     release: Semaphore,
+    /// One-shot. A turn now passes two gate points (subagent finalization and
+    /// the window before the lock is released), and a gate that fired at both
+    /// would hand the test two arrivals to tell apart — the earlier one
+    /// arriving after it had already released the second.
+    fired: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -35,6 +40,7 @@ fn install_lifecycle_gate(session: &Session, agent: &Agent) -> Arc<LifecycleGate
         ))),
         reached: Semaphore::new(0),
         release: Semaphore::new(0),
+        fired: std::sync::atomic::AtomicBool::new(false),
     });
     *LIFECYCLE_GATE
         .get_or_init(|| StdMutex::new(None))
@@ -59,7 +65,9 @@ async fn wait_for_lifecycle_gate(session: &Session, agent: &Agent) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_deref()
         .is_some_and(|expected_owner| expected_owner == expected);
-    if matches {
+    // One-shot: a turn passes two gate points now, and firing at both would
+    // leave a test holding two arrivals it cannot tell apart.
+    if matches && !gate.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
         gate.reached.add_permits(1);
         let _ = gate.release.acquire().await;
     }
@@ -804,9 +812,15 @@ fn start_claimed_turn(
             }
         }
         let has_recovery = recovery_admission.is_some();
-        let should_redrive = !agent.stop_requested()
-            && !agent.injections.is_empty()
-            && (agent.id().is_main() || has_recovery || agent.injections.has_user_admission());
+        // Whether this turn owes the agent another one. Computed here for the
+        // subagent-finalization branch below, and recomputed once the lock is
+        // released — see the second call at the end of this task.
+        let owes_turn = |agent: &Agent, has_recovery: bool| {
+            !agent.stop_requested()
+                && !agent.injections.is_empty()
+                && (agent.id().is_main() || has_recovery || agent.injections.has_user_admission())
+        };
+        let should_redrive = owes_turn(&agent, has_recovery);
 
         // A stopped subagent keeps `Stopped` and its history so `continue` can
         // re-drive it later. No report is injected into the parent: it learned
@@ -895,10 +909,29 @@ fn start_claimed_turn(
         }
 
         emit_turn_end(&session, &agent, &turn_id, spawned_at, usage, &stop).await;
+        // Test-only: parks the turn inside the window between the redrive
+        // decision above and the lock release below — exactly where an injector
+        // can arrive and be told the agent is busy.
+        #[cfg(test)]
+        wait_for_lifecycle_gate(&session, &agent).await;
         drop(turn_guard);
         session.emit_session_status();
 
-        if should_redrive {
+        // Re-checked *after* the lock is released, not reused from above.
+        //
+        // Between deciding `should_redrive` and dropping the guard, this turn
+        // still owns the agent: an injector arriving in that window sees
+        // `is_running() == true` and deliberately skips the wake, because a
+        // running turn is supposed to pick the injection up itself. Trusting
+        // the earlier decision strands it — the queue is non-empty, the agent
+        // is idle, and nothing else will start a turn. That is a stuck session,
+        // not a slow one, and it gets likelier exactly where this codebase aims
+        // to work: 128 subagents reporting into a parent that is mid-teardown.
+        //
+        // With the lock dropped the race closes in both directions: an injector
+        // either already woke the agent (this call finds the turn claimed and
+        // returns without doing anything) or will do so itself.
+        if owes_turn(&agent, has_recovery) {
             request_turn(session.clone(), agent.clone());
         }
     });

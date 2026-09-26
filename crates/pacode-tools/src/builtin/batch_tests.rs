@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use pacode_exec::TaskManager;
 use pacode_types::{ExecConfig, Mode, PermissionDecision, WebConfig};
 
-use super::{BatchTool, NAME};
+use super::{BatchTool, MAX_OPS, NAME};
 use crate::builtin::builtin_tools;
 use crate::registry::{MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_WORKERS_PER_AGENT, ToolRegistry};
 use crate::test_support::{StubToolHost, stub_ctx};
@@ -396,7 +396,12 @@ async fn oversized_single_op_still_obeys_hard_byte_cap() {
     assert!(out.content.contains("output truncated"));
 }
 
-#[tokio::test]
+/// Two full batches from the same agent: 2 × `MAX_OPS` ops contend for
+/// `MAX_TOOL_WORKERS_PER_AGENT` slots, so this both pins the per-agent bound and
+/// proves the batch takes a slot per op *only* — a batch that also held a slot
+/// for itself would still pass, but one that held no slots at all would blow
+/// past the bound.
+#[tokio::test(flavor = "multi_thread")]
 async fn batch_workers_are_bounded_per_agent() {
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -409,15 +414,24 @@ async fn batch_workers_are_bounded_per_agent() {
         std::env::current_dir().unwrap(),
         registry,
     );
-    let ops = (0..8)
+    let ops = (0..MAX_OPS)
         .map(|index| json!({"tool": "read", "input": {"path": index.to_string()}}))
         .collect::<Vec<_>>();
 
-    let out = BatchTool.call(json!({"ops": ops}), &ctx).await.unwrap();
+    let (first, second) = tokio::join!(
+        BatchTool.call(json!({"ops": ops.clone()}), &ctx),
+        BatchTool.call(json!({"ops": ops}), &ctx),
+    );
 
-    assert!(!out.is_error);
+    for out in [first.unwrap(), second.unwrap()] {
+        assert!(!out.is_error);
+    }
     assert_eq!(active.load(Ordering::SeqCst), 0);
-    assert!(max_active.load(Ordering::SeqCst) <= MAX_TOOL_WORKERS_PER_AGENT);
+    assert!(
+        max_active.load(Ordering::SeqCst) <= MAX_TOOL_WORKERS_PER_AGENT,
+        "ops ran {} at once, over the {MAX_TOOL_WORKERS_PER_AGENT}-slot per-agent cap",
+        max_active.load(Ordering::SeqCst)
+    );
 }
 
 #[tokio::test]

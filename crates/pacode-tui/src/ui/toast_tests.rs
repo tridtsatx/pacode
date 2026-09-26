@@ -245,7 +245,16 @@ fn fading_toast_flattens_to_faint_style() {
 
     let backend = TestBackend::new(80, 10);
     let mut terminal = Terminal::new(backend).unwrap();
-    let opts = RenderOptions::new(80, false);
+    // Pinned explicitly: the fade flattens to `opts.theme.faint`, and in a
+    // mono theme `faint.fg` is `None`, so the assertion below would compare a
+    // real cell colour against `None` — a failure of the environment's colour
+    // detection, not of the toast.
+    let opts = RenderOptions::with_theme_color(
+        80,
+        false,
+        pacode_render::Theme::ansi(),
+        pacode_render::ColorMode::Ansi,
+    );
     terminal
         .draw(|f| {
             draw(f, Rect::new(0, 0, 60, 1), &state, &opts);

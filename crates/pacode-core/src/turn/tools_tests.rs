@@ -401,6 +401,133 @@ impl Tool for ExecTool {
 
 static BUDGET_CALL_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// Holds every call open for `hold` and records how many ran at once, so a test
+/// can tell real parallelism from a queue.
+struct ProbeTool {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    hold: Duration,
+}
+
+#[async_trait]
+impl Tool for ProbeTool {
+    fn name(&self) -> &str {
+        "read"
+    }
+
+    fn description(&self) -> &str {
+        "test"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(self.hold).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("probe-result"))
+    }
+}
+
+/// A subagent alongside the session's main agent, sharing its tool registry.
+fn subagent_of(session: &Session, main: &Agent, id: &str) -> Arc<Agent> {
+    let agent_id = AgentId::new(id);
+    let info = AgentInfo {
+        id: agent_id.clone(),
+        name: id.to_string(),
+        kind: pacode_types::AgentKind::Sub,
+        parent: Some(main.id()),
+        started_at_ms: pacode_types::now_ms(),
+        ..main.info()
+    };
+    let agent = Arc::new(Agent::new(
+        agent_id.clone(),
+        info,
+        History::default(),
+        main.tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+        200,
+        None,
+    ));
+    session
+        .agents
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(agent_id, agent.clone());
+    agent
+}
+
+/// Regression guard for the removed process-wide worker cap, exercised through
+/// the real dispatch path rather than the semaphore directly. 24 agents is above
+/// the 16 that used to be global: under that cap 16 calls would have overlapped
+/// and the rest would have waited, and at 128 subagents the parent's own
+/// `agent spawn` call queued behind the children it had just spawned.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_agents_do_not_queue_behind_a_process_wide_cap() {
+    const AGENTS: usize = 24;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (_temp, session, main) = test_session(
+        Config::default(),
+        Arc::new(ProbeTool {
+            active: active.clone(),
+            peak: peak.clone(),
+            hold: Duration::from_millis(150),
+        }),
+    );
+    let agents = (0..AGENTS)
+        .map(|index| subagent_of(&session, &main, &format!("sub-{index}")))
+        .collect::<Vec<_>>();
+
+    let results = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::join_all(agents.iter().map(|agent| {
+            let session = session.clone();
+            let agent = agent.clone();
+            async move {
+                call_with_budget(
+                    &session,
+                    &agent,
+                    turn_budget(&session, &agent),
+                    BudgetLimits {
+                        tool_calls: 8,
+                        exec_calls: 0,
+                    },
+                    "read",
+                    "probe",
+                )
+                .await
+            }
+        })),
+    )
+    .await
+    .expect("agents queued behind a process-wide worker cap");
+
+    for out in results {
+        assert_eq!(out, "probe-result");
+    }
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        AGENTS,
+        "all {AGENTS} agents must have their call in flight at once"
+    );
+}
+
 /// One call straight through `run_single_tool`, with the budget handed in, so a
 /// test can spend a small allowance instead of the production default.
 async fn call_with_budget(

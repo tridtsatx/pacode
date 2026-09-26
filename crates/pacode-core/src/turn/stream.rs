@@ -141,6 +141,11 @@ pub async fn consume_stream(
     // call_id → cell seq, for provider retries that re-issue `ToolCallStart`.
     let mut tool_call_seqs: HashMap<CallId, u64> = HashMap::new();
     let mut turn_usage = Usage::default();
+    // Recorded once, on the first event of any kind. This is the stage that
+    // separates "the spawn path is slow" from "the provider is slow", and it is
+    // measurable only here: only the stream loop sees the first event, and only
+    // the agent knows when it was spawned.
+    let mut first_event_recorded = false;
 
     let stream_interrupted = loop {
         tokio::select! {
@@ -179,6 +184,12 @@ pub async fn consume_stream(
                         break false;
                     }
                     Ok(Some(event_res)) => {
+                        if !first_event_recorded {
+                            first_event_recorded = true;
+                            if let Some(elapsed) = agent.since_spawn() {
+                                pacode_types::record_launch_prompt_to_first(elapsed);
+                            }
+                        }
                         match event_res {
                             Ok(StreamEvent::TextDelta { text }) => {
                                 if assistant_item_seq.is_none() {

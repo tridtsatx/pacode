@@ -375,6 +375,10 @@ pub type PermissionResolution = (PermissionDecision, Option<String>);
 
 pub(crate) const CANCELLED_BY_AGENT_REASON: &str = "\0pacode-permission-cancelled";
 
+/// Prompts that may wait for the user at once, per session. Deliberately small:
+/// these queue behind a human reading them, so raising it buys no throughput and
+/// only makes the client's prompt list unusable. A subagent whose prompt is
+/// refused is told so — it is not a throttle on how many agents may work.
 pub const MAX_PENDING: usize = 8;
 
 /// Both permission tables live under one mutex: "is this target already granted

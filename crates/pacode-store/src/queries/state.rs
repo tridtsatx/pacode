@@ -9,9 +9,10 @@ use pacode_types::{
     TaskId, TaskInfo, TaskProgress, TaskStatus, Usage, UsageTotals,
 };
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::StoreError;
+use crate::txn::Txn;
 
 pub(crate) fn agent_kind_to_str(kind: AgentKind) -> &'static str {
     match kind {
@@ -117,8 +118,8 @@ pub fn upsert_agent(
     info: &AgentInfo,
     prompt: Option<&str>,
 ) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
-    upsert_agent_in_transaction(&tx, session, info, prompt)?;
+    let tx = Txn::open(conn)?;
+    upsert_agent_in_unit_of_work(&tx, session, info, prompt)?;
     tx.commit()?;
     Ok(())
 }
@@ -130,10 +131,10 @@ pub fn create_agent_with_history(
     prompt: Option<&str>,
     rows: &[(u64, Arc<Message>)],
 ) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
-    upsert_agent_in_transaction(&tx, session, info, prompt)?;
+    let tx = Txn::open(conn)?;
+    upsert_agent_in_unit_of_work(&tx, session, info, prompt)?;
     for (seq, message) in rows {
-        super::message::append_message_in_transaction(
+        super::message::append_message_in_unit_of_work(
             &tx,
             session,
             &info.id,
@@ -145,8 +146,10 @@ pub fn create_agent_with_history(
     Ok(())
 }
 
-pub(crate) fn upsert_agent_in_transaction(
-    tx: &Transaction<'_>,
+/// Upserts inside a unit of work the caller already owns, for the same reason
+/// [`super::message::append_message_in_unit_of_work`] does not open one.
+pub(crate) fn upsert_agent_in_unit_of_work(
+    conn: &Connection,
     session: &SessionId,
     info: &AgentInfo,
     prompt: Option<&str>,
@@ -156,7 +159,7 @@ pub(crate) fn upsert_agent_in_transaction(
     let model = format!("{}/{}", info.model.provider, info.model.model);
     let parent = info.parent.as_ref().map(|p| p.as_str());
 
-    tx.execute(
+    conn.execute(
         r#"
         INSERT INTO agents (
             id, session_id, name, kind, status, activity, parent_id, prompt,
@@ -212,8 +215,8 @@ pub fn detach_agent(
     old_owner: &AgentId,
     new_owner: &AgentId,
 ) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
-    upsert_agent_in_transaction(&tx, session, info, prompt)?;
+    let tx = Txn::open(conn)?;
+    upsert_agent_in_unit_of_work(&tx, session, info, prompt)?;
 
     let retained_seqs = retained_seqs.iter().copied().collect::<BTreeSet<_>>();
     let retained_json = seq_set_json(&retained_seqs);
@@ -245,7 +248,7 @@ pub fn detach_agent(
     )?;
 
     for (seq, message) in rows {
-        super::message::append_message_in_transaction(
+        super::message::append_message_in_unit_of_work(
             &tx,
             session,
             &info.id,
@@ -282,7 +285,7 @@ pub fn rollback_detach(
     rows: &[(u64, Arc<Message>)],
     old_owner: &AgentId,
 ) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
+    let tx = Txn::open(conn)?;
     super::message::purge_messages(
         &tx,
         "session_id = ?1 AND agent_id = ?2",
@@ -300,7 +303,7 @@ pub fn rollback_detach(
         params![session.as_str(), detached.as_str()],
     )?;
     for (seq, message) in rows {
-        super::message::append_message_in_transaction(
+        super::message::append_message_in_unit_of_work(
             &tx,
             session,
             old_owner,
