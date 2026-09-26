@@ -39,6 +39,33 @@ pub fn dimmed(base: Style, faint: Style) -> Style {
     }
 }
 
+/// `base` lifted toward white, for the crest of a sweep.
+///
+/// The obvious crest is `accent` in bold, and that is what this used to be —
+/// but `font.weight = "bold"` puts BOLD on every cell of the frame, so under a
+/// bold interface the crest and the flank became the same glyph in the same
+/// colour and the sweep dropped from three tiers to two. A colour step survives
+/// any weight setting, so the crest is now a colour step *and* bold: the weight
+/// is free, the colour is what carries the tier.
+///
+/// ANSI-16 has no room between two shades of the same hue, so there the best
+/// available distinction is the weight — which is exactly what it falls back
+/// to, and is the only thing left to try.
+pub fn brightened(base: Style) -> Style {
+    let lifted = match base.fg {
+        Some(Color::Rgb(r, g, b)) => Some(Color::Rgb(
+            (r as u16 + (255 - r as u16) / 2) as u8,
+            (g as u16 + (255 - g as u16) / 2) as u8,
+            (b as u16 + (255 - b as u16) / 2) as u8,
+        )),
+        _ => None,
+    };
+    match lifted {
+        Some(fg) => base.fg(fg).add_modifier(Modifier::BOLD),
+        None => base.add_modifier(Modifier::BOLD),
+    }
+}
+
 /// `base` while the pulse is lit, `dimmed` toward `faint` while it is not.
 pub fn pulse(theme: &Theme, base: Style, lit: bool) -> Style {
     if lit { base } else { dimmed(base, theme.faint) }
@@ -202,9 +229,11 @@ pub fn render_activity_line(
 /// on screen — it costs exactly what it cost before sweeps existed.
 ///
 /// The palette is built around the caller's style rather than around the theme:
-/// the low tier is that colour dimmed toward `faint` and the crest is the
-/// accent, so a line keeps its identity (a thinking line keeps its thinking
-/// colour) instead of turning into generic theme text.
+/// the low tier is that colour dimmed toward `faint`, the crest is the accent
+/// lifted toward white, so a line keeps its identity (a thinking line keeps its
+/// thinking colour) instead of turning into generic theme text — and the crest
+/// stays a distinct colour under a bold interface, where a bold-only crest
+/// would be invisible.
 pub(crate) fn sweep_spans(text: String, base: Style, opts: &RenderOptions) -> Vec<Span<'static>> {
     if !opts.shimmer.enabled() {
         return vec![Span::styled(text, base)];
@@ -212,7 +241,7 @@ pub(crate) fn sweep_spans(text: String, base: Style, opts: &RenderOptions) -> Ve
     let palette = ShimmerPalette {
         low: dimmed(base, opts.theme.faint),
         mid: base,
-        high: opts.theme.accent.add_modifier(Modifier::BOLD),
+        high: brightened(opts.theme.accent),
     };
     shimmer_spans(
         &text,
@@ -453,6 +482,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_crest_is_a_colour_step_not_only_a_weight() {
+        // `font.weight = "bold"` puts BOLD on every cell of the frame, so a
+        // crest marked by weight alone would collapse into the flank exactly
+        // when the user asked for a heavier interface. The colour has to carry
+        // the tier on its own.
+        let theme = Theme::truecolor();
+        let crest = brightened(theme.accent);
+        assert_ne!(
+            crest.fg, theme.accent.fg,
+            "the crest must be a different colour, not the same one in bold"
+        );
+        assert!(crest.add_modifier.contains(Modifier::BOLD));
+
+        let ansi = Theme::ansi();
+        let crest = brightened(ansi.accent);
+        assert_eq!(crest.fg, ansi.accent.fg, "ANSI-16 has no room to lift");
+        assert!(
+            crest.add_modifier.contains(Modifier::BOLD),
+            "so weight is the only distinction left"
+        );
+    }
+
     /// The activity line's tail under a band: its text, its span styles, and
     /// the cell offset where the crest starts (`None` while the band is off
     /// the text entirely).
@@ -460,7 +512,7 @@ mod tests {
         let opts = RenderOptions::new(80, false)
             .shimmer(ShimmerMode::Classic)
             .anim(pacode_render::AnimClock::new(elapsed_ms, tick_ms));
-        let crest = opts.theme.accent.add_modifier(Modifier::BOLD);
+        let crest = brightened(opts.theme.accent);
         let line = render_activity_line(0, &opts, &Phase::Thinking, 0, 80);
         let text = line
             .spans
