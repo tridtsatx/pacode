@@ -157,6 +157,15 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
     };
 
     let mut tools = builtin_tools(&opts.config.web);
+    // The context-quality checkpoint tool, at the daemon level on purpose: the
+    // detached MCP refresh rebuilds every session's registry from
+    // `core.deps.tools` plus the MCP set, so anything a session added on its
+    // own is wiped the moment that lands.
+    if opts.config.ui.analyze_checkpoint_every > 0 {
+        tools.register(Arc::new(
+            pacode_tools::builtin::checkpoint::CheckpointTool::default(),
+        ));
+    }
     // `[tools.<name>] enabled = false` drops the tool from the model schema and
     // refuses later registrations (plugins, skill, per-session MCP tools).
     tools.apply_disabled(opts.config.disabled_tool_names().map(str::to_string));
