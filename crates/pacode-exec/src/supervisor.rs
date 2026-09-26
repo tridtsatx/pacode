@@ -312,6 +312,16 @@ async fn handle_chunk(
         complete_lines.push(String::from_utf8_lossy(&dropped).into_owned());
     }
 
+    // The live tail, before the parser sees the lines: this is the output the
+    // client draws, and the parser's job is to summarise progress out of it.
+    let live_text = if complete_lines.is_empty() {
+        String::new()
+    } else {
+        let mut text = complete_lines.join("\n");
+        text.push('\n');
+        text
+    };
+
     let now_timestamp = now_ms();
     let mut progress_to_emit = None;
 
@@ -345,6 +355,20 @@ async fn handle_chunk(
 
     if let Some(info) = progress_to_emit {
         let _ = state.events.send(TaskEvent::Progress(info));
+    }
+    if !live_text.is_empty() {
+        let info = state
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|entry| entry.info.clone());
+        if let Some(info) = info {
+            let _ = state.events.send(TaskEvent::Output {
+                info,
+                text: live_text,
+            });
+        }
     }
 }
 

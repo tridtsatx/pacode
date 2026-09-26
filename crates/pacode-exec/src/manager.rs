@@ -41,6 +41,17 @@ pub enum TaskEvent {
     Ended(TaskInfo),
     /// No output and no progress for `exec.stall_secs`; the task is still running.
     Stalled(TaskInfo),
+    /// Output the process produced, on whole lines, while it is still running.
+    ///
+    /// One event per batch of completed lines, not per line and not per read:
+    /// a build that flushes 8 KiB at a time would otherwise put a hundred
+    /// events on the wire to say one thing. A partial trailing line waits for
+    /// its newline — a client that drew half a line would repaint it a moment
+    /// later anyway.
+    Output {
+        info: TaskInfo,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

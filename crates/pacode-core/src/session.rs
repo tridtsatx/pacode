@@ -231,6 +231,14 @@ impl Session {
         self.agents.read().ok()?.get(id).cloned()
     }
 
+    /// The transcript row a running call is drawing into, when the agent has
+    /// exactly one. See `sole_running_tool_call_seq` for why "exactly one".
+    pub(crate) fn sole_running_tool_call_seq(&self, agent: &AgentId) -> Option<u64> {
+        let agent = self.agent_for_host(agent)?;
+        let transcript = agent.transcript.lock().unwrap_or_else(|p| p.into_inner());
+        transcript.sole_running_tool_call_seq()
+    }
+
     pub(crate) fn agent_for_host(&self, id: &AgentId) -> Option<Arc<Agent>> {
         self.agent(id).or_else(|| {
             self.agent_aliases

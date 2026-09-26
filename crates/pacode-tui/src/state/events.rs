@@ -149,6 +149,14 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                 state.panel.agent_transcript.upsert(item, now);
             }
         }
+        Event::ToolOutput { item_seq, text, .. } => {
+            // The cell grows while the process runs. `push_tool_output` refuses
+            // anything that is not a running tool row, so a chunk that arrives
+            // after the call finished is dropped rather than appended to a
+            // result the model has already read.
+            state.transcript.push_tool_output(item_seq, &text);
+            state.dirty = true;
+        }
         Event::ItemUpdated(item) => {
             // The finished call's `DiffStat` lands here — fold it into the
             // row `ItemAdded` created (§5.5's `+A −R` column).

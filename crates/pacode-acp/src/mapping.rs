@@ -718,6 +718,11 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         | Event::AgentUpdated(_)
         | Event::TaskAdded(_)
         | Event::TaskUpdated(_)
+        // A running call's output belongs to the tool cell ACP already got as
+        // an item update when the call started; there is no ACP channel for
+        // "the row is still growing", and sending it as message chunks would
+        // put tool output into the assistant's transcript.
+        | Event::ToolOutput { .. }
         | Event::Toast { .. }
         | Event::DaemonShuttingDown
         | Event::PluginToast { .. }

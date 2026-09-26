@@ -21,6 +21,7 @@ async fn route_task_event(
         | TaskEvent::Progress(info)
         | TaskEvent::Ended(info)
         | TaskEvent::Stalled(info) => info.id.clone(),
+        TaskEvent::Output { info, .. } => info.id.clone(),
     };
     if core.is_task_tombstoned(&task_id) {
         return;
@@ -48,6 +49,29 @@ async fn route_task_event(
         TaskEvent::Ended(info) => {
             last_progress.remove(&info.id);
             finish_task(core, info, ended).await;
+        }
+        TaskEvent::Output { info, text } => {
+            // Only for a task the client is watching as a *foreground* call: a
+            // background task already has its own live view, and sending its
+            // tail into the transcript as well would put the same output in two
+            // places.
+            if info.backgrounded {
+                return;
+            }
+            let Some(session) = core.session(&info.session) else {
+                return;
+            };
+            let Some(agent) = session.agent_for_host(&info.owner) else {
+                return;
+            };
+            let Some(seq) = session.sole_running_tool_call_seq(&info.owner) else {
+                return;
+            };
+            session.events.emit(Event::ToolOutput {
+                agent: agent.id(),
+                item_seq: seq,
+                text,
+            });
         }
         TaskEvent::Stalled(info) => {
             if let Some(session) = core.session(&info.session) {

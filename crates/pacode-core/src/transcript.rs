@@ -206,6 +206,33 @@ impl TranscriptState {
         })
     }
 
+    /// Seq of the *only* running tool call in the tail, or `None` when there is
+    /// none or more than one.
+    ///
+    /// Live output arrives from the exec layer addressed to a task, but a
+    /// running call's cell does not know its task id yet — that arrives with the
+    /// result, once the process has already finished. So the row is found by the
+    /// one running call the agent has, and **only when there is exactly one**:
+    /// with two calls in flight, guessing would put a build's output under
+    /// someone else's command, and dropped output is a far smaller failure than
+    /// output in the wrong row.
+    pub fn sole_running_tool_call_seq(&self) -> Option<u64> {
+        let mut found = None;
+        for item in self.tail.iter().rev() {
+            if let pacode_types::TranscriptKind::ToolCall {
+                status: pacode_types::ToolStatus::Running,
+                ..
+            } = item.kind
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(item.seq);
+            }
+        }
+        found
+    }
+
     /// Seq of the item carrying the `Permission` cell for `id`, while it is
     /// still in the tail — the mirror of `find_question_seq`, used when a
     /// pending permission is cancelled without its waiter (interrupt/stop).
@@ -602,6 +629,33 @@ mod tests {
     use pacode_types::{ContentBlock, Message, Role, ToastLevel, ToolStatus, TranscriptKind};
     use std::sync::Barrier;
     use std::thread;
+
+    #[test]
+    fn the_running_tool_row_is_found_only_when_there_is_exactly_one() {
+        // Live output arrives from the exec layer addressed to a task, but a
+        // running call's cell does not know its task id yet. So the row is the
+        // agent's only running call — and with two in flight the answer has to
+        // be "none", because guessing would file a build's output under
+        // someone else's command.
+        let mut transcript = TranscriptState::new(64);
+        assert_eq!(transcript.sole_running_tool_call_seq(), None);
+
+        transcript.upsert(test_tool_item(1, &CallId::new("a"), ToolStatus::Running));
+        assert_eq!(transcript.sole_running_tool_call_seq(), Some(1));
+
+        transcript.upsert(test_tool_item(2, &CallId::new("b"), ToolStatus::Running));
+        assert_eq!(
+            transcript.sole_running_tool_call_seq(),
+            None,
+            "two calls in flight: no row is safe to attribute output to"
+        );
+
+        // One of them finishes: the survivor is unambiguous again.
+        let mut done = test_tool_item(2, &CallId::new("b"), ToolStatus::Ok);
+        done.seq = 2;
+        transcript.upsert(done);
+        assert_eq!(transcript.sole_running_tool_call_seq(), Some(1));
+    }
 
     fn test_tool_item(seq: u64, call_id: &CallId, status: ToolStatus) -> TranscriptItem {
         TranscriptItem {

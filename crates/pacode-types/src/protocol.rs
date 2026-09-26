@@ -71,7 +71,7 @@ pub const SNAPSHOT_MAX_PENDING_PERMISSIONS: usize = 64;
 /// replies before session events; v8 adds the session `Resync` control marker
 /// and separates attach request ids from stable idempotency keys; v9 adds
 /// `SetNoticeLock` and the `NoticeLockChanged` broadcast.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -1080,6 +1080,16 @@ pub enum Event {
     SessionStatus {
         session: SessionId,
         status: SessionStatusKind,
+    },
+    /// Output a running foreground tool call has produced, on whole lines.
+    ///
+    /// The cell grows as the process writes instead of appearing all at once
+    /// when it exits. `item_seq` is the transcript cell, so the client appends to
+    /// exactly the row the call is drawing into.
+    ToolOutput {
+        agent: AgentId,
+        item_seq: u64,
+        text: String,
     },
     /// The session's notice lock moved: the switch flipped, or the parked
     /// backlog changed size. Fired on transitions only — a twenty-notice
