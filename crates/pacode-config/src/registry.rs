@@ -151,6 +151,26 @@ const ZDR_OPTIONS: &[&str] = &["always", "session", "off"];
 /// clamped frame rate is the same one an edit would have accepted.
 const UPS_RANGE: std::ops::RangeInclusive<i64> = 1..=240;
 
+/// Parse the one-line `ui.fusion` value: `"planner -> implementer"`, both
+/// `provider/model` routes.
+///
+/// A half-written pair is not a pair. A pipeline missing either half would
+/// bill the expensive model for the work it was supposed to delegate, so an
+/// unparseable value turns fusion *off* rather than guessing which half the
+/// user meant.
+fn parse_fusion_pair(value: &str) -> Option<pacode_types::config::FusionConfig> {
+    let (planner, implementer) = value.split_once("->")?;
+    let planner = planner.trim();
+    let implementer = implementer.trim();
+    if planner.is_empty() || implementer.is_empty() {
+        return None;
+    }
+    Some(pacode_types::config::FusionConfig {
+        planner: planner.to_string(),
+        implementer: implementer.to_string(),
+    })
+}
+
 #[rustfmt::skip]
 pub static SETTINGS: &[SettingEntry] = &[
     // provider
@@ -169,6 +189,10 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "ui.ups", label: "Updates Per Second", description: "Render update rate: auto, dynamic, or fixed 1..=240", section: "ui", default_value: "10", kind: SettingKind::String, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.animation", label: "Animation Mode", description: "Animation clock preset: smooth, balanced, or eco", section: "ui", default_value: "smooth", kind: SettingKind::Enum { options: ANIMATION_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.shimmer", label: "Shimmer Sweep", description: "Light band sweeping across live text: classic, kitt, or off", section: "ui", default_value: "classic", kind: SettingKind::Enum { options: SHIMMER_OPTIONS }, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.tool_memory_percent", label: "Tool Memory Ceiling", description: "RAM ceiling per tool process, percent of the machine; 0 disables it", section: "ui", default_value: "80", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "ui.tool_memory_split_sessions", label: "Split Ceiling Across Sessions", description: "Divide the ceiling between concurrent sessions instead of applying it to each", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "ui.analyze_checkpoint_every", label: "Analyze Checkpoint Interval", description: "Actions between context-quality checkpoints, used with --analyze-mode", section: "ui", default_value: "100", kind: SettingKind::Integer { min: 1, max: 10000 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "ui.fusion", label: "Fusion", description: "planner = \"provider/model\" for the thinking model, implementer = the cheap one that writes the code", section: "ui", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "ui.color", label: "Color Mode", description: "Terminal color fidelity: auto, truecolor, or ansi", section: "ui", default_value: "auto", kind: SettingKind::Enum { options: COLOR_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.transcript_cells", label: "Transcript Cells", description: "Max transcript cells kept in RAM before evicting", section: "ui", default_value: "500", kind: SettingKind::Integer { min: 10, max: 100000 }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.images", label: "Image Rendering", description: "Terminal image protocol: auto or off", section: "ui", default_value: "auto", kind: SettingKind::Enum { options: IMAGE_OPTIONS }, apply: ApplyMode::Immediate },
@@ -326,6 +350,17 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         }),
         "ui.animation" => Some(config.ui.animation.as_str().to_string()),
         "ui.shimmer" => Some(config.ui.shimmer.as_str().to_string()),
+        "ui.tool_memory_percent" => Some(config.ui.tool_memory_percent.to_string()),
+        "ui.tool_memory_split_sessions" => Some(config.ui.tool_memory_split_sessions.to_string()),
+        "ui.analyze_checkpoint_every" => Some(config.ui.analyze_checkpoint_every.to_string()),
+        "ui.fusion" => Some(
+            config
+                .ui
+                .fusion
+                .as_ref()
+                .map(|f| format!("{} → {}", f.planner, f.implementer))
+                .unwrap_or_default(),
+        ),
         "ui.color" => Some(config.ui.color.clone()),
         "ui.transcript_cells" => Some(config.ui.transcript_cells.to_string()),
         "ui.images" => Some(config.ui.images.clone()),
@@ -795,6 +830,31 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 && let Some(mode) = pacode_types::config::ShimmerMode::parse(s)
             {
                 config.ui.shimmer = mode;
+            }
+        }
+        "ui.tool_memory_percent" => {
+            if let toml::Value::Integer(n) = value {
+                config.ui.tool_memory_percent =
+                    (*n).clamp(0, i64::from(pacode_types::config::TOOL_MEMORY_MAX_PERCENT)) as u8;
+            }
+        }
+        "ui.tool_memory_split_sessions" => {
+            if let toml::Value::Boolean(b) = value {
+                config.ui.tool_memory_split_sessions = *b;
+            }
+        }
+        "ui.analyze_checkpoint_every" => {
+            if let toml::Value::Integer(n) = value {
+                config.ui.analyze_checkpoint_every = (*n).max(1) as u32;
+            }
+        }
+        "ui.fusion" => {
+            // A pair, written as one string so the setting stays a single row:
+            // `"planner/route -> implementer/route"`. A half-written pair is
+            // not a pair, and a half-configured pipeline would silently bill
+            // the expensive model for the work.
+            if let toml::Value::String(s) = value {
+                config.ui.fusion = parse_fusion_pair(s);
             }
         }
         "ui.color" => {

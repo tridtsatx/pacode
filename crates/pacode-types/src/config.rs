@@ -722,6 +722,14 @@ fn default_images() -> String {
     "auto".to_string()
 }
 
+fn default_tool_memory_percent() -> u8 {
+    TOOL_MEMORY_DEFAULT_PERCENT
+}
+
+fn default_analyze_checkpoint_every() -> u32 {
+    ANALYZE_CHECKPOINT_DEFAULT
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -757,6 +765,22 @@ pub struct UiConfig {
     /// travelling across the activity label and running tool status.
     #[serde(default)]
     pub shimmer: ShimmerMode,
+    /// Ceiling for one tool process, in percent of machine RAM. `0` disables
+    /// the ceiling entirely. The runtime is the authority on what it can
+    /// actually enforce; this is the number it is given.
+    #[serde(default = "default_tool_memory_percent")]
+    pub tool_memory_percent: u8,
+    /// Split the ceiling between concurrent sessions instead of applying it to
+    /// each one: two sessions get half each, so the machine as a whole stays
+    /// inside the ceiling.
+    #[serde(default)]
+    pub tool_memory_split_sessions: bool,
+    /// Planner/implementer pair. `None` = no fusion: one model per turn.
+    #[serde(default)]
+    pub fusion: Option<FusionConfig>,
+    /// Actions between context-quality checkpoints, for `--analyze-mode`.
+    #[serde(default = "default_analyze_checkpoint_every")]
+    pub analyze_checkpoint_every: u32,
 }
 
 /// Where a selected subagent's conversation goes.
@@ -890,6 +914,32 @@ impl ShimmerMode {
     }
 }
 
+/// `[ui] fusion`: a second, cheaper model that implements what the primary one
+/// planned. A pipeline, not a preference: the planner reads the repository and
+/// returns a plan, the implementer turns that plan into edits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FusionConfig {
+    /// Route for the model that thinks — `provider/model`.
+    pub planner: String,
+    /// Route for the model that implements, `provider/model`.
+    pub implementer: String,
+}
+
+/// Lowest and highest `[ui] tool_memory` accepts, in percent of machine RAM.
+/// Below the floor a ceiling stops being a safety limit and starts being an
+/// outage; above the ceiling there is nothing left to protect.
+pub const TOOL_MEMORY_MIN_PERCENT: u8 = 5;
+pub const TOOL_MEMORY_MAX_PERCENT: u8 = 100;
+
+/// Default ceiling for a tool process, as a percent of machine RAM. `0` means
+/// no ceiling at all — the setting exists to stop one runaway script from
+/// taking the machine down with an OOM kill, not to make small machines
+/// unusable.
+pub const TOOL_MEMORY_DEFAULT_PERCENT: u8 = 80;
+
+/// Default number of actions between context-quality checkpoints.
+pub const ANALYZE_CHECKPOINT_DEFAULT: u32 = 100;
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -906,6 +956,10 @@ impl Default for UiConfig {
             agent_view: AgentView::default(),
             animation: AnimationMode::default(),
             shimmer: ShimmerMode::default(),
+            tool_memory_percent: default_tool_memory_percent(),
+            tool_memory_split_sessions: true,
+            fusion: None,
+            analyze_checkpoint_every: default_analyze_checkpoint_every(),
         }
     }
 }
