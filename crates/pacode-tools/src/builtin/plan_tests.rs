@@ -60,3 +60,99 @@ fn an_unknown_item_id_is_an_invalid_input() {
     let err = apply_update(&mut plan, "p9", Some("active"), None).expect_err("unknown id");
     assert!(format!("{err}").contains("plan item not found"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// Input bounding. A plan is re-rendered into the rail and read back on every
+// `get`, so what lands in it is paid for repeatedly — and a cut that is not
+// reported is indistinguishable from a successful write.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_item_within_the_limits_is_untouched() {
+    let (kept, dropped) = bound_item("a short step".to_string(), MAX_SET_CHARS);
+    assert_eq!(kept, "a short step");
+    assert_eq!(dropped, 0);
+}
+
+#[test]
+fn an_over_long_item_is_cut_to_the_per_item_cap() {
+    let long = "x".repeat(MAX_ITEM_CHARS + 100);
+    let (kept, dropped) = bound_item(long, MAX_SET_CHARS);
+    assert_eq!(kept.chars().count(), MAX_ITEM_CHARS);
+    assert_eq!(dropped, 100);
+}
+
+#[test]
+fn the_payload_budget_bounds_the_items_after_the_first() {
+    // The budget is the point: without it a plan of 20 max-length items would
+    // be 10 000 characters re-sent on every step, and `get` would come back
+    // cut by the hard output cap with a marker the model cannot act on.
+    let (kept, dropped) = bound_item("y".repeat(MAX_ITEM_CHARS + 50), 10);
+    assert_eq!(
+        kept.chars().count(),
+        10,
+        "the budget is a ceiling, not a target: kept {}",
+        kept.chars().count()
+    );
+    assert!(dropped > 0, "an exhausted budget must report the loss");
+}
+
+#[test]
+fn an_exhausted_budget_keeps_nothing_and_still_reports_the_loss() {
+    // The case the `+1` was meant to cover, and it works without it: `dropped` is
+    // measured against the full text, so a fully clipped item says so.
+    let (kept, dropped) = bound_item("z".repeat(100), 0);
+    assert_eq!(kept.chars().count(), 0);
+    assert_eq!(dropped, 100, "a wholly dropped item is still a dropped one");
+}
+
+#[test]
+fn the_whole_plan_never_exceeds_the_payload_budget() {
+    // End to end on the arithmetic: 20 items of MAX_ITEM_CHARS each against one
+    // MAX_SET_CHARS budget must come to the budget, not to it plus a character
+    // per item.
+    let mut budget = MAX_SET_CHARS;
+    let mut total = 0usize;
+    for _ in 0..MAX_ITEMS {
+        let (kept, _) = bound_item("w".repeat(MAX_ITEM_CHARS * 2), budget);
+        total += kept.chars().count();
+        budget = budget.saturating_sub(kept.chars().count());
+    }
+    assert_eq!(
+        total, MAX_SET_CHARS,
+        "the plan as a whole must fit the budget, not just each item"
+    );
+}
+
+#[test]
+fn the_cut_never_leaves_trailing_whitespace() {
+    let mut text = "z".repeat(MAX_ITEM_CHARS - 2);
+    text.push_str("   and then some more");
+    let (kept, _) = bound_item(text, MAX_SET_CHARS);
+    assert!(!kept.ends_with(' '), "kept: {kept:?}");
+}
+
+#[test]
+fn nothing_dropped_produces_no_note() {
+    assert!(truncation_note(0, 0).is_none());
+}
+
+#[test]
+fn a_dropped_item_count_is_quantified() {
+    let note = truncation_note(7, 0).expect("a dropped count is reported");
+    assert!(note.contains("7 item(s) past the 20-item limit"), "{note}");
+}
+
+#[test]
+fn dropped_characters_are_quantified() {
+    let note = truncation_note(0, 42).expect("a dropped count is reported");
+    assert!(note.contains("42 character(s)"), "{note}");
+    assert!(note.contains("500-char per-item"), "{note}");
+}
+
+#[test]
+fn both_kinds_of_loss_are_reported_together() {
+    let note = truncation_note(3, 42).expect("both losses are reported");
+    assert!(note.contains("3 item(s)"), "{note}");
+    assert!(note.contains("42 character(s)"), "{note}");
+}

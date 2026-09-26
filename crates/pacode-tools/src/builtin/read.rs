@@ -8,9 +8,12 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "read";
+
+/// Model-facing description; see `prompts/read.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/read.md");
 
 const DEFAULT_LINE_LIMIT: usize = 2000;
 const READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -26,7 +29,10 @@ const MAX_READ_WINDOW_BYTES: usize = 1024 * 1024;
 
 const BINARY_SNIFF_BYTES: usize = 8192;
 
-pub struct ReadTool;
+#[derive(Default)]
+pub struct ReadTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -166,9 +172,10 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file. Returns lines prefixed with their 1-based number (`   12\\tcode`). \
-         Use offset/limit for large files; output above the cap is cut head+tail with a \
-         marker reporting the dropped size. Binary files are refused."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

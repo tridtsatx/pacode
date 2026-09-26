@@ -7,11 +7,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{is_outside_workspace, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "edit";
 
-pub struct EditTool;
+/// Model-facing description; see `prompts/edit.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/edit.md");
+
+#[derive(Default)]
+pub struct EditTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -65,9 +71,10 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Replace an exact string in a file. `old_string` must occur exactly once \
-         (include surrounding lines to make it unique) unless `replace_all` is true. \
-         Read the file first so the match is exact."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

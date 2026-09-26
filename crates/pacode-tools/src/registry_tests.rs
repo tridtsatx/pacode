@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pacode_types::{AgentId, SessionId};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -15,9 +16,9 @@ use super::{
     MAX_TOOL_WORKERS_PER_AGENT, SourceReadError, ToolRegistry, acquire_path_write_lock,
     cap_output_bytes, read_source_file, write_atomic,
 };
-use crate::ToolError;
 use crate::builtin::glob::GlobTool;
 use crate::builtin::read::ReadTool;
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 fn names(registry: &ToolRegistry) -> Vec<String> {
     registry
@@ -30,8 +31,8 @@ fn names(registry: &ToolRegistry) -> Vec<String> {
 #[test]
 fn disabled_tool_absent_from_definitions() {
     let mut registry = ToolRegistry::new()
-        .with(Arc::new(ReadTool))
-        .with(Arc::new(GlobTool));
+        .with(Arc::new(ReadTool::default()))
+        .with(Arc::new(GlobTool::default()));
     registry.apply_disabled(["read".to_string()]);
 
     assert_eq!(names(&registry), ["glob"]);
@@ -43,38 +44,194 @@ fn disabled_tool_absent_from_definitions() {
 fn register_refuses_disabled_names() {
     let mut registry = ToolRegistry::new();
     registry.apply_disabled(["read".to_string()]);
-    registry.register(Arc::new(ReadTool));
+    registry.register(Arc::new(ReadTool::default()));
     assert!(registry.get("read").is_none());
     assert!(names(&registry).is_empty());
 }
 
 #[test]
 fn subset_and_clones_keep_disabled_set() {
-    let mut registry = ToolRegistry::new().with(Arc::new(ReadTool));
+    let mut registry = ToolRegistry::new().with(Arc::new(ReadTool::default()));
     registry.apply_disabled(["read".to_string(), "mcp__tool".to_string()]);
-    registry.register(Arc::new(ReadTool)); // refused
+    registry.register(Arc::new(ReadTool::default())); // refused
 
     let subset = registry.subset(["read", "glob"]);
     assert!(subset.names().next().is_none());
     // A subset refuses late registrations of disabled names as well.
     let mut subset = registry.subset([]);
-    subset.register(Arc::new(ReadTool));
+    subset.register(Arc::new(ReadTool::default()));
     assert!(subset.get("read").is_none());
 }
 
 #[test]
 fn unknown_disabled_names_are_harmless() {
-    let mut registry = ToolRegistry::new().with(Arc::new(ReadTool));
+    let mut registry = ToolRegistry::new().with(Arc::new(ReadTool::default()));
     registry.apply_disabled(["no_such_tool".to_string()]);
     assert_eq!(names(&registry), ["read"]);
 }
 
+/// A tool that counts how often its schema is built, so the tests below can
+/// prove the definition cache is what keeps the count at one.
+struct CountingTool {
+    name: &'static str,
+    description: &'static str,
+    schema_builds: AtomicUsize,
+    definition: DefinitionCache,
+}
+
+impl CountingTool {
+    fn new(name: &'static str, description: &'static str) -> Self {
+        Self {
+            name,
+            description,
+            schema_builds: AtomicUsize::new(0),
+            definition: DefinitionCache::new(),
+        }
+    }
+
+    fn schema_builds(&self) -> usize {
+        self.schema_builds.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for CountingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
+    }
+
+    fn schema(&self) -> Value {
+        self.schema_builds.fetch_add(1, Ordering::SeqCst);
+        json!({"type": "object", "properties": {"a": {"type": "string"}}})
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+
+    async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+/// The same tool without a cache: the default `definition_cache` is `None`.
+struct UncachedTool(CountingTool);
+
+#[async_trait::async_trait]
+impl Tool for UncachedTool {
+    fn name(&self) -> &str {
+        self.0.name
+    }
+
+    fn description(&self) -> &str {
+        self.0.description
+    }
+
+    fn schema(&self) -> Value {
+        self.0.schema()
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+
+    async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+#[test]
+fn a_tools_schema_is_built_once_however_often_definitions_are_read() {
+    let tool = Arc::new(CountingTool::new("counted", "counted tool"));
+    let registry = ToolRegistry::new().with(tool.clone());
+
+    let first = registry.definitions();
+    let second = registry.definitions();
+    let third = registry.definitions();
+
+    // Every call rebuilds the same value from the same schema, and the schema is
+    // only ever built once.
+    assert_eq!(first, second);
+    assert_eq!(second, third);
+    assert_eq!(
+        tool.schema_builds(),
+        1,
+        "the memoised definition must not rebuild the schema on every read"
+    );
+}
+
+#[test]
+fn repeated_definition_reads_are_byte_identical() {
+    let registry = ToolRegistry::new()
+        .with(Arc::new(CountingTool::new("b", "second")))
+        .with(Arc::new(CountingTool::new("a", "first")));
+
+    // A provider prompt cache only hits while the serialised list is
+    // byte-identical between steps, so the order must come from the name and
+    // stay put, and the values must not drift.
+    let first = registry.definitions();
+    let second = registry.definitions();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        ["a", "b"],
+        "definitions must be ordered by name, not by registration order"
+    );
+}
+
+#[test]
+fn a_tool_without_a_cache_rebuilds_but_answers_the_same() {
+    let uncached = Arc::new(UncachedTool(CountingTool::new("plain", "plain tool")));
+    let registry = ToolRegistry::new().with(uncached.clone());
+
+    let first = registry.definitions();
+    let second = registry.definitions();
+
+    assert_eq!(
+        first, second,
+        "an uncached tool must still be deterministic"
+    );
+    assert_eq!(
+        uncached.0.schema_builds(),
+        2,
+        "an uncached tool rebuilds its definition per read, which is the documented \
+         default; this is what the built-ins opt out of"
+    );
+}
+
+#[test]
+fn a_reregistered_name_is_replaced_and_rebuilt() {
+    let mut registry = ToolRegistry::new().with(Arc::new(CountingTool::new("dup", "first")));
+    let second = Arc::new(CountingTool::new("dup", "second"));
+    registry.register(second.clone());
+
+    let definitions = registry.definitions();
+    assert_eq!(
+        definitions.len(),
+        1,
+        "a name collision must not grow the registry"
+    );
+    assert_eq!(
+        definitions[0].description, "second",
+        "last registration wins"
+    );
+    assert_eq!(second.schema_builds(), 1);
+}
+
 #[test]
 fn snapshot_does_not_change_when_registry_mutates() {
-    let mut registry = ToolRegistry::new().with(Arc::new(ReadTool));
+    let mut registry = ToolRegistry::new().with(Arc::new(ReadTool::default()));
     let snapshot = registry.snapshot();
 
-    registry.register(Arc::new(GlobTool));
+    registry.register(Arc::new(GlobTool::default()));
 
     assert!(snapshot.get("glob").is_none());
     assert!(registry.get("glob").is_some());

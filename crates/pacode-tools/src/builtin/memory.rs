@@ -11,10 +11,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const WRITE_NAME: &str = "memory_write";
 pub const READ_NAME: &str = "memory_read";
+
+/// Characters of one note that reach the store. Memory is read back into the
+/// context at the start of an unfamiliar task, so what lands here is paid for
+/// again and again; a note is one line, and a line longer than this was never
+/// one fact.
+pub const MAX_NOTE_CHARS: usize = 500;
 
 /// Resolve the global memory path (`~/.config/pacode/memory.md`).
 /// Respects `PACODE_HOME`, `PACODE_CONFIG`, and `XDG_CONFIG_HOME`.
@@ -84,7 +90,10 @@ impl MemoryScope {
     }
 }
 
-pub struct MemoryWriteTool;
+#[derive(Default)]
+pub struct MemoryWriteTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -123,10 +132,19 @@ impl Tool for MemoryWriteTool {
         })
     }
 
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Edit
     }
 
+    /// Stores `- {text}` in the scope's file, refusing an empty note and an
+    /// exact duplicate. The text is collapsed to one line and cut to
+    /// [`MAX_NOTE_CHARS`]; a cut is *reported* in the output, since a silent cut
+    /// left the model believing a whole fact was remembered when half a
+    /// sentence was.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _accept_large_output) = parse_input::<MemoryWriteInput>(input)?;
         let scope = MemoryScope::parse(&args.scope)?;
@@ -144,9 +162,11 @@ impl Tool for MemoryWriteTool {
             return Err(ToolError::invalid("text cannot be empty"));
         }
 
-        // Cap to 500 chars
-        let capped_text: String = trimmed.chars().take(500).collect();
+        // Cut to MAX_NOTE_CHARS, and say how much was left out.
+        let total_chars = trimmed.chars().count();
+        let capped_text: String = trimmed.chars().take(MAX_NOTE_CHARS).collect();
         let capped_text = capped_text.trim();
+        let dropped_chars = total_chars - capped_text.chars().count();
         let bullet_line = format!("- {capped_text}");
 
         let target_file = match scope {
@@ -163,8 +183,16 @@ impl Tool for MemoryWriteTool {
 
         // Check exact duplicate lines
         let already_stored = existing.lines().any(|l| l.trim() == bullet_line);
+        let outcome = if dropped_chars > 0 {
+            format!(
+                "stored (truncated: {dropped_chars} character(s) past the {MAX_NOTE_CHARS}-char limit were NOT saved — split the note into several `memory_write` calls)"
+            )
+        } else {
+            "stored".to_string()
+        };
         if already_stored {
-            return Ok(ToolOutput::text("already stored")
+            let content = format!("already stored{}", truncation_suffix(dropped_chars));
+            return Ok(ToolOutput::text(content)
                 .with_title(format!("{WRITE_NAME} ({})", scope.as_str()))
                 .with_preview("already stored"));
         }
@@ -200,13 +228,33 @@ impl Tool for MemoryWriteTool {
         // root and the call is a no-op there.
         crate::walk::invalidate_path(&target_file);
 
-        Ok(ToolOutput::text("stored")
+        Ok(ToolOutput::text(outcome)
             .with_title(format!("{WRITE_NAME} ({})", scope.as_str()))
-            .with_preview("stored"))
+            .with_preview(if dropped_chars > 0 {
+                "stored (truncated)"
+            } else {
+                "stored"
+            }))
     }
 }
 
-pub struct MemoryReadTool;
+/// The truncation clause appended to an `already stored` line. Only a cut note
+/// can match an existing bullet, so the plain path never carries it.
+fn truncation_suffix(dropped_chars: usize) -> String {
+    if dropped_chars == 0 {
+        String::new()
+    } else {
+        format!(
+            " (truncated: {dropped_chars} character(s) past the {MAX_NOTE_CHARS}-char limit \
+             were not saved)"
+        )
+    }
+}
+
+#[derive(Default)]
+pub struct MemoryReadTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -238,6 +286,10 @@ impl Tool for MemoryReadTool {
                 }
             }
         })
+    }
+
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn kind(&self) -> ToolKind {

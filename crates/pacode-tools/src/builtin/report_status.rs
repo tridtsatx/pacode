@@ -5,11 +5,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::parse_input;
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "report_status";
 
-pub struct ReportStatusTool;
+/// Model-facing description; see `prompts/report_status.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/report_status.md");
+
+#[derive(Default)]
+pub struct ReportStatusTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -24,9 +30,10 @@ impl Tool for ReportStatusTool {
     }
 
     fn description(&self) -> &str {
-        "Send a brief status (1-3 sentences: what is done, what is in progress, blockers) \
-         to the agent that spawned you. Use it when you receive a `<status_request>`, or \
-         at a meaningful milestone. Then continue your work."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

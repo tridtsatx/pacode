@@ -7,16 +7,26 @@ use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
 use crate::host::{AgentKindDef, AgentSpec};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "agent";
 
-pub struct AgentTool;
+#[derive(Default)]
+pub struct AgentTool {
+    definition: DefinitionCache,
+}
 
-/// What `agent list` says when no kinds are defined. Shared by both list paths
-/// so the empty case reads the same whether or not agents exist: the model has
-/// to be told to omit `kind`, because silence here is what made it invent
-/// names and then retry the same rejected spawn for several turns.
+/// What `agent kinds` / `agent list` says when no kinds are defined.
+///
+/// This text is the whole reason `kinds` exists as a separate action: the tool
+/// *description* cannot list the kinds, because [`Tool::description`] is served
+/// from a per-tool cache and has no [`ToolCtx`] to discover them with — a
+/// dynamically-built description would either be built once for the process
+/// (stale the moment a kind file appears) or rebuilt on every model step, which
+/// is a directory scan per step. So the list is read at *call* time, where the
+/// host is reachable, and the description points at it. An explicit
+/// `kinds` action is cheap (a directory listing) and has no side effects, so
+/// the model can ask for it at the start of a task instead of guessing.
 const NO_KINDS_HINT: &str = "No agent kinds are defined — omit `kind` and the subagent gets the \
      default tool set. `kind` only works for types declared in `agents/*.md`.";
 
@@ -46,9 +56,11 @@ impl Tool for AgentTool {
          immediately; the finished agent's report is delivered to you as a message \
          — continue working or end your turn rather than polling. A `kind` names a \
          subagent type defined in `<cwd>/.pacode/agents/*.md` or the global config's \
-         `agents/` dir; the file supplies the brief, tools and model. `stop` cancels; \
-         `continue` resumes a stopped agent with its context intact; `ask_status` \
-         delivers a brief status at your next step. Subagents cannot spawn agents."
+         `agents/` dir; the file supplies the brief, tools and model. Run `kinds` \
+         (or `list`) to see which kinds this session has — do not invent a name. \
+         `stop` cancels; `continue` resumes a stopped agent with its context intact; \
+         `ask_status` delivers a brief status at your next step. Subagents cannot \
+         spawn agents."
     }
 
     fn schema(&self) -> Value {
@@ -56,9 +68,9 @@ impl Tool for AgentTool {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "stop", "continue", "list", "ask_status"]},
+                "action": {"type": "string", "enum": ["spawn", "stop", "continue", "list", "kinds", "ask_status"]},
                 "prompt": {"type": "string", "description": "Full task description for the subagent (spawn)."},
-                "kind": {"type": "string", "description": "Named subagent type from `agents/*.md` files; `list` shows what is available."},
+                "kind": {"type": "string", "description": "Named subagent type from `agents/*.md` files; `kinds` shows what this session has."},
                 "name": {"type": "string", "description": "Short name shown in the UI, e.g. `tests`."},
                 "model": {"type": "string", "description": "`provider/model` override."},
                 "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
@@ -68,6 +80,10 @@ impl Tool for AgentTool {
                 "agent_id": {"type": "string"}
             }
         })
+    }
+
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn kind(&self) -> ToolKind {
@@ -214,6 +230,18 @@ impl AgentTool {
                     .with_title(format!("Agent continue {id}"))
                     .with_preview("resumed"))
             }
+            "kinds" => {
+                // The side-effect-free half of `list`: a directory listing, so
+                // the model can ask what kinds exist without also asking for a
+                // status table of agents it may not have spawned yet.
+                let kinds = ctx.host.agent_kinds();
+                let mut content = render_kinds(&kinds);
+                content = cap_output(&content, accept_large_output, ctx.output_cap_chars);
+                let preview = preview_body(&content);
+                Ok(ToolOutput::text(content)
+                    .with_title("agent kinds")
+                    .with_preview(preview))
+            }
             "list" => {
                 let agents = ctx.host.list_agents();
                 let kinds = ctx.host.agent_kinds();
@@ -236,25 +264,10 @@ impl AgentTool {
                         a.id, a.name, status_str, dur_s, a.tokens_out
                     ));
                 }
-                if kinds.is_empty() {
-                    // Say it even when there are none. Silence here left the
-                    // model guessing whether `kind` was a usable argument at
-                    // all, and it kept inventing names; naming the empty case
-                    // is what tells it to omit the field.
-                    if !lines.is_empty() {
-                        lines.push(String::new());
-                    }
-                    lines.push(NO_KINDS_HINT.to_string());
-                } else {
-                    if !lines.is_empty() {
-                        lines.push(String::new());
-                    }
-                    lines.push("Available kinds:".to_string());
-                    for k in &kinds {
-                        let desc: String = k.description.chars().take(120).collect();
-                        lines.push(format!("  {} — {desc}", k.name));
-                    }
+                if !lines.is_empty() {
+                    lines.push(String::new());
                 }
+                lines.push(render_kinds(&kinds));
                 let joined = lines.join("\n");
                 let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
                 let preview = preview_body(&content);
@@ -265,6 +278,28 @@ impl AgentTool {
             other => Err(ToolError::invalid(format!("unknown action: {other}"))),
         }
     }
+}
+
+/// The kind list both `kinds` and `list` print, read fresh from the host on
+/// every call — this is the dynamic surface the static description cannot be.
+///
+/// The empty case is named rather than left blank. Silence here is what had the
+/// model guessing whether `kind` was a usable argument at all, and it kept
+/// inventing plausible names (`explore`, `reviewer`) to retry.
+fn render_kinds(kinds: &[AgentKindDef]) -> String {
+    if kinds.is_empty() {
+        return NO_KINDS_HINT.to_string();
+    }
+    let mut lines = vec!["Available kinds:".to_string()];
+    for k in kinds {
+        let desc: String = k.description.chars().take(120).collect();
+        if desc.is_empty() {
+            lines.push(format!("  {}", k.name));
+        } else {
+            lines.push(format!("  {} — {desc}", k.name));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Look up `name` among the host's discovered agent kinds, returning it

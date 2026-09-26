@@ -17,6 +17,8 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use super::anim::sweep_spans;
+
 use pacode_render::text as rtext;
 use pacode_render::{
     RenderOptions, display_width, render_diff_ex, truncate_spans, truncate_to_width, wrap_line,
@@ -712,12 +714,12 @@ fn outcome_spans(
     match call.status {
         ToolStatus::Running => {
             // The running cell bypasses the line cache, so this spinner turns
-            // on the anim frame alone.
+            // on the anim frame alone — and so can the sweep, which is drawn
+            // from the same clock. A running tool is the other line on screen
+            // that exists only while work happens, and a band crossing it is
+            // what tells the eye it is still moving rather than stuck.
             let spinner = opts.glyphs.spinner(anim_frame);
-            vec![Span::styled(
-                format!("{spinner} running"),
-                opts.theme.accent,
-            )]
+            sweep_spans(format!("{spinner} running"), opts.theme.accent, opts)
         }
         ToolStatus::Ok => {
             let mut groups: Vec<Vec<Span<'static>>> = Vec::new();

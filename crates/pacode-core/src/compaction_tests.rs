@@ -160,6 +160,381 @@ fn test_split_for_compaction_keeps_tool_pairs() {
 }
 
 // ---------------------------------------------------------------------------
+// The split must not fold away the request being carried out, nor the record of
+// what a mutating call actually did.
+// ---------------------------------------------------------------------------
+
+mod protected {
+    use super::*;
+
+    /// `user` / `assistant text` / `tool_use(name)` / `tool_result` runs.
+    fn tool_use(name: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: CallId::generate(),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn result_of(call: &ContentBlock) -> Arc<Message> {
+        let ContentBlock::ToolUse { id, .. } = call else {
+            panic!("expected a ToolUse block");
+        };
+        Arc::new(Message::tool_result(id.clone(), "ok", false))
+    }
+
+    /// The body of a `tool_result` block. `Message::text` concatenates only
+    /// `Text` blocks, so a tool result reads as the empty string through it —
+    /// asserting on `text()` for one of these would pass whatever the code did.
+    fn tool_result_text(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn rows_of(messages: &[Arc<Message>]) -> Vec<(u64, Arc<Message>)> {
+        messages
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, message)| (index as u64, message))
+            .collect()
+    }
+
+    #[test]
+    fn a_distant_request_is_carried_by_the_summary_not_by_the_cut() {
+        // The request is four messages back, well outside a `keep_recent` of 2.
+        // It is handed to the summariser instead of pinning the cut, so the
+        // agent still learns what it was asked to do while the burst folds.
+        let call = tool_use("read");
+        let msgs = vec![
+            Arc::new(Message::user("rename the config parser")),
+            Arc::new(Message::new(Role::Assistant, vec![call.clone()])),
+            result_of(&call),
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text {
+                    text: "looking".into(),
+                }],
+            )),
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text {
+                    text: "still looking".into(),
+                }],
+            )),
+        ];
+
+        let rows = rows_of(&msgs);
+        let split = split_rows_for_compaction(&rows, 2);
+
+        let request = split
+            .active_request
+            .expect("the request in flight must be recovered from the folded rows");
+        assert_eq!(request.text(), "rename the config parser");
+
+        // It is pinned into the prompt the summariser answers, so a summary that
+        // omits it is a summary that is wrong about the task.
+        let prompt = build_summary_request(
+            None,
+            &split
+                .to_summarize
+                .iter()
+                .map(|(_, m)| m.clone())
+                .collect::<Vec<_>>(),
+            Some(&request),
+        );
+        let rendered = prompt
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("rename the config parser"),
+            "the request must appear in the summary prompt"
+        );
+    }
+
+    #[test]
+    fn no_request_is_pinned_when_the_newest_turn_is_already_kept() {
+        // Nothing was folded past the request, so there is nothing to carry —
+        // pinning a request the agent can already see would be noise.
+        let msgs = vec![
+            Arc::new(Message::user("do the thing")),
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text {
+                    text: "working".into(),
+                }],
+            )),
+        ];
+        let rows = rows_of(&msgs);
+        let split = split_rows_for_compaction(&rows, 2);
+        assert!(split.to_summarize.is_empty());
+        assert!(split.active_request.is_none());
+    }
+
+    #[test]
+    fn the_summary_prompt_omits_the_request_block_when_there_is_none() {
+        let msgs = vec![
+            Arc::new(Message::user("old")),
+            Arc::new(Message::user("newer")),
+        ];
+        let prompt = build_summary_request(None, &msgs, None);
+        let rendered = prompt
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rendered.contains("Request currently being executed"),
+            "no request was folded, so no request block belongs in the prompt"
+        );
+    }
+
+    #[test]
+    fn a_mutating_result_near_the_cut_moves_the_cut_down() {
+        // The cheap case: the record of the mutation is within the lookback, so
+        // keeping it costs one message and no summary-prompt ceremony.
+        let call = tool_use("edit");
+        let msgs = vec![
+            Arc::new(Message::user("go")),
+            Arc::new(Message::new(Role::Assistant, vec![call.clone()])),
+            result_of(&call),
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text { text: "a".into() }],
+            )),
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text { text: "b".into() }],
+            )),
+        ];
+        let (to_summarize, to_keep) = split_for_compaction(&msgs, 2);
+        assert!(
+            to_keep.iter().any(|m| m.role == Role::Tool),
+            "the result of an `edit` is the record of the workspace and must survive"
+        );
+        assert!(
+            to_summarize.len() < 3,
+            "the cut moved down to keep it, folded {}",
+            to_summarize.len()
+        );
+    }
+
+    #[test]
+    fn a_failed_mutating_call_survives_too() {
+        // The retry after a failed edit depends on knowing what the edit
+        // actually did, which is only in the result.
+        let call = tool_use("write");
+        let msgs = vec![
+            Arc::new(Message::new(Role::Assistant, vec![call.clone()])),
+            {
+                let ContentBlock::ToolUse { id, .. } = &call else {
+                    panic!("expected a ToolUse block");
+                };
+                Arc::new(Message::tool_result(id.clone(), "permission denied", true))
+            },
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text { text: "a".into() }],
+            )),
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text { text: "b".into() }],
+            )),
+        ];
+
+        let (_, to_keep) = split_for_compaction(&msgs, 2);
+        assert!(
+            to_keep
+                .iter()
+                .any(|m| tool_result_text(m).contains("permission denied")),
+            "the failure that explains the current state must survive, kept: {:?}",
+            to_keep
+                .iter()
+                .map(|m| (m.role, tool_result_text(m)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn read_only_results_are_not_protected() {
+        // A `read` result is reproducible by re-reading; protecting every tool
+        // result would keep most of a long session and stop compaction working.
+        let call = tool_use("read");
+        let msgs = vec![
+            Arc::new(Message::new(Role::Assistant, vec![call.clone()])),
+            result_of(&call),
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text { text: "a".into() }],
+            )),
+            Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text { text: "b".into() }],
+            )),
+        ];
+
+        let (to_summarize, to_keep) = split_for_compaction(&msgs, 2);
+        assert_eq!(to_keep.len(), 2, "no reason to keep more than asked");
+        assert!(
+            to_summarize.iter().any(|m| m.role == Role::Tool),
+            "the read result is folded"
+        );
+    }
+
+    #[test]
+    fn older_user_messages_are_folded_not_carried() {
+        // Only the *newest* request is carried. Carrying every user turn would
+        // mean a conversation of nothing but user messages accumulates requests
+        // in every successive summary.
+        let msgs: Vec<Arc<Message>> = (0..10)
+            .map(|i| Arc::new(Message::user(format!("msg {i}"))))
+            .collect();
+
+        let (to_summarize, to_keep) = split_for_compaction(&msgs, 4);
+        assert_eq!(to_keep.len(), 4, "the tail is exactly keep_recent");
+        assert_eq!(to_keep[0].text(), "msg 6");
+        assert!(!to_summarize.is_empty());
+    }
+
+    #[test]
+    fn a_distant_request_does_not_stop_the_session_compacting() {
+        // The request is 40 messages back. Honouring it by moving the cut would
+        // pin all forty, and a session that compacts repeatedly would re-grow
+        // without ever shrinking — the failure compaction exists to cure. So the
+        // cut is untouched and the request is carried in the summary prompt
+        // instead: the agent still learns the task, and the tail still shrinks.
+        let mut msgs = vec![Arc::new(Message::user("the original request"))];
+        for i in 0..40 {
+            msgs.push(Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text {
+                    text: format!("step {i}"),
+                }],
+            )));
+        }
+
+        let (to_summarize, to_keep) = split_for_compaction(&msgs, 2);
+        assert_eq!(
+            to_keep.len(),
+            2,
+            "a distant request must not pin the messages behind it, kept {}",
+            to_keep.len()
+        );
+        assert_eq!(to_summarize.len(), 39, "everything but the tail folds");
+
+        // The guarantee the cut gave up is made up for by the summary prompt.
+        let rows = rows_of(&msgs);
+        let split = split_rows_for_compaction(&rows, 2);
+        let request = split.active_request.expect("the request is recovered");
+        assert_eq!(request.text(), "the original request");
+        assert_eq!(
+            split.to_keep.len(),
+            2,
+            "and it is not kept as a message either — it travels in the prompt"
+        );
+    }
+
+    #[test]
+    fn mutating_results_far_behind_the_cut_are_folded() {
+        // The bounded tier. A hundred old `edit` results must not each veto
+        // compaction; the bound exists so the tail cannot grow with the number
+        // of past mutations.
+        let mut msgs = Vec::new();
+        for _ in 0..40 {
+            let call = tool_use("edit");
+            msgs.push(Arc::new(Message::new(Role::Assistant, vec![call.clone()])));
+            msgs.push(result_of(&call));
+        }
+
+        let (to_summarize, to_keep) = split_for_compaction(&msgs, 4);
+        let kept_results = to_keep.iter().filter(|m| m.role == Role::Tool).count();
+        assert!(
+            kept_results <= MAX_EXTRA_KEPT_MESSAGES,
+            "old mutating results must not be kept without bound, kept {kept_results}"
+        );
+        // Compaction has to actually reclaim something. The kept tail is
+        // `keep_recent` plus one pulled-back `tool_result` for the pairing
+        // guard, and at most `MAX_EXTRA_KEPT_MESSAGES` of rescue — anything
+        // close to "all of it" is the unbounded-growth failure this bound
+        // exists to prevent, whatever the exact cut lands on.
+        assert!(
+            to_summarize.len() >= 80 - 2 * MAX_EXTRA_KEPT_MESSAGES,
+            "compaction must still fold the bulk of the history, folded {} of 80",
+            to_summarize.len()
+        );
+    }
+
+    #[test]
+    fn a_read_only_session_keeps_exactly_the_requested_tail() {
+        // Nothing is protected, so the cut must not move at all. This is the
+        // guard against the lookback window silently becoming a default: a
+        // read-only session with no protected message must keep `keep_recent`
+        // and nothing more.
+        let mut msgs = Vec::new();
+        for _ in 0..20 {
+            let call = tool_use("read");
+            msgs.push(Arc::new(Message::new(Role::Assistant, vec![call.clone()])));
+            msgs.push(result_of(&call));
+        }
+
+        let (_, to_keep) = split_for_compaction(&msgs, 4);
+        assert_eq!(
+            to_keep.len(),
+            4,
+            "with no protected message below the cut it must not move, kept {}",
+            to_keep.len()
+        );
+    }
+
+    #[test]
+    fn the_split_stays_a_valid_tool_pairing_boundary() {
+        // Protection must not reintroduce the orphan-result the existing
+        // pairing guard exists to prevent.
+        let call = tool_use("edit");
+        let msgs = vec![
+            Arc::new(Message::user("go")),
+            Arc::new(Message::new(Role::Assistant, vec![call.clone()])),
+            result_of(&call),
+        ];
+
+        let (to_summarize, to_keep) = split_for_compaction(&msgs, 1);
+        // Whatever the split is, the first kept message may not be a bare
+        // `tool_result`.
+        assert!(
+            to_keep.first().map(|m| m.role) != Some(Role::Tool),
+            "kept tail must not start with an orphaned tool_result"
+        );
+        // And every kept tool result must have its tool_use kept too.
+        let mut kept_ids: Vec<CallId> = Vec::new();
+        for msg in &to_keep {
+            for (id, _, _) in msg.tool_uses() {
+                kept_ids.push(id.clone());
+            }
+        }
+        for msg in &to_keep {
+            for block in &msg.content {
+                if let ContentBlock::ToolResult { call_id, .. } = block {
+                    assert!(
+                        kept_ids.contains(call_id),
+                        "kept a tool_result whose tool_use was folded away"
+                    );
+                }
+            }
+        }
+        let _ = to_summarize;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ZDR: the summary request carries the whole conversation prefix, so the route
 // that produces it has to be inside the retention boundary.
 // ---------------------------------------------------------------------------

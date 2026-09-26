@@ -51,7 +51,7 @@ impl SamplingHandler for CoreSamplingHandler {
             };
             let providers = core.providers();
             let route = session_model
-                .or_else(|| providers.default_route().cloned())
+                .or_else(|| providers.default_route())
                 .ok_or_else(|| {
                     McpError::Protocol("no provider route available for sampling".to_string())
                 })?;

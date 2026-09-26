@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 #[cfg(test)]
 #[path = "ask_question_tests.rs"]
@@ -14,7 +14,13 @@ mod ask_question_tests;
 
 pub const NAME: &str = "ask_question";
 
-pub struct AskQuestionTool;
+/// Model-facing description; see `prompts/ask_question.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/ask_question.md");
+
+#[derive(Default)]
+pub struct AskQuestionTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -40,12 +46,10 @@ impl Tool for AskQuestionTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user to choose between options and wait for the answer. Use it for \
-         a decision that is genuinely theirs — an architectural trade-off, an \
-         ambiguity you cannot resolve from the code — not for something you can \
-         decide yourself. Mark one option as recommended; marking several is \
-         refused. The user can also type an answer of their own or dismiss the \
-         question."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

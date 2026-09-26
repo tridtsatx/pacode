@@ -1,0 +1,1 @@
+Fetch an http(s) URL and return its text (HTML extracted to readable Markdown). A long page comes back as one window: the output says which slice of the page it is, and `offset` pages through the rest. A response over 5 MiB is cut there — read what you need of it in pieces instead of asking for the whole thing again.

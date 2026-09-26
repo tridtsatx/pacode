@@ -44,6 +44,7 @@ fn make_test_provider(base_url: &str, api_key: Option<&str>, session_token: Opti
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let defaults = ProviderDefaults {
@@ -232,6 +233,7 @@ fn test_exact_byte_layout_of_get_chat_message_request() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let session_token = "sess-tok-xyz-987";
@@ -873,6 +875,7 @@ async fn test_list_models_mapping_and_merge() {
             context_window: Some(64_000),
             reasoning: Some(true),
             efforts: None,
+            ..Default::default()
         }],
         catalog: true,
         context_window: Some(128_000),
@@ -881,6 +884,7 @@ async fn test_list_models_mapping_and_merge() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = Devin::new(
@@ -1172,6 +1176,7 @@ async fn test_idle_timeout_surfaces_error() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let defaults = ProviderDefaults {
@@ -1861,6 +1866,7 @@ fn test_assistant_message_with_signature_re_encoded_as_11_12_18() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let encoded = encode_get_chat_message_request("session-token", &req, &cfg, None);
@@ -2139,6 +2145,7 @@ fn test_devin_model_info_vision_and_config_efforts() {
             context_window: None,
             reasoning: None,
             efforts: Some(vec![Effort::Medium, Effort::High]),
+            ..Default::default()
         }],
         catalog: false,
         context_window: Some(128_000),
@@ -2147,6 +2154,7 @@ fn test_devin_model_info_vision_and_config_efforts() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
     let provider = Devin::new(
         "devin-test",

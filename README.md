@@ -85,6 +85,92 @@ proxy = "none"                       # direct, ignoring the environment too
 `"none"` means a direct connection even when those variables are set. The same
 proxy carries that provider's login and token refresh.
 
+## Declaring a provider
+
+A provider is a TOML entry, not a fork. `dialect` picks the wire protocol and
+`base_url` + `path` say where it goes, so a new endpoint is a config edit:
+
+```toml
+[providers.gateway]
+dialect = "openai_compatible"   # openai_compatible | anthropic | codex | devin | opencode_zen
+base_url = "https://gateway.internal/v1"
+path = "/models/{model}/generate"   # {model} is filled and URL-escaped per request
+api_key_env = "GATEWAY_TOKEN"
+default_model = "fast-1"
+priority = 10
+fallbacks = ["openrouter"]
+
+[[providers.gateway.models]]
+id = "fast-1"
+display_name = "Fast 1"
+efforts = ["low", "high"]
+max_output_tokens = 8192
+
+[providers.gateway.compat]
+thinking_mode = "auto"            # auto | never | always
+omit_max_output_tokens = false
+```
+
+Every field is optional and defaults to what pacode already did, so an existing
+entry keeps its behaviour untouched. `compat` is a closed, typed set: a typo in
+a key is a load error, not a setting silently ignored. A bare model name resolves
+against `priority` (higher first, ties alphabetically), and `fallbacks` are
+tried in declaration order when a provider can no longer serve a route — never in
+a loop. Editing the file while the daemon runs rebuilds only the providers whose
+entry actually changed, so an in-flight turn keeps the provider instance it
+started with.
+
+A dialect is a protocol; if a deployment speaks something genuinely new it needs
+a line in the dialect registry in `pacode-provider`, not a new config key.
+
+## Seeing what the client is doing
+
+`pacode stats` prints the daemon's own counters. The client's frame path is a
+different process with a different lifetime, so it is opt-in and lands beside
+them when asked for:
+
+```sh
+PACODE_FRAME_METRICS=1 pacode     # writes render-metrics.json on exit
+pacode stats                      # adds a `render` section
+```
+
+The reading separates frame, layout and backend cost, counts content,
+animation and full repaints separately, and reports the cadence multiplier the
+backpressure scheduler was applying. Nominal periods are never raised: a frame
+that costs more than its own period degrades the *animation* clock by steps of
+×2 up to ×9 after five consecutive slow frames, and the content clock is never
+touched — a keystroke is not a clock. A degraded cadence skips animation frames
+rather than slowing the animation, because the phase is read off elapsed time and
+not off a count of draws.
+
+## Animations
+
+The client runs two clocks. `ui.animation` picks the cadence — `smooth`
+(66 ms), `balanced` (100 ms), `eco` (240 ms) — and short transient animations
+(overlay unfold, toast) get a faster tick of their own. Nothing animates in
+idle: there is no timer running behind a prompt nobody is typing into.
+
+While the agent is working, a light band sweeps across the two lines that only
+exist during a turn — the activity label and a running tool's status:
+
+```toml
+[ui]
+animation = "smooth"   # smooth | balanced | eco
+shimmer = "classic"    # classic | kitt | off
+```
+
+`classic` is a cosine band crossing the text and wrapping; `kitt` is a Knight
+Rider scanner, one bright head ping-ponging with a trail behind it and nothing
+lit ahead of it. `off` costs nothing at all — no band, no per-character walk —
+and a terminal with no colour (`NO_COLOR`, `ui.color = mono`) is treated as
+`off` for the same reason.
+
+The band is a pure function of elapsed animation time, and it advances at most
+one cell per painted frame. That is why it takes its speed from the clock's
+current period rather than a constant: when backpressure has degraded the
+cadence, the same band is painted more sparsely instead of jumping several cells
+at once. A sweep that teleports reads as a glitch, not as motion.
+
 ## What it does
 
 **Sessions that outlive the terminal.** The daemon holds the session, the client

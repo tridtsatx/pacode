@@ -13,6 +13,7 @@ pub mod anthropic;
 pub mod catalog_cache;
 pub mod codex;
 pub mod devin;
+pub mod dialect;
 pub mod error_body;
 mod governor;
 pub mod image;
@@ -38,7 +39,7 @@ pub use catalog_cache::{
 pub use error_body::error_body_message;
 pub use mock::MockProvider;
 pub use openai_compat::{OpenAiCompat, redact};
-pub use registry::ProviderRegistry;
+pub use registry::{ProviderRegistry, ReloadReport};
 pub use retry::RetryBudget;
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;

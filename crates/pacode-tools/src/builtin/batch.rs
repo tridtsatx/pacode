@@ -15,9 +15,12 @@ use super::bash::{BashInput, run_authorized};
 use super::helpers::{parse_input, preview_body};
 use crate::host::PermissionDraft;
 use crate::registry::{MAX_TOOL_OUTPUT_BYTES, cap_output_bytes};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "batch";
+
+/// Model-facing description; see `prompts/batch.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/batch.md");
 
 /// Hard cap on ops per call.
 const MAX_OPS: usize = 8;
@@ -35,7 +38,10 @@ const CUT_NOTE_RESERVE: usize = 96;
 /// passing `pacode_risk::is_read_only` (the same check Plan mode applies).
 const ALLOWED_OPS: &[&str] = &["read", "grep", "glob", "ls", "symbols", "bash"];
 
-pub struct BatchTool;
+#[derive(Default)]
+pub struct BatchTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -72,14 +78,10 @@ impl Tool for BatchTool {
     }
 
     fn description(&self) -> &str {
-        "Run several independent read-only lookups in one call — file reads, content \
-         search, file globs, directory listings and read-only shell commands run in \
-         parallel and come back in the order given. Prefer this over issuing the same \
-         calls one by one when exploring; each op's output is capped to a fair share \
-         of the output budget, so for one big result call the tool directly instead. \
-         Writes are refused: editing tools and mutating shell commands never run in a \
-         batch. Shell ops share a single permission prompt covering the whole batch; \
-         refusing it fails the call."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

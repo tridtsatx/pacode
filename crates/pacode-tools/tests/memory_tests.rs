@@ -249,7 +249,7 @@ async fn test_memory_write_and_read_project_scope() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
+    let write_tool = MemoryWriteTool::default();
     let out = write_tool
         .call(
             json!({"scope": "project", "text": "use rust edition 2024"}),
@@ -273,7 +273,7 @@ async fn test_memory_write_and_read_project_scope() {
     assert!(drafts[0].detail.contains("- use rust edition 2024"));
 
     // Read back project scope
-    let read_tool = MemoryReadTool;
+    let read_tool = MemoryReadTool::default();
     let read_out = read_tool
         .call(json!({"scope": "project"}), &ctx)
         .await
@@ -294,7 +294,7 @@ async fn test_memory_write_and_read_global_scope_no_permission_prompt() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
+    let write_tool = MemoryWriteTool::default();
     let out = write_tool
         .call(
             json!({"scope": "global", "text": "prefer concise code"}),
@@ -319,7 +319,7 @@ async fn test_memory_write_and_read_global_scope_no_permission_prompt() {
     );
 
     // Read back global scope
-    let read_tool = MemoryReadTool;
+    let read_tool = MemoryReadTool::default();
     let read_out = read_tool
         .call(json!({"scope": "global"}), &ctx)
         .await
@@ -337,7 +337,7 @@ async fn test_memory_write_dedup() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
+    let write_tool = MemoryWriteTool::default();
 
     // First write: stored
     let out1 = write_tool
@@ -375,7 +375,7 @@ async fn test_memory_write_newline_collapse_and_cap() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
+    let write_tool = MemoryWriteTool::default();
 
     // Newline collapse
     let multi_line_text = "first line\nsecond line\r\nthird line\n  fourth line  ";
@@ -389,19 +389,83 @@ async fn test_memory_write_newline_collapse_and_cap() {
     let text = tokio::fs::read_to_string(&project_file).await.unwrap();
     assert_eq!(text, "- first line second line third line fourth line\n");
 
-    // Cap to 500 characters
+    // Cap to MAX_NOTE_CHARS, and *say* so: a silent cut left the model
+    // believing a whole fact was remembered when half a sentence was.
     let very_long = "a".repeat(600);
     let out_cap = write_tool
         .call(json!({"scope": "project", "text": very_long}), &ctx)
         .await
         .unwrap();
-    assert_eq!(out_cap.content, "stored");
+    assert!(
+        out_cap.content.contains("truncated"),
+        "a capped note must report the cut: {}",
+        out_cap.content
+    );
+    assert!(
+        out_cap.content.contains("100 character(s)"),
+        "the report must quantify the loss: {}",
+        out_cap.content
+    );
+    assert!(
+        out_cap.content.contains("NOT saved"),
+        "the report must be unambiguous that the tail is gone: {}",
+        out_cap.content
+    );
 
     let text_after = tokio::fs::read_to_string(&project_file).await.unwrap();
     let lines: Vec<&str> = text_after.lines().collect();
     assert_eq!(lines.len(), 2);
     let expected_line = format!("- {}", "a".repeat(500));
     assert_eq!(lines[1], expected_line);
+}
+
+#[tokio::test]
+async fn test_memory_write_within_the_cap_reports_no_truncation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let out = MemoryWriteTool::default()
+        .call(json!({"scope": "project", "text": "a complete fact"}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.content, "stored",
+        "an uncapped note must not claim a cut that did not happen"
+    );
+}
+
+#[tokio::test]
+async fn test_memory_write_a_deduped_capped_note_still_reports_the_cut() {
+    // A capped note that already exists is the one path where the cut happens
+    // and nothing is written — exactly where a silent "already stored" would
+    // tell the model its full text was saved.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = MemoryWriteTool::default();
+    let long = "b".repeat(600);
+    let first = tool
+        .call(json!({"scope": "project", "text": long}), &ctx)
+        .await
+        .unwrap();
+    assert!(first.content.contains("stored"));
+
+    let second = tool
+        .call(json!({"scope": "project", "text": long}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        second.content.contains("already stored"),
+        "{}",
+        second.content
+    );
+    assert!(
+        second.content.contains("truncated"),
+        "the dedup path must still report the cut: {}",
+        second.content
+    );
 }
 
 #[tokio::test]
@@ -416,7 +480,7 @@ async fn test_memory_read_both_scopes() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
+    let write_tool = MemoryWriteTool::default();
     write_tool
         .call(json!({"scope": "global", "text": "global knowledge"}), &ctx)
         .await
@@ -429,7 +493,7 @@ async fn test_memory_read_both_scopes() {
         .await
         .unwrap();
 
-    let read_tool = MemoryReadTool;
+    let read_tool = MemoryReadTool::default();
     let read_both = read_tool.call(json!({}), &ctx).await.unwrap();
 
     assert!(read_both.content.contains("# Memory (global)"));
@@ -449,7 +513,7 @@ async fn test_memory_write_permission_denied() {
     *host.decision.lock().unwrap() = PermissionDecision::Deny;
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
+    let write_tool = MemoryWriteTool::default();
     let err = write_tool
         .call(
             json!({"scope": "project", "text": "should be rejected"}),
@@ -475,15 +539,19 @@ async fn concurrent_notes_all_survive() {
     // the last would be dropped.
     let notes = (0..8).map(|index| format!("note {index}"));
     for note in notes {
-        MemoryWriteTool
+        MemoryWriteTool::default()
             .call(json!({"scope": "project", "text": note}), &ctx)
             .await
             .unwrap();
     }
+    // Three separate tools, as three concurrent `memory_write` calls would be.
+    let w1 = MemoryWriteTool::default();
+    let w2 = MemoryWriteTool::default();
+    let w3 = MemoryWriteTool::default();
     let (alpha, beta, gamma) = tokio::join!(
-        MemoryWriteTool.call(json!({"scope": "project", "text": "alpha"}), &ctx),
-        MemoryWriteTool.call(json!({"scope": "project", "text": "beta"}), &ctx),
-        MemoryWriteTool.call(json!({"scope": "project", "text": "gamma"}), &ctx),
+        w1.call(json!({"scope": "project", "text": "alpha"}), &ctx),
+        w2.call(json!({"scope": "project", "text": "beta"}), &ctx),
+        w3.call(json!({"scope": "project", "text": "gamma"}), &ctx),
     );
     alpha.expect("store alpha");
     beta.expect("store beta");

@@ -29,6 +29,7 @@ fn make_provider(
         extra_body,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
     OpenAiCompat::new(
         "openai",
@@ -241,6 +242,7 @@ fn test_build_body_reasoning_effort_and_map() {
             context_window: None,
             reasoning: Some(true),
             efforts: None,
+            ..Default::default()
         }],
         None,
         effort_map,
@@ -350,6 +352,7 @@ fn test_model_info() {
             context_window: Some(64_000),
             reasoning: Some(true),
             efforts: None,
+            ..Default::default()
         }],
         catalog: false,
         context_window: Some(128_000),
@@ -358,6 +361,7 @@ fn test_model_info() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = OpenAiCompat::new("my-openai", cfg, ProviderDefaults::default(), None, pricing)
@@ -398,6 +402,7 @@ async fn test_list_models_catalog_false() {
                 context_window: None,
                 reasoning: None,
                 efforts: None,
+                ..Default::default()
             },
             ModelConfig {
                 id: "o3-mini".to_string(),
@@ -405,6 +410,7 @@ async fn test_list_models_catalog_false() {
                 context_window: None,
                 reasoning: None,
                 efforts: None,
+                ..Default::default()
             },
         ],
         catalog: false,
@@ -414,6 +420,7 @@ async fn test_list_models_catalog_false() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = OpenAiCompat::new(
@@ -467,6 +474,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
             context_window: Some(128_000),
             reasoning: Some(false),
             efforts: None,
+            ..Default::default()
         }],
         catalog: true,
         context_window: None,
@@ -475,6 +483,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = OpenAiCompat::new(
@@ -596,6 +605,7 @@ async fn test_complete_non_2xx_extracts_error_message() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = OpenAiCompat::new(
@@ -878,6 +888,7 @@ fn test_model_info_vision_and_efforts() {
             context_window: None,
             reasoning: None,
             efforts: Some(vec![Effort::Low, Effort::High]),
+            ..Default::default()
         }],
         catalog: false,
         context_window: Some(128_000),
@@ -886,6 +897,7 @@ fn test_model_info_vision_and_efforts() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
     let provider = OpenAiCompat::new(
         "openai",

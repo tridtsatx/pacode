@@ -7,11 +7,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{is_outside_workspace, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "write";
 
-pub struct WriteTool;
+/// Model-facing description; see `prompts/write.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/write.md");
+
+#[derive(Default)]
+pub struct WriteTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -27,8 +33,10 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create or overwrite a file with the given content. Parent directories are \
-         created. Prefer `edit` for changes to existing files."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

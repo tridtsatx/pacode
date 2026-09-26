@@ -169,6 +169,44 @@ impl CatalogCache {
         );
     }
 
+    /// Drop everything cached for one provider: memory, disk, and any refresh
+    /// currently in flight.
+    ///
+    /// Called from registry hot reload. A provider entry that changed (new
+    /// `base_url`, new `path`, new `catalog`) may now answer `/models` with a
+    /// different answer, so serving the pre-reload list would be stale by
+    /// definition. The in-flight entry is cleared too, so a refresh started
+    /// against the old transport cannot re-seed the cache afterwards — that is
+    /// the one race a plain "remove the key" would leave open.
+    ///
+    /// Removing from disk is a read-modify-write under `disk_lock`, so a
+    /// concurrent `persist_provider_record` for a *different* provider is not
+    /// lost.
+    pub fn invalidate(&self, provider_id: &str) {
+        self.memory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+
+        let path = {
+            let guard = self.cache_path.read().unwrap_or_else(|p| p.into_inner());
+            guard.clone()
+        };
+        let Some(path) = path else { return };
+
+        let _lock = self.disk_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(mut disk_cache) = load_disk_cache(&path) else {
+            return;
+        };
+        if disk_cache.providers.remove(provider_id).is_some() {
+            save_disk_cache(&path, &disk_cache);
+        }
+    }
+
     fn read_provider_from_disk(&self, provider_id: &str) -> Option<ProviderCacheRecord> {
         let path = self
             .cache_path

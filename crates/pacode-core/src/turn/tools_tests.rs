@@ -14,7 +14,8 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BudgetLimits, ToolCallInfo, TurnBudget, execute_tool_calls, run_single_tool, turn_budget,
+    BudgetLimits, ToolCallInfo, TurnBudget, execute_tool_calls, run_single_tool,
+    split_result_for_consumers, turn_budget,
 };
 use crate::agent::{Agent, History};
 use crate::session::Session;
@@ -230,8 +231,7 @@ async fn concurrent_batches_do_not_deadlock_child_workers() {
         .tools
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .register(Arc::new(pacode_tools::builtin::batch::BatchTool));
-
+        .register(Arc::new(pacode_tools::builtin::batch::BatchTool::default()));
     let interrupted = tokio::time::timeout(
         Duration::from_secs(5),
         execute_tool_calls(
@@ -685,4 +685,106 @@ async fn the_production_allowances_are_the_documented_ones() {
     let limits = super::turn_budget_limits(&session);
     assert_eq!(limits.tool_calls, 1024);
     assert_eq!(limits.exec_calls, 128);
+}
+
+// ---------------------------------------------------------------------------
+// One tool result, two consumers: the model is bounded, the hooks are not.
+// ---------------------------------------------------------------------------
+
+mod consumers {
+    use super::*;
+
+    /// A result over the hard cap whose three landmarks sit in the three regions
+    /// a head+tail cut distinguishes: `BEGIN` in the head, `CUTAWAY` in the part
+    /// the cap drops, `TAIL` in the tail.
+    ///
+    /// The marker is placed on the 2/3 boundary because that is where the cut
+    /// lands. Anywhere else and it proves nothing: a marker in the head or the
+    /// tail survives a correct cut, and one past the end was never inside the
+    /// payload. `h` and `t` fill the two regions the cut keeps, so the same
+    /// string also asserts that both ends survive.
+    fn oversized() -> String {
+        const MARKER: &str = "CUTAWAY";
+        let total = MAX_TOOL_OUTPUT_BYTES + 4_096;
+        let marker_at = total * 2 / 3;
+        let mut out = String::with_capacity(total);
+        out.push_str("BEGIN");
+        out.push_str(&"h".repeat(marker_at - out.len() - MARKER.len()));
+        out.push_str(MARKER);
+        out.push_str(&"t".repeat(total - out.len() - "TAIL".len()));
+        out.push_str("TAIL");
+        out
+    }
+
+    fn hook_content(payload: &serde_json::Value) -> &str {
+        payload["content"].as_str().expect("content is a string")
+    }
+
+    #[test]
+    fn the_hook_sees_the_whole_result_and_the_model_the_slice() {
+        let full = oversized();
+        let (for_model, payload) = split_result_for_consumers(full.clone(), false);
+
+        // The hook gets the truth: every byte, including the stretch the model
+        // will never see.
+        assert_eq!(hook_content(&payload), full, "the hook must not be capped");
+        assert!(
+            hook_content(&payload).contains("CUTAWAY"),
+            "the part the model cannot see is exactly what the hook is for"
+        );
+
+        // The model gets a bounded head+tail slice, and is told it is one.
+        assert!(
+            for_model.len() <= MAX_TOOL_OUTPUT_BYTES,
+            "model copy is {} bytes, cap is {MAX_TOOL_OUTPUT_BYTES}",
+            for_model.len()
+        );
+        assert!(for_model.contains("output truncated"), "needs a marker");
+        assert!(
+            !for_model.contains("CUTAWAY"),
+            "the dropped stretch must actually be gone, or the cut is not happening"
+        );
+        assert!(
+            for_model.starts_with("BEGIN") && for_model.ends_with("TAIL"),
+            "a head+tail cut keeps both ends: the model needs the end of the output \
+             as much as its start, and dropping it would hide why the call finished"
+        );
+    }
+
+    #[test]
+    fn the_hook_is_told_where_the_models_copy_was_cut() {
+        let (_, payload) = split_result_for_consumers(oversized(), false);
+        assert_eq!(
+            payload["truncated_for_model_at_bytes"],
+            json!(MAX_TOOL_OUTPUT_BYTES),
+            "a hook that cannot see a cut cannot tell it missed data"
+        );
+    }
+
+    #[test]
+    fn an_uncut_result_carries_no_truncation_note() {
+        let (_, payload) = split_result_for_consumers("small result".to_string(), true);
+        assert_eq!(hook_content(&payload), "small result");
+        assert_eq!(payload["is_error"], json!(true));
+        assert!(
+            payload.get("truncated_for_model_at_bytes").is_none(),
+            "no cut happened, so claiming one would make the note a lie"
+        );
+    }
+
+    #[test]
+    fn the_uncut_result_reaches_the_model_unchanged() {
+        let (for_model, _) = split_result_for_consumers("exact".to_string(), false);
+        assert_eq!(for_model, "exact", "an under-cap result is not a slice");
+    }
+
+    #[test]
+    fn is_error_survives_the_split() {
+        let (_, payload) = split_result_for_consumers(oversized(), true);
+        assert_eq!(
+            payload["is_error"],
+            json!(true),
+            "a failed oversized call is precisely what a post_tool_use hook greps for"
+        );
+    }
 }

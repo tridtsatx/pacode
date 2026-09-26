@@ -392,24 +392,33 @@ impl Core {
     }
 
     /// Re-read config (api keys, providers, defaults) for NEW sessions. Existing
-    /// sessions keep their registry. Called by the daemon on every `Attach`.
+    /// sessions keep the provider instances they already resolved. Called by the
+    /// daemon on every `Attach`.
+    ///
+    /// The registry is reloaded **in place** rather than replaced. Replacing the
+    /// `Arc` would swap the provider out from under a running turn and would drop
+    /// the shared [`pacode_provider::CatalogCache`] along with it, refetching every
+    /// catalog; `ProviderRegistry::reload` rebuilds only the entries whose config
+    /// changed and keeps the cache. Per the registry's own contract, a turn that
+    /// already holds a provider keeps that instance until it finishes and only
+    /// new lookups see the new world.
     pub fn reload_config(
         &self,
         config: Config,
         api_keys: &std::collections::BTreeMap<String, Option<String>>,
     ) -> Result<(), CoreError> {
-        let mut registry = ProviderRegistry::from_config(&config, api_keys)?;
-        // keep a mock provider inserted at startup (tests/smoke)
-        if let Some(mock) = self.providers().get("mock") {
-            registry.insert(mock);
-            if registry.default_route().is_none() {
-                registry
-                    .set_default_route(Some(pacode_types::ModelRoute::new("mock", "mock-model")));
-            }
-        }
-        if let Ok(mut p) = self.providers.write() {
-            *p = Arc::new(registry);
-        }
+        let auth = self.load_auth_store();
+        let report = self
+            .providers()
+            .reload(&config, api_keys, Some(&auth))
+            .map_err(CoreError::Provider)?;
+        log::debug!(
+            "config reloaded: {} added, {} rebuilt, {} removed, {} unchanged",
+            report.added.len(),
+            report.rebuilt.len(),
+            report.removed.len(),
+            report.unchanged.len()
+        );
         if let Ok(mut c) = self.config.write() {
             *c = Arc::new(config);
         }

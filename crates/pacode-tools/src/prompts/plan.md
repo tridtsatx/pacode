@@ -1,0 +1,1 @@
+Maintain the visible plan for multi-step work. `set` replaces the whole list (keep ids stable when re-setting); `update` changes one item's status and/or progress. Exactly one item should be `active` at a time. Report `progress` (0-100) only when you can measure it.

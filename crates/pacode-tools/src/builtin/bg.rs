@@ -6,11 +6,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "bg";
 
-pub struct BgTool;
+/// Model-facing description; see `prompts/bg.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/bg.md");
+
+#[derive(Default)]
+pub struct BgTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -31,10 +37,10 @@ impl Tool for BgTool {
     }
 
     fn description(&self) -> &str {
-        "Manage background tasks; `progress` reports current/total or percent for a \
-         task you are supervising. A finished task's completion is delivered to you \
-         automatically as a message — continue working or end your turn rather than \
-         polling."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

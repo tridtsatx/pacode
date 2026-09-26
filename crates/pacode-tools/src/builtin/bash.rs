@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WaitOutcome};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WaitOutcome};
 
 #[path = "ssh_multiplex.rs"]
 mod ssh_multiplex;
@@ -17,7 +17,13 @@ mod ssh_multiplex_tests;
 
 pub const NAME: &str = "bash";
 
-pub struct BashTool;
+/// Model-facing description; see `prompts/bash.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/bash.md");
+
+#[derive(Default)]
+pub struct BashTool {
+    definition: DefinitionCache,
+}
 
 /// `pub(crate)` so `batch` can reuse the validated shape for its bash ops.
 #[derive(Deserialize, Default)]
@@ -36,11 +42,10 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in the working directory. Long commands (builds, tests, \
-         servers) should use `background: true`, or they are moved to the background \
-         automatically after a few seconds: you then get a task id, keep working, and \
-         a notification arrives when the task finishes. Use `bg` to check, wait for, \
-         or kill tasks. Output above the cap is cut head+tail."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

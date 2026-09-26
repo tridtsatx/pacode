@@ -20,7 +20,7 @@ async fn a_limit_cut_listing_ends_with_the_continuation_offset() {
         .expect("write");
     let ctx = ctx_in(tmp.path());
 
-    let out = ReadTool
+    let out = ReadTool::default()
         .call(json!({"path": "f.txt", "offset": 3, "limit": 4}), &ctx)
         .await
         .expect("read");
@@ -34,7 +34,7 @@ async fn a_limit_cut_listing_ends_with_the_continuation_offset() {
     );
 
     // Reading to the end of the file appends nothing.
-    let out = ReadTool
+    let out = ReadTool::default()
         .call(json!({"path": "f.txt", "offset": 7}), &ctx)
         .await
         .expect("read tail");
@@ -46,7 +46,7 @@ async fn a_limit_cut_listing_ends_with_the_continuation_offset() {
     );
 
     // An offset past the end has nothing to continue into either.
-    let out = ReadTool
+    let out = ReadTool::default()
         .call(json!({"path": "f.txt", "offset": 50}), &ctx)
         .await
         .expect("read past end");
@@ -65,7 +65,7 @@ async fn a_single_remaining_line_is_singular() {
         .expect("write");
     let ctx = ctx_in(tmp.path());
 
-    let out = ReadTool
+    let out = ReadTool::default()
         .call(json!({"path": "f.txt", "limit": 1}), &ctx)
         .await
         .expect("read");
@@ -84,7 +84,7 @@ async fn a_file_without_a_trailing_newline_still_yields_its_last_line() {
         .expect("write");
     let ctx = ctx_in(tmp.path());
 
-    let out = ReadTool
+    let out = ReadTool::default()
         .call(json!({"path": "f.txt"}), &ctx)
         .await
         .expect("read");
@@ -109,14 +109,14 @@ async fn carriage_returns_are_stripped_and_empty_files_read_empty() {
         .expect("write");
     let ctx = ctx_in(tmp.path());
 
-    let out = ReadTool
+    let out = ReadTool::default()
         .call(json!({"path": "crlf.txt"}), &ctx)
         .await
         .expect("read");
     assert!(out.content.contains("     1\ta\n"), "{:?}", out.content);
     assert!(!out.content.contains('\r'), "{:?}", out.content);
 
-    let out = ReadTool
+    let out = ReadTool::default()
         .call(json!({"path": "empty.txt"}), &ctx)
         .await
         .expect("read");
@@ -141,7 +141,7 @@ async fn a_scan_cut_by_the_cap_says_so_and_never_shows_half_a_line() {
 
     // `accept_large_output` skips the char cap, so what is left is exactly what
     // the scan produced: a leaked fragment here would be a half-read line.
-    let out = ReadTool
+    let out = ReadTool::default()
         .call(
             json!({"path": "huge.txt", "accept_large_output": true}),
             &ctx,
@@ -173,7 +173,7 @@ async fn a_scan_cut_by_the_cap_says_so_and_never_shows_half_a_line() {
         );
     }
 
-    let capped = ReadTool
+    let capped = ReadTool::default()
         .call(json!({"path": "huge.txt"}), &ctx)
         .await
         .expect("read");
@@ -199,7 +199,7 @@ async fn a_non_regular_file_is_refused_before_it_can_block() {
 
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        ReadTool.call(json!({"path": "pipe"}), &ctx),
+        ReadTool::default().call(json!({"path": "pipe"}), &ctx),
     )
     .await
     .expect("read must not hang on a fifo")

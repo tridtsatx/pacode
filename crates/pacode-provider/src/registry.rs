@@ -1,6 +1,6 @@
 //! `ProviderRegistry`: `provider/model` routes → provider instances.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -8,18 +8,64 @@ use std::sync::{Arc, RwLock};
 
 use pacode_auth::store::{Account, AuthStore};
 use pacode_types::{
-    Config, ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, ProviderKind,
+    Config, ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, ProviderDialect,
+    ProviderKind,
 };
 
 use crate::catalog_cache::{
     CatalogCache, DEFAULT_CATALOG_TTL_SECS, DEFAULT_MAX_MODELS_PER_PROVIDER,
 };
-use crate::openai_compat::OpenAiCompat;
+use crate::dialect::{DialectContext, base_url_optional};
 use crate::{Provider, ProviderError};
+
+pub use crate::dialect::{DialectFactory, known_dialects};
 
 #[cfg(test)]
 #[path = "registry_tests.rs"]
 mod registry_tests;
+
+#[cfg(test)]
+#[path = "declarative_tests.rs"]
+mod declarative_tests;
+
+/// The reported effect of a [`ProviderRegistry::reload`], so a caller can log
+/// or surface what a config write actually changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReloadReport {
+    /// Providers whose entry changed, so their transport was rebuilt.
+    pub rebuilt: Vec<String>,
+    /// Providers that appeared in the config.
+    pub added: Vec<String>,
+    /// Providers dropped from the registry because the config no longer has
+    /// them.
+    pub removed: Vec<String>,
+    /// Providers left untouched (identical entry, same credential).
+    pub unchanged: Vec<String>,
+}
+
+impl ReloadReport {
+    pub fn is_noop(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.rebuilt.is_empty()
+    }
+
+    /// One line for the log; empty when nothing changed.
+    pub fn summary(&self) -> String {
+        if self.is_noop() {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        for (label, ids) in [
+            ("added", &self.added),
+            ("rebuilt", &self.rebuilt),
+            ("removed", &self.removed),
+        ] {
+            if !ids.is_empty() {
+                parts.push(format!("{label}: {}", ids.join(", ")));
+            }
+        }
+        parts.join("; ")
+    }
+}
 
 pub type TokenRefresher = Arc<
     dyn Fn(&str) -> Pin<Box<dyn Future<Output = Result<String, ProviderError>> + Send>>
@@ -158,158 +204,35 @@ pub fn synthesize_builtin_providers(
     }
 }
 
-fn build_transport(
-    id: &str,
-    pcfg: &ProviderConfig,
-    defaults: &ProviderDefaults,
-    pricing: &BTreeMap<String, Pricing>,
-    credential: &ResolvedCredential,
-) -> Result<Arc<dyn Provider>, ProviderError> {
-    match pcfg.kind {
-        ProviderKind::OpenAi => {
-            let api_key = credential.api_key().map(String::from);
-            let provider = OpenAiCompat::new(
-                id.to_string(),
-                pcfg.clone(),
-                defaults.clone(),
-                api_key,
-                pricing.clone(),
-            )?;
-            Ok(Arc::new(provider))
-        }
-        ProviderKind::Anthropic => match credential {
-            ResolvedCredential::StoreOAuth(acc) => {
-                let provider = crate::anthropic::Anthropic::from_oauth(
-                    id.to_string(),
-                    pcfg.clone(),
-                    defaults.clone(),
-                    acc.access.clone(),
-                    pricing.clone(),
-                )?;
-                Ok(Arc::new(provider))
-            }
-            _ => {
-                let api_key = credential.api_key().map(String::from);
-                let provider = crate::anthropic::Anthropic::from_api_key(
-                    id.to_string(),
-                    pcfg.clone(),
-                    defaults.clone(),
-                    api_key,
-                    pricing.clone(),
-                )?;
-                Ok(Arc::new(provider))
-            }
-        },
-        ProviderKind::Codex => match credential {
-            ResolvedCredential::StoreOAuth(acc) => {
-                let tokens = crate::codex::CodexOAuthTokens {
-                    access_token: acc.access.clone(),
-                    refresh_token: acc.refresh.clone(),
-                    id_token: acc
-                        .extra
-                        .get("id_token")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    account_id: acc
-                        .extra
-                        .get("account_id")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                };
-                let auth = crate::codex::CodexAuth::oauth_tokens(tokens);
-                let provider = crate::codex::Codex::new(
-                    id.to_string(),
-                    pcfg.clone(),
-                    defaults.clone(),
-                    Some(auth),
-                    pricing.clone(),
-                )?;
-                Ok(Arc::new(provider))
-            }
-            _ => {
-                let api_key = credential.api_key().map(String::from);
-                let provider = crate::codex::Codex::from_api_key(
-                    id.to_string(),
-                    pcfg.clone(),
-                    defaults.clone(),
-                    api_key,
-                    pricing.clone(),
-                )?;
-                Ok(Arc::new(provider))
-            }
-        },
-        ProviderKind::Devin => {
-            // The Devin credential is a pair: the stored key plus the session token the
-            // login handed out. `api_server_url` is per account, so it comes from the
-            // credential rather than from the static config.
-            let (api_key, session_token, api_server_url) = match credential {
-                ResolvedCredential::StoreOAuth(acc) => {
-                    let extra =
-                        |k: &str| acc.extra.get(k).and_then(|v| v.as_str()).map(String::from);
-                    (
-                        Some(acc.access.clone()),
-                        extra("session_token").or_else(|| Some(acc.access.clone())),
-                        extra("api_server_url"),
-                    )
-                }
-                _ => (credential.api_key().map(String::from), None, None),
-            };
-            let provider = crate::devin::Devin::new(
-                id.to_string(),
-                pcfg.clone(),
-                defaults.clone(),
-                api_key,
-                session_token,
-                api_server_url,
-                pricing.clone(),
-            )?;
-            Ok(Arc::new(provider))
-        }
-        ProviderKind::OpenCode => {
-            // OpenCode Zen: OpenAI-compatible with `api_key = "public"` and
-            // opencode-specific headers injected via ProviderConfig.headers.
-            // Uses OpenCodeProvider which fetches models from api.json catalog.
-            let api_key = credential
-                .api_key()
-                .map(String::from)
-                .or_else(|| Some("public".to_string()));
-            let provider = crate::opencode::OpenCodeProvider::new(
-                id.to_string(),
-                pcfg.clone(),
-                defaults.clone(),
-                api_key,
-                pricing.clone(),
-            )?;
-            Ok(Arc::new(provider))
-        }
-    }
-}
-
 /// Inject the OpenCode Zen free-tier provider unconditionally.
 ///
 /// The free tier uses `api_key = "public"` and opencode-specific headers.
 /// No credentials are needed; this runs even without an AuthStore.
+///
+/// The session/request ids are drawn once per process, not once per call:
+/// they are already documented as process-stable, and generating them here
+/// would make the synthesized entry differ on every call. Hot reload compares
+/// entries by value, so a fresh id each time would rebuild the provider — and
+/// drop its catalog — on every config write, forever.
 pub fn synthesize_opencode(providers: &mut BTreeMap<String, ProviderConfig>) {
     if providers.contains_key("opencode") {
         return;
     }
+    static SESSION_ID: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(crate::opencode::random_hex_id);
+    static REQUEST_ID: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(crate::opencode::random_hex_id);
+
     let mut headers = BTreeMap::new();
     headers.insert(
         "User-Agent".to_string(),
         format!("opencode/{}", crate::opencode::OPENCODE_VERSION),
     );
     headers.insert("x-opencode-client".to_string(), "cli".to_string());
-    // Session and request IDs are expected by the Zen server.
     // Session ID is stable per pacode process; request ID is static here
     // but the server does not enforce uniqueness per-request.
-    headers.insert(
-        "x-opencode-session".to_string(),
-        crate::opencode::random_hex_id(),
-    );
-    headers.insert(
-        "x-opencode-request".to_string(),
-        crate::opencode::random_hex_id(),
-    );
+    headers.insert("x-opencode-session".to_string(), SESSION_ID.clone());
+    headers.insert("x-opencode-request".to_string(), REQUEST_ID.clone());
     providers.insert(
         "opencode".to_string(),
         ProviderConfig {
@@ -323,10 +246,29 @@ pub fn synthesize_opencode(providers: &mut BTreeMap<String, ProviderConfig>) {
     );
 }
 
+/// The route a session opens with when nothing names one explicitly.
+///
+/// `[provider].default` wins, as it always has. When it is absent, a provider
+/// that declares a `default_model` supplies both halves of the route — that is
+/// the whole point of declaring it: a new provider becomes the default for its
+/// own model without a second edit. Ties between such providers go to the
+/// higher `priority`, then the alphabetically first id.
+pub fn resolve_default_route(cfg: &Config) -> Option<ModelRoute> {
+    if let Some(route) = cfg.default_route() {
+        return Some(route);
+    }
+    let id = cfg.default_provider()?;
+    let model = cfg
+        .providers
+        .get(id)
+        .and_then(ProviderConfig::default_model)?;
+    Some(ModelRoute::new(id, model))
+}
+
 #[derive(Clone)]
 pub struct ProviderRegistry {
     providers: Arc<RwLock<BTreeMap<String, Arc<dyn Provider>>>>,
-    default_route: Option<ModelRoute>,
+    default_route: Arc<RwLock<Option<ModelRoute>>>,
     catalog_cache: Arc<CatalogCache>,
     configs: Arc<RwLock<BTreeMap<String, ProviderConfig>>>,
     defaults: Arc<RwLock<ProviderDefaults>>,
@@ -336,13 +278,18 @@ pub struct ProviderRegistry {
     /// the same file the registry was built from rather than a global default.
     auth_path: Option<std::path::PathBuf>,
     token_refresher: Option<TokenRefresher>,
+    /// Ids registered by the host rather than by config (`insert`), which a
+    /// [`ProviderRegistry::reload`] must not drop: they exist in no config file,
+    /// so "absent from the config" says nothing about whether they are still
+    /// wanted. See [`ProviderRegistry::insert`].
+    pinned: Arc<RwLock<BTreeSet<String>>>,
 }
 
 impl ProviderRegistry {
     pub fn empty() -> Self {
         Self {
             providers: Arc::new(RwLock::new(BTreeMap::new())),
-            default_route: None,
+            default_route: Arc::new(RwLock::new(None)),
             catalog_cache: Arc::new(CatalogCache::new(
                 None,
                 DEFAULT_CATALOG_TTL_SECS,
@@ -354,6 +301,7 @@ impl ProviderRegistry {
             store_providers: Arc::new(RwLock::new(BTreeMap::new())),
             auth_path: None,
             token_refresher: None,
+            pinned: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -395,7 +343,7 @@ impl ProviderRegistry {
             let credential = resolve_provider_credential(&id, &pcfg, api_keys, store);
 
             // Devin api_server_url from extra if base_url is empty
-            if pcfg.kind == ProviderKind::Devin
+            if pcfg.effective_dialect() == ProviderDialect::Devin
                 && pcfg.base_url.trim().is_empty()
                 && let ResolvedCredential::StoreOAuth(acc) = &credential
                 && let Some(url) = acc.extra.get("api_server_url").and_then(|v| v.as_str())
@@ -403,7 +351,7 @@ impl ProviderRegistry {
                 pcfg.base_url = url.to_string();
             }
 
-            if pcfg.base_url.trim().is_empty() && pcfg.kind != ProviderKind::Codex {
+            if pcfg.base_url.trim().is_empty() && !base_url_optional(pcfg.effective_dialect()) {
                 return Err(ProviderError::Config(format!(
                     "provider '{id}' has empty base_url"
                 )));
@@ -415,9 +363,13 @@ impl ProviderRegistry {
 
             configs.insert(id.clone(), pcfg.clone());
 
-            match build_transport(&id, &pcfg, &cfg.provider, &cfg.pricing, &credential) {
+            let ctx = DialectContext {
+                defaults: cfg.provider.clone(),
+                pricing: cfg.pricing.clone(),
+            };
+            match crate::dialect::build_transport(&id, &pcfg, &ctx, &credential) {
                 Ok(provider) => {
-                    registry.insert(provider);
+                    registry.insert_unpinned(provider);
                 }
                 Err(e) => {
                     // Guarded Devin: if explicitly configured, return error; if synthesized, skip
@@ -435,7 +387,7 @@ impl ProviderRegistry {
             .unwrap_or_else(|p| p.into_inner()) = store_providers;
         *registry.defaults.write().unwrap_or_else(|p| p.into_inner()) = cfg.provider.clone();
         *registry.pricing.write().unwrap_or_else(|p| p.into_inner()) = cfg.pricing.clone();
-        registry.set_default_route(cfg.default_route());
+        registry.set_default_route(resolve_default_route(cfg));
         Ok(registry)
     }
 
@@ -446,6 +398,135 @@ impl ProviderRegistry {
     pub fn with_catalog_cache(mut self, cache: Arc<CatalogCache>) -> Self {
         self.catalog_cache = cache;
         self
+    }
+
+    /// Apply a new config in place: rebuild the providers whose entry changed,
+    /// add the new ones, drop the ones that are gone, and report what moved.
+    ///
+    /// The in-flight turn is not disturbed. A session already holding
+    /// `Arc<dyn Provider>` for a removed provider keeps that instance until it
+    /// finishes, and only *new* `get` calls see the new world — the same
+    /// guarantee that lets a `Codex` token refresh swap a transport underneath
+    /// a running turn. Swapping the whole registry instead would silently
+    /// change the provider mid-conversation, and would also throw away the
+    /// shared [`CatalogCache`], so every catalog would be refetched.
+    ///
+    /// A provider that cannot be built does not abort the reload: the rest of
+    /// the config still applies, and the error is returned so the caller can
+    /// surface it. A single bad entry must not take every other provider down
+    /// with it.
+    pub fn reload(
+        &self,
+        cfg: &Config,
+        api_keys: &BTreeMap<String, Option<String>>,
+        store: Option<&AuthStore>,
+    ) -> Result<ReloadReport, ProviderError> {
+        let mut all_providers = cfg.providers.clone();
+        if let Some(store) = store {
+            synthesize_builtin_providers(&mut all_providers, store);
+        }
+        synthesize_opencode(&mut all_providers);
+
+        let old_configs = self
+            .configs
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+
+        let ctx = DialectContext {
+            defaults: cfg.provider.clone(),
+            pricing: cfg.pricing.clone(),
+        };
+        let mut report = ReloadReport::default();
+        let mut next_configs = BTreeMap::new();
+        let mut next_store_providers = BTreeMap::new();
+
+        for (id, mut pcfg) in all_providers {
+            let credential = resolve_provider_credential(&id, &pcfg, api_keys, store);
+
+            if pcfg.effective_dialect() == ProviderDialect::Devin
+                && pcfg.base_url.trim().is_empty()
+                && let ResolvedCredential::StoreOAuth(acc) = &credential
+                && let Some(url) = acc.extra.get("api_server_url").and_then(|v| v.as_str())
+            {
+                pcfg.base_url = url.to_string();
+            }
+
+            if let ResolvedCredential::StoreOAuth(acc) = &credential {
+                next_store_providers.insert(id.clone(), acc.access.clone());
+            }
+            next_configs.insert(id.clone(), pcfg.clone());
+
+            let unchanged = old_configs.get(&id) == Some(&pcfg);
+            if unchanged
+                && self
+                    .providers
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(&id)
+            {
+                // A config entry of this id owns the slot even when it did not
+                // change: the pin that protected a host-registered shim no longer
+                // applies, so a later reload may drop it if the entry goes away.
+                self.unpin(&id);
+                report.unchanged.push(id);
+                continue;
+            }
+
+            match crate::dialect::build_transport(&id, &pcfg, &ctx, &credential) {
+                Ok(provider) => {
+                    // A config entry of this id now owns the slot: the pin that
+                    // protected a host-registered shim no longer applies, so a
+                    // later reload may drop it again if the entry goes away.
+                    self.unpin(&id);
+                    self.insert_unpinned(provider);
+                    // A changed entry may answer `/models` differently now, and a
+                    // new one may shadow an id that was absent. Either way the
+                    // cached list belongs to the old config.
+                    self.catalog_cache.invalidate(&id);
+                    if old_configs.contains_key(&id) {
+                        report.rebuilt.push(id);
+                    } else {
+                        report.added.push(id);
+                    }
+                }
+                Err(e) => {
+                    if cfg.providers.contains_key(&id) {
+                        return Err(e);
+                    }
+                    // A synthesized entry that will not build is not a config
+                    // error: the account it needs is simply not logged in.
+                    report.removed.push(id);
+                }
+            }
+        }
+
+        {
+            let mut providers = self.providers.write().unwrap_or_else(|p| p.into_inner());
+            let gone: Vec<String> = providers
+                .keys()
+                .filter(|id| !next_configs.contains_key(*id) && !self.is_pinned(id))
+                .cloned()
+                .collect();
+            for id in gone {
+                providers.remove(&id);
+                self.catalog_cache.invalidate(&id);
+                report.removed.push(id);
+            }
+        }
+
+        report.removed.sort_unstable();
+        report.removed.dedup();
+
+        *self.configs.write().unwrap_or_else(|p| p.into_inner()) = next_configs;
+        *self
+            .store_providers
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = next_store_providers;
+        *self.defaults.write().unwrap_or_else(|p| p.into_inner()) = cfg.provider.clone();
+        *self.pricing.write().unwrap_or_else(|p| p.into_inner()) = cfg.pricing.clone();
+        self.apply_default_route(resolve_default_route(cfg));
+        Ok(report)
     }
 
     pub fn catalog_cache(&self) -> Arc<CatalogCache> {
@@ -465,19 +546,75 @@ impl ProviderRegistry {
         let _ = self.list_all_models().await;
     }
 
+    /// Register a provider the host owns rather than one the config declares —
+    /// a mock in tests and smoke mode, or a process-local shim. The entry is
+    /// *pinned*: a later [`ProviderRegistry::reload`] leaves it alone, because
+    /// the config it is absent from is not evidence that it went away.
+    ///
+    /// A config entry of the same id still wins on the next reload: the reload
+    /// rebuilds from config and unpins, so an explicit declaration takes over
+    /// the shim it shadows.
     pub fn insert(&mut self, provider: Arc<dyn Provider>) {
+        self.insert_unpinned(provider.clone());
+        self.pin(provider.id());
+    }
+
+    /// Store a provider without pinning it — the config-driven path, where the
+    /// entry's presence in the config is what decides its lifetime. `insert`
+    /// pins; this does not, and only the config path may use it.
+    fn insert_unpinned(&self, provider: Arc<dyn Provider>) {
         self.providers
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .insert(provider.id().to_string(), provider);
     }
 
-    pub fn set_default_route(&mut self, route: Option<ModelRoute>) {
-        self.default_route = route;
+    fn pin(&self, id: &str) {
+        self.pinned
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string());
     }
 
-    pub fn default_route(&self) -> Option<&ModelRoute> {
-        self.default_route.as_ref()
+    fn unpin(&self, id: &str) {
+        self.pinned
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
+    }
+
+    /// Set the default route outright, including to `None`.
+    pub fn set_default_route(&self, route: Option<ModelRoute>) {
+        *self
+            .default_route
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = route;
+    }
+
+    /// Apply the route a config resolves to, but only when it resolves to
+    /// something. A config that names no route must not erase a route the host
+    /// installed itself (`PACODE_SMOKE` mock, tests): an open session resolves
+    /// through the registry first, and a config that simply says nothing about
+    /// the default is not a request to drop it.
+    fn apply_default_route(&self, resolved: Option<ModelRoute>) {
+        if let Some(route) = resolved {
+            self.set_default_route(Some(route));
+        }
+    }
+
+    /// Whether `id` was registered by the host and so survives a reload.
+    fn is_pinned(&self, id: &str) -> bool {
+        self.pinned
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(id)
+    }
+
+    pub fn default_route(&self) -> Option<ModelRoute> {
+        self.default_route
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn Provider>> {
@@ -490,7 +627,47 @@ impl ProviderRegistry {
 
     /// Resolve route to provider. Before a turn uses a provider whose credential
     /// came from the store, `access_token` is consulted so an expired token is refreshed.
+    ///
+    /// When the named provider is gone from the config (a hot reload dropped it)
+    /// or its credential cannot be used, the walk follows that provider's
+    /// `fallbacks` and the same for each one after it, in declaration order. A
+    /// provider already visited is never revisited, so a cycle in the config
+    /// terminates instead of looping; the first error is what the caller sees
+    /// if nothing in the chain can serve the route.
     pub async fn resolve(&self, route: &ModelRoute) -> Result<Arc<dyn Provider>, ProviderError> {
+        let mut current = route.clone();
+        let mut visited: Vec<String> = Vec::new();
+        loop {
+            if let Some(provider) = self.resolve_one(&current).await {
+                return Ok(provider);
+            }
+            let next = self
+                .fallback_for(&current.provider)
+                .filter(|id| !visited.iter().any(|seen| seen == id));
+            match next {
+                Some(id) => {
+                    visited.push(current.provider.clone());
+                    log::warn!(
+                        "provider '{}' cannot serve {}; falling back to '{id}'",
+                        current.provider,
+                        current.model
+                    );
+                    current = ModelRoute::new(id, current.model.clone());
+                }
+                None => {
+                    return Err(ProviderError::Config(format!(
+                        "unknown provider '{}'",
+                        route.provider
+                    )));
+                }
+            }
+        }
+    }
+
+    /// The single-provider half of [`Self::resolve`], with the store-refresh
+    /// step. `None` means "this provider cannot serve the route right now", not
+    /// an error: a hot reload may have dropped it between turns.
+    async fn resolve_one(&self, route: &ModelRoute) -> Option<Arc<dyn Provider>> {
         let is_store = {
             let guard = self
                 .store_providers
@@ -503,7 +680,10 @@ impl ProviderRegistry {
             let fresh_token = if let Some(refresher) = &self.token_refresher {
                 match refresher(&route.provider).await {
                     Ok(token) => Some(token),
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        log::warn!("credential refresh for '{}' failed: {e}", route.provider);
+                        None
+                    }
                 }
             } else {
                 // No seam installed: go through the auth crate so an expired OAuth
@@ -512,10 +692,8 @@ impl ProviderRegistry {
                 match self.refresh_from_store(&route.provider).await {
                     Ok(token) => Some(token),
                     Err(e) => {
-                        return Err(ProviderError::Config(format!(
-                            "credentials for '{}' are unusable: {e}",
-                            route.provider
-                        )));
+                        log::warn!("credentials for '{}' are unusable: {e}", route.provider);
+                        None
                     }
                 }
             };
@@ -529,15 +707,27 @@ impl ProviderRegistry {
                     guard.get(&route.provider).cloned()
                 };
 
-                if current_token.as_deref() != Some(&token) {
-                    self.rebuild_provider_with_token(&route.provider, &token)?;
+                if current_token.as_deref() != Some(&token)
+                    && let Err(e) = self.rebuild_provider_with_token(&route.provider, &token)
+                {
+                    log::warn!(
+                        "rebuilding provider '{}' with a fresh token failed: {e}",
+                        route.provider
+                    );
+                    return None;
                 }
             }
         }
 
-        let prov_id = &route.provider;
-        self.get(prov_id)
-            .ok_or_else(|| ProviderError::Config(format!("unknown provider '{prov_id}'")))
+        self.get(&route.provider)
+    }
+
+    /// The first fallback of `id` that is not already being tried.
+    fn fallback_for(&self, id: &str) -> Option<String> {
+        let configs = self.configs.read().unwrap_or_else(|p| p.into_inner());
+        configs
+            .get(id)
+            .and_then(|cfg| cfg.fallbacks.first().cloned())
     }
 
     /// Refresh the stored credential of `provider` against the credential file this
@@ -591,7 +781,8 @@ impl ProviderRegistry {
         };
         let credential = ResolvedCredential::StoreOAuth(account);
 
-        let provider = build_transport(id, &pcfg, &defaults, &pricing, &credential)?;
+        let ctx = DialectContext { defaults, pricing };
+        let provider = crate::dialect::build_transport(id, &pcfg, &ctx, &credential)?;
         self.providers
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -638,7 +829,7 @@ impl ProviderRegistry {
 
         let credential = resolve_provider_credential(id, &pcfg, &BTreeMap::new(), Some(store));
         if let ResolvedCredential::StoreOAuth(acc) = &credential {
-            if pcfg.kind == ProviderKind::Devin
+            if pcfg.effective_dialect() == ProviderDialect::Devin
                 && pcfg.base_url.trim().is_empty()
                 && let Some(url) = acc.extra.get("api_server_url").and_then(|v| v.as_str())
             {
@@ -663,7 +854,8 @@ impl ProviderRegistry {
             }
         }
 
-        match build_transport(id, &pcfg, &defaults, &pricing, &credential) {
+        let ctx = DialectContext { defaults, pricing };
+        match crate::dialect::build_transport(id, &pcfg, &ctx, &credential) {
             Ok(provider) => {
                 self.providers
                     .write()
@@ -673,7 +865,7 @@ impl ProviderRegistry {
                 Ok(())
             }
             Err(e) => {
-                if pcfg.kind == ProviderKind::Devin {
+                if pcfg.effective_dialect() == ProviderDialect::Devin {
                     Ok(())
                 } else {
                     Err(e)
@@ -692,14 +884,56 @@ impl ProviderRegistry {
     }
 
     /// Parse user input (`/model`, CLI, config) into a route.
+    ///
+    /// A bare model id that some provider names as its `default_model` lands on
+    /// that provider, which is what makes a declaratively added provider usable
+    /// without also editing `[provider].default`. Otherwise the default route
+    /// decides, and finally the first provider in configured order.
     pub fn parse_route(&self, s: &str) -> Option<ModelRoute> {
         let ids = self.ids();
+        let trimmed = s.trim();
+        if !trimmed.is_empty()
+            && !trimmed.contains('/')
+            && let Some(provider) = self.provider_for_model(trimmed)
+        {
+            return Some(ModelRoute::new(provider, trimmed));
+        }
         let fallback = self
-            .default_route
-            .as_ref()
-            .map(|r| r.provider.as_str())
-            .or_else(|| ids.first().map(String::as_str));
-        ModelRoute::parse(s, ids.iter().map(String::as_str), fallback)
+            .default_route()
+            .map(|r| r.provider)
+            .or_else(|| self.ordered_ids().into_iter().next());
+        ModelRoute::parse(trimmed, ids.iter().map(String::as_str), fallback.as_deref())
+    }
+
+    /// The highest-priority provider that names `model` as its `default_model`.
+    fn provider_for_model(&self, model: &str) -> Option<String> {
+        // The order is taken first and the lock dropped: `ordered_ids` takes the
+        // same `configs` lock, and `std::sync::RwLock` is not reentrant, so
+        // holding it across that call can park a reader behind a waiting writer.
+        let ordered = self.ordered_ids();
+        let configs = self.configs.read().unwrap_or_else(|p| p.into_inner());
+        ordered.into_iter().find(|id| {
+            configs
+                .get(id)
+                .and_then(ProviderConfig::default_model)
+                .is_some_and(|declared| declared == model)
+        })
+    }
+
+    /// Provider ids in the order a bare name should try them: highest
+    /// `priority` first, alphabetically otherwise. Mirrors
+    /// [`pacode_types::Config::provider_order`] for the in-memory registry, which
+    /// also holds synthesized entries that are in no config file.
+    ///
+    /// Owned strings, not borrows: the caller must be free to drop the lock
+    /// before it uses the result.
+    fn ordered_ids(&self) -> Vec<String> {
+        let configs = self.configs.read().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<(i32, &String)> = configs.iter().map(|(id, c)| (c.priority, id)).collect();
+        if ids.iter().any(|(priority, _)| *priority != 0) {
+            ids.sort_by(|(pa, a), (pb, b)| pb.cmp(pa).then_with(|| a.cmp(b)));
+        }
+        ids.into_iter().map(|(_, id)| id.clone()).collect()
     }
 
     /// Catalog of every provider (cached immediately; refreshed in background when stale).

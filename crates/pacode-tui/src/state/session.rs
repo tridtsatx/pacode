@@ -289,6 +289,12 @@ pub struct SessionUiState {
     pub pending_chord: Option<crossterm::event::KeyEvent>,
     pub turn_started_at: Option<Instant>,
     pub anim_frame: u64,
+    /// The animation clock a sweep is drawn at: elapsed time and the period
+    /// actually in force. Both halves matter — a sweep positioned off elapsed
+    /// time alone would move one cell per *nominal* tick and jump `multiplier`
+    /// cells on a degraded cadence, which is the stutter the degraded cadence
+    /// exists to prevent.
+    pub anim: pacode_render::AnimClock,
     pub phase: Option<(Phase, Instant)>,
     pub phase_elapsed_ms: u64,
     pub started_at: Instant,
@@ -346,6 +352,7 @@ impl SessionUiState {
             pending_chord: None,
             turn_started_at: None,
             anim_frame: 0,
+            anim: pacode_render::AnimClock::default(),
             phase: None,
             phase_elapsed_ms: 0,
             started_at: Instant::now(),

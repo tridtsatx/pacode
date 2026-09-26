@@ -35,6 +35,7 @@ fn make_anthropic_provider(
         extra_body,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
     Anthropic::new(
         "anthropic",
@@ -328,6 +329,7 @@ fn test_reasoning_effort_budget_mapping() {
             context_window: None,
             reasoning: Some(true),
             efforts: None,
+            ..Default::default()
         }],
         None,
         None,
@@ -827,6 +829,7 @@ async fn test_http_status_errors_and_overloaded() {
             extra_body: None,
             headers: BTreeMap::new(),
             proxy: None,
+            ..Default::default()
         };
         let defaults = ProviderDefaults {
             max_retries: 0,
@@ -884,6 +887,7 @@ async fn test_http_status_errors_and_overloaded() {
             extra_body: None,
             headers: BTreeMap::new(),
             proxy: None,
+            ..Default::default()
         };
         let defaults = ProviderDefaults {
             max_retries: 0,
@@ -1024,6 +1028,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
             context_window: Some(200_000),
             reasoning: Some(false),
             efforts: None,
+            ..Default::default()
         }],
         catalog: true,
         context_window: None,
@@ -1032,6 +1037,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = Anthropic::new(
@@ -1216,6 +1222,7 @@ fn test_anthropic_model_info_vision_and_efforts() {
             context_window: None,
             reasoning: None,
             efforts: Some(vec![Effort::Medium, Effort::XHigh]),
+            ..Default::default()
         }],
         None,
         None,

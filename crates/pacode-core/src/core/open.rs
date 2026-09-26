@@ -267,7 +267,7 @@ async fn open_session_unlocked(
                 .await;
             }
             let model_route = model
-                .or_else(|| core.providers().default_route().cloned())
+                .or_else(|| core.providers().default_route())
                 .or_else(|| core.config().default_route())
                 .ok_or(CoreError::NoModel)?;
             let effort = effort.unwrap_or(core.config().provider.effort);

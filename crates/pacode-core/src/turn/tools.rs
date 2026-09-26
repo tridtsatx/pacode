@@ -472,7 +472,9 @@ async fn run_single_tool(
         }
     };
 
-    let content = cap_output_bytes(content, MAX_TOOL_OUTPUT_BYTES).into_owned();
+    // The hooks and the model get different copies of this result; see
+    // `split_result_for_consumers` for why that split exists.
+    let (content, output_val) = split_result_for_consumers(content, is_error);
     let preview = cap_output_bytes(preview, MAX_TOOL_OUTPUT_BYTES).into_owned();
     let duration_ms = start.elapsed().as_millis() as u64;
     log::debug!(
@@ -485,10 +487,6 @@ async fn run_single_tool(
         duration_ms
     );
 
-    let output_val = serde_json::json!({
-        "content": content,
-        "is_error": is_error,
-    });
     if !cancel.is_cancelled() {
         let event = pacode_plugin::HookEvent::PostToolCall {
             name: call.name.clone(),
@@ -541,6 +539,42 @@ async fn run_single_tool(
         result: Message::tool_result(call.call_id, content, is_error),
         interrupted: cancel.is_cancelled(),
     }
+}
+
+/// Split one tool result between its two consumers, which have different needs.
+///
+/// Returns `(for_the_model, hook_payload)`.
+///
+/// **The model** is the consumer with a hard limit: it gets the capped copy and
+/// `cap_output_bytes`' own marker, which is the only thing that can tell it the
+/// result is a slice rather than a complete one.
+///
+/// **The hooks** are observers of what the tool actually did — a plugin writing
+/// a transcript, a `[hooks].post_tool_use` matcher grepping for an error deep in
+/// a 5 MiB log. Capping their copy at the model's byte cap made them blind to
+/// exactly the oversized results they exist to catch. They get the uncut string,
+/// plus `truncated_for_model_at_bytes` when the model's copy was cut, so a hook
+/// that wants the truth has it and one that wants to reproduce the model's view
+/// can.
+///
+/// The second copy is made only when there is something to copy: the oversized
+/// branch is the one that has to keep two versions, and the under-cap branch
+/// moves `content` into the payload and gives the model a borrow of it back.
+fn split_result_for_consumers(content: String, is_error: bool) -> (String, serde_json::Value) {
+    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
+        let model_content = content.clone();
+        return (
+            model_content,
+            serde_json::json!({ "content": content, "is_error": is_error }),
+        );
+    }
+    let model_content = cap_output_bytes(content.clone(), MAX_TOOL_OUTPUT_BYTES).into_owned();
+    let payload = serde_json::json!({
+        "content": content,
+        "is_error": is_error,
+        "truncated_for_model_at_bytes": MAX_TOOL_OUTPUT_BYTES,
+    });
+    (model_content, payload)
 }
 
 /// The preview the streamed cell already shows (raw args so far), kept across

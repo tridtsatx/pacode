@@ -1,5 +1,6 @@
 //! `webfetch`: fetch a URL as text.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -7,18 +8,82 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use super::helpers::{parse_input, preview_body};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "webfetch";
 
-pub struct WebFetchTool;
+/// Bytes of the response body held before the transfer is stopped. A page the
+/// model wants more of is pulled in pieces with `max_chars`/`offset`, which costs
+/// one round trip instead of every turn re-reading a truncated 5 MiB wall.
+pub const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
+/// Window `max_chars` defaults to when the model does not name one: what a
+/// single `webfetch` normally costs the context, and one range request's worth.
+pub const MAX_CHARS_WINDOW: usize = 200_000;
+/// Hard ceiling on a whole-body fetch, whatever the window and the page. Stops a
+/// model from paging through a 40 MiB dump one 200 K slice at a time; the note
+/// says how to go on (`offset`) when that is what it actually wants.
+const MAX_TOTAL_CHARS: usize = 1_000_000;
+
+/// Collects response-body chunks up to `MAX_BODY_BYTES`.
+///
+/// A budget, not an error: a 40 MiB dump linked from a page listing used to end
+/// the call with nothing to show for it. The transfer stops at the budget —
+/// dropping the rest of the stream closes the connection instead of reading
+/// bytes nobody will look at — and `push` returning `false` is the caller learning
+/// to stop pulling.
+///
+/// Split out from the request path so the cutoff is a property that can be
+/// asserted directly: "the cap cuts and reports" is a claim about this type, not
+/// about a live HTTP response.
+struct BodyAccumulator {
+    bytes: Vec<u8>,
+    /// Set once a chunk did not fit. The partial chunk is kept up to the cap —
+    /// the model is better served by a body cut at a byte boundary with a note
+    /// than by no body at all.
+    capped: bool,
+}
+
+impl BodyAccumulator {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            capped: false,
+        }
+    }
+
+    /// Append `chunk`, up to the cap. Returns `false` once the budget is spent
+    /// and the caller should stop reading the stream.
+    fn push(&mut self, chunk: &[u8]) -> bool {
+        let Some(room) = MAX_BODY_BYTES.checked_sub(self.bytes.len()) else {
+            self.capped = true;
+            return false;
+        };
+        if chunk.len() > room {
+            self.bytes.extend_from_slice(&chunk[..room]);
+            self.capped = true;
+            return false;
+        }
+        self.bytes.extend_from_slice(chunk);
+        true
+    }
+}
+
+#[derive(Default)]
+pub struct WebFetchTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct WebFetchInput {
     url: String,
     max_chars: Option<usize>,
+    /// Character offset to start at — the paging knob. The window is
+    /// `[offset, offset + max_chars)` of the *rendered* text (Markdown for HTML,
+    /// verbatim otherwise), so the same value addresses both kinds of page only
+    /// when the render is deterministic. It is, for a given URL.
+    offset: Option<usize>,
 }
 
 #[async_trait]
@@ -29,7 +94,9 @@ impl Tool for WebFetchTool {
 
     fn description(&self) -> &str {
         "Fetch an http(s) URL and return its text (HTML extracted to readable Markdown). \
-         Output above the cap is cut head+tail."
+         A long page comes back as one window: the output says which slice of the page it is, \
+         and `offset` pages through the rest. A response over 5 MiB is cut there — read what \
+         you need of it in pieces instead of asking for the whole thing again."
     }
 
     fn schema(&self) -> Value {
@@ -38,9 +105,13 @@ impl Tool for WebFetchTool {
             "required": ["url"],
             "properties": {
                 "url": {"type": "string"},
-                "max_chars": {"type": "integer", "minimum": 100}
+                "max_chars": {"type": "integer", "minimum": 100, "description": "Characters to return from `offset`; defaults to a 200000 window."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Character offset into the rendered text to start at; use the offset the previous call reported to continue."}
             }
         })
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn kind(&self) -> ToolKind {
@@ -48,10 +119,13 @@ impl Tool for WebFetchTool {
     }
 
     /// reqwest GET with 20 s timeout, follows ≤ 5 redirects, refuses non-http(s)
-    /// schemes and bodies over 5 MiB; `text/html` → readability extraction (`dom_smoothie`)
-    /// and Markdown conversion (`htmd`); other text types verbatim; binary → error.
+    /// schemes; `text/html` → readability extraction (`dom_smoothie`) and Markdown
+    /// conversion (`htmd`); other text types verbatim; binary → error. A body over
+    /// [`MAX_BODY_BYTES`] **truncates the transfer** rather than failing the call,
+    /// and both that cut and the window cut are stated at the top of the output
+    /// with the `offset` that continues.
     /// Title `Fetch <host>`.
-    async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn call(&self, input: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<WebFetchInput>(input)?;
         if args.url.trim().is_empty() {
             return Err(ToolError::invalid("url cannot be empty"));
@@ -96,41 +170,151 @@ impl Tool for WebFetchTool {
             .unwrap_or("text/plain")
             .to_string();
 
-        const MAX_BYTES: usize = 5 * 1024 * 1024;
+        // The body is read under a byte budget, not a hard failure; see
+        // `BodyAccumulator`. `content_length` is a header, so it is read before
+        // the body is.
+        let announced_len = resp.content_length();
+        let mut body_bytes = BodyAccumulator::new();
         let mut stream = resp.bytes_stream();
-        let mut bytes = Vec::new();
-
         while let Some(chunk_res) = stream.next().await {
             let chunk = chunk_res
                 .map_err(|e| ToolError::failed(format!("failed reading response: {e}")))?;
-            if bytes.len() + chunk.len() > MAX_BYTES {
-                return Err(ToolError::failed("response body exceeds 5 MiB limit"));
+            if !body_bytes.push(&chunk) {
+                break;
             }
-            bytes.extend_from_slice(&chunk);
         }
+        let transfer_capped = body_bytes.capped;
+        let bytes = body_bytes.bytes;
+        let bytes_read = bytes.len();
 
         let check_len = bytes.len().min(8192);
         if bytes[..check_len].contains(&0) {
             return Err(ToolError::failed("binary content is not supported"));
         }
 
+        // The body becomes a `String` once and is read by reference from here
+        // on. The old shape cloned it — a second 5 MiB allocation for the same
+        // bytes, on the non-HTML path cloned *again* before being capped to
+        // 16 K chars.
+        let body = String::from_utf8(bytes)
+            .map_err(|e| ToolError::failed(format!("response is not valid UTF-8: {e}")))?;
+
+        // The window is `[offset, offset + window)` of the *rendered* text
+        // (Markdown for HTML, verbatim otherwise), so the same `offset` addresses
+        // both kinds of page for a given URL — the render is deterministic.
+        //
+        // The render happens once and is then read by reference: a non-HTML body
+        // costs nothing to "render" (it is a borrow of the bytes already in
+        // hand), and an HTML body cannot be indexed by character without being
+        // converted, so there is no cheaper honest option than one conversion.
+        // What the old code did was convert *and* clone, and then measure the
+        // clone.
         let is_html = content_type.to_lowercase().contains("text/html");
-        let text = if is_html {
-            let html_str = String::from_utf8(bytes)
-                .map_err(|e| ToolError::failed(format!("response is not valid UTF-8: {e}")))?;
-            extract_html_to_markdown(&html_str, Some(parsed_url.as_str()))
+        let rendered: Cow<'_, str> = if is_html {
+            Cow::Owned(extract_html_to_markdown(&body, Some(parsed_url.as_str())))
         } else {
-            String::from_utf8(bytes)
-                .map_err(|e| ToolError::failed(format!("response is not valid UTF-8: {e}")))?
+            Cow::Borrowed(body.as_str())
+        };
+        let total_chars = rendered.chars().count();
+
+        let window = args
+            .max_chars
+            .unwrap_or(MAX_CHARS_WINDOW)
+            .min(max_window_chars(accept_large_output));
+        let offset = args.offset.unwrap_or(0);
+        let skip = offset.min(total_chars);
+        let end = skip.saturating_add(window).min(total_chars);
+        // Borrowed whole when the call asked for everything there is — the
+        // common case, and the one where a copy is pure waste.
+        let text: Cow<'_, str> = if skip == 0 && end >= total_chars {
+            Cow::Borrowed(rendered.as_ref())
+        } else {
+            Cow::Owned(rendered.chars().skip(skip).take(end - skip).collect())
         };
 
-        let cap = args.max_chars.unwrap_or(ctx.output_cap_chars);
-        let content = cap_output(&text, accept_large_output, cap);
+        let dropped_bytes = if transfer_capped {
+            announced_len
+                .unwrap_or(MAX_BODY_BYTES as u64)
+                .saturating_sub(bytes_read as u64)
+        } else {
+            0
+        };
+        let note = window_note(
+            skip,
+            end,
+            total_chars,
+            window,
+            transfer_capped,
+            dropped_bytes,
+        );
+        let content = note_window(&text, &note);
         let preview = preview_body(&content);
 
         Ok(ToolOutput::text(content)
             .with_title(title)
             .with_preview(preview))
+    }
+}
+
+/// Window ceiling for one call. `accept_large_output` lifts it to
+/// [`MAX_TOTAL_CHARS`] — the model asking for a bigger slice is the model
+/// stating the token cost, which is exactly what that flag is for. The
+/// [`MAX_BODY_BYTES`] transfer cap does *not* move: that is a network budget,
+/// not a context one, and re-sending 40 MiB to reach a wider window is the
+/// failure this tool was fixed for.
+fn max_window_chars(accept_large_output: bool) -> usize {
+    if accept_large_output {
+        MAX_TOTAL_CHARS
+    } else {
+        MAX_CHARS_WINDOW
+    }
+}
+
+/// A single-line header above a non-exact window, or `None` when the call
+/// returned the whole rendered text. The model has to be able to tell "this is
+/// all of it" from "this is a slice" without counting characters, because
+/// counting characters is the one thing it reliably gets wrong here.
+fn window_note(
+    skip: usize,
+    end: usize,
+    total_chars: usize,
+    window: usize,
+    transfer_capped: bool,
+    dropped_bytes: u64,
+) -> Option<String> {
+    if skip == 0 && end >= total_chars && !transfer_capped {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if skip > 0 {
+        parts.push(format!("chars {skip}..{end} of {total_chars}"));
+    } else {
+        parts.push(format!("first {end} of {total_chars} characters"));
+    }
+    if transfer_capped {
+        // `content_length` is the raw body, which is not the rendered text, so
+        // this is an estimate of what the server still has — phrased as one.
+        parts.push(format!(
+            "the response itself was cut at {} MiB (~{dropped_bytes} bytes unread)",
+            MAX_BODY_BYTES / (1024 * 1024)
+        ));
+    }
+    let paging = if total_chars > end {
+        format!("read on with `offset: {end}` (up to {window} characters per call)")
+    } else if skip > 0 {
+        "read from the start with `offset: 0`".to_string()
+    } else {
+        String::new()
+    };
+    Some(format!("[{} — {paging}]\n\n", parts.join("; ")))
+}
+
+/// The note prepended to a capped window; the note is what tells the model the
+/// result is a slice, so it rides along with the content the model reads.
+fn note_window(content: &str, note: &Option<String>) -> String {
+    match note {
+        Some(note) => format!("{note}{content}"),
+        None => content.to_string(),
     }
 }
 
@@ -165,3 +349,7 @@ pub fn extract_html_to_markdown(html: &str, url: Option<&str>) -> String {
         format!("[Extraction yielded no article content; fell back to full document]\n\n{trimmed}")
     }
 }
+
+#[cfg(test)]
+#[path = "webfetch_tests.rs"]
+mod webfetch_tests;

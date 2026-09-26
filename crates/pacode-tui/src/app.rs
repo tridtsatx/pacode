@@ -416,6 +416,13 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     let mut term_guard = TerminalGuard::enter(opts.config.ui.mouse)?;
     crate::timing::mark(timing, "terminal_enter", t);
 
+    // Arm the frame metrics before the first frame and hold the gate for the
+    // whole run, so the reading `pacode stats` prints is this client's and not
+    // the previous one's. Off unless `PACODE_FRAME_METRICS` says otherwise —
+    // an unarmed gate writes nothing and does not even remove the last
+    // client's report.
+    let _frame_metrics = crate::render_metrics::MetricsGate::install(&opts.client.paths.state_dir);
+
     // Progressive paint, now cache-first (§8.2): build the state, run the one
     // allowed blocking cache read on `spawn_blocking`, apply whatever came
     // back, then draw the first frame — all before any daemon IO. The socket
@@ -545,10 +552,40 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     // Baseline of the animation clock's draw gate, tracked separately so a
     // content-gated frame does not displace the animation phase.
     let mut last_anim_draw = last_draw;
-    // The animation clock. `Some` exactly while `anim_active` holds; re-created
-    // only when the wanted period changes, so stream events can never reset the
-    // timer's phase mid-cycle (the jitter the old per-iteration sleep caused).
-    let mut anim_tick: Option<tokio::time::Interval> = None;
+    // The animation clock. `Some` exactly while `anim_active` holds, and
+    // phase-stable across a period change (`backpressure::Ticker`), so neither
+    // a stream event nor a live `ui.animation` edit can reset its phase.
+    let mut anim_tick: Option<crate::backpressure::Ticker> = None;
+    // The nominal period in force, and the backpressure state that stretches
+    // it. The budget is the nominal period itself — see `backpressure` for why
+    // a constant budget would degrade a client that is deliberately cheap.
+    let mut nominal_anim_ms = state.config.ui.animation.tick_ms();
+    let mut backpressure = crate::backpressure::Backpressure::new(nominal_anim_ms);
+    // The period the animation gate is measured against: the nominal while the
+    // frames are affordable, stretched by the multiplier while they are not.
+    // The second tick is not stretched — a clock reading that walks backwards is
+    // worse than one that skips a beat.
+    let mut anim_period = backpressure.period();
+    // Absolute animation clock. Every animated block reads its phase from this
+    // one elapsed value (see `backpressure::anim_phase`), so a degraded cadence
+    // slows the frames down and not the animation: skipped frames skip phases
+    // instead of queueing them.
+    let anim_epoch = Instant::now();
+    // The phase every animated block reads: a count of steps taken since the
+    // last period change, not since startup. A change of cadence re-anchors the
+    // count rather than multiplying it, so 66 ms -> 16 ms does not throw the
+    // spinner 3.16 turns forward in a single frame.
+    let mut anim_clock = crate::backpressure::PhaseClock::new(nominal_anim_ms);
+    // Whether a missed content/anim frame has already been counted for the slot
+    // it missed. See the drop accounting at the draw gate for why a skip is
+    // latched rather than counted on every loop iteration.
+    let mut counted_content_skip = false;
+    let mut counted_anim_skip = false;
+    // Whether each gate was open on the previous pass, so a missed slot can be
+    // told apart from an event that has simply not reached its turn yet. False at
+    // startup: nothing has been painted yet, so no slot has been missed.
+    let mut content_slot_open = false;
+    let mut anim_slot_open = false;
     let mut last_layout = ScreenLayout::default();
     // Input image-strip escapes currently on screen (spec §1): tracked so the
     // post-draw flush can diff and never re-send tens of MB of kitty/sixel
@@ -597,50 +634,156 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         // draws a frame that flushes both, so a pending anim frame can ride a
         // content draw and never stalls waiting on the slower clock.
         let now = Instant::now();
-        let anim_mode = state.config.ui.animation;
-        let anim_ms = if state.fast_anim_active(now) {
-            anim_mode.fast_tick_ms()
-        } else {
-            anim_mode.tick_ms()
-        };
         let content_gate_open = match frame_interval {
             Some(interval) => now.saturating_duration_since(last_draw) >= interval,
             None => true,
         };
-        let anim_gate_open =
-            now.saturating_duration_since(last_anim_draw) >= Duration::from_millis(anim_ms);
-        if (state.dirty && content_gate_open) || (state.dirty_anim && anim_gate_open) {
+        let anim_gate_open = now.saturating_duration_since(last_anim_draw) >= anim_period;
+        // A frame the scheduler could have painted and did not, because its
+        // slot was still occupied by the previous one. Counted once per *slot*,
+        // not once per loop iteration: the loop wakes far more often than
+        // either gate opens, and a counter that counted idle iterations would
+        // make a healthy client look like one throwing its frames away. Each
+        // flag is judged against its own gate — a `dirty_anim` two microseconds
+        // short of its period is early, not dropped.
+        let content_ready = state.dirty && content_gate_open;
+        let anim_ready = state.dirty_anim && anim_gate_open;
+        if crate::render_metrics::RenderMetrics::recording() {
+            // A *missed slot*, not a missed dirty event. Both flags are level
+            // triggered: `dirty` stays set until a frame flushes it, so the
+            // first time it is seen the gate is almost always still closed and
+            // the event is merely waiting for its turn. Counting that would
+            // report one dropped frame for every event ever drawn and the
+            // metric would measure the opposite of what it claims. A slot is
+            // missed only when the gate was open on the previous pass and is
+            // closed now with something still pending: that closed interval is
+            // a frame the client could have painted and did not. The latch
+            // re-arms on the next open gate for the same reason.
+            if content_slot_open && state.dirty && !content_gate_open && !counted_content_skip {
+                crate::render_metrics::RenderMetrics::record_drop();
+                counted_content_skip = true;
+            }
+            if anim_slot_open && state.dirty_anim && !anim_gate_open && !counted_anim_skip {
+                crate::render_metrics::RenderMetrics::record_drop();
+                counted_anim_skip = true;
+            }
+            // The slot is open: whatever is pending gets painted, so the next
+            // miss is a new one.
+            counted_content_skip &= !content_gate_open;
+            counted_anim_skip &= !anim_gate_open;
+            content_slot_open = content_gate_open;
+            anim_slot_open = anim_gate_open;
+        }
+        if content_ready || anim_ready {
             let flushed_anim = state.dirty_anim;
             let t_frame = Instant::now();
+            let recording = crate::render_metrics::RenderMetrics::recording();
+            let frame_kind = if needs_image_repaint {
+                // A buffer reset repaints every cell: the most expensive shape a
+                // frame can take, and it happened because content moved an image.
+                crate::render_metrics::FrameKind::Full
+            } else if !state.dirty {
+                // The animation clock on its own.
+                crate::render_metrics::FrameKind::Anim
+            } else {
+                crate::render_metrics::FrameKind::Content
+            };
+            if recording {
+                // The main transcript and an open agent panel are both streams, and a
+                // frame that drains one of them is reading past the other: the
+                // larger is the number that says how far the client fell behind.
+                crate::render_metrics::RenderMetrics::note_backlog(
+                    state
+                        .transcript
+                        .stream_backlog_chars()
+                        .max(state.panel.agent_transcript.stream_backlog_chars()),
+                );
+            }
             // DEC 2026 synchronized output: the terminal buffers the frame and
             // presents it whole instead of painting a half-drawn one. The
             // `CompletedFrame` borrow is dropped before `end_sync` so the sync
             // region still closes when `draw` errored.
             term_guard.begin_sync();
-            if needs_image_repaint {
+            let repainted = needs_image_repaint;
+            let mut clear_cost = Duration::ZERO;
+            if repainted {
                 // Image escapes were removed or moved last frame: the tty
                 // pixels they occupied sit on cells ratatui's buffer already
                 // considers painted, so a plain diff would leave ghosts. A
                 // buffer reset forces a full repaint inside the sync region.
+                let t_clear = Instant::now();
                 let _ = term_guard.terminal.clear();
+                if recording {
+                    clear_cost = t_clear.elapsed();
+                }
                 needs_image_repaint = false;
             }
+            // `Terminal::draw` is two steps this report has to tell apart: the
+            // render closure (this crate's widgets — all of it ours), and the
+            // diff plus the write and flush (the terminal's). A slow layout and
+            // a slow write have different owners and different fixes, so they
+            // are measured separately; the timings are only taken while
+            // recording is on.
+            //
+            // Resizes are not in that split: ratatui runs `autoresize` inside
+            // `draw`, before the closure, and a resize reallocates both buffers
+            // and clears them. Its cost lands in the frame total — a resize
+            // frame really is that expensive — and the report says so rather
+            // than blaming the layout.
+            let t_layout = Instant::now();
+            let mut layout_cost = Duration::ZERO;
             let draw_res = term_guard
                 .terminal
                 .draw(|f| {
                     let prepared = ui::prepare_frame(f.area(), &mut state, Instant::now());
                     last_layout = ui::draw(f, &state, &prepared);
                     crate::font::apply_weight_to_frame(f, &state.config.font);
+                    if recording {
+                        layout_cost = t_layout.elapsed();
+                    }
                 })
                 .map(|_| ());
+            // `t_backend` is the instant the closure ended, so the span to now
+            // is the half `draw` did on its own: the cell diff, the write and
+            // the flush. It is measured from `t_layout` rather than from
+            // `Instant::elapsed()` on a fresh instant, which would be zero by
+            // construction and report a healthy client as having a free
+            // backend.
+            let t_backend = Instant::now();
+            let backend_cost = t_backend.duration_since(t_layout);
             term_guard.end_sync();
             draw_res?;
+            let frame_cost = t_frame.elapsed();
+            if recording {
+                crate::render_metrics::RenderMetrics::record(
+                    frame_kind,
+                    crate::render_metrics::FrameCost {
+                        layout: layout_cost,
+                        backend: backend_cost,
+                        frame: frame_cost,
+                    },
+                );
+                // `frame - layout - backend` is the sync markers and a
+                // `Terminal::clear()`, which belong to neither half; the clear
+                // is timed separately so an image repaint is not read as
+                // layout.
+                if !clear_cost.is_zero() {
+                    crate::render_metrics::RenderMetrics::record_clear(clear_cost);
+                }
+            }
             // §8.3: warn when a frame ran over its refresh budget.
             crate::timing::warn_frame_over_budget(
                 timing,
-                t_frame.elapsed(),
+                frame_cost,
                 crate::timing::frame_budget(frame_clock.detected_hz),
             );
+            // Backpressure: the measured cost of the frame sets the cadence of
+            // the clock, not the cost of the clock setting it. The content gate
+            // is deliberately untouched — a keystroke is not a clock.
+            if backpressure.observe(frame_cost) {
+                anim_period = backpressure.period();
+                crate::render_metrics::RenderMetrics::note_multiplier(backpressure.multiplier());
+            }
             state.dirty = false;
             state.dirty_anim = false;
             last_draw = Instant::now();
@@ -692,20 +835,30 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         // restarted by each animation frame and never fired, so the duration only
         // moved on unrelated redraws and read 0.1 -> 0.3 -> 0.5 instead of ticking.
         let needs_second = state.needs_second_tick() || state.phase.is_some();
-        let next_boundary_ms = crate::state::activity::ms_to_next_second(state.phase_elapsed_ms);
+        // Armed to the next boundary of the displayed clock, not to a full
+        // second from now. Every other future in this `select!` cancels and
+        // re-creates this one; measuring from `now` meant a plain 1 s sleep was
+        // restarted by each animation frame and never fired, so the duration
+        // only moved on unrelated redraws and read 0.1 -> 0.3 -> 0.5 instead of
+        // ticking. The boundary is re-derived from the reading every iteration
+        // rather than held in a ticker, because the deadline is a wall-clock
+        // boundary: there is no phase for a ticker to keep.
         let second_sleep = async {
             if needs_second {
-                tokio::time::sleep(Duration::from_millis(next_boundary_ms)).await;
+                let wait = Duration::from_millis(crate::state::activity::ms_to_next_second(
+                    state.phase_elapsed_ms,
+                ));
+                tokio::time::sleep(wait).await;
             } else {
                 std::future::pending::<()>().await;
             }
         };
 
-        // The animation clock: a phase-stable `Interval`, armed exactly while
+        // The animation clock: a phase-stable ticker, armed exactly while
         // something animates — the same set of conditions that armed the old
-        // `anim_sleep`. Its cadence comes from `ui.animation` alone and never
-        // looks at the stream backlog: a growing backlog must not speed the
-        // spinner up.
+        // `anim_sleep`. Its cadence comes from `ui.animation` and the measured
+        // frame cost alone and never looks at the stream backlog: a growing
+        // backlog must not speed the spinner up.
         let now = Instant::now();
         let anim_mode = state.config.ui.animation;
         let anim_active = state.turn_active
@@ -713,32 +866,52 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             || state.needs_anim_tick(now)
             || state.toast_needs_anim(now)
             || state.fast_anim_active(now);
-        let anim_ms = if state.fast_anim_active(now) {
+        let wanted_anim_ms = if state.fast_anim_active(now) {
             anim_mode.fast_tick_ms()
         } else {
             anim_mode.tick_ms()
         };
+        // A live `ui.animation` edit (or a transient animation starting or
+        // ending) moves the nominal, and the nominal is both the ticker's period
+        // and the backpressure budget, so both follow it here rather than at the
+        // frame that happens to notice. Phase-stable: the ticker keeps it.
+        if wanted_anim_ms != nominal_anim_ms {
+            // A period change re-anchors the phase rather than re-deriving it
+            // from the epoch: `anim_phase(elapsed, period)` alone multiplies
+            // the phase by the ratio of the two periods, so leaving the fast
+            // tick after 5 s puts the spinner at phase 312 where it was 75 —
+            // a 3.16-turn jump in the frame the toast starts. The phase is the
+            // number of steps taken since the last change, and the change
+            // itself is not a step.
+            anim_clock.reanchor(crate::backpressure::elapsed_ms(anim_epoch), wanted_anim_ms);
+            nominal_anim_ms = wanted_anim_ms;
+            backpressure.set_nominal_ms(nominal_anim_ms);
+            anim_period = backpressure.period();
+        }
+        // A period change — a transient animation starting or ending, a live
+        // `ui.animation` edit, or the backpressure multiplier moving — is the
+        // only reason the ticker is re-armed, and `Ticker` moves its deadline to
+        // the next boundary of the new period instead of resetting the phase, so
+        // none of the three can make the animation jerk.
+        let anim_ms = anim_period.as_millis() as u64;
         if anim_active {
-            // A period change (a transient animation starting or ending, or
-            // `ui.animation` edited live) is the only reason to re-create the
-            // interval — re-arming per event would reset the phase and jitter.
-            if anim_tick.as_ref().map(tokio::time::Interval::period)
-                != Some(Duration::from_millis(anim_ms))
-            {
-                let mut iv = tokio::time::interval(Duration::from_millis(anim_ms));
-                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                anim_tick = Some(iv);
+            let wanted = Duration::from_millis(anim_ms);
+            match anim_tick.as_mut() {
+                Some(t) => {
+                    t.set_period(wanted, anim_epoch);
+                }
+                None => anim_tick = Some(crate::backpressure::Ticker::new(wanted, anim_epoch)),
             }
         } else {
-            // Nothing animates: drop the interval so no timer is armed at rest.
+            // Nothing animates: drop the ticker so no timer is armed at rest.
             anim_tick = None;
         }
         let anim_sleep = async {
             match anim_tick.as_mut() {
-                // `Interval::tick` is cancel-safe: the select! can drop this
+                // `Ticker::tick` is cancel-safe: the select! can drop this
                 // future for any other branch without losing the tick phase.
-                Some(iv) => {
-                    iv.tick().await;
+                Some(t) => {
+                    t.tick().await;
                 }
                 None => std::future::pending::<()>().await,
             }
@@ -797,7 +970,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         };
         let anim_wait = if state.dirty_anim {
             let elapsed = Instant::now().saturating_duration_since(last_anim_draw);
-            Some(Duration::from_millis(anim_ms).saturating_sub(elapsed))
+            Some(anim_period.saturating_sub(elapsed))
         } else {
             None
         };
@@ -907,6 +1080,11 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
                             state.cols = w;
                             state.rows = h;
                             state.dirty = true;
+                            // The next frame reallocates ratatui's buffers and
+                            // repaints every cell; marking it here is what lets
+                            // the report separate a window drag from a client
+                            // that is slow at painting.
+                            crate::render_metrics::RenderMetrics::record_resize_frame();
                             vec![]
                         }
                         _ => vec![],
@@ -963,7 +1141,19 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
                 state.tick_phase(now);
             }
             _ = anim_sleep => {
-                state.anim_frame = state.anim_frame.wrapping_add(1);
+                // The phase is read off the absolute animation clock rather
+                // than advanced here: a frame this client skipped has to skip
+                // its phase too, or the animation runs in slow motion exactly
+                // when the client is too slow to draw it
+                // (`backpressure::PhaseClock`).
+                let elapsed = crate::backpressure::elapsed_ms(anim_epoch);
+                state.anim_frame = anim_clock.phase(elapsed);
+                // The sweep reads the same clock: elapsed time positions the
+                // band, and the period actually in force is what keeps it to
+                // one cell per painted frame. Under backpressure a band still
+                // moving one cell per *nominal* tick would visibly skip, while
+                // the rest of the animation correctly slows down.
+                state.anim = pacode_render::AnimClock::new(elapsed, backpressure.period_ms());
                 state.dirty_anim = true;
             }
             _ = ctrl_c_expiry_sleep => {

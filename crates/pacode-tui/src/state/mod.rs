@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use pacode_client::{ClientEvent, ClientEventContext};
 use pacode_render::{ColorMode, Glyphs, RenderOptions};
+use pacode_types::config::ShimmerMode;
 use pacode_types::time::now_ms;
 use pacode_types::{
     AgentId, Config, Effort, Event, MarketplacePluginInfo, McpServerInfo, Mode, ModelFlags,
@@ -1031,6 +1032,22 @@ impl AppState {
         .thinking(self.config.ui.thinking)
         .expand_hint(expand_hint_for(&self.keymap))
         .cache_epoch(self.render_epoch)
+        .shimmer(self.shimmer_mode())
+        .anim(self.anim)
+    }
+
+    /// The sweep to draw, if any.
+    ///
+    /// A terminal with no colour cannot show a sweep, and a monochrome client
+    /// should not pay for the per-character walk that produces one: the tiers
+    /// collapse to a single style, so the animation would be invisible work on
+    /// every frame.
+    pub fn shimmer_mode(&self) -> ShimmerMode {
+        if self.color_mode == ColorMode::Mono {
+            ShimmerMode::Off
+        } else {
+            self.config.ui.shimmer
+        }
     }
 
     pub fn sync_render_context(&mut self) {

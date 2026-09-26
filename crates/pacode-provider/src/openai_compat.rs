@@ -31,10 +31,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_types::{
-    ContentBlock, Effort, ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, Role,
-    prettify_model_name,
+    ContentBlock, Effort, ImageTransport, ModelInfo, ModelRoute, Pricing, ProviderConfig,
+    ProviderDefaults, Role, ToolResultMode, prettify_model_name,
 };
 use serde_json::Value;
+
+/// Connect timeout when neither the provider entry nor `[provider]` names one.
+const DEFAULT_CONNECT_SECS: u64 = 30;
 
 pub use crate::sse::{ChunkState, SseParser, chunk_to_events};
 use crate::{CompletionRequest, EventStream, Provider, ProviderError, RetryBudget};
@@ -125,9 +128,13 @@ impl OpenAiCompat {
                     ProviderError::Config(format!("provider '{id}' has invalid proxy: {e}"))
                 })?;
 
+        // Per-provider timeouts win over the global `[provider]` defaults; an
+        // entry that sets none is bounded exactly as before.
         let client = pacode_net::client_builder(&proxy_setting)
             .map_err(|e| ProviderError::Config(format!("provider '{id}' proxy error: {e}")))?
-            .connect_timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(
+                cfg.timeouts.connect_secs_or(DEFAULT_CONNECT_SECS),
+            ))
             .user_agent(format!("pacode/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| ProviderError::Config(format!("failed to build HTTP client: {e}")))?;
@@ -167,7 +174,12 @@ impl OpenAiCompat {
             "content": system_content,
         }));
 
-        let vision = model_supports_vision(&req.model);
+        // A provider set to `text_only` never sees an image part, even for a
+        // model that can read them: some gateways mis-render the unexpected
+        // content type instead of erroring, and a wrong image is worse than a
+        // clear placeholder.
+        let vision = self.vision_for(&req.model)
+            && self.cfg.compat.image_transport == ImageTransport::DataUrl;
 
         for msg in &req.messages {
             match msg.role {
@@ -264,7 +276,7 @@ impl OpenAiCompat {
                             messages.push(serde_json::json!({
                                 "role": "tool",
                                 "tool_call_id": call_id.as_str(),
-                                "content": content,
+                                "content": self.render_tool_result(content),
                             }));
                         }
                     }
@@ -281,17 +293,25 @@ impl OpenAiCompat {
             serde_json::json!({ "include_usage": true }),
         );
 
-        if !req.tools.is_empty() {
-            let tools_val: Vec<Value> = req
-                .tools
+        // A model whose entry says `supports_tools = false` is chat-only: it
+        // gets no tools at all, even when the turn assembled some.
+        let model_cfg = self.cfg.models.iter().find(|m| m.id == req.model);
+        let tools_allowed = model_cfg.is_none_or(|m| m.tools_or(true));
+        let wire_tools = if tools_allowed {
+            self.cfg.compat.wire_tools(&req.tools)
+        } else {
+            Vec::new()
+        };
+        if !wire_tools.is_empty() {
+            let tools_val: Vec<Value> = wire_tools
                 .iter()
-                .map(|t| {
+                .map(|def| {
                     serde_json::json!({
                         "type": "function",
                         "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.input_schema,
+                            "name": def.name,
+                            "description": def.description,
+                            "parameters": def.input_schema,
                         }
                     })
                 })
@@ -300,11 +320,19 @@ impl OpenAiCompat {
             body.insert("tool_choice".to_string(), serde_json::json!("auto"));
         }
 
-        if let Some(max_tokens) = req.max_output_tokens {
+        // A model whose entry says `supports_tools = false` gets no tools at
+        // all, even when the turn assembled some.
+        if let Some(max_tokens) = req.max_output_tokens
+            && self.cfg.compat.sends_max_output_tokens()
+        {
             body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
 
-        if self.reasoning_enabled_for(&req.model) {
+        if self
+            .cfg
+            .compat
+            .sends_thinking_for(self.reasoning_enabled_for(&req.model))
+        {
             let effort = req.effort.unwrap_or(self.defaults.effort);
             let effort_str = match self.cfg.effort_map.get(effort.as_str()) {
                 Some(override_val) => override_val.clone(),
@@ -342,6 +370,36 @@ impl OpenAiCompat {
         model_heuristic_reasoning(model)
     }
 
+    /// Whether images go out as inline base64 parts or degrade to text
+    /// placeholders. A model entry that names `vision` overrides the id
+    /// heuristic, so a multimodal model on an unusual id still gets images.
+    fn vision_for(&self, model: &str) -> bool {
+        let guessed = model_supports_vision(model);
+        self.cfg
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .map_or(guessed, |m| m.vision_or(guessed))
+    }
+
+    /// The text a tool result contributes to the conversation. `Text` is the
+    /// historical shape; `TextWithJson` keeps the rendered text and appends the
+    /// structured payload, for a gateway that wants to parse the result itself
+    /// without pacode dropping the human-readable half.
+    fn render_tool_result(&self, content: &str) -> Value {
+        match self.cfg.compat.tool_result_mode {
+            ToolResultMode::Text => Value::String(content.to_string()),
+            ToolResultMode::TextWithJson => match serde_json::from_str::<Value>(content) {
+                Ok(parsed) if parsed.is_object() || parsed.is_array() => {
+                    serde_json::json!([content, parsed])
+                }
+                // Not JSON, or a bare scalar: there is no structured half to add,
+                // so the text stands alone rather than being mangled.
+                _ => Value::String(content.to_string()),
+            },
+        }
+    }
+
     pub fn clear_catalog_cache(&self) {
         if let Ok(mut guard) = self.catalog_cache.lock() {
             *guard = None;
@@ -364,7 +422,7 @@ impl OpenAiCompat {
             return Ok(configured_models);
         }
 
-        let url = format!("{}/models", self.cfg.base_url.trim_end_matches('/'));
+        let url = self.cfg.models_url();
         let mut req_builder = self.client.get(&url);
         if let Some(key) = &self.api_key
             && !key.is_empty()
@@ -744,12 +802,14 @@ impl Provider for OpenAiCompat {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<EventStream, ProviderError> {
-        let url = format!(
-            "{}/chat/completions",
-            self.cfg.base_url.trim_end_matches('/')
-        );
+        // `path` is the deployment half of the endpoint: a fixed suffix, or a
+        // template whose `{model}` placeholder routes per model. Absent, the
+        // dialect's own default applies.
+        let url = self
+            .cfg
+            .completion_url(self.cfg.effective_dialect(), &req.model);
         let body = self.build_body(&req);
-        let max_retries = self.defaults.max_retries;
+        let max_retries = self.cfg.timeouts.max_retries_or(self.defaults.max_retries);
 
         let body_keys: Vec<&str> = body
             .as_object()
@@ -783,7 +843,10 @@ impl Provider for OpenAiCompat {
                 .collect(),
             body: body_bytes,
             model: req.model,
-            stream_idle_secs: self.defaults.stream_idle_secs,
+            stream_idle_secs: self
+                .cfg
+                .timeouts
+                .stream_idle_secs_or(self.defaults.stream_idle_secs),
             effort,
             backoff_base: self.backoff_base,
         };
@@ -828,7 +891,7 @@ impl Provider for OpenAiCompat {
             display_name,
             context_window,
             supports_reasoning,
-            supports_vision: model_supports_vision(model),
+            supports_vision: self.vision_for(model),
             // providers.toml `efforts` wins; `/models` responses (incl.
             // OpenRouter `supported_parameters`) do not enumerate effort
             // levels, so there is nothing else to merge yet.

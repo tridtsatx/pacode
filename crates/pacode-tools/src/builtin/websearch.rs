@@ -23,9 +23,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "websearch";
+
+/// Model-facing description; see `prompts/websearch.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/websearch.md");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchResult {
@@ -189,6 +192,7 @@ struct WebSearchInput {
 pub struct WebSearchTool {
     backend: Arc<dyn SearchBackend>,
     config: WebConfig,
+    definition: DefinitionCache,
 }
 
 impl WebSearchTool {
@@ -205,7 +209,11 @@ impl WebSearchTool {
     }
 
     pub fn with_backend_and_config(backend: Arc<dyn SearchBackend>, config: WebConfig) -> Self {
-        Self { backend, config }
+        Self {
+            backend,
+            config,
+            definition: DefinitionCache::new(),
+        }
     }
 }
 
@@ -222,8 +230,10 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web using DuckDuckGo. Returns a numbered list of results with \
-         title, URL, and snippet; open a result with `webfetch`."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

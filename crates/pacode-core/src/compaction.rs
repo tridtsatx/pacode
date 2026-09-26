@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use pacode_types::{Message, ModelRoute};
+use pacode_types::{CallId, Message, ModelRoute};
 
 use crate::CoreError;
 use crate::agent::Agent;
@@ -39,6 +39,20 @@ pub fn needs_compaction(context_tokens: u32, context_window: u32, threshold: f32
 
 /// Split history: everything except the last `keep_recent` messages (never splitting a
 /// tool_use/tool_result pair) goes into the summary request.
+///
+/// A pure `keep_recent` tail is not always safe to fold away. On a long
+/// session the last `keep_recent` messages can be a few tool calls, and the
+/// user's actual request — "rename the config parser and update the callers" —
+/// may be forty messages back behind them. A summary that drops it is worse than
+/// no compaction: the agent resumes certain it was asked for something it was
+/// never told. So the tail is scanned for messages that must survive on their
+/// own terms (see [`move_cut_past_must_keep`]), and the cut moves *down* to
+/// include them rather than folding them into a summary.
+///
+/// Both halves stay contiguous in history and the boundary is still a legal
+/// tool_use/tool_result boundary, so the store's seq-based
+/// `messages after upto_seq` reconstruction and provider-side pairing are
+/// unaffected by how far down the cut moved.
 pub fn split_for_compaction(
     messages: &[Arc<Message>],
     keep_recent: usize,
@@ -48,23 +62,49 @@ pub fn split_for_compaction(
         .enumerate()
         .map(|(index, message)| (index as u64, message.clone()))
         .collect::<Vec<_>>();
-    let (summary, keep) = split_rows_for_compaction(&rows, keep_recent);
+    let split = split_rows_for_compaction(&rows, keep_recent);
     (
-        summary.into_iter().map(|(_, message)| message).collect(),
-        keep.into_iter().map(|(_, message)| message).collect(),
+        split
+            .to_summarize
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect(),
+        split
+            .to_keep
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect(),
     )
 }
 
 type HistoryRows = Vec<(u64, Arc<Message>)>;
 
-fn split_rows_for_compaction(
-    rows: &[(u64, Arc<Message>)],
-    keep_recent: usize,
-) -> (HistoryRows, HistoryRows) {
+/// The result of deciding where to cut: the two halves of history, plus the
+/// request the summary prompt must carry when the cut folded it away.
+pub struct CompactionSplit {
+    pub to_summarize: HistoryRows,
+    pub to_keep: HistoryRows,
+    pub active_request: Option<ActiveRequest>,
+}
+
+fn split_rows_for_compaction(rows: &[(u64, Arc<Message>)], keep_recent: usize) -> CompactionSplit {
     if rows.len() <= keep_recent {
-        return (Vec::new(), rows.to_vec());
+        return CompactionSplit {
+            to_summarize: Vec::new(),
+            to_keep: rows.to_vec(),
+            active_request: None,
+        };
     }
-    let mut cut = rows.len().saturating_sub(keep_recent);
+    let requested_cut = rows.len().saturating_sub(keep_recent);
+    let MoveCutOutcome {
+        mut cut,
+        active_request,
+    } = move_cut_past_must_keep(rows, requested_cut);
+    // Pull back to a legal boundary: the first kept message may not be a
+    // `tool_result` whose `tool_use` was folded away, and an assistant message
+    // carrying `tool_use` blocks may not be separated from the results that
+    // answer them. Moving the cut down keeps the pair together at the cost of
+    // keeping one more message than asked for.
     while cut > 0 {
         if rows[cut].1.role == pacode_types::Role::Tool
             || (rows[cut - 1].1.has_tool_uses()
@@ -76,7 +116,136 @@ fn split_rows_for_compaction(
             break;
         }
     }
-    (rows[..cut].to_vec(), rows[cut..].to_vec())
+    CompactionSplit {
+        to_summarize: rows[..cut].to_vec(),
+        to_keep: rows[cut..].to_vec(),
+        active_request,
+    }
+}
+
+/// The `tool_use` names whose results are worth keeping verbatim. A summary can
+/// paraphrase "ran the tests" and lose which tests failed; the message carrying
+/// the real output is the only copy there is.
+///
+/// A *failed* mutating call is included on the same reasoning as a successful
+/// one — it is the record of a state the agent has to know it did not reach, and
+/// the retry after it depends on that record.
+const MUTATING_TOOLS: &[&str] = &[
+    "edit",
+    "write",
+    "multi_edit",
+    "bash",
+    "bg",
+    "cron",
+    "monitor",
+    "memory_write",
+];
+
+/// The index of the newest user message — the request currently being executed.
+fn newest_user_index(rows: &[(u64, Arc<Message>)]) -> Option<usize> {
+    rows.iter()
+        .rposition(|(_, message)| message.role == pacode_types::Role::User)
+}
+
+/// The `call_id`s of every mutating `tool_use` in the history.
+///
+/// A `tool_result` carries only its `call_id`, so deciding whether *this* result
+/// is worth keeping means knowing which tool answered it — and the answering
+/// `tool_use` may sit many messages earlier. Hence one pass over the history up
+/// front. It touches `ToolUse` headers only and never visits the result bodies,
+/// so the pass is O(number of tool calls), not O(history bytes).
+fn mutating_call_ids(rows: &[(u64, Arc<Message>)]) -> std::collections::HashSet<CallId> {
+    let mut ids = std::collections::HashSet::new();
+    for (_, message) in rows {
+        for (id, name, _) in message.tool_uses() {
+            if MUTATING_TOOLS.contains(&name) {
+                ids.insert(id.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// How far `move_cut_past_must_keep` will reach below the requested cut to rescue
+/// a *mutating tool result*. Twelve messages is roughly two or three tool-call
+/// rounds: recent enough that the evidence is still what the agent is reasoning
+/// about, bounded enough that a long session still compacts.
+const MAX_EXTRA_KEPT_MESSAGES: usize = 12;
+
+/// What the cut adjustment decided, and the request the summary must carry.
+///
+/// The split returns both because the two protection tiers are satisfied by
+/// different mechanisms: the cut is what stops recent evidence from being
+/// folded, while `active_request` is what keeps the executing request in play
+/// once it is too far back to keep by moving a cut.
+#[derive(Debug, Clone)]
+struct MoveCutOutcome {
+    cut: usize,
+    active_request: Option<ActiveRequest>,
+}
+
+/// Move `cut` down so protected messages are not left in the folded prefix.
+///
+/// The cut is *always* bounded: both tiers are answered within
+/// `MAX_EXTRA_KEPT_MESSAGES` of the requested cut, so the kept tail cannot grow
+/// with the length of the session. A protected message further back than that is
+/// folded like anything else, and the request — the one message whose loss
+/// changes *what the agent is doing* rather than *what it knows* — is carried by
+/// [`ActiveRequest`] instead, pinned into the summary prompt. Honouring it by
+/// moving the cut instead would pin every message between it and the cut: a
+/// request forty messages back would keep forty messages, and a session that
+/// compacts repeatedly would re-grow without ever shrinking.
+fn move_cut_past_must_keep(rows: &[(u64, Arc<Message>)], cut: usize) -> MoveCutOutcome {
+    let mutating = mutating_call_ids(rows);
+    let floor = cut.saturating_sub(MAX_EXTRA_KEPT_MESSAGES);
+    let mut result = cut;
+
+    for (index, (_, message)) in rows.iter().enumerate() {
+        if index >= result || index < floor {
+            continue;
+        }
+        if message.role == pacode_types::Role::Tool
+            && message.content.iter().any(|block| match block {
+                pacode_types::ContentBlock::ToolResult { call_id, .. } => {
+                    mutating.contains(call_id)
+                }
+                _ => false,
+            })
+        {
+            result = index;
+            break;
+        }
+    }
+
+    if result < cut {
+        log::debug!(
+            "compaction: keeping {} extra messages to preserve recent mutating results \
+             (oldest kept index {result}, requested cut {cut}, lookback floor {floor})",
+            cut - result
+        );
+    }
+    MoveCutOutcome {
+        cut: result,
+        // Only the newest user turn qualifies — see `newest_user_index`.
+        active_request: newest_user_index(rows)
+            .filter(|index| *index < cut)
+            .map(|index| ActiveRequest(rows[index].1.clone())),
+    }
+}
+
+/// The request the agent is executing, recovered from the rows being folded.
+///
+/// This is the other half of the "never lose the request" guarantee. Holding the
+/// executing request out of the fold would mean holding everything between it and
+/// the cut out too; instead it is one short message handed to the summariser as a
+/// term of the task — restate it or the summary is wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveRequest(Arc<Message>);
+
+impl ActiveRequest {
+    fn text(&self) -> String {
+        self.0.text().to_string()
+    }
 }
 
 /// The summarisation prompt: previous summary (if any) + the messages to fold in.
@@ -89,10 +258,11 @@ fn split_rows_for_compaction(
 pub fn build_summary_request(
     previous_summary: Option<&str>,
     messages: &[Arc<Message>],
+    active_request: Option<&ActiveRequest>,
 ) -> Vec<Arc<Message>> {
     use pacode_types::{ContentBlock, Role};
     let (sanitized, _) = crate::agent::sanitize_tool_pairing(messages);
-    let mut out = Vec::with_capacity(sanitized.len() + 2);
+    let mut out = Vec::with_capacity(sanitized.len() + 3);
     out.push(Arc::new(Message::new(
         Role::System,
         vec![ContentBlock::Text {
@@ -102,6 +272,19 @@ pub fn build_summary_request(
     if let Some(prev) = previous_summary {
         out.push(Arc::new(Message::user(format!(
             "[Previous conversation summary to incorporate and update]\n{prev}"
+        ))));
+    }
+    // The request in flight is a term of the task, not a fact to be summarised:
+    // if it is folded away the agent resumes not knowing what it was asked to
+    // do. Naming it explicitly is what makes that guarantee independent of how
+    // far back the request sits — the alternative, keeping it out of the fold,
+    // pins every message between it and the cut and stops compaction shrinking.
+    if let Some(request) = active_request {
+        out.push(Arc::new(Message::user(format!(
+            "[Request currently being executed — the agent must continue exactly this. Your \
+             summary MUST open with it, in full and unparaphrased, before anything else. This is \
+             a requirement of the summary, not a request to summarise.]\n{}",
+            request.text()
         ))));
     }
     out.extend(sanitized);
@@ -153,24 +336,27 @@ fn pick_summary_route(
 pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool, CoreError> {
     use futures::StreamExt;
 
-    let (to_summarize, prev_summary, upto_seq) = {
+    let (to_summarize, prev_summary, upto_seq, active_request) = {
         let hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
         let keep_recent = session.config.context.keep_recent_messages;
-        let (to_summarize, _) = split_rows_for_compaction(&hist.rows(), keep_recent);
-        if to_summarize.is_empty() {
+        let split = split_rows_for_compaction(&hist.rows(), keep_recent);
+        if split.to_summarize.is_empty() {
             return Ok(false);
         }
-        let upto_seq = to_summarize
+        let upto_seq = split
+            .to_summarize
             .last()
             .map(|(seq, _)| *seq)
             .expect("non-empty compaction prefix");
         (
-            to_summarize
+            split
+                .to_summarize
                 .into_iter()
                 .map(|(_, message)| message)
                 .collect::<Vec<_>>(),
             hist.summary.clone(),
             upto_seq,
+            split.active_request,
         )
     };
 
@@ -197,7 +383,11 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
         return Err(CoreError::Invalid(reason));
     }
 
-    let summary_messages = build_summary_request(prev_summary.as_deref(), &to_summarize);
+    let summary_messages = build_summary_request(
+        prev_summary.as_deref(),
+        &to_summarize,
+        active_request.as_ref(),
+    );
 
     let provider = session.providers.resolve(&route).await?;
     let req = pacode_provider::CompletionRequest {

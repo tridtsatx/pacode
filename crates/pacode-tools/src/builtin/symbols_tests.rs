@@ -15,7 +15,7 @@ fn ctx(dir: &std::path::Path) -> ToolCtx {
 }
 
 async fn call(dir: &std::path::Path, input: serde_json::Value) -> Result<String, ToolError> {
-    SymbolsTool
+    SymbolsTool::default()
         .call(input, &ctx(dir))
         .await
         .map(|out| out.content)
@@ -28,9 +28,9 @@ fn has_row(out: &str, kind: &str, name: &str) -> bool {
 
 #[test]
 fn name_and_kind() {
-    assert_eq!(SymbolsTool.name(), "symbols");
+    assert_eq!(SymbolsTool::default().name(), "symbols");
     assert_eq!(NAME, "symbols");
-    assert_eq!(SymbolsTool.kind(), crate::ToolKind::ReadOnly);
+    assert_eq!(SymbolsTool::default().kind(), crate::ToolKind::ReadOnly);
 }
 
 #[tokio::test]

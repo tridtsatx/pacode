@@ -113,6 +113,22 @@ impl ToolRegistry {
             );
             return;
         }
+        // Last registration wins (a plugin or a per-session MCP proxy can carry a
+        // builtin name), but a silent overwrite hides a misconfigured plugin from
+        // every log, so name both sides.
+        if let Some(previous) = state.tools.get(tool.name()) {
+            let previous_kind = previous.kind();
+            let previous_name = previous.name();
+            log::warn!(
+                "tool '{name}' ({prev_kind:?} from '{prev_name}') is replaced by another tool \
+                 of the same name ({new_kind:?} from '{name}'); the model only ever sees the \
+                 second one",
+                name = tool.name(),
+                prev_kind = previous_kind,
+                prev_name = previous_name,
+                new_kind = tool.kind(),
+            );
+        }
         state.tools.insert(tool.name().to_string(), tool);
     }
 
@@ -151,6 +167,12 @@ impl ToolRegistry {
     }
 
     /// Definitions for the model, in name order (stable for prompt caching).
+    ///
+    /// Order comes from the [`BTreeMap`] key, not from registration order, and
+    /// must stay that way: a provider prompt cache keyed on the serialised tool
+    /// list only hits while the list is byte-identical between steps. The values
+    /// come from `Tool::definition`, which memoises per tool, so this walks the
+    /// map and clones rather than rebuilding a schema per call.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.state
             .tools

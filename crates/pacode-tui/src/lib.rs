@@ -9,9 +9,13 @@
 //! - `keys`: key bindings and the interaction mode machine (spec §5–§7)
 //! - `commands`: slash commands
 //! - `terminal`: raw mode / alt screen / mouse capture / panic hook
+//! - `backpressure`: frame scheduler — nominal cadence, measured degradation,
+//!   phase-stable ticker, elapsed-time animation phase
+//! - `render_metrics`: what the frame path pays, reported by `pacode stats`
 
 pub mod app;
 pub mod at_complete;
+pub mod backpressure;
 pub mod bash;
 pub mod binding;
 pub mod cache;
@@ -28,6 +32,7 @@ pub mod layout;
 pub mod mouse;
 pub mod nav;
 pub mod paste;
+pub mod render_metrics;
 pub mod state;
 pub mod terminal;
 pub mod timing;

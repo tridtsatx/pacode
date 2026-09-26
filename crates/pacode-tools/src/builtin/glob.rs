@@ -7,11 +7,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "glob";
 
-pub struct GlobTool;
+/// Model-facing description; see `prompts/glob.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/glob.md");
+
+#[derive(Default)]
+pub struct GlobTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -28,8 +34,10 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "List files matching a glob pattern (e.g. `src/**/*.rs`), most recently \
-         modified first, respecting .gitignore."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

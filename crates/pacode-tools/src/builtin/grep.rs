@@ -7,11 +7,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "grep";
 
-pub struct GrepTool;
+/// Model-facing description; see `prompts/grep.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/grep.md");
+
+#[derive(Default)]
+pub struct GrepTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -31,10 +37,10 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents with a regular expression (Rust regex syntax), \
-         respecting .gitignore. Returns `path:line:text` lines; hits stop at \
-         `max_results`, so narrow broad searches with `path`/`glob`. `glob` \
-         finds files by name; `symbols` maps functions/classes."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

@@ -91,7 +91,7 @@ fn ctx_with(host: Arc<StubToolHost>, cwd: std::path::PathBuf, tools: ToolRegistr
 async fn ops_cap_eight_and_nonempty() {
     let host = Arc::new(StubToolHost::default());
     let ctx = ctx_with(host, std::env::current_dir().unwrap(), ToolRegistry::new());
-    let tool = BatchTool;
+    let tool = BatchTool::default();
 
     let err = tool.call(json!({}), &ctx).await.unwrap_err();
     assert!(matches!(err, ToolError::InvalidInput(_)));
@@ -123,7 +123,7 @@ async fn results_follow_op_order_not_completion() {
     let host = Arc::new(StubToolHost::default());
     let ctx = ctx_with(host, tmp.path().to_path_buf(), registry);
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(
             json!({"ops": [
                 {"tool": "read", "input": {"path": "a"}},
@@ -163,7 +163,7 @@ async fn one_permission_request_lists_all_ops() {
         builtin_tools(&WebConfig::default()),
     );
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(
             json!({"ops": [
                 {"tool": "read", "input": {"path": "a.txt"}},
@@ -205,7 +205,7 @@ async fn denied_permission_fails_the_batch() {
         builtin_tools(&WebConfig::default()),
     );
 
-    let err = BatchTool
+    let err = BatchTool::default()
         .call(
             json!({"ops": [{"tool": "bash", "input": {"command": "echo hi"}}]}),
             &ctx,
@@ -227,7 +227,7 @@ async fn non_readonly_bash_is_rejected_but_batch_continues() {
         builtin_tools(&WebConfig::default()),
     );
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(
             json!({"ops": [
                 {"tool": "bash", "input": {"command": "rm -rf a.txt"}},
@@ -269,7 +269,7 @@ async fn read_only_bash_op_runs_in_plan_mode() {
     );
     ctx.mode = Mode::Plan;
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(
             json!({"ops": [{"tool": "bash", "input": {"command": "echo plan-ok"}}]}),
             &ctx,
@@ -290,7 +290,7 @@ async fn disabled_tool_fails_inside_batch() {
     let host = Arc::new(StubToolHost::default());
     let ctx = ctx_with(host, tmp.path().to_path_buf(), registry);
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(
             json!({"ops": [
                 {"tool": "read", "input": {"path": "a.txt"}},
@@ -317,7 +317,7 @@ async fn flat_and_aliased_op_shapes_normalize() {
         builtin_tools(&WebConfig::default()),
     );
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(
             json!({"ops": [
                 {"name": "read", "path": "b.txt"},
@@ -348,7 +348,7 @@ async fn per_op_output_gets_fair_share_of_cap() {
     );
     ctx.output_cap_chars = 1_000;
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(
             json!({"ops": [
                 {"tool": "read", "input": {"path": "big.txt"}},
@@ -384,7 +384,7 @@ async fn oversized_single_op_still_obeys_hard_byte_cap() {
     );
     ctx.output_cap_chars = 1_000_000;
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(
             json!({"ops": [{"tool": "read", "input": {"path": "a"}}]}),
             &ctx,
@@ -418,9 +418,13 @@ async fn batch_workers_are_bounded_per_agent() {
         .map(|index| json!({"tool": "read", "input": {"path": index.to_string()}}))
         .collect::<Vec<_>>();
 
+    // Two separate instances, as two concurrent `batch` calls would be: the
+    // scheduler cap is per call, not shared through the tool.
+    let one = BatchTool::default();
+    let two = BatchTool::default();
     let (first, second) = tokio::join!(
-        BatchTool.call(json!({"ops": ops.clone()}), &ctx),
-        BatchTool.call(json!({"ops": ops}), &ctx),
+        one.call(json!({"ops": ops.clone()}), &ctx),
+        two.call(json!({"ops": ops}), &ctx),
     );
 
     for out in [first.unwrap(), second.unwrap()] {
@@ -451,7 +455,7 @@ async fn an_oversized_ops_payload_is_refused_before_any_op_runs() {
         .map(|_| json!({"tool": "read", "input": {"path": filler.clone()}}))
         .collect();
 
-    let err = BatchTool
+    let err = BatchTool::default()
         .call(json!({"ops": ops}), &ctx)
         .await
         .expect_err("oversized payload");
@@ -491,7 +495,7 @@ async fn the_body_stays_inside_the_call_budget_when_ops_overfill_it() {
         })
         .collect();
 
-    let out = BatchTool
+    let out = BatchTool::default()
         .call(json!({"ops": ops}), &ctx)
         .await
         .expect("batch");

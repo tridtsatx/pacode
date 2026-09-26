@@ -233,18 +233,42 @@ pub fn estimate_tokens_for_chars(chars: usize) -> u32 {
 /// show and expand. Display-only: the model-facing `content` has its own cap.
 pub const PREVIEW_CAP_CHARS: usize = 16_000;
 
-/// Cut `text` to at most `cap` characters keeping head and tail, with a marker
-/// describing how much was dropped. Used for tool outputs and injections.
+/// Smallest cap that leaves room for the marker line. Below it the head+tail cut
+/// runs without one: the marker would not fit, and a marker that eats a quarter
+/// of the budget is worse than a silent cut at that size.
+const TRUNCATION_MARKER_MIN_CAP: usize = 64;
+
+/// Cut `text` to `cap` characters of payload, keeping head and tail.
+///
+/// The result is `cap` characters of useful text **plus** the marker line
+/// (`"... N characters truncated ..."`), so a caller budgeting on the result has
+/// to allow `cap + marker` — the marker is never subtracted from the payload,
+/// because callers cap the *payload* they asked for and the marker is
+/// information about what was lost on top of it.
+///
+/// * `cap == 0` → empty string, no marker, nothing kept.
+/// * `0 < cap < 64` → head/tail split 2/3 – 1/3, **no marker** (it does not fit).
+/// * `cap >= 64` and `text` longer than `cap` → head/tail split 2/3 – 1/3 with the
+///   marker naming how many characters were dropped.
+///
+/// Splits happen on character boundaries, so multi-byte UTF-8 is never cut in the
+/// middle. Used for tool outputs and injections.
 pub fn truncate_head_tail(text: &str, cap: usize) -> String {
+    if cap == 0 {
+        return String::new();
+    }
     let total = text.chars().count();
-    if total <= cap || cap < 64 {
+    if total <= cap {
         return text.to_string();
     }
     let head_len = cap * 2 / 3;
     let tail_len = cap - head_len;
     let head: String = text.chars().take(head_len).collect();
-    let tail: String = text.chars().skip(total.saturating_sub(tail_len)).collect();
+    let tail: String = text.chars().skip(total - tail_len).collect();
     let dropped = total - head_len - tail_len;
+    if cap < TRUNCATION_MARKER_MIN_CAP {
+        return format!("{head}{tail}");
+    }
     format!("{head}\n\n[... {dropped} characters truncated ...]\n\n{tail}")
 }
 
@@ -281,6 +305,108 @@ mod tests {
         assert!(cut.contains("characters truncated"));
         assert!(cut.chars().count() < 400);
         assert_eq!(truncate_head_tail("short", 300), "short");
+    }
+
+    /// A text of `n` distinct chars, so head and tail are recognisable.
+    fn ramp(n: usize) -> String {
+        (0..n).map(|i| char::from(b'a' + (i % 26) as u8)).collect()
+    }
+
+    #[test]
+    fn zero_cap_yields_nothing() {
+        assert_eq!(truncate_head_tail(&ramp(500), 0), "");
+        assert_eq!(truncate_head_tail("", 0), "");
+    }
+
+    #[test]
+    fn one_cap_keeps_exactly_one_char() {
+        // At cap 1 the 2/3 – 1/3 split gives head 0 / tail 1, so what survives
+        // is the last character — and a char boundary, not a byte one.
+        let text = ramp(500);
+        assert_eq!(truncate_head_tail(&text, 1), "f");
+        assert_eq!(truncate_head_tail("Привет", 1), "т");
+        assert_eq!(truncate_head_tail(&ramp(1), 1), "a");
+    }
+
+    #[test]
+    fn below_marker_threshold_cuts_without_a_marker() {
+        let text = ramp(500);
+        for cap in [1usize, 2, 31, 62, 63] {
+            let cut = truncate_head_tail(&text, cap);
+            assert!(
+                !cut.contains("truncated"),
+                "cap {cap} must not carry a marker, got {cut:?}"
+            );
+            assert_eq!(cut.chars().count(), cap, "cap {cap} was not honoured");
+        }
+    }
+
+    #[test]
+    fn at_marker_threshold_carries_the_marker() {
+        let text = ramp(500);
+        let cut = truncate_head_tail(&text, 64);
+        assert!(cut.contains("characters truncated"));
+        let head_len = 64 * 2 / 3;
+        let tail_len = 64 - head_len;
+        assert!(cut.starts_with(&ramp(text.len())[..head_len]));
+        assert!(cut.ends_with(&ramp(text.len())[text.len() - tail_len..]));
+        // Payload is exactly `cap` chars; the marker is extra, never carved out
+        // of the budget.
+        let payload: usize = cut.split("\n\n[... ").next().unwrap().chars().count()
+            + cut.rsplit_once(" ...]\n\n").unwrap().1.chars().count();
+        assert_eq!(payload, 64);
+    }
+
+    #[test]
+    fn sixty_five_is_still_head_tail_with_marker() {
+        let text = ramp(500);
+        let cut = truncate_head_tail(&text, 65);
+        assert!(cut.contains("characters truncated"));
+        assert!(cut.chars().count() > 65);
+        assert!(cut.chars().count() < 65 + 64);
+    }
+
+    #[test]
+    fn text_shorter_than_cap_is_untouched() {
+        assert_eq!(truncate_head_tail("short", 300), "short");
+        // Exactly `cap` is not truncation either.
+        let exact = ramp(64);
+        assert_eq!(truncate_head_tail(&exact, 64), exact);
+    }
+
+    #[test]
+    fn marker_names_the_dropped_character_count() {
+        let text = ramp(1000);
+        let cap = 300;
+        let cut = truncate_head_tail(&text, cap);
+        let dropped = 1000 - cap;
+        assert!(
+            cut.contains(&format!("[... {dropped} characters truncated ...]")),
+            "marker must name {dropped}, got {cut:?}"
+        );
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_char() {
+        // Кириллица (2 bytes) and emoji (4 bytes): a byte-wise cut would panic or
+        // produce replacement characters here.
+        let text: String = (0..300)
+            .map(|i| if i % 2 == 0 { 'я' } else { '🎉' })
+            .collect();
+        for cap in 0..200 {
+            let cut = truncate_head_tail(&text, cap);
+            // A valid `String` proves no byte was cut mid-char; re-encoding to
+            // bytes and back catches a lossy replacement character too.
+            assert_eq!(
+                String::from_utf8(cut.clone().into_bytes()).expect("valid utf-8"),
+                cut
+            );
+            assert!(!cut.contains('\u{fffd}'), "cap {cap} produced a lossy char");
+            if cap > 0 && cap < 64 {
+                assert_eq!(cut.chars().count(), cap, "cap {cap} was not honoured");
+            }
+            assert!(cut.chars().count() <= cap + 64 || cap == 0);
+        }
     }
 
     #[test]

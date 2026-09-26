@@ -178,18 +178,18 @@ async fn write_invalidates_cached_glob_scan() {
     let mut ctx = stub_ctx(host);
     ctx.cwd = tmp.path().to_path_buf();
 
-    let before = GlobTool
+    let before = GlobTool::default()
         .call(json!({"pattern": "*.txt"}), &ctx)
         .await
         .unwrap();
     assert!(!before.content.contains("new.txt"));
 
-    WriteTool
+    WriteTool::default()
         .call(json!({"path": "new.txt", "content": "hi\n"}), &ctx)
         .await
         .unwrap();
 
-    let after = GlobTool
+    let after = GlobTool::default()
         .call(json!({"pattern": "*.txt"}), &ctx)
         .await
         .unwrap();

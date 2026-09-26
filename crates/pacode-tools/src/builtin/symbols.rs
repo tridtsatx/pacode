@@ -11,11 +11,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "symbols";
 
-pub struct SymbolsTool;
+/// Model-facing description; see `prompts/symbols.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/symbols.md");
+
+#[derive(Default)]
+pub struct SymbolsTool {
+    definition: DefinitionCache,
+}
 
 const DEFAULT_MAX_FILES: usize = 100;
 const MAX_FILES_CAP: usize = 500;
@@ -132,12 +138,10 @@ impl Tool for SymbolsTool {
     }
 
     fn description(&self) -> &str {
-        "Map a file's or directory's symbols — functions, methods, classes, impls — with \
-         1-based line ranges. Use before reading a large file to see what lives where, or \
-         across a tree to locate a definition `grep` would bury in call-site hits. \
-         `mode: context` adds the first/last lines of each body. Files that fail to parse \
-         or have no grammar are listed under `skipped`, never silently dropped. Not for \
-         reading code (`read`), finding usages (`grep`), or finding files (`glob`)."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

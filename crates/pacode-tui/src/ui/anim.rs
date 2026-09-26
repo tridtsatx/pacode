@@ -8,7 +8,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::state::activity::{Phase, displayed_secs, format_activity_secs, thinking_color};
-use pacode_render::{Glyphs, RenderOptions, Theme, display_width, truncate_to_width};
+use pacode_render::{
+    Glyphs, RenderOptions, ShimmerPalette, Theme, display_width, shimmer_spans, truncate_to_width,
+};
 
 /// Display width of the activity bar, including its brackets.
 const PACMAN_WIDTH: usize = 24;
@@ -181,11 +183,44 @@ pub fn render_activity_line(
             )]
         };
     let avail = max_line_width.saturating_sub(PACMAN_WIDTH);
-    spans.push(Span::styled(
-        spread_tail(" ", &label, &dur_str, avail),
-        text_style,
-    ));
+    // The tail is the one line on screen that only ever exists while the agent
+    // is working, so it is where a sweep earns its keep: a band crossing the
+    // wording reads as work in progress, where a colour that changes once a
+    // second reads as a repaint. `spread_tail` lays the counters out first, so
+    // a band lighting a different number of cells each frame cannot move them.
+    let tail = spread_tail(" ", &label, &dur_str, avail);
+    spans.extend(sweep_spans(tail, text_style, opts));
     Line::from(spans)
+}
+
+/// `text` under a moving band, in the styles the band is passing through.
+///
+/// The text is taken by value so the switched-off path can hand its `String`
+/// straight to the span: copying it would add a heap allocation and a full
+/// memcpy of the line to every animation frame for a sweep that is not drawn.
+/// That path returns the caller's own style, so the line is not merely the same
+/// on screen — it costs exactly what it cost before sweeps existed.
+///
+/// The palette is built around the caller's style rather than around the theme:
+/// the low tier is that colour dimmed toward `faint` and the crest is the
+/// accent, so a line keeps its identity (a thinking line keeps its thinking
+/// colour) instead of turning into generic theme text.
+pub(crate) fn sweep_spans(text: String, base: Style, opts: &RenderOptions) -> Vec<Span<'static>> {
+    if !opts.shimmer.enabled() {
+        return vec![Span::styled(text, base)];
+    }
+    let palette = ShimmerPalette {
+        low: dimmed(base, opts.theme.faint),
+        mid: base,
+        high: opts.theme.accent.add_modifier(Modifier::BOLD),
+    };
+    shimmer_spans(
+        &text,
+        opts.shimmer,
+        opts.anim.elapsed_ms,
+        opts.anim.tick_ms,
+        palette,
+    )
 }
 
 /// Styled pacman bar of `width` cells: eaten track dim, pacman yellow, candies plain.
@@ -221,6 +256,7 @@ fn pacman_spans(frame: u64, width: usize, opts: &RenderOptions) -> Vec<Span<'sta
 mod tests {
     use super::*;
     use pacode_render::display_width;
+    use pacode_types::config::ShimmerMode;
 
     #[test]
     fn candy_is_on_unless_it_is_switched_off() {
@@ -415,5 +451,110 @@ mod tests {
             pulse(&theme, theme.green, false),
             dimmed(theme.green, theme.faint)
         );
+    }
+
+    /// The activity line's tail under a band: its text, its span styles, and
+    /// the cell offset where the crest starts (`None` while the band is off
+    /// the text entirely).
+    fn swept_tail(elapsed_ms: u64, tick_ms: u64) -> (String, Vec<Style>, Option<usize>) {
+        let opts = RenderOptions::new(80, false)
+            .shimmer(ShimmerMode::Classic)
+            .anim(pacode_render::AnimClock::new(elapsed_ms, tick_ms));
+        let crest = opts.theme.accent.add_modifier(Modifier::BOLD);
+        let line = render_activity_line(0, &opts, &Phase::Thinking, 0, 80);
+        let text = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        let styles = line.spans.iter().map(|s| s.style).collect::<Vec<_>>();
+        let crest_at = line
+            .spans
+            .iter()
+            .scan(0usize, |cell, s| {
+                let start = *cell;
+                *cell += display_width(&s.content);
+                Some((start, s.style == crest))
+            })
+            .find(|(_, is_crest)| *is_crest)
+            .map(|(start, _)| start);
+        (text, styles, crest_at)
+    }
+
+    #[test]
+    fn a_disabled_sweep_leaves_the_activity_line_exactly_as_it_was() {
+        // One span, in the caller's own style: no band, no extra runs, no
+        // per-character walk. That is the whole promise of `ui.shimmer = off`.
+        let opts = RenderOptions::new(80, false).shimmer(ShimmerMode::Off);
+        let line = render_activity_line(0, &opts, &Phase::Thinking, 0, 80);
+        let tail = line
+            .spans
+            .last()
+            .expect("the bar and the tail are both drawn");
+        assert!(
+            tail.content.starts_with(" thinking.  "),
+            "{:?}",
+            tail.content
+        );
+        assert!(tail.content.ends_with("0s"), "{:?}", tail.content);
+        // The tail still fills the line, so the duration stays pinned to the
+        // right edge and a wording change still cannot move it.
+        assert_eq!(display_width(&tail.content), 80 - PACMAN_WIDTH);
+        assert!(!tail.style.add_modifier.contains(Modifier::DIM));
+        assert!(!tail.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn a_swept_activity_line_keeps_its_text_and_moves_its_colours() {
+        // The user-visible contract of a sweep: identical wording on every
+        // frame, different colouring. Shuffled text or a frozen band fail.
+        let (first_text, first_styles, _) = swept_tail(0, 66);
+        let mut moved = false;
+        let mut crest_seen = false;
+        let mut previous = first_styles;
+        for step in 1..200u64 {
+            let (text, styles, crest) = swept_tail(step * 66, 66);
+            assert_eq!(text, first_text, "the wording changed at tick {step}");
+            moved |= styles != previous;
+            crest_seen |= crest.is_some();
+            previous = styles;
+        }
+        assert!(moved, "the band never changed a single cell in 200 frames");
+        assert!(crest_seen, "the crest never reached the line");
+    }
+
+    #[test]
+    fn the_band_never_jumps_a_cell_at_any_cadence() {
+        // What the period-in-force buys: a degraded cadence paints the same
+        // band more sparsely. A band still moving a cell per *nominal* tick
+        // would jump nine cells per painted frame under the ×9 ceiling, which
+        // is the stutter backpressure exists to avoid. Frames with the band
+        // off the text carry no position, and a frame where the band is still
+        // entering pins the crest against the first cell — so the invariant is
+        // "it travels, at most one cell per painted frame", not "+1 every frame".
+        for tick_ms in [66u64, 100, 240, 66 * 9] {
+            let mut previous: Option<usize> = None;
+            let mut travel = 0i64;
+            for step in 0..400u64 {
+                let crest = swept_tail(step * tick_ms, tick_ms).2;
+                let moved = match (crest, previous) {
+                    (Some(now), Some(before)) => {
+                        let cells = now as i64 - before as i64;
+                        assert!(
+                            (0..=1).contains(&cells),
+                            "at a {tick_ms}ms period the band moved {cells} cells at tick {step}"
+                        );
+                        cells
+                    }
+                    _ => 0,
+                };
+                travel += moved;
+                previous = crest;
+            }
+            assert!(
+                travel >= 40,
+                "at a {tick_ms}ms period the band only travelled {travel} cells"
+            );
+        }
     }
 }

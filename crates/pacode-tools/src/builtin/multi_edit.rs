@@ -8,11 +8,17 @@ use serde_json::{Value, json};
 
 use super::edit;
 use super::helpers::{is_outside_workspace, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "multi_edit";
 
-pub struct MultiEditTool;
+/// Model-facing description; see `prompts/multi_edit.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/multi_edit.md");
+
+#[derive(Default)]
+pub struct MultiEditTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -36,8 +42,10 @@ impl Tool for MultiEditTool {
     }
 
     fn description(&self) -> &str {
-        "Apply several exact replacements to one file in order, atomically: if any \
-         edit fails nothing is written. Same matching rules as `edit`."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

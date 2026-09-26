@@ -28,6 +28,7 @@ fn make_test_provider(auth: Option<CodexAuth>, base_url: Option<&str>) -> Codex 
                 context_window: Some(128_000),
                 reasoning: Some(true),
                 efforts: None,
+                ..Default::default()
             },
             ModelConfig {
                 id: "custom-plain".to_string(),
@@ -35,6 +36,7 @@ fn make_test_provider(auth: Option<CodexAuth>, base_url: Option<&str>) -> Codex 
                 context_window: Some(64_000),
                 reasoning: Some(false),
                 efforts: None,
+                ..Default::default()
             },
         ],
         catalog: true,
@@ -44,6 +46,7 @@ fn make_test_provider(auth: Option<CodexAuth>, base_url: Option<&str>) -> Codex 
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     Codex::new(
@@ -364,6 +367,7 @@ fn test_build_body_reasoning_block() {
             context_window: Some(128_000),
             reasoning: Some(true),
             efforts: None,
+            ..Default::default()
         }],
         catalog: false,
         context_window: None,
@@ -372,6 +376,7 @@ fn test_build_body_reasoning_block() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = Codex::new(
@@ -741,6 +746,7 @@ async fn test_complete_e2e_streaming_success() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = Codex::new(
@@ -823,6 +829,7 @@ async fn test_complete_e2e_401_auth_error() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = Codex::new(
@@ -894,6 +901,7 @@ async fn test_complete_e2e_429_rate_limit_error() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let defaults = ProviderDefaults {
@@ -975,6 +983,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
             context_window: Some(128_000),
             reasoning: Some(true),
             efforts: None,
+            ..Default::default()
         }],
         catalog: true,
         context_window: None,
@@ -983,6 +992,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = Codex::new(
@@ -1034,6 +1044,7 @@ fn test_model_info_pricing_and_reasoning() {
             context_window: Some(128_000),
             reasoning: Some(true),
             efforts: None,
+            ..Default::default()
         }],
         catalog: false,
         context_window: Some(64_000),
@@ -1042,6 +1053,7 @@ fn test_model_info_pricing_and_reasoning() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = Codex::new(
@@ -1218,6 +1230,7 @@ fn test_codex_model_info_vision_and_efforts() {
             context_window: None,
             reasoning: None,
             efforts: Some(vec![Effort::Low, Effort::Max]),
+            ..Default::default()
         }],
         catalog: false,
         context_window: Some(64_000),
@@ -1226,6 +1239,7 @@ fn test_codex_model_info_vision_and_efforts() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
     let provider = Codex::new(
         "codex",

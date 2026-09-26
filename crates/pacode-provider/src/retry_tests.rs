@@ -88,6 +88,7 @@ fn provider_with_idle_secs(port: u16, max_retries: u32, stream_idle_secs: u64) -
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
     let defaults = ProviderDefaults {
         max_retries,

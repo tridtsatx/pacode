@@ -39,3 +39,7 @@ tempfile = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
+# `test-util` for the paused clock the ticker's phase tests run on: the ticker
+# deadlines are a property of the arithmetic, and a real clock would only make
+# them flaky. Nothing in the crate's own code path pulls it in.
+tokio = { workspace = true, features = ["test-util"] }

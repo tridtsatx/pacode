@@ -1,0 +1,1 @@
+Read persistent memory. Without `scope` returns both stores: project (<cwd>/.pacode/memory.md) and global (~/.config/pacode/memory.md). Read at the start of an unfamiliar task; store entries with `memory_write`.

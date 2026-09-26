@@ -6,16 +6,20 @@ pub mod cache;
 pub mod diff;
 pub mod markdown;
 pub mod palettes;
+pub mod shimmer;
 pub mod stream;
 pub mod syntax;
 pub mod text;
 pub mod theme;
 pub mod wrap;
 
+use pacode_types::config::ShimmerMode;
+
 pub use cache::LineCache;
 pub use diff::{diff_hides_lines, diff_stat, render_diff, render_diff_ex, unified_diff};
 pub use markdown::render_markdown;
 pub use palettes::builtin_palettes;
+pub use shimmer::{AnimClock, ShimmerPalette, shimmer_spans, shimmer_tiers};
 pub use stream::{StreamBuffer, StreamKind, StreamOp};
 pub use syntax::{Lang, Lexer, Token, TokenKind, detect_lang, token_style};
 pub use theme::{
@@ -45,6 +49,13 @@ pub struct RenderOptions {
     pub thinking: bool,
     pub expand_hint: String,
     pub cache_epoch: u64,
+    /// Which sweep, if any, is drawn across live text.
+    pub shimmer: ShimmerMode,
+    /// The animation clock a sweep is drawn at. Deliberately *not* part of the
+    /// render context that `cache_epoch` digests: a sweep only ever lands on a
+    /// row the client redraws on every tick, so a moving clock must not
+    /// invalidate the line cache once per frame.
+    pub anim: AnimClock,
 }
 
 impl RenderOptions {
@@ -69,6 +80,8 @@ impl RenderOptions {
             thinking: false,
             expand_hint: "ctrl+o".to_string(),
             cache_epoch: 0,
+            shimmer: ShimmerMode::default(),
+            anim: AnimClock::default(),
         }
     }
 
@@ -89,6 +102,16 @@ impl RenderOptions {
 
     pub fn cache_epoch(mut self, epoch: u64) -> Self {
         self.cache_epoch = epoch;
+        self
+    }
+
+    pub fn shimmer(mut self, mode: ShimmerMode) -> Self {
+        self.shimmer = mode;
+        self
+    }
+
+    pub fn anim(mut self, anim: AnimClock) -> Self {
+        self.anim = anim;
         self
     }
 

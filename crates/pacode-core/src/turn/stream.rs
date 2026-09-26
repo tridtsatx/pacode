@@ -19,7 +19,9 @@ use crate::transcript::DeltaCoalescer;
 /// Raw argument bytes kept per in-flight call — a provider emitting unbounded
 /// args must not grow memory without bound. Past it the buffer stops growing
 /// and the cell preview carries a truncation note.
-const RAW_ARGS_CAP: usize = 1024 * 1024;
+pub(super) const RAW_ARGS_CAP: usize = 1024 * 1024;
+/// The same cap in MiB, for the error text a capped call returns.
+const RAW_ARGS_CAP_MIB: usize = RAW_ARGS_CAP / (1024 * 1024);
 /// The streamed-args cell preview shows head+tail only; the parsed tool
 /// output replaces it when the call lands.
 const ARGS_PREVIEW_CAP: usize = 6_000;
@@ -57,6 +59,36 @@ pub struct StreamOutcome {
     pub tool_calls: Vec<PendingToolCall>,
     pub usage: Usage,
     pub interrupted: bool,
+}
+
+/// Decide the dispatchable input for a finished streaming call.
+///
+/// Three cases, in this order.
+///
+/// 1. The args were cut at `RAW_ARGS_CAP`. The buffer holds a JSON *prefix* —
+///    an unclosed string, or a missing `}` or `,`, whatever the cut landed
+///    inside — so parsing it would report a syntax error that describes the cut
+///    rather than what the model actually sent. It is not a parse failure; it
+///    is a call pacode refused to dispatch, and saying so plainly is what lets
+///    the model retry with smaller arguments instead of concluding its own
+///    output was malformed. The input is `{}` and no tool ever sees it.
+/// 2. Complete args that do not parse — a real error, reported as one.
+/// 3. Complete args that parse.
+fn finish_args(args: &str, args_capped: bool) -> (Option<String>, serde_json::Value) {
+    if args_capped {
+        return (
+            Some(format!(
+                "arguments exceeded the {RAW_ARGS_CAP_MIB} MiB streaming cap and were not parsed; \
+                 they are incomplete JSON by construction. Re-issue the call with smaller \
+                 arguments (write long content to a file and pass its path)."
+            )),
+            serde_json::json!({}),
+        );
+    }
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => (None, v),
+        Err(e) => (Some(e.to_string()), serde_json::json!({})),
+    }
 }
 
 /// The transcript cell for a streaming call: `ItemUpdated` with the raw args
@@ -450,11 +482,7 @@ pub async fn consume_stream(
 
     let mut tool_calls = Vec::new();
     for (_, building) in tool_calls_building {
-        let (parse_err, input_val) = match serde_json::from_str::<serde_json::Value>(&building.args)
-        {
-            Ok(v) => (None, v),
-            Err(e) => (Some(e.to_string()), serde_json::json!({})),
-        };
+        let (parse_err, input_val) = finish_args(&building.args, building.args_capped);
         tool_calls.push(PendingToolCall {
             call_id: building.call_id,
             name: building.name,
@@ -473,3 +501,7 @@ pub async fn consume_stream(
         interrupted: false,
     })
 }
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod stream_tests;

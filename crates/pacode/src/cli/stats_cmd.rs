@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use pacode_client::{Client, ClientOptions};
 use pacode_config::Paths;
+use pacode_tui::render_metrics::{self, RenderStats};
 use pacode_types::{
     AgentLaunchStats, HistogramSnapshot, ProviderStats, Reply, Request, RuntimeStats, StoreStats,
 };
@@ -21,6 +22,12 @@ pub fn run(socket: Option<PathBuf>, paths: Paths, json: bool) -> anyhow::Result<
         .context("failed to create tokio runtime")?;
 
     rt.block_on(async move {
+        // Resolved before `paths` is moved into the client options, and only
+        // the path — the file is still read below, after the daemon reply, so a
+        // client that writes its report while this command is connecting is
+        // still seen.
+        let render_path = render_report_path(&paths);
+
         let mut client_opts = ClientOptions::new(paths, pacode_config::APP_VERSION);
         client_opts.socket = socket;
         client_opts.spawn_daemon = true;
@@ -40,14 +47,34 @@ pub fn run(socket: Option<PathBuf>, paths: Paths, json: bool) -> anyhow::Result<
             other => bail!("unexpected reply: {other:?}"),
         };
 
+        // The TUI is a separate process from the daemon, so its frame numbers
+        // are not in `RuntimeStats` — it writes them into the state directory on
+        // quit and they are read here, next to the daemon snapshot. `None` when
+        // no client has been measured (see `render_metrics::MetricsGate`), and
+        // `stats` says so rather than printing zeroes that read as a fast client.
+        let render = render_metrics::read_report(&render_path);
+
         if json {
-            let payload = serde_json::json!({ "core": core, "providers": providers });
+            let payload = serde_json::json!({
+                "core": core,
+                "providers": providers,
+                "render": render,
+            });
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(());
         }
         print_report(&core, &providers);
+        print_render(&render);
         Ok(())
     })
+}
+
+/// Where the client left its reading. Same file name the gate writes, built the
+/// same way, so the two cannot drift apart silently — the constant itself is not
+/// public because a caller should never hand the path to anything but
+/// [`render_metrics::read_report`].
+fn render_report_path(paths: &Paths) -> PathBuf {
+    paths.state_dir.join("render-metrics.json")
 }
 
 fn print_report(core: &RuntimeStats, providers: &ProviderStats) {
@@ -119,6 +146,125 @@ fn print_report(core: &RuntimeStats, providers: &ProviderStats) {
     }
     println!("  history pages served: {}", core.history_pages);
     print_launch(&core.launches);
+}
+
+/// The client's frame path. Kept apart from the daemon's numbers because it
+/// comes from a different process and a different lifetime: this is the run that
+/// just quit, and the rest of the report is whatever the daemon is holding right
+/// now. Mixing them would invite reading a two-hour-old client as the cost of
+/// the current one.
+fn print_render(render: &Option<RenderStats>) {
+    println!();
+    let Some(render) = render else {
+        println!("render (no measured client)");
+        println!("  run a TUI with PACODE_FRAME_METRICS=1 to leave a reading here");
+        return;
+    };
+    if render.draws == 0 {
+        println!("render (measured client, no frames yet)");
+        return;
+    }
+
+    println!("render (client, sampled {})", age_ms(render.sampled_at_ms));
+    println!(
+        "  {} draws — {} content ({} full repaints), {} animation, {} refused by their gate",
+        render.draws,
+        render.content_draws,
+        render.full_draws,
+        render.anim_draws,
+        render.dropped_frames
+    );
+    print_hist(
+        "  frame  (whole frame, sync markers included)",
+        &render.frame,
+    );
+    print_hist("  layout (prepare_frame + widgets + font)", &render.layout);
+    print_hist(
+        "  backend(ratatui diff + write + flush)     ",
+        &render.backend,
+    );
+    if render.clear.count > 0 {
+        print_hist("  clear  (buffer reset before a repaint)   ", &render.clear);
+    }
+    if render.resize_frames > 0 {
+        println!(
+            "  {} of those frames also reallocated the buffers (resize);",
+            render.resize_frames
+        );
+        println!("  their cost is inside frame/layout and cannot be separated out.");
+    }
+    println!(
+        "  cadence x{}   stream backlog peak {} chars, {} at the last frame",
+        render.cadence_multiplier,
+        render.stream_backlog_high_water,
+        render
+            .stream_backlog
+            .map_or("none".to_string(), |v| v.to_string())
+    );
+    println!("  {}", explain_render(render));
+}
+
+/// What the frame numbers say about the client, in the order a reader needs
+/// them: is the animation being stretched, and if so is that the client being
+/// slow or the report catching a resize.
+fn explain_render(render: &RenderStats) -> String {
+    if render.frame.count == 0 {
+        return "render: no frames".to_string();
+    }
+    let p50 = render.frame.quantile_micros(0.50);
+    let p99 = render.frame.quantile_micros(0.99);
+    let layout_p50 = render.layout.quantile_micros(0.50);
+    let backend_p50 = render.backend.quantile_micros(0.50);
+
+    let cadence = if render.cadence_multiplier > 1 {
+        format!(
+            "cadence stretched to x{} — the clock is being held back because frames are expensive",
+            render.cadence_multiplier
+        )
+    } else {
+        "cadence at nominal".to_string()
+    };
+
+    // The resize verdict comes first because it is the one that would
+    // otherwise be misread: a couple of window drags can put a slow frame in
+    // every distribution without the client being slow.
+    if render.resize_frames * 2 > render.draws {
+        return format!(
+            "{cadence}; most frames are resizes, so the frame cost is reflow, not steady-state painting"
+        );
+    }
+    if backend_p50 > layout_p50 * 2 && backend_p50 > 5_000 {
+        return format!(
+            "{cadence}; the backend half dominates (p50 {backend_p50}us vs layout {layout_p50}us) —              the terminal is not draining, not this crate's widgets"
+        );
+    }
+    if layout_p50 > 5_000 {
+        return format!(
+            "{cadence}; layout dominates (p50 {layout_p50}us, backend {backend_p50}us) —              transcript/widget work is where to look"
+        );
+    }
+    if render.dropped_frames > render.draws {
+        return format!(
+            "{cadence}; more frames were refused than painted, so the gate is the constraint              (p50 {p50}us, p99 {p99}us)"
+        );
+    }
+    format!("{cadence}; healthy (p50 {p50}us, p99 {p99}us)")
+}
+
+/// Human-readable age of a sample, so a report that outlived its window is
+/// legible instead of silently current. Renders the raw number if it is absurd
+/// (clock skew, a corrupt value) rather than printing nonsense like "-3s".
+fn age_ms(sampled_at_ms: u64) -> String {
+    let now = pacode_types::time::now_ms();
+    match now.checked_sub(sampled_at_ms) {
+        Some(age) if age < 60_000 => format!("{}s ago", age / 1000),
+        Some(age) if age < 3_600_000 => format!("{}m ago", age / 60_000),
+        Some(age) if age < 86_400_000 => format!("{}h ago", age / 3_600_000),
+        Some(age) => format!("{}d ago", age / 86_400_000),
+        // A timestamp in the future means the clocks disagree; say so rather
+        // than pretending it is fresh.
+        None => "with a clock in the future".to_string(),
+    }
 }
 
 fn print_launch(launch: &AgentLaunchStats) {

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::helpers::{parse_input, preview_body};
 use crate::host::PermissionDraft;
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 #[cfg(test)]
 #[path = "schedule_tests.rs"]
@@ -19,6 +19,11 @@ mod schedule_tests;
 
 pub const CRON_NAME: &str = "cron";
 pub const MONITOR_NAME: &str = "monitor";
+
+/// Model-facing descriptions; see `prompts/cron.md` and `prompts/monitor.md`
+/// for the convention.
+const CRON_DESCRIPTION: &str = include_str!("../prompts/cron.md");
+const MONITOR_DESCRIPTION: &str = include_str!("../prompts/monitor.md");
 
 /// Longest values accepted from the model, so a job or a monitor cannot carry an
 /// unbounded string into the session or the store.
@@ -62,7 +67,10 @@ async fn require_schedule_permission(
         .map(|_| ())
 }
 
-pub struct CronTool;
+#[derive(Default)]
+pub struct CronTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -81,11 +89,10 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &str {
-        "Scheduled prompts. `add` a job that sends `prompt` to this session on a \
-         `schedule`, `list` the jobs with the time until each next run, or `remove` \
-         one by id. Jobs survive a daemon restart and fire without further approval, \
-         so `add` and `remove` ask for permission. Use this for work that should \
-         happen again later, not to wait for something to finish."
+        CRON_DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
@@ -211,7 +218,10 @@ impl Tool for CronTool {
     }
 }
 
-pub struct MonitorTool;
+#[derive(Default)]
+pub struct MonitorTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -234,12 +244,10 @@ impl Tool for MonitorTool {
     }
 
     fn description(&self) -> &str {
-        "Watch for a condition and be told once when it becomes true, instead of \
-         blocking on a wait. `command_succeeds` = the command exits 0; \
-         `process_gone` = nothing matches the `process` pattern any more; \
-         `file_matches` = `path` contains `pattern`. A monitor fires at most once \
-         and stops with the session, but it polls on its own, so `watch` and \
-         `stop` ask for permission."
+        MONITOR_DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

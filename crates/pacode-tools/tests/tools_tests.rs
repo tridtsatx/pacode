@@ -313,7 +313,7 @@ async fn test_read_offset_limit_and_binary() {
     }
     tokio::fs::write(&text_file, text.as_bytes()).await.unwrap();
 
-    let tool = ReadTool;
+    let tool = ReadTool::default();
     let out = tool
         .call(json!({"path": "test.txt", "offset": 3, "limit": 4}), &ctx)
         .await
@@ -339,7 +339,7 @@ async fn test_write_creates_dirs_and_asks_permission() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let tool = WriteTool;
+    let tool = WriteTool::default();
     let out = tool
         .call(
             json!({"path": "sub/dir/new.txt", "content": "hello\nworld\n"}),
@@ -394,7 +394,7 @@ async fn test_edit_unique_ambiguous_replace_all_atomic() {
         .await
         .unwrap();
 
-    let tool = EditTool;
+    let tool = EditTool::default();
 
     // Not found
     let err_nf = tool
@@ -455,7 +455,7 @@ async fn test_multi_edit_all_or_nothing() {
         .await
         .unwrap();
 
-    let tool = MultiEditTool;
+    let tool = MultiEditTool::default();
 
     // One edit fails -> nothing written
     let err = tool
@@ -500,7 +500,7 @@ async fn test_bash_foreground_exit_code_and_output() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host);
 
-    let tool = BashTool;
+    let tool = BashTool::default();
 
     let out_ok = tool
         .call(
@@ -532,7 +532,7 @@ async fn test_bash_auto_yield() {
     let mut ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
     ctx.exec_yield_after = Duration::from_millis(200);
 
-    let tool = BashTool;
+    let tool = BashTool::default();
     let out = tool
         .call(json!({"command": "sleep 3"}), &ctx)
         .await
@@ -548,7 +548,7 @@ async fn test_bash_background_immediate() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host);
 
-    let tool = BashTool;
+    let tool = BashTool::default();
     let start = std::time::Instant::now();
     let out = tool
         .call(json!({"command": "sleep 5", "background": true}), &ctx)
@@ -566,7 +566,7 @@ async fn test_bash_plan_mode_denies_touch_allows_ls() {
     let mut ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
     ctx.mode = Mode::Plan;
 
-    let tool = BashTool;
+    let tool = BashTool::default();
 
     let err = tool.call(json!({"command": "touch x"}), &ctx).await;
     assert!(matches!(err, Err(ToolError::Denied(_))));
@@ -583,7 +583,7 @@ async fn test_bash_catastrophic_denial() {
     let mut ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
     ctx.mode = Mode::Bypass;
 
-    let tool = BashTool;
+    let tool = BashTool::default();
     let err = tool.call(json!({"command": "rm -rf ~"}), &ctx).await;
     assert!(matches!(err, Err(ToolError::Denied(_))));
 
@@ -622,7 +622,7 @@ async fn test_grep_glob_ls_with_gitignore() {
         .unwrap();
 
     // Grep
-    let grep = GrepTool;
+    let grep = GrepTool::default();
     let out_grep = grep.call(json!({"pattern": "hello"}), &ctx).await.unwrap();
     assert!(out_grep.content.contains("file1.rs"));
     assert!(!out_grep.content.contains("test.ignored"));
@@ -630,14 +630,14 @@ async fn test_grep_glob_ls_with_gitignore() {
     assert!(!out_grep.content.contains(".hidden_file"));
 
     // Glob
-    let glob = GlobTool;
+    let glob = GlobTool::default();
     let out_glob = glob.call(json!({"pattern": "*.rs"}), &ctx).await.unwrap();
     assert!(out_glob.content.contains("file1.rs"));
     assert!(out_glob.content.contains("file2.rs"));
     assert!(!out_glob.content.contains("ignored_dir"));
 
     // Ls
-    let ls = LsTool;
+    let ls = LsTool::default();
     let out_ls = ls.call(json!({}), &ctx).await.unwrap();
     assert!(out_ls.content.contains("file1.rs"));
     assert!(out_ls.content.contains("file2.rs"));
@@ -652,7 +652,7 @@ async fn test_plan_set_and_update() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let tool = PlanTool;
+    let tool = PlanTool::default();
     let set_out = tool
         .call(
             json!({
@@ -694,7 +694,7 @@ async fn test_agent_spawn_and_list() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let tool = AgentTool;
+    let tool = AgentTool::default();
     let spawn_out = tool
         .call(
             json!({
@@ -739,7 +739,7 @@ async fn test_agent_spawn_with_named_kind() {
         .push(reviewer_kind(tmp.path()));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let tool = AgentTool;
+    let tool = AgentTool::default();
     let out = tool
         .call(
             json!({"action": "spawn", "kind": "reviewer", "prompt": "Review src/main.rs"}),
@@ -800,7 +800,7 @@ async fn test_agent_spawn_unknown_kind_warns_instead_of_refusing() {
         .push(reviewer_kind(tmp.path()));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let tool = AgentTool;
+    let tool = AgentTool::default();
     let out = tool
         .call(
             json!({"action": "spawn", "kind": "explore", "prompt": "do work"}),
@@ -845,7 +845,7 @@ async fn test_agent_spawn_kind_with_unresolvable_model() {
     host.agent_kinds.lock().unwrap().push(kind);
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let tool = AgentTool;
+    let tool = AgentTool::default();
     let err = tool
         .call(
             json!({"action": "spawn", "kind": "reviewer", "prompt": "do work"}),
@@ -870,7 +870,7 @@ async fn test_agent_list_shows_kinds_without_agents() {
         .push(reviewer_kind(tmp.path()));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let tool = AgentTool;
+    let tool = AgentTool::default();
     let out = tool.call(json!({"action": "list"}), &ctx).await.unwrap();
     assert!(
         out.content.contains("Available kinds"),
@@ -894,7 +894,7 @@ async fn test_agent_list_says_to_omit_kind_when_none_are_defined() {
         "this test is about the empty case"
     );
 
-    let tool = AgentTool;
+    let tool = AgentTool::default();
     let out = tool.call(json!({"action": "list"}), &ctx).await.unwrap();
     assert!(
         out.content.contains("omit `kind`"),
@@ -905,7 +905,7 @@ async fn test_agent_list_says_to_omit_kind_when_none_are_defined() {
 
 #[test]
 fn test_definition_ensures_common_properties() {
-    let read = ReadTool;
+    let read = ReadTool::default();
     let def = read.definition();
     assert_eq!(def.name, "read");
     let props = &def.input_schema["properties"];
@@ -921,7 +921,7 @@ async fn test_bg_lifecycle() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let bash = BashTool;
+    let bash = BashTool::default();
     let spawn_res = bash
         .call(
             json!({"command": "echo 'bg line 1' && sleep 10", "background": true}),
@@ -931,7 +931,7 @@ async fn test_bg_lifecycle() {
         .unwrap();
     let task_id = spawn_res.task.unwrap();
 
-    let bg = BgTool;
+    let bg = BgTool::default();
     let list_out = bg.call(json!({"action": "list"}), &ctx).await.unwrap();
     assert!(list_out.content.contains(task_id.as_str()));
     assert!(list_out.content.contains("running"));
@@ -986,7 +986,7 @@ async fn test_outside_workspace_detection() {
     let outside_path_str = outside_file.to_string_lossy().to_string();
 
     // Write outside workspace
-    let write_tool = WriteTool;
+    let write_tool = WriteTool::default();
     let write_out = write_tool
         .call(
             json!({"path": outside_path_str, "content": "hello outside\n"}),
@@ -1005,7 +1005,7 @@ async fn test_outside_workspace_detection() {
     );
 
     // Edit outside workspace
-    let edit_tool = EditTool;
+    let edit_tool = EditTool::default();
     let edit_out = edit_tool
         .call(
             json!({"path": outside_path_str, "old_string": "outside", "new_string": "world"}),
@@ -1024,7 +1024,7 @@ async fn test_outside_workspace_detection() {
     );
 
     // Multi-edit outside workspace
-    let multi_edit_tool = MultiEditTool;
+    let multi_edit_tool = MultiEditTool::default();
     let multi_out = multi_edit_tool
         .call(
             json!({
@@ -1052,7 +1052,7 @@ async fn test_webfetch_url_validation() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host);
 
-    let tool = pacode_tools::builtin::webfetch::WebFetchTool;
+    let tool = pacode_tools::builtin::webfetch::WebFetchTool::default();
 
     let err_scheme = tool
         .call(json!({"url": "ftp://example.com/file"}), &ctx)
@@ -1216,12 +1216,15 @@ async fn two_edits_of_one_file_both_land() {
     // Both callers read the same starting content; without the per-path lock one
     // of the two writes would be computed from a file the other had already
     // replaced, and the first change would vanish.
+    // Two separate tools, as two concurrent `edit` calls would be.
+    let one = EditTool::default();
+    let two = EditTool::default();
     let (first, second) = tokio::join!(
-        EditTool.call(
+        one.call(
             json!({"path": "shared.txt", "old_string": "aaa", "new_string": "AAA"}),
             &ctx
         ),
-        EditTool.call(
+        two.call(
             json!({"path": "./shared.txt", "old_string": "bbb", "new_string": "BBB"}),
             &ctx
         )
@@ -1255,7 +1258,7 @@ async fn write_keeps_the_mode_and_caps_a_huge_permission_detail() {
         .await
         .unwrap();
 
-    WriteTool
+    WriteTool::default()
         .call(json!({"path": "run.sh", "content": "new\n"}), &ctx)
         .await
         .unwrap();
@@ -1268,7 +1271,7 @@ async fn write_keeps_the_mode_and_caps_a_huge_permission_detail() {
     );
 
     let filler = "z".repeat(200_000);
-    WriteTool
+    WriteTool::default()
         .call(json!({"path": "run.sh", "content": filler}), &ctx)
         .await
         .unwrap();
@@ -1299,7 +1302,7 @@ async fn a_file_too_large_to_diff_is_refused_instead_of_loaded() {
         .unwrap();
     drop(handle);
 
-    let err = EditTool
+    let err = EditTool::default()
         .call(
             json!({"path": "huge.txt", "old_string": "a", "new_string": "b"}),
             &ctx,
@@ -1308,7 +1311,7 @@ async fn a_file_too_large_to_diff_is_refused_instead_of_loaded() {
         .expect_err("too large to load whole");
     assert!(format!("{err}").contains("byte limit"), "{err}");
 
-    let err = WriteTool
+    let err = WriteTool::default()
         .call(json!({"path": "huge.txt", "content": "b"}), &ctx)
         .await
         .expect_err("too large to load whole");
@@ -1316,4 +1319,188 @@ async fn a_file_too_large_to_diff_is_refused_instead_of_loaded() {
 
     // Nothing was written, and nothing was asked.
     assert!(host.drafts.lock().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Input caps: `plan set` and `memory_write` must bound what they store and say
+// so out loud. A silent cut looks exactly like a successful write, and the model
+// goes on believing in content that was never stored.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_plan_set_caps_item_length_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = PlanTool::default();
+    let long = "x".repeat(pacode_tools::builtin::plan::MAX_ITEM_CHARS + 500);
+    let out = tool
+        .call(json!({"action": "set", "items": [{"content": long}]}), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains("plan input truncated"),
+        "a capped set must say so: {}",
+        out.content
+    );
+
+    // And what was actually stored is the bounded text, not the input.
+    let plan = ctx.host.plan();
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(
+        plan.items[0].content.chars().count(),
+        pacode_tools::builtin::plan::MAX_ITEM_CHARS
+    );
+}
+
+#[tokio::test]
+async fn test_plan_set_caps_item_count_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = PlanTool::default();
+    let items: Vec<serde_json::Value> = (0..30)
+        .map(|i| json!({"content": format!("step {i}")}))
+        .collect();
+    let out = tool
+        .call(json!({"action": "set", "items": items}), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains("plan input truncated"),
+        "a capped set must say so: {}",
+        out.content
+    );
+    assert!(out.content.contains("10 item(s) past the 20-item limit"));
+
+    let plan = ctx.host.plan();
+    assert_eq!(plan.items.len(), pacode_tools::builtin::plan::MAX_ITEMS);
+}
+
+#[tokio::test]
+async fn test_plan_set_within_limits_has_no_truncation_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = PlanTool::default();
+    let out = tool
+        .call(
+            json!({"action": "set", "items": [{"content": "a short step"}]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !out.content.contains("truncated"),
+        "an uncapped set must not claim it truncated anything: {}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn test_plan_get_after_a_capped_set_shows_the_bounded_plan() {
+    // The cap has to be below the hard output byte cap, or the model would get
+    // a plan back that is itself cut with a marker it cannot act on.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = PlanTool::default();
+    let long = "y".repeat(pacode_tools::builtin::plan::MAX_ITEM_CHARS + 500);
+    tool.call(json!({"action": "set", "items": [{"content": long}]}), &ctx)
+        .await
+        .unwrap();
+
+    let got = tool.call(json!({"action": "get"}), &ctx).await.unwrap();
+    assert!(
+        !got.content.contains("output truncated"),
+        "a plan that fits the input cap must survive `get` intact: {}",
+        got.content
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `agent`: the kind list is read at call time, because the tool description is
+// served from a cache and cannot see the host.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_agent_kinds_lists_what_the_session_actually_has() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    host.agent_kinds
+        .lock()
+        .unwrap()
+        .push(reviewer_kind(tmp.path()));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = AgentTool::default();
+    let out = tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    assert!(out.content.contains("reviewer"), "{}", out.content);
+    assert!(out.content.contains("Reviews code changes"));
+}
+
+#[tokio::test]
+async fn test_agent_kinds_names_the_empty_case() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = AgentTool::default();
+    let out = tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    // Silence here is what had the model inventing `explore`/`reviewer`.
+    assert!(
+        out.content.contains("No agent kinds are defined"),
+        "the empty case must be named: {}",
+        out.content
+    );
+    assert!(out.content.contains("omit `kind`"));
+}
+
+#[tokio::test]
+async fn test_agent_kinds_reflects_a_kind_added_after_the_definition_was_cached() {
+    // The point of the call-time read: `Tool::description` is memoised per tool
+    // and has no ToolCtx, so a kind appearing later cannot reach it. Reading at
+    // call time can.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    let tool = AgentTool::default();
+
+    let before = tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    assert!(before.content.contains("No agent kinds are defined"));
+
+    // Touch the definition cache the way the turn loop does on every step.
+    let _ = tool.definition();
+
+    host.agent_kinds
+        .lock()
+        .unwrap()
+        .push(reviewer_kind(tmp.path()));
+
+    let after = tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    assert!(
+        after.content.contains("reviewer"),
+        "a kind added after the definition was cached must still be visible: {}",
+        after.content
+    );
+}
+
+#[tokio::test]
+async fn test_agent_kinds_is_side_effect_free() {
+    // `kinds` exists so the model can look without acting; it must not spawn.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+
+    let tool = AgentTool::default();
+    tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    assert!(host.spawned_specs.lock().unwrap().is_empty());
+    assert!(host.list_agents().is_empty());
 }

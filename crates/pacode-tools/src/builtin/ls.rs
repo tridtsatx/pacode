@@ -7,11 +7,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "ls";
 
-pub struct LsTool;
+/// Model-facing description; see `prompts/ls.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/ls.md");
+
+#[derive(Default)]
+pub struct LsTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -27,10 +33,10 @@ impl Tool for LsTool {
     }
 
     fn description(&self) -> &str {
-        "List a directory's top level only (not recursive): one entry per line, \
-         directories with a trailing `/`, files with their size. Hidden entries \
-         only with `all`. For a recursive tree use `glob`; for code structure \
-         use `symbols`."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {

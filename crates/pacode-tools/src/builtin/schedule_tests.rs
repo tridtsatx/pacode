@@ -10,7 +10,7 @@ async fn cron_add_registers_a_job_and_reports_the_next_run() {
     let host = Arc::new(StubToolHost::default());
     let ctx = stub_ctx(host.clone());
 
-    let out = CronTool
+    let out = CronTool::default()
         .call(
             json!({
                 "action": "add",
@@ -38,7 +38,7 @@ async fn cron_rejects_a_schedule_it_cannot_read() {
     let host = Arc::new(StubToolHost::default());
     let ctx = stub_ctx(host.clone());
 
-    let err = CronTool
+    let err = CronTool::default()
         .call(
             json!({
                 "action": "add",
@@ -60,7 +60,7 @@ async fn cron_list_and_remove_round_trip() {
     let host = Arc::new(StubToolHost::default());
     let ctx = stub_ctx(host.clone());
 
-    CronTool
+    CronTool::default()
         .call(
             json!({"action": "add", "name": "nightly", "schedule": "every 1h", "prompt": "x", "intent": "add"}),
             &ctx,
@@ -69,13 +69,13 @@ async fn cron_list_and_remove_round_trip() {
         .expect("add");
     let id = host.schedule.list_cron_jobs()[0].id.clone();
 
-    let listed = CronTool
+    let listed = CronTool::default()
         .call(json!({"action": "list", "intent": "list"}), &ctx)
         .await
         .expect("list");
     assert!(listed.content.contains("nightly"), "{}", listed.content);
 
-    CronTool
+    CronTool::default()
         .call(
             json!({"action": "remove", "job_id": id.to_string(), "intent": "remove"}),
             &ctx,
@@ -84,7 +84,7 @@ async fn cron_list_and_remove_round_trip() {
         .expect("remove");
     assert!(host.schedule.list_cron_jobs().is_empty());
 
-    let empty = CronTool
+    let empty = CronTool::default()
         .call(json!({"action": "list", "intent": "list"}), &ctx)
         .await
         .expect("list");
@@ -110,7 +110,7 @@ async fn cron_needs_every_field_of_an_add() {
             "prompt",
         ),
     ] {
-        let err = CronTool
+        let err = CronTool::default()
             .call(args, &ctx)
             .await
             .expect_err("must be refused");
@@ -120,7 +120,7 @@ async fn cron_needs_every_field_of_an_add() {
         );
     }
 
-    let err = CronTool
+    let err = CronTool::default()
         .call(json!({"action": "dance", "intent": "i"}), &ctx)
         .await
         .expect_err("unknown action");
@@ -138,11 +138,14 @@ async fn monitor_watch_accepts_each_condition_and_needs_its_fields() {
         json!({"action": "watch", "condition": "file_exists", "path": "target/release/pacode", "intent": "i"}),
         json!({"action": "watch", "condition": "file_matches", "path": "build.log", "pattern": "Finished", "intent": "i"}),
     ] {
-        MonitorTool.call(args, &ctx).await.expect("watch");
+        MonitorTool::default()
+            .call(args, &ctx)
+            .await
+            .expect("watch");
     }
     assert_eq!(host.schedule.list_monitors().len(), 4);
 
-    let err = MonitorTool
+    let err = MonitorTool::default()
         .call(
             json!({"action": "watch", "condition": "file_matches", "path": "x", "intent": "i"}),
             &ctx,
@@ -151,7 +154,7 @@ async fn monitor_watch_accepts_each_condition_and_needs_its_fields() {
         .expect_err("missing pattern");
     assert!(format!("{err}").contains("pattern"), "{err}");
 
-    let err = MonitorTool
+    let err = MonitorTool::default()
         .call(
             json!({"action": "watch", "condition": "telepathy", "intent": "i"}),
             &ctx,
@@ -166,7 +169,7 @@ async fn monitor_list_and_stop_round_trip() {
     let host = Arc::new(StubToolHost::default());
     let ctx = stub_ctx(host.clone());
 
-    MonitorTool
+    MonitorTool::default()
         .call(
             json!({"action": "watch", "label": "build", "condition": "file_exists", "path": "done", "intent": "i"}),
             &ctx,
@@ -175,13 +178,13 @@ async fn monitor_list_and_stop_round_trip() {
         .expect("watch");
     let id = host.schedule.list_monitors()[0].id.clone();
 
-    let listed = MonitorTool
+    let listed = MonitorTool::default()
         .call(json!({"action": "list", "intent": "i"}), &ctx)
         .await
         .expect("list");
     assert!(listed.content.contains("build"), "{}", listed.content);
 
-    MonitorTool
+    MonitorTool::default()
         .call(
             json!({"action": "stop", "monitor_id": id.to_string(), "intent": "i"}),
             &ctx,
@@ -199,7 +202,7 @@ async fn long_values_from_the_model_are_capped() {
     let host = Arc::new(StubToolHost::default());
     let ctx = stub_ctx(host.clone());
 
-    CronTool
+    CronTool::default()
         .call(
             json!({
                 "action": "add",
@@ -223,7 +226,7 @@ async fn scheduling_side_effects_ask_first_and_listing_does_not() {
     let host = Arc::new(StubToolHost::default());
     let ctx = stub_ctx(host.clone());
 
-    CronTool
+    CronTool::default()
         .call(
             json!({"action": "add", "name": "nightly", "schedule": "every 1h", "prompt": "run the suite", "intent": "i"}),
             &ctx,
@@ -231,7 +234,7 @@ async fn scheduling_side_effects_ask_first_and_listing_does_not() {
         .await
         .expect("add");
     let job_id = host.schedule.list_cron_jobs()[0].id.clone();
-    let out = MonitorTool
+    let out = MonitorTool::default()
         .call(
             json!({"action": "watch", "label": "build", "condition": "file_exists", "path": "done", "intent": "i"}),
             &ctx,
@@ -258,11 +261,11 @@ async fn scheduling_side_effects_ask_first_and_listing_does_not() {
     assert!(watch.detail.contains("done exists"), "{}", watch.detail);
     assert!(watch.detail.contains("5s"), "{}", watch.detail);
 
-    CronTool
+    CronTool::default()
         .call(json!({"action": "list", "intent": "i"}), &ctx)
         .await
         .expect("list");
-    MonitorTool
+    MonitorTool::default()
         .call(json!({"action": "list", "intent": "i"}), &ctx)
         .await
         .expect("list");
@@ -272,14 +275,14 @@ async fn scheduling_side_effects_ask_first_and_listing_does_not() {
         "listing is not a side effect and must not prompt"
     );
 
-    CronTool
+    CronTool::default()
         .call(
             json!({"action": "remove", "job_id": job_id.to_string(), "intent": "i"}),
             &ctx,
         )
         .await
         .expect("remove");
-    MonitorTool
+    MonitorTool::default()
         .call(
             json!({"action": "stop", "monitor_id": monitor_id.to_string(), "intent": "i"}),
             &ctx,
@@ -300,7 +303,7 @@ async fn a_refused_schedule_change_leaves_nothing_behind() {
     *host.decision.lock().unwrap() = pacode_types::PermissionDecision::Deny;
     let ctx = stub_ctx(host.clone());
 
-    let err = CronTool
+    let err = CronTool::default()
         .call(
             json!({"action": "add", "name": "nightly", "schedule": "every 1h", "prompt": "p", "intent": "i"}),
             &ctx,
@@ -310,7 +313,7 @@ async fn a_refused_schedule_change_leaves_nothing_behind() {
     assert!(matches!(err, ToolError::Denied(_)), "{err}");
     assert!(host.schedule.list_cron_jobs().is_empty());
 
-    let err = MonitorTool
+    let err = MonitorTool::default()
         .call(
             json!({"action": "watch", "condition": "process_gone", "process": "dota2", "intent": "i"}),
             &ctx,
@@ -326,7 +329,7 @@ async fn a_command_monitor_is_graded_on_the_command_it_runs() {
     let host = Arc::new(StubToolHost::default());
     let ctx = stub_ctx(host.clone());
 
-    MonitorTool
+    MonitorTool::default()
         .call(
             json!({"action": "watch", "condition": "command_succeeds", "command": "rm -rf /", "intent": "i"}),
             &ctx,

@@ -27,6 +27,7 @@ fn test_registry_from_config_empty_base_url() {
             extra_body: None,
             headers: BTreeMap::new(),
             proxy: None,
+            ..Default::default()
         },
     );
 
@@ -68,6 +69,7 @@ fn test_registry_from_config_and_routes() {
             extra_body: None,
             headers: BTreeMap::new(),
             proxy: None,
+            ..Default::default()
         },
     );
 
@@ -86,10 +88,7 @@ fn test_registry_from_config_and_routes() {
     let reg = ProviderRegistry::from_config(&cfg, &api_keys).expect("valid registry");
     assert_eq!(
         reg.default_route(),
-        Some(&ModelRoute::new(
-            "openrouter",
-            "anthropic/claude-3.5-sonnet"
-        ))
+        Some(ModelRoute::new("openrouter", "anthropic/claude-3.5-sonnet"))
     );
 
     let prov = reg.get("openrouter");

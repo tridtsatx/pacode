@@ -9,7 +9,10 @@ use pacode_mcp::{McpPool, McpToolInfo};
 use serde_json::Value;
 
 use super::helpers::{cap_output, preview_body};
-use crate::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{
+    ACCEPT_LARGE_OUTPUT_KEY, DefinitionCache, INTENT_KEY, Tool, ToolCtx, ToolError, ToolKind,
+    ToolOutput,
+};
 
 pub struct McpTool {
     pool: Arc<McpPool>,
@@ -18,6 +21,11 @@ pub struct McpTool {
     /// `<server>__<tool>`
     name: String,
     kind: ToolKind,
+    /// A listing is immutable for the life of the proxy, so the memoised
+    /// definition needs no invalidation: a refreshed pool is served by
+    /// [`mcp_tools`], which builds *new* proxies (with new, empty caches) rather
+    /// than mutating the ones a session already holds.
+    definition: DefinitionCache,
 }
 
 impl McpTool {
@@ -38,6 +46,7 @@ impl McpTool {
             info,
             name,
             kind,
+            definition: DefinitionCache::new(),
         }
     }
 }
@@ -47,12 +56,19 @@ pub struct McpResourceTool {
     server: String,
     /// `<server>__resource`
     name: String,
+    /// Fixed by construction, so it has no refresh path.
+    definition: DefinitionCache,
 }
 
 impl McpResourceTool {
     pub fn new(pool: Arc<McpPool>, server: String) -> Self {
         let name = pacode_mcp::tool_name(&server, "resource");
-        Self { pool, server, name }
+        Self {
+            pool,
+            server,
+            name,
+            definition: DefinitionCache::new(),
+        }
     }
 }
 
@@ -109,6 +125,9 @@ impl Tool for McpTool {
 
     fn description(&self) -> &str {
         &self.info.description
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
@@ -186,6 +205,9 @@ impl Tool for McpResourceTool {
             },
             "required": ["uri"]
         })
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn kind(&self) -> ToolKind {

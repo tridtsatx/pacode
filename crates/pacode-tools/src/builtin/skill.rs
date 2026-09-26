@@ -6,13 +6,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "skill";
+
+/// Model-facing description; see `prompts/skill.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/skill.md");
 
 pub struct SkillTool {
     registry: Arc<SkillRegistry>,
     max_body_bytes: usize,
+    definition: DefinitionCache,
 }
 
 impl SkillTool {
@@ -20,16 +24,14 @@ impl SkillTool {
         Self {
             registry,
             max_body_bytes,
+            definition: DefinitionCache::new(),
         }
     }
 }
 
 impl Default for SkillTool {
     fn default() -> Self {
-        Self {
-            registry: Arc::new(SkillRegistry::default()),
-            max_body_bytes: 16384,
-        }
+        Self::new(Arc::new(SkillRegistry::default()), 16384)
     }
 }
 
@@ -46,10 +48,10 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        "Load a skill's full instructions on demand: call it when one of the \
-         skills listed in the system prompt matches the task. The body is \
-         capped (~16K) and a truncated body ends with a `[... truncated ...]` \
-         marker."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
