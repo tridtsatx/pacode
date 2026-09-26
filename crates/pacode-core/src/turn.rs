@@ -231,6 +231,36 @@ pub async fn run_turn(
         // byte-for-byte what it was.
         let model_route = phase.model(&agent_info.model);
 
+        // A context checkpoint, if one is due: a word pushed into the history as
+        // an ordinary user message, so compaction can take it away and the
+        // settle can tell "lost" from "forgotten". Asked *before* the request is
+        // built, so the word is in the very context it is asked about.
+        let checkpoint_word = {
+            let mut checkpoints = agent
+                .checkpoints
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            checkpoints.due(
+                session.config.ui.analyze_checkpoint_every,
+                agent.compaction_generation(),
+            )
+        };
+        if let Some(word) = checkpoint_word {
+            let (seq, message) = agent
+                .history
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(pacode_types::Message::user(
+                    crate::analyze::checkpoint::instruction(&word),
+                ));
+            // Persisted with the rest of the conversation: a checkpoint that
+            // only existed in memory would vanish on resume, and the resumed
+            // session would score differently from the live one.
+            let _ = session
+                .append_agent_message(agent.as_ref(), seq, &message)
+                .await;
+        }
+
         let history_msgs = agent
             .history
             .lock()
@@ -376,6 +406,32 @@ pub async fn run_turn(
             content_blocks.push(ContentBlock::Text {
                 text: outcome.text.clone(),
             });
+        }
+
+        // The checkpoint is answered by a `checkpoint` call in *this* step. A
+        // model that saw the word and answered it in prose instead has not
+        // demonstrated it reached into the context, so prose does not count:
+        // `None` here is an ignored checkpoint, and that is the honest reading.
+        let checkpoint_answer = outcome.tool_calls.iter().find_map(|call| {
+            (call.name == pacode_tools::builtin::checkpoint::NAME)
+                .then(|| call.input.get("word").and_then(|w| w.as_str()))
+                .flatten()
+                .map(str::to_string)
+        });
+        {
+            let mut checkpoints = agent
+                .checkpoints
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if checkpoints.pending_word().is_some() {
+                checkpoints.settle(checkpoint_answer.as_deref(), agent.compaction_generation());
+                // Published every turn, not only when a checkpoint was asked:
+                // the page reads the scorecard when it is opened, and a
+                // scorecard that only updates on a checkpoint is a stale one.
+                session
+                    .accounting
+                    .record_context_quality(checkpoints.report());
+            }
         }
 
         for call in &outcome.tool_calls {

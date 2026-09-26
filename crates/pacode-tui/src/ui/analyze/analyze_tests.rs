@@ -223,7 +223,13 @@ fn a_stale_scroll_offset_lands_on_the_last_row_instead_of_blank_space() {
         rows[built.len()..].iter().all(|row| row.is_empty()),
         "a clamped page leaves blanks, not missing content: {rows:?}"
     );
-    assert!(screen.iter().any(|row| row.contains("100%")), "{screen:?}");
+    // Three correct and nothing else is three points, and the page says so
+    // with a sign — a run that ignored half its checkpoints must not read as
+    // the same "100%".
+    assert!(
+        screen.iter().any(|row| row.contains("score +3")),
+        "{screen:?}"
+    );
 }
 
 #[test]

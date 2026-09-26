@@ -15,6 +15,7 @@ pub mod ask_question;
 pub mod bash;
 pub mod batch;
 pub mod bg;
+pub mod checkpoint;
 pub mod edit;
 pub mod glob;
 pub mod grep;

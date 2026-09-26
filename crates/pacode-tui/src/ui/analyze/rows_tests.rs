@@ -177,7 +177,7 @@ fn a_session_where_every_checkpoint_was_compacted_away_shows_no_score() {
         text.contains("score: not scored"),
         "a 0% here would blame the model for compaction:\n{text}"
     );
-    assert!(!text.contains("score 0%"), "{text}");
+    assert!(!text.contains("score +0"), "{text}");
 }
 
 #[test]

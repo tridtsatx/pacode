@@ -252,8 +252,13 @@ impl ContextQualityReport {
         self.checkpoints > 0 && self.scored_checkpoints() == 0
     }
 
+    /// Points, not a ratio: a correct word is worth one, ignoring the
+    /// instruction costs two, and a wrong word costs one. A ratio cannot say
+    /// that — it scores "answered every time, wrong every time" as a perfect
+    /// result, and the question is whether the model held on to the
+    /// instruction, not how often it spoke.
     fn refresh_score(&mut self) {
-        self.score = self.passed as f64 / self.scored_checkpoints().max(1) as f64;
+        self.score = f64::from(self.passed as i32 - 2 * self.ignored as i32 - self.wrong as i32);
     }
 }
 

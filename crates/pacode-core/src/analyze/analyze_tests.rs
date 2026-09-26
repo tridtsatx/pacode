@@ -263,7 +263,14 @@ fn the_context_quality_slot_takes_a_report_and_an_incremental_edit() {
     let report = ledger.report();
     assert_eq!(report.quality.checkpoints, 5);
     assert_eq!(report.quality.passed, 4);
-    assert!((report.quality.score - 0.8).abs() < 1e-12);
+    // Points, not a ratio: three correct minus one wrong, plus the one just
+    // recorded. A ratio would call four-out-of-five "0.8" and hide the fact that
+    // a wrong word costs a point.
+    assert!(
+        (report.quality.score - 3.0).abs() < 1e-12,
+        "{}",
+        report.quality.score
+    );
 }
 
 #[test]

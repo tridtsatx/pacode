@@ -298,6 +298,13 @@ async fn open_session_unlocked(
             for tool in core.get_mcp_tools_cached() {
                 session_tools.register(tool);
             }
+            // Only with `--analyze-mode`: a checkpoint the model chose to ask
+            // for measures nothing, and the tool is the model's to call.
+            if core.config().ui.analyze_checkpoint_every > 0 {
+                session_tools.register(Arc::new(
+                    pacode_tools::builtin::checkpoint::CheckpointTool::default(),
+                ));
+            }
 
             let main_info = pacode_types::AgentInfo {
                 id: pacode_types::AgentId::main(),
@@ -416,6 +423,13 @@ async fn open_session_unlocked(
             let mut session_tools = core.deps.tools.clone();
             for tool in core.get_mcp_tools_cached() {
                 session_tools.register(tool);
+            }
+            // Only with `--analyze-mode`: a checkpoint the model chose to ask
+            // for measures nothing, and the tool is the model's to call.
+            if core.config().ui.analyze_checkpoint_every > 0 {
+                session_tools.register(Arc::new(
+                    pacode_tools::builtin::checkpoint::CheckpointTool::default(),
+                ));
             }
 
             let main_id = pacode_types::AgentId::main();

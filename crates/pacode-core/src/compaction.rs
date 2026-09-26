@@ -439,6 +439,11 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
         .await?;
 
     {
+        // Before the rewrite, so a checkpoint open across this line is already
+        // marked lost by the time the settle asks: a word that went into the
+        // summary is one the model may still have, and a word that fell off the
+        // end is one it certainly did not.
+        agent.note_compacted();
         let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
         let keep = hist
             .rows()

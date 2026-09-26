@@ -512,6 +512,14 @@ pub struct Agent {
     /// (`request_turn` and `drain_injections`) read from one and put back into
     /// the other, and a take they later undo must not have spent a release.
     pub notice_lock: crate::notice_lock::NoticeLock,
+    /// The context-quality checkpoints this agent has been asked, and the words
+    /// it is still holding. Driven entirely by the turn loop — ask at the top of
+    /// a turn, settle at the bottom — so it costs nothing while idle.
+    pub checkpoints: Mutex<crate::analyze::Checkpoints>,
+    /// Bumped whenever this agent's history is compacted. A checkpoint issued
+    /// under one generation and answered under another lost its context, and
+    /// that is a fact about the session rather than about the model.
+    compaction_generation: std::sync::atomic::AtomicU64,
     /// Tools this agent may call (main: all; subagent: subset without `agent`).
     pub tools: RwLock<ToolRegistry>,
     /// Cancellation token of the running turn, if any. Bookkeeping for the
@@ -591,6 +599,8 @@ impl Agent {
             stream_usage: Mutex::new(Usage::default()),
             injections: InjectionQueue::default(),
             notice_lock: crate::notice_lock::NoticeLock::new(),
+            checkpoints: Mutex::new(crate::analyze::Checkpoints::default()),
+            compaction_generation: std::sync::atomic::AtomicU64::new(0),
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
@@ -645,6 +655,8 @@ impl Agent {
             stream_usage: Mutex::new(Usage::default()),
             injections: InjectionQueue::default(),
             notice_lock: crate::notice_lock::NoticeLock::new(),
+            checkpoints: Mutex::new(crate::analyze::Checkpoints::default()),
+            compaction_generation: std::sync::atomic::AtomicU64::new(0),
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
@@ -864,6 +876,20 @@ impl Agent {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
+    }
+
+    /// The compaction generation a checkpoint would be issued under right now.
+    pub fn compaction_generation(&self) -> u64 {
+        self.compaction_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// This agent's history was compacted. A checkpoint that was open when it
+    /// happened lost the context it lived in, and the next settle records that
+    /// rather than scoring the model for it.
+    pub fn note_compacted(&self) {
+        self.compaction_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn record_turn_usage(&self, usage: Usage) {

@@ -292,18 +292,21 @@ fn quality(
         ));
         return;
     }
-    let percent = (score * 100.0).clamp(0.0, 100.0);
+    // Points, not a percentage: the score is `passed − 2·ignored − wrong`, so
+    // it is negative for a session where the model kept talking and stopped
+    // holding on. Printing that as a percentage would clamp every bad run to
+    // zero and make them all look identical.
+    let points = score.round() as i64;
     out.push(fit(
         vec![
             Span::raw("score "),
             Span::styled(
-                format!("{percent:.0}%"),
-                opts.theme.bold.patch(score_style(percent, opts)),
+                format!("{points:+}"),
+                opts.theme.bold.patch(score_style(score, opts)),
             ),
             Span::styled(
                 format!(
-                    "  ({} of {} checkpoints scored)",
-                    passed,
+                    "  ({passed} correct of {} asked, −2 ignored, −1 wrong)",
                     report.quality.scored_checkpoints()
                 ),
                 opts.theme.faint,
@@ -401,10 +404,14 @@ fn bar_style(category: TokenCategory, opts: &RenderOptions) -> Style {
     }
 }
 
-fn score_style(percent: f64, opts: &RenderOptions) -> Style {
-    if percent >= 80.0 {
+/// Colour by the points: green at zero or better, yellow for a single wrong
+/// word, red beyond that. A ratio could not do this — a run that answered
+/// every checkpoint and a run that ignored half of them both sat in the middle
+/// of the same scale.
+fn score_style(points: f64, opts: &RenderOptions) -> Style {
+    if points >= 0.0 {
         opts.theme.green
-    } else if percent >= 50.0 {
+    } else if points >= -1.0 {
         opts.theme.yellow
     } else {
         opts.theme.red

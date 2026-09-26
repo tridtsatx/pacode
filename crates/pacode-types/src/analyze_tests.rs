@@ -30,12 +30,13 @@ fn adding_a_category_lands_in_that_category_and_the_total() {
 #[test]
 fn a_lost_checkpoint_is_never_scored_as_a_miss() {
     // 10 checkpoints, 7 passed, 1 ignored, 1 wrong, 1 lost to compaction.
-    // The lost one was never askable, so it must not sit in the denominator:
-    // 7/9, not 7/10.
+    // Points: 7 correct, 1 ignored at -2, 1 wrong at -1, and the lost one
+    // costing nothing — 4. A ratio would put the lost checkpoint in the
+    // denominator and quietly bill the model for our own compaction.
     let report = ContextQualityReport::scored(10, 7, 1, 1, 1);
     assert_eq!(report.scored_checkpoints(), 9);
     assert!(
-        (report.score - 7.0 / 9.0).abs() < 1e-12,
+        (report.score - 4.0).abs() < 1e-12,
         "score was {}",
         report.score
     );
@@ -62,8 +63,9 @@ fn recording_checkpoints_keeps_the_score_in_step_with_the_counters() {
     assert_eq!(report.ignored, 1);
     assert_eq!(report.lost_to_compaction, 1);
     assert_eq!(report.scored_checkpoints(), 5);
+    // 3 correct, 1 wrong at -1, 1 ignored at -2, the lost one free.
     assert!(
-        (report.score - 0.6).abs() < 1e-12,
+        (report.score - 0.0).abs() < 1e-12,
         "score was {}",
         report.score
     );

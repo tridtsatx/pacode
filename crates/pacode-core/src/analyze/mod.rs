@@ -16,9 +16,11 @@
 //! it, and those two crates do not depend on each other.
 
 pub mod attribution;
+pub mod checkpoint;
 pub mod ledger;
 
 pub use attribution::RequestAttribution;
+pub use checkpoint::Checkpoints;
 pub use ledger::{RequestLatency, SessionAccounting};
 
 #[cfg(test)]
