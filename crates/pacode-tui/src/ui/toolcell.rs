@@ -95,6 +95,33 @@ pub fn render(
             if !display_arg(call).trim().is_empty() {
                 out.push(command_line(call, body_w, gutter_style, opts));
             }
+        } else if is_content_tool(call.name) {
+            // The arguments of a writing tool *are* the thing being written, and
+            // they arrive as the model emits them. Drawing the whole growing
+            // value — not the first line of it — is the difference between
+            // "a write is running" and "this is what it is writing".
+            let content = streaming_content(call);
+            if content.is_empty() {
+                // Nothing of the content has arrived: show the target instead,
+                // so the row says what is being written rather than nothing.
+                let arg = display_arg(call);
+                if let Some(first) = arg.lines().map(str::trim).find(|l| !l.is_empty()) {
+                    out.push(Line::from(vec![
+                        gutter(opts, gutter_style),
+                        Span::styled(truncate_to_width(first, body_w, true), opts.theme.fg),
+                    ]));
+                }
+            } else {
+                stream::push_live_body(
+                    &mut out,
+                    &strip_ansi(&content),
+                    0,
+                    body_w,
+                    gutter_style,
+                    opts,
+                    true,
+                );
+            }
         } else {
             let arg = display_arg(call);
             if let Some(first) = arg.lines().map(str::trim).find(|l| !l.is_empty()) {
@@ -291,6 +318,75 @@ fn title_arg<'a>(call: &ToolCallView<'a>) -> &'a str {
 /// parsed back into its salient field instead of being shown verbatim. While
 /// the call is still `Running` with no dispatched title, `preview` holds the
 /// streamed raw args — the same salient-field pick answers "with what".
+/// Tools whose arguments are content rather than a locator: what they receive
+/// is what they are about to write, and while the call is running that content
+/// is still arriving.
+fn is_content_tool(name: &str) -> bool {
+    matches!(name, "write" | "edit" | "multi_edit")
+}
+
+/// The text a running content tool is composing, read out of the *raw* argument
+/// prefix.
+///
+/// Not parsed: while the model is still emitting the arguments the JSON is a
+/// truncated prefix and would not parse, which is exactly the moment the user
+/// wants to watch. So the value is cut out textually — everything after the
+/// opening quote of the content field, up to its closing quote or the end of what
+/// has arrived — and the usual escapes are undone, because a file containing
+/// `\n` in its source should not appear as a literal backslash-n.
+fn streaming_content(call: &ToolCallView<'_>) -> String {
+    let key = match call.name {
+        "write" | "multi_edit" => "\"content\"",
+        "edit" => "\"new_string\"",
+        _ => return String::new(),
+    };
+    let Some(at) = call.preview.find(key) else {
+        return String::new();
+    };
+    let rest = &call.preview[at + key.len()..];
+    let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+    let Some(rest) = rest.strip_prefix('"') else {
+        return String::new();
+    };
+    // The closing quote is the first one not preceded by a backslash; absent,
+    // which is the normal case mid-stream, the text runs to the end.
+    let mut end = rest.len();
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            end = i;
+            break;
+        }
+        i += 1;
+    }
+    unescape(&rest[..end])
+}
+
+/// The three escapes a streamed file body actually contains, in one pass.
+fn unescape(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => out.push(other),
+            None => break,
+        }
+    }
+    out
+}
+
 fn display_arg(call: &ToolCallView<'_>) -> String {
     let cleaned = strip_ansi(title_arg(call));
     let arg = cleaned.trim();

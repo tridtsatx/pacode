@@ -307,6 +307,37 @@ fn backgrounded_calls_show_the_background_outcome() {
 }
 
 #[test]
+fn a_running_write_shows_the_content_it_is_writing() {
+    // The whole point of streaming a writing tool: the user watches the file
+    // arrive. A running call whose arguments are the content must draw all of
+    // it, not the first line of it.
+    let opts = RenderOptions::new(80, false);
+    let mut c = running("write", "write x.rs", "");
+    c.title = "write x.rs";
+    c.preview = "";
+    c.streamed = None;
+    // Before anything arrives the row shows the target and the incomplete-tail
+    // cursor — it is visibly in flight, and it is not showing content.
+    let empty_text = text_of(&render(&c, 80, &opts, 0, false));
+    let body = body_rows(&empty_text, &opts).join("\n");
+    assert!(body.contains("x.rs"), "the target is missing: {body:?}");
+    assert!(
+        !body.contains("println"),
+        "nothing has arrived yet, so no content may be drawn: {body:?}"
+    );
+
+    c.preview = r#"{"path":"x.rs","content":"fn main() {\n    println!(\"hi\");\n}"}"#;
+    let text = text_of(&render(&c, 80, &opts, 0, false));
+    let joined = body_rows(&text, &opts).join("\n");
+    for expected in ["fn main()", "println!"] {
+        assert!(
+            joined.contains(expected),
+            "the content being written is missing {expected:?}: {joined:?}"
+        );
+    }
+}
+
+#[test]
 fn running_calls_spin_on_the_anim_frame() {
     let opts = RenderOptions::new(80, false);
     let mut c = call("bash", "bash cargo test", ToolStatus::Running, "");
