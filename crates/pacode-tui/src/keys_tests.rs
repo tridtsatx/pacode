@@ -343,6 +343,76 @@ fn test_effort_picker_focus_capture() {
 }
 
 #[test]
+fn the_effort_cursor_skips_levels_the_model_does_not_accept() {
+    // A model that takes only low and high: pressing "smarter" from low must
+    // land on high, not on medium, and pressing it again must wrap to low —
+    // the first *available* level, not the bottom of the ladder.
+    let mut state = make_test_state();
+    let now = Instant::now();
+    state.models = vec![pacode_types::ModelInfo {
+        route: ModelRoute::new("p", "sparse"),
+        display_name: "Sparse".into(),
+        context_window: Some(1000),
+        supports_reasoning: true,
+        supports_vision: false,
+        supported_efforts: Some(vec![Effort::Low, Effort::High]),
+        pricing: None,
+    }];
+    // The session has to be *on* the sparse model, or the catalog lookup that
+    // answers "what does this model accept" has nothing to match against and
+    // every rung looks available.
+    state.meta = Some(pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_effort"),
+        name: None,
+        cwd: "/tmp".into(),
+        git_branch: None,
+        model: ModelRoute::new("p", "sparse"),
+        effort: Effort::Medium,
+        mode: pacode_types::state::Mode::Build,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        first_prompt: None,
+        zdr: false,
+    });
+
+    state.input.insert_str("/effort");
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        now,
+    );
+    let Focus::Overlay(Overlay::EffortPicker { index }) = &state.focus else {
+        panic!("expected the effort ladder, got {:?}", state.focus);
+    };
+    assert_eq!(
+        Effort::ALL[*index],
+        Effort::Medium,
+        "the ladder opens on the current level, supported or not"
+    );
+
+    let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+    handle_key(&mut state, right, now);
+    let Focus::Overlay(Overlay::EffortPicker { index }) = &state.focus else {
+        panic!("the ladder closed on a move");
+    };
+    assert_eq!(
+        Effort::ALL[*index],
+        Effort::High,
+        "medium is not supported, so the cursor must skip it"
+    );
+
+    handle_key(&mut state, right, now);
+    let Focus::Overlay(Overlay::EffortPicker { index }) = &state.focus else {
+        panic!("the ladder closed on a move");
+    };
+    assert_eq!(
+        Effort::ALL[*index],
+        Effort::Low,
+        "past the last available level the cursor wraps to the first available one"
+    );
+}
+
+#[test]
 fn test_overlay_model_picker_navigation_and_esc() {
     let mut state = make_test_state();
     let now = Instant::now();

@@ -108,7 +108,46 @@ fn toggle_model_mark(
     })]
 }
 
-pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
+/// The next rung the cursor may land on, skipping levels the current model does
+/// not accept.
+///
+/// `None` from [`AppState::supported_efforts`] means "nothing is known", and
+/// every level is then allowed — the cursor moves exactly as it did before.
+/// The walk is bounded by the length of the ladder, so a model that accepts
+/// nothing leaves the cursor where it is instead of spinning.
+pub(crate) fn next_allowed_index(
+    supported: Option<&[pacode_types::Effort]>,
+    from: usize,
+    forward: bool,
+) -> usize {
+    let ladder = pacode_types::Effort::ALL;
+    let last = ladder.len().saturating_sub(1);
+    if ladder.is_empty() {
+        return from;
+    }
+    // `None` means nothing is known about this model, so every rung is allowed.
+    let allowed = |index: usize| {
+        ladder
+            .get(index)
+            .is_some_and(|effort| supported.is_none_or(|levels| levels.contains(effort)))
+    };
+    let mut index = from;
+    for _ in 0..=last {
+        index = if forward {
+            if index >= last { 0 } else { index + 1 }
+        } else if index == 0 {
+            last
+        } else {
+            index - 1
+        };
+        if allowed(index) {
+            return index;
+        }
+    }
+    from
+}
+
+pub(crate) fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     let prev_overlay = match &state.focus {
         Focus::Overlay(o) => Some(crate::nav::overlay_name(o)),
         _ => None,
@@ -186,6 +225,11 @@ fn handle_rail_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
 }
 
 fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
+    // The effort ladder needs the model's supported set, and the focus match
+    // below holds `state` mutably. Copied out first, so the two never overlap.
+    let supported_efforts = state
+        .supported_efforts()
+        .map(<[pacode_types::Effort]>::to_vec);
     if matches!(state.focus, Focus::Overlay(Overlay::RailOverlay { .. })) {
         return handle_rail_overlay_key(state, key);
     }
@@ -348,11 +392,16 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
         Focus::Overlay(Overlay::EffortPicker { index }) => {
             match key.code {
                 KeyCode::Esc => state.focus = Focus::Normal,
+                // The cursor skips levels this model does not accept and lands
+                // on the next one that does, wrapping to the first *available*
+                // rather than to the bottom of the ladder. Stepping onto a greyed
+                // level is not a greyed level: the user pressed "faster" and
+                // nothing happened, which reads as a dead key.
                 KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
-                    *index = index.saturating_sub(1);
+                    *index = next_allowed_index(supported_efforts.as_deref(), *index, false);
                 }
                 KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
-                    *index = (*index + 1).min(pacode_types::Effort::ALL.len() - 1);
+                    *index = next_allowed_index(supported_efforts.as_deref(), *index, true);
                 }
                 KeyCode::Enter => {
                     let effort = pacode_types::Effort::ALL[*index];
