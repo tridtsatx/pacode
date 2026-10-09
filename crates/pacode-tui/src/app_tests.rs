@@ -2425,3 +2425,23 @@ fn a_late_analyze_reply_does_not_steal_focus() {
         crate::state::Focus::Overlay(crate::state::Overlay::QuestionPicker)
     );
 }
+
+/// The last default change before quitting reaches `prefs.toml` even when its
+/// blocking write never ran.
+#[test]
+fn quitting_writes_the_pending_prefs_delta() {
+    let mut state = AppState::new(Config::default(), "test".into(), 100, 30);
+    let dir = tempfile::tempdir().expect("tempdir");
+    state.paths = pacode_config::Paths::under(dir.path());
+    state.prefs_outbox.post(crate::state::PrefsDelta {
+        model: Some("p/b".into()),
+        effort: None,
+        mode: None,
+        recent_models: None,
+    });
+    flush_prefs_on_exit(&mut state);
+    assert_eq!(
+        pacode_config::load_prefs(&state.paths).model.as_deref(),
+        Some("p/b")
+    );
+}

@@ -397,6 +397,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         }
     }
 
+    flush_prefs_on_exit(&mut state);
     // `None` is a real outcome: quitting while the background attach was
     // still in flight means no session was ever attached.
     let attached_session = state.meta.as_ref().map(|m| m.id.clone());
@@ -488,6 +489,17 @@ fn flush_prefs_write(state: &mut AppState) {
         let paths = state.paths.clone();
         tokio::task::spawn_blocking(move || outbox.flush(&paths));
     }
+}
+
+/// The loop is over: the last change's blocking write may still be queued
+/// when the runtime shuts down and never run, so the outbox is written here,
+/// once, on this thread. `flush` takes the delta, so
+/// a write that did run leaves nothing to repeat.
+fn flush_prefs_on_exit(state: &mut AppState) {
+    if let Some(delta) = state.take_prefs_write() {
+        state.prefs_outbox.post(delta);
+    }
+    state.prefs_outbox.flush(&state.paths);
 }
 
 /// A background result: fold it in, then dispatch what it produced and
