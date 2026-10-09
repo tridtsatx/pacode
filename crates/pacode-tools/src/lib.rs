@@ -150,7 +150,7 @@ pub fn ensure_common_properties(mut schema: Value) -> Value {
             .or_insert_with(|| {
                 serde_json::json!({
                     "type": "boolean",
-                    "description": "Re-run accepting the stated token cost of a withheld result."
+                    "description": "Return the full output instead of the head+tail cut; costs the size the cut marker reported."
                 })
             });
     } else {

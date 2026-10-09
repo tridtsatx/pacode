@@ -73,7 +73,7 @@ impl Tool for BashTool {
     ///    `{task_id, status: running}` immediately, title `Bash <label>`,
     ///    `ToolOutput.task = Some(id)`.
     /// 4. Foreground: `host.wait_task(id, yield_after, false)`; `Finished` → output from
-    ///    `host.task_tail`/full output (capped) + exit code line; `Timeout` → the task
+    ///    `host.task_output` (head+tail, capped) + exit code line; `Timeout` → the task
     ///    keeps running: output `Command still running after Ns; moved to background as
     ///    task <id>. Latest output:\n<tail>`, `ToolOutput.task = Some(id)`.
     ///    The core marks the task backgrounded when `task` is set on a foreground call.
@@ -159,11 +159,16 @@ pub(crate) async fn run_authorized(
                 .task_info(&id)
                 .and_then(|i| i.exit_code)
                 .unwrap_or(0);
-            let tail_lines = ctx.host.task_tail(&id, 400).await?;
-            let joined = tail_lines.join("\n");
-            let capped = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-            let preview = preview_body(&joined);
-            let mut content = capped;
+            // Head+tail, not a tail: the first error of a long build is
+            // usually the one that matters. `accept_large_output` lifts the
+            // char cap; the exec buffer's own head/tail caps still bound it.
+            let max_chars = if accept_large_output {
+                usize::MAX
+            } else {
+                ctx.output_cap_chars
+            };
+            let mut content = ctx.host.task_output(&id, max_chars).await?;
+            let preview = preview_body(&content);
             if !content.ends_with('\n') {
                 content.push('\n');
             }
@@ -179,7 +184,13 @@ pub(crate) async fn run_authorized(
         }
         WaitOutcome::Timeout | WaitOutcome::Progress => {
             let tail_lines = ctx.host.task_tail(&id, 40).await.unwrap_or_default();
-            let tail_joined = tail_lines.join("\n");
+            // 40 lines can still be the whole 64 KB tail buffer (progress
+            // bars redraw with `\r`, never `\n`), so the cap applies here too.
+            let tail_joined = cap_output(
+                &tail_lines.join("\n"),
+                accept_large_output,
+                ctx.output_cap_chars,
+            );
             let secs = if ctx.exec_yield_after.subsec_millis() == 0 {
                 format!("{}s", ctx.exec_yield_after.as_secs())
             } else {

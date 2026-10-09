@@ -601,6 +601,10 @@ pub trait ToolHost: Send + Sync {
     async fn kill_task(&self, task: &TaskId) -> Result<(), ToolError>;
     /// Last `lines` lines of the spooled output.
     async fn task_tail(&self, task: &TaskId, lines: usize) -> Result<Vec<String>, ToolError>;
+    /// The task's output as the exec buffer holds it — the first and the last
+    /// bytes with a `[... N bytes omitted ...]` marker between them when the
+    /// middle was dropped — cut head+tail to `max_chars`.
+    async fn task_output(&self, task: &TaskId, max_chars: usize) -> Result<String, ToolError>;
     fn report_task_progress(&self, task: &TaskId, progress: TaskProgress) -> Result<(), ToolError>;
 
     // --- subagents (depth 1) ---

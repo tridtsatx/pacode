@@ -58,7 +58,8 @@ impl Tool for GlobTool {
 
     /// `globset::Glob` matched against paths relative to the root while walking with
     /// `ignore::WalkBuilder`; collect (mtime, path); sort desc by mtime; cap; output one
-    /// relative path per line; `spawn_blocking`.
+    /// relative path per line, plus a footer naming how many matches the cap hid;
+    /// `spawn_blocking`.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<GlobInput>(input)?;
         if args.pattern.is_empty() {
@@ -75,8 +76,8 @@ impl Tool for GlobTool {
         let cancel = ctx.cancel.clone();
         let pattern = args.pattern.clone();
 
-        let matched_paths =
-            tokio::task::spawn_blocking(move || -> Result<Vec<String>, ToolError> {
+        let (matched_paths, total) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<String>, usize), ToolError> {
                 let glob = globset::GlobBuilder::new(&pattern)
                     .literal_separator(false)
                     .build()
@@ -108,19 +109,27 @@ impl Tool for GlobTool {
                     .collect();
 
                 matched.sort_by_key(|b| std::cmp::Reverse(b.0));
+                let total = matched.len();
                 matched.truncate(max_results);
 
                 let lines = matched
                     .into_iter()
                     .map(|(_, p)| p.to_string_lossy().to_string())
                     .collect();
-                Ok(lines)
+                Ok((lines, total))
             })
             .await
             .map_err(|e| ToolError::failed(e.to_string()))??;
 
         let count = matched_paths.len();
-        let joined = matched_paths.join("\n");
+        let mut joined = matched_paths.join("\n");
+        if total > count {
+            let more = total - count;
+            joined.push_str(&format!(
+                "\n— {more} more matching files not shown (newest {count} listed); narrow the \
+                 pattern or raise `max_results`"
+            ));
+        }
         let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
         let preview = if count == 0 {
             "no files".to_string()
@@ -134,3 +143,7 @@ impl Tool for GlobTool {
             .with_preview(preview))
     }
 }
+
+#[cfg(test)]
+#[path = "glob_tests.rs"]
+mod glob_tests;

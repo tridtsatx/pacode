@@ -180,6 +180,13 @@ impl ToolHost for StubHost {
             .map_err(|e| ToolError::failed(e.to_string()))
     }
 
+    async fn task_output(&self, task: &TaskId, max_chars: usize) -> Result<String, ToolError> {
+        self.tasks
+            .output(task, max_chars)
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))
+    }
+
     fn report_task_progress(&self, task: &TaskId, progress: TaskProgress) -> Result<(), ToolError> {
         self.tasks
             .report_progress(task, progress)
@@ -523,6 +530,39 @@ async fn test_bash_foreground_exit_code_and_output() {
     assert!(out_fail.content.contains("failing foreground"));
     assert!(out_fail.content.ends_with("\n[exit code 42]"));
     assert!(out_fail.is_error);
+}
+
+/// Output past the cap keeps its head as well as its tail: the first error of
+/// a long build is the one that matters, and a tail-only cut lost it.
+#[tokio::test]
+async fn test_bash_long_output_keeps_head_and_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+    let tool = BashTool::default();
+
+    // Under the cap but over the old 400-line window: every line arrives.
+    let out = tool
+        .call(json!({"command": "seq 1 3000"}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out.content.starts_with("1\n2\n3\n"),
+        "{}",
+        &out.content[..40]
+    );
+    assert!(out.content.contains("\n1500\n"));
+    assert!(out.content.ends_with("\n3000\n[exit code 0]"));
+
+    // Over the cap: head and tail around a truncation marker, within the cap.
+    let out = tool
+        .call(json!({"command": "seq 1 100000"}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("1\n2\n3\n"));
+    assert!(out.content.contains("truncated"));
+    assert!(out.content.ends_with("\n100000\n[exit code 0]"));
+    assert!(out.content.chars().count() <= ctx.output_cap_chars + 200);
 }
 
 #[tokio::test]
