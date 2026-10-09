@@ -271,6 +271,9 @@ pub struct SessionUiState {
     pub user_msgs_in_flight: usize,
     pub turn_boundary_pending: bool,
     turn_cycle_observed: bool,
+    /// Requests the prompt path waits behind (`state::barriers`).
+    pub clear_in_flight: bool,
+    pub settings_in_flight: usize,
     pub transcript: Transcript,
     pub panel: PanelState,
     pub files: FilesState,
@@ -338,6 +341,8 @@ impl SessionUiState {
 
             turn_boundary_pending: false,
             turn_cycle_observed: false,
+            clear_in_flight: false,
+            settings_in_flight: 0,
             transcript: Transcript::new(transcript_cells),
             panel: PanelState::new(transcript_cells),
             files: FilesState::default(),

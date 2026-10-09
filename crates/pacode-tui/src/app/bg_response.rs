@@ -9,7 +9,7 @@ use pacode_types::{Attach, Reply, Request, TranscriptKind};
 
 use super::attach::fold_attach_finished;
 use super::panel::{fold_load_history_reply, fold_load_panel_reply};
-use super::prompt::{fold_user_message_done, fold_user_message_step_done};
+use super::prompt::{fold_barrier_reply, fold_user_message_done, fold_user_message_step_done};
 use super::reply::{
     ReplyScope, deferred_reply_is_current, handle_reply, reply_scope_is_current,
     session_reply_is_current,
@@ -17,7 +17,7 @@ use super::reply::{
 use super::resync::fold_resync_done;
 use crate::keys::Action;
 use crate::state::transcript::{Cell, CellKind};
-use crate::state::{AppState, PanelTarget, SessionContext, UserMessageInFlight};
+use crate::state::{AppState, PanelTarget, RequestBarrier, SessionContext, UserMessageInFlight};
 
 pub(super) enum BgResponse {
     AttachFinished {
@@ -32,6 +32,12 @@ pub(super) enum BgResponse {
         scope: ReplyScope,
         kind: Option<crate::cache::ListKind>,
         global_refresh: bool,
+        res: Result<Reply, pacode_client::ClientError>,
+    },
+    /// The reply to a request the prompt path waits behind.
+    BarrierReply {
+        barrier: RequestBarrier,
+        scope: ReplyScope,
         res: Result<Reply, pacode_client::ClientError>,
     },
     ResyncDone {
@@ -200,6 +206,11 @@ fn fold_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
             };
             handle_reply(res, state, context)
         }
+        BgResponse::BarrierReply {
+            barrier,
+            scope,
+            res,
+        } => fold_barrier_reply(state, barrier, scope, res),
         BgResponse::ResyncDone {
             context,
             client_context,

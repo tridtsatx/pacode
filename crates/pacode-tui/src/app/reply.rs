@@ -14,7 +14,7 @@ use super::bg_response::BgResponse;
 use super::dispatch::{defer_unbound_request, queue_pending_request};
 use super::prompt::{prompt_gate_open, queue_user_message_request, resolve_request};
 use crate::keys::Action;
-use crate::state::{AppState, SessionContext};
+use crate::state::{AppState, RequestBarrier, SessionContext};
 
 pub(super) enum ReplyScope {
     Global {
@@ -85,6 +85,10 @@ pub(super) fn send_request(
             state.ui_context(),
         )
     });
+    let barrier = RequestBarrier::for_request(&req);
+    if let Some(barrier) = barrier {
+        state.raise_barrier(barrier);
+    }
     let ticket = match &req {
         Request::UserMessage { .. } => Some(
             state
@@ -123,11 +127,18 @@ pub(super) fn send_request(
                 });
             }
         } else if let Some(scope) = scope {
-            let _ = tx.send(BgResponse::Reply {
-                scope,
-                kind,
-                global_refresh,
-                res,
+            let _ = tx.send(match barrier {
+                Some(barrier) => BgResponse::BarrierReply {
+                    barrier,
+                    scope,
+                    res,
+                },
+                None => BgResponse::Reply {
+                    scope,
+                    kind,
+                    global_refresh,
+                    res,
+                },
             });
         }
     });

@@ -406,7 +406,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
         } => {
             state.notice_lock.apply(session, locked, held, dropped);
         }
-        Event::ContextCleared => apply_context_cleared(state),
+        Event::ContextCleared => apply_context_cleared(state, now),
     }
     let turn_active = state.turn_active;
     state.rail.update_idle(turn_active, now);
@@ -415,7 +415,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
 /// The daemon reset the conversation (`/clear`, from this client or another):
 /// drop everything drawn from it. Cron jobs, monitors and tasks are not
 /// conversation and stay; so do the session's spend totals.
-fn apply_context_cleared(state: &mut AppState) {
+fn apply_context_cleared(state: &mut AppState, now: Instant) {
+    state.drop_prompts_of_cleared_context(now);
     state.transcript.reset(Vec::new(), false);
     state.selection.clear();
     state.rail.plan = pacode_types::Plan::default();

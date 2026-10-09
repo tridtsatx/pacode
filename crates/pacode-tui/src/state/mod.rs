@@ -17,6 +17,7 @@ pub mod transcript;
 pub mod vim;
 
 mod attach;
+mod barriers;
 mod client_events;
 mod focus;
 mod notices;
@@ -39,6 +40,7 @@ use pacode_types::{
     PluginInfo, SessionMeta, TranscriptKind,
 };
 
+pub use barriers::RequestBarrier;
 pub use client_events::RESYNC_DEBOUNCE_MS;
 pub use files::FilesState;
 pub use focus::{Focus, Overlay, PanelTarget, ThemePickerStep};
@@ -327,6 +329,7 @@ impl AppState {
             || self.turn_active
             || self.user_msgs_in_flight > 0
             || self.turn_boundary_pending
+            || self.prompt_path_held()
         {
             return None;
         }
@@ -342,6 +345,7 @@ impl AppState {
             || self.turn_boundary_pending
             || self.initial_prompt.is_some()
             || self.has_retry_request()
+            || self.prompt_path_held()
         {
             return None;
         }
@@ -360,6 +364,7 @@ impl AppState {
             || self.turn_boundary_pending
             || self.has_retry_request()
             || self.has_pending_sequence()
+            || self.prompt_path_held()
         {
             return None;
         }

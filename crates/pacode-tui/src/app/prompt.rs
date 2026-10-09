@@ -11,9 +11,13 @@ use pacode_types::{Reply, Request};
 use tokio::sync::mpsc;
 
 use super::bg_response::BgResponse;
-use super::reply::{ReplyScope, handle_reply, session_reply_is_current};
+use super::reply::{ReplyScope, handle_reply, reply_scope_is_current, session_reply_is_current};
 use crate::keys::Action;
-use crate::state::{AppState, PromptBatch, UserMessageInFlight};
+use crate::state::{AppState, PromptBatch, RequestBarrier, UserMessageInFlight};
+
+#[cfg(test)]
+#[path = "barriers_tests.rs"]
+mod barriers_tests;
 
 pub(super) fn prompt_gate_open(state: &AppState) -> bool {
     state.meta.is_some()
@@ -23,6 +27,7 @@ pub(super) fn prompt_gate_open(state: &AppState) -> bool {
         && !state.turn_active
         && state.user_msgs_in_flight == 0
         && !state.turn_boundary_pending
+        && !state.prompt_path_held()
 }
 
 /// A terminal hands over a bracketed paste of any size in one event, and every
@@ -111,7 +116,9 @@ pub(super) fn queue_sequence(state: &mut AppState, requests: Vec<Request>, text:
 /// Session requests that depend on each other — a route switch, then the
 /// effort or ZDR it enables. One task sends them in order and stops at the
 /// first refusal, whose error lands like any reply's. Without a session the
-/// run waits whole in the sequence queue, so it keeps its order.
+/// run waits whole in the sequence queue, so it keeps its order. In flight it
+/// holds the prompt path (`RequestBarrier::Settings`) until its reply, so a
+/// prompt sent after it runs on the settings it asked for.
 fn send_ordered(
     requests: Vec<Request>,
     state: &mut AppState,
@@ -136,6 +143,7 @@ fn send_ordered(
         context: state.session_context(),
         client_context: client_context.clone(),
     };
+    state.raise_barrier(RequestBarrier::Settings);
     let cl = Arc::clone(client);
     let tx = bg_tx.clone();
     tokio::spawn(async move {
@@ -143,13 +151,36 @@ fn send_ordered(
             .request_sequence(client_context, requests)
             .await
             .map(|mut replies| replies.pop().unwrap_or(Reply::Ok));
-        let _ = tx.send(BgResponse::Reply {
+        let _ = tx.send(BgResponse::BarrierReply {
+            barrier: RequestBarrier::Settings,
             scope,
-            kind: None,
-            global_refresh: false,
             res,
         });
     });
+}
+
+/// `BgResponse::BarrierReply`: release the prompt path, then fold the reply
+/// like any other; the loop drains what waited behind it. A clear the daemon
+/// carried out takes the queued prompts with it, whichever of this reply and
+/// `ContextCleared` lands first.
+pub(super) fn fold_barrier_reply(
+    state: &mut AppState,
+    barrier: RequestBarrier,
+    scope: ReplyScope,
+    res: Result<Reply, pacode_client::ClientError>,
+) -> Vec<Action> {
+    if !reply_scope_is_current(state, &scope) {
+        return Vec::new();
+    }
+    state.lower_barrier(barrier);
+    if barrier == RequestBarrier::Clear && matches!(res, Ok(Reply::Ok)) {
+        state.drop_prompts_of_cleared_context(Instant::now());
+    }
+    let context = match &scope {
+        ReplyScope::Session { context, .. } => Some(context),
+        ReplyScope::Global { .. } | ReplyScope::Ui { .. } => None,
+    };
+    handle_reply(res, state, context)
 }
 
 fn fail_prompt_batch(state: &mut AppState, id: u64) {
@@ -214,6 +245,7 @@ pub(super) fn send_sequence(
         || state.turn_boundary_pending
         || state.initial_prompt.is_some()
         || state.has_retry_request()
+        || state.prompt_path_held()
     {
         queue_sequence(state, requests, user_text);
         return;

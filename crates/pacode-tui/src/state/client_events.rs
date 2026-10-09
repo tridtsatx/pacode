@@ -133,6 +133,7 @@ impl AppState {
                 self.session.cancel_deferred_work();
                 self.session.fail_in_flight_user_messages();
                 self.session.drop_pending_detach_turns();
+                self.session.drop_request_barriers();
                 self.session.clear_buffered_events();
                 self.invalidate_pending_attach_after_disconnect();
                 self.resync_want = false;
@@ -150,6 +151,7 @@ impl AppState {
                 self.cancel_global_refresh();
                 self.session.fail_in_flight_user_messages();
                 self.session.drop_pending_detach_turns();
+                self.session.drop_request_barriers();
                 self.reconnect_snapshot_pending =
                     self.meta.is_some() && self.pending_attach.is_none();
                 self.awaiting_snapshot = true;
