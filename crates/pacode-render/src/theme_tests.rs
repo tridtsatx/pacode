@@ -85,8 +85,6 @@ fn ansi_fallback_keeps_greys_grey_and_hues_hued() {
         assert_eq!(t.cyan.fg, Some(Color::Cyan), "{name}");
         assert_eq!(t.yellow.fg, Some(Color::Yellow), "{name}");
         assert_eq!(t.violet.fg, Some(Color::Magenta), "{name}");
-        // The accent keeps a hue rather than collapsing to a grey.
-        assert!(!grey(t.accent.fg), "{name}: accent {:?}", t.accent.fg);
         // A badge is the hue reversed, never a grey plaque.
         let badge = t.badge(t.green);
         assert!(badge.add_modifier.contains(Modifier::REVERSED), "{name}");
@@ -95,6 +93,91 @@ fn ansi_fallback_keeps_greys_grey_and_hues_hued() {
     // Nearest-by-distance put this dark grey on Yellow (128,128,0).
     assert_eq!(rgb_to_ansi16(0x43, 0x46, 0x3f), Color::DarkGray);
     assert_eq!(rgb_to_ansi16(0x6e, 0xa9, 0xbd), Color::Cyan);
+}
+
+/// An accent is never drawn in the error colour: oranges used to fall in a
+/// ±30° red sector (pacode-light `#b45309` → Red, gruvbox `#fe8019` →
+/// LightRed).
+#[test]
+fn ansi_accent_is_never_the_error_red() {
+    for palette in builtin_palettes() {
+        let t = Theme::from_palette(palette, false);
+        assert_ne!(t.accent.fg, t.red.fg, "{}", palette.name);
+        assert_eq!(t.accent.fg, Theme::ansi().accent.fg, "{}", palette.name);
+    }
+    // Free oranges (no role to borrow) land on yellow, not red.
+    assert_eq!(ansi_hue(0xb4, 0x53, 0x09), Color::Yellow);
+    assert_eq!(ansi_hue(0xfe, 0x80, 0x19), Color::LightYellow);
+    assert_eq!(ansi_hue(0xc8, 0x10, 0x10), Color::Red);
+}
+
+/// The ANSI colour a palette role resolves to (`selected_bg` by background).
+fn role_color(t: &Theme, key: &str) -> Option<Color> {
+    match key {
+        "fg" => t.fg.fg,
+        "dim" => t.dim.fg,
+        "faint" => t.faint.fg,
+        "accent" => t.accent.fg,
+        "green" => t.green.fg,
+        "cyan" => t.cyan.fg,
+        "red" => t.red.fg,
+        "violet" => t.violet.fg,
+        "yellow" => t.yellow.fg,
+        "bold" => t.bold.fg,
+        "selected_bg" => t.selected_bg.bg,
+        "user_bar" => t.user_bar.fg,
+        "bash_command" => t.bash_command.fg,
+        "bash_flag" => t.bash_flag.fg,
+        "bash_string" => t.bash_string.fg,
+        "bash_operator" => t.bash_operator.fg,
+        "bash_variable" => t.bash_variable.fg,
+        "bash_arg" => t.bash_arg.fg,
+        other => panic!("unmapped role {other}"),
+    }
+}
+
+/// Syntax borrows status colours by hex (pacode-dark `bash_string` is the
+/// green hex); under ANSI the borrowed colour must stay the same colour —
+/// it used to land on Yellow while green was Green.
+#[test]
+fn ansi_same_hex_means_same_colour_within_a_palette() {
+    for palette in builtin_palettes() {
+        let t = Theme::from_palette(palette, false);
+        let roles: Vec<(&String, &String)> = palette.colors.iter().collect();
+        for (i, (a, hex_a)) in roles.iter().enumerate() {
+            for (b, hex_b) in &roles[i + 1..] {
+                if hex_a.eq_ignore_ascii_case(hex_b) {
+                    assert_eq!(
+                        role_color(&t, a),
+                        role_color(&t, b),
+                        "{}: {a} and {b} share {hex_a}",
+                        palette.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// fg / dim / faint stay three levels, as in `Theme::ansi()`, and a
+/// selection never paints the faint grey under faint text.
+#[test]
+fn ansi_greys_keep_their_hierarchy_and_selection_stays_readable() {
+    for palette in builtin_palettes() {
+        let t = Theme::from_palette(palette, false);
+        let name = &palette.name;
+        let levels = [t.fg.fg, t.dim.fg, t.faint.fg];
+        assert_ne!(levels[0], levels[1], "{name}: fg == dim");
+        assert_ne!(levels[1], levels[2], "{name}: dim == faint");
+        assert_ne!(levels[0], levels[2], "{name}: fg == faint");
+        assert_eq!(t.dim.fg, Some(Color::Gray), "{name}");
+        assert_eq!(t.faint.fg, Some(Color::DarkGray), "{name}");
+        assert_ne!(t.selected_bg.bg, t.faint.fg, "{name}");
+        assert!(
+            t.selected_bg.add_modifier.contains(Modifier::REVERSED),
+            "{name}: an ANSI selection is reversed video"
+        );
+    }
 }
 
 #[test]
@@ -150,9 +233,11 @@ fn test_partial_palette_fallback() {
 #[test]
 fn test_non_truecolor_converts_hex_to_ansi16() {
     let mut colors = BTreeMap::new();
-    colors.insert("accent".to_string(), "#ff0000".to_string());
+    colors.insert("user_bar".to_string(), "#ff0000".to_string());
+    colors.insert("bash_flag".to_string(), "#00ff00".to_string());
     colors.insert("red".to_string(), "#ff8080".to_string());
     colors.insert("fg".to_string(), "#ff0000".to_string());
+    colors.insert("accent".to_string(), "magenta".to_string());
     let pal = Palette {
         name: "test".to_string(),
         light: false,
@@ -160,11 +245,13 @@ fn test_non_truecolor_converts_hex_to_ansi16() {
     };
 
     let theme = Theme::from_palette(&pal, false);
-    // A hue role keeps its hue, a role named after a colour is that colour,
-    // and a text role stays on the grey ramp.
-    assert_eq!(theme.accent, Style::default().fg(Color::LightRed));
+    // A free hue role keeps its hue; a role named after a colour is that
+    // colour; a grey role keeps the ANSI grey ladder; a named colour is kept.
+    assert_eq!(theme.user_bar, Style::default().fg(Color::LightRed));
+    assert_eq!(theme.bash_flag, Style::default().fg(Color::LightGreen));
     assert_eq!(theme.red, Style::default().fg(Color::Red));
-    assert_eq!(theme.fg, Style::default().fg(Color::White));
+    assert_eq!(theme.fg, Theme::ansi().fg);
+    assert_eq!(theme.accent, Style::default().fg(Color::Magenta));
 }
 
 #[test]

@@ -52,8 +52,12 @@ pub fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
-/// Palette roles that are greys by meaning: under ANSI-16 they map onto the
-/// grey ramp however tinted the palette draws them.
+/// Palette roles that are greys by meaning. Under ANSI-16 they take the grey
+/// ladder of `Theme::ansi()` (fg = the terminal's own, dim = Gray, faint =
+/// DarkGray, selection reversed) whatever the palette's tint: the palette's
+/// greys are tuned for its own background, which an ANSI terminal does not
+/// share, and mapping them by brightness merges levels (dim onto faint, dim
+/// onto fg) or puts faint text on a selection of the same grey.
 pub(crate) const GREY_ROLES: &[&str] = &[
     "fg",
     "dim",
@@ -66,13 +70,17 @@ pub(crate) const GREY_ROLES: &[&str] = &[
     "border",
 ];
 
-/// Palette roles named after a colour, and the ANSI-16 colour each is.
+/// Palette roles whose ANSI-16 colour is fixed by meaning, as in
+/// `Theme::ansi()`: the roles named after a colour, and the accent (Yellow —
+/// never the error red). Any other role drawn in the same hex takes the same
+/// colour, so syntax highlighting agrees with the status it borrows from.
 pub(crate) const NAMED_ROLES: &[(&str, Color)] = &[
     ("green", Color::Green),
     ("red", Color::Red),
     ("yellow", Color::Yellow),
     ("cyan", Color::Cyan),
     ("violet", Color::Magenta),
+    ("accent", Color::Yellow),
 ];
 
 /// Saturation below which a colour is a grey, not a hue.
@@ -136,19 +144,20 @@ pub fn ansi_hue(r: u8, g: u8, b: u8) -> Color {
         60.0 * ((rf - gf) / delta + 4.0)
     };
     let bright = value > 0.85 && saturation > 0.6;
-    // Sectors of 60° centred on each primary and secondary hue.
-    match ((hue + 30.0) / 60.0) as u32 % 6 {
-        0 if bright => Color::LightRed,
-        0 => Color::Red,
-        1 if bright => Color::LightYellow,
-        1 => Color::Yellow,
-        2 if bright => Color::LightGreen,
-        2 => Color::Green,
-        3 if bright => Color::LightCyan,
-        3 => Color::Cyan,
-        4 if bright => Color::LightBlue,
-        4 => Color::Blue,
-        _ if bright => Color::LightMagenta,
-        _ => Color::Magenta,
+    let (normal, light) = hue_sector(hue);
+    if bright { light } else { normal }
+}
+
+/// The ANSI pair for a hue in degrees. Red is narrow (±18°): oranges are
+/// accents and warnings, and a terminal's yellow carries them; folding them
+/// into red would draw an accent in the error colour.
+fn hue_sector(hue: f32) -> (Color, Color) {
+    match hue {
+        h if !(18.0..342.0).contains(&h) => (Color::Red, Color::LightRed),
+        h if h < 75.0 => (Color::Yellow, Color::LightYellow),
+        h if h < 165.0 => (Color::Green, Color::LightGreen),
+        h if h < 200.0 => (Color::Cyan, Color::LightCyan),
+        h if h < 270.0 => (Color::Blue, Color::LightBlue),
+        _ => (Color::Magenta, Color::LightMagenta),
     }
 }

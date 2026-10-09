@@ -272,6 +272,11 @@ fn live_render_settings_rebuild_context_and_clear_caches() {
             vec![ratatui::text::Line::from("stale")],
         )),
     });
+    // Pinned to truecolor: under ANSI-16 the built-in palettes map by role
+    // meaning and dark/light resolve to the same 16 colours, so the suite's
+    // terminal must not decide whether the theme change is observable.
+    s.config.ui.color = "truecolor".to_string();
+    s.apply_runtime_config("ui.color");
     let old_theme = s.theme.clone();
     s.config.theme.name = "pacode-light".to_string();
     s.apply_runtime_config("theme.name");

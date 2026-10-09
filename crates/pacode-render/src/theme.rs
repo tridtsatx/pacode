@@ -140,27 +140,36 @@ impl Theme {
             Self::ansi()
         };
 
+        // Under ANSI-16 a role's meaning picks its colour (see `NAMED_ROLES`,
+        // `GREY_ROLES`): the hexes the fixed roles use, so a syntax role in
+        // the same hex lands on the same colour.
+        let fixed: Vec<((u8, u8, u8), Color)> = NAMED_ROLES
+            .iter()
+            .filter_map(|(role, ansi)| match parse_color(p.colors.get(*role)?)? {
+                Color::Rgb(r, g, b) => Some(((r, g, b), *ansi)),
+                _ => None,
+            })
+            .collect();
         let resolve = |key: &str| -> Option<Color> {
             let raw = p.colors.get(key)?;
             let parsed = parse_color(raw)?;
-            if !truecolor {
-                // A role's meaning picks the mapping: text and backgrounds
-                // stay on the grey ramp, status and syntax roles keep a hue.
-                // A role named after a colour is that colour, as in
-                // `Theme::ansi()`: a palette's olive "green" is still green.
-                let named = NAMED_ROLES
-                    .iter()
-                    .find(|(role, _)| *role == key)
-                    .map(|(_, c)| *c);
-                match parsed {
-                    Color::Rgb(..) if named.is_some() => named,
-                    Color::Rgb(r, g, b) if GREY_ROLES.contains(&key) => Some(ansi_grey(r, g, b)),
-                    Color::Rgb(r, g, b) => Some(ansi_hue(r, g, b)),
-                    other => Some(other),
-                }
-            } else {
-                Some(parsed)
+            if truecolor {
+                return Some(parsed);
             }
+            let Color::Rgb(r, g, b) = parsed else {
+                // A named or indexed colour is already an ANSI choice.
+                return Some(parsed);
+            };
+            if GREY_ROLES.contains(&key) {
+                // `None` keeps `Theme::ansi()`'s grey ladder for the role.
+                return None;
+            }
+            let named = NAMED_ROLES.iter().find(|(role, _)| *role == key);
+            let shared = fixed.iter().find(|(rgb, _)| *rgb == (r, g, b));
+            Some(match (named, shared) {
+                (Some((_, ansi)), _) | (None, Some((_, ansi))) => *ansi,
+                (None, None) => ansi_hue(r, g, b),
+            })
         };
 
         let fg = resolve("fg")
