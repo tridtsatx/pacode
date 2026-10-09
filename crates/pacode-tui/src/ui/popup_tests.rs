@@ -28,39 +28,90 @@ fn full_overlay_wins_over_every_input_completion() {
     assert!(popup.is_full());
 }
 
-/// B25: the palette is centred on the whole frame, not on the dialog column an
-/// open panel squeezes; 44..=84 wide, at most the frame height less 4.
+fn palette_models(count: usize) -> Vec<pacode_types::ModelInfo> {
+    (0..count)
+        .map(|n| pacode_types::ModelInfo {
+            route: pacode_types::ModelRoute::new("p", format!("m{n:02}")),
+            display_name: format!("m{n:02}"),
+            context_window: None,
+            supports_reasoning: false,
+            supports_vision: false,
+            supported_efforts: None,
+            pricing: None,
+        })
+        .collect()
+}
+
+fn palette_area_with(app: &AppState) -> (Rect, Rect, Rect) {
+    let layout = crate::layout::current(app);
+    let popup = popup::resolve(app, &layout, Instant::now()).expect("palette resolves");
+    (
+        popup.area(),
+        popup::overlay_container(&layout),
+        layout.preview,
+    )
+}
+
+/// B25: the palette sits in the shared overlay container (the left column
+/// above the prompt frame, panel or not), 44..=84 wide and centred across;
+/// its height follows its rows up to the tallest box, whose centred top it
+/// keeps.
 #[test]
-fn the_model_palette_centres_in_the_shared_overlay_container() {
+fn the_model_palette_sizes_to_its_rows_in_the_overlay_container() {
     for (cols, rows) in [(130u16, 40u16), (200, 60), (60, 20), (40, 12)] {
         let mut app = state(cols, rows);
         app.panel.target = Some(PanelTarget::Task(TaskId::new("task")));
         app.focus = Focus::Overlay(Overlay::ModelPalette {
             palette: Default::default(),
         });
-        let layout = crate::layout::current(&app);
-        let popup = popup::resolve(&app, &layout, Instant::now()).expect("palette resolves");
-        let area = popup.area();
-        let container = popup::overlay_container(&layout);
-        let expected_w = container
-            .width
-            .saturating_sub(4)
-            .clamp(44.min(container.width), 84);
-        assert_eq!(area.width, expected_w, "{cols}x{rows}");
-        assert_eq!(area.height, container.height.min(26), "{cols}x{rows}");
-        assert_eq!(
-            area.x,
-            container.x + (container.width - area.width) / 2,
-            "{cols}x{rows}: centred"
-        );
-        assert_eq!(
-            area.y,
-            container.y + (container.height - area.height) / 2,
-            "{cols}x{rows}: centred"
-        );
-        // Never over the prompt frame or the footer.
-        assert!(area.bottom() <= layout.preview.y, "{cols}x{rows}");
+        for (models, list_rows) in [(3usize, 4u16), (0, 0), (60, 61)] {
+            app.models = palette_models(models);
+            let (area, container, preview) = palette_area_with(&app);
+            let expected_w = container
+                .width
+                .saturating_sub(4)
+                .clamp(44.min(container.width), 84);
+            let tallest = container.height.min(popup::PALETTE_MAX_HEIGHT);
+            // Border, search + spacer + effort + hint, the rows plus one
+            // spacer, and never fewer than four list rows.
+            let wanted = 2 + 4 + (list_rows + 1).max(4);
+            let at = format!("{cols}x{rows}, {models} models");
+            assert_eq!(area.width, expected_w, "{at}");
+            assert_eq!(area.height, wanted.min(tallest), "{at}");
+            assert_eq!(
+                area.x,
+                container.x + (container.width - area.width) / 2,
+                "{at}: centred across"
+            );
+            assert_eq!(
+                area.y,
+                container.y + (container.height - tallest) / 2,
+                "{at}: the tallest box's top"
+            );
+            assert!(area.bottom() <= preview.y, "{at}: clear of the prompt");
+        }
     }
+}
+
+/// A filter that shrinks the list shortens the box from below: the frame
+/// keeps its x, width and top, so the search line never moves.
+#[test]
+fn filtering_shrinks_the_palette_without_moving_it() {
+    let mut app = state(120, 34);
+    app.models = palette_models(12);
+    app.focus = Focus::Overlay(Overlay::ModelPalette {
+        palette: Default::default(),
+    });
+    let (before, _, _) = palette_area_with(&app);
+    if let Focus::Overlay(Overlay::ModelPalette { palette }) = &mut app.session.focus {
+        palette.push_str("m07");
+    }
+    let (after, _, _) = palette_area_with(&app);
+    assert!(after.height < before.height, "{before:?} -> {after:?}");
+    assert_eq!(
+        (after.x, after.y, after.width),
+        (before.x, before.y, before.width)
+    );
 }
 
 #[test]

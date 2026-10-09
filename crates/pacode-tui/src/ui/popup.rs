@@ -506,7 +506,7 @@ fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId)
         return elapsed.map_or(area, |ms| grow_bottom(area, ms));
     }
     if id == PopupId::ModelPalette {
-        let area = palette_area(overlay_container(layout));
+        let area = crate::ui::model_palette_view::area(state, overlay_container(layout));
         return elapsed.map_or(area, |ms| grow_center(area, ms));
     }
     let area = center_container(overlay_container(layout), elapsed);
@@ -520,18 +520,31 @@ fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId)
     }
 }
 
-/// The model palette's box, centred in the shared [`overlay_container`]: 44
-/// to 84 columns wide (the container's own width below 44) and as tall as the
-/// container allows, up to 26 rows. The container already leaves out the
-/// prompt frame and the footer, so the box never covers where the typing is.
-pub(crate) fn palette_area(container: Rect) -> Rect {
-    const MAX_HEIGHT: u16 = 26;
+/// The model palette's box in the shared [`overlay_container`]: 44 to 84
+/// columns wide (the container's own width below 44), centred across, and
+/// `height` rows tall up to [`PALETTE_MAX_HEIGHT`] and the container. The top
+/// sits where the tallest box would sit centred, so a filter that shrinks the
+/// list shortens the box from below without moving its search line. The
+/// container already leaves out the prompt frame and the footer.
+pub(crate) fn palette_area(container: Rect, height: u16) -> Rect {
+    if container.width == 0 || container.height == 0 {
+        return Rect::new(container.x, container.y, 0, 0);
+    }
     let width = container
         .width
         .saturating_sub(4)
         .clamp(44.min(container.width), 84);
-    center_area(container, width, container.height.min(MAX_HEIGHT))
+    let tallest = container.height.min(PALETTE_MAX_HEIGHT);
+    Rect::new(
+        container.x + (container.width - width) / 2,
+        container.y + (container.height - tallest) / 2,
+        width,
+        height.min(tallest),
+    )
 }
+
+/// The model palette's tallest box.
+pub(crate) const PALETTE_MAX_HEIGHT: u16 = 26;
 
 fn center_container(area: Rect, elapsed: Option<u64>) -> Rect {
     elapsed.map_or(area, |ms| grow_center(area, ms))

@@ -674,6 +674,18 @@ fn a_mark_after_a_query_marks_the_match() {
 
 /// A full frame at `cols`x`rows`, as the app draws it.
 fn draw(state: &mut AppState, cols: u16, rows: u16) -> String {
+    let buffer = draw_buffer(state, cols, rows);
+    (0..rows)
+        .map(|y| {
+            (0..cols)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn draw_buffer(state: &mut AppState, cols: u16, rows: u16) -> ratatui::buffer::Buffer {
     // Mark the layer seen, so the palette is drawn full size rather than the
     // first frame of its unfold.
     state.last_focus_key = crate::ui::focus_key(&state.focus);
@@ -685,7 +697,46 @@ fn draw(state: &mut AppState, cols: u16, rows: u16) -> String {
             crate::ui::draw(frame, state, &prepared);
         })
         .expect("draw");
-    format!("{}", terminal.backend())
+    terminal.backend().buffer().clone()
+}
+
+/// ANSI-16 and mono: the selected row is one uniform bar between the frame's
+/// borders — the header's section style, the status badge and its words all
+/// give way to the bar's single style.
+#[test]
+fn a_non_rgb_selection_is_one_uniform_bar() {
+    for mode in ["ansi", "mono"] {
+        let (mut state, _dir) = state();
+        state.config.ui.color = mode.to_string();
+        state.apply_runtime_config("ui.color");
+        state.auth_providers = vec![provider("p", AuthState::Configured, &["one"])];
+        open(&mut state);
+        // The provider header (title, badge, words, kind) is the busiest row.
+        press(&mut state, key(KeyCode::Char('p')));
+        let buffer = draw_buffer(&mut state, 120, 34);
+        let area = buffer.area;
+        let pointer = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].symbol() == "▸")
+            .expect("a selected row");
+        let (left, y) = (pointer.0 - 1, pointer.1);
+        assert_eq!(
+            buffer[(left, y)].symbol(),
+            "│",
+            "{mode}: the frame's left border"
+        );
+        let right = (pointer.0..area.width)
+            .find(|&x| buffer[(x, y)].symbol() == "│")
+            .expect("the frame's right border");
+        let row: String = (pointer.0..right)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        assert!(row.contains("signed in"), "{mode}: {row}");
+        let bar = buffer[pointer].style();
+        for x in pointer.0..right {
+            assert_eq!(buffer[(x, y)].style(), bar, "{mode}: column {x} of {row}");
+        }
+    }
 }
 
 /// Moving inside the visible rows leaves the list where it is; the frame

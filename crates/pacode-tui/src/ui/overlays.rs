@@ -132,9 +132,14 @@ pub(crate) fn menu_block(title: &str, hint: &str, opts: &RenderOptions) -> Block
         .border_style(opts.theme.border)
 }
 
-/// The selected row: every span keeps its colour over `selected_bg`, padded to
-/// the row's full width so the highlight is a bar, not a word. The pointer span
-/// stays accent on top of the bar.
+/// The selected row, padded to the row's full width so the highlight is a bar,
+/// not a word.
+///
+/// On an RGB `selected_bg` every span keeps its colour over the bar (the
+/// pointer stays accent). Anywhere else — ANSI-16 and mono draw the bar with
+/// `REVERSED` — a span's own colour would be reversed into a block of that
+/// colour and the row would read as a patchwork, so the whole row takes
+/// `selected_bg` alone: one uniform bar, badges included.
 pub(crate) fn selected_row(line: Line<'static>, width: u16, opts: &RenderOptions) -> Line<'static> {
     let width = width as usize;
     let used: usize = line
@@ -142,14 +147,18 @@ pub(crate) fn selected_row(line: Line<'static>, width: u16, opts: &RenderOptions
         .iter()
         .map(|s| pacode_render::display_width(&s.content))
         .sum();
+    let bar = opts.theme.selected_bg;
+    let keeps_colours = matches!(bar.bg, Some(ratatui::style::Color::Rgb(..)));
     let mut spans: Vec<Span<'static>> = line
         .spans
         .into_iter()
         .map(|s| {
-            Span::styled(
-                s.content.into_owned(),
-                opts.theme.selected_bg.patch(s.style),
-            )
+            let style = if keeps_colours {
+                bar.patch(s.style)
+            } else {
+                bar
+            };
+            Span::styled(s.content.into_owned(), style)
         })
         .collect();
     if used < width {
@@ -276,6 +285,28 @@ mod tests {
         assert_eq!(window_groups(&[], 0, 5), 0);
         assert_eq!(window_groups(&heights, 0, 0), 0);
         assert_eq!(window_groups(&heights, 99, 6), 4);
+    }
+
+    /// ANSI-16 and mono draw the bar with REVERSED: every span's own colour
+    /// (a badge's included) gives way to one bar style across the row.
+    #[test]
+    fn a_reversed_selection_bar_is_one_uniform_style() {
+        for theme in [pacode_render::Theme::ansi(), pacode_render::Theme::mono()] {
+            let opts = RenderOptions::with_theme(40, false, theme);
+            let line = Line::from(vec![
+                Span::styled("▸ ".to_string(), opts.theme.accent),
+                Span::styled("ANTHROPIC".to_string(), opts.theme.bold),
+                crate::ui::chrome::badge("●", opts.theme.green, &opts),
+                Span::styled(" signed in".to_string(), opts.theme.green),
+            ]);
+            let row = selected_row(line, 30, &opts);
+            assert!(
+                row.spans
+                    .iter()
+                    .all(|span| span.style == opts.theme.selected_bg),
+                "{row:?}"
+            );
+        }
     }
 
     #[test]

@@ -416,15 +416,40 @@ fn list_height(area: Rect) -> usize {
     usize::from(area.height.saturating_sub(2 + CHROME_ROWS))
 }
 
-/// Store the window the palette shows in a box of `area` (its full size, not
-/// the opening animation's), so the next frame starts from it. Called once
-/// per frame from `prepare_frame`, which covers keys, catalog updates and
-/// resizes alike.
-pub(crate) fn sync_scroll(state: &mut AppState, area: Rect) {
+/// The list never shrinks below this, so the empty and loading states and a
+/// one-model search still read as a dialog.
+const MIN_LIST: usize = 4;
+
+/// The box height `list_rows` rows ask for: border, chrome, the rows and one
+/// spacer above the effort line.
+fn box_height(list_rows: usize) -> u16 {
+    let list = list_rows.saturating_add(1).max(MIN_LIST);
+    u16::try_from(list)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2 + CHROME_ROWS)
+}
+
+/// The palette's box in `container`, sized to its rows (see
+/// [`popup::palette_area`](crate::ui::popup::palette_area)). An empty rect
+/// when the palette is not open.
+pub(crate) fn area(state: &AppState, container: Rect) -> Rect {
+    let Focus::Overlay(Overlay::ModelPalette { palette }) = &state.focus else {
+        return Rect::new(container.x, container.y, 0, 0);
+    };
+    let rows = palette.rows(&Sources::of(state)).len();
+    crate::ui::popup::palette_area(container, box_height(rows))
+}
+
+/// Store the window the palette shows in its box in `container` (the full
+/// size, not the opening animation's), so the next frame starts from it.
+/// Called once per frame from `prepare_frame`, which covers keys, catalog
+/// updates and resizes alike.
+pub(crate) fn sync_scroll(state: &mut AppState, container: Rect) {
     let Focus::Overlay(Overlay::ModelPalette { palette }) = &state.focus else {
         return;
     };
     let rows = palette.rows(&Sources::of(state));
+    let area = crate::ui::popup::palette_area(container, box_height(rows.len()));
     let scroll = palette.window(&rows, palette.selected_index(&rows), list_height(area));
     if let Focus::Overlay(Overlay::ModelPalette { palette }) = &mut state.session.focus {
         palette.scroll = scroll;
