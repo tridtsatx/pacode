@@ -29,6 +29,7 @@ pub mod editor;
 pub mod font;
 pub mod keys;
 pub mod keys_menu;
+pub mod keys_palette;
 pub mod keys_picker;
 pub mod layout;
 pub mod lock;

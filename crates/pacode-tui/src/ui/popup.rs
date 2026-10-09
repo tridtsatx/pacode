@@ -24,16 +24,14 @@ pub enum PopupId {
     Bash,
     PromptQueue,
     Menu,
-    ModelPicker,
     EffortPicker,
     ModePicker,
     QuestionPicker,
     ThemePicker,
-    LoginPicker,
     RailOverlay,
     Analyze,
     Settings,
-    ModelPickerPage,
+    ModelPalette,
 }
 
 impl PopupId {
@@ -47,12 +45,7 @@ impl PopupId {
     fn is_bottom(self) -> bool {
         matches!(
             self,
-            Self::ModelPicker
-                | Self::EffortPicker
-                | Self::ModePicker
-                | Self::QuestionPicker
-                | Self::ThemePicker
-                | Self::LoginPicker
+            Self::EffortPicker | Self::ModePicker | Self::QuestionPicker | Self::ThemePicker
         )
     }
 }
@@ -218,16 +211,14 @@ pub(crate) fn resolve_full(
         return None;
     };
     let id = match overlay {
-        Overlay::ModelPicker { .. } => PopupId::ModelPicker,
         Overlay::EffortPicker { .. } => PopupId::EffortPicker,
         Overlay::ModePicker { .. } => PopupId::ModePicker,
         Overlay::QuestionPicker => PopupId::QuestionPicker,
         Overlay::ThemePicker { .. } => PopupId::ThemePicker,
-        Overlay::LoginPicker { .. } => PopupId::LoginPicker,
         Overlay::RailOverlay { .. } => PopupId::RailOverlay,
         Overlay::Analyze { .. } => PopupId::Analyze,
         Overlay::Settings { .. } => PopupId::Settings,
-        Overlay::ModelPickerPage { .. } => PopupId::ModelPickerPage,
+        Overlay::ModelPalette { .. } => PopupId::ModelPalette,
         // A menu with nothing on its stack has no level to draw, and reporting
         // it as a full overlay would suppress the inline completions the
         // reader's own prompt is showing.
@@ -513,6 +504,10 @@ fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId)
         let area = bottom_area(container, container.width, state.bottom_picker_height());
         return elapsed.map_or(area, |ms| grow_bottom(area, ms));
     }
+    if id == PopupId::ModelPalette {
+        let area = palette_area(layout.screen);
+        return elapsed.map_or(area, |ms| grow_center(area, ms));
+    }
     let area = center_container(overlay_container(layout), elapsed);
     match id {
         PopupId::RailOverlay => {
@@ -522,6 +517,19 @@ fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId)
         }
         _ => area,
     }
+}
+
+/// The model palette's box: centred on the whole frame — not the dialog
+/// column, which an open panel squeezes to half the width — 44 to 84 columns
+/// wide (the frame's own width below 44) and at most the frame height less 4.
+pub(crate) fn palette_area(screen: Rect) -> Rect {
+    const MAX_HEIGHT: u16 = 26;
+    let width = screen
+        .width
+        .saturating_sub(4)
+        .clamp(44.min(screen.width), 84);
+    let height = screen.height.saturating_sub(4).min(MAX_HEIGHT);
+    center_area(screen, width, height)
 }
 
 fn center_container(area: Rect, elapsed: Option<u64>) -> Rect {

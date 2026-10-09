@@ -114,7 +114,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
     }
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('d'))
-        && !matches!(state.focus, Focus::Overlay(Overlay::LoginPicker { .. }))
+        // Inside the model palette `ctrl+d` is its logout chord by default.
+        && !(matches!(state.focus, Focus::Overlay(Overlay::ModelPalette { .. }))
+            && state
+                .keymap
+                .bindings_for(KeyAction::ModelPickerLogout)
+                .iter()
+                .any(|b| crate::binding::matches_key(b, key)))
     {
         state.quit = true;
         return vec![Action::Quit];
@@ -261,7 +267,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 }
                 // A reading, not a chooser: Escape closes the page and there is
                 // nothing underneath to peel back to.
-                PopupId::Analyze | PopupId::Settings | PopupId::ModelPickerPage => {
+                PopupId::Analyze | PopupId::Settings | PopupId::ModelPalette => {
                     state.focus = Focus::Normal;
                     state.dirty = true;
                     return vec![];
@@ -269,12 +275,10 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 PopupId::Slash
                 | PopupId::PromptQueue
                 | PopupId::Menu
-                | PopupId::ModelPicker
                 | PopupId::EffortPicker
                 | PopupId::ModePicker
                 | PopupId::QuestionPicker
                 | PopupId::ThemePicker
-                | PopupId::LoginPicker
                 | PopupId::RailOverlay => {}
             }
         }
@@ -564,37 +568,6 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                     return select_agent_by_id(state, &id);
                 }
             }
-            Focus::Overlay(Overlay::ModelPicker {
-                query,
-                index,
-                for_zdr,
-            }) => {
-                let q_lower = query.to_lowercase();
-                let for_zdr_flag = *for_zdr;
-                let zdr_only =
-                    for_zdr_flag || crate::state::zdr_active(&state.config, state.meta.as_ref());
-                let route = {
-                    let rows = crate::state::picker_models(
-                        &state.models,
-                        &state.model_flags,
-                        &q_lower,
-                        zdr_only,
-                    );
-                    rows.get(*index).map(|m| m.route.clone())
-                };
-                if let Some(route) = route {
-                    log::debug!("close overlay: ModelPicker");
-                    state.focus = Focus::Normal;
-                    let mut actions = vec![Action::Send(Request::SetModel(route))];
-                    if for_zdr_flag {
-                        if let Some(m) = state.meta.as_mut() {
-                            m.zdr = true;
-                        }
-                        actions.push(Action::Send(Request::SetZdr(true)));
-                    }
-                    return actions;
-                }
-            }
             Focus::Overlay(Overlay::EffortPicker { index }) => {
                 if let Some(effort) = pacode_types::model::Effort::ALL.get(*index) {
                     let eff = *effort;
@@ -619,13 +592,12 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | Overlay::QuestionPicker
                 | Overlay::RailOverlay { .. }
                 | Overlay::ThemePicker { .. }
-                | Overlay::LoginPicker { .. }
                 // A reading has no selection to confirm, and the settings page
-                // and the model picker handle their own keys; Enter does
+                // and the model palette handle their own keys; Enter does
                 // nothing here.
                 | Overlay::Analyze { .. }
                 | Overlay::Settings { .. }
-                | Overlay::ModelPickerPage { .. }
+                | Overlay::ModelPalette { .. }
                 // Unreachable — an open menu intercepts Enter earlier — but
                 // the match stays exhaustive.
                 | Overlay::Menu { .. },
@@ -756,8 +728,8 @@ pub use crate::nav::{
 
 /// Alt+Z. Only `zdr = "session"` toggles; `always`/`off` are config-forced.
 /// Enabling requires the current route to be `zdr_capable` — otherwise the
-/// model picker opens filtered to capable routes, and Enter there sends
-/// `SetModel` then `SetZdr(true)`; Esc keeps ZDR off.
+/// model palette opens filtered to capable routes, and Enter there sends
+/// `SetModel` then `SetZdr(true)` in order; Esc keeps ZDR off.
 fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
     if state.config.zdr != pacode_types::ZdrMode::Session {
         return vec![];
@@ -781,12 +753,7 @@ fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
         }
         vec![Action::Send(Request::SetZdr(true))]
     } else {
-        state.focus = Focus::Overlay(Overlay::ModelPicker {
-            query: String::new(),
-            index: 0,
-            for_zdr: true,
-        });
-        vec![Action::Send(Request::ListModels)]
+        crate::keys_palette::open(state, crate::keys_palette::Opening::Zdr)
     }
 }
 
@@ -805,15 +772,13 @@ fn move_popup_selection(state: &mut AppState, delta: i32) -> bool {
         PopupId::Slash => state.input.slash_index % total,
         PopupId::PromptQueue
         | PopupId::Menu
-        | PopupId::ModelPicker
         | PopupId::EffortPicker
         | PopupId::ModePicker
         | PopupId::QuestionPicker
         | PopupId::ThemePicker
-        | PopupId::LoginPicker
         | PopupId::Analyze
         | PopupId::Settings
-        | PopupId::ModelPickerPage
+        | PopupId::ModelPalette
         | PopupId::RailOverlay => return false,
     };
     let next = if delta < 0 {

@@ -49,17 +49,6 @@ pub enum PanelTarget {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Overlay {
-    ModelPicker {
-        query: String,
-        index: usize,
-        /// Opened by the Alt+Z enable flow: Enter switches to the picked
-        /// ZDR-capable route and turns ZDR on; Esc keeps ZDR off.
-        for_zdr: bool,
-    },
-    LoginPicker {
-        query: String,
-        index: usize,
-    },
     EffortPicker {
         index: usize,
     },
@@ -89,11 +78,11 @@ pub enum Overlay {
         stack: crate::ui::menu::MenuStack,
         ui: crate::ui::menu::MenuUiState,
     },
-    /// The model picker: providers on the left with live counts, models on the
-    /// right with context, price and capabilities, and an effort ladder that
-    /// greys out the levels a model does not accept.
-    ModelPickerPage {
-        picker: crate::ui::model_picker::ModelPicker,
+    /// The central model palette (`/model`, `/login`, Alt+Z): fuzzy search,
+    /// models grouped by provider, inline sign-in and the effort ladder of
+    /// the highlighted model.
+    ModelPalette {
+        palette: crate::ui::model_palette::ModelPalette,
     },
     /// The settings page: sections across the top, `setting → value` rows, a
     /// description line for the highlighted row, and a search that filters

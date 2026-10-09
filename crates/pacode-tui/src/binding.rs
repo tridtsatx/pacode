@@ -74,6 +74,12 @@ pub enum Action {
     ModelPickerZdr,
     /// Force-refresh the model catalog, bypassing the stale cache (§9.1).
     ModelPickerRefresh,
+    /// Step the model palette's capability filter (all / reasoning / vision).
+    ModelPickerKind,
+    /// Switch the highlighted provider to its next stored account.
+    ModelPickerAccount,
+    /// Sign the highlighted provider's active account out.
+    ModelPickerLogout,
     /// Expand or collapse the newest tool-call cell with hidden output (§6);
     /// a click on a cell does the same for that specific cell.
     ExpandOutput,
@@ -104,7 +110,7 @@ pub enum Scope {
     Rail,
     /// The bottom panel — agent transcript and task output.
     Panel,
-    /// The bottom pickers (model, theme, login…): their keys resolve only
+    /// The pickers (the model palette, theme…): their keys resolve only
     /// while the picker overlay owns the keyboard, so a chord spelled like
     /// a global one (`alt+f`) is not a conflict (§9.1).
     Picker,
@@ -205,6 +211,9 @@ impl Action {
             Self::ModelPickerFavorite => "model_picker_favorite",
             Self::ModelPickerZdr => "model_picker_zdr",
             Self::ModelPickerRefresh => "model_picker_refresh",
+            Self::ModelPickerKind => "model_picker_kind",
+            Self::ModelPickerAccount => "model_picker_account",
+            Self::ModelPickerLogout => "model_picker_logout",
             Self::ExpandOutput => "expand_output",
             Self::MoveWordLeft => "move_word_left",
             Self::MoveWordRight => "move_word_right",
@@ -268,6 +277,9 @@ impl Action {
             Self::ModelPickerFavorite => "Model picker: mark model as favorite",
             Self::ModelPickerZdr => "Model picker: mark model ZDR-capable",
             Self::ModelPickerRefresh => "Model picker: force-refresh the catalog",
+            Self::ModelPickerKind => "Model picker: cycle the capability filter",
+            Self::ModelPickerAccount => "Model picker: switch the provider's account",
+            Self::ModelPickerLogout => "Model picker: sign the provider out",
             Self::ExpandOutput => "Expand/collapse the latest tool output",
             Self::MoveWordLeft => "Move cursor one word left",
             Self::MoveWordRight => "Move cursor one word right",
@@ -335,9 +347,12 @@ impl Action {
             | Self::SelectSession8
             | Self::SelectSession9 => Scope::Rail,
             Self::StopAgent | Self::KillTask => Scope::Panel,
-            Self::ModelPickerFavorite | Self::ModelPickerZdr | Self::ModelPickerRefresh => {
-                Scope::Picker
-            }
+            Self::ModelPickerFavorite
+            | Self::ModelPickerZdr
+            | Self::ModelPickerRefresh
+            | Self::ModelPickerKind
+            | Self::ModelPickerAccount
+            | Self::ModelPickerLogout => Scope::Picker,
         }
     }
 
@@ -592,6 +607,9 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("model_picker_favorite", Action::ModelPickerFavorite),
     ("model_picker_zdr", Action::ModelPickerZdr),
     ("model_picker_refresh", Action::ModelPickerRefresh),
+    ("model_picker_kind", Action::ModelPickerKind),
+    ("model_picker_account", Action::ModelPickerAccount),
+    ("model_picker_logout", Action::ModelPickerLogout),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -995,6 +1013,42 @@ impl Keymap {
             Action::ModelPickerRefresh,
             vec![Binding {
                 code: KeyCode::Char('r'),
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        // Letters in the palette are search text, so its account and filter
+        // keys are chords too (alt first, ctrl for terminals that eat alt).
+        // Logout keeps the `ctrl+d` the old login screen had.
+        bindings.insert(
+            Action::ModelPickerKind,
+            vec![
+                Binding {
+                    code: KeyCode::Char('k'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('k'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        bindings.insert(
+            Action::ModelPickerAccount,
+            vec![
+                Binding {
+                    code: KeyCode::Char('a'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('a'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        bindings.insert(
+            Action::ModelPickerLogout,
+            vec![Binding {
+                code: KeyCode::Char('d'),
                 mods: KeyModifiers::CONTROL,
             }],
         );

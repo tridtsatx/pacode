@@ -81,12 +81,11 @@ pub(crate) fn draw(
             frame.render_widget(Clear, popup.area);
             draw_rail_overlay(frame, popup.area, prepared, state, opts);
         }
-        crate::ui::popup::PopupId::ModelPickerPage => {
-            let Focus::Overlay(Overlay::ModelPickerPage { picker }) = &state.focus else {
+        crate::ui::popup::PopupId::ModelPalette => {
+            let Focus::Overlay(Overlay::ModelPalette { palette }) = &state.focus else {
                 return;
             };
-            frame.render_widget(Clear, popup.area);
-            crate::ui::model_picker_page::draw(frame, popup.area, state, picker, opts);
+            crate::ui::model_palette_view::draw(frame, popup.area, state, palette, opts);
         }
         crate::ui::popup::PopupId::Settings => {
             let (Focus::Overlay(Overlay::Settings { ui }), Some(_)) =
@@ -112,12 +111,10 @@ pub(crate) fn draw(
         | crate::ui::popup::PopupId::At
         | crate::ui::popup::PopupId::Bash
         | crate::ui::popup::PopupId::PromptQueue
-        | crate::ui::popup::PopupId::ModelPicker
         | crate::ui::popup::PopupId::EffortPicker
         | crate::ui::popup::PopupId::ModePicker
         | crate::ui::popup::PopupId::QuestionPicker
-        | crate::ui::popup::PopupId::ThemePicker
-        | crate::ui::popup::PopupId::LoginPicker => {}
+        | crate::ui::popup::PopupId::ThemePicker => {}
     }
 }
 

@@ -19,15 +19,34 @@ fn state(cols: u16, rows: u16) -> AppState {
 fn full_overlay_wins_over_every_input_completion() {
     let mut app = state(80, 24);
     app.input.insert_str("!echo @src");
-    app.focus = Focus::Overlay(Overlay::ModelPicker {
-        query: String::new(),
-        index: 0,
-        for_zdr: false,
+    app.focus = Focus::Overlay(Overlay::ModelPalette {
+        palette: Default::default(),
     });
 
     let popup = popup::resolve(&app, &crate::layout::current(&app), Instant::now()).unwrap();
-    assert_eq!(popup.id(), PopupId::ModelPicker);
+    assert_eq!(popup.id(), PopupId::ModelPalette);
     assert!(popup.is_full());
+}
+
+/// B25: the palette is centred on the whole frame, not on the dialog column an
+/// open panel squeezes; 44..=84 wide, at most the frame height less 4.
+#[test]
+fn the_model_palette_centres_on_the_frame_even_with_a_panel_open() {
+    for (cols, rows) in [(130u16, 40u16), (200, 60), (60, 20), (40, 12)] {
+        let mut app = state(cols, rows);
+        app.panel.target = Some(PanelTarget::Task(TaskId::new("task")));
+        app.focus = Focus::Overlay(Overlay::ModelPalette {
+            palette: Default::default(),
+        });
+        let popup = popup::resolve(&app, &crate::layout::current(&app), Instant::now())
+            .expect("palette resolves");
+        let area = popup.area();
+        let expected_w = cols.saturating_sub(4).clamp(44.min(cols), 84);
+        assert_eq!(area.width, expected_w, "{cols}x{rows}");
+        assert!(area.height <= rows.saturating_sub(4), "{cols}x{rows}");
+        assert_eq!(area.x, (cols - area.width) / 2, "{cols}x{rows}: centred");
+        assert_eq!(area.y, (rows - area.height) / 2, "{cols}x{rows}: centred");
+    }
 }
 
 #[test]

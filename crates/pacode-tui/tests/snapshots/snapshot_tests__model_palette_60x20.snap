@@ -1,0 +1,24 @@
+---
+source: crates/pacode-tui/tests/snapshot_tests.rs
+expression: view
+---
+"▄▀▀▀▀▀▀▀▀▀▀▀▀                                               "
+"▀▀▀▀▀▀▀▀▀▀       pacode v0.1.0-dev                          "
+"▀▀╭ Select model ────────────────────────────────────────╮  "
+"▀▀│❯                                                     │  "
+"  │                                                      │  "
+"  │  RECENT                                              │  "
+"▎ │  Claude Opus 5  anthropic   200k  $15/$75     RVE    │  "
+"  │                                                      │  "
+"I'│  ANTHROPIC  ● signed in                              │l "
+"an│  Claude Opus 5              200k  $15/$75     RVE    │  "
+"  │▸ Claude Sonnet 3.7          200k  $3/$15      RVE    │  "
+"▣ │                                                      │ ✓"
+"│ │  BUBNA                                               │  "
+"  │  Gemini 3.8 Flash           200k  $0.25/$1.5  RVE    │  "
+"[C│                                                      │0s"
+"──│effort  low · medium · [high] · xhigh                 │──"
+"❯ │↑↓ move · enter select · tab effort · esc close       │  "
+"──╰ alt+f fav · alt+z zdr · alt+k kind · ctrl+r refres…──╯──"
+"Build · Claude 3 7 Sonnet | high /effort              /model"
+"» ask before edits and commands · ← 4 agents · 1 bg         "

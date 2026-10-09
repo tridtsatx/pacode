@@ -230,6 +230,12 @@ editors that speak it.
 | `shift+tab` | cycle permission mode |
 | `ctrl+c` twice | quit |
 
+`/model` (and `/login`) open the model palette: type to fuzzy-search models
+and providers, `↑↓` to move, `tab` to step the effort the highlighted model
+accepts, `enter` to switch — or to sign in to a provider that needs it.
+Chords there: `alt+f` favourite, `alt+z` ZDR-capable, `alt+k` capability
+filter, `ctrl+r` refresh the catalog, `alt+a` next account, `ctrl+d` sign out.
+
 `/model`, `/effort`, `/mode`, `/theme`, `/config`, `/sessions`, `/mcp`,
 `/plugins`, `/keys`, `/editor`, `/import`, `/compact`, `/export`, `/help`.
 

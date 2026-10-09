@@ -949,3 +949,111 @@ fn w128_tui_delta_burst_coalesces_into_one_cell() {
     assert_eq!(text, &expected);
     assert_eq!(state.last_event_seq, Some(138));
 }
+
+/// The model palette open on the session's route, at the smallest and the
+/// usual terminal size: centred on the frame, every row inside the box.
+fn palette_view(cols: u16, rows: u16) -> String {
+    use pacode_types::{AuthState, ModelInfo, Pricing, ProviderAuthInfo};
+    let mut state = create_state(cols, rows, make_base_snapshot());
+    let priced = |provider: &str, id: &str, name: &str, input: f64, output: f64| ModelInfo {
+        route: ModelRoute::new(provider, id),
+        display_name: name.to_string(),
+        context_window: Some(200_000),
+        supports_reasoning: true,
+        supports_vision: true,
+        supported_efforts: Some(vec![
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::XHigh,
+        ]),
+        pricing: Some(Pricing {
+            input_per_m: input,
+            output_per_m: output,
+            cache_read_per_m: None,
+            cache_write_per_m: None,
+        }),
+    };
+    state.models = vec![
+        priced(
+            "anthropic",
+            "claude-3-7-sonnet",
+            "Claude Sonnet 3.7",
+            3.0,
+            15.0,
+        ),
+        priced("anthropic", "claude-opus-5", "Claude Opus 5", 15.0, 75.0),
+        priced("bubna", "gemini-3.8-flash", "Gemini 3.8 Flash", 0.25, 1.5),
+    ];
+    let auth = |id: &str, name: &str, state: AuthState| ProviderAuthInfo {
+        id: id.to_string(),
+        display_name: name.to_string(),
+        auth_kind: "oauth".to_string(),
+        detail: String::new(),
+        recommended: false,
+        state,
+        accounts: Vec::new(),
+        active: None,
+    };
+    state.auth_providers = vec![
+        auth("anthropic", "Anthropic", AuthState::Configured),
+        auth("openrouter", "OpenRouter", AuthState::NotConfigured),
+    ];
+    state.model_flags.clear();
+    state.recent_models = vec!["anthropic/claude-opus-5".to_string()];
+    pacode_tui::commands::execute(&mut state, "/model");
+    settle_focus(&mut state);
+
+    let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+    terminal
+        .draw(|f| {
+            prepare_and_draw_frame(f, &mut state);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    // The box is centred on the whole frame (B25).
+    let top = (0..rows)
+        .find(|y| (0..cols).any(|x| buffer.cell((x, *y)).is_some_and(|c| c.symbol() == "╭")))
+        .expect("the palette's top border");
+    let left = (0..cols)
+        .find(|x| buffer.cell((*x, top)).is_some_and(|c| c.symbol() == "╭"))
+        .unwrap_or(0);
+    let right = (left..cols)
+        .rev()
+        .find(|x| buffer.cell((*x, top)).is_some_and(|c| c.symbol() == "╮"))
+        .unwrap_or(0);
+    let width = right - left + 1;
+    assert_eq!(width, cols.saturating_sub(4).clamp(44, 84), "{cols}x{rows}");
+    assert_eq!(left, (cols - width) / 2, "{cols}x{rows}: centred");
+    format!("{}", terminal.backend())
+}
+
+#[test]
+fn test_model_palette_60x20() {
+    let view = palette_view(60, 20);
+    assert!(view.contains("Select model"), "{view}");
+    assert!(view.contains("RECENT"), "{view}");
+    assert!(
+        view.contains("[high]"),
+        "the session effort is shown: {view}"
+    );
+    insta::assert_snapshot!("model_palette_60x20", view);
+}
+
+#[test]
+fn test_model_palette_120x34() {
+    let view = palette_view(120, 34);
+    for needle in [
+        "Select model",
+        "RECENT",
+        "ANTHROPIC",
+        "signed in",
+        "OPENROUTER",
+        "enter to sign in",
+        "$3/$15",
+        "effort",
+    ] {
+        assert!(view.contains(needle), "missing {needle}: {view}");
+    }
+    insta::assert_snapshot!("model_palette_120x34", view);
+}

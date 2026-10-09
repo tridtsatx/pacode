@@ -49,6 +49,7 @@ impl AppState {
         stage: pacode_types::LoginStage,
         now: Instant,
     ) {
+        self.palette_login_line(&provider, &stage);
         match stage {
             pacode_types::LoginStage::OpenUrl { url, opened } => {
                 let detail = if opened {
@@ -76,9 +77,6 @@ impl AppState {
             }
             pacode_types::LoginStage::Done { label } => {
                 self.push_toast(ToastLevel::Success, "Signed in".into(), Some(label), now);
-                if matches!(self.focus, Focus::Overlay(Overlay::LoginPicker { .. })) {
-                    self.focus = Focus::Normal;
-                }
             }
             pacode_types::LoginStage::Failed { message } => {
                 self.push_toast(
@@ -87,12 +85,38 @@ impl AppState {
                     Some(message),
                     now,
                 );
-                if matches!(self.focus, Focus::Overlay(Overlay::LoginPicker { .. })) {
-                    self.focus = Focus::Normal;
-                }
             }
         }
         self.dirty = true;
+    }
+
+    /// The model palette shows a sign-in inline, on the provider's header;
+    /// the toasts above stay for when it is closed. `Done` clears the line —
+    /// the group unlocks once `AuthUpdated` and `ModelsUpdated` land.
+    fn palette_login_line(&mut self, provider: &str, stage: &pacode_types::LoginStage) {
+        let Focus::Overlay(Overlay::ModelPalette { palette }) = &mut self.session.focus else {
+            return;
+        };
+        let (text, failed) = match stage {
+            pacode_types::LoginStage::OpenUrl { opened: true, .. } => {
+                ("finish in the browser".to_string(), false)
+            }
+            pacode_types::LoginStage::OpenUrl { opened: false, .. } => {
+                ("open the URL from the notice".to_string(), false)
+            }
+            pacode_types::LoginStage::Waiting => ("waiting for authorization".to_string(), false),
+            pacode_types::LoginStage::Exchanging => ("exchanging the code".to_string(), false),
+            pacode_types::LoginStage::Done { .. } => {
+                palette.login = None;
+                return;
+            }
+            pacode_types::LoginStage::Failed { message } => (message.clone(), true),
+        };
+        palette.login = Some(crate::ui::model_palette::LoginLine {
+            provider: provider.to_string(),
+            text,
+            failed,
+        });
     }
 
     pub fn push_toast(
