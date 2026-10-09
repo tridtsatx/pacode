@@ -428,18 +428,7 @@ fn the_logout_question_is_shown_on_the_header() {
         &mut state,
         KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
     );
-    // Mark the layer seen, so the draw shows the palette full size rather
-    // than the first frame of its unfold.
-    state.last_focus_key = crate::ui::focus_key(&state.focus);
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 34)).expect("terminal");
-    terminal
-        .draw(|frame| {
-            let prepared = crate::ui::prepare_frame(frame.area(), &mut state, Instant::now());
-            crate::ui::draw(frame, &state, &prepared);
-        })
-        .expect("draw");
-    let view = format!("{}", terminal.backend());
+    let view = draw(&mut state, 120, 34);
     assert!(view.contains("alt+x again to sign out P"), "{view}");
 }
 
@@ -582,7 +571,14 @@ fn model_with_argument_sends_route_then_downgrade_in_order() {
     assert_eq!(pacode_config::load_prefs(&state.paths).model, None);
     // The downgrade notice is phrased as a request: a refused switch must not
     // leave it claiming the effort changed.
-    let notices: Vec<String> = state
+    assert_eq!(
+        notices(&state),
+        vec!["p/b does not accept effort high; asking for medium with the switch"]
+    );
+}
+
+fn notices(state: &AppState) -> Vec<String> {
+    state
         .transcript
         .cells
         .iter()
@@ -596,9 +592,127 @@ fn model_with_argument_sends_route_then_downgrade_in_order() {
                 None
             }
         })
-        .collect();
+        .collect()
+}
+
+/// `/model <the current route>` switches nothing; when the session's effort
+/// is outside the route's ladder only the effort is asked for, and the notice
+/// does not talk about a switch.
+#[test]
+fn model_on_the_current_route_asks_for_the_effort_alone() {
+    let (mut state, _dir) = state();
+    state.meta = Some(meta("p/b", Effort::High, false));
+    let actions = crate::commands::execute(&mut state, "/model p/b");
+    assert_eq!(sequence(&actions), vec![Request::SetEffort(Effort::Medium)]);
     assert_eq!(
-        notices,
-        vec!["p/b does not accept effort high; asking for medium with the switch"]
+        notices(&state),
+        vec!["p/b does not accept effort high; asking for medium"]
     );
+}
+
+/// `ctrl+y` is the ZDR mark's second default chord, for terminals that eat
+/// alt+z.
+#[test]
+fn ctrl_y_marks_the_row_zdr_capable() {
+    let (mut state, _dir) = state();
+    open(&mut state);
+    let actions = press(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+    );
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Send(Request::SetModelFlag { model, flags })]
+            if model == "p/a" && flags.zdr_capable
+    ));
+    assert!(palette(&state).query.is_empty(), "the chord never types");
+}
+
+/// Plain `s` and `z` (the old picker's mark keys) are search text.
+#[test]
+fn plain_s_and_z_type_into_the_search() {
+    let (mut state, _dir) = state();
+    open(&mut state);
+    for c in ['s', 'z'] {
+        assert!(press(&mut state, key(KeyCode::Char(c))).is_empty());
+    }
+    assert_eq!(palette(&state).query, "sz");
+    assert!(state.model_flags.is_empty(), "no mark was toggled");
+}
+
+/// A mark chord after a query marks the highlighted match and keeps the
+/// query as typed.
+#[test]
+fn a_mark_after_a_query_marks_the_match() {
+    let (mut state, _dir) = state();
+    open(&mut state);
+    for c in "haiku".chars() {
+        press(&mut state, key(KeyCode::Char(c)));
+    }
+    press(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+    );
+    let actions = press(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+    );
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Send(Request::SetModelFlag { model, flags })]
+            if model == "p/haiku" && flags.zdr_capable && flags.favorite
+    ));
+    assert!(
+        state
+            .model_flags
+            .get("p/haiku")
+            .is_some_and(|f| f.favorite && f.zdr_capable)
+    );
+    assert!(!state.model_flags.contains_key("p/a"));
+    assert_eq!(palette(&state).query, "haiku");
+}
+
+/// A full frame at `cols`x`rows`, as the app draws it.
+fn draw(state: &mut AppState, cols: u16, rows: u16) -> String {
+    // Mark the layer seen, so the palette is drawn full size rather than the
+    // first frame of its unfold.
+    state.last_focus_key = crate::ui::focus_key(&state.focus);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(cols, rows)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let prepared = crate::ui::prepare_frame(frame.area(), state, Instant::now());
+            crate::ui::draw(frame, state, &prepared);
+        })
+        .expect("draw");
+    format!("{}", terminal.backend())
+}
+
+/// Moving inside the visible rows leaves the list where it is; the frame
+/// keeps the window between key presses.
+#[test]
+fn the_list_holds_still_while_the_selection_moves_inside_it() {
+    let (mut state, _dir) = state();
+    state.models = (0..30)
+        .map(|n| model("p", &format!("m{n:02}"), None))
+        .collect();
+    open(&mut state);
+    draw(&mut state, 60, 20);
+    let mut last = 0;
+    for _ in 0..25 {
+        press(&mut state, key(KeyCode::Down));
+        draw(&mut state, 60, 20);
+        last = palette(&state).scroll;
+    }
+    assert!(last > 0, "the list scrolled");
+    let before = draw(&mut state, 60, 20);
+    press(&mut state, key(KeyCode::Up));
+    let after = draw(&mut state, 60, 20);
+    assert_eq!(palette(&state).scroll, last, "no shift on a move inside");
+    let names = |view: &str| -> Vec<String> {
+        view.lines()
+            .filter_map(|line| line.find(" m").map(|at| line[at + 1..at + 4].to_string()))
+            .collect()
+    };
+    assert_eq!(names(&before), names(&after));
 }

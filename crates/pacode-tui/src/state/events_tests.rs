@@ -1726,3 +1726,32 @@ fn a_session_switch_keeps_the_composer_and_stashes_the_queue() {
         vec!["queued"]
     );
 }
+
+/// The panel moved off a subagent (to a task) while its buffer still holds
+/// the subagent's items: a cleared context drops that buffer too, owner
+/// included, so nothing from before the clear can be painted again.
+#[test]
+fn context_cleared_drops_the_agent_transcript_whatever_the_panel_shows() {
+    let mut state = attached_state();
+    let sub = AgentId::new("agt_sub1");
+    state.panel.agent_transcript_for(&sub).reset(
+        vec![TranscriptItem {
+            seq: 1,
+            agent: sub.clone(),
+            ts_ms: 1,
+            kind: TranscriptKind::User {
+                text: "subagent work".into(),
+            },
+        }],
+        false,
+    );
+    let task = PanelTarget::Task(pacode_types::ids::TaskId::new("task"));
+    state.panel.target = Some(task.clone());
+    assert!(state.panel.owned_agent_transcript(&sub).is_some());
+
+    state.apply_event(2, Event::ContextCleared, Instant::now());
+
+    assert!(state.panel.agent_transcript.cells.is_empty());
+    assert!(state.panel.owned_agent_transcript(&sub).is_none());
+    assert_eq!(state.panel.target, Some(task), "a task panel stays open");
+}

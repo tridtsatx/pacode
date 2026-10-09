@@ -429,10 +429,12 @@ fn apply_context_cleared(state: &mut AppState) {
     state.rail.replace_agents(main);
     state.rail.usage.context_tokens = 0;
     // A panel target `Agent` is always a subagent, and every subagent is gone.
+    // The agent transcript goes whatever the panel shows: it may still hold a
+    // subagent's stream from before the panel moved to a task or a diff.
     if matches!(state.panel.target, Some(PanelTarget::Agent(_))) {
         state.panel.target = None;
-        state.panel.agent_transcript.reset(Vec::new(), false);
     }
+    state.panel.drop_agent_transcript();
     if matches!(
         state.focus,
         Focus::SelectAgent { .. }

@@ -229,10 +229,13 @@ impl AppState {
         }
         let next = nearest_supported_effort(cur, supported)?;
         // Said as a request, not a fact: the daemon may still refuse the
-        // switch, and then neither level changes.
+        // switch, and then neither level changes. `/model <current route>`
+        // switches nothing, so only the effort is asked for.
+        let switching = self.meta.as_ref().is_none_or(|meta| meta.model != *route);
+        let with = if switching { " with the switch" } else { "" };
         self.push_notice_with_level(
             ToastLevel::Warn,
-            format!("{route} does not accept effort {cur}; asking for {next} with the switch"),
+            format!("{route} does not accept effort {cur}; asking for {next}{with}"),
         );
         Some(next)
     }

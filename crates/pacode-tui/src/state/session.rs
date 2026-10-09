@@ -1012,6 +1012,13 @@ impl PanelState {
         &mut self.agent_transcript
     }
 
+    /// Forget the agent transcript and whose it was: the agents it came from
+    /// are gone (a cleared context), whatever the panel shows now.
+    pub fn drop_agent_transcript(&mut self) {
+        self.agent_transcript.reset(Vec::new(), false);
+        self.agent_owner = None;
+    }
+
     /// The agent transcript, but only while it belongs to `agent`.
     pub fn owned_agent_transcript(&self, agent: &AgentId) -> Option<&Transcript> {
         (self.agent_owner.as_ref() == Some(agent)).then_some(&self.agent_transcript)
