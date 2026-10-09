@@ -437,9 +437,44 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
         } => {
             state.notice_lock.apply(session, locked, held, dropped);
         }
+        Event::ContextCleared => apply_context_cleared(state),
     }
     let turn_active = state.turn_active;
     state.rail.update_idle(turn_active, now);
+}
+
+/// The daemon reset the conversation (`/clear`, from this client or another):
+/// drop everything drawn from it. Cron jobs, monitors and tasks are not
+/// conversation and stay; so do the session's spend totals.
+fn apply_context_cleared(state: &mut AppState) {
+    state.transcript.reset(Vec::new(), false);
+    state.selection.clear();
+    state.rail.plan = pacode_types::Plan::default();
+    let main = state
+        .rail
+        .agents
+        .iter()
+        .filter(|agent| agent.id.is_main())
+        .cloned()
+        .collect();
+    state.rail.replace_agents(main);
+    state.rail.usage.context_tokens = 0;
+    // A panel target `Agent` is always a subagent, and every subagent is gone.
+    if matches!(state.panel.target, Some(PanelTarget::Agent(_))) {
+        state.panel.target = None;
+        state.panel.agent_transcript.reset(Vec::new(), false);
+    }
+    if matches!(
+        state.focus,
+        Focus::SelectAgent { .. }
+            | Focus::Panel {
+                target: PanelTarget::Agent(_),
+                ..
+            }
+    ) {
+        state.focus = Focus::Normal;
+    }
+    state.dirty = true;
 }
 
 fn compute_turn_stats(duration_ms: u64, usage: &pacode_types::stream::Usage) -> Option<String> {

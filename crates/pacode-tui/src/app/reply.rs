@@ -187,6 +187,7 @@ fn request_needs_session(req: &Request) -> bool {
         | Request::GetHistory { .. }
         | Request::GetTaskOutput { .. }
         | Request::Compact
+        | Request::ClearContext
         | Request::DetachTurn
         | Request::AnswerQuestion { .. }
         | Request::ListCronJobs

@@ -12,6 +12,7 @@
 //!   the two drain sites
 //! - `permissions`: the mode × kind × risk matrix and the AllowSession cache
 //! - `prompt`: system prompt (static + dynamic), AGENTS.md/CLAUDE.md discovery
+//! - `clear`: `/clear` — the conversation reset in place
 //! - `compaction`: threshold check and summary turn
 //! - `transcript`: history → `TranscriptItem`, event sink with seq, delta coalescing
 //! - `host`: `ToolHost` implementation handed to tools
@@ -25,6 +26,7 @@
 pub mod agent;
 pub mod analyze;
 pub mod auth;
+pub mod clear;
 pub mod compaction;
 pub mod core;
 pub mod expand;

@@ -2,7 +2,8 @@
 //!
 //! `/model [name]` (picker without argument), `/effort <low|medium|high|xhigh|max>` (picker
 //! without argument), `/mode <build|auto|plan|bypass>`, `/sessions` (picker),
-//! `/mcp`, `/plugins`, `/compact`, `/clear` (transcript view only),
+//! `/mcp`, `/plugins`, `/compact`, `/clear` (reset the conversation in place),
+//! `/new` (start a fresh session with the current settings),
 //! `/export [path]` (write the visible transcript as markdown to `path` or `~/pacode-<session>.md`),
 //! `/help`, `/quit`.
 
@@ -162,7 +163,13 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: Cow::Borrowed("clear"),
         usage: Cow::Borrowed("/clear"),
-        help: Cow::Borrowed("clear the transcript view"),
+        help: Cow::Borrowed("forget the conversation, keep the session"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
+        name: Cow::Borrowed("new"),
+        usage: Cow::Borrowed("/new"),
+        help: Cow::Borrowed("start a fresh session; this one stays in /sessions"),
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
@@ -496,12 +503,10 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![]
         }
         "compact" => vec![Action::Send(Request::Compact)],
-        "clear" => {
-            state.transcript.cells.clear();
-            state.transcript.cache.clear();
-            state.dirty = true;
-            vec![]
-        }
+        // The view resets on `Event::ContextCleared`, not here: a refused
+        // clear must leave the transcript as it was, next to the error.
+        "clear" => vec![Action::Send(Request::ClearContext)],
+        "new" => new_session(state),
         "export" => {
             let path = if arg.is_empty() {
                 let ses_id = state
@@ -598,6 +603,22 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             vec![]
         }
     }
+}
+
+/// `/new` — a fresh session on the current route, effort and mode, attached
+/// in place of this one. The old session is detached, not closed: a turn
+/// running there keeps running, and `/sessions` resumes it.
+fn new_session(state: &mut AppState) -> Vec<Action> {
+    let attach = pacode_types::Attach::New {
+        cwd: state.cwd(),
+        model: state.meta.as_ref().map(|meta| meta.model.clone()),
+        effort: state.meta.as_ref().map(|meta| meta.effort),
+        mode: state.meta.as_ref().map(|meta| meta.mode),
+    };
+    log::debug!("new session from /new");
+    state.leave_active_slot();
+    state.begin_attach(attach.clone());
+    vec![Action::SwitchSession { attach }]
 }
 
 /// `/model` with no argument — the bottom picker. Also the hub's `Model` row

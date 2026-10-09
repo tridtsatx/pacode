@@ -1058,6 +1058,12 @@ impl Core {
                     }
                 }
             }
+            Request::ClearContext => match crate::clear::clear_context(&session).await {
+                Ok(()) => Reply::Ok,
+                Err(e) => Reply::Error {
+                    message: e.to_string(),
+                },
+            },
             Request::DetachTurn => match session.detach_main_turn().await {
                 Ok(agent) => Reply::TurnDetached { agent },
                 Err(e) => Reply::Error {

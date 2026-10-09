@@ -1003,6 +1003,7 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::ListModels
         | Request::RefreshModels
         | Request::Compact
+        | Request::ClearContext
         | Request::Shutdown { .. }
         | Request::Ping
         | Request::ListMcpServers
@@ -1030,4 +1031,14 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::GitShow { .. }
         | Request::GitDiff { .. } => panic!("expected Request::Interrupt"),
     }
+}
+
+#[test]
+fn a_cleared_context_empties_the_client_plan() {
+    let mut state = MappingState::new();
+    let updates = event_to_session_updates(&Event::ContextCleared, &mut state);
+    assert_eq!(
+        updates,
+        vec![SessionUpdate::Plan(plan_to_acp(&Plan::default()))]
+    );
 }

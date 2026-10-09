@@ -1546,7 +1546,7 @@ impl Session {
     /// Drop everything the main agent was still holding for a user message:
     /// the admission it is answering, messages persisted but not yet folded in,
     /// queued injections and the recovery backlog.
-    async fn sweep_main_admissions(&self, main: &Arc<Agent>) {
+    pub(crate) async fn sweep_main_admissions(&self, main: &Arc<Agent>) {
         let _ = main.cancel_admission_turn();
         let pending = main.discard_pending_user_messages();
         for admission in &pending {

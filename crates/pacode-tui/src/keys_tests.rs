@@ -1803,8 +1803,8 @@ fn test_slash_command_enter_completion_and_execution() {
     );
     assert_eq!(state.input.cursor, "/clear ".chars().count());
 
-    // 2. A second Enter runs it
-    // Insert a dummy cell to verify /clear clears the transcript
+    // 2. A second Enter runs it: `/clear` asks the daemon, and the view
+    // waits for `ContextCleared` (a refused clear must leave it intact)
     state.transcript.cells.push_back(crate::state::Cell {
         id: 1,
         kind: crate::state::CellKind::Item(pacode_types::TranscriptKind::User {
@@ -1817,14 +1817,15 @@ fn test_slash_command_enter_completion_and_execution() {
     });
     assert!(!state.transcript.cells.is_empty());
     let actions2 = handle_key(&mut state, enter, now);
-    assert!(actions2.is_empty());
+    assert_eq!(actions2, vec![Action::Send(Request::ClearContext)]);
     assert!(
         state.input.is_empty(),
         "Second enter must submit and clear the prompt"
     );
-    assert!(
-        state.transcript.cells.is_empty(),
-        "/clear must have executed and cleared cells"
+    assert_eq!(
+        state.transcript.cells.len(),
+        1,
+        "/clear leaves the view until the daemon answers"
     );
 
     // 3. `/clear` + Enter (already complete, one exact match) runs it immediately rather than requiring two presses
@@ -1840,14 +1841,14 @@ fn test_slash_command_enter_completion_and_execution() {
     });
     state.input.insert_str("/clear");
     let actions_exact = handle_key(&mut state, enter, now);
-    assert!(actions_exact.is_empty());
+    assert_eq!(
+        actions_exact,
+        vec![Action::Send(Request::ClearContext)],
+        "/clear must have executed immediately"
+    );
     assert!(
         state.input.is_empty(),
         "Exact match must run immediately on single Enter"
-    );
-    assert!(
-        state.transcript.cells.is_empty(),
-        "/clear must have executed immediately"
     );
 
     // 4. `/x` matching nothing + Enter behaves as today (attempts execution, produces notice)

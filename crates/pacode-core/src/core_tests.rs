@@ -656,3 +656,7 @@ async fn shutdown_stops_eviction() {
     assert!(h.core.session(&session_id).is_some());
     let _: SessionLease = h.attach(&session_id).await;
 }
+
+// `/clear` drives the same core through the same harness.
+#[path = "clear_tests.rs"]
+mod clear_tests;

@@ -1393,3 +1393,66 @@ fn login_progress_is_global_and_does_not_write_transcript() {
     assert!(state.transcript.cells.is_empty());
     assert!(!state.toasts.is_empty());
 }
+
+#[test]
+fn context_cleared_drops_everything_drawn_from_the_conversation() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    let mut snap = snapshot(1, PathBuf::from("/tmp"));
+    snap.transcript = vec![TranscriptItem {
+        seq: 1,
+        agent: AgentId::main(),
+        ts_ms: 1,
+        kind: TranscriptKind::User {
+            text: "before the clear".into(),
+        },
+    }];
+    let mut main = sub_agent("agt_main", AgentStatus::Idle);
+    main.id = AgentId::main();
+    main.kind = AgentKind::Main;
+    main.parent = None;
+    snap.agents = vec![main, sub_agent("agt_sub1", AgentStatus::Thinking)];
+    snap.plan = Plan {
+        version: 1,
+        items: vec![pacode_types::PlanItem {
+            id: "p1".into(),
+            content: "port the parser".into(),
+            status: pacode_types::PlanStatus::Active,
+            progress: None,
+        }],
+    };
+    snap.usage.context_tokens = 5_000;
+    snap.usage.turns = 4;
+    assert!(state.apply_snapshot(snap, now));
+    let sub = AgentId::new("agt_sub1");
+    state.focus = Focus::Panel {
+        target: PanelTarget::Agent(sub.clone()),
+        follow: true,
+        follow_paused: false,
+    };
+    state.panel.target = Some(PanelTarget::Agent(sub));
+    state.selection.active = true;
+    assert!(!state.transcript.cells.is_empty());
+
+    state.apply_event(2, Event::ContextCleared, now);
+
+    assert!(state.transcript.cells.is_empty());
+    assert!(!state.transcript.has_more_history);
+    assert_eq!(state.transcript.scroll_from_bottom, 0);
+    assert!(!state.selection.is_active());
+    assert!(state.rail.plan.items.is_empty());
+    assert_eq!(
+        state
+            .rail
+            .agents
+            .iter()
+            .map(|agent| agent.id.clone())
+            .collect::<Vec<_>>(),
+        vec![AgentId::main()]
+    );
+    assert_eq!(state.rail.usage.context_tokens, 0);
+    assert_eq!(state.rail.usage.turns, 4, "spend totals are not context");
+    assert_eq!(state.panel.target, None);
+    assert!(matches!(state.focus, Focus::Normal));
+    assert_eq!(state.meta.as_ref().map(|m| m.id.as_str()), Some("ses_test"));
+}

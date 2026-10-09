@@ -2318,3 +2318,59 @@ fn an_inline_thumbnail_over_the_cap_falls_back_to_the_placeholder() {
     assert!(render_thumbnail(&missing, 20, 6).is_none());
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_refused_clear_keeps_the_transcript_and_says_why() {
+    let mut state = AppState::new(Config::default(), "test".into(), 100, 30);
+    state.meta = Some(meta("ses_test"));
+    state.event_connection_epoch = 1;
+    state.event_session_epoch = 1;
+    state.awaiting_snapshot = false;
+    let client_context = ClientEventContext {
+        connection_epoch: 1,
+        session_epoch: 1,
+        session: Some(SessionId::new("ses_test")),
+    };
+    state.transcript.reset(
+        vec![TranscriptItem {
+            seq: 1,
+            agent: AgentId::main(),
+            ts_ms: 1,
+            kind: TranscriptKind::User {
+                text: "before the clear".into(),
+            },
+        }],
+        false,
+    );
+    assert_eq!(
+        crate::commands::execute(&mut state, "/clear"),
+        vec![Action::Send(Request::ClearContext)]
+    );
+
+    let actions = handle_bg_response(
+        BgResponse::Reply {
+            scope: ReplyScope::Session {
+                context: state.session_context(),
+                client_context,
+            },
+            kind: None,
+            global_refresh: false,
+            res: Ok(Reply::Error {
+                message: "store: injected store failure".into(),
+            }),
+        },
+        &mut state,
+    );
+
+    assert!(actions.is_empty());
+    let kinds: Vec<_> = state.transcript.cells.iter().map(|c| &c.kind).collect();
+    assert!(matches!(
+        kinds.first(),
+        Some(CellKind::Item(TranscriptKind::User { text })) if text == "before the clear"
+    ));
+    assert!(matches!(
+        kinds.last(),
+        Some(CellKind::Item(TranscriptKind::Notice { level: ToastLevel::Error, text }))
+            if text.contains("injected store failure")
+    ));
+}

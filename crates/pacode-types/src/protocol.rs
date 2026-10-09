@@ -70,8 +70,9 @@ pub const SNAPSHOT_MAX_PENDING_PERMISSIONS: usize = 64;
 /// `Attach::New` idempotent for one client/envelope id and orders attach
 /// replies before session events; v8 adds the session `Resync` control marker
 /// and separates attach request ids from stable idempotency keys; v9 adds
-/// `SetNoticeLock` and the `NoticeLockChanged` broadcast.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// `SetNoticeLock` and the `NoticeLockChanged` broadcast; v12 adds
+/// `ClearContext` and the `ContextCleared` broadcast.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -208,6 +209,10 @@ pub enum Request {
     /// TTL (`Reply::Models`; an `Event::ModelsUpdated` broadcast follows).
     RefreshModels,
     Compact,
+    /// Reset the conversation in place: same session id, model context wiped.
+    /// Running agents are interrupted first; subagents are dropped. Every
+    /// attached client resets on the `Event::ContextCleared` that follows.
+    ClearContext,
     /// Detach a running turn on the main agent into a background subagent.
     DetachTurn,
     /// Ask the daemon to exit. Without `force` it exits only when idle.
@@ -347,6 +352,7 @@ impl Request {
             Request::ListModels => "list_models",
             Request::RefreshModels => "refresh_models",
             Request::Compact => "compact",
+            Request::ClearContext => "clear_context",
             Request::DetachTurn => "detach_turn",
             Request::Shutdown { .. } => "shutdown",
             Request::Ping => "ping",
@@ -395,6 +401,7 @@ impl Request {
             | Self::ListModels
             | Self::RefreshModels
             | Self::Compact
+            | Self::ClearContext
             | Self::DetachTurn
             | Self::Ping
             | Self::ListMcpServers
@@ -1103,6 +1110,10 @@ pub enum Event {
         /// Injections a cap refused since the daemon started.
         dropped: u64,
     },
+    /// The conversation was reset in place (`Request::ClearContext`): the
+    /// transcript, plan and subagents are gone and the context meter is back
+    /// at zero. Clients drop everything they drew from them.
+    ContextCleared,
 }
 
 impl Event {
@@ -1224,6 +1235,28 @@ mod tests {
         assert!(line.contains("\"agent\":\"agt_test123\""));
         let back_reply: ServerMessage = serde_json::from_str(&line).unwrap();
         assert_eq!(back_reply, reply_msg);
+    }
+
+    #[test]
+    fn clear_context_protocol_round_trip() {
+        let env = Envelope {
+            id: 5,
+            req: Request::ClearContext,
+        };
+        assert_eq!(env.req.name(), "clear_context");
+        assert!(env.req.validate().is_ok());
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"clear_context\""));
+        assert_eq!(serde_json::from_str::<Envelope>(&json).unwrap(), env);
+
+        let event = ServerMessage::Event {
+            seq: 3,
+            event: Event::ContextCleared,
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(line.contains("\"type\":\"context_cleared\""));
+        assert_eq!(serde_json::from_str::<ServerMessage>(&line).unwrap(), event);
+        assert!(!Event::ContextCleared.is_global());
     }
 
     #[test]

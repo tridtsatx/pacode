@@ -188,6 +188,16 @@ impl TranscriptState {
         self.next_item_seq = self.next_item_seq.max(HISTORY_ITEM_BASE);
     }
 
+    /// Forget every item (`/clear`) but keep the counter: a late update for an
+    /// item from before the clear then finds no row and is not new, so it
+    /// cannot bring that item back.
+    pub fn clear(&mut self) {
+        *self = Self {
+            next_item_seq: self.next_item_seq,
+            ..Self::new(self.tail_cap)
+        };
+    }
+
     pub fn next_seq(&mut self) -> u64 {
         let seq = self.next_item_seq;
         self.next_item_seq = self.next_item_seq.saturating_add(1);

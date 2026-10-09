@@ -679,6 +679,11 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         Event::PlanUpdated(plan) => {
             vec![SessionUpdate::Plan(plan_to_acp(plan))]
         }
+        // ACP has no way to retract transcript it already streamed; the plan
+        // is the one piece of state a client keeps from us that a clear empties.
+        Event::ContextCleared => {
+            vec![SessionUpdate::Plan(plan_to_acp(&Plan::default()))]
+        }
         Event::SessionUpdated(meta) => {
             vec![SessionUpdate::CurrentModeUpdate(
                 agent_client_protocol::schema::v1::CurrentModeUpdate::new(SessionModeId::new(

@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use pacode_types::{Config, McpServerInfo, PluginInfo, Request};
 
 use crate::commands;
+use crate::keys::Action;
 use crate::state::AppState;
 use crate::ui::input::command_inline_hint;
 
@@ -156,4 +157,65 @@ fn test_mcp_invalid_format_pushes_notice() {
     let actions = commands::execute(&mut state, "/mcp:malformed");
     assert!(actions.is_empty());
     assert!(state.transcript.cells.len() > initial_cell_count);
+}
+
+fn attached_meta() -> pacode_types::SessionMeta {
+    pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_old"),
+        name: Some("old".into()),
+        cwd: std::path::PathBuf::from("/work/project"),
+        git_branch: None,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        model: pacode_types::ModelRoute::new("prov", "model-x"),
+        effort: pacode_types::Effort::Max,
+        mode: pacode_types::Mode::Plan,
+        first_prompt: None,
+        zdr: false,
+    }
+}
+
+#[test]
+fn clear_asks_the_daemon_and_leaves_the_view_until_it_answers() {
+    let mut state = make_test_state();
+    state.meta = Some(attached_meta());
+    commands::execute(&mut state, "/mcp:malformed");
+    let cells = state.transcript.cells.len();
+    assert!(cells > 0);
+
+    let actions = commands::execute(&mut state, "/clear");
+
+    assert_eq!(actions, vec![Action::Send(Request::ClearContext)]);
+    assert_eq!(
+        state.transcript.cells.len(),
+        cells,
+        "a refused clear must find the transcript where it was"
+    );
+}
+
+#[test]
+fn new_attaches_a_fresh_session_with_the_current_settings() {
+    let mut state = make_test_state();
+    state.meta = Some(attached_meta());
+
+    let actions = commands::execute(&mut state, "/new");
+
+    let expected = pacode_types::Attach::New {
+        cwd: std::path::PathBuf::from("/work/project"),
+        model: Some(pacode_types::ModelRoute::new("prov", "model-x")),
+        effort: Some(pacode_types::Effort::Max),
+        mode: Some(pacode_types::Mode::Plan),
+    };
+    assert_eq!(
+        actions,
+        vec![Action::SwitchSession {
+            attach: expected.clone()
+        }]
+    );
+    assert_eq!(
+        state.pending_attach.as_ref().map(|p| p.attach.clone()),
+        Some(expected)
+    );
+    assert!(state.meta.is_none(), "the old session is left, not closed");
+    assert!(commands::find_command("new").is_some());
 }
