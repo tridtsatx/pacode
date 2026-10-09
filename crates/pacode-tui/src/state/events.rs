@@ -16,7 +16,18 @@ mod events_tests;
 pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
     match event {
         Event::SessionUpdated(meta) => {
+            // The daemon accepted a route switch: both ends are recent. Recorded
+            // here, not on the request, so a refused switch never lands in prefs.
+            if let Some(old) = state.meta.as_ref()
+                && old.id == meta.id
+                && old.model != meta.model
+            {
+                let old = old.model.to_string();
+                state.push_recent_model(&old);
+                state.push_recent_model(&meta.model.to_string());
+            }
             let mut prefs = pacode_config::load_prefs(&state.paths);
+            prefs.recent_models = state.recent_models.clone();
             prefs.model = Some(meta.model.to_string());
             prefs.effort = Some(meta.effort);
             prefs.mode = Some(meta.mode);

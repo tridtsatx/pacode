@@ -8,12 +8,11 @@ pub mod footer;
 pub mod header;
 pub mod images;
 pub mod input;
-pub mod login_picker;
 pub mod mascot;
 pub mod menu;
-pub mod model_picker;
-pub mod model_picker_page;
-pub mod model_picker_view;
+pub mod model_catalog;
+pub mod model_palette;
+pub mod model_palette_view;
 pub mod notice;
 pub mod overlays;
 pub mod panel;
@@ -52,20 +51,18 @@ pub fn focus_key(focus: &Focus) -> u8 {
         Focus::SelectAgent { .. } => 1,
         Focus::Panel { .. } => 2,
         Focus::Overlay(overlay) => match overlay {
-            Overlay::ModelPicker { .. } => 10,
             Overlay::EffortPicker { .. } => 11,
             Overlay::ModePicker { .. } => 12,
             Overlay::QuestionPicker => 14,
             Overlay::ThemePicker { .. } => 15,
             Overlay::RailOverlay { .. } => 22,
-            Overlay::LoginPicker { .. } => 24,
             // Its own key: the page is a reading, not a menu level, and reusing a
             // menu key would replay the menu's unfold when it opens.
             Overlay::Analyze { .. } => 40,
             // Its own key: the settings page is a full screen, not a menu level,
             // and reusing a menu key would replay the menu's unfold.
             Overlay::Settings { .. } => 41,
-            Overlay::ModelPickerPage { .. } => 42,
+            Overlay::ModelPalette { .. } => 42,
             // Menu levels key off `MenuId` — the table lives in the menu base
             // (§3.1); 25..=36 here are the `focus_key` range it owns.
             Overlay::Menu { stack, .. } => stack
@@ -541,9 +538,8 @@ mod tests {
         assert_eq!(focus_key(&Focus::Normal), 0);
         assert_eq!(focus_key(&Focus::SelectAgent { index: 2 }), 1);
         assert_ne!(
-            focus_key(&Focus::Overlay(Overlay::LoginPicker {
-                query: String::new(),
-                index: 0,
+            focus_key(&Focus::Overlay(Overlay::ModelPalette {
+                palette: Default::default(),
             })),
             focus_key(&Focus::Overlay(Overlay::RailOverlay {
                 selected: pacode_types::AgentId::main(),

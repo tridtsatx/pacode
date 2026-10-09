@@ -118,9 +118,8 @@ pub fn handle_paste_with_runner(
     };
 
     match &mut state.focus {
-        Focus::Overlay(Overlay::ModelPicker { query, index, .. })
-        | Focus::Overlay(Overlay::LoginPicker { query, index }) => {
-            paste_into_filter(query, index, &text);
+        Focus::Overlay(Overlay::ModelPalette { palette }) => {
+            palette.push_str(&flatten_single_line(&text, FILTER_MAX_CHARS));
             state.dirty = true;
             vec![]
         }
@@ -165,15 +164,6 @@ pub fn handle_paste_with_runner(
             vec![]
         }
     }
-}
-
-/// Pastes text into an overlay's single-line filter box.
-fn paste_into_filter(query: &mut String, index: &mut usize, text: &str) {
-    let flattened = flatten_single_line(text, FILTER_MAX_CHARS);
-    let available = FILTER_MAX_CHARS.saturating_sub(query.chars().count());
-    let to_insert: String = flattened.chars().take(available).collect();
-    query.push_str(&to_insert);
-    *index = 0;
 }
 
 fn flatten_single_line(text: &str, cap: usize) -> String {

@@ -1162,6 +1162,7 @@ impl Core {
                         let _ = core
                             .providers()
                             .rebuild_provider_from_store(&provider_clone, &store);
+                        core.announce_catalog(&provider_clone);
 
                         if let Some(info) = crate::auth::get_provider_auth_info(
                             &store,
@@ -1210,6 +1211,7 @@ impl Core {
         let _ = self
             .providers()
             .rebuild_provider_from_store(&provider, &store);
+        self.announce_catalog(&provider);
 
         if let Some(info) =
             crate::auth::get_provider_auth_info(&store, &self.config().providers, &provider)
@@ -1235,6 +1237,7 @@ impl Core {
         let _ = self
             .providers()
             .rebuild_provider_from_store(&provider, &store);
+        self.announce_catalog(&provider);
 
         if let Some(info) =
             crate::auth::get_provider_auth_info(&store, &self.config().providers, &provider)
@@ -1244,6 +1247,31 @@ impl Core {
 
         let providers = crate::auth::build_auth_status(&store, &self.config().providers);
         Reply::AuthStatus { providers }
+    }
+
+    /// A login, logout or account switch rebuilt a provider, so the catalog
+    /// changed: push it to every attached client, or an open model palette
+    /// keeps showing the provider as it was until someone asks again. The
+    /// rebuild swaps the credential, not the cached catalog, so that
+    /// provider's catalog is fetched again first — a new account can see
+    /// other models than the old one.
+    pub(crate) fn announce_catalog(&self, provider: &str) {
+        let core = self.self_weak.get().cloned().unwrap_or_default();
+        let provider = provider.to_string();
+        tokio::spawn(async move {
+            let Some(core) = core.upgrade() else {
+                return;
+            };
+            let providers = core.providers();
+            if let Some(handle) = providers.get(&provider) {
+                providers
+                    .catalog_cache()
+                    .force_refresh(&provider, &handle)
+                    .await;
+            }
+            let models = core.providers().list_all_models().await;
+            core.broadcast_event(Event::ModelsUpdated { models });
+        });
     }
 
     /// Emit a daemon-wide event. Unlike [`Self::broadcast_event`] this reaches every

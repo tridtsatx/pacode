@@ -48,7 +48,7 @@ pub use notices::{
     BACKGROUND_NOTICE_MIN_MS, TOAST_EXIT_MS, TOAST_MAX, TOAST_TTL_SECS, Toast,
     background_worth_reporting,
 };
-pub use pickers::{nearest_supported_effort, picker_models, zdr_active};
+pub use pickers::{nearest_supported_effort, zdr_active};
 pub use questions::{PendingQuestions, QuestionFocus};
 pub use rail::RailState;
 pub use render::RenderContext;
@@ -138,7 +138,11 @@ pub struct AppState {
     /// written through `save_pref_model_flags` and pushed to the daemon via
     /// `Request::SetModelFlag`.
     pub model_flags: HashMap<String, ModelFlags>,
-    /// Providers with auth status for the login picker (filled by `ListAuth` or `AuthUpdated`).
+    /// Recently used routes, most recent first (`prefs.toml`
+    /// `recent_models`); the model palette's `RECENT` group.
+    pub recent_models: Vec<String>,
+    /// Providers with auth status for the model palette (filled by `ListAuth`
+    /// or `AuthUpdated`).
     pub auth_providers: Vec<pacode_types::ProviderAuthInfo>,
     pub sessions: Vec<SessionMeta>,
     pub plugins: Vec<PluginInfo>,
@@ -220,7 +224,9 @@ impl AppState {
             thinking: config.ui.thinking,
             expand_hint: render::expand_hint_for(&keymap),
         };
-        let model_flags = pacode_config::load_prefs(&paths).model_flags;
+        let prefs = pacode_config::load_prefs(&paths);
+        let model_flags = prefs.model_flags;
+        let recent_models = pickers::capped_recents(prefs.recent_models);
         Self {
             config,
             theme,
@@ -243,6 +249,7 @@ impl AppState {
             toasts: VecDeque::new(),
             models: Vec::new(),
             model_flags,
+            recent_models,
             auth_providers: Vec::new(),
             sessions: Vec::new(),
             plugins: Vec::new(),

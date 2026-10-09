@@ -11,7 +11,7 @@ use pacode_types::{Reply, Request};
 use tokio::sync::mpsc;
 
 use super::bg_response::BgResponse;
-use super::reply::{handle_reply, session_reply_is_current};
+use super::reply::{ReplyScope, handle_reply, session_reply_is_current};
 use crate::keys::Action;
 use crate::state::{AppState, PromptBatch, UserMessageInFlight};
 
@@ -108,6 +108,50 @@ pub(super) fn queue_sequence(state: &mut AppState, requests: Vec<Request>, text:
     );
 }
 
+/// Session requests that depend on each other — a route switch, then the
+/// effort or ZDR it enables. One task sends them in order and stops at the
+/// first refusal, whose error lands like any reply's. Without a session the
+/// run waits whole in the sequence queue, so it keeps its order.
+fn send_ordered(
+    requests: Vec<Request>,
+    state: &mut AppState,
+    client: &Arc<Client>,
+    bg_tx: &mpsc::UnboundedSender<BgResponse>,
+) {
+    let client_context = client.event_context();
+    if state.meta.is_none() || state.awaiting_snapshot || client_context.session.is_none() {
+        if !state.session.queue_sequence(PromptBatch { requests }) {
+            state.push_notice_with_level(
+                ToastLevel::Warn,
+                "request queue full — not sent".to_string(),
+            );
+        }
+        return;
+    }
+    let requests: Vec<Request> = requests
+        .into_iter()
+        .map(|request| resolve_request(state, request))
+        .collect();
+    let scope = ReplyScope::Session {
+        context: state.session_context(),
+        client_context: client_context.clone(),
+    };
+    let cl = Arc::clone(client);
+    let tx = bg_tx.clone();
+    tokio::spawn(async move {
+        let res = cl
+            .request_sequence(client_context, requests)
+            .await
+            .map(|mut replies| replies.pop().unwrap_or(Reply::Ok));
+        let _ = tx.send(BgResponse::Reply {
+            scope,
+            kind: None,
+            global_refresh: false,
+            res,
+        });
+    });
+}
+
 fn fail_prompt_batch(state: &mut AppState, id: u64) {
     if state.session.finish_user_message(id, true).is_none() {
         return;
@@ -151,7 +195,7 @@ fn spawn_prompt_batch_step(
 }
 
 /// `Action::SendSequence`: a detach-then-send batch, queued while the
-/// prompt gate is closed.
+/// prompt gate is closed — or an ordered run of settings ([`send_ordered`]).
 pub(super) fn send_sequence(
     requests: Vec<Request>,
     state: &mut AppState,
@@ -160,7 +204,7 @@ pub(super) fn send_sequence(
 ) {
     let user_text = match requests.as_slice() {
         [Request::DetachTurn, Request::UserMessage { text, .. }] => text.clone(),
-        _ => return,
+        _ => return send_ordered(requests, state, client, bg_tx),
     };
     if state.meta.is_none()
         || !matches!(state.connection, crate::state::Connection::Connected)

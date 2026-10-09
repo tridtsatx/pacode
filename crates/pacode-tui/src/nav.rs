@@ -88,14 +88,12 @@ pub fn overlay_name(o: &Overlay) -> &'static str {
     match o {
         Overlay::EffortPicker { .. } => "EffortPicker",
         Overlay::ModePicker { .. } => "ModePicker",
-        Overlay::ModelPicker { .. } => "ModelPicker",
-        Overlay::LoginPicker { .. } => "LoginPicker",
         Overlay::RailOverlay { .. } => "RailOverlay",
         Overlay::ThemePicker { .. } => "ThemePicker",
         Overlay::QuestionPicker => "QuestionPicker",
         Overlay::Analyze { .. } => "Analyze",
         Overlay::Settings { .. } => "Settings",
-        Overlay::ModelPickerPage { .. } => "ModelPickerPage",
+        Overlay::ModelPalette { .. } => "ModelPalette",
         // The level on screen names the menu in the log (§3.1).
         Overlay::Menu { stack, .. } => stack.current().map_or("Menu", |l| l.id.title()),
     }
@@ -196,9 +194,7 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
                 *index = (*index + 1) % agents.len();
             }
         }
-        Focus::Overlay(Overlay::ModelPicker { index, .. })
-        | Focus::Overlay(Overlay::LoginPicker { index, .. })
-        | Focus::Overlay(Overlay::EffortPicker { index }) => {
+        Focus::Overlay(Overlay::EffortPicker { index }) => {
             *index += 1;
         }
         // The page scrolls, and its length is only known once its rows are
@@ -222,9 +218,9 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
             // The settings page scrolls with its own keys, and a global
             // navigate must not turn that into "select the first agent".
             | Overlay::Settings { .. }
-            // The picker moves its own cursor, so a global navigate must not
+            // The palette moves its own cursor, so a global navigate must not
             // turn that into "select the first agent".
-            | Overlay::ModelPickerPage { .. }
+            | Overlay::ModelPalette { .. }
             // Unreachable — an open menu intercepts keys before `nav` — but
             // the match stays exhaustive.
             | Overlay::Menu { .. },
@@ -246,11 +242,7 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
                 *index = (*index + agents.len() - 1) % agents.len();
             }
         }
-        Focus::Overlay(Overlay::ModelPicker { index, .. })
-        | Focus::Overlay(Overlay::LoginPicker { index, .. })
-        | Focus::Overlay(Overlay::EffortPicker { index })
-            if *index > 0 =>
-        {
+        Focus::Overlay(Overlay::EffortPicker { index }) if *index > 0 => {
             *index -= 1;
         }
         Focus::Overlay(Overlay::Analyze { .. }) => {
@@ -262,14 +254,12 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
         // The settings page scrolls with its own keys; a global navigate
         // must not turn that into "select the first agent".
         Focus::Overlay(Overlay::Settings { .. }) => {}
-        // And the picker owns its cursor, for the same reason.
-        Focus::Overlay(Overlay::ModelPickerPage { .. }) => {}
+        // And the palette owns its cursor, for the same reason.
+        Focus::Overlay(Overlay::ModelPalette { .. }) => {}
         Focus::Normal
         | Focus::Panel { .. }
         | Focus::Overlay(
-            Overlay::ModelPicker { .. }
-            | Overlay::LoginPicker { .. }
-            | Overlay::EffortPicker { .. }
+            Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
             | Overlay::QuestionPicker
             | Overlay::RailOverlay { .. }
@@ -380,7 +370,10 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             // picker overlay swallows its keys before this dispatch.
             | KeyAction::ModelPickerFavorite
             | KeyAction::ModelPickerZdr
-            | KeyAction::ModelPickerRefresh => {}
+            | KeyAction::ModelPickerRefresh
+            | KeyAction::ModelPickerKind
+            | KeyAction::ModelPickerAccount
+            | KeyAction::ModelPickerLogout => {}
         }
     } else {
         match action {
@@ -440,7 +433,10 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ExpandOutput
             | KeyAction::ModelPickerFavorite
             | KeyAction::ModelPickerZdr
-            | KeyAction::ModelPickerRefresh => {}
+            | KeyAction::ModelPickerRefresh
+            | KeyAction::ModelPickerKind
+            | KeyAction::ModelPickerAccount
+            | KeyAction::ModelPickerLogout => {}
         }
         if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
             && state.transcript.is_at_top()

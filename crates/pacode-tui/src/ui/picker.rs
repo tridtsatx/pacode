@@ -8,7 +8,6 @@ use ratatui::widgets::{Clear, Paragraph};
 use pacode_render::RenderOptions;
 
 use crate::state::{AppState, Focus, Overlay};
-use crate::ui::overlays::selected_row;
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOptions) {
     if area.width == 0 || area.height == 0 {
@@ -23,16 +22,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         }
         Focus::Overlay(Overlay::ModePicker { index }) => {
             draw_mode(frame, area, state, *index, opts);
-        }
-        Focus::Overlay(Overlay::ModelPicker {
-            query,
-            index,
-            for_zdr,
-        }) => {
-            draw_model(frame, area, state, query, *index, *for_zdr, opts);
-        }
-        Focus::Overlay(Overlay::LoginPicker { query, index }) => {
-            crate::ui::login_picker::draw(frame, area, state, query, *index, opts);
         }
         Focus::Overlay(Overlay::QuestionPicker) => {
             if let Some(question) = state.questions.current() {
@@ -272,189 +261,9 @@ fn draw_mode(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_model(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    query: &str,
-    selected: usize,
-    for_zdr: bool,
-    opts: &RenderOptions,
-) {
-    let mut lines = Vec::new();
-
-    // 0: Title — with the §8.2 cache badge when the model list on screen is a
-    // stale disk copy or still loading.
-    let base_title = if for_zdr {
-        "ZDR: pick a capable model"
-    } else {
-        "Switch Model"
-    };
-    let title = crate::ui::overlays::title_with_badge(
-        base_title,
-        state.lists.badge(crate::cache::ListKind::Models),
-    );
-    lines.push(Line::from(Span::styled(
-        title,
-        opts.theme.bold.patch(opts.theme.accent),
-    )));
-
-    // 1: Query input
-    lines.push(Line::from(vec![
-        Span::styled("> ", opts.theme.accent),
-        Span::styled(query.to_string(), opts.theme.fg),
-    ]));
-
-    let query_lower = query.to_lowercase();
-    // ZDR-active sessions restrict the picker to `zdr_capable` routes, same
-    // as an explicit for_zdr open (Alt+Z).
-    let zdr_only = for_zdr || crate::state::zdr_active(&state.config, state.meta.as_ref());
-    let filtered =
-        crate::state::picker_models(&state.models, &state.model_flags, &query_lower, zdr_only);
-
-    let list_height = (area.height as usize).saturating_sub(3).min(8);
-
-    if state.models.is_empty() {
-        lines.push(Line::from(Span::styled("  loading…", opts.theme.faint)));
-    } else if filtered.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no matching models",
-            opts.theme.dim,
-        )));
-        lines.push(Line::from(Span::styled(
-            "  backspace to clear the filter",
-            opts.theme.faint,
-        )));
-    } else {
-        let sel_idx = if filtered.is_empty() {
-            0
-        } else {
-            selected % filtered.len()
-        };
-        let start = if sel_idx >= list_height {
-            sel_idx + 1 - list_height
-        } else {
-            0
-        };
-
-        for (i, m) in filtered.iter().enumerate().skip(start).take(list_height) {
-            let is_sel = i == sel_idx;
-            let route_str = m.route.to_string();
-            let flags = state
-                .model_flags
-                .get(&route_str)
-                .copied()
-                .unwrap_or_default();
-            let mut spans = vec![
-                Span::styled(
-                    format!("{} ", if is_sel { opts.glyphs.pointer } else { " " }),
-                    opts.theme.accent,
-                ),
-                Span::styled(
-                    route_str,
-                    if is_sel {
-                        opts.theme.bold
-                    } else {
-                        opts.theme.fg
-                    },
-                ),
-                Span::raw("  "),
-                Span::styled(m.display_name.clone(), opts.theme.dim),
-            ];
-            if flags.zdr_capable {
-                spans.push(Span::styled(" [ZDR]", opts.theme.green));
-            }
-            if flags.favorite {
-                let star = if state.config.ui.ascii_only {
-                    "*"
-                } else {
-                    "\u{2605}"
-                };
-                spans.push(Span::styled(format!(" {star}"), opts.theme.yellow));
-            }
-            let line = Line::from(spans);
-            if is_sel {
-                lines.push(selected_row(line, area.width, opts));
-            } else {
-                lines.push(line);
-            }
-        }
-    }
-
-    while lines.len() < (area.height as usize).saturating_sub(1) {
-        lines.push(Line::default());
-    }
-
-    // §9.1: the mark chips are generated from the live keymap — a rebound
-    // chord shows its own spelling, an unbound action drops out entirely.
-    let sep = opts.glyphs.dot_sep;
-    let arrows = if opts.glyphs.ascii { "^/v" } else { "↑/↓" };
-    let mut items = vec![format!("{arrows} select"), "enter confirm".to_string()];
-    for (action, label) in [
-        (crate::binding::Action::ModelPickerFavorite, "fav"),
-        (crate::binding::Action::ModelPickerZdr, "zdr"),
-        (crate::binding::Action::ModelPickerRefresh, "refresh"),
-    ] {
-        let chords = state
-            .keymap
-            .bindings_for(action)
-            .iter()
-            .map(crate::binding::format_binding)
-            .collect::<Vec<_>>()
-            .join("/");
-        if !chords.is_empty() {
-            items.push(format!("{chords} {label}"));
-        }
-    }
-    items.push("esc cancel".to_string());
-    let hint = items.join(sep);
-    lines.push(Line::from(Span::styled(
-        pacode_render::truncate_to_width(&hint, area.width as usize, true),
-        opts.theme.dim,
-    )));
-
-    frame.render_widget(Paragraph::new(lines), area);
-
-    if let Some(position) = crate::ui::popup::query_cursor(area, query, 2, 1) {
-        frame.set_cursor_position(position);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use ratatui::Terminal;
-    use ratatui::backend::{Backend, TestBackend};
-
     use super::*;
-
-    #[test]
-    fn unicode_query_cursor_uses_cells_and_stays_inside() {
-        let mut state =
-            crate::state::AppState::new(pacode_types::Config::default(), "test".to_string(), 10, 3);
-        state.focus = crate::state::Focus::Overlay(crate::state::Overlay::ModelPicker {
-            query: "模型".to_string(),
-            index: 0,
-            for_zdr: false,
-        });
-        let opts = RenderOptions::new(10, false);
-        let backend = TestBackend::new(10, 3);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let area = Rect::new(0, 0, 10, 3);
-
-        terminal
-            .draw(|frame| draw(frame, area, &state, &opts))
-            .expect("draw");
-
-        assert_eq!(
-            terminal
-                .backend_mut()
-                .get_cursor_position()
-                .ok()
-                .map(|position| (position.x, position.y)),
-            Some((6, 1))
-        );
-    }
 
     #[test]
     fn test_picker_marker_aligns_with_label_center() {

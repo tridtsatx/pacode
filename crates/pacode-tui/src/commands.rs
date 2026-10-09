@@ -1,7 +1,8 @@
 //! Slash commands typed in the prompt.
 //!
-//! `/model [name]` (picker without argument), `/effort <low|medium|high|xhigh|max>` (picker
-//! without argument), `/mode <build|auto|plan|bypass>`, `/sessions` (picker),
+//! `/model [name]` (the model palette without argument), `/login [provider]`
+//! (the palette on the first provider to sign in to, without argument),
+//! `/effort <low|medium|high|xhigh|max>` (picker without argument), `/mode <build|auto|plan|bypass>`, `/sessions` (picker),
 //! `/mcp`, `/plugins`, `/compact`, `/clear` (reset the conversation in place),
 //! `/new` (start a fresh session with the current settings),
 //! `/export [path]` (write the visible transcript as markdown to `path` or `~/pacode-<session>.md`),
@@ -67,7 +68,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: Cow::Borrowed("model"),
         usage: Cow::Borrowed("/model"),
-        help: Cow::Borrowed("switch model"),
+        help: Cow::Borrowed("model palette: model, effort, sign-in"),
         arg_hint: Cow::Borrowed("[provider/model]"),
     },
     SlashCommand {
@@ -332,13 +333,8 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
     match cmd {
         "login" => {
             if arg.is_empty() {
-                log::debug!("open overlay: LoginPicker");
-                state.focus = Focus::Overlay(Overlay::LoginPicker {
-                    query: String::new(),
-                    index: 0,
-                });
-                state.dirty = true;
-                vec![Action::Send(Request::ListAuth)]
+                log::debug!("open overlay: model palette (login)");
+                crate::keys_palette::open(state, crate::keys_palette::Opening::Login)
             } else {
                 vec![Action::Send(Request::Login { provider: arg })]
             }
@@ -352,12 +348,15 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 } else {
                     ModelRoute::new("default", &arg)
                 };
-                state.save_pref_model(&route.to_string());
-                let mut actions = vec![Action::Send(Request::SetModel(route.clone()))];
+                // Prefs follow the daemon's `SessionUpdated`, not this request:
+                // a refused switch must not become the next session's default.
+                let mut requests = vec![Request::SetModel(route.clone())];
                 // Downgrade the session effort if the new route can't run it
-                // (spec §6).
-                actions.extend(state.clamp_effort_actions(&route));
-                actions
+                // (spec §6) — after the switch, and only if it succeeded.
+                requests.extend(state.clamp_effort(&route).map(Request::SetEffort));
+                vec![crate::keys::prompt_batch_action(
+                    crate::state::PromptBatch { requests },
+                )]
             }
         }
         "effort" => {
@@ -379,7 +378,6 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                     );
                     vec![]
                 } else {
-                    state.save_pref_effort(eff);
                     vec![Action::Send(Request::SetEffort(eff))]
                 }
             } else {
@@ -402,7 +400,6 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 state.dirty = true;
                 vec![]
             } else if let Some(m) = Mode::parse(&arg) {
-                state.save_pref_mode(m);
                 vec![Action::Send(Request::SetMode(m))]
             } else {
                 push_notice(
@@ -621,14 +618,11 @@ fn new_session(state: &mut AppState) -> Vec<Action> {
     vec![Action::SwitchSession { attach }]
 }
 
-/// `/model` with no argument — the bottom picker. Also the hub's `Model` row
-/// (`ui/menu/root.rs`): the picker is bottom chrome, not a menu level.
-/// `/model` with no argument, and the hub's model row. The full picker:
-/// providers with live counts, the models under the highlighted one, and the
-/// effort ladder that greys out the levels a model does not accept.
+/// `/model` with no argument, and the hub's model row: the central model
+/// palette, landing on the session's route.
 pub fn open_model_picker(state: &mut AppState) -> Vec<Action> {
-    log::debug!("open overlay: model picker page");
-    crate::ui::model_picker_page::open(state)
+    log::debug!("open overlay: model palette");
+    crate::keys_palette::open(state, crate::keys_palette::Opening::Model)
 }
 
 /// `/theme` with no argument — the bottom picker, pre-selected on the active

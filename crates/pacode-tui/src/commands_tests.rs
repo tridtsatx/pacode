@@ -126,16 +126,20 @@ fn test_login_command_registration_and_execution() {
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].name, "login");
 
-    // 3. Execution without argument: opens Overlay::LoginPicker and sends ListAuth
+    // 3. Execution without argument: opens the model palette and asks for
+    //    the catalog and the auth status it groups by.
     let actions = commands::execute(&mut state, "/login");
-    assert_eq!(actions, vec![crate::keys::Action::Send(Request::ListAuth)]);
     assert_eq!(
-        state.focus,
-        crate::state::Focus::Overlay(crate::state::Overlay::LoginPicker {
-            query: String::new(),
-            index: 0,
-        })
+        actions,
+        vec![
+            crate::keys::Action::Send(Request::ListModels),
+            crate::keys::Action::Send(Request::ListAuth),
+        ]
     );
+    assert!(matches!(
+        state.focus,
+        crate::state::Focus::Overlay(crate::state::Overlay::ModelPalette { .. })
+    ));
 
     // 4. Execution with argument: sends Request::Login { provider }
     state.focus = crate::state::Focus::Normal;
