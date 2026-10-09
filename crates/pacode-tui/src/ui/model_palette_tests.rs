@@ -448,3 +448,93 @@ fn a_finished_sign_in_moves_the_selection_to_the_provider() {
         Some(Row::Model { model, .. }) if model.route.to_string() == "openrouter/z-ai/glm"
     ));
 }
+
+/// Three providers of four models, no auth records (headers not selectable):
+/// rows `0 #A, 1-4 a, 5 -, 6 #B, 7-10 b, 11 -, 12 #C, 13-16 c`.
+fn three_groups() -> Fixture {
+    let models = ["a", "b", "c"]
+        .iter()
+        .flat_map(|p| (1..=4).map(move |n| model(p, &format!("{p}{n}"), &format!("{p}{n}"))))
+        .collect();
+    Fixture {
+        models,
+        flags: Flags::new(),
+        auth: Vec::new(),
+        recent: Vec::new(),
+    }
+}
+
+/// One key press as the app does it: move, then the frame stores the window.
+fn step(palette: &mut ModelPalette, rows: &[Row], delta: isize, height: usize) -> (usize, usize) {
+    palette.move_by(delta, rows);
+    let selected = palette.selected_index(rows);
+    palette.scroll = palette.window(rows, selected, height);
+    (selected.unwrap_or(0), palette.scroll)
+}
+
+#[test]
+fn the_window_holds_while_the_selection_moves_inside_it() {
+    let fx = three_groups();
+    let mut palette = ModelPalette::default();
+    let rows = palette.rows(&fx.src());
+    assert_eq!(rows.len(), 17);
+    assert_eq!(step(&mut palette, &rows, 0, 5), (1, 0));
+    assert_eq!(step(&mut palette, &rows, 3, 5), (4, 0), "a4 still fits");
+    // Down out of the window: the minimum move, b1 on the last row and its
+    // header right above it.
+    assert_eq!(step(&mut palette, &rows, 1, 5), (7, 3));
+    assert_eq!(shape(&rows[3..8])[3], "# B");
+    // Back up inside the view: nothing shifts (the old bottom pin moved the
+    // whole list down a row here).
+    assert_eq!(step(&mut palette, &rows, -1, 5), (4, 3));
+    assert_eq!(step(&mut palette, &rows, 1, 5), (7, 3));
+}
+
+#[test]
+fn moving_up_out_of_the_window_shows_the_group_header() {
+    let fx = three_groups();
+    let mut palette = ModelPalette::default();
+    let rows = palette.rows(&fx.src());
+    assert_eq!(
+        step(&mut palette, &rows, 100, 3),
+        (16, 14),
+        "c4 at the bottom"
+    );
+    assert_eq!(step(&mut palette, &rows, -1, 3), (15, 14));
+    assert_eq!(step(&mut palette, &rows, -1, 3), (14, 14));
+    // c1 leaves upward: the window starts at its header so the group is named.
+    assert_eq!(step(&mut palette, &rows, -1, 3), (13, 12));
+    // b4 is four rows under its header, which a 3-row window cannot hold
+    // with it: the selection takes the top row.
+    assert_eq!(step(&mut palette, &rows, -1, 3), (10, 10));
+    assert_eq!(step(&mut palette, &rows, -1, 3), (9, 9));
+    // b1 and its header fit together: header first.
+    assert_eq!(step(&mut palette, &rows, -2, 3), (7, 6));
+}
+
+#[test]
+fn the_window_never_runs_past_a_shrunken_list() {
+    let fx = three_groups();
+    let palette = ModelPalette {
+        scroll: 14,
+        ..ModelPalette::default()
+    };
+    let rows = palette.rows(&fx.src());
+    // Five rows left (the first group): the stored start clamps so the box
+    // stays full and the selection stays on screen.
+    assert_eq!(palette.window(&rows[..5], Some(4), 3), 2);
+    assert_eq!(palette.window(&rows[..5], Some(1), 3), 0);
+    assert_eq!(palette.window(&rows, None, 3), 14);
+    assert_eq!(palette.window(&rows, Some(4), 0), 14);
+}
+
+#[test]
+fn a_new_query_starts_the_window_at_the_top() {
+    let fx = three_groups();
+    let mut palette = ModelPalette::default();
+    let rows = palette.rows(&fx.src());
+    step(&mut palette, &rows, 100, 3);
+    assert_eq!(palette.scroll, 14);
+    palette.push_char('c');
+    assert_eq!(palette.scroll, 0);
+}

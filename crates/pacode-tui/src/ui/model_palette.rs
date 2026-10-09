@@ -138,6 +138,9 @@ pub struct ModelPalette {
     pub kind: Kind,
     /// Index among the *selectable* rows, clamped at use.
     pub cursor: usize,
+    /// The first list row on screen, kept between frames so moving inside
+    /// the view never shifts it — see [`ModelPalette::window`].
+    pub scroll: usize,
     /// A row to land on once it exists. Rows may still be loading when the
     /// palette opens; the first move or keystroke drops it.
     anchor: Option<Anchor>,
@@ -325,6 +328,31 @@ impl ModelPalette {
         self.selected_index(rows).and_then(|index| rows.get(index))
     }
 
+    /// The first row of a `height`-row window over `rows` that shows
+    /// `selected`. The stored [`scroll`](Self::scroll) holds while the
+    /// selection stays inside it, so moving within the view never shifts it.
+    /// When the selection leaves, the window moves just enough: down, the
+    /// selection becomes the last row (its header stays above while the group
+    /// fits); up, the window starts at the selection's group header when the
+    /// header and the selection fit together, so the provider stays named.
+    pub fn window(&self, rows: &[Row], selected: Option<usize>, height: usize) -> usize {
+        let stored = self.scroll.min(rows.len().saturating_sub(height));
+        let Some(sel) = selected.filter(|sel| height > 0 && *sel < rows.len()) else {
+            return stored;
+        };
+        if (stored..stored + height).contains(&sel) {
+            stored
+        } else if sel > stored {
+            sel + 1 - height
+        } else {
+            let header = rows[..=sel]
+                .iter()
+                .rposition(|row| matches!(row, Row::Header { .. }))
+                .unwrap_or(sel);
+            if sel - header < height { header } else { sel }
+        }
+    }
+
     /// Move the selection by `delta` selectable rows, clamped to the list.
     pub fn move_by(&mut self, delta: isize, rows: &[Row]) {
         let selectable: Vec<usize> = selectable(rows).collect();
@@ -341,6 +369,7 @@ impl ModelPalette {
     /// there.
     fn reset_selection(&mut self) {
         self.cursor = 0;
+        self.scroll = 0;
         self.anchor = None;
     }
 

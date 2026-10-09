@@ -11,7 +11,8 @@ use pacode_render::{RenderOptions, display_width, truncate_to_width};
 use pacode_types::ModelInfo;
 
 use crate::binding::Action as KeyAction;
-use crate::state::AppState;
+use crate::state::{AppState, Focus, Overlay};
+use crate::ui::chrome;
 use crate::ui::model_catalog::{Kind, accepted_efforts, capability_tags, ctx_label, price_label};
 use crate::ui::model_palette::{GroupStatus, ModelPalette, Row, Sources};
 use crate::ui::overlays::{menu_block, selected_row, title_with_badge};
@@ -67,7 +68,7 @@ pub fn draw(
         ]),
         Line::default(),
     ];
-    let list_h = usize::from(inner.height.saturating_sub(CHROME_ROWS));
+    let list_h = list_height(area);
     if rows.is_empty() {
         if state.models.is_empty() && state.auth_providers.is_empty() {
             lines.push(Line::from(Span::styled("  loading…", opts.theme.faint)));
@@ -82,7 +83,7 @@ pub fn draw(
         let columns = Columns::fit(&rows, width);
         let current = state.meta.as_ref().map(|meta| meta.model.to_string());
         let logout_chord = first_chord(state, KeyAction::ModelPickerLogout).unwrap_or_default();
-        let start = window_start(selected.unwrap_or(0), list_h);
+        let start = palette.window(&rows, selected, list_h);
         for (index, row) in rows.iter().enumerate().skip(start).take(list_h) {
             let is_sel = selected == Some(index);
             let line = match row {
@@ -256,11 +257,13 @@ fn header_line(
     let pointer = if selected { opts.glyphs.pointer } else { " " };
     let mut spans = vec![
         Span::styled(format!("{pointer} "), opts.theme.accent),
-        Span::styled(title.to_string(), opts.theme.bold),
+        chrome::section(title, opts),
     ];
     if provider.is_some() && provider == palette.confirm_logout.as_deref() {
+        spans.push(Span::raw(" "));
+        spans.push(chrome::badge("!", opts.theme.red, opts));
         spans.push(Span::styled(
-            format!("  {logout_chord} again to sign out {title}"),
+            format!(" {logout_chord} again to sign out {title}"),
             opts.theme.red.patch(opts.theme.bold),
         ));
         return Line::from(spans);
@@ -269,25 +272,28 @@ fn header_line(
         .login
         .as_ref()
         .filter(|login| provider == Some(login.provider.as_str()));
-    let status = match (login, status) {
-        (Some(login), _) if login.failed => Some((format!("! {}", login.text), opts.theme.red)),
-        (Some(login), _) => Some((
-            format!("{} {}", opts.glyphs.running, login.text),
-            opts.theme.yellow,
-        )),
+    // The status mark is a badge in the status tone, the words beside it in
+    // the same tone — the toast idiom, so it survives ANSI-16 and mono.
+    let status: Option<(&str, String, _)> = match (login, status) {
+        (Some(login), _) if login.failed => Some(("!", login.text.clone(), opts.theme.red)),
+        (Some(login), _) => Some((opts.glyphs.running, login.text.clone(), opts.theme.yellow)),
         (None, GroupStatus::Plain) => None,
         (None, GroupStatus::SignedIn) => Some((
-            format!("{} signed in", opts.glyphs.main_dot),
+            opts.glyphs.main_dot,
+            "signed in".to_string(),
             opts.theme.green,
         )),
         (None, GroupStatus::SignIn) => Some((
-            format!("{} enter to sign in", opts.glyphs.agent_dot),
+            opts.glyphs.agent_dot,
+            "enter to sign in".to_string(),
             opts.theme.dim,
         )),
-        (None, GroupStatus::Error(reason)) => Some((format!("! {reason}"), opts.theme.red)),
+        (None, GroupStatus::Error(reason)) => Some(("!", reason.clone(), opts.theme.red)),
     };
-    if let Some((text, style)) = status {
-        spans.push(Span::styled(format!("  {text}"), style));
+    if let Some((mark, text, tone)) = status {
+        spans.push(Span::raw(" "));
+        spans.push(chrome::badge(mark, tone, opts));
+        spans.push(Span::styled(format!(" {text}"), tone));
     }
     if let Some(kind) = kind {
         spans.push(Span::styled(format!("  {kind}"), opts.theme.faint));
@@ -410,10 +416,23 @@ fn first_chord(state: &AppState, action: KeyAction) -> Option<String> {
         .map(crate::binding::format_binding)
 }
 
-/// First row of a window of `height` rows that keeps `selected` on screen.
-fn window_start(selected: usize, height: usize) -> usize {
-    if height == 0 {
-        return 0;
+/// List rows a palette box of `area` holds: the box less its border and the
+/// search, spacer, effort and hint rows.
+fn list_height(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(2 + CHROME_ROWS))
+}
+
+/// Store the window the palette shows in a box of `area` (its full size, not
+/// the opening animation's), so the next frame starts from it. Called once
+/// per frame from `prepare_frame`, which covers keys, catalog updates and
+/// resizes alike.
+pub(crate) fn sync_scroll(state: &mut AppState, area: Rect) {
+    let Focus::Overlay(Overlay::ModelPalette { palette }) = &state.focus else {
+        return;
+    };
+    let rows = palette.rows(&Sources::of(state));
+    let scroll = palette.window(&rows, palette.selected_index(&rows), list_height(area));
+    if let Focus::Overlay(Overlay::ModelPalette { palette }) = &mut state.session.focus {
+        palette.scroll = scroll;
     }
-    (selected + 1).saturating_sub(height)
 }

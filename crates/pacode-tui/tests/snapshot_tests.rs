@@ -706,15 +706,22 @@ fn palette_view(cols: u16, rows: u16) -> String {
     settle_focus(&mut state);
 
     let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+    let mut layout = ScreenLayout::default();
     terminal
         .draw(|f| {
-            prepare_and_draw_frame(f, &mut state);
+            layout = prepare_and_draw_frame(f, &mut state);
         })
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
-    // The box is centred on the whole frame (B25).
+    // The box is centred in the left column above the prompt frame (B25):
+    // the column the transcript and any panel share.
+    let row_text = |y: u16| -> String {
+        (0..cols)
+            .filter_map(|x| buffer.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect()
+    };
     let top = (0..rows)
-        .find(|y| (0..cols).any(|x| buffer.cell((x, *y)).is_some_and(|c| c.symbol() == "╭")))
+        .find(|y| row_text(*y).contains("Select model"))
         .expect("the palette's top border");
     let left = (0..cols)
         .find(|x| buffer.cell((*x, top)).is_some_and(|c| c.symbol() == "╭"))
@@ -724,8 +731,25 @@ fn palette_view(cols: u16, rows: u16) -> String {
         .find(|x| buffer.cell((*x, top)).is_some_and(|c| c.symbol() == "╮"))
         .unwrap_or(0);
     let width = right - left + 1;
-    assert_eq!(width, cols.saturating_sub(4).clamp(44, 84), "{cols}x{rows}");
-    assert_eq!(left, (cols - width) / 2, "{cols}x{rows}: centred");
+    let column_x = layout.input_top.x;
+    let column_w = layout.input_top.width;
+    assert_eq!(
+        width,
+        column_w.saturating_sub(4).clamp(44.min(column_w), 84),
+        "{cols}x{rows}"
+    );
+    assert_eq!(
+        left,
+        column_x + (column_w - width) / 2,
+        "{cols}x{rows}: centred"
+    );
+    let bottom = (top..rows)
+        .find(|y| buffer.cell((left, *y)).is_some_and(|c| c.symbol() == "╰"))
+        .expect("the palette's bottom border");
+    assert!(
+        bottom < layout.preview.y,
+        "{cols}x{rows}: clear of the prompt"
+    );
     format!("{}", terminal.backend())
 }
 

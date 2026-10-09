@@ -506,7 +506,7 @@ fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId)
         return elapsed.map_or(area, |ms| grow_bottom(area, ms));
     }
     if id == PopupId::ModelPalette {
-        let area = palette_area(layout.screen);
+        let area = palette_area(overlay_container(layout));
         return elapsed.map_or(area, |ms| grow_center(area, ms));
     }
     let area = center_container(overlay_container(layout), elapsed);
@@ -520,17 +520,17 @@ fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId)
     }
 }
 
-/// The model palette's box: centred on the whole frame — not the dialog
-/// column, which an open panel squeezes to half the width — 44 to 84 columns
-/// wide (the frame's own width below 44) and at most the frame height less 4.
-pub(crate) fn palette_area(screen: Rect) -> Rect {
+/// The model palette's box, centred in the shared [`overlay_container`]: 44
+/// to 84 columns wide (the container's own width below 44) and as tall as the
+/// container allows, up to 26 rows. The container already leaves out the
+/// prompt frame and the footer, so the box never covers where the typing is.
+pub(crate) fn palette_area(container: Rect) -> Rect {
     const MAX_HEIGHT: u16 = 26;
-    let width = screen
+    let width = container
         .width
         .saturating_sub(4)
-        .clamp(44.min(screen.width), 84);
-    let height = screen.height.saturating_sub(4).min(MAX_HEIGHT);
-    center_area(screen, width, height)
+        .clamp(44.min(container.width), 84);
+    center_area(container, width, container.height.min(MAX_HEIGHT))
 }
 
 fn center_container(area: Rect, elapsed: Option<u64>) -> Rect {

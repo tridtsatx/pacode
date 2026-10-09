@@ -31,21 +31,35 @@ fn full_overlay_wins_over_every_input_completion() {
 /// B25: the palette is centred on the whole frame, not on the dialog column an
 /// open panel squeezes; 44..=84 wide, at most the frame height less 4.
 #[test]
-fn the_model_palette_centres_on_the_frame_even_with_a_panel_open() {
+fn the_model_palette_centres_in_the_shared_overlay_container() {
     for (cols, rows) in [(130u16, 40u16), (200, 60), (60, 20), (40, 12)] {
         let mut app = state(cols, rows);
         app.panel.target = Some(PanelTarget::Task(TaskId::new("task")));
         app.focus = Focus::Overlay(Overlay::ModelPalette {
             palette: Default::default(),
         });
-        let popup = popup::resolve(&app, &crate::layout::current(&app), Instant::now())
-            .expect("palette resolves");
+        let layout = crate::layout::current(&app);
+        let popup = popup::resolve(&app, &layout, Instant::now()).expect("palette resolves");
         let area = popup.area();
-        let expected_w = cols.saturating_sub(4).clamp(44.min(cols), 84);
+        let container = popup::overlay_container(&layout);
+        let expected_w = container
+            .width
+            .saturating_sub(4)
+            .clamp(44.min(container.width), 84);
         assert_eq!(area.width, expected_w, "{cols}x{rows}");
-        assert!(area.height <= rows.saturating_sub(4), "{cols}x{rows}");
-        assert_eq!(area.x, (cols - area.width) / 2, "{cols}x{rows}: centred");
-        assert_eq!(area.y, (rows - area.height) / 2, "{cols}x{rows}: centred");
+        assert_eq!(area.height, container.height.min(26), "{cols}x{rows}");
+        assert_eq!(
+            area.x,
+            container.x + (container.width - area.width) / 2,
+            "{cols}x{rows}: centred"
+        );
+        assert_eq!(
+            area.y,
+            container.y + (container.height - area.height) / 2,
+            "{cols}x{rows}: centred"
+        );
+        // Never over the prompt frame or the footer.
+        assert!(area.bottom() <= layout.preview.y, "{cols}x{rows}");
     }
 }
 
