@@ -57,24 +57,27 @@ fn same_agents(locked: &[Arc<Agent>], now: &[Arc<Agent>]) -> bool {
 /// 4. The events go out while the locks are still held, so nothing from a
 ///    turn started after the clear reaches a client ahead of them.
 pub async fn clear_context(session: &Arc<Session>) -> Result<(), CoreError> {
+    let result = clear_under_locks(session).await;
+    // Every exit, cleared or refused, passes here with the locks released: an
+    // injection that arrived while they were held found the turn claimed and
+    // was left for a turn that is not coming. A no-op when nothing is due.
+    if let Some(main) = session.main_agent() {
+        crate::turn::lifecycle::request_turn(session.clone(), main);
+    }
+    result
+}
+
+/// Take the locks (re-taking them while the agent set keeps moving) and
+/// clear under them. Every guard is dropped by the time this returns.
+async fn clear_under_locks(session: &Arc<Session>) -> Result<(), CoreError> {
     for _ in 0..LOCK_ATTEMPTS {
         session.interrupt_all().await;
         let agents = resident_agents(session);
-        let turns = lock_turns_interrupting(session, &agents).await;
-        let submit = session.submit_lock.lock().await;
-        if !same_agents(&agents, &resident_agents(session)) {
-            continue;
+        let _turns = lock_turns_interrupting(session, &agents).await;
+        let _submit = session.submit_lock.lock().await;
+        if same_agents(&agents, &resident_agents(session)) {
+            return clear_locked(session).await;
         }
-        let result = clear_locked(session).await;
-        drop(submit);
-        drop(turns);
-        // Refused or not: an injection that arrived while the locks were held
-        // found the turn claimed and was left for a turn that is not coming.
-        // A no-op when nothing is due.
-        if let Some(main) = session.main_agent() {
-            crate::turn::lifecycle::request_turn(session.clone(), main);
-        }
-        return result;
     }
     Err(CoreError::Invalid(
         "the session kept starting agents during the clear; try again".to_string(),
