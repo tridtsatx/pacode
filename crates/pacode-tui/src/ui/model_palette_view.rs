@@ -82,7 +82,10 @@ pub fn draw(
     } else {
         let columns = Columns::fit(&rows, width);
         let current = state.meta.as_ref().map(|meta| meta.model.to_string());
-        let logout_chord = first_chord(state, KeyAction::ModelPickerLogout).unwrap_or_default();
+        let logout_chord = state
+            .keymap
+            .hint(KeyAction::ModelPickerLogout)
+            .unwrap_or_default();
         let start = palette.window(&rows, selected, list_h);
         for (index, row) in rows.iter().enumerate().skip(start).take(list_h) {
             let is_sel = selected == Some(index);
@@ -399,21 +402,12 @@ fn chord_hint(
     }
     let parts: Vec<String> = items
         .into_iter()
-        .filter_map(|(action, label)| Some(format!("{} {label}", first_chord(state, action)?)))
+        .filter_map(|(action, label)| Some(format!("{} {label}", state.keymap.hint(action)?)))
         .collect();
     if parts.is_empty() {
         return String::new();
     }
     format!(" {} ", parts.join(opts.glyphs.dot_sep))
-}
-
-/// The primary spelling of `action` in the live keymap.
-fn first_chord(state: &AppState, action: KeyAction) -> Option<String> {
-    state
-        .keymap
-        .bindings_for(action)
-        .first()
-        .map(crate::binding::format_binding)
 }
 
 /// List rows a palette box of `area` holds: the box less its border and the
