@@ -466,3 +466,37 @@ async fn test_logout_and_set_auth_account() {
         other => panic!("expected AuthStatus, got {other:?}"),
     }
 }
+
+/// A logout (like a login or an account switch) changes which providers serve
+/// models, so attached clients get the new catalog without asking again —
+/// that is what unlocks or locks a group in an open model palette.
+#[tokio::test]
+async fn test_auth_change_pushes_the_catalog_to_attached_sessions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let core = build_test_core(Paths::under(temp_dir.path())).await;
+    let session_id = core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(pacode_types::ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .expect("open session");
+    let mut events = core.subscribe(&session_id).expect("session events");
+
+    let _ = core.handle_logout("claude".to_string(), None);
+
+    let models_updated = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Ok((_, Event::ModelsUpdated { .. })) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(models_updated, "a logout must push ModelsUpdated");
+}

@@ -1156,6 +1156,7 @@ impl Core {
                         let _ = core
                             .providers()
                             .rebuild_provider_from_store(&provider_clone, &store);
+                        core.announce_catalog();
 
                         if let Some(info) = crate::auth::get_provider_auth_info(
                             &store,
@@ -1204,6 +1205,7 @@ impl Core {
         let _ = self
             .providers()
             .rebuild_provider_from_store(&provider, &store);
+        self.announce_catalog();
 
         if let Some(info) =
             crate::auth::get_provider_auth_info(&store, &self.config().providers, &provider)
@@ -1229,6 +1231,7 @@ impl Core {
         let _ = self
             .providers()
             .rebuild_provider_from_store(&provider, &store);
+        self.announce_catalog();
 
         if let Some(info) =
             crate::auth::get_provider_auth_info(&store, &self.config().providers, &provider)
@@ -1238,6 +1241,20 @@ impl Core {
 
         let providers = crate::auth::build_auth_status(&store, &self.config().providers);
         Reply::AuthStatus { providers }
+    }
+
+    /// A login, logout or account switch rebuilt a provider, so the catalog
+    /// changed: push it to every attached client, or an open model palette
+    /// keeps showing the provider as it was until someone asks again.
+    fn announce_catalog(&self) {
+        let core = self.self_weak.get().cloned().unwrap_or_default();
+        tokio::spawn(async move {
+            let Some(core) = core.upgrade() else {
+                return;
+            };
+            let models = core.providers().list_all_models().await;
+            core.broadcast_event(Event::ModelsUpdated { models });
+        });
     }
 
     /// Emit a daemon-wide event. Unlike [`Self::broadcast_event`] this reaches every
