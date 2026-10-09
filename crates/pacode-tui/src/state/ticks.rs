@@ -134,15 +134,6 @@ impl AppState {
         }
     }
 
-    /// How long until a SCHEDULE countdown on the rail (`in 4m59s`) next
-    /// reads differently — one deadline, not a periodic tick, and `None`
-    /// (no wakeup at all) unless the last frame drew a countdown.
-    pub fn schedule_redraw_in(&self, now_ms: u64) -> Option<std::time::Duration> {
-        self.rail
-            .schedule_tick_ms(now_ms, self.rail.schedule_rows_drawn)
-            .map(std::time::Duration::from_millis)
-    }
-
     /// Whether a periodic 1 s tick is needed (live agents or tasks: durations
     /// change, and the SESSION-stats debounce has to fire on a quiet screen).
     pub fn needs_second_tick(&self) -> bool {

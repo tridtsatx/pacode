@@ -205,8 +205,7 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
 
 /// What the background zone fits: how many task rows (and whether an
 /// `and N more` line follows them), then how many SCHEDULE rows under the
-/// SCHEDULE header (`None`: no SCHEDULE block). Drawing and the countdown
-/// wakeup both read it, so a wakeup is armed exactly for drawn countdowns.
+/// SCHEDULE header (`None`: no SCHEDULE block).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BackgroundFit {
     pub(crate) tasks_shown: usize,
@@ -256,8 +255,8 @@ fn schedule_lines(
 
     for job in state.rail.cron_jobs.iter().filter(|j| j.enabled) {
         let due = job
-            .due_in_ms(now)
-            .map(|ms| format!("in {}", format_duration_ms(ms)))
+            .next_run_ms
+            .and_then(|at| next_run_label(at, now, &chrono::Local))
             .unwrap_or_else(|| "paused".to_string());
         rows.push((opts.glyphs.running, opts.theme.cyan, job.name.clone(), due));
     }
@@ -292,6 +291,28 @@ fn schedule_lines(
         )));
     }
     out
+}
+
+/// The next run as an absolute local time: `at 14:05` today, `Fri 09:00`
+/// within six days, `Oct 17` further out. A countdown (`in 4m59s`) would go stale
+/// on an idle screen unless a timer redrew it; a wall-clock time never does.
+pub(crate) fn next_run_label<Tz: chrono::TimeZone>(
+    at_ms: u64,
+    now_ms: u64,
+    tz: &Tz,
+) -> Option<String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let local = |ms: u64| tz.timestamp_millis_opt(i64::try_from(ms).ok()?).single();
+    let (at, now) = (local(at_ms)?, local(now_ms)?);
+    let days = (at.date_naive() - now.date_naive()).num_days();
+    let fmt = match days {
+        0 => "at %H:%M",
+        -6..=6 => "%a %H:%M",
+        _ => "%b %-d",
+    };
+    Some(at.format(fmt).to_string())
 }
 
 fn render_task_line(

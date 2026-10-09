@@ -220,48 +220,6 @@ fn stale_agent_turn_end_cannot_finish_the_new_turn() {
     );
 }
 
-#[test]
-fn the_schedule_countdown_ticks_at_the_resolution_it_shows() {
-    use pacode_types::{CronJob, CronJobId, CronSchedule};
-
-    let mut rail = RailState::default();
-    // Nothing scheduled: no tick at all.
-    assert_eq!(rail.schedule_tick_ms(1_000, usize::MAX), None);
-
-    let mut job = CronJob {
-        id: CronJobId::new("cron_1"),
-        name: "nightly".to_string(),
-        schedule: CronSchedule::every(3600),
-        prompt: "x".to_string(),
-        enabled: true,
-        created_at_ms: 0,
-        last_run_ms: None,
-        next_run_ms: Some(100_000),
-        last_status: None,
-    };
-    rail.upsert_cron_job(job.clone());
-
-    // Hours away: the rail shows whole minutes, so one wake a minute is enough.
-    job.next_run_ms = Some(2 * 3_600_000 + 30_500);
-    rail.upsert_cron_job(job.clone());
-    let tick = rail.schedule_tick_ms(0, usize::MAX).expect("tick");
-    assert!(
-        tick > 1_000 && tick <= 60_000,
-        "a distant job must not tick every second: {tick}"
-    );
-
-    // Inside the last minute the countdown shows seconds.
-    job.next_run_ms = Some(30_400);
-    rail.upsert_cron_job(job.clone());
-    let tick = rail.schedule_tick_ms(0, usize::MAX).expect("tick");
-    assert!(tick <= 1_000, "a near job ticks per second: {tick}");
-
-    // A disabled job counts down to nothing and needs no tick.
-    job.enabled = false;
-    rail.upsert_cron_job(job);
-    assert_eq!(rail.schedule_tick_ms(0, usize::MAX), None);
-}
-
 fn cron(id: &str, next_run_ms: u64) -> pacode_types::CronJob {
     pacode_types::CronJob {
         id: pacode_types::CronJobId::new(id),
@@ -276,60 +234,69 @@ fn cron(id: &str, next_run_ms: u64) -> pacode_types::CronJob {
     }
 }
 
-/// B26: the wake lands exactly where the rail's `in …` text changes — not a
-/// moment earlier (a wasted frame) and not later (a stale countdown). The
-/// rail prints seconds below an hour (`1m40s`), so a 100 s job must not wait
-/// for the minute.
+/// B26: the next run reads as a wall-clock time, so the text never goes stale
+/// on an idle screen: `at HH:MM` today, the weekday within a week, the date
+/// beyond.
 #[test]
-fn the_schedule_wake_lands_on_the_next_change_of_the_text() {
-    use pacode_types::time::format_duration_ms;
-    for due in [12_345, 100_000, 59_999, 3_599_999, 3_600_000, 7_230_500] {
-        let mut rail = RailState::default();
-        rail.upsert_cron_job(cron("j", due));
-        let tick = rail.schedule_tick_ms(0, usize::MAX).expect("tick");
-        let shown = format_duration_ms(due);
-        assert_eq!(format_duration_ms(due - (tick - 1)), shown, "due {due}");
-        assert_ne!(format_duration_ms(due - tick), shown, "due {due}");
-    }
-}
-
-/// B26: the soonest change wins, which is not always the nearest job.
-#[test]
-fn the_schedule_wake_takes_the_soonest_change_over_all_jobs() {
-    let mut rail = RailState::default();
-    rail.upsert_cron_job(cron("near", 30_900));
-    rail.upsert_cron_job(cron("far", 45_050));
-    assert_eq!(rail.schedule_tick_ms(0, usize::MAX), Some(51));
-}
-
-/// B26: the event loop wakes for the countdown only while the rail is on
-/// screen; at rest without one there is no timer.
-#[test]
-fn the_schedule_wake_is_armed_only_while_the_rail_shows() {
-    let frame = |state: &mut crate::state::AppState| {
-        let area = ratatui::layout::Rect::new(0, 0, state.cols, state.rows);
-        crate::ui::prepare_frame(area, state, std::time::Instant::now());
+fn the_schedule_shows_the_next_run_as_local_time() {
+    use crate::ui::rail_session::next_run_label;
+    use chrono::{FixedOffset, TimeZone};
+    let tz = FixedOffset::east_opt(3 * 3600).expect("valid offset");
+    let ms = |d, h, m| {
+        let t = tz.with_ymd_and_hms(2026, 10, d, h, m, 0).single();
+        u64::try_from(t.expect("valid time").timestamp_millis()).expect("after epoch")
     };
+    // 2026-10-09 is a Friday.
+    let now = ms(9, 13, 30);
+    assert_eq!(
+        next_run_label(ms(9, 14, 5), now, &tz).as_deref(),
+        Some("at 14:05")
+    );
+    assert_eq!(
+        next_run_label(ms(10, 0, 5), now, &tz).as_deref(),
+        Some("Sat 00:05")
+    );
+    assert_eq!(
+        next_run_label(ms(15, 9, 0), now, &tz).as_deref(),
+        Some("Thu 09:00")
+    );
+    // A week out the weekday would read as today's: the date instead.
+    assert_eq!(
+        next_run_label(ms(16, 9, 0), now, &tz).as_deref(),
+        Some("Oct 16")
+    );
+}
+
+/// B26: a visible SCHEDULE row arms no timer — the idle client stays asleep.
+#[test]
+fn a_visible_schedule_arms_no_wakeup() {
+    use ratatui::{Terminal, backend::TestBackend};
     let mut state =
         crate::state::AppState::new(pacode_types::Config::default(), "t".into(), 120, 34);
-    frame(&mut state);
-    assert_eq!(state.schedule_redraw_in(0), None);
-    state.rail.upsert_cron_job(cron("j", 30_900));
-    // Not drawn yet: the wakeup follows what is on screen.
-    assert_eq!(state.schedule_redraw_in(0), None);
-    frame(&mut state);
-    assert_eq!(
-        state.schedule_redraw_in(0),
-        Some(Duration::from_millis(901))
-    );
-    // No rail at this width: nothing on screen counts down.
-    state.cols = 60;
-    frame(&mut state);
-    assert_eq!(state.schedule_redraw_in(0), None);
+    let now_ms = pacode_types::time::now_ms();
+    state.rail.upsert_cron_job(cron("nightly", now_ms + 30_000));
+    let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("test backend");
+    terminal
+        .draw(|f| {
+            let prepared = crate::ui::prepare_frame(f.area(), &mut state, Instant::now());
+            crate::ui::draw(f, &state, &prepared);
+        })
+        .expect("draw");
+    let buf = terminal.backend().buffer();
+    let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+    assert!(screen.contains("nightly"), "the schedule row is on screen");
+    assert!(!screen.contains("in 30s") && !screen.contains("in 29s"));
+
+    // Past the welcome cascade, which animates every fresh client.
+    let now = Instant::now() + Duration::from_millis(crate::state::WELCOME_ANIM_MS);
+    assert!(!state.needs_second_tick());
+    assert!(!state.needs_anim_tick(now));
+    assert!(!state.needs_stream_tick());
+    assert!(!state.fast_anim_active(now));
 }
 
-/// B26: the SCHEDULE block needs its header plus a row; a zone the task list
-/// fills, or one too short, draws no countdown — and so arms no wakeup.
+/// The SCHEDULE block needs its header plus a row; a zone the task list
+/// fills, or one too short, draws no schedule row.
 #[test]
 fn the_background_fit_draws_schedule_rows_only_where_they_fit() {
     use crate::ui::rail_session::background_fit;
@@ -338,7 +305,7 @@ fn the_background_fit_draws_schedule_rows_only_where_they_fit() {
     assert_eq!(background_fit(5, 0, 4).schedule_shown, Some(4));
     // More rows than fit: one gives way to `and N more`.
     assert_eq!(background_fit(5, 0, 6).schedule_shown, Some(3));
-    // Too short: only the header and `and N more` fit — no countdown.
+    // Too short: only the header and `and N more` fit — no row.
     assert_eq!(background_fit(2, 0, 3).schedule_shown, Some(0));
     assert_eq!(background_fit(1, 0, 1).schedule_shown, None);
     // Four tasks under their header fill a five-row zone.

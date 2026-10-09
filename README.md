@@ -34,8 +34,8 @@ the default:
 
 Those are measured, not aspirational. "Economy" is a rule in this repository, not
 a nice-to-have: every cache states its cap, its invalidation and its owner, and
-**nothing is allowed to tick while the session is idle.** A scheduled job a day
-away costs one wakeup a minute to redraw its countdown, not sixty.
+**nothing is allowed to tick while the session is idle.** A scheduled job shows
+when it runs (`at 14:05`), not a countdown that would need a timer to redraw it.
 
 ## Install
 

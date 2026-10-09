@@ -141,9 +141,6 @@ pub fn prepare_frame(area: Rect, state: &mut AppState, now: std::time::Instant) 
         model_palette_view::store_scroll(state, palette);
     }
     let rail = rail::resolve(state, layout.rail);
-    // The countdown wakeup (`AppState::schedule_redraw_in`) reads what this
-    // frame draws; no rail, no countdown on screen.
-    state.rail.schedule_rows_drawn = rail.as_ref().map_or(0, |r| r.schedule_rows_drawn);
     let overlay = overlays::prepare(
         state,
         full_popup.as_ref(),

@@ -30,8 +30,6 @@ pub(crate) struct PreparedRail {
     pub(crate) selected_main: bool,
     pub(crate) selected_subagent: Option<usize>,
     pub(crate) agents_scroll: usize,
-    /// SCHEDULE rows the background zone draws this frame.
-    pub(crate) schedule_rows_drawn: usize,
 }
 
 pub(crate) fn resolve(state: &AppState, area: Rect) -> Option<PreparedRail> {
@@ -119,16 +117,7 @@ pub(crate) fn resolve_from(
         }
     }
 
-    let schedule_rows_drawn = crate::ui::rail_session::background_fit(
-        usize::from(layout.background.height),
-        usize::from(bg_tasks_count),
-        schedule_count,
-    )
-    .schedule_shown
-    .unwrap_or(0);
-
     Some(PreparedRail {
-        schedule_rows_drawn,
         layout,
         select_mode,
         show_session,
@@ -159,7 +148,6 @@ pub(crate) fn draw(
         selected_main,
         selected_subagent,
         agents_scroll,
-        schedule_rows_drawn: _,
     } = *prepared;
 
     draw_header(frame, layout.header, state, opts);
