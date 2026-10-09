@@ -170,18 +170,19 @@ fn evict_oldest(scans: &mut HashMap<WalkKey, Scan>, max_roots: usize) {
     }
 }
 
-/// Ceiling on walker threads for one unbounded scan; several agents may
-/// explore at once.
+/// Ceiling on walker threads for one unbounded scan, before the process-wide
+/// budget (`crate::threads`) has its say.
 const MAX_WALK_THREADS: usize = 8;
 
 /// One `ignore`-crate walk producing plain entries sorted by relative path;
 /// the root itself (depth 0) is never yielded since no consumer lists it.
 ///
-/// An unbounded walk runs on `ignore`'s parallel walker: the cost is CPU in
-/// gitignore matching, not IO, and on a large tree it dominates a cold
-/// `grep`/`glob`. A depth-limited walk (`ls`) is a single directory read, too
-/// small to pay for threads. Either way the result is sorted, so the order
-/// does not depend on thread timing or on `readdir`.
+/// An unbounded walk runs on `ignore`'s parallel walker when the process-wide
+/// thread budget grants at least two threads: the cost is CPU in gitignore
+/// matching, not IO, and on a large tree it dominates a cold `grep`/`glob`.
+/// Otherwise — a depth-limited walk (`ls`, a single directory read) or a busy
+/// budget — it walks serially on the calling thread. Either way the result is
+/// sorted, so the order does not depend on thread timing or on `readdir`.
 fn scan(
     root: &Path,
     options: WalkOptions,
@@ -194,42 +195,75 @@ fn scan(
         .require_git(false)
         .max_depth(options.max_depth);
 
-    let mut entries = Vec::new();
-    if options.max_depth.is_some() {
-        for entry in builder.build() {
+    // The calling thread only waits while `ignore`'s threads walk, so fewer
+    // than two extra threads would not be faster than walking here.
+    let threads = match options.max_depth {
+        Some(_) => None,
+        None => Some(crate::threads::shared().reserve(MAX_WALK_THREADS)),
+    }
+    .filter(|reserved| reserved.count() >= 2);
+
+    let mut entries = match threads {
+        None => {
+            let mut entries = Vec::new();
+            for entry in builder.build() {
+                if cancel.is_cancelled() {
+                    return Err(ToolError::Cancelled);
+                }
+                if let Some(entry) = walk_entry(root, entry) {
+                    entries.push(entry);
+                }
+            }
+            entries
+        }
+        Some(reserved) => {
+            // Each walker thread fills its own Vec and hands it over when
+            // its visitor is dropped at the end of the walk: one copy of the
+            // entries, no channel buffer beside the result.
+            let parts: Mutex<Vec<Vec<WalkEntry>>> = Mutex::new(Vec::new());
+            builder.threads(reserved.count()).build_parallel().run(|| {
+                let mut local = LocalEntries {
+                    entries: Vec::new(),
+                    parts: &parts,
+                };
+                Box::new(move |entry| {
+                    if cancel.is_cancelled() {
+                        return ignore::WalkState::Quit;
+                    }
+                    if let Some(entry) = walk_entry(root, entry) {
+                        local.entries.push(entry);
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+            drop(reserved);
             if cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
-            if let Some(entry) = walk_entry(root, entry) {
-                entries.push(entry);
-            }
+            parts
+                .into_inner()
+                .unwrap_or_else(|p| p.into_inner())
+                .concat()
         }
-    } else {
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(MAX_WALK_THREADS);
-        let (tx, rx) = std::sync::mpsc::channel();
-        builder.threads(threads).build_parallel().run(|| {
-            let tx = tx.clone();
-            Box::new(move |entry| {
-                if cancel.is_cancelled() {
-                    return ignore::WalkState::Quit;
-                }
-                if let Some(entry) = walk_entry(root, entry) {
-                    // The receiver outlives the walk, so a send cannot fail.
-                    let _ = tx.send(entry);
-                }
-                ignore::WalkState::Continue
-            })
-        });
-        drop(tx);
-        entries.extend(rx);
-        if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
-    }
+    };
     entries.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
     Ok(entries)
+}
+
+/// One walker thread's entries, appended to the shared parts on drop.
+struct LocalEntries<'a> {
+    entries: Vec<WalkEntry>,
+    parts: &'a Mutex<Vec<Vec<WalkEntry>>>,
+}
+
+impl Drop for LocalEntries<'_> {
+    fn drop(&mut self) {
+        let entries = std::mem::take(&mut self.entries);
+        self.parts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(entries);
+    }
 }
 
 fn walk_entry(root: &Path, entry: Result<ignore::DirEntry, ignore::Error>) -> Option<WalkEntry> {

@@ -5,8 +5,8 @@ use serde_json::json;
 use super::*;
 use crate::test_support::{StubToolHost, stub_ctx};
 
-/// The walk no longer carries sizes; ls stats its own entries and still
-/// prints directories first, then files with their byte size.
+/// Directories first, then files with the byte size the walk records for each
+/// entry.
 #[tokio::test]
 async fn files_show_their_size_and_dirs_come_first() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -249,6 +249,34 @@ fn parallel_scan_is_complete_sorted_and_honours_gitignore() {
     assert_eq!(top, want_top);
 }
 
+/// With the process-wide thread budget used up, the unbounded walk runs
+/// serially on the calling thread and returns the same sorted entries.
+#[test]
+fn walk_without_spare_threads_matches_the_parallel_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    for d in 0..10 {
+        std::fs::create_dir_all(tmp.path().join(format!("d{d}/sub"))).unwrap();
+        for f in 0..5 {
+            std::fs::write(tmp.path().join(format!("d{d}/sub/f{f}.rs")), "").unwrap();
+        }
+    }
+    let cancel = CancellationToken::new();
+    let names = |cache: &WalkCache| -> Vec<String> {
+        cache
+            .collect(tmp.path(), NO_HIDDEN, &cancel)
+            .unwrap()
+            .iter()
+            .map(|e| e.rel.to_string_lossy().into_owned())
+            .collect()
+    };
+    let free = names(&WalkCache::new(Duration::from_secs(60), 16, 1024));
+    let held = crate::threads::shared().reserve(usize::MAX);
+    let starved = names(&WalkCache::new(Duration::from_secs(60), 16, 1024));
+    drop(held);
+    assert_eq!(free.len(), 10 + 10 + 50);
+    assert_eq!(starved, free);
+}
+
 #[test]
 fn cancelled_parallel_scan_reports_cancelled() {
     let tmp = tempfile::tempdir().unwrap();

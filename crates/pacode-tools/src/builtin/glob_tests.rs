@@ -35,8 +35,8 @@ async fn a_capped_listing_names_how_many_matches_it_hid() {
     assert!(!out.content.contains('—'));
 }
 
-/// The walk no longer carries mtimes; glob stats its matches itself and still
-/// lists them newest first (ties in path order).
+/// Matches come newest first by the mtime the walk records for each entry
+/// (ties in path order, since the walk is sorted).
 #[tokio::test]
 async fn matches_are_listed_newest_first() {
     let tmp = tempfile::tempdir().expect("tempdir");

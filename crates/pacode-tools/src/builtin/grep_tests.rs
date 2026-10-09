@@ -152,6 +152,33 @@ async fn a_parallel_search_keeps_walk_order_and_the_first_hits() {
         want.pop(); // the 151st hit is the first line of the 76th file
         assert_eq!(rows, want);
     }
+
+    // Settled by the calling thread's solo start (well inside the first
+    // FILES_PER_THREAD files): same first hits, same footer.
+    let out = GrepTool::default()
+        .call(json!({"pattern": "hit", "max_results": 21}), &ctx)
+        .await
+        .expect("grep");
+    let mut rows: Vec<String> = out.content.lines().map(str::to_string).collect();
+    assert!(
+        rows.pop()
+            .unwrap_or_default()
+            .starts_with("— stopped at max_results=21")
+    );
+    let mut want = expected(11);
+    want.pop();
+    assert_eq!(rows, want);
+
+    // With the process-wide thread budget used up, the search runs on its
+    // own thread and returns exactly the same rows.
+    let held = crate::threads::shared().reserve(usize::MAX);
+    let out = GrepTool::default()
+        .call(json!({"pattern": "hit", "max_results": 1000}), &ctx)
+        .await
+        .expect("grep");
+    drop(held);
+    let rows: Vec<String> = out.content.lines().map(str::to_string).collect();
+    assert_eq!(rows, expected(400));
 }
 
 /// A line longer than a search thread's buffer cap fails there; the file is

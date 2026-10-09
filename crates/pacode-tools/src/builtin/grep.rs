@@ -149,24 +149,27 @@ struct Query {
     max_results: usize,
 }
 
-/// Candidate files per search thread; below this a thread costs more than
-/// it saves, so small trees stay on one thread.
+/// Files the calling thread searches before asking for helpers, and files per
+/// helper thread: a search that a few files settle (a common pattern filling
+/// `max_results`) never pays for threads, and a small tree stays on one thread.
 const FILES_PER_THREAD: usize = 64;
-/// Ceiling on search threads per call: several agents may grep at once, and
-/// the blocking pool already runs one thread per call.
-const MAX_SEARCH_THREADS: usize = 8;
-/// Line-buffer ceiling for a parallel search thread (the searcher's buffer
-/// grows to the longest line it meets and keeps that size).
+/// Ceiling on helper threads for one call, before the process-wide budget
+/// (`crate::threads`) has its say.
+const MAX_HELPER_THREADS: usize = 7;
+/// Line-buffer ceiling for a helper thread (the searcher's buffer grows to the
+/// longest line it meets and keeps that size).
 const WORKER_HEAP_LIMIT: usize = 1024 * 1024;
 
 /// Blocking search of one file or a whole (cached) tree; returns the output
 /// rows and the number of hits.
 ///
-/// A tree is searched by up to `MAX_SEARCH_THREADS` threads pulling files in
-/// walk order from a shared index. Threads stop taking files once
-/// `max_results` hits are found; since files are handed out in order, every
-/// file before the last one taken has been searched, so merging per-file
-/// results in walk order yields exactly the rows a one-thread search would.
+/// A tree is searched in walk order: the calling thread takes the first
+/// `FILES_PER_THREAD` files alone; if they do not reach `max_results`, helper
+/// threads from the process-wide budget join it, all pulling files from one
+/// shared index. Workers stop taking files once `max_results` hits are found;
+/// since files are handed out in order, every file before the last one taken
+/// has been searched, so merging per-file results in walk order yields exactly
+/// the rows a one-thread search would.
 fn search(
     query: &Query,
     search_root: PathBuf,
@@ -179,17 +182,17 @@ fn search(
             .to_string_lossy()
             .into_owned()
     };
+    // The calling thread's searcher has no line cap: it is the one searcher
+    // a single-threaded grep would have, and it re-searches what the capped
+    // helpers could not.
+    let mut own = new_searcher(query, None);
 
     if search_root.is_file() {
-        let file = match search_file(
-            query,
-            &mut new_searcher(query, None),
-            &search_root,
-            &display(&search_root),
-        ) {
-            Ok(hits) | Err(hits) => hits,
-        };
-        return Ok(merge([file], query.max_results));
+        let file = search_file(query, &mut own, &search_root, &display(&search_root));
+        return Ok(merge(
+            [file.unwrap_or_else(|partial| partial)],
+            query.max_results,
+        ));
     }
 
     let entries = crate::walk::shared().collect(
@@ -210,63 +213,84 @@ fn search(
         })
         .collect();
 
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(MAX_SEARCH_THREADS);
-    let workers = (files.len() / FILES_PER_THREAD).clamp(1, threads);
     let next = AtomicUsize::new(0);
     let found = AtomicUsize::new(0);
-    // Each worker's line buffer is capped; a file with a longer line (a
-    // minified bundle, a binary without an early NUL) fails there and is
-    // searched again below by one uncapped searcher, so N threads never hold
-    // N giant buffers at once and no file is skipped.
-    let worker = || {
-        let mut searcher = new_searcher(query, Some(WORKER_HEAP_LIMIT));
+    // Pull files until none are left, `max_results` is reached, or (for the
+    // calling thread's solo start) `until` files have been handed out. A
+    // capped searcher's failure is queued for the uncapped retry; an uncapped
+    // one's is an IO error, and its partial rows stand, as in a plain search.
+    let work = |searcher: &mut Searcher, capped: bool, until: usize| {
         let mut out = Vec::new();
         let mut retry = Vec::new();
         while !cancel.is_cancelled() && found.load(Ordering::Relaxed) < query.max_results {
             let index = next.fetch_add(1, Ordering::Relaxed);
-            let Some(entry) = files.get(index) else { break };
+            if index >= until.min(files.len()) {
+                break;
+            }
             // Join onto the non-canonical root so the display path strips
             // against `cwd` exactly like a fresh walk would.
-            let path = search_root.join(&entry.rel);
-            match search_file(query, &mut searcher, &path, &display(&path)) {
-                Ok(hits) if hits.hits > 0 => {
-                    found.fetch_add(hits.hits, Ordering::Relaxed);
-                    out.push((index, hits));
+            let path = search_root.join(&files[index].rel);
+            let hits = match search_file(query, searcher, &path, &display(&path)) {
+                Ok(hits) => hits,
+                Err(_) if capped => {
+                    retry.push(index);
+                    continue;
                 }
-                Ok(_) => {}
-                Err(_) => retry.push(index),
+                Err(partial) => partial,
+            };
+            if hits.hits > 0 {
+                found.fetch_add(hits.hits, Ordering::Relaxed);
+                out.push((index, hits));
             }
         }
         (out, retry)
     };
-    let (mut per_file, retry) = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers).map(|_| scope.spawn(worker)).collect();
-        let mut all = Vec::new();
-        let mut retry = Vec::new();
-        for handle in handles {
-            let (part, failed) = handle
-                .join()
-                .map_err(|_| ToolError::failed("grep search thread panicked"))?;
-            all.extend(part);
-            retry.extend(failed);
-        }
-        Ok::<_, ToolError>((all, retry))
-    })?;
-    let mut uncapped = new_searcher(query, None);
-    for index in retry {
-        if cancel.is_cancelled() {
-            break;
-        }
-        let path = search_root.join(&files[index].rel);
-        // A second failure is an IO error (permissions, a vanished file):
-        // keep whatever rows came before it, as a single search would.
-        let hits = match search_file(query, &mut uncapped, &path, &display(&path)) {
-            Ok(hits) | Err(hits) => hits,
-        };
-        if hits.hits > 0 {
-            per_file.push((index, hits));
+
+    // Solo start; `next` overshoots by one when this stops at `until`, so it
+    // is reset to where the shared phase picks up.
+    let (mut per_file, _) = work(&mut own, false, FILES_PER_THREAD);
+    next.store(FILES_PER_THREAD, Ordering::Relaxed);
+
+    let remaining = files.len().saturating_sub(FILES_PER_THREAD);
+    if remaining > 0 && found.load(Ordering::Relaxed) < query.max_results && !cancel.is_cancelled()
+    {
+        let helpers = crate::threads::shared()
+            .reserve((remaining / FILES_PER_THREAD).min(MAX_HELPER_THREADS));
+        let retry = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..helpers.count())
+                .map(|_| {
+                    scope.spawn(|| {
+                        work(
+                            &mut new_searcher(query, Some(WORKER_HEAP_LIMIT)),
+                            true,
+                            usize::MAX,
+                        )
+                    })
+                })
+                .collect();
+            let (mine, _) = work(&mut own, false, usize::MAX);
+            per_file.extend(mine);
+            let mut retry = Vec::new();
+            for handle in handles {
+                let (part, failed) = handle
+                    .join()
+                    .map_err(|_| ToolError::failed("grep search thread panicked"))?;
+                per_file.extend(part);
+                retry.extend(failed);
+            }
+            Ok::<_, ToolError>(retry)
+        })?;
+        drop(helpers);
+        for index in retry {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let path = search_root.join(&files[index].rel);
+            let hits = search_file(query, &mut own, &path, &display(&path))
+                .unwrap_or_else(|partial| partial);
+            if hits.hits > 0 {
+                per_file.push((index, hits));
+            }
         }
     }
     if cancel.is_cancelled() {
