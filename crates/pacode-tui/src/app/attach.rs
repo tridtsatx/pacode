@@ -111,6 +111,10 @@ pub(super) fn switch_session(
         return;
     }
     let attach_client_context = client.event_context();
+    // Both expects below are unreachable: `pending_attach` is `Some` here.
+    // `leave_active_slot` (the only call above that clears it) ran first, then
+    // the block above either kept the pending attach for this same target or
+    // `begin_attach` set a new one, and nothing between there and here takes it.
     let token = state
         .set_pending_attach_client_epoch(attach_client_context.session_epoch.wrapping_add(1))
         .expect("pending attach must exist");
