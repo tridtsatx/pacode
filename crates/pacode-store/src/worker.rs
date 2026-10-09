@@ -568,13 +568,9 @@ impl Store {
 
     /// Forgets the session's conversation and keeps the session — see
     /// [`queries::clear_context`] for exactly what goes.
-    pub async fn clear_context(
-        &self,
-        session: &SessionId,
-        main_next_seq: u64,
-    ) -> Result<(), StoreError> {
+    pub async fn clear_context(&self, session: &SessionId) -> Result<(), StoreError> {
         let session = session.clone();
-        self.call(move |conn| queries::clear_context(conn, &session, main_next_seq))
+        self.call(move |conn| queries::clear_context(conn, &session))
             .await
     }
 

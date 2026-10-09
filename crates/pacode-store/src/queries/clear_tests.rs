@@ -122,7 +122,7 @@ async fn a_cleared_session_loads_nothing_from_before_the_clear() {
     let (store, session, sub) = seeded_store().await;
     let main = AgentId::main();
 
-    store.clear_context(&session, 4).await.unwrap();
+    store.clear_context(&session).await.unwrap();
 
     assert!(
         store
@@ -160,7 +160,7 @@ async fn a_cleared_session_keeps_admissions_as_idempotency_but_not_their_seqs() 
     let (store, session, _sub) = seeded_store().await;
     let main = AgentId::main();
 
-    store.clear_context(&session, 4).await.unwrap();
+    store.clear_context(&session).await.unwrap();
 
     // A replay of a message admitted before the clear is still a duplicate…
     let replay = store
@@ -198,7 +198,7 @@ async fn a_cleared_session_keeps_admissions_as_idempotency_but_not_their_seqs() 
 }
 
 #[tokio::test]
-async fn a_clear_keeps_main_rows_past_the_boundary_and_other_sessions() {
+async fn a_clear_deletes_every_row_of_the_session_and_nothing_of_another() {
     let (store, session, _sub) = seeded_store().await;
     let main = AgentId::main();
     let other = SessionId::new("ses_other");
@@ -208,15 +208,22 @@ async fn a_clear_keeps_main_rows_past_the_boundary_and_other_sessions() {
         .await
         .unwrap();
     store.save_plan(&other, &plan()).await.unwrap();
+    // A row memory has not caught up with: the clear has every writer locked
+    // out, so there is no cut-off to fall short of — it goes too.
     store
-        .append_message(&session, &main, 4, &Message::user("after the boundary"))
+        .append_message(&session, &main, 900, &Message::user("written last"))
         .await
         .unwrap();
 
-    store.clear_context(&session, 4).await.unwrap();
+    store.clear_context(&session).await.unwrap();
 
-    let kept = store.load_messages(&session, &main).await.unwrap();
-    assert_eq!(texts(&kept), vec!["after the boundary".to_string()]);
+    assert!(
+        store
+            .load_messages(&session, &main)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let elsewhere = store.load_messages(&other, &main).await.unwrap();
     assert_eq!(texts(&elsewhere), vec!["alpha elsewhere".to_string()]);
     assert_eq!(store.load_plan(&other).await.unwrap(), plan());

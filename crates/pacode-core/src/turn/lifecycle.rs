@@ -235,14 +235,10 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
         if agent.status().is_live() {
             agent.set_status(AgentStatus::Stopped, None);
             let info = agent.info();
-            session.events.emit(Event::AgentUpdated(info.clone()));
-            let session = session.clone();
-            let agent = agent.clone();
+            // Through the residency guard: a `/clear` may drop this agent
+            // before the spawned write runs.
             tokio::spawn(async move {
-                let _ = session
-                    .store
-                    .upsert_agent(&session.id, &info, agent.prompt().as_deref())
-                    .await;
+                session.publish_agent(&agent, info).await;
             });
         }
         return;

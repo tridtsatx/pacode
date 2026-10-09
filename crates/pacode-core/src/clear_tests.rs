@@ -110,12 +110,21 @@ async fn a_clear_resets_the_session_state_and_announces_it() {
     assert_eq!(snapshot.meta.id, id);
     assert_eq!(snapshot.meta.name.as_deref(), Some("clear test"));
     let mut announced = false;
+    let mut meter_reset = false;
     let mut badge_settled = false;
     while let Ok((_, event)) = events.try_recv() {
         announced |= event == Event::ContextCleared;
+        meter_reset |= matches!(
+            &event,
+            Event::UsageUpdated(usage) if usage.context_tokens == 0 && usage.turns == turns_before
+        ) && announced;
         badge_settled |= matches!(event, Event::NoticeLockChanged { held: 0, .. }) && announced;
     }
     assert!(announced, "attached clients reset on ContextCleared");
+    assert!(
+        meter_reset,
+        "every client folds UsageUpdated, so the meter rides it too"
+    );
     assert!(badge_settled, "the notice badge learns its backlog is gone");
 }
 
@@ -239,4 +248,164 @@ async fn a_refused_clear_leaves_the_conversation_alone() {
     while let Ok((_, event)) = events.try_recv() {
         assert_ne!(event, Event::ContextCleared);
     }
+}
+
+fn digger() -> pacode_tools::AgentSpec {
+    pacode_tools::AgentSpec {
+        prompt: "dig through the logs".into(),
+        name: Some("digger".into()),
+        model: None,
+        effort: None,
+        fork: false,
+        tools: None,
+        exclude_tools: None,
+    }
+}
+
+/// A subagent that ran to the end — so `interrupt_all` has nothing to stop
+/// and a test holding its `message_write_lock` blocks only the clear — and
+/// the main turn its report woke.
+async fn finished_subagent(
+    h: &Harness,
+    session: &Arc<crate::session::Session>,
+) -> Arc<crate::agent::Agent> {
+    let main = session.main_agent().unwrap();
+    h.mock.push(MockResponse::Text("found it".into()));
+    h.mock.push(MockResponse::Text("noted".into()));
+    let id = session.spawn_agent(digger()).await.unwrap();
+    let sub = session.agent(&id).unwrap();
+    wait_until(|| {
+        sub.status() == pacode_types::AgentStatus::Finished
+            && h.mock.requests().len() == 2
+            && !main.is_running()
+    })
+    .await;
+    sub
+}
+
+/// Spawn the clear and return once it is parked on `sub`'s write lock, which
+/// the caller holds: the clear then holds every turn lock, `submit_lock` and
+/// the main agent's write lock — taken right before the subagents' — and
+/// nothing else in these tests takes that last one.
+async fn clear_parked_on(
+    h: &Harness,
+    id: &SessionId,
+    session: &Arc<crate::session::Session>,
+) -> tokio::task::JoinHandle<Reply> {
+    let main = session.main_agent().unwrap();
+    let core = Arc::clone(&h.core);
+    let id = id.clone();
+    let clear = tokio::spawn(async move { core.handle(&id, Request::ClearContext).await });
+    wait_until(|| main.message_write_lock.try_lock().is_err()).await;
+    clear
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_write_in_flight_lands_before_the_purge_and_goes_with_it() {
+    let h = Harness::new().await;
+    let (id, session) = open_named(&h, false).await;
+    let sub = finished_subagent(&h, &session).await;
+    let write = sub.message_write_lock.clone().lock_owned().await;
+
+    let clear = clear_parked_on(&h, &id, &session).await;
+    assert!(
+        session.agent(&sub.id()).is_some(),
+        "the clear may not drop an agent whose row write is in flight"
+    );
+    // What `stop_agent` or `publish_agent` does under that lock.
+    session
+        .store
+        .upsert_agent(&id, &sub.info(), None)
+        .await
+        .unwrap();
+    drop(write);
+
+    assert_eq!(clear.await.unwrap(), Reply::Ok);
+    let stored = session.store.list_agents(&id).await.unwrap();
+    assert!(stored.iter().all(|info| info.id.is_main()), "{stored:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_write_cannot_bring_a_cleared_subagent_back() {
+    let h = Harness::new().await;
+    let (id, session) = open_named(&h, false).await;
+    let sub = finished_subagent(&h, &session).await;
+    assert_eq!(h.core.handle(&id, Request::ClearContext).await, Reply::Ok);
+    let mut events = session.events.subscribe();
+
+    // The write `set_model`/`set_effort` or the stopped-subagent landing would
+    // make with an `Arc` taken before the clear.
+    session.publish_agent(&sub, sub.info()).await;
+
+    let stored = session.store.list_agents(&id).await.unwrap();
+    assert!(stored.iter().all(|info| info.id.is_main()), "{stored:?}");
+    while let Ok((_, event)) = events.try_recv() {
+        assert!(
+            !matches!(&event, Event::AgentUpdated(info) if info.id == sub.id()),
+            "no client may get the dropped card back: {event:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_clear_still_wakes_the_main_agent() {
+    let h = Harness::new().await;
+    let (id, session) = open_named(&h, false).await;
+    let main = session.main_agent().unwrap();
+    let sub = finished_subagent(&h, &session).await;
+    let write = sub.message_write_lock.clone().lock_owned().await;
+    let clear = clear_parked_on(&h, &id, &session).await;
+
+    // Close lands while the clear waits, and a notice arrives that finds the
+    // main turn lock taken — so nothing but the clear can deliver it.
+    session
+        .closed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.mock.push(MockResponse::Text("woken".into()));
+    session.inject_and_wake(
+        &main,
+        crate::inject::Injection::SystemNotice("wake after the clear".into()),
+    );
+    drop(write);
+
+    assert!(matches!(clear.await.unwrap(), Reply::Error { .. }));
+    wait_until(|| {
+        h.mock
+            .requests()
+            .iter()
+            .any(|request| mentions(&request.messages, "wake after the clear"))
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_started_after_the_sweep_is_cancelled_not_waited_out() {
+    let h = Harness::new().await;
+    let (_id, session) = open_named(&h, true).await;
+    let main = session.main_agent().unwrap();
+    // The gate never opens on its own: this is the turn a redrive or a
+    // monitor starts between `interrupt_all` and the lock acquisition.
+    session
+        .submit_user_message("started in the gap".into())
+        .await
+        .unwrap();
+    h.wait_for_gate().await;
+
+    let agents = session
+        .agents
+        .read()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let guards = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::clear::lock_turns_interrupting(&session, &agents),
+    )
+    .await
+    .expect("the lock waits for an unwind, never for a whole turn");
+
+    assert_eq!(guards.len(), agents.len());
+    drop(guards);
+    wait_until(|| !main.is_running()).await;
 }

@@ -1323,19 +1323,36 @@ impl Session {
             let Some(info) = updated_info else {
                 continue;
             };
-            if let Err(e) = self
-                .store
-                .upsert_agent(&self.id, &info, agent.prompt().as_deref())
-                .await
-            {
-                log::warn!(
-                    "failed to persist agent {} in session {}: {e}",
-                    info.id,
-                    self.id
-                );
-            }
-            self.events.emit(pacode_types::Event::AgentUpdated(info));
+            self.publish_agent(&agent, info).await;
         }
+    }
+
+    /// Persist `info` as `agent`'s row and broadcast it — unless the agent has
+    /// left the session. Both happen under the agent's `message_write_lock`,
+    /// which `/clear` holds while it drops subagents and purges their rows, so
+    /// a write either lands before the purge (and goes with it) or finds the
+    /// agent gone. A write that slipped past would bring a cleared subagent
+    /// back: its row on the next resume, its card in every rail.
+    pub(crate) async fn publish_agent(&self, agent: &Arc<Agent>, info: AgentInfo) {
+        let _guard = agent.message_write_lock.clone().lock_owned().await;
+        let resident = self
+            .agent_for_host(&agent.id())
+            .is_some_and(|current| Arc::ptr_eq(&current, agent));
+        if !resident {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .upsert_agent(&self.id, &info, agent.prompt().as_deref())
+            .await
+        {
+            log::warn!(
+                "failed to persist agent {} in session {}: {e}",
+                info.id,
+                self.id
+            );
+        }
+        self.events.emit(pacode_types::Event::AgentUpdated(info));
     }
 
     /// Spawn a subagent (depth 1, no concurrency cap) and start its turn.

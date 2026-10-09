@@ -11,10 +11,11 @@ use crate::txn::Txn;
 #[path = "clear_tests.rs"]
 mod clear_tests;
 
-/// Forget a session's conversation, in one transaction: every main-agent
-/// message with `seq < main_next_seq`, every row of every other agent
-/// (subagents are dropped with the conversation), every compaction summary
-/// and the plan.
+/// Forget a session's conversation, in one transaction: every message of
+/// every agent (subagents are dropped with the conversation), every subagent
+/// row, every compaction summary and the plan. The caller has every writer of
+/// these rows locked out, so "every" needs no boundary — a seq cut-off taken
+/// from memory could only lag the store and leave rows behind.
 ///
 /// The rows are deleted rather than fenced off behind a persisted boundary.
 /// The UI transcript has no table of its own — a resume rebuilds it from
@@ -28,31 +29,20 @@ mod clear_tests;
 /// Message admissions stay: they are the idempotency record a replayed client
 /// message is answered from. They lose their `message_seq`, though — the rows
 /// they pointed at are gone, and a resumed session restarts its seq counter
-/// from what is left, so an `interrupted` admission still holding seq 3 would
-/// hide the new message that takes seq 3. Usage rows stay too: they are what
-/// the session cost, not what the model remembers.
-pub fn clear_context(
-    conn: &mut Connection,
-    session: &SessionId,
-    main_next_seq: u64,
-) -> Result<(), StoreError> {
-    let main = AgentId::main();
-    let next_seq = i64::try_from(main_next_seq).unwrap_or(i64::MAX);
+/// from an empty table, so an `interrupted` admission still holding seq 3
+/// would hide the new message that takes seq 3. Usage rows stay too: they are
+/// what the session cost, not what the model remembers.
+pub fn clear_context(conn: &mut Connection, session: &SessionId) -> Result<(), StoreError> {
     let tx = Txn::open(conn)?;
     super::message::purge_messages(
         &tx,
-        "session_id = ?1 AND (agent_id <> ?2 OR seq < ?3)",
-        &[
-            Value::Text(session.as_str().to_string()),
-            Value::Text(main.as_str().to_string()),
-            Value::Integer(next_seq),
-        ],
+        "session_id = ?1",
+        &[Value::Text(session.as_str().to_string())],
     )?;
     tx.execute(
         "UPDATE message_admissions SET message_seq = NULL
-         WHERE session_id = ?1 AND message_seq IS NOT NULL
-           AND (agent_id <> ?2 OR message_seq < ?3);",
-        params![session.as_str(), main.as_str(), next_seq],
+         WHERE session_id = ?1 AND message_seq IS NOT NULL;",
+        params![session.as_str()],
     )?;
     tx.execute(
         "DELETE FROM compaction WHERE session_id = ?1;",
@@ -60,7 +50,7 @@ pub fn clear_context(
     )?;
     tx.execute(
         "DELETE FROM agents WHERE session_id = ?1 AND id <> ?2;",
-        params![session.as_str(), main.as_str()],
+        params![session.as_str(), AgentId::main().as_str()],
     )?;
     tx.execute(
         "DELETE FROM plans WHERE session_id = ?1;",
