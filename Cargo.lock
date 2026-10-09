@@ -3201,6 +3201,7 @@ dependencies = [
  "grep-searcher",
  "htmd",
  "ignore",
+ "libc",
  "log",
  "pacode-exec",
  "pacode-mcp",

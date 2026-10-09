@@ -11,6 +11,10 @@
 //! keep freed memory resident.
 //!
 //! Owner: the [`shared`] singleton; a reservation returns its threads on drop.
+//!
+//! Outside the budget: `grep`'s long-line lane (`builtin/grep_lane.rs`), one
+//! process-lifetime thread that is idle until a file has a line over the
+//! search buffer cap.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};

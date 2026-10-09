@@ -119,10 +119,13 @@ impl Tool for GrepTool {
         let cancel = ctx.cancel.clone();
         let cwd = ctx.cwd.clone();
 
-        let (output_lines, hits_count) =
-            tokio::task::spawn_blocking(move || search(&query, search_root, &cwd, &cancel))
-                .await
-                .map_err(|e| ToolError::failed(e.to_string()))??;
+        let Found {
+            rows: output_lines,
+            hits: hits_count,
+            too_long,
+        } = tokio::task::spawn_blocking(move || search(&query, search_root, &cwd, &cancel))
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))??;
 
         let mut joined = output_lines.join("\n");
         // The search stops at the limit, so whether more matches exist is
@@ -132,6 +135,9 @@ impl Tool for GrepTool {
                 "\n— stopped at max_results={max_results}; more matches may exist, narrow \
                  `path`/`glob` or raise `max_results`"
             ));
+        }
+        if !too_long.is_empty() {
+            joined.push_str(&too_long_note(&too_long));
         }
         let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
         let preview = if hits_count == 0 {
@@ -184,7 +190,7 @@ fn search(
     search_root: PathBuf,
     cwd: &Path,
     cancel: &CancellationToken,
-) -> Result<(Vec<String>, usize), ToolError> {
+) -> Result<Found, ToolError> {
     let display = |path: &Path| {
         path.strip_prefix(cwd)
             .unwrap_or(path)
@@ -194,9 +200,21 @@ fn search(
 
     if search_root.is_file() {
         let shown = display(&search_root);
-        let file = search_file(query, &mut new_searcher(query), &search_root, &shown)
-            .unwrap_or_else(|_| search_long_lines(query, &search_root, &shown));
-        return Ok(merge([file], query.max_results));
+        let (file, too_long) =
+            match search_file(query, &mut new_searcher(query), &search_root, &shown) {
+                Ok(hits) => (hits, false),
+                Err(_) => {
+                    let lane = search_long_lines(query, &search_root, &shown);
+                    (lane.hits, lane.too_long)
+                }
+            };
+        let (rows, hits) = merge([file], query.max_results);
+        let too_long = if too_long { vec![shown] } else { Vec::new() };
+        return Ok(Found {
+            rows,
+            hits,
+            too_long,
+        });
     }
 
     let entries = crate::walk::shared().collect(
@@ -277,24 +295,67 @@ fn search(
             Ok::<_, ToolError>(())
         })?;
     }
+    retry.sort_unstable();
+    let mut too_long = Vec::new();
     for index in retry {
         if cancel.is_cancelled() {
             break;
         }
         let path = search_root.join(&files[index].rel);
-        let hits = search_long_lines(query, &path, &display(&path));
-        if hits.hits > 0 {
-            per_file.push((index, hits));
+        let shown = display(&path);
+        let lane = search_long_lines(query, &path, &shown);
+        if lane.too_long {
+            too_long.push(shown);
+        }
+        if lane.hits.hits > 0 {
+            per_file.push((index, lane.hits));
         }
     }
     if cancel.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
     per_file.sort_unstable_by_key(|(index, _)| *index);
-    Ok(merge(
+    let (rows, hits) = merge(
         per_file.into_iter().map(|(_, file)| file),
         query.max_results,
-    ))
+    );
+    Ok(Found {
+        rows,
+        hits,
+        too_long,
+    })
+}
+
+/// What a search produced: output rows, hit count, and the files it could not
+/// search to the end because a line is longer than the lane's buffer cap.
+struct Found {
+    rows: Vec<String>,
+    hits: usize,
+    too_long: Vec<String>,
+}
+
+/// Paths named in the too-long footer; the rest are counted.
+const MAX_TOO_LONG_NAMED: usize = 5;
+
+/// Footer naming the files not searched to the end (never silent), bounded.
+fn too_long_note(paths: &[String]) -> String {
+    let limit_mib = lane::LANE_LINE_LIMIT / (1024 * 1024);
+    let named = paths
+        .iter()
+        .take(MAX_TOO_LONG_NAMED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = paths.len().saturating_sub(MAX_TOO_LONG_NAMED);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "\n— not searched past a line longer than {limit_mib} MiB: {named}{more}; search those \
+         with `bash` (e.g. `grep -c`)"
+    )
 }
 
 fn new_searcher(query: &Query) -> Searcher {
@@ -319,13 +380,13 @@ struct FileHits {
     hits: usize,
 }
 
-/// `Err` carries the rows found before the search failed.
+/// `Err` carries the rows found before the search failed, and why it failed.
 fn search_file(
     query: &Query,
     searcher: &mut Searcher,
     path: &Path,
     display: &str,
-) -> Result<FileHits, FileHits> {
+) -> Result<FileHits, (FileHits, std::io::Error)> {
     let mut sink = CollectSink {
         matcher: &query.matcher,
         display_path: display,
@@ -334,7 +395,7 @@ fn search_file(
     };
     match searcher.search_path(&query.matcher, path, &mut sink) {
         Ok(()) => Ok(sink.out),
-        Err(_) => Err(sink.out),
+        Err(err) => Err((sink.out, err)),
     }
 }
 

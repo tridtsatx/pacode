@@ -38,6 +38,7 @@ url = { workspace = true }
 dom_smoothie = { workspace = true }
 htmd = { workspace = true }
 regex = { workspace = true }
+libc = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]

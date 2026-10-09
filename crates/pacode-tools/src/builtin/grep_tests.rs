@@ -217,3 +217,55 @@ async fn a_line_over_the_thread_buffer_cap_is_still_searched() {
         assert_eq!(result.expect("grep").content, out.content);
     }
 }
+
+/// A line longer than even the lane's cap is not searched (holding it would
+/// cost that much memory): the rows before it stand and the footer names the
+/// file — in a tree and when the file is named directly. Other files are
+/// unaffected.
+#[tokio::test]
+async fn a_line_over_the_lane_cap_is_skipped_and_reported() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("ok.txt"), "NEEDLE ok\n").expect("write");
+    let huge = "x".repeat(lane::LANE_LINE_LIMIT + 1024);
+    std::fs::write(
+        tmp.path().join("huge.txt"),
+        format!("NEEDLE before\n{huge}NEEDLE\nNEEDLE after\n"),
+    )
+    .expect("write");
+    let ctx = ctx_in(tmp.path());
+    let footer = format!(
+        "— not searched past a line longer than {} MiB: huge.txt; search those with `bash` (e.g. `grep -c`)",
+        lane::LANE_LINE_LIMIT / (1024 * 1024)
+    );
+
+    let out = GrepTool::default()
+        .call(json!({"pattern": "NEEDLE"}), &ctx)
+        .await
+        .expect("grep");
+    let rows: Vec<&str> = out.content.lines().collect();
+    assert_eq!(
+        rows,
+        vec![
+            "huge.txt:1:NEEDLE before",
+            "ok.txt:1:NEEDLE ok",
+            footer.as_str()
+        ],
+        "content: {}",
+        out.content
+    );
+
+    let single = GrepTool::default()
+        .call(json!({"pattern": "NEEDLE", "path": "huge.txt"}), &ctx)
+        .await
+        .expect("grep");
+    let rows: Vec<&str> = single.content.lines().collect();
+    assert_eq!(rows, vec!["huge.txt:1:NEEDLE before", footer.as_str()]);
+}
+
+#[test]
+fn the_too_long_footer_names_at_most_five_files() {
+    let paths: Vec<String> = (0..7).map(|i| format!("f{i}")).collect();
+    let note = too_long_note(&paths);
+    assert!(note.contains(": f0, f1, f2, f3, f4 and 2 more;"), "{note}");
+    assert!(!note.contains("f5"));
+}
