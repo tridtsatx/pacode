@@ -63,6 +63,40 @@ fn test_rgb_to_ansi16_fallback() {
     assert_eq!(rgb_to_ansi16(192, 192, 192), Color::Gray);
 }
 
+/// Under ANSI-16 a palette's quiet greys must stay grey and its status
+/// colours must keep their hue: nearest-by-distance turned `faint` yellow and
+/// green/cyan grey, so every badge drew as a grey plaque.
+#[test]
+fn ansi_fallback_keeps_greys_grey_and_hues_hued() {
+    let grey = |c: Option<Color>| {
+        matches!(
+            c,
+            Some(Color::Black | Color::DarkGray | Color::Gray | Color::White)
+        )
+    };
+    for palette in builtin_palettes() {
+        let t = Theme::from_palette(palette, false);
+        let name = &palette.name;
+        assert!(grey(t.faint.fg), "{name}: faint {:?}", t.faint.fg);
+        assert!(grey(t.dim.fg), "{name}: dim {:?}", t.dim.fg);
+        // Roles named after a colour are that colour, as in `Theme::ansi()`.
+        assert_eq!(t.green.fg, Some(Color::Green), "{name}");
+        assert_eq!(t.red.fg, Some(Color::Red), "{name}");
+        assert_eq!(t.cyan.fg, Some(Color::Cyan), "{name}");
+        assert_eq!(t.yellow.fg, Some(Color::Yellow), "{name}");
+        assert_eq!(t.violet.fg, Some(Color::Magenta), "{name}");
+        // The accent keeps a hue rather than collapsing to a grey.
+        assert!(!grey(t.accent.fg), "{name}: accent {:?}", t.accent.fg);
+        // A badge is the hue reversed, never a grey plaque.
+        let badge = t.badge(t.green);
+        assert!(badge.add_modifier.contains(Modifier::REVERSED), "{name}");
+        assert!(!grey(badge.fg), "{name}: badge {:?}", badge.fg);
+    }
+    // Nearest-by-distance put this dark grey on Yellow (128,128,0).
+    assert_eq!(rgb_to_ansi16(0x43, 0x46, 0x3f), Color::DarkGray);
+    assert_eq!(rgb_to_ansi16(0x6e, 0xa9, 0xbd), Color::Cyan);
+}
+
 #[test]
 fn test_pacode_dark_equals_theme_default_field_for_field() {
     let builtins = builtin_palettes();
@@ -116,6 +150,8 @@ fn test_partial_palette_fallback() {
 #[test]
 fn test_non_truecolor_converts_hex_to_ansi16() {
     let mut colors = BTreeMap::new();
+    colors.insert("accent".to_string(), "#ff0000".to_string());
+    colors.insert("red".to_string(), "#ff8080".to_string());
     colors.insert("fg".to_string(), "#ff0000".to_string());
     let pal = Palette {
         name: "test".to_string(),
@@ -124,7 +160,11 @@ fn test_non_truecolor_converts_hex_to_ansi16() {
     };
 
     let theme = Theme::from_palette(&pal, false);
-    assert_eq!(theme.fg, Style::default().fg(Color::LightRed));
+    // A hue role keeps its hue, a role named after a colour is that colour,
+    // and a text role stays on the grey ramp.
+    assert_eq!(theme.accent, Style::default().fg(Color::LightRed));
+    assert_eq!(theme.red, Style::default().fg(Color::Red));
+    assert_eq!(theme.fg, Style::default().fg(Color::White));
 }
 
 #[test]

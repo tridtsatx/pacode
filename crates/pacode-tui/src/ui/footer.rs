@@ -327,23 +327,23 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                     }
                     _ => {
                         // Without a session the mode is unknown: saying the
-                        // default mode's rules would be a guess (B10).
-                        let (perm_line, perm_style, hint) = match state.meta.as_ref() {
-                            Some(meta) => (
-                                meta.mode.permission_line(),
-                                crate::ui::chrome::mode_tone(meta.mode, &opts.theme),
-                                state
-                                    .keymap
-                                    .hint(KeyAction::CycleMode)
-                                    .map(|key| format!(" ({key} to cycle)"))
-                                    .unwrap_or_default(),
-                            ),
-                            None => (
-                                crate::ui::footer_status::NO_SESSION,
-                                opts.theme.faint,
-                                String::new(),
-                            ),
+                        // default mode's rules would be a guess (B10). Row 1
+                        // already says "no session"; this row keeps only the
+                        // slots and the keys.
+                        let Some(meta) = state.meta.as_ref() else {
+                            return render_row2_with_right(
+                                Vec::new(),
+                                context_right_spans(state, opts),
+                                width,
+                            );
                         };
+                        let perm_line = meta.mode.permission_line();
+                        let perm_style = crate::ui::chrome::mode_tone(meta.mode, &opts.theme);
+                        let hint = state
+                            .keymap
+                            .hint(KeyAction::CycleMode)
+                            .map(|key| format!(" ({key} to cycle)"))
+                            .unwrap_or_default();
 
                         let right_spans = context_right_spans(state, opts);
                         let right_len: usize =

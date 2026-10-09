@@ -193,11 +193,15 @@ pub fn compute(
     let clamped_input = input_lines.clamp(INPUT_MIN_LINES, INPUT_MAX_LINES);
     let input_h = clamped_input.min(rem_for_input);
     let input_y = input_bottom_y.saturating_sub(input_h);
-    let inset = if left_area.width >= PROMPT_FRAME_MIN_WIDTH {
-        PROMPT_INSET
-    } else {
-        0
-    };
+    // Above the input: the frame's top border, then the preview strip above
+    // the frame. The strip takes space from the dialog (which can scroll),
+    // never from the input.
+    let input_top_h = if input_y > left_area.y { 1 } else { 0 };
+    // Side borders only when the whole frame is there: both border rows and
+    // room for the text. Otherwise the input keeps the full column and the
+    // rows that exist draw as plain rules.
+    let framed = left_area.width >= PROMPT_FRAME_MIN_WIDTH && input_top_h > 0 && input_bottom_h > 0;
+    let inset = if framed { PROMPT_INSET } else { 0 };
     let input = Rect::new(
         left_area.x + inset,
         input_y,
@@ -205,10 +209,6 @@ pub fn compute(
         input_h,
     );
 
-    // Above the input: the frame's top border, then the preview strip above
-    // the frame. The strip takes space from the dialog (which can scroll),
-    // never from the input.
-    let input_top_h = if input_y > left_area.y { 1 } else { 0 };
     let input_top_y = input_y.saturating_sub(input_top_h);
     let input_top = Rect::new(left_area.x, input_top_y, left_area.width, input_top_h);
     let preview_h = preview_lines.min(input_top_y.saturating_sub(left_area.y));

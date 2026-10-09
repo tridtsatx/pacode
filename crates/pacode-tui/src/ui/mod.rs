@@ -452,12 +452,18 @@ pub(crate) fn extract_selection_text(
         let Some(col_range) = selection.col_range_for_line(line_idx, width) else {
             continue;
         };
-        let Some(text) = lines.lines.get(line_idx.saturating_sub(lines.first_line)) else {
+        let index = line_idx.saturating_sub(lines.first_line);
+        let Some(text) = lines.lines.get(index) else {
             continue;
         };
-        let slice =
-            crate::state::selection::slice_by_columns(text, *col_range.start(), *col_range.end())
-                .to_string();
+        // Decoration (bar, marker, gutter) is drawn, never copied.
+        let lead = lines.leads.get(index).copied().unwrap_or(0);
+        let start = (*col_range.start()).max(u16::try_from(lead).unwrap_or(u16::MAX));
+        let slice = if start > *col_range.end() {
+            String::new()
+        } else {
+            crate::state::selection::slice_by_columns(text, start, *col_range.end()).to_string()
+        };
         let slice = slice.trim_end().to_string();
         if slice.chars().count() > budget {
             out.push(slice.chars().take(budget).collect());

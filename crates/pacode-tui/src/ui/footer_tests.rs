@@ -51,6 +51,24 @@ fn no_session_shows_no_model_mode_or_effort() {
     let row2 = line_text(&render_row2(120, &state, &opts));
     assert!(!row2.contains("ask before edits"), "row2 was: {row2}");
     assert!(!row2.contains("to cycle"), "row2 was: {row2}");
+    // Said once, on row 1.
+    assert!(
+        !row2.contains(crate::ui::footer_status::NO_SESSION),
+        "row2 was: {row2}"
+    );
+}
+
+/// The model name is the part that yields, with a visible `…`, and the
+/// effort after it survives whole.
+#[test]
+fn a_narrow_status_row_cuts_the_model_not_the_effort() {
+    let state = make_test_state();
+    // " BUILD " + " " + model + " · " + "high" = 15 cells + the model.
+    let opts = RenderOptions::new(22, false);
+    let text = line_text(&render_row1(22, &state, &opts));
+    assert_eq!(pacode_render::display_width(&text), 22, "{text}");
+    assert!(text.ends_with(" · high"), "{text}");
+    assert!(text.contains('…'), "{text}");
 }
 
 #[test]

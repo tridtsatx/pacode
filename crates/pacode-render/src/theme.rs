@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
+use crate::color::{GREY_ROLES, NAMED_ROLES};
+pub use crate::color::{ansi_grey, ansi_hue, parse_color, rgb_to_ansi16};
 pub use crate::glyphs::Glyphs;
 pub use crate::palettes::builtin_palettes;
 
@@ -142,8 +144,18 @@ impl Theme {
             let raw = p.colors.get(key)?;
             let parsed = parse_color(raw)?;
             if !truecolor {
+                // A role's meaning picks the mapping: text and backgrounds
+                // stay on the grey ramp, status and syntax roles keep a hue.
+                // A role named after a colour is that colour, as in
+                // `Theme::ansi()`: a palette's olive "green" is still green.
+                let named = NAMED_ROLES
+                    .iter()
+                    .find(|(role, _)| *role == key)
+                    .map(|(_, c)| *c);
                 match parsed {
-                    Color::Rgb(r, g, b) => Some(rgb_to_ansi16(r, g, b)),
+                    Color::Rgb(..) if named.is_some() => named,
+                    Color::Rgb(r, g, b) if GREY_ROLES.contains(&key) => Some(ansi_grey(r, g, b)),
+                    Color::Rgb(r, g, b) => Some(ansi_hue(r, g, b)),
                     other => Some(other),
                 }
             } else {
@@ -412,93 +424,6 @@ fn contrast_fg(r: u8, g: u8, b: u8) -> Color {
     } else {
         BADGE_LIGHT
     }
-}
-
-/// Parse a color string: `"#rrggbb"`, `"#rgb"`, a named ANSI colour, or an index `0-255`.
-pub fn parse_color(s: &str) -> Option<Color> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-
-    if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some(Color::Rgb(r, g, b));
-        } else if hex.len() == 3 {
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
-            return Some(Color::Rgb(r * 17, g * 17, b * 17));
-        }
-        return None;
-    }
-
-    if let Ok(idx) = s.parse::<u8>() {
-        return Some(Color::Indexed(idx));
-    }
-
-    let lower = s.to_ascii_lowercase();
-    match lower.as_str() {
-        "black" => Some(Color::Black),
-        "red" => Some(Color::Red),
-        "green" => Some(Color::Green),
-        "yellow" => Some(Color::Yellow),
-        "blue" => Some(Color::Blue),
-        "magenta" | "purple" => Some(Color::Magenta),
-        "cyan" => Some(Color::Cyan),
-        "gray" | "grey" => Some(Color::Gray),
-        "darkgray" | "dark_gray" | "dark-gray" | "darkgrey" => Some(Color::DarkGray),
-        "lightred" | "light_red" | "light-red" => Some(Color::LightRed),
-        "lightgreen" | "light_green" | "light-green" => Some(Color::LightGreen),
-        "lightyellow" | "light_yellow" | "light-yellow" => Some(Color::LightYellow),
-        "lightblue" | "light_blue" | "light-blue" => Some(Color::LightBlue),
-        "lightmagenta" | "light_magenta" | "light-magenta" => Some(Color::LightMagenta),
-        "lightcyan" | "light_cyan" | "light-cyan" => Some(Color::LightCyan),
-        "white" => Some(Color::White),
-        "reset" => Some(Color::Reset),
-        _ => None,
-    }
-}
-
-/// Map an RGB value to the nearest ANSI-16 colour using squared Euclidean distance.
-pub fn rgb_to_ansi16(r: u8, g: u8, b: u8) -> Color {
-    const ANSI_TABLE: [(Color, (u8, u8, u8)); 16] = [
-        (Color::Black, (0, 0, 0)),
-        (Color::Red, (128, 0, 0)),
-        (Color::Green, (0, 128, 0)),
-        (Color::Yellow, (128, 128, 0)),
-        (Color::Blue, (0, 0, 128)),
-        (Color::Magenta, (128, 0, 128)),
-        (Color::Cyan, (0, 128, 128)),
-        (Color::Gray, (192, 192, 192)),
-        (Color::DarkGray, (128, 128, 128)),
-        (Color::LightRed, (255, 0, 0)),
-        (Color::LightGreen, (0, 255, 0)),
-        (Color::LightYellow, (255, 255, 0)),
-        (Color::LightBlue, (0, 0, 255)),
-        (Color::LightMagenta, (255, 0, 255)),
-        (Color::LightCyan, (0, 255, 255)),
-        (Color::White, (255, 255, 255)),
-    ];
-
-    let mut best_color = Color::White;
-    let mut best_dist = u64::MAX;
-
-    for (color, (ar, ag, ab)) in ANSI_TABLE {
-        let dr = (r as i32) - (ar as i32);
-        let dg = (g as i32) - (ag as i32);
-        let db = (b as i32) - (ab as i32);
-        let dist = (dr * dr + dg * dg + db * db) as u64;
-        if dist < best_dist {
-            best_dist = dist;
-            best_color = color;
-        }
-    }
-
-    best_color
 }
 
 #[cfg(test)]

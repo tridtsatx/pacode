@@ -15,7 +15,8 @@ use pacode_types::TranscriptKind;
 use pacode_types::transcript::ToolStatus;
 
 use super::cells::{
-    assistant_markdown, assistant_stats_line, render_background_result, render_item_inner,
+    assistant_markdown, assistant_stats_line, decoration_width, render_background_result,
+    render_item_inner,
 };
 use crate::state::selection::{MAX_SELECTION_BYTES, MAX_SELECTION_LINES};
 use crate::state::transcript::{
@@ -47,9 +48,15 @@ impl PlainWindow {
 /// content line number `lines[0]` stands for, so the caller can index the
 /// result by transcript line without the copy having materialized everything
 /// above the selection.
+///
+/// `leads[i]` is how many leading columns of `lines[i]` are decoration — the
+/// user band's bar, the answer's marker and indent, a tool body's gutter. The
+/// text keeps them so columns stay aligned with the screen; the copy drops
+/// them. A missing entry means none.
 #[derive(Default)]
 pub(crate) struct PlainLines {
     pub lines: Vec<String>,
+    pub leads: Vec<usize>,
     pub first_line: usize,
 }
 
@@ -76,8 +83,9 @@ impl PlainSink {
         }
     }
 
-    fn push(&mut self, rendered: &[String], at: usize) {
-        for (offset, text) in rendered.iter().enumerate() {
+    /// `rendered` holds each row's text and its decoration width.
+    fn push(&mut self, rendered: &[(String, usize)], at: usize) {
+        for (offset, (text, lead)) in rendered.iter().enumerate() {
             let line = at.saturating_add(offset);
             if line < self.start || line > self.end {
                 continue;
@@ -87,6 +95,7 @@ impl PlainSink {
                 self.out.first_line = line;
             }
             self.out.lines.push(text.clone());
+            self.out.leads.push(*lead);
             if self.full() {
                 return;
             }
@@ -565,10 +574,10 @@ pub(crate) fn plain_lines(
     let mut line = 0usize;
 
     if let Some(info) = header.as_ref() {
-        let rendered: Vec<String> =
+        let rendered: Vec<(String, usize)> =
             crate::ui::header::render(info, width, opts, anim_frame, welcome_ms)
                 .iter()
-                .map(line_text)
+                .map(|l| (line_text(l), 0))
                 .collect();
         sink.push(&rendered, line);
         line += rendered.len();
@@ -584,7 +593,11 @@ pub(crate) fn plain_lines(
             stable_revision: stable_revisions.get(&cell.id).copied().unwrap_or((0, 0)),
         };
         let block = render_cell_block(cell, state, opts, cache, tool_streams, width, anim_frame);
-        let rendered: Vec<String> = block.lines().iter().map(line_text).collect();
+        let rendered: Vec<(String, usize)> = block
+            .lines()
+            .iter()
+            .map(|l| (line_text(l), decoration_width(&cell.kind, l, opts)))
+            .collect();
         sink.push(&rendered, line);
         line += rendered.len();
     }

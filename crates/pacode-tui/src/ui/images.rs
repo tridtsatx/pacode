@@ -56,7 +56,7 @@ pub(crate) fn prepare(
     let tokens: Vec<usize> = live.iter().map(|(token, ..)| *token).collect();
     state.image_strip.retain(&tokens);
     let mut images = Vec::new();
-    for (token, path, slot) in layout_slots(state, &live, input, area, opts) {
+    for (token, path, slot) in layout_slots(state, &live, input, area) {
         if slot.width < 4 || slot.height == 0 {
             continue;
         }
@@ -149,8 +149,8 @@ pub(crate) fn draw(frame: &mut Frame, prepared: &PreparedImages) {
 
 /// One slot per live record. Each slot is centered over the first occurrence
 /// of its `[Image N]` token in the input text — `input` is the input rect:
-/// text renders at `input.x + 2` and wraps at `input.width - 2`, except in
-/// bash mode, where `<prefix>` + `text[1:]` draw on ONE unwrapped line.
+/// text renders at `input.x + 2` and wraps at `input.width - 2`, bash mode
+/// included (it draws the same wrapped rows behind the same prefix).
 /// Records in text order (sorted by center, not insertion order); a record
 /// whose token position did not resolve — a mid-frame deletion race,
 /// `live_pasted_images` requires the token in the text — packs at the right
@@ -161,18 +161,10 @@ fn layout_slots(
     live: &[(usize, String, std::path::PathBuf)],
     input: Rect,
     area: Rect,
-    opts: &RenderOptions,
 ) -> Vec<(usize, std::path::PathBuf, Rect)> {
-    // The bash-mode prefix the input renderer actually drew: `! `, or
-    // `<running> (busy) ` while a captured command runs.
-    let bash_prefix_w = if state.is_running_bash() {
-        display_width(&format!("{} (busy) ", opts.glyphs.running))
-    } else {
-        2
-    };
     let centers: Vec<Option<u16>> = live
         .iter()
-        .map(|(_, label, _)| token_center(&state.input, input, label, bash_prefix_w))
+        .map(|(_, label, _)| token_center(&state.input, input, label))
         .collect();
 
     // No token resolved at all (the whole set was deleted mid-frame):
@@ -237,24 +229,13 @@ fn layout_slots(
 
 /// Absolute screen column of the center cell of `label`'s first occurrence
 /// in the input text — `None` while the text holds no such token.
-fn token_center(
-    input: &crate::state::InputState,
-    input_rect: Rect,
-    label: &str,
-    bash_prefix_w: usize,
-) -> Option<u16> {
-    let text = &input.text;
-    let byte = text.find(label)?;
+fn token_center(input: &crate::state::InputState, input_rect: Rect, label: &str) -> Option<u16> {
+    let byte = input.text.find(label)?;
     let token_w = display_width(label);
-    let start = if text.starts_with('!') {
-        // Bash mode: `<prefix>` + text[1:] on one unwrapped line — the `!`
-        // itself is the prefix's first cell.
-        bash_prefix_w + display_width(text.get(1..byte).unwrap_or(""))
-    } else {
-        // Wrapped mode: a token may split across lines (`[Image` / `N]`) —
-        // anchor by the column where it STARTS, on the line where it begins.
-        2 + input.wrapped_position_of_byte(byte, input_rect.width).1
-    };
+    // Bash mode draws the same wrapped rows behind the same 2-cell prefix as
+    // a plain prompt, so one rule places both. A token may split across rows
+    // (`[Image` / `N]`) — anchor by the column where it STARTS.
+    let start = 2 + input.wrapped_position_of_byte(byte, input_rect.width).1;
     Some(
         input_rect
             .x

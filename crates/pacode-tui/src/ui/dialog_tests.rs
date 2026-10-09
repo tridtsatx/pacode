@@ -252,6 +252,85 @@ fn plain_lines_stop_at_the_selection_hard_cap() {
     assert_eq!(lines.lines.len(), MAX_SELECTION_LINES);
 }
 
+fn copy_all(t: &mut Transcript, width: u16, opts: &pacode_render::RenderOptions) -> String {
+    use crate::state::selection::{Point, Selection};
+    let lines = super::plain_lines(t, width, opts, 0, 0, whole());
+    let last = lines.first_line + lines.lines.len().saturating_sub(1);
+    let selection = Selection {
+        anchor: Point { line: 0, col: 0 },
+        head: Point {
+            line: last,
+            col: width - 1,
+        },
+        active: true,
+        ..Selection::default()
+    };
+    crate::ui::extract_selection_text(&lines, &selection, width)
+}
+
+/// Decoration is drawn, never copied: a selection across a wrapped answer, a
+/// user band and a tool body yields the text alone — no `●`, no indent, no
+/// `▌`, no ` │ ` gutter.
+#[test]
+fn a_copy_drops_markers_bars_and_gutters() {
+    let opts = pacode_render::RenderOptions::new(30, false);
+    let mut t = Transcript::new(16);
+    let item = |seq, kind| pacode_types::TranscriptItem {
+        seq,
+        agent: pacode_types::AgentId::main(),
+        ts_ms: seq,
+        kind,
+    };
+    t.upsert(
+        item(
+            1,
+            TranscriptKind::User {
+                text: "make me a weather bot".into(),
+            },
+        ),
+        Instant::now(),
+    );
+    t.upsert(
+        item(
+            2,
+            TranscriptKind::Assistant {
+                text: "Sure, I will scaffold the command line first.".into(),
+                complete: true,
+            },
+        ),
+        Instant::now(),
+    );
+    t.upsert(
+        item(
+            3,
+            TranscriptKind::ToolCall {
+                call_id: "call_1".into(),
+                name: "read".into(),
+                title: "read src/main.rs".into(),
+                intent: None,
+                status: pacode_types::transcript::ToolStatus::Ok,
+                preview: "fn main() {}\nmore".into(),
+                diff: None,
+                duration_ms: None,
+                task: None,
+            },
+        ),
+        Instant::now(),
+    );
+    t.flush_stream();
+    let copied = copy_all(&mut t, 30, &opts);
+    let rows: Vec<&str> = copied.lines().collect();
+    assert!(rows.contains(&"make me a weather bot"), "{copied}");
+    // The answer wraps at 30 columns; both rows lose the marker and indent.
+    assert!(rows.contains(&"Sure, I will scaffold the"), "{copied}");
+    assert!(rows.contains(&"command line first."), "{copied}");
+    assert!(rows.contains(&"fn main() {}"), "{copied}");
+    assert!(rows.contains(&"more"), "{copied}");
+    for bad in ["▌", "●", "│"] {
+        assert!(!copied.contains(bad), "{bad} copied: {copied}");
+    }
+}
+
 #[test]
 fn live_stable_prefix_cache_survives_tail_growth() {
     let opts = pacode_render::RenderOptions::new(80, false);

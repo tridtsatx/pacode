@@ -250,4 +250,10 @@ fn the_prompt_frame_fits_at_every_size() {
     );
     assert!(!narrow.prompt_framed());
     assert_eq!(narrow.input.width, PROMPT_FRAME_MIN_WIDTH - 1);
+    // Too short for the top border: no frame, so no inset either.
+    let short = compute(Rect::new(0, 0, 80, 3), 1, false, 0, 0);
+    assert_eq!(short.input_top.height, 0);
+    assert!(!short.prompt_framed());
+    assert_eq!(short.input.x, short.input_bottom.x);
+    assert_eq!(short.input.width, short.input_bottom.width);
 }

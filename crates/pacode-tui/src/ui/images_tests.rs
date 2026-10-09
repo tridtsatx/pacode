@@ -4,7 +4,6 @@
 
 use std::path::PathBuf;
 
-use pacode_render::RenderOptions;
 use pacode_types::Config;
 use ratatui::layout::Rect;
 
@@ -21,10 +20,6 @@ fn app_state(text: &str) -> AppState {
     let mut state = AppState::new(Config::default(), "1.0.0".to_string(), 120, 34);
     state.input.insert_str(text);
     state
-}
-
-fn opts() -> RenderOptions {
-    RenderOptions::new(80, false)
 }
 
 fn live(labels: &[&str]) -> Vec<(usize, String, PathBuf)> {
@@ -47,10 +42,10 @@ fn token_center_first_line() {
     // token 9 cells wide → center at 6 + 4 = 10 inside the input rect.
     let s = input_state("see [Image 2] ok");
     let input = Rect::new(0, 10, 80, 3);
-    assert_eq!(token_center(&s, input, "[Image 2]", 2), Some(10));
+    assert_eq!(token_center(&s, input, "[Image 2]"), Some(10));
     // An input rect offset shifts the absolute column.
     let input = Rect::new(5, 10, 80, 3);
-    assert_eq!(token_center(&s, input, "[Image 2]", 2), Some(15));
+    assert_eq!(token_center(&s, input, "[Image 2]"), Some(15));
 }
 
 #[test]
@@ -59,27 +54,33 @@ fn token_center_wrapped_second_line() {
     // on line 1 — the anchor is the column where the token STARTS.
     let s = input_state("see [Image 2] ok");
     let input = Rect::new(0, 10, 10, 3);
-    assert_eq!(token_center(&s, input, "[Image 2]", 2), Some(6)); // 2 + 0 + 4
+    assert_eq!(token_center(&s, input, "[Image 2]"), Some(6)); // 2 + 0 + 4
 }
 
 #[test]
 fn token_center_bash_mode() {
-    // "!ls [Image 1]": the `!` becomes the 2-cell prefix, so the token's
-    // start col is 2 + width("ls ") = 5; center 5 + 4 = 9.
+    // Bash mode draws the same rows as a plain prompt: the `!` is text after
+    // the 2-cell prefix, so the token starts at 2 + width("!ls ") = 6 and
+    // its center is 6 + 4 = 10 — running or not, the prefix is 2 cells.
     let s = input_state("!ls [Image 1]");
     let input = Rect::new(0, 10, 80, 1);
-    assert_eq!(token_center(&s, input, "[Image 1]", 2), Some(9));
-    // The busy prefix pushes it right.
-    assert_eq!(token_center(&s, input, "[Image 1]", 9), Some(16));
+    assert_eq!(token_center(&s, input, "[Image 1]"), Some(10));
+}
+
+#[test]
+fn token_center_bash_mode_follows_the_wrap() {
+    // Outer width 12 → text width 10: "!echo aaa " fills row 0 and the token
+    // starts row 1 at col 0 → 2 + 0 + 4.
+    let s = input_state("!echo aaa [Image 1]");
+    let input = Rect::new(0, 10, 12, 2);
+    assert_eq!(s.wrap_lines(12), vec!["!echo aaa ", "[Image 1]"]);
+    assert_eq!(token_center(&s, input, "[Image 1]"), Some(6));
 }
 
 #[test]
 fn token_center_absent_is_none() {
     let s = input_state("no tokens");
-    assert_eq!(
-        token_center(&s, Rect::new(0, 10, 80, 1), "[Image 1]", 2),
-        None
-    );
+    assert_eq!(token_center(&s, Rect::new(0, 10, 80, 1), "[Image 1]"), None);
 }
 
 #[test]
@@ -116,13 +117,7 @@ fn layout_slots_follow_text_order_not_insertion() {
     let state = app_state("[Image 2] then [Image 1]");
     let input = Rect::new(0, 10, 80, 3);
     let area = Rect::new(0, 4, 80, 6);
-    let slots = layout_slots(
-        &state,
-        &live(&["[Image 1]", "[Image 2]"]),
-        input,
-        area,
-        &opts(),
-    );
+    let slots = layout_slots(&state, &live(&["[Image 1]", "[Image 2]"]), input, area);
     let order: Vec<usize> = slots.iter().map(|(t, ..)| *t).collect();
     assert_eq!(order, vec![2, 1], "slots come out in text order");
     // Centres 6 and 21 → gap 15 → slots narrow to 15 so both can centre:
@@ -139,13 +134,7 @@ fn layout_slots_adjacent_tokens_shrink_to_center() {
     let state = app_state("[Image 1] [Image 2]");
     let input = Rect::new(0, 10, 80, 3);
     let area = Rect::new(0, 4, 80, 6);
-    let slots = layout_slots(
-        &state,
-        &live(&["[Image 1]", "[Image 2]"]),
-        input,
-        area,
-        &opts(),
-    );
+    let slots = layout_slots(&state, &live(&["[Image 1]", "[Image 2]"]), input, area);
     let rects: Vec<(u16, u16)> = slots.iter().map(|(.., r)| (r.x, r.width)).collect();
     // centre 6 → ideal 1; centre 16 → ideal 11 — each thumb centred on its
     // token instead of packing at x=0/20.
@@ -158,13 +147,7 @@ fn layout_slots_centers_distant_tokens() {
     let state = app_state("a [Image 1] bbbbbbbbbbbbbbbbbbbbb [Image 2]");
     let input = Rect::new(0, 10, 80, 3);
     let area = Rect::new(0, 4, 80, 6);
-    let slots = layout_slots(
-        &state,
-        &live(&["[Image 1]", "[Image 2]"]),
-        input,
-        area,
-        &opts(),
-    );
+    let slots = layout_slots(&state, &live(&["[Image 1]", "[Image 2]"]), input, area);
     let xs: Vec<(usize, u16)> = slots.iter().map(|(t, .., r)| (*t, r.x)).collect();
     // t1: byte 2 → center 2+2+4=8 → ideal x 0 (saturating); t2: byte 34 →
     // center 2+34+4=40 → x = 40 - 10 = 30.
@@ -176,10 +159,11 @@ fn layout_slots_bash_mode() {
     let state = app_state("!echo [Image 1]");
     let input = Rect::new(0, 10, 80, 1);
     let area = Rect::new(0, 4, 80, 6);
-    let slots = layout_slots(&state, &live(&["[Image 1]"]), input, area, &opts());
+    let slots = layout_slots(&state, &live(&["[Image 1]"]), input, area);
     assert_eq!(slots.len(), 1);
-    // center = 2 + width("echo ") + 4 = 11 → x = 11 - 10 = 1.
-    assert_eq!(slots[0].2.x, 1);
+    // The `!` is text behind the 2-cell prefix:
+    // center = 2 + width("!echo ") + 4 = 12 → x = 12 - 10 = 2.
+    assert_eq!(slots[0].2.x, 2);
     assert_eq!(slots[0].2.width, THUMB_SLOT_W);
 }
 
@@ -195,7 +179,6 @@ fn layout_slots_narrow_area_shrinks_and_packs() {
         &live(&["[Image 1]", "[Image 2]", "[Image 3]"]),
         input,
         area,
-        &opts(),
     );
     assert_eq!(slots.len(), 3);
     let mut prev_right = area.x;
@@ -215,7 +198,7 @@ fn layout_slots_fallback_left_packs_when_no_token_resolves() {
     let input = Rect::new(0, 10, 80, 3);
     let area = Rect::new(2, 4, 50, 6);
     let recs = live(&["[Image 7]", "[Image 8]"]);
-    let slots = layout_slots(&state, &recs, input, area, &opts());
+    let slots = layout_slots(&state, &recs, input, area);
     let xs: Vec<u16> = slots.iter().map(|(.., r)| r.x).collect();
     assert_eq!(xs, vec![area.x, area.x + THUMB_SLOT_W]);
 }
@@ -227,13 +210,7 @@ fn layout_slots_partial_fallback_packs_unresolved_right() {
     let state = app_state("x [Image 1]");
     let input = Rect::new(0, 10, 80, 3);
     let area = Rect::new(0, 4, 80, 6);
-    let slots = layout_slots(
-        &state,
-        &live(&["[Image 1]", "[Image 9]"]),
-        input,
-        area,
-        &opts(),
-    );
+    let slots = layout_slots(&state, &live(&["[Image 1]", "[Image 9]"]), input, area);
     assert_eq!(slots.len(), 2);
     // Resolved first (center 2+2+4=8 → x 0), unresolved after it.
     assert_eq!(slots[0].0, 1);

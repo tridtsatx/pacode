@@ -3,6 +3,7 @@
 //! the bounded line cache. No terminal IO here.
 
 pub mod cache;
+pub mod color;
 pub mod diff;
 pub mod glyphs;
 pub mod markdown;

@@ -9,7 +9,7 @@ use pacode_render::{RenderOptions, display_width, render_markdown, truncate_to_w
 use pacode_types::transcript::ToolStatus;
 use pacode_types::{ExplainLevel, RiskLevel, ToastLevel, TranscriptKind};
 
-use crate::state::transcript::{PermExplain, ToolStreamView};
+use crate::state::transcript::{CellKind, PermExplain, ToolStreamView};
 
 #[cfg(test)]
 #[path = "cells_tests.rs"]
@@ -71,10 +71,44 @@ pub(super) fn assistant_markdown(
 
 /// The turn's stats under an answer, on the answer's hanging indent.
 pub(super) fn assistant_stats_line(stats: &str, opts: &RenderOptions) -> Line<'static> {
-    Line::from(Span::styled(
-        format!("{}{stats}", " ".repeat(ASSISTANT_INDENT)),
-        opts.theme.faint,
-    ))
+    Line::from(vec![
+        Span::raw(" ".repeat(ASSISTANT_INDENT)),
+        Span::styled(stats.to_string(), opts.theme.faint),
+    ])
+}
+
+/// How many leading columns of a rendered row are decoration rather than
+/// text — the user band's `▌ `, the answer's `● ` and its hanging indent, the
+/// ` │ ` / ` └ ` gutter of a tool body or an error notice. A copy drops them.
+///
+/// Every decoration this module draws is the row's first span, so the check
+/// is "is the first span exactly the decoration this kind of cell draws":
+/// text that merely starts with spaces or a bar is never mistaken for one.
+pub(crate) fn decoration_width(kind: &CellKind, line: &Line<'_>, opts: &RenderOptions) -> usize {
+    let Some(first) = line.spans.first() else {
+        return 0;
+    };
+    let lead = first.content.as_ref();
+    let gutter = |lead: &str| {
+        lead == format!(" {} ", opts.glyphs.vline) || lead == format!(" {} ", opts.glyphs.vcorner)
+    };
+    let decorated = match kind {
+        CellKind::Gap | CellKind::BackgroundResult(_) => false,
+        CellKind::Item(item) => match item {
+            TranscriptKind::User { .. } => {
+                lead == format!("{} ", crate::ui::chrome::band_bar(opts))
+            }
+            TranscriptKind::Assistant { .. } => {
+                lead == format!("{} ", opts.glyphs.main_dot) || lead == " ".repeat(ASSISTANT_INDENT)
+            }
+            TranscriptKind::ToolCall { .. } | TranscriptKind::BashCommand { .. } => gutter(lead),
+            TranscriptKind::Notice { level, .. } => *level == ToastLevel::Error && gutter(lead),
+            TranscriptKind::Reasoning { .. }
+            | TranscriptKind::Permission(_)
+            | TranscriptKind::Question { .. } => false,
+        },
+    };
+    if decorated { display_width(lead) } else { 0 }
 }
 
 /// A finished background job, drawn in the tool-call idiom: symbol, what ran,

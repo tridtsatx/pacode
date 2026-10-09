@@ -33,7 +33,7 @@ struct Keep {
 pub(super) fn render(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'static> {
     let Some(meta) = state.meta.as_ref() else {
         return Line::from(Span::styled(
-            truncate_to_width(NO_SESSION, width, opts.glyphs.ascii),
+            truncate_to_width(NO_SESSION, width, true),
             opts.theme.faint,
         ));
     };
@@ -76,8 +76,10 @@ pub(super) fn render(width: usize, state: &AppState, opts: &RenderOptions) -> Li
         plugin: false,
         ctx: false,
     };
+    // Measured without the model, which also drops the ` · ` that follows
+    // it — the separator comes back with the model, so it is paid for here.
     let (left, _) = pieces(meta, state, opts, keep, Some(0));
-    let budget = width.saturating_sub(spans_width(&left));
+    let budget = width.saturating_sub(spans_width(&left) + display_width(opts.glyphs.dot_sep));
     let (left, _) = pieces(meta, state, opts, keep, Some(budget));
     let left = pacode_render::truncate_spans(&left, width, opts.glyphs.ellipsis);
     Line::from(left)
@@ -121,7 +123,7 @@ fn pieces(
     left.push(Span::raw(" "));
     let model = meta.model.display_name();
     let model = match model_budget {
-        Some(budget) => truncate_to_width(&model, budget, opts.glyphs.ascii),
+        Some(budget) => truncate_to_width(&model, budget, true),
         None => model,
     };
     if !model.is_empty() {
