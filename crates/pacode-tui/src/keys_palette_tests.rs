@@ -354,10 +354,9 @@ fn login_lands_on_the_first_sign_in_and_starts_it_inline() {
     assert_eq!(palette(&state).login, None);
 }
 
-/// B23: `a` is search text; switching accounts is a chord. `ctrl+d` signs the
-/// highlighted provider out instead of quitting.
+/// B23: `a` is search text; switching accounts is a chord.
 #[test]
-fn account_switch_and_logout_are_chords() {
+fn account_switch_is_a_chord() {
     let (mut state, _dir) = state();
     state.auth_providers = vec![provider("p", AuthState::Configured, &["one", "two"])];
     open(&mut state);
@@ -376,10 +375,34 @@ fn account_switch_and_logout_are_chords() {
             label: "two".to_string(),
         })]
     );
-    let actions = press(
-        &mut state,
-        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+}
+
+/// Signing out takes two presses of the logout chord, the first one asking on
+/// the provider's header; any other key in between cancels. `ctrl+d` is not
+/// the chord: it still quits, palette or not.
+#[test]
+fn logout_asks_first_and_ctrl_d_still_quits() {
+    let (mut state, _dir) = state();
+    state.auth_providers = vec![provider("p", AuthState::Configured, &["one"])];
+    open(&mut state);
+    let alt_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+
+    assert!(
+        press(&mut state, alt_x).is_empty(),
+        "the first press only asks"
     );
+    assert_eq!(palette(&state).confirm_logout.as_deref(), Some("p"));
+    assert!(press(&mut state, key(KeyCode::Down)).is_empty());
+    assert_eq!(palette(&state).confirm_logout, None, "another key cancels");
+    press(&mut state, key(KeyCode::Up));
+
+    press(&mut state, alt_x);
+    // Esc while asking only cancels; the palette stays.
+    press(&mut state, key(KeyCode::Esc));
+    assert_eq!(palette(&state).confirm_logout, None);
+
+    press(&mut state, alt_x);
+    let actions = press(&mut state, alt_x);
     assert_eq!(
         actions,
         vec![Action::Send(Request::Logout {
@@ -387,7 +410,103 @@ fn account_switch_and_logout_are_chords() {
             label: Some("one".to_string()),
         })]
     );
-    assert!(!state.quit, "ctrl+d in the palette is logout, not quit");
+
+    let actions = press(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(actions, vec![Action::Quit]);
+}
+
+/// The confirmation is drawn on the provider's header, spelled from the keymap.
+#[test]
+fn the_logout_question_is_shown_on_the_header() {
+    let (mut state, _dir) = state();
+    state.auth_providers = vec![provider("p", AuthState::Configured, &["one"])];
+    open(&mut state);
+    press(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    );
+    // Mark the layer seen, so the draw shows the palette full size rather
+    // than the first frame of its unfold.
+    state.last_focus_key = crate::ui::focus_key(&state.focus);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 34)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let prepared = crate::ui::prepare_frame(frame.area(), &mut state, Instant::now());
+            crate::ui::draw(frame, &state, &prepared);
+        })
+        .expect("draw");
+    let view = format!("{}", terminal.backend());
+    assert!(view.contains("alt+x again to sign out P"), "{view}");
+}
+
+/// Enter on a signed-in provider's header signs in again: another account,
+/// as the old login screen allowed.
+#[test]
+fn enter_on_a_signed_in_header_adds_an_account() {
+    let (mut state, _dir) = state();
+    state.auth_providers = vec![provider("p", AuthState::Configured, &["one"])];
+    open(&mut state);
+    press(&mut state, key(KeyCode::Char('p')));
+    // The best match for "p" is the provider's header row.
+    let mut actions = Vec::new();
+    for _ in 0..4 {
+        actions = press(&mut state, key(KeyCode::Enter));
+        if !actions.is_empty() {
+            break;
+        }
+        press(&mut state, key(KeyCode::Up));
+    }
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::Login {
+            provider: "p".to_string()
+        })]
+    );
+}
+
+/// `/login` under ZDR still lists the providers to sign in to.
+#[test]
+fn login_under_zdr_still_offers_providers() {
+    let (mut state, _dir) = state();
+    state.config.zdr = pacode_types::ZdrMode::Always;
+    state.auth_providers = vec![provider("zed", AuthState::NotConfigured, &[])];
+    crate::commands::execute(&mut state, "/login");
+    assert!(palette(&state).zdr_only);
+    let actions = press(&mut state, key(KeyCode::Enter));
+    assert_eq!(
+        actions,
+        vec![Action::Send(Request::Login {
+            provider: "zed".to_string()
+        })]
+    );
+}
+
+/// When a sign-in finishes, the selection follows the provider's group as its
+/// models arrive.
+#[test]
+fn a_finished_sign_in_lands_on_the_new_models() {
+    let (mut state, _dir) = state();
+    state.auth_providers = vec![provider("zed", AuthState::NotConfigured, &[])];
+    crate::commands::execute(&mut state, "/login");
+    press(&mut state, key(KeyCode::Enter));
+    state.apply_login_progress(
+        "zed".to_string(),
+        pacode_types::LoginStage::Done {
+            label: "me".to_string(),
+        },
+        Instant::now(),
+    );
+    state.auth_providers = vec![provider("zed", AuthState::Configured, &["me"])];
+    state.models.push(model("zed", "zeta", None));
+    let actions = press(&mut state, key(KeyCode::Enter));
+    assert_eq!(
+        sequence(&actions),
+        vec![Request::SetModel(ModelRoute::new("zed", "zeta"))]
+    );
 }
 
 /// B17: a pick writes no prefs; the accepted `SessionUpdated` does, with the
@@ -447,4 +566,25 @@ fn model_with_argument_sends_route_then_downgrade_in_order() {
         ]
     );
     assert_eq!(pacode_config::load_prefs(&state.paths).model, None);
+    // The downgrade notice is phrased as a request: a refused switch must not
+    // leave it claiming the effort changed.
+    let notices: Vec<String> = state
+        .transcript
+        .cells
+        .iter()
+        .filter_map(|cell| {
+            if let crate::state::CellKind::Item(pacode_types::TranscriptKind::Notice {
+                text, ..
+            }) = &cell.kind
+            {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        vec!["p/b does not accept effort high; asking for medium with the switch"]
+    );
 }

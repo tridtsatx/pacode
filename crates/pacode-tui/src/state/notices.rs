@@ -108,6 +108,7 @@ impl AppState {
             pacode_types::LoginStage::Exchanging => ("exchanging the code".to_string(), false),
             pacode_types::LoginStage::Done { .. } => {
                 palette.login = None;
+                palette.follow_provider(provider);
                 return;
             }
             pacode_types::LoginStage::Failed { message } => (message.clone(), true),

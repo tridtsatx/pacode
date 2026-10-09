@@ -5,13 +5,13 @@
 //! | letters, digits | type into the search (`h j k l` included) |
 //! | ↑ ↓, ctrl+p ctrl+n, pgup pgdn | move the selection |
 //! | tab / shift+tab | step the highlighted model's effort (local until enter) |
-//! | enter | model: switch to it (+ effort if changed); unsigned provider: sign in |
+//! | enter | model: switch to it (+ effort if changed); provider header: sign in (another account when signed in) |
 //! | esc | close, nothing sent |
 //! | alt+f / alt+z | mark favourite / ZDR-capable |
 //! | alt+k | capability filter (all / reasoning / vision) |
 //! | ctrl+r | force-refresh the catalog |
 //! | alt+a | next stored account of the highlighted provider |
-//! | ctrl+d | sign the highlighted provider out |
+//! | alt+x, twice | sign the highlighted provider out (the first press asks on its header) |
 //!
 //! The chords come from the keymap (`model_picker_*` actions), so `/keys` can
 //! rebind them and the palette's hints spell whatever is bound.
@@ -45,7 +45,7 @@ pub(crate) fn open(state: &mut AppState, opening: Opening) -> Vec<Action> {
     let route = state
         .meta
         .as_ref()
-        .map(|meta| Anchor::Route(meta.model.to_string()));
+        .map(|meta| Anchor::Route(meta.model.clone()));
     let anchor = match opening {
         Opening::Model | Opening::Zdr => route,
         Opening::Login => Some(Anchor::FirstSignIn),
@@ -139,6 +139,16 @@ fn picked(state: &AppState, palette: &ModelPalette) -> Picked {
 }
 
 fn handle(state: &mut AppState, palette: &mut ModelPalette, key: KeyEvent) -> (Vec<Action>, bool) {
+    // A pending logout lives for exactly one key: its chord again confirms,
+    // anything else (Esc included) only cancels it.
+    if let Some(provider) = palette.confirm_logout.take() {
+        if matches!(chord_of(state, key), Some(Chord::Logout)) {
+            return (logout(state, palette, provider), false);
+        }
+        if key.code == KeyCode::Esc {
+            return (vec![], false);
+        }
+    }
     if let Some(chord) = chord_of(state, key) {
         let actions = match chord {
             Chord::Favorite => toggle_mark(state, palette, Mark::Favorite),
@@ -151,7 +161,12 @@ fn handle(state: &mut AppState, palette: &mut ModelPalette, key: KeyEvent) -> (V
                 vec![]
             }
             Chord::Account => switch_account(state, palette),
-            Chord::Logout => logout(state, palette),
+            Chord::Logout => {
+                palette.confirm_logout = highlighted_auth(state, palette)
+                    .filter(|info| !info.accounts.is_empty())
+                    .map(|info| info.id);
+                vec![]
+            }
         };
         return (actions, false);
     }
@@ -269,8 +284,11 @@ fn switch_account(state: &AppState, palette: &ModelPalette) -> Vec<Action> {
     })]
 }
 
-fn logout(state: &AppState, palette: &ModelPalette) -> Vec<Action> {
-    let Some(info) = highlighted_auth(state, palette).filter(|info| !info.accounts.is_empty())
+/// The confirming press: sign `provider` out, if it is still the one
+/// highlighted and still has an account.
+fn logout(state: &AppState, palette: &ModelPalette, provider: String) -> Vec<Action> {
+    let Some(info) = highlighted_auth(state, palette)
+        .filter(|info| info.id == provider && !info.accounts.is_empty())
     else {
         return vec![];
     };

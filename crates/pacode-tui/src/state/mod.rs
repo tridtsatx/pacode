@@ -226,7 +226,7 @@ impl AppState {
         };
         let prefs = pacode_config::load_prefs(&paths);
         let model_flags = prefs.model_flags;
-        let recent_models = prefs.recent_models;
+        let recent_models = pickers::capped_recents(prefs.recent_models);
         Self {
             config,
             theme,

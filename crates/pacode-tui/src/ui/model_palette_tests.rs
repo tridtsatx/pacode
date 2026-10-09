@@ -106,15 +106,25 @@ fn groups_run_recent_then_signed_in_then_needing_a_sign_in() {
             "# OPENROUTER",
         ]
     );
-    // Signed-in group: not selectable; sign-in and error headers are.
+    // Every header with an auth record is selectable (sign in, add an
+    // account, switch, sign out); `RECENT` and config-only providers are not.
     let header = |title: &str| {
         rows.iter()
             .find(|row| matches!(row, Row::Header { title: t, .. } if t == title))
             .cloned()
     };
-    assert!(!header("CLAUDE").is_some_and(|r| r.selectable()));
+    assert!(header("CLAUDE").is_some_and(|r| r.selectable()));
     assert!(header("STALE").is_some_and(|r| r.selectable()));
     assert!(header("OPENROUTER").is_some_and(|r| r.selectable()));
+    assert!(!header("BUBNA").is_some_and(|r| r.selectable()));
+    assert!(!header("RECENT").is_some_and(|r| r.selectable()));
+    assert!(matches!(
+        header("OPENROUTER"),
+        Some(Row::Header {
+            kind: Some("OAuth"),
+            ..
+        })
+    ));
     assert!(matches!(
         header("CLAUDE"),
         Some(Row::Header {
@@ -132,18 +142,20 @@ fn groups_run_recent_then_signed_in_then_needing_a_sign_in() {
 }
 
 #[test]
-fn fuzzy_search_ranks_inside_groups_and_hides_recent() {
-    let fx = Fixture::new();
+fn fuzzy_search_ranks_inside_groups_and_filters_recent() {
+    let mut fx = Fixture::new();
+    fx.recent = vec!["claude/opus".to_string(), "claude/sonnet".to_string()];
     let mut palette = ModelPalette::default();
     for c in "son".chars() {
         palette.push_char(c);
     }
     let rows = palette.rows(&fx.src());
     let shape = shape(&rows);
-    assert!(!shape.contains(&"# RECENT".to_string()), "{shape:?}");
-    assert_eq!(shape[0], "# CLAUDE");
+    // RECENT stays while searching, holding only the recents that match.
+    assert_eq!(shape[..2], ["# RECENT", "r claude/sonnet"], "{shape:?}");
+    assert_eq!(shape[3], "# CLAUDE");
     assert_eq!(
-        shape[1], "m claude/sonnet",
+        shape[4], "m claude/sonnet",
         "the best match leads: {shape:?}"
     );
     // The provider name is searched too: "router" finds the bare provider.
@@ -230,10 +242,11 @@ fn moving_skips_gaps_and_signed_in_headers_and_clamps() {
     assert_eq!(palette.selected_index(&rows), Some(rows.len() - 1));
 }
 
-/// B04: with ZDR on only marked routes are offered, and a fresh provider
-/// (nothing marked yet) is not.
+/// B04: with ZDR on only marked routes are offered — but signing in has
+/// nothing to do with ZDR, so every provider with an auth record keeps its
+/// header (that is all `/login` under ZDR has to show).
 #[test]
-fn zdr_only_lists_capable_routes_and_no_bare_providers() {
+fn zdr_only_filters_models_but_keeps_sign_in_headers() {
     let mut fx = Fixture::new();
     fx.flags.insert(
         "claude/sonnet".to_string(),
@@ -244,7 +257,17 @@ fn zdr_only_lists_capable_routes_and_no_bare_providers() {
     );
     let palette = ModelPalette::new(Effort::Medium, true, false, None);
     let shape = shape_of(&palette, &fx);
-    assert_eq!(shape, vec!["# CLAUDE", "m claude/sonnet"]);
+    assert_eq!(
+        shape,
+        vec![
+            "# CLAUDE",
+            "m claude/sonnet",
+            "-",
+            "# OPENROUTER",
+            "-",
+            "# STALE"
+        ]
+    );
 }
 
 #[test]
@@ -301,7 +324,7 @@ fn anchors_land_on_the_session_route_or_the_first_sign_in() {
         Effort::Medium,
         false,
         false,
-        Some(Anchor::Route("claude/sonnet".to_string())),
+        Some(Anchor::Route(ModelRoute::new("claude", "sonnet"))),
     );
     // The anchor waits for rows that are still loading.
     let empty = Sources {
@@ -338,16 +361,90 @@ fn rows_in_an_unsigned_group_are_marked_for_sign_in() {
     let fx = Fixture::new();
     let rows = ModelPalette::default().rows(&fx.src());
     let signed = |route: &str| {
-        rows.iter().find_map(|row| match row {
-            Row::Model {
+        rows.iter().find_map(|row| {
+            if let Row::Model {
                 model,
                 signed_in,
                 recent: false,
-            } if model.route.to_string() == route => Some(*signed_in),
-            _ => None,
+            } = row
+                && model.route.to_string() == route
+            {
+                Some(*signed_in)
+            } else {
+                None
+            }
         })
     };
     assert_eq!(signed("claude/opus"), Some(true));
     assert_eq!(signed("bubna/flash"), Some(true), "no auth record: usable");
     assert_eq!(signed("stale/old"), Some(false));
+}
+
+/// A provider that is signed in but lists nothing (an empty or failed
+/// catalog) is still a group: its account and logout chords must reach it.
+#[test]
+fn a_signed_in_provider_with_an_empty_catalog_keeps_its_header() {
+    let mut fx = Fixture::new();
+    fx.auth.push(auth("devin", "Devin", AuthState::Configured));
+    let rows = ModelPalette::default().rows(&fx.src());
+    let devin = rows
+        .iter()
+        .find(|row| matches!(row, Row::Header { title, .. } if title == "DEVIN"))
+        .expect("DEVIN header");
+    assert!(devin.selectable());
+    assert!(matches!(
+        devin,
+        Row::Header {
+            status: GroupStatus::SignedIn,
+            ..
+        }
+    ));
+    // Signed-in before needing a sign-in; with models before without.
+    let shape = shape(&rows);
+    let at = |line: &str| shape.iter().position(|l| l == line);
+    assert!(at("# CLAUDE") < at("# DEVIN"));
+    assert!(at("# DEVIN") < at("# STALE"), "{shape:?}");
+}
+
+/// The bare headers are searched on what the old login screen searched:
+/// name, id, how it signs in and its help line.
+#[test]
+fn provider_search_matches_kind_and_detail() {
+    let mut fx = Fixture::new();
+    fx.auth[2].auth_kind = "api_key".to_string();
+    fx.auth[2].detail = "one key, hundreds of models".to_string();
+    let mut palette = ModelPalette::default();
+    palette.push_str("hundreds");
+    assert_eq!(shape_of(&palette, &fx), vec!["# OPENROUTER"]);
+    palette.query = "api_key".to_string();
+    let rows = palette.rows(&fx.src());
+    assert!(matches!(
+        rows.as_slice(),
+        [Row::Header {
+            kind: Some("API key"),
+            ..
+        }]
+    ));
+}
+
+/// After a sign-in the highlight follows the provider's group as it gains
+/// models, instead of staying on a position the new rows shifted.
+#[test]
+fn a_finished_sign_in_moves_the_selection_to_the_provider() {
+    let mut fx = Fixture::new();
+    fx.recent.clear();
+    let mut palette = ModelPalette::new(Effort::Medium, false, false, Some(Anchor::FirstSignIn));
+    palette.follow_provider("openrouter");
+    let rows = palette.rows(&fx.src());
+    assert!(matches!(
+        palette.selected(&rows),
+        Some(Row::Header { title, .. }) if title == "OPENROUTER"
+    ));
+    fx.auth[2].state = AuthState::Configured;
+    fx.models.push(model("openrouter", "z-ai/glm", "GLM"));
+    let rows = palette.rows(&fx.src());
+    assert!(matches!(
+        palette.selected(&rows),
+        Some(Row::Model { model, .. }) if model.route.to_string() == "openrouter/z-ai/glm"
+    ));
 }

@@ -81,6 +81,7 @@ pub fn draw(
     } else {
         let columns = Columns::fit(&rows, width);
         let current = state.meta.as_ref().map(|meta| meta.model.to_string());
+        let logout_chord = first_chord(state, KeyAction::ModelPickerLogout).unwrap_or_default();
         let start = window_start(selected.unwrap_or(0), list_h);
         for (index, row) in rows.iter().enumerate().skip(start).take(list_h) {
             let is_sel = selected == Some(index);
@@ -90,7 +91,19 @@ pub fn draw(
                     title,
                     provider,
                     status,
-                } => header_line(title, provider.as_deref(), status, is_sel, palette, opts),
+                    kind,
+                } => header_line(
+                    HeaderView {
+                        title,
+                        provider: provider.as_deref(),
+                        status,
+                        kind: *kind,
+                        selected: is_sel,
+                    },
+                    palette,
+                    &logout_chord,
+                    opts,
+                ),
                 Row::Model { model, recent, .. } => {
                     let is_current = current.as_deref() == Some(&model.route.to_string());
                     model_line(model, *recent, is_sel, is_current, &columns, &src, opts)
@@ -219,19 +232,39 @@ fn model_line(
     Line::from(spans)
 }
 
-fn header_line(
-    title: &str,
-    provider: Option<&str>,
-    status: &GroupStatus,
+struct HeaderView<'r> {
+    title: &'r str,
+    provider: Option<&'r str>,
+    status: &'r GroupStatus,
+    kind: Option<&'static str>,
     selected: bool,
+}
+
+fn header_line(
+    header: HeaderView,
     palette: &ModelPalette,
+    logout_chord: &str,
     opts: &RenderOptions,
 ) -> Line<'static> {
+    let HeaderView {
+        title,
+        provider,
+        status,
+        kind,
+        selected,
+    } = header;
     let pointer = if selected { opts.glyphs.pointer } else { " " };
     let mut spans = vec![
         Span::styled(format!("{pointer} "), opts.theme.accent),
         Span::styled(title.to_string(), opts.theme.bold),
     ];
+    if provider.is_some() && provider == palette.confirm_logout.as_deref() {
+        spans.push(Span::styled(
+            format!("  {logout_chord} again to sign out {title}"),
+            opts.theme.red.patch(opts.theme.bold),
+        ));
+        return Line::from(spans);
+    }
     let login = palette
         .login
         .as_ref()
@@ -256,6 +289,9 @@ fn header_line(
     if let Some((text, style)) = status {
         spans.push(Span::styled(format!("  {text}"), style));
     }
+    if let Some(kind) = kind {
+        spans.push(Span::styled(format!("  {kind}"), opts.theme.faint));
+    }
     Line::from(spans)
 }
 
@@ -267,6 +303,13 @@ fn effort_line(
     let mut spans = vec![Span::styled("effort  ", opts.theme.dim)];
     let model = match highlighted {
         Some(Row::Model { model, .. }) => model,
+        Some(Row::Header {
+            status: GroupStatus::SignedIn | GroupStatus::Plain,
+            ..
+        }) => {
+            spans.push(Span::styled("pick a model below", opts.theme.faint));
+            return Line::from(spans);
+        }
         Some(Row::Header { .. }) => {
             spans.push(Span::styled("sign in to see models", opts.theme.faint));
             return Line::from(spans);
@@ -301,6 +344,10 @@ fn effort_line(
 fn hint_line(highlighted: Option<&Row>, width: usize, opts: &RenderOptions) -> Line<'static> {
     let arrows = if opts.glyphs.ascii { "^v" } else { "↑↓" };
     let enter = match highlighted {
+        Some(Row::Header {
+            status: GroupStatus::SignedIn,
+            ..
+        }) => "enter add account",
         Some(Row::Model {
             signed_in: false, ..
         })
@@ -346,15 +393,21 @@ fn chord_hint(
     }
     let parts: Vec<String> = items
         .into_iter()
-        .filter_map(|(action, label)| {
-            let chord = state.keymap.bindings_for(action).first()?;
-            Some(format!("{} {label}", crate::binding::format_binding(chord)))
-        })
+        .filter_map(|(action, label)| Some(format!("{} {label}", first_chord(state, action)?)))
         .collect();
     if parts.is_empty() {
         return String::new();
     }
     format!(" {} ", parts.join(opts.glyphs.dot_sep))
+}
+
+/// The primary spelling of `action` in the live keymap.
+fn first_chord(state: &AppState, action: KeyAction) -> Option<String> {
+    state
+        .keymap
+        .bindings_for(action)
+        .first()
+        .map(crate::binding::format_binding)
 }
 
 /// First row of a window of `height` rows that keeps `selected` on screen.

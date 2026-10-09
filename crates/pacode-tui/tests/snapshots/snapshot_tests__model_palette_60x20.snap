@@ -10,7 +10,7 @@ expression: view
 "  │  RECENT                                              │  "
 "▎ │  Claude Opus 5  anthropic   200k  $15/$75     RVE    │  "
 "  │                                                      │  "
-"I'│  ANTHROPIC  ● signed in                              │l "
+"I'│  ANTHROPIC  ● signed in  OAuth                       │l "
 "an│  Claude Opus 5              200k  $15/$75     RVE    │  "
 "  │▸ Claude Sonnet 3.7          200k  $3/$15      RVE    │  "
 "▣ │                                                      │ ✓"

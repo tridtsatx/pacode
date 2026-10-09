@@ -31,6 +31,19 @@ pub fn nearest_supported_effort(current: Effort, supported: &[Effort]) -> Option
         .copied()
 }
 
+/// Recent routes as loaded from `prefs.toml`: the file is user-editable, so
+/// duplicates and length are not trusted.
+pub(crate) fn capped_recents(loaded: Vec<String>) -> Vec<String> {
+    let mut recents: Vec<String> = Vec::new();
+    for route in loaded {
+        if !recents.contains(&route) {
+            recents.push(route);
+        }
+    }
+    recents.truncate(crate::ui::model_palette::RECENT_CAP);
+    recents
+}
+
 impl AppState {
     /// `supported_efforts` of the current route; `None` — route unknown to
     /// the model list or unrestricted — means every [`Effort`] is selectable
@@ -63,9 +76,11 @@ impl AppState {
             return None;
         }
         let next = nearest_supported_effort(cur, supported)?;
+        // Said as a request, not a fact: the daemon may still refuse the
+        // switch, and then neither level changes.
         self.push_notice_with_level(
             ToastLevel::Warn,
-            format!("effort {cur} → {next}: not supported by {route}"),
+            format!("{route} does not accept effort {cur}; asking for {next} with the switch"),
         );
         Some(next)
     }

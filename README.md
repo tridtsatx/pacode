@@ -234,7 +234,8 @@ editors that speak it.
 and providers, `↑↓` to move, `tab` to step the effort the highlighted model
 accepts, `enter` to switch — or to sign in to a provider that needs it.
 Chords there: `alt+f` favourite, `alt+z` ZDR-capable, `alt+k` capability
-filter, `ctrl+r` refresh the catalog, `alt+a` next account, `ctrl+d` sign out.
+filter, `ctrl+r` refresh the catalog, `alt+a` next account, `alt+x` twice sign
+out. Enter on a provider header signs in (another account when signed in).
 
 `/model`, `/effort`, `/mode`, `/theme`, `/config`, `/sessions`, `/mcp`,
 `/plugins`, `/keys`, `/editor`, `/import`, `/compact`, `/export`, `/help`.

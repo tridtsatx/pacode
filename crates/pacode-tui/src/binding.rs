@@ -1018,7 +1018,8 @@ impl Keymap {
         );
         // Letters in the palette are search text, so its account and filter
         // keys are chords too (alt first, ctrl for terminals that eat alt).
-        // Logout keeps the `ctrl+d` the old login screen had.
+        // Logout is never `ctrl+d` — that chord quits everywhere else — and
+        // the palette asks for a second press before it signs anyone out.
         bindings.insert(
             Action::ModelPickerKind,
             vec![
@@ -1047,10 +1048,16 @@ impl Keymap {
         );
         bindings.insert(
             Action::ModelPickerLogout,
-            vec![Binding {
-                code: KeyCode::Char('d'),
-                mods: KeyModifiers::CONTROL,
-            }],
+            vec![
+                Binding {
+                    code: KeyCode::Char('x'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('x'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
         );
 
         Self {

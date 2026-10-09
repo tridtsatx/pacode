@@ -24,7 +24,7 @@
 //! typing, moving, a catalog refresh — can leave it on a level that model
 //! rejects.
 
-use pacode_types::{AuthState, Effort, ModelInfo, ProviderAuthInfo};
+use pacode_types::{AuthState, Effort, ModelInfo, ModelRoute, ProviderAuthInfo};
 
 use crate::state::AppState;
 use crate::ui::model_catalog::{Flags, Kind, fuzzy_score, next_effort, prev_effort, snap_effort};
@@ -56,13 +56,6 @@ impl<'a> Sources<'a> {
     fn auth_for(&self, provider: &str) -> Option<&'a ProviderAuthInfo> {
         self.auth.iter().find(|info| info.id == provider)
     }
-
-    /// A provider whose models are listed is usable unless its auth record
-    /// says otherwise; one with no record (a config-only provider) is usable.
-    fn signed_in(&self, provider: &str) -> bool {
-        self.auth_for(provider)
-            .is_none_or(|info| info.state == AuthState::Configured)
-    }
 }
 
 /// A group header's auth status.
@@ -81,9 +74,12 @@ pub enum Row<'a> {
     Gap,
     Header {
         title: String,
-        /// The auth id Enter signs in to; `None` for `RECENT`.
+        /// The provider (auth) id; `None` for `RECENT`.
         provider: Option<String>,
         status: GroupStatus,
+        /// How the provider signs in (`OAuth`, `API key`, `local`), when it
+        /// has an auth record.
+        kind: Option<&'static str>,
     },
     Model {
         model: &'a ModelInfo,
@@ -93,14 +89,16 @@ pub enum Row<'a> {
 }
 
 impl Row<'_> {
-    /// Models, and the headers of providers that need a sign-in.
+    /// Models, and the header of every provider with an auth record: Enter
+    /// there signs in (another account, when already signed in), and the
+    /// account and logout chords act on it.
     pub fn selectable(&self) -> bool {
         match self {
             Row::Gap => false,
             Row::Model { .. } => true,
-            Row::Header { status, .. } => {
-                matches!(status, GroupStatus::SignIn | GroupStatus::Error(_))
-            }
+            Row::Header {
+                provider, status, ..
+            } => provider.is_some() && *status != GroupStatus::Plain,
         }
     }
 
@@ -114,13 +112,16 @@ impl Row<'_> {
     }
 }
 
-/// Where the selection lands when the palette opens.
+/// Where the selection lands once the row exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Anchor {
     /// `/model`: the session's route.
-    Route(String),
+    Route(ModelRoute),
     /// `/login`: the first provider that needs a sign-in.
     FirstSignIn,
+    /// A sign-in finished: the provider's first model once its catalog
+    /// lands, its header until then.
+    Provider(String),
 }
 
 /// Inline progress of a sign-in started from the palette.
@@ -148,6 +149,9 @@ pub struct ModelPalette {
     /// Opened by Alt+Z: Enter also turns ZDR on, after the route switch.
     pub for_zdr: bool,
     pub login: Option<LoginLine>,
+    /// The provider whose logout chord was pressed once; the next press
+    /// signs it out, any other key forgets it.
+    pub confirm_logout: Option<String>,
 }
 
 impl ModelPalette {
@@ -161,87 +165,128 @@ impl ModelPalette {
         }
     }
 
-    /// Every row on screen, in order: `RECENT` (empty search only), then one
-    /// group per provider — signed-in first, then the ones that need a
-    /// sign-in, with providers that list no models last.
+    /// Every row on screen, in order: `RECENT` (the recent routes that match),
+    /// then one group per provider — signed-in first, then the ones that need
+    /// a sign-in; within each, groups with models before the ones whose
+    /// catalog is empty. Sign-in headers ignore the ZDR and kind filters:
+    /// they list no models.
     pub fn rows<'a>(&self, src: &Sources<'a>) -> Vec<Row<'a>> {
         let query = self.query.trim();
-        let flag = |model: &ModelInfo| {
-            src.flags
-                .get(&model.route.to_string())
-                .copied()
-                .unwrap_or_default()
-        };
         let mut groups: Vec<Group<'a>> = Vec::new();
         for model in src.models {
-            if !self.kind.keeps(model) || (self.zdr_only && !flag(model).zdr_capable) {
+            if !self.kind.keeps(model) {
+                continue;
+            }
+            // One key and one flag lookup per model, reused by the filter,
+            // the score, the sort and `RECENT`.
+            let key = model.route.to_string();
+            let flags = src.flags.get(&key).copied().unwrap_or_default();
+            if self.zdr_only && !flags.zdr_capable {
                 continue;
             }
             let provider = model.route.provider.as_str();
-            let auth = src.auth_for(provider);
-            let label = auth.map_or(provider, |info| info.display_name.as_str());
-            let Some(score) = [model.display_name.as_str(), &model.route.to_string(), label]
+            let index = match groups.iter().position(|g| g.provider == provider) {
+                Some(index) => index,
+                None => {
+                    let auth = src.auth_for(provider);
+                    groups.push(Group {
+                        provider,
+                        auth,
+                        signed_in: auth.is_none_or(|info| info.state == AuthState::Configured),
+                        models: Vec::new(),
+                    });
+                    groups.len() - 1
+                }
+            };
+            let group = &mut groups[index];
+            let label = group
+                .auth
+                .map_or(provider, |info| info.display_name.as_str());
+            let Some(score) = [model.display_name.as_str(), key.as_str(), label]
                 .iter()
                 .filter_map(|text| fuzzy_score(query, text))
                 .max()
             else {
                 continue;
             };
-            match groups.iter_mut().find(|g| g.provider == provider) {
-                Some(group) => group.models.push((model, score)),
-                None => groups.push(Group {
-                    provider,
-                    auth,
-                    models: vec![(model, score)],
-                }),
+            group.models.push(Entry {
+                model,
+                key,
+                score,
+                favorite: flags.favorite,
+            });
+        }
+        groups.retain(|g| !g.models.is_empty());
+        // Providers with an auth record but nothing listed: not signed in yet,
+        // or signed in with an empty catalog. Matched on what the old login
+        // screen searched.
+        for info in src.auth {
+            if groups.iter().any(|g| g.provider == info.id) {
+                continue;
+            }
+            let matches = [&info.display_name, &info.id, &info.auth_kind, &info.detail]
+                .iter()
+                .any(|text| fuzzy_score(query, text).is_some());
+            if matches {
+                groups.push(Group {
+                    provider: &info.id,
+                    auth: Some(info),
+                    signed_in: info.state == AuthState::Configured,
+                    models: Vec::new(),
+                });
             }
         }
         for group in &mut groups {
-            group.models.sort_by(|(a, sa), (b, sb)| {
-                sb.cmp(sa)
-                    .then_with(|| flag(b).favorite.cmp(&flag(a).favorite))
-                    .then_with(|| a.display_name.cmp(&b.display_name))
-                    .then_with(|| a.route.model.cmp(&b.route.model))
+            group.models.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| b.favorite.cmp(&a.favorite))
+                    .then_with(|| a.model.display_name.cmp(&b.model.display_name))
+                    .then_with(|| a.model.route.model.cmp(&b.model.route.model))
             });
         }
         groups.sort_by(|a, b| {
-            let best = |g: &Group| g.models.first().map_or(0, |(_, s)| *s);
-            src.signed_in(b.provider)
-                .cmp(&src.signed_in(a.provider))
+            let best = |g: &Group| g.models.first().map_or(i32::MIN, |e| e.score);
+            b.signed_in
+                .cmp(&a.signed_in)
+                .then_with(|| a.models.is_empty().cmp(&b.models.is_empty()))
                 .then_with(|| best(b).cmp(&best(a)))
+                .then_with(|| {
+                    let recommended = |g: &Group| g.auth.is_some_and(|info| info.recommended);
+                    recommended(b).cmp(&recommended(a))
+                })
                 .then_with(|| a.provider.cmp(b.provider))
         });
 
         let mut rows = Vec::new();
-        if query.is_empty() {
-            let recent: Vec<&'a ModelInfo> = src
-                .recent
-                .iter()
-                .filter_map(|key| {
-                    groups
+        let recent: Vec<(&'a ModelInfo, bool)> = src
+            .recent
+            .iter()
+            .filter_map(|key| {
+                groups.iter().find_map(|g| {
+                    g.models
                         .iter()
-                        .flat_map(|g| g.models.iter())
-                        .find(|(m, _)| m.route.to_string() == *key)
-                        .map(|(m, _)| *m)
+                        .find(|e| e.key == *key)
+                        .map(|e| (e.model, g.signed_in))
                 })
-                .take(RECENT_CAP)
-                .collect();
-            if !recent.is_empty() {
-                rows.push(Row::Header {
-                    title: "RECENT".to_string(),
-                    provider: None,
-                    status: GroupStatus::Plain,
-                });
-                rows.extend(recent.into_iter().map(|model| Row::Model {
-                    model,
-                    recent: true,
-                    signed_in: src.signed_in(&model.route.provider),
-                }));
-            }
+            })
+            .take(RECENT_CAP)
+            .collect();
+        if !recent.is_empty() {
+            rows.push(Row::Header {
+                title: "RECENT".to_string(),
+                provider: None,
+                status: GroupStatus::Plain,
+                kind: None,
+            });
+            rows.extend(recent.into_iter().map(|(model, signed_in)| Row::Model {
+                model,
+                recent: true,
+                signed_in,
+            }));
         }
         for group in &groups {
             push_gap(&mut rows);
-            let signed_in = src.signed_in(group.provider);
             rows.push(Row::Header {
                 title: group
                     .auth
@@ -249,39 +294,13 @@ impl ModelPalette {
                     .to_uppercase(),
                 provider: Some(group.provider.to_string()),
                 status: group.auth.map_or(GroupStatus::Plain, status_of),
+                kind: group.auth.map(|info| kind_label(&info.auth_kind)),
             });
-            rows.extend(group.models.iter().map(|(model, _)| Row::Model {
-                model,
+            rows.extend(group.models.iter().map(|entry| Row::Model {
+                model: entry.model,
                 recent: false,
-                signed_in,
+                signed_in: group.signed_in,
             }));
-        }
-        // Providers with nothing listed yet: a sign-in is the only thing to
-        // do there. Hidden under ZDR — a fresh provider has no capable marks.
-        if !self.zdr_only {
-            let mut bare: Vec<&ProviderAuthInfo> = src
-                .auth
-                .iter()
-                .filter(|info| info.state != AuthState::Configured)
-                .filter(|info| !groups.iter().any(|g| g.provider == info.id))
-                .filter(|info| {
-                    fuzzy_score(query, &info.display_name).is_some()
-                        || fuzzy_score(query, &info.id).is_some()
-                })
-                .collect();
-            bare.sort_by(|a, b| {
-                b.recommended
-                    .cmp(&a.recommended)
-                    .then_with(|| a.display_name.cmp(&b.display_name))
-            });
-            for info in bare {
-                push_gap(&mut rows);
-                rows.push(Row::Header {
-                    title: info.display_name.to_uppercase(),
-                    provider: Some(info.id.clone()),
-                    status: status_of(info),
-                });
-            }
         }
         rows
     }
@@ -289,15 +308,11 @@ impl ModelPalette {
     /// The row index of the selection: the anchor while it is pending and
     /// present, else the `cursor`-th selectable row (clamped).
     pub fn selected_index(&self, rows: &[Row]) -> Option<usize> {
-        if let Some(index) = self.anchor.as_ref().and_then(|anchor| {
-            rows.iter().position(|row| match (anchor, row) {
-                (Anchor::Route(route), Row::Model { model, .. }) => {
-                    model.route.to_string() == *route
-                }
-                (Anchor::FirstSignIn, Row::Header { .. }) => row.selectable(),
-                (Anchor::Route(_) | Anchor::FirstSignIn, _) => false,
-            })
-        }) {
+        if let Some(index) = self
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor_index(anchor, rows))
+        {
             return Some(index);
         }
         let selectable: Vec<usize> = selectable(rows).collect();
@@ -348,6 +363,12 @@ impl ModelPalette {
         self.reset_selection();
     }
 
+    /// A sign-in finished: follow the provider's group as it unlocks, rather
+    /// than keep a position the new rows shifted.
+    pub fn follow_provider(&mut self, provider: &str) {
+        self.anchor = Some(Anchor::Provider(provider.to_string()));
+    }
+
     pub fn cycle_kind(&mut self) {
         self.kind = self.kind.next();
         self.reset_selection();
@@ -380,7 +401,53 @@ impl ModelPalette {
 struct Group<'a> {
     provider: &'a str,
     auth: Option<&'a ProviderAuthInfo>,
-    models: Vec<(&'a ModelInfo, i32)>,
+    signed_in: bool,
+    models: Vec<Entry<'a>>,
+}
+
+struct Entry<'a> {
+    model: &'a ModelInfo,
+    key: String,
+    score: i32,
+    favorite: bool,
+}
+
+fn anchor_index(anchor: &Anchor, rows: &[Row]) -> Option<usize> {
+    let header_of = |id: &str| {
+        rows.iter()
+            .position(|row| matches!(row, Row::Header { provider: Some(p), .. } if p == id))
+    };
+    match anchor {
+        Anchor::Route(route) => rows
+            .iter()
+            .position(|row| matches!(row, Row::Model { model, .. } if model.route == *route)),
+        Anchor::FirstSignIn => rows.iter().position(|row| {
+            matches!(
+                row,
+                Row::Header {
+                    status: GroupStatus::SignIn | GroupStatus::Error(_),
+                    ..
+                }
+            )
+        }),
+        Anchor::Provider(id) => header_of(id).map(|header| {
+            let first_model = matches!(
+                rows.get(header + 1),
+                Some(Row::Model { model, .. }) if model.route.provider == *id
+            );
+            if first_model { header + 1 } else { header }
+        }),
+    }
+}
+
+/// How a provider signs in, for its header.
+fn kind_label(auth_kind: &str) -> &'static str {
+    match auth_kind {
+        "oauth" => "OAuth",
+        "api_key" => "API key",
+        "local" => "local",
+        _ => "sign-in",
+    }
 }
 
 fn status_of(info: &ProviderAuthInfo) -> GroupStatus {

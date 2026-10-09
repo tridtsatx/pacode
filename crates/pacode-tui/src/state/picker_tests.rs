@@ -52,3 +52,14 @@ fn nearest_effort_picks_lower_supported() {
     // Empty supported list -> no answer.
     assert_eq!(nearest_supported_effort(Effort::High, &[]), None);
 }
+
+#[test]
+fn recents_from_prefs_are_deduplicated_and_capped() {
+    let loaded = ["a", "b", "a", "c", "d", "e", "f", "g"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(
+        super::pickers::capped_recents(loaded),
+        vec!["a", "b", "c", "d", "e"]
+    );
+}

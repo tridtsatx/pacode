@@ -112,16 +112,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         }
         return vec![];
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('d'))
-        // Inside the model palette `ctrl+d` is its logout chord by default.
-        && !(matches!(state.focus, Focus::Overlay(Overlay::ModelPalette { .. }))
-            && state
-                .keymap
-                .bindings_for(KeyAction::ModelPickerLogout)
-                .iter()
-                .any(|b| crate::binding::matches_key(b, key)))
-    {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('d')) {
         state.quit = true;
         return vec![Action::Quit];
     }
