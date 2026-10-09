@@ -241,9 +241,14 @@ fn the_schedule_countdown_ticks_at_the_resolution_it_shows() {
     };
     rail.upsert_cron_job(job.clone());
 
-    // Far away: the rail shows whole minutes, so one wake a minute is enough.
+    // Hours away: the rail shows whole minutes, so one wake a minute is enough.
+    job.next_run_ms = Some(2 * 3_600_000 + 30_500);
+    rail.upsert_cron_job(job.clone());
     let tick = rail.schedule_tick_ms(0).expect("tick");
-    assert!(tick <= 60_000, "a distant job must not tick every second");
+    assert!(
+        tick > 1_000 && tick <= 60_000,
+        "a distant job must not tick every second: {tick}"
+    );
 
     // Inside the last minute the countdown shows seconds.
     job.next_run_ms = Some(30_400);
@@ -255,6 +260,62 @@ fn the_schedule_countdown_ticks_at_the_resolution_it_shows() {
     job.enabled = false;
     rail.upsert_cron_job(job);
     assert_eq!(rail.schedule_tick_ms(0), None);
+}
+
+fn cron(id: &str, next_run_ms: u64) -> pacode_types::CronJob {
+    pacode_types::CronJob {
+        id: pacode_types::CronJobId::new(id),
+        name: id.to_string(),
+        schedule: pacode_types::CronSchedule::every(3600),
+        prompt: "x".to_string(),
+        enabled: true,
+        created_at_ms: 0,
+        last_run_ms: None,
+        next_run_ms: Some(next_run_ms),
+        last_status: None,
+    }
+}
+
+/// B26: the wake lands exactly where the rail's `in …` text changes — not a
+/// moment earlier (a wasted frame) and not later (a stale countdown). The
+/// rail prints seconds below an hour (`1m40s`), so a 100 s job must not wait
+/// for the minute.
+#[test]
+fn the_schedule_wake_lands_on_the_next_change_of_the_text() {
+    use pacode_types::time::format_duration_ms;
+    for due in [12_345, 100_000, 59_999, 3_599_999, 3_600_000, 7_230_500] {
+        let mut rail = RailState::default();
+        rail.upsert_cron_job(cron("j", due));
+        let tick = rail.schedule_tick_ms(0).expect("tick");
+        let shown = format_duration_ms(due);
+        assert_eq!(format_duration_ms(due - (tick - 1)), shown, "due {due}");
+        assert_ne!(format_duration_ms(due - tick), shown, "due {due}");
+    }
+}
+
+/// B26: the soonest change wins, which is not always the nearest job.
+#[test]
+fn the_schedule_wake_takes_the_soonest_change_over_all_jobs() {
+    let mut rail = RailState::default();
+    rail.upsert_cron_job(cron("near", 30_900));
+    rail.upsert_cron_job(cron("far", 45_050));
+    assert_eq!(rail.schedule_tick_ms(0), Some(51));
+}
+
+/// B26: the event loop wakes for the countdown only while the rail is on
+/// screen; at rest without one there is no timer.
+#[test]
+fn the_schedule_wake_is_armed_only_while_the_rail_shows() {
+    let mut state =
+        crate::state::AppState::new(pacode_types::Config::default(), "t".into(), 120, 34);
+    assert_eq!(state.schedule_redraw_in(0), None);
+    state.rail.upsert_cron_job(cron("j", 30_900));
+    assert_eq!(
+        state.schedule_redraw_in(0),
+        Some(Duration::from_millis(901))
+    );
+    state.cols = 60;
+    assert_eq!(state.schedule_redraw_in(0), None);
 }
 
 #[test]

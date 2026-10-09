@@ -228,23 +228,29 @@ impl RailState {
 
     /// How long until a countdown on screen would change, in milliseconds.
     ///
-    /// The rail shows seconds under a minute and whole minutes above it, so a
-    /// distant job needs one redraw a minute rather than sixty. `None` means
-    /// nothing on screen counts down and no tick is needed at all.
+    /// The countdown reads as `format_duration_ms` prints it: whole minutes
+    /// from an hour out (`1h23m`), seconds below (`4m59s`, `42s`), tenths
+    /// under ten seconds (`5.3s`). Each job wakes when it crosses the next
+    /// lower multiple of the unit it shows, and the soonest one wins — not
+    /// necessarily the nearest job. Under ten seconds the tenth is also the
+    /// floor, so the last second never wakes per millisecond. `None` means
+    /// nothing counts down (a job at 0 waits for the daemon's reschedule).
     pub fn schedule_tick_ms(&self, now_ms: u64) -> Option<u64> {
-        let next = self
-            .cron_jobs
+        self.cron_jobs
             .iter()
-            .filter(|j| j.enabled)
             .filter_map(|j| j.due_in_ms(now_ms))
-            .min()?;
-        if next <= 60_000 {
-            // Second resolution: wake on the next whole second of the countdown.
-            Some(next % 1000 + 1)
-        } else {
-            // Minute resolution: wake when the displayed minute changes.
-            Some(next % 60_000 + 1)
-        }
+            .filter(|&due| due > 0)
+            .map(|due| {
+                let unit = if due < 10_000 {
+                    100
+                } else if due < 3_600_000 {
+                    1_000
+                } else {
+                    60_000
+                };
+                due % unit + 1
+            })
+            .min()
     }
 
     /// Cron jobs and monitors worth a row: enabled jobs, and monitors still

@@ -295,6 +295,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             wakeups::deferred_draw(painter.next_draw_wait(&state, frame_interval, anim.period()));
         let menu_remote_sleep = wakeups::menu_remote(&state);
         let resync_sleep = wakeups::resync(&state);
+        let schedule_sleep = wakeups::schedule(&state);
         let anim_sleep = anim.tick();
 
         tokio::select! {
@@ -376,6 +377,9 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             }
             _ = toast_expiry_sleep => {
                 state.expire_toasts(Instant::now());
+            }
+            _ = schedule_sleep => {
+                state.dirty = true;
             }
             _ = deferred_draw_sleep => {
                 // Loop iteration triggers draw
