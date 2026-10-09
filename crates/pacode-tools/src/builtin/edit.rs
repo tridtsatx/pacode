@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{is_outside_workspace, parse_input, preview_body};
+use super::helpers::{
+    FileChange, diff_off_runtime, is_outside_workspace, parse_input, preview_body,
+};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "edit";
@@ -131,8 +133,11 @@ impl Tool for EditTool {
             .to_string_lossy()
             .to_string();
 
-        let diff = pacode_render::unified_diff(&content, &new_content, &rel_path, 3);
-        let stat = pacode_render::diff_stat(&content, &new_content);
+        let FileChange {
+            new: new_content,
+            diff,
+            stat,
+        } = diff_off_runtime(content, new_content, rel_path.clone()).await?;
 
         let outside = is_outside_workspace(&full_path, &ctx.cwd);
         let perm_title = if outside {
