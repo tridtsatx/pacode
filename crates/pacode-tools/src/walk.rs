@@ -45,7 +45,10 @@ pub struct WalkOptions {
 }
 
 /// One visited entry; `rel` is relative to the canonical walk root.
-#[derive(Clone, Debug)]
+///
+/// Not `Clone` on purpose: entries are only moved or borrowed (see
+/// `join_parts`), so a deep copy of a whole scan cannot slip in.
+#[derive(Debug)]
 pub struct WalkEntry {
     pub rel: PathBuf,
     pub is_file: bool,
@@ -218,8 +221,8 @@ fn scan(
         }
         Some(reserved) => {
             // Each walker thread fills its own Vec and hands it over when
-            // its visitor is dropped at the end of the walk: one copy of the
-            // entries, no channel buffer beside the result.
+            // its visitor is dropped at the end of the walk; the parts are
+            // then moved into one Vec (`join_parts`), never cloned.
             let parts: Mutex<Vec<Vec<WalkEntry>>> = Mutex::new(Vec::new());
             builder.threads(reserved.count()).build_parallel().run(|| {
                 let mut local = LocalEntries {
@@ -240,14 +243,28 @@ fn scan(
             if cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
-            parts
-                .into_inner()
-                .unwrap_or_else(|p| p.into_inner())
-                .concat()
+            join_parts(parts.into_inner().unwrap_or_else(|p| p.into_inner()))
         }
     };
     entries.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
     Ok(entries)
+}
+
+/// The walker threads' parts as one Vec: the largest part is the base and the
+/// others are moved onto it, so each entry's heap data moves rather than being
+/// copied (`WalkEntry` is deliberately not `Clone`; `concat` would deep-copy).
+/// Peak is the parts plus one buffer of entry headers for the result.
+fn join_parts(mut parts: Vec<Vec<WalkEntry>>) -> Vec<WalkEntry> {
+    let total: usize = parts.iter().map(Vec::len).sum();
+    let Some(largest) = (0..parts.len()).max_by_key(|&i| parts[i].len()) else {
+        return Vec::new();
+    };
+    let mut joined = parts.swap_remove(largest);
+    joined.reserve_exact(total - joined.len());
+    for mut part in parts {
+        joined.append(&mut part);
+    }
+    joined
 }
 
 /// One walker thread's entries, appended to the shared parts on drop.

@@ -277,6 +277,49 @@ fn walk_without_spare_threads_matches_the_parallel_one() {
     assert_eq!(starved, free);
 }
 
+/// The walker threads' parts are moved into the result, not copied: every
+/// entry keeps its path's heap buffer, and nothing is lost or duplicated.
+#[test]
+fn joining_parts_moves_entries() {
+    let entry = |name: &str| super::WalkEntry {
+        rel: PathBuf::from(name),
+        is_file: true,
+        is_dir: false,
+        mtime: None,
+        size: 0,
+    };
+    let parts = vec![
+        vec![entry("a"), entry("b")],
+        vec![entry("c"), entry("d"), entry("e")],
+        Vec::new(),
+        vec![entry("f")],
+    ];
+    let mut before: Vec<(String, usize)> = parts
+        .iter()
+        .flatten()
+        .map(|e| {
+            (
+                e.rel.to_string_lossy().into_owned(),
+                e.rel.as_os_str().as_encoded_bytes().as_ptr() as usize,
+            )
+        })
+        .collect();
+    let joined = super::join_parts(parts);
+    let mut after: Vec<(String, usize)> = joined
+        .iter()
+        .map(|e| {
+            (
+                e.rel.to_string_lossy().into_owned(),
+                e.rel.as_os_str().as_encoded_bytes().as_ptr() as usize,
+            )
+        })
+        .collect();
+    before.sort();
+    after.sort();
+    assert_eq!(after, before, "same entries, same heap buffers");
+    assert!(super::join_parts(Vec::new()).is_empty());
+}
+
 #[test]
 fn cancelled_parallel_scan_reports_cancelled() {
     let tmp = tempfile::tempdir().unwrap();
