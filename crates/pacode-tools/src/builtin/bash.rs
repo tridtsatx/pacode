@@ -154,11 +154,9 @@ pub(crate) async fn run_authorized(
     let outcome = ctx.host.wait_task(&id, ctx.exec_yield_after, false).await;
     match outcome {
         WaitOutcome::Finished => {
-            let exit_code = ctx
-                .host
-                .task_info(&id)
-                .and_then(|i| i.exit_code)
-                .unwrap_or(0);
+            let info = ctx.host.task_info(&id);
+            let exit_code = info.as_ref().and_then(|i| i.exit_code).unwrap_or(0);
+            let total_bytes = info.map_or(0, |i| i.output_bytes);
             // Head+tail, not a tail: the first error of a long build is
             // usually the one that matters. `accept_large_output` lifts the
             // char cap; the exec buffer's own head/tail caps still bound it.
@@ -169,10 +167,20 @@ pub(crate) async fn run_authorized(
             };
             let mut content = ctx.host.task_output(&id, max_chars).await?;
             let preview = preview_body(&content);
+            // Past the exec buffer's 80 KB its own `bytes omitted` marker sits
+            // in the middle the char cap cuts away, so the real size is named
+            // on the last line whenever the model is not seeing all of it.
+            let shown_all = total_bytes <= content.len() as u64;
             if !content.ends_with('\n') {
                 content.push('\n');
             }
-            content.push_str(&format!("[exit code {exit_code}]"));
+            if shown_all {
+                content.push_str(&format!("[exit code {exit_code}]"));
+            } else {
+                content.push_str(&format!(
+                    "[exit code {exit_code}, {total_bytes} bytes total]"
+                ));
+            }
 
             let mut out = ToolOutput::text(content)
                 .with_title(tool_title)

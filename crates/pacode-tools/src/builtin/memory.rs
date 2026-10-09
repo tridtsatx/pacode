@@ -136,6 +136,10 @@ impl Tool for MemoryWriteTool {
         Some(&self.definition)
     }
 
+    fn can_exceed_output_cap(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Edit
     }

@@ -92,6 +92,10 @@ impl Tool for EditTool {
         })
     }
 
+    fn can_exceed_output_cap(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Edit
     }

@@ -561,7 +561,11 @@ async fn test_bash_long_output_keeps_head_and_tail() {
         .unwrap();
     assert!(out.content.starts_with("1\n2\n3\n"));
     assert!(out.content.contains("truncated"));
-    assert!(out.content.ends_with("\n100000\n[exit code 0]"));
+    // The real size is named: the exec buffer's own marker fell inside the cut.
+    assert!(
+        out.content
+            .ends_with("\n100000\n[exit code 0, 588895 bytes total]")
+    );
     assert!(out.content.chars().count() <= ctx.output_cap_chars + 200);
 }
 

@@ -52,6 +52,10 @@ impl Tool for WriteTool {
         })
     }
 
+    fn can_exceed_output_cap(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Edit
     }
