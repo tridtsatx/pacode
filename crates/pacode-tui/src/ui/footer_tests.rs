@@ -7,9 +7,118 @@ use pacode_types::{AgentId, AgentInfo};
 use super::*;
 use crate::state::AppState;
 
+fn test_meta() -> pacode_types::SessionMeta {
+    pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_footer"),
+        name: None,
+        cwd: "/repo".into(),
+        git_branch: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        model: ModelRoute::new("anthropic", "claude-sonnet-4-5"),
+        effort: Effort::High,
+        mode: pacode_types::state::Mode::Build,
+        first_prompt: None,
+        zdr: false,
+    }
+}
+
+/// An attached session: the status row only speaks for a session it knows.
 fn make_test_state() -> AppState {
     let config = Config::default();
-    AppState::new(config, "0.1.0".into(), 120, 34)
+    let mut state = AppState::new(config, "0.1.0".into(), 120, 34);
+    state.meta = Some(test_meta());
+    state
+}
+
+fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'static> {
+    crate::ui::footer_status::render(width, state, opts)
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// B10: with no session attached the row used to read a hardcoded
+/// "Gemini 3.8 Flash" plus the default mode and effort.
+#[test]
+fn no_session_shows_no_model_mode_or_effort() {
+    let mut state = make_test_state();
+    state.meta = None;
+    let opts = RenderOptions::new(120, false);
+    let row1 = line_text(&render_row1(120, &state, &opts));
+    assert_eq!(row1, crate::ui::footer_status::NO_SESSION);
+    let row2 = line_text(&render_row2(120, &state, &opts));
+    assert!(!row2.contains("ask before edits"), "row2 was: {row2}");
+    assert!(!row2.contains("to cycle"), "row2 was: {row2}");
+}
+
+#[test]
+fn the_status_row_is_a_mode_badge_model_effort_and_context() {
+    let mut state = make_test_state();
+    state.rail.usage.context_tokens = 12_000;
+    state.rail.usage.context_window = Some(100_000);
+    let opts = RenderOptions::new(100, false);
+    let row1 = render_row1(100, &state, &opts);
+    let text = line_text(&row1);
+    assert!(text.starts_with(" BUILD  "), "row1 was: {text}");
+    assert_eq!(row1.spans[0].style, opts.theme.badge(opts.theme.cyan));
+    assert!(text.contains("high"));
+    assert!(text.contains("ctx 12%"), "row1 was: {text}");
+    assert_eq!(pacode_render::display_width(&text), 100);
+}
+
+#[test]
+fn the_status_row_degrades_without_overflowing() {
+    let state = make_test_state();
+    for width in [8usize, 20, 30, 44, 60] {
+        let opts = RenderOptions::new(width as u16, false);
+        let text = line_text(&render_row1(width, &state, &opts));
+        assert!(
+            pacode_render::display_width(&text) <= width,
+            "{width}: {text}"
+        );
+    }
+}
+
+/// B27: the hints used to spell the default keys whatever `/keys` said.
+#[test]
+fn hints_follow_the_keymap() {
+    use crate::binding::{Action, parse_binding};
+    let mut state = make_test_state();
+    let opts = RenderOptions::new(160, false);
+    state
+        .keymap
+        .set_binding(Action::CycleMode, parse_binding("alt+m").unwrap());
+    state
+        .keymap
+        .set_binding(Action::SessionPicker, parse_binding("ctrl+o").unwrap());
+    let row2 = line_text(&render_row2(160, &state, &opts));
+    assert!(row2.contains("(alt+m to cycle)"), "row2 was: {row2}");
+    assert!(!row2.contains("shift+tab"), "row2 was: {row2}");
+    assert!(row2.contains("ctrl+o"), "row2 was: {row2}");
+    assert!(!row2.contains("ctrl+p"), "row2 was: {row2}");
+
+    // An unbound action drops out instead of naming a dead key.
+    state.keymap.set_bindings(Action::CycleMode, Vec::new());
+    let row2 = line_text(&render_row2(160, &state, &opts));
+    assert!(!row2.contains("to cycle"), "row2 was: {row2}");
+
+    state
+        .keymap
+        .set_binding(Action::FollowAgent, parse_binding("alt+y").unwrap());
+    state.keymap.set_bindings(Action::Submit, Vec::new());
+    assert_eq!(
+        key_hints(
+            &state,
+            &[
+                (Action::Submit, "open"),
+                (Action::FollowAgent, "follow"),
+                (Action::Cancel, "clear"),
+            ]
+        ),
+        "alt+y follow · esc clear"
+    );
 }
 
 #[test]
@@ -31,9 +140,9 @@ fn test_footer_render_plugin_status() {
 
     let row1 = render_row1(120, &state, &opts);
     let row1_text: String = row1.spans.iter().map(|s| s.content.as_ref()).collect();
-    // Mode label is followed by " · git-sync: rebasing"
+    // The mode badge is followed by the plugin status
     assert!(
-        row1_text.contains("Build · git-sync: rebasing"),
+        row1_text.contains(" BUILD  git-sync: rebasing"),
         "row1_text was: {row1_text}"
     );
 
@@ -201,7 +310,7 @@ fn task_panel_footer_names_task_actions() {
         .iter()
         .map(|span| span.content.as_ref())
         .collect();
-    assert!(text.contains("esc back · scroll pages · k kill"), "{text}");
+    assert!(text.contains("esc back · pgup scroll · k kill"), "{text}");
 }
 
 #[test]

@@ -66,10 +66,13 @@ pub fn draw_session(frame: &mut Frame, area: Rect, state: &AppState, opts: &Rend
 
     if !finished_subagents.is_empty() {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            format!("AGENTS  {} done", finished_subagents.len()),
-            opts.theme.faint,
-        )));
+        lines.push(Line::from(vec![
+            crate::ui::chrome::section("AGENTS", opts),
+            Span::styled(
+                format!("  {} done", finished_subagents.len()),
+                opts.theme.faint,
+            ),
+        ]));
 
         let rem = (area.height as usize).saturating_sub(lines.len());
         let now = now_ms();
@@ -166,7 +169,7 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
     // BACKGROUND header would name an empty list.
     if !tasks.is_empty() {
         let mut header_spans = vec![
-            Span::styled(title_text, opts.theme.faint),
+            crate::ui::chrome::section(title_text, opts),
             Span::raw(" ".repeat(spaces)),
         ];
         header_spans.extend(right_spans);
@@ -217,7 +220,7 @@ fn schedule_lines(
     now: u64,
     budget: usize,
 ) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(Span::styled("SCHEDULE", opts.theme.faint))];
+    let mut out = vec![Line::from(crate::ui::chrome::section("SCHEDULE", opts))];
     let mut rows = Vec::new();
 
     for job in state.rail.cron_jobs.iter().filter(|j| j.enabled) {

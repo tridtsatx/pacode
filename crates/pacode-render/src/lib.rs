@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod diff;
+pub mod glyphs;
 pub mod markdown;
 pub mod palettes;
 pub mod shimmer;

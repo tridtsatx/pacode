@@ -163,3 +163,104 @@ fn test_builtins_palettes_exist() {
     );
     assert!(builtins.iter().any(|p| p.name == "nord" && !p.light));
 }
+
+#[test]
+fn every_builtin_palette_derives_a_distinct_band_and_border_in_truecolor() {
+    for palette in builtin_palettes() {
+        let theme = Theme::from_palette(palette, true);
+        let name = &palette.name;
+        assert!(
+            matches!(theme.surface.bg, Some(Color::Rgb(..))),
+            "{name}: truecolor surface must be an RGB background"
+        );
+        // A selection painted over a band must stay visible.
+        assert_ne!(theme.surface.bg, theme.selected_bg.bg, "{name}");
+        assert_eq!(
+            theme.surface.fg, None,
+            "{name}: a band never recolours text"
+        );
+        assert!(
+            matches!(theme.border.fg, Some(Color::Rgb(..))),
+            "{name}: truecolor border must be an RGB foreground"
+        );
+        assert_ne!(theme.border.fg, theme.fg.fg, "{name}");
+    }
+}
+
+#[test]
+fn ansi_and_mono_themes_draw_no_band() {
+    for palette in builtin_palettes() {
+        let ansi = Theme::from_palette(palette, false);
+        assert_eq!(ansi.surface, Style::default(), "{}", palette.name);
+        assert!(
+            !matches!(ansi.border.fg, Some(Color::Rgb(..)) | None),
+            "{}: an ANSI border is a named colour",
+            palette.name
+        );
+    }
+    assert_eq!(Theme::ansi().surface, Style::default());
+    assert_eq!(Theme::mono().surface, Style::default());
+    assert_eq!(Theme::mono().border, Style::default());
+}
+
+#[test]
+fn explicit_surface_and_border_keys_override_the_derivation() {
+    let mut colors = BTreeMap::new();
+    colors.insert("surface".to_string(), "#102030".to_string());
+    colors.insert("border".to_string(), "#405060".to_string());
+    let pal = Palette {
+        name: "custom".to_string(),
+        light: false,
+        colors,
+    };
+    let theme = Theme::from_palette(&pal, true);
+    assert_eq!(
+        theme.surface,
+        Style::default().bg(Color::Rgb(0x10, 0x20, 0x30))
+    );
+    assert_eq!(
+        theme.border,
+        Style::default().fg(Color::Rgb(0x40, 0x50, 0x60))
+    );
+}
+
+#[test]
+fn badge_degrades_with_the_colour_mode() {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    // Truecolor: the tone becomes the background, the foreground contrasts.
+    let tc = Theme::truecolor();
+    let badge = tc.badge(tc.green);
+    assert_eq!(badge.bg, tc.green.fg);
+    assert!(badge.add_modifier.contains(Modifier::BOLD));
+    assert!(!badge.add_modifier.contains(Modifier::REVERSED));
+    assert_ne!(badge.fg, badge.bg);
+    // ANSI-16: the terminal swaps the named colour in.
+    let ansi = Theme::ansi();
+    assert_eq!(
+        ansi.badge(ansi.red),
+        bold.fg(Color::Red).add_modifier(Modifier::REVERSED)
+    );
+    // Mono: nothing but weight — the glyph and the text are the marker.
+    let mono = Theme::mono();
+    assert_eq!(mono.badge(mono.red), bold);
+}
+
+#[test]
+fn badge_foreground_contrasts_with_light_and_dark_tones() {
+    let theme = Theme::truecolor();
+    let on_light = theme.badge(Style::default().fg(Color::Rgb(0xf5, 0xc5, 0x42)));
+    let on_dark = theme.badge(Style::default().fg(Color::Rgb(0x1a, 0x20, 0x2c)));
+    assert_eq!(on_light.fg, Some(BADGE_DARK));
+    assert_eq!(on_dark.fg, Some(BADGE_LIGHT));
+    for palette in builtin_palettes() {
+        let t = Theme::from_palette(palette, true);
+        for tone in [t.accent, t.green, t.red, t.yellow, t.cyan, t.violet, t.dim] {
+            let b = t.badge(tone);
+            assert!(
+                b.bg.is_some() && b.fg.is_some() && b.fg != b.bg,
+                "{}",
+                palette.name
+            );
+        }
+    }
+}

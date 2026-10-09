@@ -3,8 +3,11 @@
 
 pub mod analyze;
 pub mod anim;
+mod cells;
+pub mod chrome;
 pub mod dialog;
 pub mod footer;
+mod footer_status;
 pub mod header;
 pub mod images;
 pub mod input;

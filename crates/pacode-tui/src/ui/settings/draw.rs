@@ -11,7 +11,7 @@ use ratatui::layout::{Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
 use pacode_config::registry::{self, SettingEntry, SettingKind};
@@ -110,19 +110,14 @@ pub fn draw(
 /// just the icons: a rounded border on a terminal that cannot draw one is the
 /// same tofu a missing icon would be.
 fn frame_block(title: String, hint: &'static str, opts: &RenderOptions) -> Block<'static> {
-    let border = if opts.glyphs.ascii {
-        BorderType::Plain
-    } else {
-        BorderType::Rounded
-    };
     Block::default()
         .borders(Borders::ALL)
-        .border_type(border)
-        .border_style(opts.theme.dim)
-        .title(Span::styled(
-            title,
-            opts.theme.bold.patch(opts.theme.accent),
-        ))
+        .border_set(crate::ui::chrome::border_set(opts))
+        .border_style(opts.theme.border)
+        .title(Line::from(vec![
+            Span::styled(opts.glyphs.hline, opts.theme.border),
+            Span::styled(title, opts.theme.bold.patch(opts.theme.accent)),
+        ]))
         .title_bottom(Span::styled(hint, opts.theme.dim))
 }
 

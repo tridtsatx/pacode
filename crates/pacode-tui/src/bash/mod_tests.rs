@@ -79,7 +79,7 @@ fn test_non_zero_exit_is_visible() {
         .iter()
         .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
         .collect();
-    assert!(full_rendered.contains("(exit 1)"));
+    assert!(full_rendered.contains("Exited with code 1"));
     assert!(full_rendered.contains("failure"));
 }
 

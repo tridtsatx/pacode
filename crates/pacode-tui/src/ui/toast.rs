@@ -67,15 +67,21 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
             ToastLevel::Warn => ("!", opts.theme.accent),
             ToastLevel::Info => (opts.glyphs.main_dot, opts.theme.cyan),
         };
-        // Fading flattens every span to faint.
-        let (sym_style, title_style, detail_style) = if is_fading(age_ms) {
+        // The level glyph is a badge, like a tool call's outcome. Fading
+        // flattens every span to faint, the plaque included.
+        let fading = is_fading(age_ms);
+        let (sym_style, title_style, detail_style) = if fading {
             (opts.theme.faint, opts.theme.faint, opts.theme.faint)
         } else {
-            (level_style, opts.theme.fg, opts.theme.faint)
+            (
+                opts.theme.badge(level_style),
+                opts.theme.fg,
+                opts.theme.faint,
+            )
         };
 
-        // One line: `{glyph} {title}`, plus ` · {detail}` when it fits.
-        let sym_w = display_width(sym) + 1;
+        // One line: ` {glyph} ` {title}, plus ` · {detail}` when it fits.
+        let sym_w = display_width(sym) + 3;
         let text_w = (area.width as usize).saturating_sub(sym_w);
         let combined = match toast.detail.as_deref() {
             Some(detail) => format!("{} · {detail}", toast.title),
@@ -91,7 +97,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         };
         let (title_part, detail_part) = trunc.split_at(boundary);
         let mut spans = vec![
-            Span::styled(format!("{sym} "), sym_style),
+            Span::styled(format!(" {sym} "), sym_style),
+            Span::raw(" "),
             Span::styled(title_part.to_string(), title_style),
         ];
         if !detail_part.is_empty() {

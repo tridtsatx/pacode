@@ -1,6 +1,9 @@
 use std::time::Instant;
 
+use pacode_types::{ExplainLevel, RiskLevel, ToastLevel};
+
 use super::*;
+use crate::state::transcript::PermExplain;
 
 fn whole() -> super::PlainWindow {
     super::PlainWindow {
@@ -117,7 +120,7 @@ fn an_error_notice_is_a_classified_block() {
         "turn failed: authentication failed: Invalid x-api-key",
         80,
     );
-    assert!(joined.contains("✗ turn failed · auth"), "{joined}");
+    assert!(joined.contains(" ✗  turn failed · auth"), "{joined}");
     assert!(joined.contains("│ Invalid x-api-key"), "{joined}");
     assert!(!joined.contains("authentication failed:"), "{joined}");
 
@@ -209,7 +212,7 @@ fn a_long_error_body_wraps_onto_the_gutter() {
     let body = "word ".repeat(40);
     let text = format!("turn failed: transport: {}", body.trim());
     let joined = notice_text(ToastLevel::Error, &text, 40);
-    let gutter_lines = joined.lines().filter(|l| l.starts_with("│ ")).count();
+    let gutter_lines = joined.lines().filter(|l| l.starts_with(" │ ")).count();
     assert!(gutter_lines > 1, "{joined}");
 
     // A multi-line body keeps every line on the gutter.

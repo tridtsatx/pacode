@@ -19,7 +19,7 @@ fn wide_header_shows_mascot_and_title_once() {
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
     let joined = text.join("\n");
-    assert_eq!(joined.matches("pacode v0.1.0").count(), 1);
+    assert_eq!(joined.matches(" pacode  v0.1.0").count(), 1);
     assert_eq!(joined.matches("made by tridtsat").count(), 1);
     assert_eq!(lines.len(), mascot::HEIGHT + 1);
 }
@@ -33,7 +33,7 @@ fn wide_header_shows_the_phrase_of_the_day_right_aligned() {
         .iter()
         .find(|l| {
             let t: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
-            t.contains("pacode v0.1.0")
+            t.contains(" pacode  v0.1.0")
         })
         .expect("title row");
     let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -68,7 +68,7 @@ fn narrow_header_drops_the_mascot() {
     let lines = render(&info(), 30, &opts, 0, u64::MAX);
     assert_eq!(lines.len(), 3);
     let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(first, "pacode v0.1.0");
+    assert_eq!(first, " pacode  v0.1.0");
 }
 
 #[test]
@@ -98,15 +98,15 @@ fn the_welcome_cascade_reveals_rows_top_down() {
     assert_eq!(blank_rows(2 * super::CASCADE_ROW_MS), mascot::HEIGHT - 1);
 
     let early = text(0);
-    assert!(!early.contains("pacode v0.1.0"));
+    assert!(!early.contains(" pacode  v0.1.0"));
     assert!(!early.contains("made by tridtsat"));
 
     let mid = text(super::CASCADE_ROW_MS * (mascot::HEIGHT as u64 + 1));
-    assert!(mid.contains("pacode v0.1.0"));
+    assert!(mid.contains(" pacode  v0.1.0"));
     assert!(!mid.contains("made by tridtsat"));
 
     let done = text(crate::state::WELCOME_ANIM_MS);
-    assert!(done.contains("pacode v0.1.0"));
+    assert!(done.contains(" pacode  v0.1.0"));
     assert!(done.contains("made by tridtsat"));
 }
 

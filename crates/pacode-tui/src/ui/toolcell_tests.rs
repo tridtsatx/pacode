@@ -60,9 +60,9 @@ fn lines_preview(n: usize) -> String {
         .join("\n")
 }
 
-/// Body rows are the ones hanging on the `│ ` gutter.
+/// Body rows are the ones hanging on the ` │ ` gutter.
 fn body_rows<'a>(text: &'a [String], opts: &RenderOptions) -> Vec<&'a str> {
-    let g = format!("{} ", opts.glyphs.vline);
+    let g = format!(" {} ", opts.glyphs.vline);
     text.iter()
         .filter(|l| l.starts_with(&g))
         .map(String::as_str)
@@ -83,19 +83,19 @@ fn header_is_label_arg_and_the_outcome_sits_flush_right() {
     let text = text_of(&lines);
     let header = &text[0];
 
-    let label = rtext::tool_label("bash").unwrap_or("bash");
-    let tool = opts.glyphs.tool;
-    let sep = opts.glyphs.dot_sep;
+    let label = rtext::tool_label("bash").unwrap_or("bash").to_uppercase();
+    let ok = opts.glyphs.ok;
     let dur = format_duration_ms(400);
-    // `▣ Command · docker ps · 400ms` — the duration hugs the title.
-    let expected_left = format!("{tool} {label}{sep}docker ps{sep}{dur}");
+    // ` ✓ BASH  docker ps` — the badge, then the arg in normal weight.
+    let expected_left = format!(" {ok} {label}  docker ps");
     assert!(header.starts_with(&expected_left), "{header}");
+    assert_eq!(lines[0].spans[0].style, opts.theme.badge(opts.theme.green));
+    assert_eq!(lines[0].spans[2].style, opts.theme.fg);
 
     // Genuinely flush right: the row is exactly `width` wide and ends with the
-    // bare status glyph — the exit code moved into the `└` footer.
-    let ok = opts.glyphs.ok;
+    // duration — the exit code moved into the `└` footer.
     assert_eq!(display_width(header), 80, "{header}");
-    assert!(header.ends_with(ok), "{header}");
+    assert!(header.ends_with(&dur), "{header}");
 
     // `│ $ docker ps`, then the output; the exit-code line stays out of the body.
     let body = body_rows(&text, &opts);
@@ -104,7 +104,7 @@ fn header_is_label_arg_and_the_outcome_sits_flush_right() {
     assert!(body[1].contains("container-a"), "{}", body[1]);
 
     // `└ Exited with code 0` closes the gutter.
-    let corner = format!("{} ", opts.glyphs.vcorner);
+    let corner = format!(" {} ", opts.glyphs.vcorner);
     let footer = text
         .iter()
         .find(|l| l.starts_with(&corner))
@@ -126,8 +126,32 @@ fn the_outcome_stays_on_the_right_edge_even_when_narrow() {
     let text = text_of(&lines);
     let header = &text[0];
     assert_eq!(display_width(header), 30, "{header}");
-    // Too narrow for the duration — the bare glyph still pins the right edge.
-    assert!(header.ends_with(opts.glyphs.ok), "{header}");
+    // The arg yields first: the badge and the duration both survive.
+    assert!(
+        header.starts_with(&format!(" {} READ ", opts.glyphs.ok)),
+        "{header}"
+    );
+    assert!(header.ends_with(&format_duration_ms(40)), "{header}");
+    assert!(header.contains(opts.glyphs.ellipsis), "{header}");
+}
+
+#[test]
+fn the_badge_tone_follows_the_outcome() {
+    let opts = RenderOptions::new(60, false);
+    for (status, tone) in [
+        (ToolStatus::Running, opts.theme.accent),
+        (ToolStatus::Ok, opts.theme.green),
+        (ToolStatus::Error, opts.theme.red),
+        (ToolStatus::Denied, opts.theme.dim),
+        (ToolStatus::Backgrounded, opts.theme.violet),
+    ] {
+        let lines = render(&call("read", "read x", status, "x"), 60, &opts, 0, false);
+        assert_eq!(
+            lines[0].spans[0].style,
+            opts.theme.badge(tone),
+            "{status:?}"
+        );
+    }
 }
 
 #[test]
@@ -184,9 +208,9 @@ fn collapsed_failure_keeps_only_the_tail() {
 
     let fail = opts.glyphs.fail;
     let dur = format_duration_ms(12_000);
-    // `✗` flush right; the duration sits next to the title.
-    assert!(text[0].ends_with(fail), "{}", text[0]);
-    assert!(text[0].contains(&dur), "{}", text[0]);
+    // `✗` in the badge; the duration flush right.
+    assert!(text[0].starts_with(&format!(" {fail} ")), "{}", text[0]);
+    assert!(text[0].ends_with(&dur), "{}", text[0]);
     let joined = text.join("\n");
     assert!(
         joined.contains("Exited with code 1"),
@@ -236,8 +260,12 @@ fn ansi_escapes_are_stripped_and_cannot_restyle_the_gutter() {
         "raw escapes must never reach a span"
     );
 
-    // The gutter is painted by US, from the outcome — not by the program.
-    assert_eq!(lines[1].spans[0].style, opts.theme.green);
+    // The gutter is painted by US — not by the program.
+    assert_eq!(lines[1].spans[0].style, opts.theme.dim);
+    assert_eq!(
+        lines[1].spans[0].content,
+        format!(" {} ", opts.glyphs.vline)
+    );
     // …while the program's text itself stays dim.
     assert_eq!(lines[1].spans[1].style, opts.theme.dim);
 }
@@ -253,12 +281,12 @@ fn ascii_mode_falls_back_on_plain_glyphs() {
     );
     c.duration_ms = Some(40);
     let text = text_of(&render(&c, 60, &opts, 0, false));
-    assert!(text[0].starts_with("# "), "{}", text[0]);
-    assert!(text[0].contains(". cargo test . 40ms"), "{}", text[0]);
-    assert!(text[0].ends_with("+"), "{}", text[0]);
+    assert!(text[0].starts_with(" + BASH  cargo test"), "{}", text[0]);
+    assert!(text[0].ends_with("40ms"), "{}", text[0]);
     let body = body_rows(&text, &opts);
-    assert!(body.iter().all(|l| l.starts_with("| ")), "{body:?}");
-    let corner = format!("{} ", opts.glyphs.vcorner);
+    assert!(!body.is_empty());
+    assert!(body.iter().all(|l| l.starts_with(" | ")), "{body:?}");
+    let corner = format!(" {} ", opts.glyphs.vcorner);
     assert!(
         text.iter()
             .any(|l| l.starts_with(&corner) && l.contains("Exited with code 0")),
@@ -267,14 +295,16 @@ fn ascii_mode_falls_back_on_plain_glyphs() {
 }
 
 #[test]
-fn denied_calls_say_denied_on_a_red_gutter() {
+fn denied_calls_say_denied_on_a_dim_badge() {
     let opts = RenderOptions::new(80, false);
     let c = call("bash", "bash rm -rf /", ToolStatus::Denied, "Denied");
     let lines = render(&c, 80, &opts, 0, false);
     let text = text_of(&lines);
     assert!(text[0].ends_with("denied"), "{}", text[0]);
-    // The gutter is red, and a denied bash call still shows what it would have run.
-    assert_eq!(lines[1].spans[0].style, opts.theme.red);
+    // A refused call is quiet, and a denied bash call still shows what it
+    // would have run.
+    assert_eq!(lines[0].spans[0].style, opts.theme.badge(opts.theme.dim));
+    assert!(text[0].starts_with(&format!(" {} BASH", opts.glyphs.disabled)));
     let body = body_rows(&text, &opts);
     assert!(body[0].contains("$ rm -rf /"), "{}", body[0]);
     assert!(body[1].contains("Denied"), "{}", body[1]);
@@ -295,9 +325,14 @@ fn backgrounded_calls_show_the_background_outcome() {
     let running = opts.glyphs.running;
     let bg = rtext::in_background();
     let dur = format_duration_ms(107_000);
-    assert!(text[0].ends_with(&format!("{running} {bg}")), "{}", text[0]);
-    assert!(text[0].contains(&dur), "{}", text[0]);
-    assert_eq!(lines[1].spans[0].style, opts.theme.violet);
+    let sep = opts.glyphs.dot_sep;
+    assert!(
+        text[0].starts_with(&format!(" {running} BASH")),
+        "{}",
+        text[0]
+    );
+    assert!(text[0].ends_with(&format!("{bg}{sep}{dur}")), "{}", text[0]);
+    assert_eq!(lines[0].spans[0].style, opts.theme.badge(opts.theme.violet));
     let body = body_rows(&text, &opts);
     assert!(
         body.iter()
@@ -345,21 +380,21 @@ fn running_calls_spin_on_the_anim_frame() {
     let header_at =
         |frame: u64, o: &RenderOptions| text_of(&render(&c, 80, o, frame, false))[0].clone();
     assert!(
-        header_at(0, &opts).contains("⠋ running"),
+        header_at(0, &opts).contains("⠋ BASH"),
         "{}",
         header_at(0, &opts)
     );
     assert!(
-        header_at(1, &opts).contains("⠙ running"),
+        header_at(1, &opts).contains("⠙ BASH"),
         "{}",
         header_at(1, &opts)
     );
     assert!(
-        header_at(10, &opts).contains("⠋ running"),
+        header_at(10, &opts).contains("⠋ BASH"),
         "{}",
         header_at(10, &opts)
     );
-    // The elapsed time sits next to the title, not at the right edge.
+    // The elapsed time sits at the right edge, after the swept word.
     assert!(
         header_at(0, &opts).contains("12s"),
         "{}",
@@ -368,22 +403,22 @@ fn running_calls_spin_on_the_anim_frame() {
 
     let ascii = RenderOptions::new(80, true);
     assert!(
-        header_at(0, &ascii).contains("- running"),
+        header_at(0, &ascii).contains("- BASH"),
         "{}",
         header_at(0, &ascii)
     );
     assert!(
-        header_at(1, &ascii).contains("\\ running"),
+        header_at(1, &ascii).contains("\\ BASH"),
         "{}",
         header_at(1, &ascii)
     );
     assert!(
-        header_at(2, &ascii).contains("| running"),
+        header_at(2, &ascii).contains("| BASH"),
         "{}",
         header_at(2, &ascii)
     );
     assert!(
-        header_at(3, &ascii).contains("/ running"),
+        header_at(3, &ascii).contains("/ BASH"),
         "{}",
         header_at(3, &ascii)
     );
@@ -421,10 +456,11 @@ fn non_bash_args_are_the_title_tail_not_a_dollar_line() {
     );
     let lines = render(&c, 80, &opts, 0, false);
     let text = text_of(&lines);
-    let label = rtext::tool_label("read_file").unwrap_or("read_file");
-    let sep = opts.glyphs.dot_sep;
+    let label = rtext::tool_label("read_file")
+        .unwrap_or("read_file")
+        .to_uppercase();
     assert!(
-        text[0].contains(&format!("{label}{sep}crates/x.rs")),
+        text[0].contains(&format!("{label}  crates/x.rs")),
         "{}",
         text[0]
     );
@@ -478,7 +514,7 @@ fn expanded_is_still_bounded() {
 /// Body-row text without the `│ ` gutter — glued back together it must hold
 /// every piece a wrap split mid-word.
 fn glued_body(text: &[String], opts: &RenderOptions) -> String {
-    let g = format!("{} ", opts.glyphs.vline);
+    let g = format!(" {} ", opts.glyphs.vline);
     body_rows(text, opts)
         .iter()
         .map(|l| l[g.len()..].to_string())
@@ -545,7 +581,7 @@ fn a_denied_cell_expands_to_the_full_refused_command() {
 }
 
 #[test]
-fn a_diff_preview_renders_on_the_outcome_gutter() {
+fn a_diff_preview_renders_on_the_gutter() {
     let opts = RenderOptions::new(80, false);
     let diff = DiffStat {
         added: 1,
@@ -569,9 +605,9 @@ fn a_diff_preview_renders_on_the_outcome_gutter() {
     );
     let joined = text.join("\n");
     assert!(joined.contains("@@"), "{joined}");
-    // The outcome gutter tints the diff renderer's output, and the header
+    // The quiet gutter fronts the diff renderer's output, and the header
     // still carries the +A −R stat.
-    assert_eq!(lines[1].spans[0].style, opts.theme.green);
+    assert_eq!(lines[1].spans[0].style, opts.theme.dim);
     assert!(text[0].contains("+1"), "{}", text[0]);
     // No `$` line, no line cap — the diff renderer owns this body.
     assert!(body.iter().all(|l| !l.contains("$ ")), "{body:?}");
@@ -651,7 +687,7 @@ fn a_trailing_newline_puts_the_cursor_on_the_line_being_written() {
     let c = running("bash", "bash make", "line one\n");
     let text = text_of(&render(&c, 80, &opts, 0, false));
     let body = body_rows(&text, &opts);
-    let g = format!("{} ", opts.glyphs.vline);
+    let g = format!(" {} ", opts.glyphs.vline);
 
     // "line one" is done; the cursor stands on the empty line after it, not
     // on the row above.

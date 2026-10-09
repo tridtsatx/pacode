@@ -13,6 +13,10 @@ use std::path::PathBuf;
 use pacode_render::display_width;
 use unicode_segmentation::UnicodeSegmentation;
 
+#[path = "input_wrap.rs"]
+mod wrap;
+pub use wrap::wrap_text_non_trimming;
+
 #[cfg(test)]
 #[path = "input_tests.rs"]
 mod input_tests;
@@ -171,102 +175,6 @@ pub fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(idx, _)| idx)
         .unwrap_or(text.len())
-}
-
-/// Wrap text into lines preserving all characters without trimming.
-/// Trailing whitespace (spaces, etc.) occupies terminal cells.
-///
-/// Word-aware (spec §4): graphemes group into words separated by whitespace
-/// runs, and a line wraps at the last word boundary that still fits `width`.
-/// Whitespace keeps occupying cells — a run that overflows continues at the
-/// next line's start. A word longer than `width` hard-breaks mid-word.
-pub fn wrap_text_non_trimming(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let width = width.max(1);
-    let mut lines = Vec::new();
-
-    for raw_line in text.split('\n') {
-        let raw_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        if raw_line.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-
-        let mut cur_line = String::new();
-        let mut cur_w = 0usize;
-        // Non-whitespace run accumulated until the next whitespace grapheme
-        // (or the end of the raw line) marks it a complete word.
-        let mut word = String::new();
-        let mut word_w = 0usize;
-
-        for g in raw_line.graphemes(true) {
-            if g.chars().all(char::is_whitespace) {
-                flush_word(
-                    &mut lines,
-                    &mut cur_line,
-                    &mut cur_w,
-                    &mut word,
-                    &mut word_w,
-                    width,
-                );
-                let gw = display_width(g);
-                if cur_w + gw > width && cur_w > 0 {
-                    lines.push(std::mem::take(&mut cur_line));
-                    cur_w = 0;
-                }
-                cur_line.push_str(g);
-                cur_w += gw;
-            } else {
-                word.push_str(g);
-                word_w += display_width(g);
-            }
-        }
-        flush_word(
-            &mut lines,
-            &mut cur_line,
-            &mut cur_w,
-            &mut word,
-            &mut word_w,
-            width,
-        );
-        lines.push(cur_line);
-    }
-
-    lines
-}
-
-/// Place a completed word on the current line: whole when it still fits, on a
-/// fresh line when it only fits at a boundary, chunked mid-word when it is
-/// longer than a whole line.
-fn flush_word(
-    lines: &mut Vec<String>,
-    cur_line: &mut String,
-    cur_w: &mut usize,
-    word: &mut String,
-    word_w: &mut usize,
-    width: usize,
-) {
-    if word.is_empty() {
-        return;
-    }
-    // Wrap at the word boundary first: the word starts on a fresh line.
-    if *cur_w + *word_w > width && *cur_w > 0 {
-        lines.push(std::mem::take(cur_line));
-        *cur_w = 0;
-    }
-    let taken = std::mem::take(word);
-    *word_w = 0;
-    for g in taken.graphemes(true) {
-        let gw = display_width(g);
-        if *cur_w + gw > width && *cur_w > 0 {
-            lines.push(std::mem::take(cur_line));
-            *cur_w = 0;
-        }
-        cur_line.push_str(g);
-        *cur_w += gw;
-    }
 }
 
 impl InputState {
@@ -646,18 +554,43 @@ impl InputState {
         };
     }
 
-    /// Cursor position as (line, column) after wrapping at `width`.
+    /// Cursor position as (line, column) after wrapping at `width`, the
+    /// column counting the 2-cell prompt prefix.
+    ///
+    /// Located in the FULL wrap, not by wrapping the text before the cursor:
+    /// a word's row depends on what follows it, so a prefix that ends inside
+    /// a wrapped word fits on the row above while its letters are drawn on
+    /// the row below (B15).
     pub fn cursor_position(&self, width: u16) -> (u16, u16) {
-        if self.cursor == 0 {
-            return (0, 2.min(width.saturating_sub(1)));
+        let (line, col) = self.cursor_in_wrap(width);
+        (
+            line.min(u16::MAX as usize) as u16,
+            ((2 + col).min(u16::MAX as usize) as u16).min(width.saturating_sub(1)),
+        )
+    }
+
+    /// (wrapped line, text column) of the cursor in the full wrap. A soft
+    /// wrap boundary is both the end of one row and the start of the next;
+    /// the cursor keeps the end of the row it was typed on, so a run of
+    /// typing never jumps rows mid-word.
+    fn cursor_in_wrap(&self, width: u16) -> (usize, usize) {
+        let byte = self.cursor_byte();
+        let (line, col) = self.wrapped_position_of_byte(byte, width);
+        if col == 0 && line > 0 && byte > 0 && !self.text[..byte].ends_with('\n') {
+            let text_w = (width as usize).saturating_sub(2).max(1);
+            if let Some(prev) = wrap_text_non_trimming(&self.text, text_w).get(line - 1) {
+                return (line - 1, display_width(prev));
+            }
         }
-        let text_w = (width as usize).saturating_sub(2).max(1);
-        let before_cursor: String = self.text.chars().take(self.cursor).collect();
-        let lines = wrap_text_non_trimming(&before_cursor, text_w);
-        let line_idx = lines.len().saturating_sub(1) as u16;
-        let last_line = lines.last().map(|s| s.as_str()).unwrap_or("");
-        let col = 2 + display_width(last_line);
-        (line_idx, (col as u16).min(width.saturating_sub(1)))
+        (line, col)
+    }
+
+    /// Byte offset of the cursor (a char index) in `text`.
+    fn cursor_byte(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.text.len(), |(byte, _)| byte)
     }
 
     /// (wrapped line, display column) of byte offset `byte` in the FULL wrap
@@ -666,9 +599,9 @@ impl InputState {
     /// column counts text cells only, WITHOUT the 2-cell prompt prefix the
     /// renderer adds per line. `input_scroll` does not affect columns.
     ///
-    /// Unlike `cursor_position` this cannot just wrap the prefix: a word's
-    /// line depends on lookahead (a token starting after a full line wraps
-    /// to the next one). Instead it replays the wrap per logical line —
+    /// It cannot just wrap the text before `byte`: a word's line depends on
+    /// lookahead (a token starting after a full line wraps to the next one).
+    /// Instead it replays the wrap per logical line —
     /// `wrap_text_non_trimming` splits on `\n`, strips one trailing `\r`,
     /// then wraps each raw line into pieces that partition it contiguously,
     /// so each piece covers the next `piece.len()` bytes of `text`.
@@ -722,18 +655,14 @@ impl InputState {
     }
 
     /// Shared vertical move: locate the wrapped (line, column) the cursor
-    /// renders at — the same wrap-the-prefix path as
+    /// renders at — the same full-wrap lookup as
     /// [`Self::cursor_position`] — then land on the line `±1` away at the
     /// sticky goal column, clamped to that line's width. The goal is the
     /// column of the first vertical move in a run (`vert_goal`); any other
     /// editing method clears it.
     fn move_vert(&mut self, width: u16, down: bool) -> bool {
         let text_w = (width as usize).saturating_sub(2).max(1);
-        let before_cursor: String = self.text.chars().take(self.cursor).collect();
-        let prefix_lines = wrap_text_non_trimming(&before_cursor, text_w);
-        // `wrap_text_non_trimming` always returns >= 1 line.
-        let cur_line = prefix_lines.len() - 1;
-        let cur_col = display_width(prefix_lines.last().map_or("", String::as_str));
+        let (cur_line, cur_col) = self.cursor_in_wrap(width);
         let target = if down {
             cur_line + 1
         } else {

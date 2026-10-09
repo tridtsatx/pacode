@@ -1118,6 +1118,29 @@ fn ctrl_o_expands_the_newest_tool_cell_and_collapses_it_back() {
     assert!(!t.is_expanded(3));
 }
 
+/// B24: a `!cmd` result folds like a bash call, so `ctrl+o` must reach it.
+#[test]
+fn ctrl_o_expands_a_bang_command_result() {
+    let mut t = Transcript::new(8);
+    t.cells.push_back(tool_cell(1, "older tool call"));
+    t.cells.push_back(Cell {
+        id: 2,
+        kind: CellKind::Item(pacode_types::TranscriptKind::BashCommand {
+            command: "seq 40".into(),
+            output: "1\n2".into(),
+            exit_code: Some(0),
+            truncated: false,
+        }),
+        version: 0,
+        ts_ms: 2,
+        stats: None,
+        perm_explain: None,
+    });
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(2));
+    assert!(!t.is_expanded(1));
+}
+
 #[test]
 fn ctrl_o_expands_short_and_denied_cells_too() {
     // A single-line output still expands — the expanded cell also spells out

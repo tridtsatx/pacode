@@ -26,7 +26,7 @@ fn more_lines_uses_the_bound_key() {
 
 #[test]
 fn tool_label_covers_the_named_tools_and_leaves_the_rest() {
-    assert_eq!(tool_label("bash"), Some("Command"));
+    assert_eq!(tool_label("bash"), Some("Bash"));
     assert_eq!(tool_label("read"), Some("Read"));
     assert_eq!(tool_label("grep"), Some("Search"));
     assert_eq!(tool_label("write"), Some("Write"));

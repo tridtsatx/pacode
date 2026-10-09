@@ -1,14 +1,14 @@
 //! Error notices in the transcript — the block form of a failed turn:
 //!
 //! ```text
-//! ✗ turn failed · http 400
-//! │ Invalid request — model foo is not supported
+//!  ✗  turn failed · http 400
+//!  │ Invalid request — model foo is not supported
 //! ```
 //!
 //! The title classifies the `turn failed: <ProviderError>` prefix (`· auth`,
 //! `· http 400`, `· network`, …) so the body keeps just the message; a body
 //! that is raw JSON yields its `error.message`/`message` field instead. The
-//! `│ ` gutter in red follows the failed tool-call cell (`toolcell`).
+//! badge and the gutter follow the failed tool-call cell (`toolcell`).
 
 use ratatui::text::{Line, Span};
 
@@ -18,27 +18,31 @@ use pacode_render::{RenderOptions, truncate_to_width, wrap_text};
 #[path = "notice_tests.rs"]
 mod notice_tests;
 
-/// An error notice as a block: `✗ <title>` in red bold, then the detail
-/// wrapped on a red `│ ` gutter in `dim`.
+/// An error notice as a block: a red `✗` badge and the title in red bold, then the detail
+/// wrapped on a dim ` │ ` gutter.
 pub(crate) fn render_error(text: &str, width: u16, opts: &RenderOptions) -> Vec<Line<'static>> {
     let width = width as usize;
     let (title, body) = split_error_notice(text, opts.glyphs.dot_sep);
 
     let head_style = opts.theme.bold.patch(opts.theme.red);
+    let badge = crate::ui::chrome::badge(opts.glyphs.fail, opts.theme.red, opts);
+    let badge_w = pacode_render::display_width(&badge.content) + 1;
     let mut out = vec![Line::from(vec![
-        Span::styled(format!("{} ", opts.glyphs.fail), head_style),
+        badge,
+        Span::raw(" "),
         Span::styled(
-            truncate_to_width(&title, width.saturating_sub(2), true),
+            truncate_to_width(&title, width.saturating_sub(badge_w), true),
             head_style,
         ),
     ])];
 
     let body = extract_json_message(&body);
     if !body.is_empty() {
-        let body_w = width.saturating_sub(4).max(1);
+        // ` │ ` — the gutter hangs under the badge's glyph, as in a tool cell.
+        let body_w = width.saturating_sub(3).max(1);
         for l in wrap_text(&body, body_w) {
             out.push(Line::from(vec![
-                Span::styled(format!("{} ", opts.glyphs.vline), opts.theme.red),
+                Span::styled(format!(" {} ", opts.glyphs.vline), opts.theme.dim),
                 Span::styled(l, opts.theme.dim),
             ]));
         }

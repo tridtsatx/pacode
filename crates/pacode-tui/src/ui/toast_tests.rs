@@ -143,8 +143,8 @@ fn strip_renders_plain_line_at_left_edge_without_border() {
         rows[3]
     );
     assert!(
-        !row[5].is_whitespace(),
-        "glyph must start at the strip's left edge: {:?}",
+        !row[6].is_whitespace(),
+        "the glyph badge must start at the strip's left edge: {:?}",
         rows[3]
     );
     assert!(rows[2].trim().is_empty(), "top strip row stays empty");
@@ -182,10 +182,10 @@ fn strip_truncates_title_and_detail_to_width() {
         Instant::now(),
     );
 
-    // 20 cells: glyph + space + 18 text cells — the detail is cut entirely.
+    // 20 cells: ` ! ` badge + space + 16 text cells — the detail is cut entirely.
     let rows = render_rows(&state, Rect::new(0, 0, 20, 1), 80, 10);
     let row: Vec<char> = rows[0].chars().collect();
-    assert_eq!(row[0], '!', "warn glyph at the strip's left edge");
+    assert_eq!(row[1], '!', "warn badge at the strip's left edge");
     assert_eq!(row[19], '…', "text truncated to the strip width");
     assert!(
         !row[..20].iter().collect::<String>().contains("detail"),
@@ -352,10 +352,11 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
         row.contains("disable autocopy in /config"),
         "detail must be inline on the strip line: {row:?}"
     );
+    // The prompt below has a frame; the strip line itself has no box.
     for border in ['╭', '╮', '╰', '╯'] {
         assert!(
-            !view.contains(border),
-            "strip has no box: border char {border} must not render"
+            !row.contains(border),
+            "strip has no box: border char {border} must not render: {row:?}"
         );
     }
 
