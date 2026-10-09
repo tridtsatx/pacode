@@ -86,3 +86,93 @@ fn clipping_respects_char_boundaries_and_line_start() {
         Cow::Borrowed("short")
     ));
 }
+
+#[test]
+fn floor_char_boundary_steps_back_inside_a_char() {
+    let line = "aé"; // `é` spans bytes 1..3
+    assert_eq!(floor_char_boundary(line, 0), 0);
+    assert_eq!(floor_char_boundary(line, 2), 1);
+    assert_eq!(floor_char_boundary(line, 3), 3);
+    assert_eq!(floor_char_boundary(line, 99), 3);
+}
+
+/// Enough files for several search threads: the rows must still come out in
+/// walk order, and a limit must keep exactly the first hits in that order —
+/// the same output a single-threaded search gives.
+#[tokio::test]
+async fn a_parallel_search_keeps_walk_order_and_the_first_hits() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for i in 0..400 {
+        std::fs::write(
+            tmp.path().join(format!("f{i:03}.txt")),
+            "hit a\nmiss\nhit b\n",
+        )
+        .expect("write");
+    }
+    let ctx = ctx_in(tmp.path());
+    let walk_order: Vec<String> = crate::walk::shared()
+        .collect(
+            tmp.path(),
+            crate::walk::WalkOptions {
+                include_hidden: false,
+                max_depth: None,
+            },
+            &Default::default(),
+        )
+        .expect("walk")
+        .iter()
+        .map(|entry| entry.rel.to_string_lossy().into_owned())
+        .collect();
+    let expected = |files: usize| -> Vec<String> {
+        walk_order[..files]
+            .iter()
+            .flat_map(|f| [format!("{f}:1:hit a"), format!("{f}:3:hit b")])
+            .collect()
+    };
+
+    let out = GrepTool::default()
+        .call(json!({"pattern": "hit", "max_results": 1000}), &ctx)
+        .await
+        .expect("grep");
+    let rows: Vec<String> = out.content.lines().map(str::to_string).collect();
+    assert_eq!(rows, expected(400));
+
+    for _ in 0..5 {
+        let out = GrepTool::default()
+            .call(json!({"pattern": "hit", "max_results": 151}), &ctx)
+            .await
+            .expect("grep");
+        let mut rows: Vec<String> = out.content.lines().map(str::to_string).collect();
+        let footer = rows.pop().unwrap_or_default();
+        assert!(
+            footer.starts_with("— stopped at max_results=151"),
+            "{footer}"
+        );
+        let mut want = expected(76);
+        want.pop(); // the 151st hit is the first line of the 76th file
+        assert_eq!(rows, want);
+    }
+}
+
+/// A line longer than a search thread's buffer cap fails there; the file is
+/// searched again uncapped, so its hit is still found — once, in order.
+#[tokio::test]
+async fn a_line_over_the_thread_buffer_cap_is_still_searched() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for i in 0..200 {
+        std::fs::write(tmp.path().join(format!("s{i:03}.txt")), "nothing\n").expect("write");
+    }
+    let giant = format!("{}NEEDLE\n", "x".repeat(WORKER_HEAP_LIMIT * 2));
+    std::fs::write(tmp.path().join("big.txt"), format!("NEEDLE first\n{giant}")).expect("write");
+    let ctx = ctx_in(tmp.path());
+
+    let out = GrepTool::default()
+        .call(json!({"pattern": "NEEDLE"}), &ctx)
+        .await
+        .expect("grep");
+    let rows: Vec<&str> = out.content.lines().collect();
+    assert_eq!(rows.len(), 2, "content: {}", out.content);
+    assert_eq!(rows[0], "big.txt:1:NEEDLE first");
+    assert!(rows[1].starts_with("big.txt:2:…"), "row: {}", rows[1]);
+    assert!(rows[1].contains("NEEDLE"));
+}

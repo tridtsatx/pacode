@@ -170,48 +170,93 @@ fn evict_oldest(scans: &mut HashMap<WalkKey, Scan>, max_roots: usize) {
     }
 }
 
-/// One `ignore`-crate walk producing plain entries; the root itself (depth 0)
-/// is never yielded since no consumer lists it.
+/// Ceiling on walker threads for one unbounded scan; several agents may
+/// explore at once.
+const MAX_WALK_THREADS: usize = 8;
+
+/// One `ignore`-crate walk producing plain entries sorted by relative path;
+/// the root itself (depth 0) is never yielded since no consumer lists it.
+///
+/// An unbounded walk runs on `ignore`'s parallel walker: the cost is CPU in
+/// gitignore matching, not IO, and on a large tree it dominates a cold
+/// `grep`/`glob`. A depth-limited walk (`ls`) is a single directory read, too
+/// small to pay for threads. Either way the result is sorted, so the order
+/// does not depend on thread timing or on `readdir`.
 fn scan(
     root: &Path,
     options: WalkOptions,
     cancel: &CancellationToken,
 ) -> Result<Vec<WalkEntry>, ToolError> {
-    let walker = ignore::WalkBuilder::new(root)
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
         .hidden(!options.include_hidden)
         .git_ignore(true)
         .require_git(false)
-        .max_depth(options.max_depth)
-        .build();
+        .max_depth(options.max_depth);
 
     let mut entries = Vec::new();
-    for entry in walker {
+    if options.max_depth.is_some() {
+        for entry in builder.build() {
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
+            if let Some(entry) = walk_entry(root, entry) {
+                entries.push(entry);
+            }
+        }
+    } else {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(MAX_WALK_THREADS);
+        let (tx, rx) = std::sync::mpsc::channel();
+        builder.threads(threads).build_parallel().run(|| {
+            let tx = tx.clone();
+            Box::new(move |entry| {
+                if cancel.is_cancelled() {
+                    return ignore::WalkState::Quit;
+                }
+                if let Some(entry) = walk_entry(root, entry) {
+                    // The receiver outlives the walk, so a send cannot fail.
+                    let _ = tx.send(entry);
+                }
+                ignore::WalkState::Continue
+            })
+        });
+        drop(tx);
+        entries.extend(rx);
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let Ok(entry) = entry else { continue };
-        if entry.depth() == 0 {
-            continue;
-        }
-        let file_type = entry.file_type();
-        let (mtime, size) = match entry.metadata() {
-            Ok(meta) => (meta.modified().ok(), meta.len()),
-            Err(_) => (None, 0),
-        };
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .unwrap_or_else(|_| entry.path())
-            .to_path_buf();
-        entries.push(WalkEntry {
-            rel,
-            is_file: file_type.is_some_and(|ft| ft.is_file()),
-            is_dir: file_type.is_some_and(|ft| ft.is_dir()),
-            mtime,
-            size,
-        });
     }
+    entries.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
     Ok(entries)
+}
+
+fn walk_entry(root: &Path, entry: Result<ignore::DirEntry, ignore::Error>) -> Option<WalkEntry> {
+    let entry = entry.ok()?;
+    if entry.depth() == 0 {
+        return None;
+    }
+    // One stat per entry. Measured: spread over the walker threads it costs
+    // little, and caching it keeps a warm `glob` (mtime sort) from re-stating
+    // every match on each call.
+    let file_type = entry.file_type();
+    let (mtime, size) = match entry.metadata() {
+        Ok(meta) => (meta.modified().ok(), meta.len()),
+        Err(_) => (None, 0),
+    };
+    let rel = entry
+        .path()
+        .strip_prefix(root)
+        .unwrap_or_else(|_| entry.path())
+        .to_path_buf();
+    Some(WalkEntry {
+        rel,
+        is_file: file_type.is_some_and(|ft| ft.is_file()),
+        is_dir: file_type.is_some_and(|ft| ft.is_dir()),
+        mtime,
+        size,
+    })
 }
 
 #[cfg(test)]
