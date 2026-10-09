@@ -12,12 +12,12 @@ use std::sync::RwLock;
 
 use pacode_types::model::{Effort, ModelRoute};
 use pacode_types::state::{Mode, ToastLevel};
-use pacode_types::time::now_ms;
-use pacode_types::{McpServerInfo, PluginInfo, Request, TranscriptKind};
+use pacode_types::{McpServerInfo, PluginInfo, Request};
 
 use crate::keys::Action;
-use crate::state::transcript::{Cell, CellKind};
 use crate::state::{AppState, Focus, Overlay};
+
+mod export;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommand {
@@ -379,7 +379,10 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 push_notice(
                     state,
                     ToastLevel::Warn,
-                    format!("Invalid effort '{arg}'. Valid: low, medium, high, max"),
+                    format!(
+                        "Invalid effort '{arg}'. Valid: {}",
+                        Effort::ALL.map(|e| e.to_string()).join(", ")
+                    ),
                 );
                 vec![]
             }
@@ -410,6 +413,19 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             let truecolor = state.truecolor;
             if arg.is_empty() {
                 open_theme_picker(state)
+            } else if !pacode_render::builtin_palettes()
+                .iter()
+                .any(|p| p.name == arg)
+                && !pacode_config::user_theme_names(&state.paths).contains(&arg)
+            {
+                // `load_theme` would quietly fall back to the default, and the
+                // typo would be saved as the configured theme.
+                push_notice(
+                    state,
+                    ToastLevel::Warn,
+                    format!("Unknown theme '{arg}'. Run /theme to pick one."),
+                );
+                vec![]
             } else {
                 let theme_cfg = pacode_types::ThemeConfig {
                     name: arg.clone(),
@@ -502,57 +518,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             state.dirty = true;
             vec![]
         }
-        "export" => {
-            let path = if arg.is_empty() {
-                let ses_id = state
-                    .meta
-                    .as_ref()
-                    .map(|m| m.id.to_string())
-                    .unwrap_or_else(|| "current".to_string());
-                format!("pacode-{ses_id}.md")
-            } else {
-                arg
-            };
-
-            let mut md = String::new();
-            for cell in &state.transcript.cells {
-                match &cell.kind {
-                    CellKind::Item(TranscriptKind::User { text }) => {
-                        md.push_str(&format!("### User\n\n{text}\n\n"));
-                    }
-                    CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
-                        md.push_str(&format!("### Assistant\n\n{text}\n\n"));
-                    }
-                    CellKind::Item(TranscriptKind::ToolCall { name, title, .. }) => {
-                        md.push_str(&format!("*Tool: {name} - {title}*\n\n"));
-                    }
-                    CellKind::Item(TranscriptKind::BashCommand {
-                        command,
-                        output,
-                        exit_code,
-                        ..
-                    }) => {
-                        let code = exit_code
-                            .map(|c| format!(" (exit {c})"))
-                            .unwrap_or_default();
-                        md.push_str(&format!(
-                            "### Bash: {command}{code}\n\n```\n{output}\n```\n\n"
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-
-            match std::fs::write(&path, md) {
-                Ok(_) => {
-                    push_notice(state, ToastLevel::Success, format!("Exported to {path}"));
-                }
-                Err(e) => {
-                    push_notice(state, ToastLevel::Error, format!("Export failed: {e}"));
-                }
-            }
-            vec![]
-        }
+        "export" => export::run(state, &arg),
         "help" => {
             log::debug!("open overlay: Help");
             crate::keys_menu::open(state, crate::ui::menu::MenuId::Help)
@@ -640,16 +606,7 @@ pub fn open_theme_picker(state: &mut AppState) -> Vec<Action> {
 }
 
 fn push_notice(state: &mut AppState, level: ToastLevel, text: String) {
-    let now = now_ms();
-    state.transcript.push_cell(Cell {
-        id: now,
-        kind: CellKind::Item(TranscriptKind::Notice { level, text }),
-        version: 0,
-        ts_ms: now,
-        stats: None,
-        perm_explain: None,
-    });
-    state.dirty = true;
+    state.push_notice_with_level(level, text);
 }
 
 #[cfg(test)]
