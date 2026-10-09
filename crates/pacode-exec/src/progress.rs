@@ -11,6 +11,7 @@
 //! - generic: a trailing `N/M` with M ≥ N, or `NN%` at end of line.
 //! - `error`/`warning` counters for `npm run lint`-style output (`✖ 3 problems (3 errors, 0 warnings)`).
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use pacode_types::{ProgressSource, TaskProgress};
@@ -19,14 +20,12 @@ use regex::Regex;
 static ANSI_RE: OnceLock<Regex> = OnceLock::new();
 static CARGO_TEST_RUNNING_RE: OnceLock<Regex> = OnceLock::new();
 static CARGO_TEST_CASE_RE: OnceLock<Regex> = OnceLock::new();
-static CARGO_TEST_RESULT_RE: OnceLock<Regex> = OnceLock::new();
 static CARGO_COMPILING_RE: OnceLock<Regex> = OnceLock::new();
 static JEST_TESTS_RE: OnceLock<Regex> = OnceLock::new();
 static PYTEST_COLLECTED_RE: OnceLock<Regex> = OnceLock::new();
 static PYTEST_PERCENT_RE: OnceLock<Regex> = OnceLock::new();
 static GENERIC_RATIO_RE: OnceLock<Regex> = OnceLock::new();
 static GENERIC_PERCENT_RE: OnceLock<Regex> = OnceLock::new();
-static LINT_SUMMARY_RE: OnceLock<Regex> = OnceLock::new();
 static LINT_ERRORS_RE: OnceLock<Regex> = OnceLock::new();
 static LINT_WARNINGS_RE: OnceLock<Regex> = OnceLock::new();
 static WARNING_RE: OnceLock<Regex> = OnceLock::new();
@@ -39,10 +38,11 @@ fn regex_or_init(lock: &'static OnceLock<Regex>, pattern: &'static str) -> &'sta
     })
 }
 
-fn strip_ansi(line: &str) -> String {
-    regex_or_init(&ANSI_RE, r"\x1b\[[0-9;]*[a-zA-Z]")
-        .replace_all(line, "")
-        .into_owned()
+fn strip_ansi(line: &str) -> Cow<'_, str> {
+    if !line.contains('\x1b') {
+        return Cow::Borrowed(line);
+    }
+    regex_or_init(&ANSI_RE, r"\x1b\[[0-9;]*[a-zA-Z]").replace_all(line, "")
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -61,7 +61,7 @@ impl ProgressParser {
     }
 
     fn parse_warnings_errors(&mut self, line: &str) {
-        let is_lint = regex_or_init(&LINT_SUMMARY_RE, r"(?:problem|problems|✖)").is_match(line);
+        let is_lint = line.contains("problem") || line.contains('✖');
         if is_lint {
             let errs = regex_or_init(&LINT_ERRORS_RE, r"(\d+)\s+errors?")
                 .captures(line)
@@ -78,19 +78,27 @@ impl ProgressParser {
                 self.warnings = w;
             }
         } else {
-            if regex_or_init(&WARNING_RE, r"\bwarning:|\bwarning\[").is_match(line) {
+            if line.contains("warning")
+                && regex_or_init(&WARNING_RE, r"\bwarning:|\bwarning\[").is_match(line)
+            {
                 self.warnings = self.warnings.saturating_add(1);
             }
-            if regex_or_init(&ERROR_RE, r"\berror:|\berror\[").is_match(line) {
+            if line.contains("error")
+                && regex_or_init(&ERROR_RE, r"\berror:|\berror\[").is_match(line)
+            {
                 self.errors = self.errors.saturating_add(1);
             }
         }
     }
 
+    /// Each pattern is guarded by a literal it cannot match without, so the
+    /// common line (plain output, no marker) runs no regex at all: this runs
+    /// for every output line of every task, on a runtime worker.
     fn parse_progress(&mut self, line: &str, now_ms: u64) -> Option<TaskProgress> {
         // 1. Cargo test
-        if let Some(caps) =
-            regex_or_init(&CARGO_TEST_RUNNING_RE, r"^running (\d+) tests?").captures(line)
+        if line.starts_with("running ")
+            && let Some(caps) =
+                regex_or_init(&CARGO_TEST_RUNNING_RE, r"^running (\d+) tests?").captures(line)
         {
             let total = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok())?;
             self.cargo_test_total = Some(total);
@@ -105,11 +113,12 @@ impl ProgressParser {
             });
         }
 
-        if let Some(caps) = regex_or_init(
-            &CARGO_TEST_CASE_RE,
-            r"^test (.+?) \.\.\. (?:ok|FAILED|ignored)",
-        )
-        .captures(line)
+        if line.starts_with("test ")
+            && let Some(caps) = regex_or_init(
+                &CARGO_TEST_CASE_RE,
+                r"^test (.+?) \.\.\. (?:ok|FAILED|ignored)",
+            )
+            .captures(line)
         {
             let test_name = caps
                 .get(1)
@@ -129,7 +138,7 @@ impl ProgressParser {
             );
         }
 
-        if regex_or_init(&CARGO_TEST_RESULT_RE, r"^test result:").is_match(line)
+        if line.starts_with("test result:")
             && let Some(total) = self.cargo_test_total
         {
             return Some(TaskProgress {
@@ -143,8 +152,10 @@ impl ProgressParser {
         }
 
         // 2. Cargo build
-        if let Some(caps) =
-            regex_or_init(&CARGO_COMPILING_RE, r"^\s*Compiling\s+([a-zA-Z0-9_\-]+)").captures(line)
+        if line.contains("Compiling")
+            && let Some(caps) =
+                regex_or_init(&CARGO_COMPILING_RE, r"^\s*Compiling\s+([a-zA-Z0-9_\-]+)")
+                    .captures(line)
         {
             let crate_name = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
             return Some(TaskProgress {
@@ -158,8 +169,9 @@ impl ProgressParser {
         }
 
         // 3. Jest / Vitest
-        if let Some(caps) =
-            regex_or_init(&JEST_TESTS_RE, r"^\s*Tests:\s+.*?\b(\d+)\s+total").captures(line)
+        if line.contains("Tests:")
+            && let Some(caps) =
+                regex_or_init(&JEST_TESTS_RE, r"^\s*Tests:\s+.*?\b(\d+)\s+total").captures(line)
         {
             let total = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok())?;
             return Some(TaskProgress {
@@ -173,8 +185,10 @@ impl ProgressParser {
         }
 
         // 4. Pytest
-        if let Some(caps) =
-            regex_or_init(&PYTEST_COLLECTED_RE, r"(?:^|\s)collected (\d+) items?").captures(line)
+        if line.contains("collected ")
+            && let Some(caps) =
+                regex_or_init(&PYTEST_COLLECTED_RE, r"(?:^|\s)collected (\d+) items?")
+                    .captures(line)
         {
             let total = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok())?;
             self.pytest_total = Some(total);
@@ -188,7 +202,10 @@ impl ProgressParser {
             });
         }
 
-        if let Some(caps) = regex_or_init(&PYTEST_PERCENT_RE, r"\[\s*(\d+)%\]").captures(line) {
+        let has_percent = line.contains('%');
+        if has_percent
+            && let Some(caps) = regex_or_init(&PYTEST_PERCENT_RE, r"\[\s*(\d+)%\]").captures(line)
+        {
             let pct = caps.get(1).and_then(|m| m.as_str().parse::<f32>().ok())?;
             return Some(
                 TaskProgress {
@@ -204,11 +221,12 @@ impl ProgressParser {
         }
 
         // 5. Generic trailing N/M
-        if let Some(caps) = regex_or_init(
-            &GENERIC_RATIO_RE,
-            r"(?:\s|^)(?P<cur>\d+)\s*/\s*(?P<tot>\d+)\s*$",
-        )
-        .captures(line)
+        if line.contains('/')
+            && let Some(caps) = regex_or_init(
+                &GENERIC_RATIO_RE,
+                r"(?:\s|^)(?P<cur>\d+)\s*/\s*(?P<tot>\d+)\s*$",
+            )
+            .captures(line)
         {
             let cur = caps
                 .name("cur")
@@ -232,8 +250,10 @@ impl ProgressParser {
         }
 
         // 6. Generic trailing NN%
-        if let Some(caps) =
-            regex_or_init(&GENERIC_PERCENT_RE, r"(?:\s|^)(?P<pct>100|[1-9]?\d)%\s*$").captures(line)
+        if has_percent
+            && let Some(caps) =
+                regex_or_init(&GENERIC_PERCENT_RE, r"(?:\s|^)(?P<pct>100|[1-9]?\d)%\s*$")
+                    .captures(line)
         {
             let pct = caps
                 .name("pct")
