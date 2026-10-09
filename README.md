@@ -238,7 +238,8 @@ filter, `ctrl+r` refresh the catalog, `alt+a` next account, `alt+x` twice sign
 out. Enter on a provider header signs in (another account when signed in).
 
 `/model`, `/effort`, `/mode`, `/theme`, `/config`, `/sessions`, `/mcp`,
-`/plugins`, `/keys`, `/editor`, `/import`, `/compact`, `/export`, `/help`.
+`/plugins`, `/keys`, `/editor`, `/import`, `/compact`, `/clear` (reset the
+conversation in place), `/new` (a fresh session), `/export`, `/help`.
 
 Every binding is rebindable from `/keys`.
 

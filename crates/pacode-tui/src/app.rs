@@ -280,11 +280,6 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         let stream_tick_dur = frame_interval.unwrap_or(Duration::from_millis(33));
         let stream_sleep = wakeups::stream(needs_stream, stream_tick_dur);
 
-        // The second tick is armed to the next boundary of the displayed clock, not
-        // to a full second from now. Every other timer in this select! cancels and
-        // re-creates this future; measuring from `now` meant a plain 1 s sleep was
-        // restarted by each animation frame and never fired, so the duration only
-        // moved on unrelated redraws and read 0.1 -> 0.3 -> 0.5 instead of ticking.
         let needs_second = state.needs_second_tick() || state.phase.is_some();
         let second_sleep = wakeups::second(needs_second, &state);
 

@@ -472,19 +472,7 @@ fn fold_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                 }
                 Err(err) => {
                     log::warn!("bash-mode captured error: {err}");
-                    let now = now_ms();
-                    state.transcript.push_cell(Cell {
-                        id: now,
-                        kind: CellKind::Item(TranscriptKind::Notice {
-                            level: ToastLevel::Error,
-                            text: err,
-                        }),
-                        version: 0,
-                        ts_ms: now,
-                        stats: None,
-                        perm_explain: None,
-                    });
-                    state.transcript.scroll_to_bottom();
+                    state.push_notice_with_level(ToastLevel::Error, err);
                 }
             }
             vec![]
