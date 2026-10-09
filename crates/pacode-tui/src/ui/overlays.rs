@@ -82,10 +82,9 @@ pub(crate) fn draw(
             draw_rail_overlay(frame, popup.area, prepared, state, opts);
         }
         crate::ui::popup::PopupId::ModelPalette => {
-            let Focus::Overlay(Overlay::ModelPalette { palette }) = &state.focus else {
-                return;
-            };
-            crate::ui::model_palette_view::draw(frame, popup.area, state, palette, opts);
+            if let Some(palette) = popup.palette.as_ref() {
+                crate::ui::model_palette_view::draw(frame, popup.area, palette);
+            }
         }
         crate::ui::popup::PopupId::Settings => {
             let (Focus::Overlay(Overlay::Settings { ui }), Some(_)) =
@@ -135,11 +134,12 @@ pub(crate) fn menu_block(title: &str, hint: &str, opts: &RenderOptions) -> Block
 /// The selected row, padded to the row's full width so the highlight is a bar,
 /// not a word.
 ///
-/// On an RGB `selected_bg` every span keeps its colour over the bar (the
-/// pointer stays accent). Anywhere else — ANSI-16 and mono draw the bar with
-/// `REVERSED` — a span's own colour would be reversed into a block of that
-/// colour and the row would read as a patchwork, so the whole row takes
-/// `selected_bg` alone: one uniform bar, badges included.
+/// A bar with a background of its own (truecolor, or a palette's named
+/// `selected_bg`) keeps every span's colour over it; the pointer stays
+/// accent. A bar drawn with `REVERSED` (ANSI-16, mono), or with no
+/// background at all, would turn each span's own colour into a block of that
+/// colour — a patchwork — so there the whole row takes `selected_bg` alone:
+/// one uniform bar, badges included.
 pub(crate) fn selected_row(line: Line<'static>, width: u16, opts: &RenderOptions) -> Line<'static> {
     let width = width as usize;
     let used: usize = line
@@ -148,7 +148,10 @@ pub(crate) fn selected_row(line: Line<'static>, width: u16, opts: &RenderOptions
         .map(|s| pacode_render::display_width(&s.content))
         .sum();
     let bar = opts.theme.selected_bg;
-    let keeps_colours = matches!(bar.bg, Some(ratatui::style::Color::Rgb(..)));
+    let keeps_colours = bar.bg.is_some()
+        && !bar
+            .add_modifier
+            .contains(ratatui::style::Modifier::REVERSED);
     let mut spans: Vec<Span<'static>> = line
         .spans
         .into_iter()
@@ -307,6 +310,27 @@ mod tests {
                 "{row:?}"
             );
         }
+    }
+
+    /// A named-colour bar without REVERSED (a user palette's `"blue"`) has a
+    /// background of its own: the spans keep their colours over it.
+    #[test]
+    fn a_named_colour_bar_keeps_the_span_colours() {
+        let mut theme = pacode_render::Theme::ansi();
+        theme.selected_bg = ratatui::style::Style::default().bg(ratatui::style::Color::Blue);
+        let opts = RenderOptions::with_theme(40, false, theme);
+        let line = Line::from(vec![
+            Span::styled("▸ ".to_string(), opts.theme.accent),
+            Span::styled(" signed in".to_string(), opts.theme.green),
+        ]);
+        let row = selected_row(line, 30, &opts);
+        assert_eq!(row.spans[0].style.fg, opts.theme.accent.fg);
+        assert_eq!(row.spans[1].style.fg, opts.theme.green.fg);
+        assert!(
+            row.spans
+                .iter()
+                .all(|span| span.style.bg == Some(ratatui::style::Color::Blue))
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use pacode_render::{RenderOptions, display_width, truncate_to_width};
 use pacode_types::ModelInfo;
@@ -25,111 +25,187 @@ const CTX_W: usize = 5;
 /// Favourite + ZDR marks, two cells each.
 const MARKS_W: usize = 4;
 
-pub fn draw(
-    frame: &mut Frame,
-    area: Rect,
+/// The palette as one frame draws it, built from a single pass over its rows.
+pub(crate) struct PreparedPalette {
+    /// The window start for the box's full size (not the unfolding one):
+    /// `prepare_frame` stores it so the next frame starts from it.
+    scroll: usize,
+    /// `None` when the box is too small to draw anything.
+    content: Option<PaletteContent>,
+}
+
+struct PaletteContent {
+    block: Block<'static>,
+    lines: Vec<Line<'static>>,
+    cursor: Option<(u16, u16)>,
+}
+
+/// Build the palette's rows once and derive the whole frame from them: the
+/// box in `container` (sized to the rows, grown while it unfolds after
+/// `elapsed` ms), the window it scrolls to and the lines it draws. Nothing is
+/// kept across frames.
+pub(crate) fn prepare(
     state: &AppState,
     palette: &ModelPalette,
+    container: Rect,
+    elapsed: Option<u64>,
     opts: &RenderOptions,
-) {
-    if area.width < 4 || area.height < 3 {
-        return;
-    }
+) -> (Rect, PreparedPalette) {
     let src = Sources::of(state);
     let rows = palette.rows(&src);
     let selected = palette.selected_index(&rows);
-    let highlighted = selected.and_then(|index| rows.get(index));
+    let full = crate::ui::popup::palette_area(container, box_height(rows.len()));
+    let scroll = ModelPalette::window_from(palette.scroll, &rows, selected, list_height(full));
+    let area = elapsed.map_or(full, |ms| crate::ui::popup::grow_center(full, ms));
+    let content = (area.width >= 4 && area.height >= 3).then(|| {
+        let view = View {
+            state,
+            palette,
+            src: &src,
+            rows: &rows,
+            selected,
+            scroll,
+        };
+        view.content(area, opts)
+    });
+    (area, PreparedPalette { scroll, content })
+}
 
-    let base = if palette.for_zdr {
-        "ZDR: pick a capable model".to_string()
-    } else {
-        "Select model".to_string()
+/// Keep the window this frame resolved, so moving inside it next frame does
+/// not shift it.
+pub(crate) fn store_scroll(state: &mut AppState, prepared: &PreparedPalette) {
+    if let Focus::Overlay(Overlay::ModelPalette { palette }) = &mut state.session.focus {
+        palette.scroll = prepared.scroll;
+    }
+}
+
+pub(crate) fn draw(frame: &mut Frame, area: Rect, prepared: &PreparedPalette) {
+    let Some(content) = prepared.content.as_ref() else {
+        return;
     };
-    let base = match palette.kind {
-        Kind::All => base,
-        kind => format!("{base}{}{}", opts.glyphs.dot_sep, kind.label()),
-    };
-    let title = title_with_badge(&base, state.lists.badge(crate::cache::ListKind::Models));
-    let chords = chord_hint(state, &src, highlighted, opts);
-    let block = menu_block(
-        &title,
-        &truncate_to_width(&chords, usize::from(area.width.saturating_sub(4)), true),
-        opts,
-    );
-    let inner = block.inner(area);
+    let inner = content.block.inner(area);
     frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-
-    let width = usize::from(inner.width);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(format!("{} ", opts.glyphs.prompt), opts.theme.accent),
-            Span::styled(palette.query.clone(), opts.theme.fg),
-        ]),
-        Line::default(),
-    ];
-    let list_h = list_height(area);
-    if rows.is_empty() {
-        if state.models.is_empty() && state.auth_providers.is_empty() {
-            lines.push(Line::from(Span::styled("  loading…", opts.theme.faint)));
-        } else {
-            lines.push(Line::from(Span::styled("  no matches", opts.theme.dim)));
-            lines.push(Line::from(Span::styled(
-                "  backspace to widen the search",
-                opts.theme.faint,
-            )));
-        }
-    } else {
-        let columns = Columns::fit(&rows, width);
-        let current = state.meta.as_ref().map(|meta| meta.model.to_string());
-        let logout_chord = state
-            .keymap
-            .hint(KeyAction::ModelPickerLogout)
-            .unwrap_or_default();
-        let start = palette.window(&rows, selected, list_h);
-        for (index, row) in rows.iter().enumerate().skip(start).take(list_h) {
-            let is_sel = selected == Some(index);
-            let line = match row {
-                Row::Gap => Line::default(),
-                Row::Header {
-                    title,
-                    provider,
-                    status,
-                    kind,
-                } => header_line(
-                    HeaderView {
-                        title,
-                        provider: provider.as_deref(),
-                        status,
-                        kind: *kind,
-                        selected: is_sel,
-                    },
-                    palette,
-                    &logout_chord,
-                    opts,
-                ),
-                Row::Model { model, recent, .. } => {
-                    let is_current = current.as_deref() == Some(&model.route.to_string());
-                    model_line(model, *recent, is_sel, is_current, &columns, &src, opts)
-                }
-            };
-            lines.push(if is_sel {
-                selected_row(line, inner.width, opts)
-            } else {
-                line
-            });
-        }
-    }
-    while lines.len() < usize::from(inner.height.saturating_sub(2)) {
-        lines.push(Line::default());
-    }
-    lines.truncate(usize::from(inner.height.saturating_sub(2)));
-    lines.push(effort_line(palette, highlighted, opts));
-    lines.push(hint_line(highlighted, width, opts));
-    frame.render_widget(Paragraph::new(lines), inner);
-
-    if let Some(position) = crate::ui::popup::query_cursor(inner, &palette.query, 2, 0) {
+    frame.render_widget(content.block.clone(), area);
+    frame.render_widget(Paragraph::new(content.lines.clone()), inner);
+    if let Some(position) = content.cursor {
         frame.set_cursor_position(position);
+    }
+}
+
+/// What one frame's content is built from.
+struct View<'v, 'a> {
+    state: &'v AppState,
+    palette: &'v ModelPalette,
+    src: &'v Sources<'a>,
+    rows: &'v [Row<'a>],
+    selected: Option<usize>,
+    /// The stored window start for the full-size box.
+    scroll: usize,
+}
+
+impl View<'_, '_> {
+    fn content(&self, area: Rect, opts: &RenderOptions) -> PaletteContent {
+        let View {
+            state,
+            palette,
+            src,
+            rows,
+            selected,
+            scroll,
+        } = *self;
+        let highlighted = selected.and_then(|index| rows.get(index));
+
+        let base = if palette.for_zdr {
+            "ZDR: pick a capable model".to_string()
+        } else {
+            "Select model".to_string()
+        };
+        let base = match palette.kind {
+            Kind::All => base,
+            kind => format!("{base}{}{}", opts.glyphs.dot_sep, kind.label()),
+        };
+        let title = title_with_badge(&base, state.lists.badge(crate::cache::ListKind::Models));
+        let chords = chord_hint(state, src, highlighted, opts);
+        let block = menu_block(
+            &title,
+            &truncate_to_width(&chords, usize::from(area.width.saturating_sub(4)), true),
+            opts,
+        );
+        let inner = block.inner(area);
+
+        let width = usize::from(inner.width);
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(format!("{} ", opts.glyphs.prompt), opts.theme.accent),
+                Span::styled(palette.query.clone(), opts.theme.fg),
+            ]),
+            Line::default(),
+        ];
+        let list_h = list_height(area);
+        if rows.is_empty() {
+            if state.models.is_empty() && state.auth_providers.is_empty() {
+                lines.push(Line::from(Span::styled("  loading…", opts.theme.faint)));
+            } else {
+                lines.push(Line::from(Span::styled("  no matches", opts.theme.dim)));
+                lines.push(Line::from(Span::styled(
+                    "  backspace to widen the search",
+                    opts.theme.faint,
+                )));
+            }
+        } else {
+            let columns = Columns::fit(rows, width);
+            let current = state.meta.as_ref().map(|meta| meta.model.to_string());
+            let logout_chord = state
+                .keymap
+                .hint(KeyAction::ModelPickerLogout)
+                .unwrap_or_default();
+            // The unfolding box is shorter than the full one: it windows from
+            // the full box's start, as the full box will.
+            let start = ModelPalette::window_from(scroll, rows, selected, list_h);
+            for (index, row) in rows.iter().enumerate().skip(start).take(list_h) {
+                let is_sel = selected == Some(index);
+                let line = match row {
+                    Row::Gap => Line::default(),
+                    Row::Header {
+                        title,
+                        provider,
+                        status,
+                        kind,
+                    } => header_line(
+                        HeaderView {
+                            title,
+                            provider: provider.as_deref(),
+                            status,
+                            kind: *kind,
+                            selected: is_sel,
+                        },
+                        palette,
+                        &logout_chord,
+                        opts,
+                    ),
+                    Row::Model { model, recent, .. } => {
+                        let is_current = current.as_deref() == Some(&model.route.to_string());
+                        model_line(model, *recent, is_sel, is_current, &columns, src, opts)
+                    }
+                };
+                lines.push(if is_sel {
+                    selected_row(line, inner.width, opts)
+                } else {
+                    line
+                });
+            }
+        }
+        while lines.len() < usize::from(inner.height.saturating_sub(2)) {
+            lines.push(Line::default());
+        }
+        lines.truncate(usize::from(inner.height.saturating_sub(2)));
+        lines.push(effort_line(palette, highlighted, opts));
+        lines.push(hint_line(highlighted, width, opts));
+        PaletteContent {
+            block,
+            lines,
+            cursor: crate::ui::popup::query_cursor(inner, &palette.query, 2, 0),
+        }
     }
 }
 
@@ -427,31 +503,4 @@ fn box_height(list_rows: usize) -> u16 {
     u16::try_from(list)
         .unwrap_or(u16::MAX)
         .saturating_add(2 + CHROME_ROWS)
-}
-
-/// The palette's box in `container`, sized to its rows (see
-/// [`popup::palette_area`](crate::ui::popup::palette_area)). An empty rect
-/// when the palette is not open.
-pub(crate) fn area(state: &AppState, container: Rect) -> Rect {
-    let Focus::Overlay(Overlay::ModelPalette { palette }) = &state.focus else {
-        return Rect::new(container.x, container.y, 0, 0);
-    };
-    let rows = palette.rows(&Sources::of(state)).len();
-    crate::ui::popup::palette_area(container, box_height(rows))
-}
-
-/// Store the window the palette shows in its box in `container` (the full
-/// size, not the opening animation's), so the next frame starts from it.
-/// Called once per frame from `prepare_frame`, which covers keys, catalog
-/// updates and resizes alike.
-pub(crate) fn sync_scroll(state: &mut AppState, container: Rect) {
-    let Focus::Overlay(Overlay::ModelPalette { palette }) = &state.focus else {
-        return;
-    };
-    let rows = palette.rows(&Sources::of(state));
-    let area = crate::ui::popup::palette_area(container, box_height(rows.len()));
-    let scroll = palette.window(&rows, palette.selected_index(&rows), list_height(area));
-    if let Focus::Overlay(Overlay::ModelPalette { palette }) = &mut state.session.focus {
-        palette.scroll = scroll;
-    }
 }

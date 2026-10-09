@@ -336,7 +336,17 @@ impl ModelPalette {
     /// fits); up, the window starts at the selection's group header when the
     /// header and the selection fit together, so the provider stays named.
     pub fn window(&self, rows: &[Row], selected: Option<usize>, height: usize) -> usize {
-        let stored = self.scroll.min(rows.len().saturating_sub(height));
+        Self::window_from(self.scroll, rows, selected, height)
+    }
+
+    /// [`window`](Self::window) from an explicit stored start.
+    pub fn window_from(
+        stored: usize,
+        rows: &[Row],
+        selected: Option<usize>,
+        height: usize,
+    ) -> usize {
+        let stored = stored.min(rows.len().saturating_sub(height));
         let Some(sel) = selected.filter(|sel| height > 0 && *sel < rows.len()) else {
             return stored;
         };

@@ -83,6 +83,8 @@ pub(crate) struct FullPopup {
     pub id: PopupId,
     pub area: Rect,
     pub menu: Option<MenuPopup>,
+    /// The model palette's frame, built from one pass over its rows.
+    pub palette: Option<crate::ui::model_palette_view::PreparedPalette>,
 }
 
 pub(crate) enum PreparedInlineContent {
@@ -193,7 +195,7 @@ pub fn resolve<'a>(
     let Some(popup) = resolve_full(state, layout, now) else {
         return resolve_inline(state, layout);
     };
-    let FullPopup { id, area, menu: _ } = popup;
+    let FullPopup { id, area, .. } = popup;
     Some(ResolvedPopup {
         id,
         area,
@@ -225,6 +227,25 @@ pub(crate) fn resolve_full(
         Overlay::Menu { stack, .. } if stack.is_empty() => return None,
         Overlay::Menu { .. } => PopupId::Menu,
     };
+    if let Focus::Overlay(Overlay::ModelPalette { palette }) = &state.focus {
+        let elapsed = state
+            .overlay_since
+            .map(|opened| now.saturating_duration_since(opened).as_millis() as u64);
+        let opts = state.render_options(layout.screen.width);
+        let (area, prepared) = crate::ui::model_palette_view::prepare(
+            state,
+            palette,
+            overlay_container(layout),
+            elapsed,
+            &opts,
+        );
+        return Some(FullPopup {
+            id,
+            area,
+            menu: None,
+            palette: Some(prepared),
+        });
+    }
     let mut area = full_area(state, layout, now, id);
     let menu = match (id, &state.focus) {
         (PopupId::Menu, Focus::Overlay(Overlay::Menu { stack, ui })) if !stack.is_empty() => {
@@ -241,7 +262,12 @@ pub(crate) fn resolve_full(
         }
         _ => None,
     };
-    Some(FullPopup { id, area, menu })
+    Some(FullPopup {
+        id,
+        area,
+        menu,
+        palette: None,
+    })
 }
 
 pub(crate) fn resolve_inline<'a>(
@@ -504,10 +530,6 @@ fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId)
         let container = bottom_picker_container(layout);
         let area = bottom_area(container, container.width, state.bottom_picker_height());
         return elapsed.map_or(area, |ms| grow_bottom(area, ms));
-    }
-    if id == PopupId::ModelPalette {
-        let area = crate::ui::model_palette_view::area(state, overlay_container(layout));
-        return elapsed.map_or(area, |ms| grow_center(area, ms));
     }
     let area = center_container(overlay_container(layout), elapsed);
     match id {

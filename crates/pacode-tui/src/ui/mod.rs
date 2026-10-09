@@ -137,7 +137,9 @@ pub fn prepare_frame(area: Rect, state: &mut AppState, now: std::time::Instant) 
     let completion = popup::InputCompletion::detect(state);
     popup::prepare_scan_wants(state, completion.as_ref());
     let full_popup = popup::resolve_full(state, &layout, now);
-    model_palette_view::sync_scroll(state, popup::overlay_container(&layout));
+    if let Some(palette) = full_popup.as_ref().and_then(|popup| popup.palette.as_ref()) {
+        model_palette_view::store_scroll(state, palette);
+    }
     let rail = rail::resolve(state, layout.rail);
     // The countdown wakeup (`AppState::schedule_redraw_in`) reads what this
     // frame draws; no rail, no countdown on screen.
