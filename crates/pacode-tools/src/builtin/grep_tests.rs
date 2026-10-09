@@ -181,15 +181,16 @@ async fn a_parallel_search_keeps_walk_order_and_the_first_hits() {
     assert_eq!(rows, expected(400));
 }
 
-/// A line longer than a search thread's buffer cap fails there; the file is
-/// searched again uncapped, so its hit is still found — once, in order.
+/// A line longer than the searchers' buffer cap fails there; the file is
+/// searched again uncapped in the long-line lane, so its hit is still found —
+/// once, in order — in a tree and when the file is named directly.
 #[tokio::test]
 async fn a_line_over_the_thread_buffer_cap_is_still_searched() {
     let tmp = tempfile::tempdir().expect("tempdir");
     for i in 0..200 {
         std::fs::write(tmp.path().join(format!("s{i:03}.txt")), "nothing\n").expect("write");
     }
-    let giant = format!("{}NEEDLE\n", "x".repeat(WORKER_HEAP_LIMIT * 2));
+    let giant = format!("{}NEEDLE\n", "x".repeat(LINE_BUFFER_LIMIT * 2));
     std::fs::write(tmp.path().join("big.txt"), format!("NEEDLE first\n{giant}")).expect("write");
     let ctx = ctx_in(tmp.path());
 
@@ -202,4 +203,17 @@ async fn a_line_over_the_thread_buffer_cap_is_still_searched() {
     assert_eq!(rows[0], "big.txt:1:NEEDLE first");
     assert!(rows[1].starts_with("big.txt:2:…"), "row: {}", rows[1]);
     assert!(rows[1].contains("NEEDLE"));
+
+    let single = GrepTool::default()
+        .call(json!({"pattern": "NEEDLE", "path": "big.txt"}), &ctx)
+        .await
+        .expect("grep");
+    assert_eq!(single.content, out.content);
+
+    // Several calls queue on the one lane thread; each gets its own answer.
+    let tool = GrepTool::default();
+    let calls = (0..4).map(|_| tool.call(json!({"pattern": "NEEDLE", "path": "big.txt"}), &ctx));
+    for result in futures::future::join_all(calls).await {
+        assert_eq!(result.expect("grep").content, out.content);
+    }
 }

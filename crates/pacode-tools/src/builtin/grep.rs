@@ -13,6 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use lane::search_long_lines;
+
+#[path = "grep_lane.rs"]
+mod lane;
 
 pub const NAME: &str = "grep";
 
@@ -142,6 +146,8 @@ impl Tool for GrepTool {
     }
 }
 
+/// `Clone` so a long-line search can be handed to the lane thread.
+#[derive(Clone)]
 struct Query {
     matcher: RegexMatcher,
     glob: Option<globset::GlobMatcher>,
@@ -156,9 +162,11 @@ const FILES_PER_THREAD: usize = 64;
 /// Ceiling on helper threads for one call, before the process-wide budget
 /// (`crate::threads`) has its say.
 const MAX_HELPER_THREADS: usize = 7;
-/// Line-buffer ceiling for a helper thread (the searcher's buffer grows to the
-/// longest line it meets and keeps that size).
-const WORKER_HEAP_LIMIT: usize = 1024 * 1024;
+/// Line-buffer ceiling for every searcher on a caller or helper thread. A
+/// searcher's buffer grows to the longest line it meets (an 11 MB one-line
+/// `models.json` makes it ~16 MB); a file with a longer line than this goes to
+/// the long-line lane (`grep_lane`), the one place an uncapped buffer lives.
+const LINE_BUFFER_LIMIT: usize = 1024 * 1024;
 
 /// Blocking search of one file or a whole (cached) tree; returns the output
 /// rows and the number of hits.
@@ -169,7 +177,8 @@ const WORKER_HEAP_LIMIT: usize = 1024 * 1024;
 /// shared index. Workers stop taking files once `max_results` hits are found;
 /// since files are handed out in order, every file before the last one taken
 /// has been searched, so merging per-file results in walk order yields exactly
-/// the rows a one-thread search would.
+/// the rows a one-thread search would. Files over the line-buffer cap are
+/// searched again at the end through the long-line lane.
 fn search(
     query: &Query,
     search_root: PathBuf,
@@ -182,17 +191,12 @@ fn search(
             .to_string_lossy()
             .into_owned()
     };
-    // The calling thread's searcher has no line cap: it is the one searcher
-    // a single-threaded grep would have, and it re-searches what the capped
-    // helpers could not.
-    let mut own = new_searcher(query, None);
 
     if search_root.is_file() {
-        let file = search_file(query, &mut own, &search_root, &display(&search_root));
-        return Ok(merge(
-            [file.unwrap_or_else(|partial| partial)],
-            query.max_results,
-        ));
+        let shown = display(&search_root);
+        let file = search_file(query, &mut new_searcher(query), &search_root, &shown)
+            .unwrap_or_else(|_| search_long_lines(query, &search_root, &shown));
+        return Ok(merge([file], query.max_results));
     }
 
     let entries = crate::walk::shared().collect(
@@ -213,13 +217,17 @@ fn search(
         })
         .collect();
 
+    // This thread counts against the budget while it searches, so concurrent
+    // calls leave each other no helpers instead of oversubscribing the cores.
+    let budget = crate::threads::shared();
+    let _own = budget.occupy();
     let next = AtomicUsize::new(0);
     let found = AtomicUsize::new(0);
     // Pull files until none are left, `max_results` is reached, or (for the
-    // calling thread's solo start) `until` files have been handed out. A
-    // capped searcher's failure is queued for the uncapped retry; an uncapped
-    // one's is an IO error, and its partial rows stand, as in a plain search.
-    let work = |searcher: &mut Searcher, capped: bool, until: usize| {
+    // calling thread's solo start) `until` files have been handed out. A file
+    // whose search fails (a line over the cap, or an IO error) is queued for
+    // the long-line lane, which keeps a real IO error's partial rows.
+    let work = |searcher: &mut Searcher, until: usize| {
         let mut out = Vec::new();
         let mut retry = Vec::new();
         while !cancel.is_cancelled() && found.load(Ordering::Relaxed) < query.max_results {
@@ -230,47 +238,35 @@ fn search(
             // Join onto the non-canonical root so the display path strips
             // against `cwd` exactly like a fresh walk would.
             let path = search_root.join(&files[index].rel);
-            let hits = match search_file(query, searcher, &path, &display(&path)) {
-                Ok(hits) => hits,
-                Err(_) if capped => {
-                    retry.push(index);
-                    continue;
+            match search_file(query, searcher, &path, &display(&path)) {
+                Ok(hits) if hits.hits > 0 => {
+                    found.fetch_add(hits.hits, Ordering::Relaxed);
+                    out.push((index, hits));
                 }
-                Err(partial) => partial,
-            };
-            if hits.hits > 0 {
-                found.fetch_add(hits.hits, Ordering::Relaxed);
-                out.push((index, hits));
+                Ok(_) => {}
+                Err(_) => retry.push(index),
             }
         }
         (out, retry)
     };
 
+    let mut own = new_searcher(query);
     // Solo start; `next` overshoots by one when this stops at `until`, so it
     // is reset to where the shared phase picks up.
-    let (mut per_file, _) = work(&mut own, false, FILES_PER_THREAD);
+    let (mut per_file, mut retry) = work(&mut own, FILES_PER_THREAD);
     next.store(FILES_PER_THREAD, Ordering::Relaxed);
 
     let remaining = files.len().saturating_sub(FILES_PER_THREAD);
     if remaining > 0 && found.load(Ordering::Relaxed) < query.max_results && !cancel.is_cancelled()
     {
-        let helpers = crate::threads::shared()
-            .reserve((remaining / FILES_PER_THREAD).min(MAX_HELPER_THREADS));
-        let retry = std::thread::scope(|scope| {
+        let helpers = budget.reserve((remaining / FILES_PER_THREAD).min(MAX_HELPER_THREADS));
+        std::thread::scope(|scope| {
             let handles: Vec<_> = (0..helpers.count())
-                .map(|_| {
-                    scope.spawn(|| {
-                        work(
-                            &mut new_searcher(query, Some(WORKER_HEAP_LIMIT)),
-                            true,
-                            usize::MAX,
-                        )
-                    })
-                })
+                .map(|_| scope.spawn(|| work(&mut new_searcher(query), usize::MAX)))
                 .collect();
-            let (mine, _) = work(&mut own, false, usize::MAX);
+            let (mine, failed) = work(&mut own, usize::MAX);
             per_file.extend(mine);
-            let mut retry = Vec::new();
+            retry.extend(failed);
             for handle in handles {
                 let (part, failed) = handle
                     .join()
@@ -278,19 +274,17 @@ fn search(
                 per_file.extend(part);
                 retry.extend(failed);
             }
-            Ok::<_, ToolError>(retry)
+            Ok::<_, ToolError>(())
         })?;
-        drop(helpers);
-        for index in retry {
-            if cancel.is_cancelled() {
-                break;
-            }
-            let path = search_root.join(&files[index].rel);
-            let hits = search_file(query, &mut own, &path, &display(&path))
-                .unwrap_or_else(|partial| partial);
-            if hits.hits > 0 {
-                per_file.push((index, hits));
-            }
+    }
+    for index in retry {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let path = search_root.join(&files[index].rel);
+        let hits = search_long_lines(query, &path, &display(&path));
+        if hits.hits > 0 {
+            per_file.push((index, hits));
         }
     }
     if cancel.is_cancelled() {
@@ -303,7 +297,11 @@ fn search(
     ))
 }
 
-fn new_searcher(query: &Query, heap_limit: Option<usize>) -> Searcher {
+fn new_searcher(query: &Query) -> Searcher {
+    searcher_with_limit(query, Some(LINE_BUFFER_LIMIT))
+}
+
+fn searcher_with_limit(query: &Query, heap_limit: Option<usize>) -> Searcher {
     SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(0x00))

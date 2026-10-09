@@ -1,10 +1,11 @@
 //! Process-wide budget of extra threads for parallel tool work (`grep`'s
 //! search, the shared walk).
 //!
-//! Every tool call already runs on its own blocking-pool thread; a call that
-//! wants to fan out takes *extra* threads from this one budget, sized to the
-//! machine's parallelism. A call gets `min(wanted, free)` and runs with what it
-//! got — with none free it stays on its own thread. So concurrent calls (a
+//! Every tool call already runs on its own blocking-pool thread; while it
+//! works, that thread is counted here too ([`ThreadBudget::occupy`]). A call
+//! that wants to fan out takes *extra* threads from the same budget, sized to
+//! the machine's parallelism: `min(wanted, free)`, and with none free it stays
+//! on its own thread. So concurrent calls (a
 //! batch of greps, several agents) share the cores instead of multiplying
 //! threads, and with them CPU contention and the per-thread malloc arenas that
 //! keep freed memory resident.
@@ -59,6 +60,18 @@ impl ThreadBudget {
                 }
                 Err(actual) => current = actual,
             }
+        }
+    }
+
+    /// Count the calling thread itself while it does the work, whether or not
+    /// a slot is free (it is already running). Concurrent calls then see the
+    /// cores as taken and get no helpers, instead of each adding threads on
+    /// top of the others.
+    pub fn occupy(&self) -> Reservation<'_> {
+        self.in_use.fetch_add(1, Ordering::AcqRel);
+        Reservation {
+            budget: self,
+            count: 1,
         }
     }
 

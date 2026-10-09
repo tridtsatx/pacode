@@ -18,6 +18,21 @@ fn reservations_share_one_capacity_and_return_on_drop() {
     assert_eq!(budget.in_use(), 0);
 }
 
+/// Working threads count even past capacity, and leave no helpers while
+/// they do: 16 concurrent calls on 4 cores add no threads on top.
+#[test]
+fn occupied_threads_leave_no_helpers() {
+    let budget = ThreadBudget::new(4);
+    let one = budget.occupy();
+    assert_eq!(budget.reserve(8).count(), 3, "a lone call gets the rest");
+    let busy: Vec<_> = (0..15).map(|_| budget.occupy()).collect();
+    assert_eq!(budget.in_use(), 16);
+    assert_eq!(budget.reserve(8).count(), 0);
+    drop(busy);
+    drop(one);
+    assert_eq!(budget.in_use(), 0);
+}
+
 #[test]
 fn concurrent_reservations_never_exceed_capacity() {
     let budget = ThreadBudget::new(5);

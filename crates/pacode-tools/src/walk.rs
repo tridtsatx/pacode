@@ -200,6 +200,12 @@ fn scan(
 
     // The calling thread only waits while `ignore`'s threads walk, so fewer
     // than two extra threads would not be faster than walking here.
+    // An unbounded walk counts this thread against the budget while it runs,
+    // so concurrent walks leave each other no helpers.
+    let _own = options
+        .max_depth
+        .is_none()
+        .then(|| crate::threads::shared().occupy());
     let threads = match options.max_depth {
         Some(_) => None,
         None => Some(crate::threads::shared().reserve(MAX_WALK_THREADS)),
