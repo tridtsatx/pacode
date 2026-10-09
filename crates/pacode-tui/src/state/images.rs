@@ -11,6 +11,8 @@ use pacode_types::ImageSource;
 
 use crate::clipboard_read::PastedImages;
 
+use super::AppState;
+
 #[cfg(test)]
 #[path = "images_tests.rs"]
 mod images_tests;
@@ -121,4 +123,32 @@ pub fn resolve_image_tokens(images: &PastedImages, text: &str) -> (String, Vec<I
     }
     out.push_str(rest);
     (out, sources)
+}
+
+impl AppState {
+    pub fn cleanup_pasted_images(&mut self) {
+        let text = self.input.text.clone();
+        self.pasted_images.cleanup_unreferenced(&text);
+    }
+
+    /// Records whose `[Image N]` token is still referenced by the current
+    /// input. Submitted records are excluded: they stay on disk for the
+    /// daemon but the preview strip no longer shows them.
+    pub fn live_pasted_images(&self) -> Vec<&crate::clipboard_read::PastedImageRecord> {
+        self.pasted_images
+            .records()
+            .iter()
+            .filter(|r| !r.submitted && self.input.text.contains(r.token_label().as_str()))
+            .collect()
+    }
+
+    /// Preview strip height in terminal rows: 0 when images are disabled or
+    /// no live `[Image N]` token remains in the input.
+    pub fn image_strip_rows(&self) -> u16 {
+        if self.config.ui.images_enabled() && !self.live_pasted_images().is_empty() {
+            STRIP_ROWS.min(STRIP_MAX_ROWS)
+        } else {
+            0
+        }
+    }
 }
