@@ -284,6 +284,20 @@ impl ToolHost for StubToolHost {
         }
     }
 
+    async fn task_output(
+        &self,
+        task: &pacode_types::TaskId,
+        max_chars: usize,
+    ) -> Result<String, ToolError> {
+        match &self.tasks {
+            Some(tasks) => tasks
+                .output(task, max_chars)
+                .await
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Ok(String::new()),
+        }
+    }
+
     fn report_task_progress(
         &self,
         task: &pacode_types::TaskId,

@@ -3,6 +3,8 @@
 //! code, and context folded to three lines around each change. Degrades by
 //! `RenderOptions::color`: `Ansi` drops the band, `Mono` drops the colours.
 
+use std::time::Duration;
+
 use pacode_types::DiffStat;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -17,30 +19,38 @@ use crate::wrap::{display_width, truncate_spans};
 #[path = "diff_tests.rs"]
 mod diff_tests;
 
-/// Added/removed line counts between two texts.
-pub fn diff_stat(old: &str, new: &str) -> DiffStat {
-    let diff = TextDiff::from_lines(old, new);
-    let mut added = 0u32;
-    let mut removed = 0u32;
+/// Wall-clock budget for the line diff. Myers is O((N+M)·D): rewriting most
+/// of a multi-megabyte file would otherwise run for minutes. Past the budget
+/// `similar` stops refining and emits a coarser (still exact) delete+insert
+/// diff, so the text and the counts stay true — only less minimal.
+pub const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Unified diff text with `context` lines and `a/<path>` / `b/<path>` headers,
+/// plus its added/removed line counts — both from one diff pass, bounded by
+/// [`DIFF_TIMEOUT`].
+pub fn unified_diff(old: &str, new: &str, path: &str, context: usize) -> (String, DiffStat) {
+    let diff = TextDiff::configure()
+        .timeout(DIFF_TIMEOUT)
+        .diff_lines(old, new);
+    let mut stat = DiffStat {
+        added: 0,
+        removed: 0,
+    };
     for change in diff.iter_all_changes() {
         match change.tag() {
-            ChangeTag::Insert => added += 1,
-            ChangeTag::Delete => removed += 1,
+            ChangeTag::Insert => stat.added += 1,
+            ChangeTag::Delete => stat.removed += 1,
             ChangeTag::Equal => {}
         }
     }
-    DiffStat { added, removed }
-}
-
-/// Unified diff text with `context` lines and `a/<path>` / `b/<path>` headers.
-pub fn unified_diff(old: &str, new: &str, path: &str, context: usize) -> String {
     let a_header = format!("a/{path}");
     let b_header = format!("b/{path}");
-    TextDiff::from_lines(old, new)
+    let text = diff
         .unified_diff()
         .context_radius(context)
         .header(&a_header, &b_header)
-        .to_string()
+        .to_string();
+    (text, stat)
 }
 
 /// Context lines kept on each side of a change; longer runs fold into

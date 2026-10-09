@@ -128,6 +128,9 @@ impl ToolHost for DummyHost {
     async fn task_tail(&self, _task: &TaskId, _lines: usize) -> Result<Vec<String>, ToolError> {
         Ok(Vec::new())
     }
+    async fn task_output(&self, _task: &TaskId, _max_chars: usize) -> Result<String, ToolError> {
+        Ok(String::new())
+    }
     fn report_task_progress(
         &self,
         _task: &TaskId,

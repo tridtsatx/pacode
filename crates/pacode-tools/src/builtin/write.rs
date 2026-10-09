@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{is_outside_workspace, parse_input, preview_body};
+use super::helpers::{
+    FileChange, diff_off_runtime, is_outside_workspace, parse_input, preview_body,
+};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "write";
@@ -50,6 +52,10 @@ impl Tool for WriteTool {
         })
     }
 
+    fn can_exceed_output_cap(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Edit
     }
@@ -58,7 +64,7 @@ impl Tool for WriteTool {
     /// (or `new file, N lines`) as detail; the read of the current content and the
     /// write itself run under the path's write lock, and the write lands atomically
     /// (temp file + rename in the same dir) keeping the existing mode; output
-    /// `Wrote <bytes> bytes to <path>`; diff stat from `pacode_render::diff_stat`.
+    /// `Wrote <bytes> bytes to <path>`; diff stat from the same diff pass.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _accept_large_output) = parse_input::<WriteInput>(input)?;
         if args.path.is_empty() {
@@ -89,27 +95,22 @@ impl Tool for WriteTool {
             .to_string_lossy()
             .to_string();
 
-        let (diff, diff_stat, extra_head) = match &old_content {
-            Some(old) => {
-                let diff = pacode_render::unified_diff(old, &args.content, &rel_path, 3);
-                let stat = pacode_render::diff_stat(old, &args.content);
-                (diff, Some(stat), None)
-            }
-            None => {
-                let stat = pacode_render::diff_stat("", &args.content);
-                // The all-added diff doubles as the cell body (the written
-                // content itself) and shows the reviewer what lands on disk.
-                let diff = pacode_render::unified_diff("", &args.content, &rel_path, 3);
-                (
-                    diff,
-                    Some(stat),
-                    Some(format!(
-                        "new file, {} lines\n",
-                        args.content.lines().count()
-                    )),
-                )
-            }
-        };
+        let is_new_file = old_content.is_none();
+        // A new file diffs against "": the all-added diff doubles as the cell
+        // body (the written content itself) and shows the reviewer what lands
+        // on disk.
+        let FileChange {
+            new: content,
+            diff,
+            stat,
+        } = diff_off_runtime(
+            old_content.unwrap_or_default(),
+            args.content,
+            rel_path.clone(),
+        )
+        .await?;
+        let extra_head =
+            is_new_file.then(|| format!("new file, {} lines\n", content.lines().count()));
 
         let outside = is_outside_workspace(&full_path, &ctx.cwd);
         let perm_title = if outside {
@@ -132,19 +133,16 @@ impl Tool for WriteTool {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        crate::registry::write_atomic(&full_path, args.content.as_bytes()).await?;
+        crate::registry::write_atomic(&full_path, content.as_bytes()).await?;
         crate::walk::invalidate_path(&full_path);
 
-        let content_msg = format!("Wrote {} bytes to {rel_path}", args.content.len());
+        let content_msg = format!("Wrote {} bytes to {rel_path}", content.len());
         let preview = preview_body(&diff);
         let title = format!("Write {rel_path}");
 
-        let mut out = ToolOutput::text(content_msg)
+        Ok(ToolOutput::text(content_msg)
             .with_title(title)
-            .with_preview(preview);
-        if let Some(stat) = diff_stat {
-            out = out.with_diff(stat);
-        }
-        Ok(out)
+            .with_preview(preview)
+            .with_diff(stat))
     }
 }

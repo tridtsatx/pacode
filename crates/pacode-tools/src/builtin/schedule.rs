@@ -109,6 +109,10 @@ impl Tool for CronTool {
         })
     }
 
+    fn can_exceed_output_cap(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Control
     }
@@ -269,6 +273,10 @@ impl Tool for MonitorTool {
                 "monitor_id": {"type": "string", "description": "For stop."}
             }
         })
+    }
+
+    fn can_exceed_output_cap(&self) -> bool {
+        false
     }
 
     fn kind(&self) -> ToolKind {

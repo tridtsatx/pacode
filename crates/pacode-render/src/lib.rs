@@ -18,7 +18,7 @@ pub mod wrap;
 use pacode_types::config::ShimmerMode;
 
 pub use cache::LineCache;
-pub use diff::{diff_hides_lines, diff_stat, render_diff, render_diff_ex, unified_diff};
+pub use diff::{DIFF_TIMEOUT, diff_hides_lines, render_diff, render_diff_ex, unified_diff};
 pub use markdown::render_markdown;
 pub use palettes::builtin_palettes;
 pub use shimmer::{AnimClock, ShimmerPalette, shimmer_spans, shimmer_tiers};

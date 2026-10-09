@@ -99,6 +99,13 @@ impl ToolHost for DummyHost {
     ) -> Result<Vec<String>, ToolError> {
         Ok(Vec::new())
     }
+    async fn task_output(
+        &self,
+        _task: &pacode_types::TaskId,
+        _max_chars: usize,
+    ) -> Result<String, ToolError> {
+        Ok(String::new())
+    }
     fn report_task_progress(
         &self,
         _task: &pacode_types::TaskId,

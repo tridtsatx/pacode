@@ -157,3 +157,7 @@ impl Tool for LsTool {
             .with_preview(preview))
     }
 }
+
+#[cfg(test)]
+#[path = "ls_tests.rs"]
+mod ls_tests;

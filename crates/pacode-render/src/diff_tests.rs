@@ -23,16 +23,45 @@ fn line_text(l: &Line) -> String {
 fn diff_stat_counts_added_and_removed() {
     let old = "line 1\nline 2\nline 3\n";
     let new = "line 1\nmodified line 2\nline 3\nline 4\n";
-    let stat = diff_stat(old, new);
+    let (_, stat) = unified_diff(old, new, "f", 3);
     assert_eq!(stat.added, 2);
     assert_eq!(stat.removed, 1);
+}
+
+/// A rewrite of every other line of a large file is the Myers worst case
+/// (D ≈ N); without the timeout it runs for minutes. With it the diff comes
+/// back promptly and stays exact: every changed line is still counted.
+#[test]
+fn huge_rewrite_diff_is_time_bounded_and_exact() {
+    let lines = 60_000;
+    let old: String = (0..lines).map(|i| format!("line {i}\n")).collect();
+    let new: String = (0..lines)
+        .map(|i| {
+            if i % 2 == 0 {
+                format!("changed {i}\n")
+            } else {
+                format!("line {i}\n")
+            }
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let (text, stat) = unified_diff(&old, &new, "big.txt", 3);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < DIFF_TIMEOUT * 20,
+        "diff took {elapsed:?}, budget {DIFF_TIMEOUT:?}"
+    );
+    assert!(stat.added as usize >= lines / 2);
+    assert_eq!(stat.added, stat.removed);
+    assert!(text.contains("+changed 0"));
+    assert!(text.contains("-line 0"));
 }
 
 #[test]
 fn unified_diff_generates_header() {
     let old = "fn main() {}\n";
     let new = "fn main() {\n    println!(\"hi\");\n}\n";
-    let diff = unified_diff(old, new, "src/main.rs", 3);
+    let (diff, _) = unified_diff(old, new, "src/main.rs", 3);
     assert!(diff.contains("--- a/src/main.rs"));
     assert!(diff.contains("+++ b/src/main.rs"));
     assert!(diff.contains("@@"));

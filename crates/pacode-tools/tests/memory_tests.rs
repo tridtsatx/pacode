@@ -164,6 +164,13 @@ impl ToolHost for StubHost {
             .map_err(|e| ToolError::failed(e.to_string()))
     }
 
+    async fn task_output(&self, task: &TaskId, max_chars: usize) -> Result<String, ToolError> {
+        self.tasks
+            .output(task, max_chars)
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))
+    }
+
     fn report_task_progress(&self, task: &TaskId, progress: TaskProgress) -> Result<(), ToolError> {
         self.tasks
             .report_progress(task, progress)

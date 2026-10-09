@@ -700,6 +700,17 @@ impl ToolHost for SessionHost {
             .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
+    async fn task_output(&self, task: &TaskId, max_chars: usize) -> Result<String, ToolError> {
+        if self.task_info(task).is_none() {
+            return Err(ToolError::Failed("task not found".to_string()));
+        }
+        self.session
+            .tasks
+            .output(task, max_chars)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
+    }
+
     fn report_task_progress(&self, task: &TaskId, progress: TaskProgress) -> Result<(), ToolError> {
         if self.task_info(task).is_none() {
             return Err(ToolError::Failed("task not found".to_string()));

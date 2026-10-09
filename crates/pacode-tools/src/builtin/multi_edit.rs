@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::edit;
-use super::helpers::{is_outside_workspace, parse_input, preview_body};
+use super::helpers::{
+    FileChange, diff_off_runtime, is_outside_workspace, parse_input, preview_body,
+};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "multi_edit";
@@ -71,6 +73,10 @@ impl Tool for MultiEditTool {
         })
     }
 
+    fn can_exceed_output_cap(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Edit
     }
@@ -124,8 +130,11 @@ impl Tool for MultiEditTool {
             .to_string_lossy()
             .to_string();
 
-        let diff = pacode_render::unified_diff(&original, &current, &rel_path, 3);
-        let stat = pacode_render::diff_stat(&original, &current);
+        let FileChange {
+            new: current,
+            diff,
+            stat,
+        } = diff_off_runtime(original, current, rel_path.clone()).await?;
 
         let outside = is_outside_workspace(&full_path, &ctx.cwd);
         let perm_title = if outside {

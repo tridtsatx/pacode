@@ -119,6 +119,37 @@ fn ansi_escape_stripping() {
     assert_eq!(p.total, Some(5));
 }
 
+/// The literal guards must not change what matches: near-miss lines (the
+/// guard word without the pattern) count nothing, real ones still count.
+#[test]
+fn literal_guards_keep_the_patterns_exact() {
+    let mut parser = ProgressParser::new();
+    for line in [
+        "12345",
+        "an error occurred",
+        "warnings are fine",
+        "a/b/c path",
+        "100% sure, not at the end",
+        "running late",
+        "test me",
+    ] {
+        assert!(parser.feed_line(line, 1).is_none(), "{line}");
+    }
+    assert_eq!((parser.warnings(), parser.errors()), (0, 0));
+
+    let _ = parser.feed_line("\x1b[33mwarning\x1b[0m: unused", 2);
+    let _ = parser.feed_line("error[E0425]: nope", 3);
+    assert_eq!((parser.warnings(), parser.errors()), (1, 1));
+    let _ = parser.feed_line("✖ 4 problems (3 errors, 1 warning)", 4);
+    assert_eq!((parser.warnings(), parser.errors()), (1, 3));
+    let p = parser
+        .feed_line("   Compiling serde v1.0", 5)
+        .expect("compiling");
+    assert_eq!(p.message.as_deref(), Some("Compiling serde"));
+    let p = parser.feed_line("step 3/7", 6).expect("ratio");
+    assert_eq!((p.current, p.total), (Some(3), Some(7)));
+}
+
 #[test]
 fn unchanged_line_returns_none() {
     let mut parser = ProgressParser::new();

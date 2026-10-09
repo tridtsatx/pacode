@@ -45,7 +45,10 @@ pub struct WalkOptions {
 }
 
 /// One visited entry; `rel` is relative to the canonical walk root.
-#[derive(Clone, Debug)]
+///
+/// Not `Clone` on purpose: entries are only moved or borrowed (see
+/// `join_parts`), so a deep copy of a whole scan cannot slip in.
+#[derive(Debug)]
 pub struct WalkEntry {
     pub rel: PathBuf,
     pub is_file: bool,
@@ -170,48 +173,147 @@ fn evict_oldest(scans: &mut HashMap<WalkKey, Scan>, max_roots: usize) {
     }
 }
 
-/// One `ignore`-crate walk producing plain entries; the root itself (depth 0)
-/// is never yielded since no consumer lists it.
+/// Ceiling on walker threads for one unbounded scan, before the process-wide
+/// budget (`crate::threads`) has its say.
+const MAX_WALK_THREADS: usize = 8;
+
+/// One `ignore`-crate walk producing plain entries sorted by relative path;
+/// the root itself (depth 0) is never yielded since no consumer lists it.
+///
+/// An unbounded walk runs on `ignore`'s parallel walker when the process-wide
+/// thread budget grants at least two threads: the cost is CPU in gitignore
+/// matching, not IO, and on a large tree it dominates a cold `grep`/`glob`.
+/// Otherwise — a depth-limited walk (`ls`, a single directory read) or a busy
+/// budget — it walks serially on the calling thread. Either way the result is
+/// sorted, so the order does not depend on thread timing or on `readdir`.
 fn scan(
     root: &Path,
     options: WalkOptions,
     cancel: &CancellationToken,
 ) -> Result<Vec<WalkEntry>, ToolError> {
-    let walker = ignore::WalkBuilder::new(root)
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
         .hidden(!options.include_hidden)
         .git_ignore(true)
         .require_git(false)
-        .max_depth(options.max_depth)
-        .build();
+        .max_depth(options.max_depth);
 
-    let mut entries = Vec::new();
-    for entry in walker {
-        if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
-        let Ok(entry) = entry else { continue };
-        if entry.depth() == 0 {
-            continue;
-        }
-        let file_type = entry.file_type();
-        let (mtime, size) = match entry.metadata() {
-            Ok(meta) => (meta.modified().ok(), meta.len()),
-            Err(_) => (None, 0),
-        };
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .unwrap_or_else(|_| entry.path())
-            .to_path_buf();
-        entries.push(WalkEntry {
-            rel,
-            is_file: file_type.is_some_and(|ft| ft.is_file()),
-            is_dir: file_type.is_some_and(|ft| ft.is_dir()),
-            mtime,
-            size,
-        });
+    // The calling thread only waits while `ignore`'s threads walk, so fewer
+    // than two extra threads would not be faster than walking here.
+    // An unbounded walk counts this thread against the budget while it runs,
+    // so concurrent walks leave each other no helpers.
+    let _own = options
+        .max_depth
+        .is_none()
+        .then(|| crate::threads::shared().occupy());
+    let threads = match options.max_depth {
+        Some(_) => None,
+        None => Some(crate::threads::shared().reserve(MAX_WALK_THREADS)),
     }
+    .filter(|reserved| reserved.count() >= 2);
+
+    let mut entries = match threads {
+        None => {
+            let mut entries = Vec::new();
+            for entry in builder.build() {
+                if cancel.is_cancelled() {
+                    return Err(ToolError::Cancelled);
+                }
+                if let Some(entry) = walk_entry(root, entry) {
+                    entries.push(entry);
+                }
+            }
+            entries
+        }
+        Some(reserved) => {
+            // Each walker thread fills its own Vec and hands it over when
+            // its visitor is dropped at the end of the walk; the parts are
+            // then moved into one Vec (`join_parts`), never cloned.
+            let parts: Mutex<Vec<Vec<WalkEntry>>> = Mutex::new(Vec::new());
+            builder.threads(reserved.count()).build_parallel().run(|| {
+                let mut local = LocalEntries {
+                    entries: Vec::new(),
+                    parts: &parts,
+                };
+                Box::new(move |entry| {
+                    if cancel.is_cancelled() {
+                        return ignore::WalkState::Quit;
+                    }
+                    if let Some(entry) = walk_entry(root, entry) {
+                        local.entries.push(entry);
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+            drop(reserved);
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
+            join_parts(parts.into_inner().unwrap_or_else(|p| p.into_inner()))
+        }
+    };
+    entries.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
     Ok(entries)
+}
+
+/// The walker threads' parts as one Vec: the largest part is the base and the
+/// others are moved onto it, so each entry's heap data moves rather than being
+/// copied (`WalkEntry` is deliberately not `Clone`; `concat` would deep-copy).
+/// Peak is the parts plus one buffer of entry headers for the result.
+fn join_parts(mut parts: Vec<Vec<WalkEntry>>) -> Vec<WalkEntry> {
+    let total: usize = parts.iter().map(Vec::len).sum();
+    let Some(largest) = (0..parts.len()).max_by_key(|&i| parts[i].len()) else {
+        return Vec::new();
+    };
+    let mut joined = parts.swap_remove(largest);
+    joined.reserve_exact(total - joined.len());
+    for mut part in parts {
+        joined.append(&mut part);
+    }
+    joined
+}
+
+/// One walker thread's entries, appended to the shared parts on drop.
+struct LocalEntries<'a> {
+    entries: Vec<WalkEntry>,
+    parts: &'a Mutex<Vec<Vec<WalkEntry>>>,
+}
+
+impl Drop for LocalEntries<'_> {
+    fn drop(&mut self) {
+        let entries = std::mem::take(&mut self.entries);
+        self.parts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(entries);
+    }
+}
+
+fn walk_entry(root: &Path, entry: Result<ignore::DirEntry, ignore::Error>) -> Option<WalkEntry> {
+    let entry = entry.ok()?;
+    if entry.depth() == 0 {
+        return None;
+    }
+    // One stat per entry. Measured: spread over the walker threads it costs
+    // little, and caching it keeps a warm `glob` (mtime sort) from re-stating
+    // every match on each call.
+    let file_type = entry.file_type();
+    let (mtime, size) = match entry.metadata() {
+        Ok(meta) => (meta.modified().ok(), meta.len()),
+        Err(_) => (None, 0),
+    };
+    let rel = entry
+        .path()
+        .strip_prefix(root)
+        .unwrap_or_else(|_| entry.path())
+        .to_path_buf();
+    Some(WalkEntry {
+        rel,
+        is_file: file_type.is_some_and(|ft| ft.is_file()),
+        is_dir: file_type.is_some_and(|ft| ft.is_dir()),
+        mtime,
+        size,
+    })
 }
 
 #[cfg(test)]
