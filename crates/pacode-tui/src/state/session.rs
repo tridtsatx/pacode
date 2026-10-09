@@ -274,6 +274,7 @@ pub struct SessionUiState {
     /// Requests the prompt path waits behind (`state::barriers`).
     pub clear_in_flight: bool,
     pub settings_in_flight: usize,
+    pub clear_outcome_unknown: bool,
     pub transcript: Transcript,
     pub panel: PanelState,
     pub files: FilesState,
@@ -343,6 +344,7 @@ impl SessionUiState {
             turn_cycle_observed: false,
             clear_in_flight: false,
             settings_in_flight: 0,
+            clear_outcome_unknown: false,
             transcript: Transcript::new(transcript_cells),
             panel: PanelState::new(transcript_cells),
             files: FilesState::default(),
@@ -742,7 +744,10 @@ impl SessionUiState {
         }
     }
 
+    /// Replies scoped to the old epoch no longer fold, so the request
+    /// barriers waiting on them go with it.
     pub fn advance_deferred_epoch(&mut self) {
+        self.drop_request_barriers();
         loop {
             self.deferred_epoch = self.deferred_epoch.wrapping_add(1);
             if self.deferred_epoch != 0 {

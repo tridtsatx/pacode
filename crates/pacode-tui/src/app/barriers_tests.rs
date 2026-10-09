@@ -5,9 +5,10 @@ use std::time::Instant;
 
 use pacode_client::ClientEventContext;
 use pacode_types::model::{Effort, ModelRoute};
-use pacode_types::state::Mode;
+use pacode_types::state::{Mode, Plan, UsageTotals};
 use pacode_types::{
-    AgentId, Config, Event, Reply, Request, SessionId, SessionMeta, TurnId, TurnStop,
+    AgentId, Config, Event, Reply, Request, SessionId, SessionMeta, SessionSnapshot,
+    TranscriptItem, TranscriptKind, TurnId, TurnStop,
 };
 
 use super::super::bg_response::{BgResponse, handle_bg_response};
@@ -23,10 +24,8 @@ fn client_context() -> ClientEventContext {
     }
 }
 
-/// A session attached and idle, its prompt gate open.
-fn ready() -> AppState {
-    let mut state = AppState::new(Config::default(), "test".into(), 100, 30);
-    state.meta = Some(SessionMeta {
+fn meta() -> SessionMeta {
+    SessionMeta {
         id: SessionId::new("ses_test"),
         name: None,
         cwd: PathBuf::from("/tmp"),
@@ -38,7 +37,43 @@ fn ready() -> AppState {
         mode: Mode::Build,
         first_prompt: None,
         zdr: false,
-    });
+    }
+}
+
+/// The resync snapshot: `transcript` empty or holding one user message.
+fn snapshot(seq: u64, transcript: Option<&str>) -> SessionSnapshot {
+    SessionSnapshot {
+        meta: meta(),
+        agents: Vec::new(),
+        plan: Plan::default(),
+        tasks: Vec::new(),
+        usage: UsageTotals::default(),
+        transcript: transcript
+            .map(|text| TranscriptItem {
+                seq: 1,
+                agent: AgentId::main(),
+                ts_ms: 1,
+                kind: TranscriptKind::User { text: text.into() },
+            })
+            .into_iter()
+            .collect(),
+        has_more_history: false,
+        pending_permissions: Vec::new(),
+        pending_questions: Vec::new(),
+        turn_active: false,
+        active_turn: None,
+        terminal_turn: None,
+        terminal_error: None,
+        cron_jobs: Vec::new(),
+        monitors: Vec::new(),
+        seq,
+    }
+}
+
+/// A session attached and idle, its prompt gate open.
+fn ready() -> AppState {
+    let mut state = AppState::new(Config::default(), "test".into(), 100, 30);
+    state.meta = Some(meta());
     state.event_connection_epoch = 1;
     state.event_session_epoch = 1;
     state.awaiting_snapshot = false;
@@ -57,11 +92,24 @@ fn event(state: &mut AppState, seq: u64, event: Event) {
     );
 }
 
-fn reply(state: &mut AppState, barrier: RequestBarrier, res: Reply) -> Vec<crate::keys::Action> {
-    let scope = ReplyScope::Session {
+fn scope(state: &AppState) -> ReplyScope {
+    ReplyScope::Session {
         context: state.session_context(),
         client_context: client_context(),
-    };
+    }
+}
+
+fn reply(state: &mut AppState, barrier: RequestBarrier, res: Reply) -> Vec<crate::keys::Action> {
+    let scope = scope(state);
+    reply_in(state, scope, barrier, res)
+}
+
+fn reply_in(
+    state: &mut AppState,
+    scope: ReplyScope,
+    barrier: RequestBarrier,
+    res: Reply,
+) -> Vec<crate::keys::Action> {
     handle_bg_response(
         BgResponse::BarrierReply {
             barrier,
@@ -225,4 +273,83 @@ fn a_disconnect_drops_the_barriers() {
         Instant::now(),
     );
     assert!(!state.prompt_path_held());
+}
+
+/// Resync while a settings change is in flight: the resync writes the barrier
+/// off (its reply is scoped to the old epoch and can never fold), the queue
+/// drains once the snapshot lands, and the stale reply lowers nothing newer.
+#[test]
+fn a_resync_releases_a_settings_barrier_and_its_stale_reply_lowers_nothing() {
+    let mut state = ready();
+    state.raise_barrier(RequestBarrier::Settings);
+    let stale = scope(&state);
+    state.input.queue_push("after the switch".into());
+
+    state.resync_want = true;
+    assert_eq!(
+        state.take_resync_request(Instant::now()),
+        Some(Request::GetSnapshot)
+    );
+    assert!(!state.prompt_path_held());
+    assert!(state.apply_snapshot(snapshot(5, Some("before")), Instant::now()));
+    assert_eq!(state.drain_prompt_queue(), Some(user("after the switch")));
+
+    state.raise_barrier(RequestBarrier::Settings);
+    reply_in(&mut state, stale, RequestBarrier::Settings, Reply::Ok);
+    assert_eq!(state.settings_in_flight, 1, "the newer barrier stays");
+}
+
+/// A clear whose reply the resync made stale: the snapshot decides. An empty
+/// transcript means the clear went through, so the queue goes with a toast.
+#[test]
+fn a_clear_lost_to_a_resync_drops_the_queue_when_the_snapshot_is_empty() {
+    let mut state = ready();
+    state.raise_barrier(RequestBarrier::Clear);
+    let stale = scope(&state);
+    state.input.queue_push("old".into());
+    state.resync_want = true;
+    assert!(state.take_resync_request(Instant::now()).is_some());
+    assert!(!state.prompt_path_held());
+
+    assert!(state.apply_snapshot(snapshot(5, None), Instant::now()));
+    assert!(state.input.prompt_queue.is_empty());
+    assert!(
+        state
+            .toasts
+            .iter()
+            .any(|toast| toast.title == "1 queued prompt dropped")
+    );
+    reply_in(&mut state, stale, RequestBarrier::Clear, Reply::Ok);
+    assert_eq!(state.toasts.len(), 1);
+}
+
+/// The same, but the snapshot still holds the conversation: the prompts stay
+/// and drain.
+#[test]
+fn a_clear_lost_to_a_resync_keeps_the_queue_when_the_snapshot_is_not_empty() {
+    let mut state = ready();
+    state.raise_barrier(RequestBarrier::Clear);
+    state.input.queue_push("still wanted".into());
+    state.resync_want = true;
+    assert!(state.take_resync_request(Instant::now()).is_some());
+
+    assert!(state.apply_snapshot(snapshot(5, Some("kept")), Instant::now()));
+    assert!(!state.prompt_path_held());
+    assert_eq!(state.drain_prompt_queue(), Some(user("still wanted")));
+    assert!(state.toasts.is_empty());
+}
+
+/// `ContextCleared` already dropped the old queue; a prompt queued after it is
+/// for the new conversation, and the clear's late `Ok` must not drop it.
+#[test]
+fn a_late_clear_reply_spares_prompts_queued_after_the_event() {
+    let mut state = ready();
+    state.raise_barrier(RequestBarrier::Clear);
+    event(&mut state, 1, Event::ContextCleared);
+    state.input.queue_push("for the new conversation".into());
+    reply(&mut state, RequestBarrier::Clear, Reply::Ok);
+    assert_eq!(
+        state.drain_prompt_queue(),
+        Some(user("for the new conversation"))
+    );
 }

@@ -4,10 +4,14 @@
 //! belongs to the conversation being cleared and must not drain into the gap,
 //! where the clear would sweep it or it would open the cleared context.
 //!
-//! A barrier drops on its reply (`BgResponse::BarrierReply`), on
-//! `ContextCleared` for a clear, and on a connection loss, after which the
-//! reply's client context is stale and it never folds. A session switch resets
-//! the session state, barriers included.
+//! A barrier drops on its own reply (`BgResponse::BarrierReply`, whenever the
+//! reply still belongs to this session generation, deferred epoch and slot,
+//! even while a snapshot is awaited), on `ContextCleared` for a clear, and
+//! whenever the deferred epoch advances (connection change, disconnect, seq-gap
+//! resync) or the link starts reconnecting, after which its reply is stale
+//! and never folds. A clear dropped that way leaves its outcome to the next
+//! snapshot (`settle_lost_clear`). A session switch resets the session
+//! state, barriers included.
 
 use std::time::Instant;
 
@@ -106,19 +110,41 @@ impl SessionUiState {
         }
     }
 
-    /// The connection is gone: no reply in flight will fold any more.
+    /// No reply in flight will fold any more. A clear whose reply is lost
+    /// may or may not have happened; the next snapshot tells.
     pub fn drop_request_barriers(&mut self) {
+        self.clear_outcome_unknown |= self.clear_in_flight;
         self.clear_in_flight = false;
         self.settings_in_flight = 0;
     }
 }
 
 impl AppState {
+    /// Whether a reply scoped to `(generation, deferred_epoch, slot)` is the
+    /// reply of a barrier raised in this state: barriers drop whenever any of
+    /// the three moves (a slot switch resets the session), so a reply from
+    /// before cannot lower a newer barrier.
+    pub fn owns_barrier_reply(&self, generation: u64, deferred_epoch: u64, slot: usize) -> bool {
+        generation == self.session.generation
+            && deferred_epoch == self.session.deferred_epoch
+            && slot == self.active_slot
+    }
+
+    /// A snapshot landed after a clear lost its reply: an empty transcript
+    /// means the clear went through, and the queued prompts belonged to what
+    /// it cleared; otherwise they stay.
+    pub fn settle_lost_clear(&mut self, transcript_empty: bool, now: Instant) {
+        if std::mem::take(&mut self.session.clear_outcome_unknown) && transcript_empty {
+            self.drop_prompts_of_cleared_context(now);
+        }
+    }
+
     /// The conversation was cleared (our `/clear` answered `Ok`, or any
     /// client's `ContextCleared` arrived): the prompts waiting to go out were
     /// typed for it, so they go too, and a toast says how many.
     pub fn drop_prompts_of_cleared_context(&mut self, now: Instant) {
         self.clear_in_flight = false;
+        self.clear_outcome_unknown = false;
         let mut dropped = self.input.prompt_queue.len();
         self.input.queue_clear();
         self.session.pending_sequences.retain(|sequence| {

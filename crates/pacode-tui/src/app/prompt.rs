@@ -160,20 +160,36 @@ fn send_ordered(
 }
 
 /// `BgResponse::BarrierReply`: release the prompt path, then fold the reply
-/// like any other; the loop drains what waited behind it. A clear the daemon
-/// carried out takes the queued prompts with it, whichever of this reply and
-/// `ContextCleared` lands first.
+/// like any other; the loop drains what waited behind it. The release only
+/// asks that the barrier is this reply's (`owns_barrier_reply`), not that the
+/// session is snapshot-current: a reply landing while a snapshot is awaited
+/// must still let go. A clear the daemon carried out takes the queued prompts
+/// with it, whichever of this reply and `ContextCleared` lands first.
 pub(super) fn fold_barrier_reply(
     state: &mut AppState,
     barrier: RequestBarrier,
     scope: ReplyScope,
     res: Result<Reply, pacode_client::ClientError>,
 ) -> Vec<Action> {
+    let (generation, deferred_epoch, slot) = match &scope {
+        ReplyScope::Session { context, .. } => {
+            (context.generation, context.deferred_epoch, context.slot)
+        }
+        ReplyScope::Global { context } | ReplyScope::Ui { context } => {
+            (context.generation, context.deferred_epoch, context.slot)
+        }
+    };
+    let owned = state.owns_barrier_reply(generation, deferred_epoch, slot);
+    // Still holding: `ContextCleared` has not dropped the queue yet, so the
+    // prompts in it now were queued before the clear.
+    let clear_pending = owned && barrier == RequestBarrier::Clear && state.clear_in_flight;
+    if owned {
+        state.lower_barrier(barrier);
+    }
     if !reply_scope_is_current(state, &scope) {
         return Vec::new();
     }
-    state.lower_barrier(barrier);
-    if barrier == RequestBarrier::Clear && matches!(res, Ok(Reply::Ok)) {
+    if clear_pending && matches!(res, Ok(Reply::Ok)) {
         state.drop_prompts_of_cleared_context(Instant::now());
     }
     let context = match &scope {

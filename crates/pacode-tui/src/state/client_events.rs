@@ -133,7 +133,6 @@ impl AppState {
                 self.session.cancel_deferred_work();
                 self.session.fail_in_flight_user_messages();
                 self.session.drop_pending_detach_turns();
-                self.session.drop_request_barriers();
                 self.session.clear_buffered_events();
                 self.invalidate_pending_attach_after_disconnect();
                 self.resync_want = false;
@@ -255,6 +254,7 @@ impl AppState {
         self.meta = Some(snapshot.meta.clone());
         self.restore_stashed_queue(&snapshot.meta.id);
         self.record_slot(self.active_slot, &snapshot);
+        self.settle_lost_clear(snapshot.transcript.is_empty(), now);
         self.transcript
             .reset(snapshot.transcript.clone(), snapshot.has_more_history);
         let header = crate::state::transcript::HeaderInfo {
@@ -357,6 +357,9 @@ impl AppState {
         self.resync_in_flight = false;
         self.awaiting_snapshot = false;
         self.snapshot_rebase_allowed = false;
+        // No snapshot tells whether a clear that lost its reply went through:
+        // the queued prompts stay.
+        self.session.clear_outcome_unknown = false;
         self.session.reconcile_turn_boundary(self.turn_active);
         self.replay_buffered_session_events(now);
         self.resync_want |= retry && matches!(self.connection, Connection::Connected);
