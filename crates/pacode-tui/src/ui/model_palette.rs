@@ -122,6 +122,14 @@ pub enum Anchor {
     /// A sign-in finished: the provider's first model once its catalog
     /// lands, its header until then.
     Provider(String),
+    /// A row the user moved to: that model, in `RECENT` or in its group (the
+    /// same route can be in both). Rows rebuild when a list reply or an auth
+    /// change lands; the highlight stays on the model rather than on an index
+    /// the new rows shifted, so Enter switches to what is highlighted.
+    Model { route: ModelRoute, recent: bool },
+    /// A provider header the user moved to: it stays on the header, even
+    /// once the provider's catalog lands under it.
+    Header(String),
 }
 
 /// Inline progress of a sign-in started from the palette.
@@ -141,8 +149,10 @@ pub struct ModelPalette {
     /// The first list row on screen, kept between frames so moving inside
     /// the view never shifts it — see [`ModelPalette::window`].
     pub scroll: usize,
-    /// A row to land on once it exists. Rows may still be loading when the
-    /// palette opens; the first move or keystroke drops it.
+    /// The row the selection follows while it exists: where the palette
+    /// opened (rows may still be loading), then the row the user moved to.
+    /// A new query drops it (the best match is on top). `cursor` is the
+    /// fallback once the row is gone.
     anchor: Option<Anchor>,
     /// The effort the user asked for. Shown and sent snapped to the
     /// highlighted model's ladder — see [`ModelPalette::effort_for`].
@@ -372,7 +382,10 @@ impl ModelPalette {
             .unwrap_or(0);
         let last = selectable.len().saturating_sub(1) as isize;
         self.cursor = (current as isize + delta).clamp(0, last.max(0)) as usize;
-        self.anchor = None;
+        self.anchor = selectable
+            .get(self.cursor)
+            .and_then(|index| rows.get(*index))
+            .and_then(anchor_of);
     }
 
     /// The query changed: the best match is on top, so the selection goes
@@ -451,6 +464,18 @@ struct Entry<'a> {
     favorite: bool,
 }
 
+/// The anchor that keeps the selection on `row` across a rebuild.
+fn anchor_of(row: &Row) -> Option<Anchor> {
+    match row {
+        Row::Gap => None,
+        Row::Header { provider, .. } => provider.clone().map(Anchor::Header),
+        Row::Model { model, recent, .. } => Some(Anchor::Model {
+            route: model.route.clone(),
+            recent: *recent,
+        }),
+    }
+}
+
 fn anchor_index(anchor: &Anchor, rows: &[Row]) -> Option<usize> {
     let header_of = |id: &str| {
         rows.iter()
@@ -476,6 +501,15 @@ fn anchor_index(anchor: &Anchor, rows: &[Row]) -> Option<usize> {
             );
             if first_model { header + 1 } else { header }
         }),
+        Anchor::Model { route, recent } => rows
+            .iter()
+            .position(|row| {
+                matches!(row, Row::Model { model, recent: r, .. }
+                    if model.route == *route && r == recent)
+            })
+            // Out of `RECENT` (or into it): the same model elsewhere.
+            .or_else(|| anchor_index(&Anchor::Route(route.clone()), rows)),
+        Anchor::Header(id) => header_of(id),
     }
 }
 

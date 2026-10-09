@@ -222,7 +222,7 @@ fn filtering_keeps_the_selection_in_range() {
 }
 
 #[test]
-fn moving_skips_gaps_and_signed_in_headers_and_clamps() {
+fn moving_skips_gaps_and_headers_without_auth_and_clamps() {
     let fx = Fixture::new();
     let mut palette = ModelPalette::default();
     let rows = palette.rows(&fx.src());
@@ -347,7 +347,7 @@ fn anchors_land_on_the_session_route_or_the_first_sign_in() {
         Some(Row::Header { title, .. }) if title == "STALE"
     ));
 
-    // The first move drops the anchor and continues from where it was.
+    // The first move continues from where the anchor was.
     let mut palette = palette;
     palette.move_by(1, &rows);
     assert!(matches!(
@@ -537,4 +537,53 @@ fn a_new_query_starts_the_window_at_the_top() {
     assert_eq!(palette.scroll, 14);
     palette.push_char('c');
     assert_eq!(palette.scroll, 0);
+}
+
+/// The highlight follows the model the user moved to, not its index: a late
+/// list reply that inserts a model above it must not move it onto another
+/// model, which Enter would then switch to.
+#[test]
+fn the_selection_stays_on_its_model_when_rows_rebuild() {
+    let mut fx = Fixture::new();
+    let mut palette = ModelPalette::default();
+    let rows = palette.rows(&fx.src());
+    // RECENT opus -> bubna/flash -> the CLAUDE header -> claude/opus.
+    palette.move_by(3, &rows);
+    let picked = |palette: &ModelPalette, rows: &[Row]| match palette.selected(rows) {
+        Some(Row::Model { model, recent, .. }) => Some((model.route.to_string(), *recent)),
+        _ => None,
+    };
+    assert_eq!(picked(&palette, &rows), Some(("claude/opus".into(), false)));
+
+    fx.models.insert(0, model("bubna", "aaa", "Another Flash"));
+    let rows = palette.rows(&fx.src());
+    assert_eq!(picked(&palette, &rows), Some(("claude/opus".into(), false)));
+
+    // The `RECENT` copy of the same route is a different row.
+    palette.move_by(-100, &rows);
+    assert_eq!(picked(&palette, &rows), Some(("claude/opus".into(), true)));
+    fx.models.insert(0, model("bubna", "aab", "Yet Another"));
+    let rows = palette.rows(&fx.src());
+    assert_eq!(picked(&palette, &rows), Some(("claude/opus".into(), true)));
+}
+
+/// A header the user moved to keeps the highlight when its catalog lands.
+#[test]
+fn a_selected_header_stays_selected_when_its_models_arrive() {
+    let mut fx = Fixture::new();
+    fx.recent.clear();
+    let mut palette = ModelPalette::default();
+    let rows = palette.rows(&fx.src());
+    palette.move_by(100, &rows);
+    assert!(matches!(
+        palette.selected(&rows),
+        Some(Row::Header { title, .. }) if title == "OPENROUTER"
+    ));
+    fx.auth[2].state = AuthState::Configured;
+    fx.models.push(model("openrouter", "z-ai/glm", "GLM"));
+    let rows = palette.rows(&fx.src());
+    assert!(matches!(
+        palette.selected(&rows),
+        Some(Row::Header { title, .. }) if title == "OPENROUTER"
+    ));
 }
