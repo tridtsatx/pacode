@@ -103,20 +103,33 @@ fn gallery() {
             index.push(file);
         }
     }
-    // The colour fallbacks, once each.
+    // The colour fallbacks, once each: the base screen and the palette (its
+    // badges and selection bar are where the fallbacks show most).
     for mode in ["ansi", "mono"] {
-        let mut state = base(120, 34);
-        force_color(&mut state, mode);
-        let file = format!("01_base_{mode}_120x34.html");
-        write_shot(
-            &dir,
-            &file,
-            &format!("01_base {mode} 120x34"),
-            &mut state,
-            120,
-            34,
-        );
-        index.push(file);
+        let fallbacks = [
+            Shot {
+                name: "01_base",
+                build: base,
+            },
+            Shot {
+                name: "07_model_palette",
+                build: model_palette,
+            },
+        ];
+        for Shot { name, build } in fallbacks {
+            let mut state = build(120, 34);
+            force_color(&mut state, mode);
+            let file = format!("{name}_{mode}_120x34.html");
+            write_shot(
+                &dir,
+                &file,
+                &format!("{name} {mode} 120x34"),
+                &mut state,
+                120,
+                34,
+            );
+            index.push(file);
+        }
     }
 
     let mut html = page_head("pacode gallery");
@@ -299,6 +312,21 @@ fn model_palette(w: u16, h: u16) -> AppState {
          "supports_reasoning": true}
     ]);
     state.models = serde_json::from_value(models).expect("models");
+    // Built from JSON like the models, so the file compiles against any
+    // checkout whose wire types parse it.
+    let auth = serde_json::json!([
+        {"id": "anthropic", "display_name": "Anthropic", "auth_kind": "oauth",
+         "detail": "", "recommended": true, "state": {"type": "configured"},
+         "accounts": ["work"], "active": "work"},
+        {"id": "openrouter", "display_name": "OpenRouter", "auth_kind": "api_key",
+         "detail": "", "recommended": false, "state": {"type": "configured"}},
+        {"id": "google", "display_name": "Google", "auth_kind": "oauth",
+         "detail": "", "recommended": false,
+         "state": {"type": "needs_attention", "reason": "token expired"}},
+        {"id": "openai", "display_name": "OpenAI", "auth_kind": "oauth",
+         "detail": "", "recommended": false, "state": {"type": "not_configured"}}
+    ]);
+    state.auth_providers = serde_json::from_value(auth).expect("auth");
     let _ = pacode_tui::commands::execute(&mut state, "/model");
     settle_focus(&mut state);
     state
