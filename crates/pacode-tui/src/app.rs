@@ -487,8 +487,10 @@ fn on_client_event(
 /// thread: `prefs.toml` is disk IO and the UI thread never waits on it.
 fn flush_prefs_write(state: &mut AppState) {
     if let Some(delta) = state.take_prefs_write() {
+        state.prefs_outbox.post(delta);
+        let outbox = state.prefs_outbox.clone();
         let paths = state.paths.clone();
-        tokio::task::spawn_blocking(move || delta.save(&paths));
+        tokio::task::spawn_blocking(move || outbox.flush(&paths));
     }
 }
 

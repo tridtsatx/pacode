@@ -72,6 +72,10 @@ pub struct RailState {
     tasks_version: u64,
     agent_turn_fences: HashMap<AgentId, AgentTurnFence>,
     pub usage: UsageTotals,
+    /// SCHEDULE rows the last frame drew (jobs first, so the first this-many
+    /// enabled jobs had a countdown on screen). Written by `ui::prepare_frame`;
+    /// 0 while the rail or its SCHEDULE block is not drawn.
+    pub schedule_rows_drawn: usize,
     /// When the session became idle (no live agents, no running tasks, turn over);
     /// the SESSION block replaces AGENTS after `IDLE_DEBOUNCE_MS`.
     pub idle_since: Option<Instant>,
@@ -235,9 +239,14 @@ impl RailState {
     /// necessarily the nearest job. Under ten seconds the tenth is also the
     /// floor, so the last second never wakes per millisecond. `None` means
     /// nothing counts down (a job at 0 waits for the daemon's reschedule).
-    pub fn schedule_tick_ms(&self, now_ms: u64) -> Option<u64> {
+    ///
+    /// Only the first `shown` enabled jobs count: those are the countdown rows
+    /// the last frame drew.
+    pub fn schedule_tick_ms(&self, now_ms: u64, shown: usize) -> Option<u64> {
         self.cron_jobs
             .iter()
+            .filter(|j| j.enabled)
+            .take(shown)
             .filter_map(|j| j.due_in_ms(now_ms))
             .filter(|&due| due > 0)
             .map(|due| {
@@ -256,7 +265,13 @@ impl RailState {
     /// Cron jobs and monitors worth a row: enabled jobs, and monitors still
     /// watching or freshly fired.
     pub fn has_schedule_rows(&self) -> bool {
-        self.cron_jobs.iter().any(|j| j.enabled) || self.monitors.iter().any(|m| m.status.is_live())
+        self.schedule_row_count() > 0
+    }
+
+    /// SCHEDULE rows: enabled jobs first, then live monitors.
+    pub fn schedule_row_count(&self) -> usize {
+        self.cron_jobs.iter().filter(|j| j.enabled).count()
+            + self.monitors.iter().filter(|m| m.status.is_live()).count()
     }
 
     pub fn upsert_task(&mut self, info: TaskInfo) {

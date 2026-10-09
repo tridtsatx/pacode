@@ -6,7 +6,7 @@ use pacode_types::{AgentId, Event, PermissionDecision, ToastLevel, TranscriptKin
 
 use crate::state::session::TurnEndMatch;
 use crate::state::stats;
-use crate::state::transcript::{Cell, CellKind, PermExplain, Transcript};
+use crate::state::transcript::{CellKind, PermExplain, Transcript};
 use crate::state::{AppState, Focus, PanelTarget};
 
 #[cfg(test)]
@@ -266,18 +266,9 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                     ),
                     None => text,
                 };
-                let now_ms = pacode_types::time::now_ms();
-                state.transcript.push_cell(Cell {
-                    id: seq,
-                    kind: CellKind::Item(TranscriptKind::Notice {
-                        level: ToastLevel::Info,
-                        text,
-                    }),
-                    version: 0,
-                    ts_ms: now_ms,
-                    stats: None,
-                    perm_explain: None,
-                });
+                // It answers the user's `e`, so it scrolls into view like
+                // every other notice.
+                state.push_notice_with_level(ToastLevel::Info, text);
             }
         }
         Event::PlanUpdated(plan) => {

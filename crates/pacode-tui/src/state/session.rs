@@ -401,8 +401,7 @@ impl SessionUiState {
         // browsing, and the cwd-keyed completion caches.
         let mut input = std::mem::take(&mut self.input);
         input.prompt_queue.clear();
-        input.history_index = None;
-        input.bash_history_index = None;
+        input.leave_history();
         input.at_comp = Default::default();
         input.bash_comp = Default::default();
         let pasted_images = std::mem::take(&mut self.pasted_images);

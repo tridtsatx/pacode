@@ -48,7 +48,7 @@ pub use notices::{
     BACKGROUND_NOTICE_MIN_MS, TOAST_EXIT_MS, TOAST_MAX, TOAST_TTL_SECS, Toast,
     background_worth_reporting,
 };
-pub use pickers::{PrefsDelta, nearest_supported_effort, picker_models, zdr_active};
+pub use pickers::{PrefsDelta, PrefsOutbox, nearest_supported_effort, picker_models, zdr_active};
 pub use questions::{PendingQuestions, QuestionFocus};
 pub use rail::RailState;
 pub use render::RenderContext;
@@ -200,6 +200,8 @@ pub struct AppState {
     /// Default changes (`prefs.toml`) waiting for the event loop to write
     /// them on a blocking thread; coalesced, so it is at most one record.
     pub(crate) pending_prefs: PrefsDelta,
+    /// Where `pending_prefs` goes for the blocking writer (one merged delta).
+    pub(crate) prefs_outbox: PrefsOutbox,
 }
 
 impl Deref for AppState {
@@ -290,6 +292,7 @@ impl AppState {
             analyze_mode: false,
             stashed_queues: VecDeque::new(),
             pending_prefs: PrefsDelta::default(),
+            prefs_outbox: PrefsOutbox::default(),
         }
     }
 

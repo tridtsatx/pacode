@@ -173,18 +173,17 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
         lines.push(Line::from(header_spans));
     }
 
-    let rem = (area.height as usize).saturating_sub(1);
     let now = now_ms();
-
-    if tasks.len() <= rem {
-        for t in tasks {
-            lines.push(render_task_line(t, area.width as usize, opts, now, lit));
-        }
-    } else if rem > 1 {
-        for t in tasks.iter().take(rem - 1) {
-            lines.push(render_task_line(t, area.width as usize, opts, now, lit));
-        }
-        let more = tasks.len() - (rem - 1);
+    let fit = background_fit(
+        area.height as usize,
+        tasks.len(),
+        state.rail.schedule_row_count(),
+    );
+    for t in tasks.iter().take(fit.tasks_shown) {
+        lines.push(render_task_line(t, area.width as usize, opts, now, lit));
+    }
+    if fit.tasks_more {
+        let more = tasks.len() - fit.tasks_shown;
         lines.push(Line::from(Span::styled(
             format!("  and {more} more"),
             opts.theme.faint,
@@ -194,19 +193,51 @@ pub fn draw_background(frame: &mut Frame, area: Rect, state: &AppState, opts: &R
     // The schedule rows share this zone: a cron job or a monitor is background
     // work the reader watches the same way, and giving it its own zone would cost
     // a rail block that most sessions never use.
-    let used = lines.len();
-    let left = (area.height as usize).saturating_sub(used);
-    if left > 1 && state.rail.has_schedule_rows() {
-        lines.extend(schedule_lines(
-            state,
-            area.width as usize,
-            opts,
-            now,
-            left - 1,
-        ));
+    if let Some(shown) = fit.schedule_shown {
+        lines.extend(schedule_lines(state, area.width as usize, opts, now, shown));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// What the background zone fits: how many task rows (and whether an
+/// `and N more` line follows them), then how many SCHEDULE rows under the
+/// SCHEDULE header (`None`: no SCHEDULE block). Drawing and the countdown
+/// wakeup both read it, so a wakeup is armed exactly for drawn countdowns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackgroundFit {
+    pub(crate) tasks_shown: usize,
+    pub(crate) tasks_more: bool,
+    pub(crate) schedule_shown: Option<usize>,
+}
+
+pub(crate) fn background_fit(height: usize, tasks: usize, schedule_rows: usize) -> BackgroundFit {
+    let header = usize::from(tasks > 0);
+    let rem = height.saturating_sub(1);
+    let (tasks_shown, tasks_more) = if tasks <= rem {
+        (tasks, false)
+    } else if rem > 1 {
+        (rem - 1, true)
+    } else {
+        (0, false)
+    };
+    let used = header + tasks_shown + usize::from(tasks_more);
+    let left = height.saturating_sub(used);
+    // The header row, then every row when they fit; otherwise one row gives
+    // way to an `and N more` line (the task list's rule). Reserving that line
+    // unconditionally hid the last job of a zone sized exactly for its rows.
+    let schedule_shown = (left > 1 && schedule_rows > 0).then(|| {
+        if schedule_rows < left {
+            schedule_rows
+        } else {
+            left - 2
+        }
+    });
+    BackgroundFit {
+        tasks_shown,
+        tasks_more,
+        schedule_shown,
+    }
 }
 
 /// `SCHEDULE` header plus one row per enabled job and live monitor, newest last.
@@ -215,7 +246,7 @@ fn schedule_lines(
     width: usize,
     opts: &RenderOptions,
     now: u64,
-    budget: usize,
+    shown: usize,
 ) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled("SCHEDULE", opts.theme.faint))];
     let mut rows = Vec::new();
@@ -236,8 +267,6 @@ fn schedule_lines(
         ));
     }
 
-    let budget = budget.saturating_sub(1);
-    let shown = rows.len().min(budget);
     for (sym, style, label, tail) in rows.iter().take(shown) {
         let tail_w = display_width(tail);
         let label_w = width.saturating_sub(tail_w + 4);

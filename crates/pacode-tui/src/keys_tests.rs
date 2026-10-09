@@ -3953,10 +3953,17 @@ fn test_esc_closes_a_panel_left_open_under_normal_focus() {
         let target = crate::state::PanelTarget::Agent(AgentId::new("agt_1"));
         state.panel.target = Some(target);
         state.focus = Focus::Normal;
+        // A half-typed `3d` — esc drops it as vim's own esc would.
+        state.vim.count = Some(3);
+        state.vim.pending = "d".into();
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         handle_key(&mut state, esc, Instant::now());
         assert_eq!(state.panel.target, None, "vim = {vim}");
         assert_eq!(state.focus, Focus::Normal);
+        if vim {
+            assert_eq!(state.vim.count, None);
+            assert!(state.vim.pending.is_empty());
+        }
     }
 }
 

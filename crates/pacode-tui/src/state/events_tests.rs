@@ -931,7 +931,8 @@ fn permission_explained_after_resolve_lands_as_a_notice() {
     assert!(cell.perm_explain.is_none());
 
     // The aux call finished after the verdict — the answer still lands
-    // rather than vanishing.
+    // rather than vanishing, and (it answers the user's `e`) in view.
+    state.transcript.scroll_from_bottom = 4;
     state.apply_client_event(
         ClientEvent::Event {
             context: event_context(),
@@ -951,6 +952,7 @@ fn permission_explained_after_resolve_lands_as_a_notice() {
         }
         other => panic!("expected a notice, got {other:?}"),
     }
+    assert_eq!(state.transcript.scroll_from_bottom, 0);
 }
 
 #[test]
@@ -1558,6 +1560,57 @@ fn session_updated_hands_off_only_the_changed_defaults() {
     other.mode = Mode::Plan;
     session_updated(&mut state, other);
     assert_eq!(state.take_prefs_write(), None);
+}
+
+/// B21: two quick changes (shift+tab twice: Plan, then Auto) each hand a
+/// write to the blocking pool, which may run them in either order. The file
+/// must end on the later change either way.
+#[test]
+fn prefs_writes_land_in_change_order_whatever_order_the_writers_run() {
+    for later_writer_first in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "pacode-b21-order-{}-{later_writer_first}",
+            std::process::id()
+        ));
+        let paths = pacode_config::Paths::under(&root);
+        let outbox = crate::state::PrefsOutbox::default();
+        let mode = |mode| crate::state::PrefsDelta {
+            mode: Some(mode),
+            ..Default::default()
+        };
+        // Each post is followed by its own writer task, as in the loop.
+        outbox.post(mode(Mode::Plan));
+        let first_writer = outbox.clone();
+        outbox.post(mode(Mode::Auto));
+        let second_writer = outbox.clone();
+        if later_writer_first {
+            second_writer.flush(&paths);
+            first_writer.flush(&paths);
+        } else {
+            first_writer.flush(&paths);
+            second_writer.flush(&paths);
+        }
+        assert_eq!(
+            pacode_config::load_prefs(&paths).mode,
+            Some(Mode::Auto),
+            "later writer first: {later_writer_first}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// B12: switching while ↑ shows a history entry brings the real draft back,
+/// not the previewed entry.
+#[test]
+fn a_session_switch_while_browsing_history_keeps_the_real_draft() {
+    let mut state = attached_state();
+    state.input.history.push_back("old prompt".into());
+    state.input.text = "my draft".into();
+    state.input.history_up();
+    assert_eq!(state.input.text, "old prompt");
+    state.leave_active_slot();
+    assert_eq!(state.input.text, "my draft");
+    assert_eq!(state.input.history_index, None);
 }
 
 /// B11: `--analyze-mode` is per process; a session switch must not drop it.

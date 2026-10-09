@@ -226,7 +226,7 @@ fn the_schedule_countdown_ticks_at_the_resolution_it_shows() {
 
     let mut rail = RailState::default();
     // Nothing scheduled: no tick at all.
-    assert_eq!(rail.schedule_tick_ms(1_000), None);
+    assert_eq!(rail.schedule_tick_ms(1_000, usize::MAX), None);
 
     let mut job = CronJob {
         id: CronJobId::new("cron_1"),
@@ -244,7 +244,7 @@ fn the_schedule_countdown_ticks_at_the_resolution_it_shows() {
     // Hours away: the rail shows whole minutes, so one wake a minute is enough.
     job.next_run_ms = Some(2 * 3_600_000 + 30_500);
     rail.upsert_cron_job(job.clone());
-    let tick = rail.schedule_tick_ms(0).expect("tick");
+    let tick = rail.schedule_tick_ms(0, usize::MAX).expect("tick");
     assert!(
         tick > 1_000 && tick <= 60_000,
         "a distant job must not tick every second: {tick}"
@@ -253,13 +253,13 @@ fn the_schedule_countdown_ticks_at_the_resolution_it_shows() {
     // Inside the last minute the countdown shows seconds.
     job.next_run_ms = Some(30_400);
     rail.upsert_cron_job(job.clone());
-    let tick = rail.schedule_tick_ms(0).expect("tick");
+    let tick = rail.schedule_tick_ms(0, usize::MAX).expect("tick");
     assert!(tick <= 1_000, "a near job ticks per second: {tick}");
 
     // A disabled job counts down to nothing and needs no tick.
     job.enabled = false;
     rail.upsert_cron_job(job);
-    assert_eq!(rail.schedule_tick_ms(0), None);
+    assert_eq!(rail.schedule_tick_ms(0, usize::MAX), None);
 }
 
 fn cron(id: &str, next_run_ms: u64) -> pacode_types::CronJob {
@@ -286,7 +286,7 @@ fn the_schedule_wake_lands_on_the_next_change_of_the_text() {
     for due in [12_345, 100_000, 59_999, 3_599_999, 3_600_000, 7_230_500] {
         let mut rail = RailState::default();
         rail.upsert_cron_job(cron("j", due));
-        let tick = rail.schedule_tick_ms(0).expect("tick");
+        let tick = rail.schedule_tick_ms(0, usize::MAX).expect("tick");
         let shown = format_duration_ms(due);
         assert_eq!(format_duration_ms(due - (tick - 1)), shown, "due {due}");
         assert_ne!(format_duration_ms(due - tick), shown, "due {due}");
@@ -299,23 +299,56 @@ fn the_schedule_wake_takes_the_soonest_change_over_all_jobs() {
     let mut rail = RailState::default();
     rail.upsert_cron_job(cron("near", 30_900));
     rail.upsert_cron_job(cron("far", 45_050));
-    assert_eq!(rail.schedule_tick_ms(0), Some(51));
+    assert_eq!(rail.schedule_tick_ms(0, usize::MAX), Some(51));
 }
 
 /// B26: the event loop wakes for the countdown only while the rail is on
 /// screen; at rest without one there is no timer.
 #[test]
 fn the_schedule_wake_is_armed_only_while_the_rail_shows() {
+    let frame = |state: &mut crate::state::AppState| {
+        let area = ratatui::layout::Rect::new(0, 0, state.cols, state.rows);
+        crate::ui::prepare_frame(area, state, std::time::Instant::now());
+    };
     let mut state =
         crate::state::AppState::new(pacode_types::Config::default(), "t".into(), 120, 34);
+    frame(&mut state);
     assert_eq!(state.schedule_redraw_in(0), None);
     state.rail.upsert_cron_job(cron("j", 30_900));
+    // Not drawn yet: the wakeup follows what is on screen.
+    assert_eq!(state.schedule_redraw_in(0), None);
+    frame(&mut state);
     assert_eq!(
         state.schedule_redraw_in(0),
         Some(Duration::from_millis(901))
     );
+    // No rail at this width: nothing on screen counts down.
     state.cols = 60;
+    frame(&mut state);
     assert_eq!(state.schedule_redraw_in(0), None);
+}
+
+/// B26: the SCHEDULE block needs its header plus a row; a zone the task list
+/// fills, or one too short, draws no countdown — and so arms no wakeup.
+#[test]
+fn the_background_fit_draws_schedule_rows_only_where_they_fit() {
+    use crate::ui::rail_session::background_fit;
+    // The zone the layout sizes for header + rows shows every row.
+    assert_eq!(background_fit(2, 0, 1).schedule_shown, Some(1));
+    assert_eq!(background_fit(5, 0, 4).schedule_shown, Some(4));
+    // More rows than fit: one gives way to `and N more`.
+    assert_eq!(background_fit(5, 0, 6).schedule_shown, Some(3));
+    // Too short: only the header and `and N more` fit — no countdown.
+    assert_eq!(background_fit(2, 0, 3).schedule_shown, Some(0));
+    assert_eq!(background_fit(1, 0, 1).schedule_shown, None);
+    // Four tasks under their header fill a five-row zone.
+    let fit = background_fit(5, 4, 1);
+    assert_eq!((fit.tasks_shown, fit.tasks_more), (4, false));
+    assert_eq!(fit.schedule_shown, None);
+    // Too many tasks: the zone ends in `and N more`, no SCHEDULE.
+    let fit = background_fit(5, 9, 1);
+    assert_eq!((fit.tasks_shown, fit.tasks_more), (3, true));
+    assert_eq!(fit.schedule_shown, None);
 }
 
 #[test]

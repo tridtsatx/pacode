@@ -75,11 +75,20 @@ static PREFS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Load `prefs.toml`, apply `edit`, save it back — under [`PREFS_LOCK`].
 fn update_prefs(paths: &pacode_config::Paths, edit: impl FnOnce(&mut pacode_config::Prefs)) {
-    // A poisoned lock only means another writer panicked mid-edit; the file
-    // on disk is still whole, so the guard is taken over.
-    let _guard = PREFS_LOCK
+    let _guard = prefs_lock();
+    update_prefs_locked(paths, edit);
+}
+
+/// A poisoned lock only means another writer panicked mid-edit; the file on
+/// disk is still whole, so the guard is taken over.
+fn prefs_lock() -> std::sync::MutexGuard<'static, ()> {
+    PREFS_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`update_prefs`] for a caller already holding [`PREFS_LOCK`].
+fn update_prefs_locked(paths: &pacode_config::Paths, edit: impl FnOnce(&mut pacode_config::Prefs)) {
     let mut prefs = pacode_config::load_prefs(paths);
     edit(&mut prefs);
     if let Err(e) = pacode_config::save_prefs(paths, &prefs) {
@@ -122,19 +131,49 @@ impl PrefsDelta {
         self.mode = later.mode.or(self.mode);
     }
 
+    fn apply_to(self, prefs: &mut pacode_config::Prefs) {
+        if let Some(model) = self.model {
+            prefs.model = Some(model);
+        }
+        if let Some(effort) = self.effort {
+            prefs.effort = Some(effort);
+        }
+        if let Some(mode) = self.mode {
+            prefs.mode = Some(mode);
+        }
+    }
+}
+
+/// The one pending default change, shared between the event loop (which
+/// posts changes in the order they happened) and the blocking tasks that
+/// write it. A task takes the delta and writes it under [`PREFS_LOCK`], so
+/// whichever task runs first writes the latest merged value and later ones
+/// find nothing: a later change can never be overwritten by an earlier one,
+/// however the blocking pool orders its tasks.
+#[derive(Clone, Default)]
+pub struct PrefsOutbox(std::sync::Arc<std::sync::Mutex<PrefsDelta>>);
+
+impl PrefsOutbox {
+    fn delta(&self) -> std::sync::MutexGuard<'_, PrefsDelta> {
+        // Poisoned only if a merge panicked; the delta is plain data.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Fold a change in, on the event loop, in event order.
+    pub fn post(&self, delta: PrefsDelta) {
+        self.delta().merge(delta);
+    }
+
     /// Blocking disk IO — the event loop runs it on a blocking thread.
-    pub fn save(self, paths: &pacode_config::Paths) {
-        update_prefs(paths, |prefs| {
-            if let Some(model) = self.model {
-                prefs.model = Some(model);
-            }
-            if let Some(effort) = self.effort {
-                prefs.effort = Some(effort);
-            }
-            if let Some(mode) = self.mode {
-                prefs.mode = Some(mode);
-            }
-        });
+    pub fn flush(&self, paths: &pacode_config::Paths) {
+        let _guard = prefs_lock();
+        let delta = std::mem::take(&mut *self.delta());
+        if delta.is_empty() {
+            return;
+        }
+        update_prefs_locked(paths, |prefs| delta.apply_to(prefs));
     }
 }
 

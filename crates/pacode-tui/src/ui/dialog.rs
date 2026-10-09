@@ -185,13 +185,16 @@ pub(crate) fn prepare(
     *rendered_lines = Some(total_lines);
     *viewport_height = Some(viewport);
     let max_scroll = total_lines.saturating_sub(viewport);
-    if let Some((cell_id, offset)) = anchor
-        && let Some((_, start, end)) = cell_line_index
-            .get(&cell_id)
+    let top = match anchor {
+        Some(ViewAnchor::Cell { id, offset }) => cell_line_index
+            .get(&id)
             .and_then(|&index| cell_lines.get(index))
-    {
-        let top = (start + offset).min(end.saturating_sub(1)).min(max_scroll);
-        *scroll_from_bottom = max_scroll - top;
+            .map(|(_, start, end)| (start + offset).min(end.saturating_sub(1))),
+        Some(ViewAnchor::Header { line }) => Some(line),
+        None => None,
+    };
+    if let Some(top) = top {
+        *scroll_from_bottom = max_scroll - top.min(max_scroll);
     }
     *scroll_from_bottom = (*scroll_from_bottom).min(max_scroll);
     *first_visible_line = max_scroll.saturating_sub(*scroll_from_bottom);
@@ -222,12 +225,27 @@ pub(crate) fn prepare(
     }
 }
 
-/// The cell drawn at content line `line` of the last frame, and how far into
-/// it that line is. `None` on the header or past the end.
-fn line_anchor(spans: &[(u64, usize, usize)], line: usize) -> Option<(u64, usize)> {
+/// What the top row of a scrolled-up view showed last frame.
+enum ViewAnchor {
+    /// A transcript cell, and how far into it.
+    Cell { id: u64, offset: usize },
+    /// The welcome header above every cell: it never moves, so the absolute
+    /// line holds.
+    Header { line: usize },
+}
+
+/// The anchor at content line `line` of the last frame. `None` past the end.
+fn line_anchor(spans: &[(u64, usize, usize)], line: usize) -> Option<ViewAnchor> {
+    if spans.first().is_none_or(|(_, first, _)| line < *first) {
+        return Some(ViewAnchor::Header { line });
+    }
     let index = spans.partition_point(|(_, _, end)| *end <= line);
     let (cell_id, start, end) = spans.get(index)?;
-    (*start <= line && line < *end).then_some((*cell_id, line - start))
+    // Lazy: `line - start` must not be computed when `line` is not inside.
+    (*start <= line && line < *end).then(|| ViewAnchor::Cell {
+        id: *cell_id,
+        offset: line - start,
+    })
 }
 
 pub(crate) fn draw(frame: &mut Frame, area: Rect, prepared: &PreparedDialog) {
