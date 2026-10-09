@@ -221,7 +221,9 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
     let mut painter = Painter::new(frame_interval);
     let mut anim = AnimPacer::new(state.config.ui.animation.tick_ms());
 
-    loop {
+    // Every way out of the loop yields here, so the exit work below runs on
+    // an error too.
+    let loop_result: Result<(), TuiError> = loop {
         if term_guard.mouse_enabled() != state.config.ui.mouse
             && let Err(error) = term_guard.set_mouse(state.config.ui.mouse)
         {
@@ -254,14 +256,16 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         // only and the displayed duration never depends on when a redraw happened.
         state.tick_phase(Instant::now());
 
-        painter.draw_if_due(
+        if let Err(error) = painter.draw_if_due(
             &mut term_guard,
             &mut state,
             frame_interval,
             &mut anim,
             frame_clock.detected_hz,
             timing,
-        )?;
+        ) {
+            break Err(error);
+        }
 
         // Deferred work recorded before paint: completion scans, image
         // renders, the stashed clipboard copy — all of it runs on blocking
@@ -272,7 +276,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
         }
 
         if state.quit {
-            break;
+            break Ok(());
         }
 
         // Compute timers dynamically
@@ -297,7 +301,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
                 match client_ev {
                     Some(ev) => on_client_event(ev, &mut state, &client, &bg_tx),
                     None => {
-                        break;
+                        break Ok(());
                     }
                 }
             }
@@ -390,9 +394,10 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
                 }
             }
         }
-    }
+    };
 
     flush_prefs_on_exit(&mut state);
+    loop_result?;
     // `None` is a real outcome: quitting while the background attach was
     // still in flight means no session was ever attached.
     let attached_session = state.meta.as_ref().map(|m| m.id.clone());
