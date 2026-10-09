@@ -3386,9 +3386,14 @@ fn test_alt_z_toggles_zdr_when_model_capable() {
             .any(|a| matches!(a, Action::Send(Request::SetZdr(true)))),
         "expected SetZdr(true), got {actions:?}"
     );
-    assert!(state.meta.as_ref().is_some_and(|m| m.zdr));
+    // B07: the badge follows the daemon's `SessionUpdated`, not the key — a
+    // refused `SetZdr` emits none, so an optimistic flip would stick.
+    assert!(state.meta.as_ref().is_some_and(|m| !m.zdr));
 
-    // Second Alt+Z turns it back off.
+    // Once the daemon reports ZDR on, Alt+Z turns it back off.
+    if let Some(m) = state.meta.as_mut() {
+        m.zdr = true;
+    }
     let actions = handle_key(&mut state, alt_z, now);
     assert!(
         actions
@@ -3396,7 +3401,7 @@ fn test_alt_z_toggles_zdr_when_model_capable() {
             .any(|a| matches!(a, Action::Send(Request::SetZdr(false)))),
         "expected SetZdr(false), got {actions:?}"
     );
-    assert!(state.meta.as_ref().is_some_and(|m| !m.zdr));
+    assert!(state.meta.as_ref().is_some_and(|m| m.zdr));
 }
 
 #[test]
@@ -3570,10 +3575,11 @@ fn test_model_picker_mark_chords_toggle_flags() {
     // Enter picks the row: only SetModel (for_zdr is false).
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let actions = handle_key(&mut state, enter, now);
-    assert_eq!(actions.len(), 1, "expected just SetModel, got {actions:?}");
-    assert!(
-        matches!(&actions[0], Action::Send(Request::SetModel(r)) if r.to_string() == "p/m"),
-        "expected SetModel, got {actions:?}"
+    assert_eq!(
+        actions,
+        vec![Action::SendSequence {
+            requests: vec![Request::SetModel(ModelRoute::new("p", "m"))],
+        }]
     );
     assert!(state.meta.as_ref().is_some_and(|m| !m.zdr));
     assert_eq!(state.focus, Focus::Normal);
@@ -3662,16 +3668,19 @@ fn test_model_picker_for_zdr_enter_sends_setmodel_then_setzdr() {
 
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let actions = handle_key(&mut state, enter, now);
-    assert_eq!(actions.len(), 2, "expected [SetModel, SetZdr]");
-    assert!(
-        matches!(&actions[0], Action::Send(Request::SetModel(r)) if r.to_string() == "p/m"),
-        "first action must be SetModel, got {actions:?}"
+    // B07: one ordered sequence — `SetZdr` is checked against the route
+    // `SetModel` sets, so two independent sends could race.
+    assert_eq!(
+        actions,
+        vec![Action::SendSequence {
+            requests: vec![
+                Request::SetModel(ModelRoute::new("p", "m")),
+                Request::SetZdr(true),
+            ],
+        }]
     );
-    assert!(
-        matches!(&actions[1], Action::Send(Request::SetZdr(true))),
-        "second action must be SetZdr(true), got {actions:?}"
-    );
-    assert!(state.meta.as_ref().is_some_and(|m| m.zdr));
+    // No optimistic badge: a refused `SetZdr` would never undo it.
+    assert!(state.meta.as_ref().is_some_and(|m| !m.zdr));
     assert_eq!(state.focus, Focus::Normal);
 }
 
@@ -3808,17 +3817,15 @@ fn test_model_switch_clamps_unsupported_effort() {
     // High isn't in p/n2's supported set -> nearest lower supported = Medium.
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let actions = handle_key(&mut state, enter, now);
-    assert_eq!(actions.len(), 2, "expected [SetModel, SetEffort]");
-    assert!(
-        matches!(&actions[0], Action::Send(Request::SetModel(r)) if r.to_string() == "p/n2"),
-        "first action must be SetModel, got {actions:?}"
-    );
-    assert!(
-        matches!(
-            &actions[1],
-            Action::Send(Request::SetEffort(Effort::Medium))
-        ),
-        "second action must be the downgrade to Medium, got {actions:?}"
+    // One ordered sequence (B07): the downgrade follows the route switch.
+    assert_eq!(
+        actions,
+        vec![Action::SendSequence {
+            requests: vec![
+                Request::SetModel(ModelRoute::new("p", "n2")),
+                Request::SetEffort(Effort::Medium),
+            ],
+        }]
     );
 }
 

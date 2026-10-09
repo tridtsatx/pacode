@@ -509,19 +509,10 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     if let Some(route) = route {
                         state.focus = Focus::Normal;
                         state.save_pref_model(&route.to_string());
-                        let mut actions = vec![Action::Send(Request::SetModel(route.clone()))];
-                        // If the new route doesn't support the session effort,
-                        // downgrade to the nearest supported level (spec §6).
-                        actions.extend(state.clamp_effort_actions(&route));
                         // Alt+Z enable flow: the route switch must land before
-                        // ZDR turns on, or `set_model` would hit the ZDR guard.
-                        if for_zdr_flag {
-                            if let Some(m) = state.meta.as_mut() {
-                                m.zdr = true;
-                            }
-                            actions.push(Action::Send(Request::SetZdr(true)));
-                        }
-                        return actions;
+                        // ZDR turns on, or `set_zdr` checks the old route. The
+                        // badge follows the daemon's `SessionUpdated`.
+                        return vec![state.model_switch_action(route, for_zdr_flag)];
                     }
                 }
                 KeyCode::Backspace => {

@@ -346,11 +346,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                     ModelRoute::new("default", &arg)
                 };
                 state.save_pref_model(&route.to_string());
-                let mut actions = vec![Action::Send(Request::SetModel(route.clone()))];
-                // Downgrade the session effort if the new route can't run it
-                // (spec §6).
-                actions.extend(state.clamp_effort_actions(&route));
-                actions
+                vec![state.model_switch_action(route, false)]
             }
         }
         "effort" => {

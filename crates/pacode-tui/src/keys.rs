@@ -592,14 +592,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 if let Some(route) = route {
                     log::debug!("close overlay: ModelPicker");
                     state.focus = Focus::Normal;
-                    let mut actions = vec![Action::Send(Request::SetModel(route))];
-                    if for_zdr_flag {
-                        if let Some(m) = state.meta.as_mut() {
-                            m.zdr = true;
-                        }
-                        actions.push(Action::Send(Request::SetZdr(true)));
-                    }
-                    return actions;
+                    return vec![state.model_switch_action(route, for_zdr_flag)];
                 }
             }
             Focus::Overlay(Overlay::EffortPicker { index }) => {
@@ -772,10 +765,9 @@ fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
     let Some(meta) = state.meta.as_ref() else {
         return vec![];
     };
+    // No optimistic `meta.zdr` write: a refused `SetZdr` emits no
+    // `SessionUpdated` to undo it, so the badge waits for the daemon's.
     if meta.zdr {
-        if let Some(m) = state.meta.as_mut() {
-            m.zdr = false;
-        }
         return vec![Action::Send(Request::SetZdr(false))];
     }
     let capable = state
@@ -783,9 +775,6 @@ fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
         .get(&meta.model.to_string())
         .is_some_and(|f| f.zdr_capable);
     if capable {
-        if let Some(m) = state.meta.as_mut() {
-            m.zdr = true;
-        }
         vec![Action::Send(Request::SetZdr(true))]
     } else {
         state.focus = Focus::Overlay(Overlay::ModelPicker {

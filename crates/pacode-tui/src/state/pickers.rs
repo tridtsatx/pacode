@@ -156,33 +156,46 @@ impl AppState {
         self.supported_efforts().is_none_or(|l| l.contains(&effort))
     }
 
-    /// After a route switch: when the session effort is outside `route`'s
-    /// supported set, downgrade to the nearest lower supported level, notice
-    /// the change, and return the `SetEffort` action to send (spec §6).
-    pub fn clamp_effort_actions(&mut self, route: &ModelRoute) -> Vec<crate::keys::Action> {
-        let Some(supported) = self
+    /// Switch the session to `route`, as one ordered sequence: `SetModel`,
+    /// then — when the session effort is outside `route`'s supported set — the
+    /// downgrade to the nearest lower supported level (spec §6), then, for the
+    /// Alt+Z enable flow, `SetZdr(true)`. Each later step is checked by the
+    /// daemon against the route the first one sets, so they must not race.
+    pub fn model_switch_action(
+        &mut self,
+        route: ModelRoute,
+        enable_zdr: bool,
+    ) -> crate::keys::Action {
+        use pacode_types::Request;
+        let mut requests = vec![Request::SetModel(route.clone())];
+        if let Some(effort) = self.clamp_effort(&route) {
+            requests.push(Request::SetEffort(effort));
+        }
+        if enable_zdr {
+            requests.push(Request::SetZdr(true));
+        }
+        crate::keys::Action::SendSequence { requests }
+    }
+
+    /// The effort to downgrade to when the session effort is outside
+    /// `route`'s supported set; notices the change.
+    fn clamp_effort(&mut self, route: &ModelRoute) -> Option<Effort> {
+        let supported = self
             .models
             .iter()
             .find(|m| &m.route == route)
-            .and_then(|m| m.supported_efforts.as_deref())
-        else {
-            return Vec::new();
-        };
+            .and_then(|m| m.supported_efforts.as_deref())?;
         let cur = self.effort();
         if supported.contains(&cur) {
-            return Vec::new();
+            return None;
         }
-        let Some(next) = nearest_supported_effort(cur, supported) else {
-            return Vec::new();
-        };
+        let next = nearest_supported_effort(cur, supported)?;
         self.save_pref_effort(next);
         self.push_notice_with_level(
             ToastLevel::Warn,
             format!("effort {cur} → {next}: not supported by {route}"),
         );
-        vec![crate::keys::Action::Send(pacode_types::Request::SetEffort(
-            next,
-        ))]
+        Some(next)
     }
 
     /// Remember the marketplace `/plugins <source>` pointed at.

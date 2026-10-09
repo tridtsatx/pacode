@@ -274,8 +274,10 @@ pub(super) fn handle_reply(
         Ok(Reply::Analyze { report }) => {
             // Drawn from this copy, so scrolling never re-asks and a client that
             // reconnects mid-read keeps what it was reading.
+            // `/analyze` already opened the page; a reply that lands after the
+            // user closed it, or moved to something else, must not take the
+            // screen back.
             state.analyze_report = Some(*report);
-            state.open_analyze();
             state.dirty = true;
             vec![]
         }

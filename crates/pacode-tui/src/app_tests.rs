@@ -2318,3 +2318,56 @@ fn an_inline_thumbnail_over_the_cap_falls_back_to_the_placeholder() {
     assert!(render_thumbnail(&missing, 20, 6).is_none());
     let _ = std::fs::remove_file(&path);
 }
+
+/// B07: a model switch that ZDR or an effort clamp depends on goes out as one
+/// ordered sequence.
+#[test]
+fn model_switch_is_one_ordered_sequence() {
+    let root = std::env::temp_dir().join(format!("pacode-b07-{}", std::process::id()));
+    let mut state = AppState::new(Config::default(), "test".into(), 120, 34);
+    // The clamp also records the new default effort; keep it off the real prefs.
+    state.paths = pacode_config::Paths::under(&root);
+    state.meta = Some(meta("ses_1"));
+    state.models = vec![pacode_types::ModelInfo {
+        route: ModelRoute::new("p", "small"),
+        display_name: "small".into(),
+        context_window: None,
+        supports_reasoning: false,
+        supports_vision: false,
+        supported_efforts: Some(vec![Effort::Low]),
+        pricing: None,
+    }];
+    let action = state.model_switch_action(ModelRoute::new("p", "small"), true);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        action,
+        Action::SendSequence {
+            requests: vec![
+                Request::SetModel(ModelRoute::new("p", "small")),
+                Request::SetEffort(Effort::Low),
+                Request::SetZdr(true),
+            ],
+        }
+    );
+}
+
+/// B30: `/analyze` opens the page itself; a reply that lands after the user
+/// moved on is stored, and does not take the screen back.
+#[test]
+fn a_late_analyze_reply_does_not_steal_focus() {
+    let mut state = AppState::new(Config::default(), "test".into(), 120, 34);
+    state.analyze_mode = true;
+    state.focus = crate::state::Focus::Overlay(crate::state::Overlay::QuestionPicker);
+    handle_reply(
+        Ok(Reply::Analyze {
+            report: Box::default(),
+        }),
+        &mut state,
+        None,
+    );
+    assert!(state.analyze_report.is_some());
+    assert_eq!(
+        state.focus,
+        crate::state::Focus::Overlay(crate::state::Overlay::QuestionPicker)
+    );
+}
