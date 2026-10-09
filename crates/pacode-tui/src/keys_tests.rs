@@ -3933,3 +3933,42 @@ fn test_e_without_a_pending_permission_types_into_the_prompt() {
     assert!(actions.is_empty());
     assert_eq!(state.input.text, "e");
 }
+
+/// B05: an overlay opened over a subagent panel closes back to `Normal` with
+/// the panel still on screen; esc must then close the panel, in vim's normal
+/// mode too.
+#[test]
+fn test_esc_closes_a_panel_left_open_under_normal_focus() {
+    for vim in [false, true] {
+        let mut state = make_test_state();
+        state.config.ui.vim = vim;
+        state.vim.mode = crate::state::VimMode::Normal;
+        let target = crate::state::PanelTarget::Agent(AgentId::new("agt_1"));
+        state.panel.target = Some(target);
+        state.focus = Focus::Normal;
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut state, esc, Instant::now());
+        assert_eq!(state.panel.target, None, "vim = {vim}");
+        assert_eq!(state.focus, Focus::Normal);
+    }
+}
+
+/// B28: in vim mode esc on the prompt belongs to vim, but a mouse selection
+/// still clears on it.
+#[test]
+fn test_vim_esc_clears_the_mouse_selection() {
+    let mut state = make_test_state();
+    state.config.ui.vim = true;
+    let rect = ratatui::layout::Rect::new(0, 0, 80, 24);
+    state.selection.start(0, 0, rect, 0);
+    state.selection.drag(5, 0, rect, 0);
+    state.selection.finish();
+    assert!(state.selection.is_active());
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        Instant::now(),
+    );
+    assert!(!state.selection.is_active());
+    assert_eq!(state.vim.mode, crate::state::VimMode::Normal);
+}

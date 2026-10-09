@@ -278,8 +278,15 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
                 | PopupId::RailOverlay => {}
             }
         }
-        if state.config.ui.vim && state.focus == Focus::Normal {
-            // Handled by vim::handle on the normal prompt
+        if state.config.ui.vim
+            && state.focus == Focus::Normal
+            && !(state.vim.mode == crate::state::VimMode::Normal && state.panel.target.is_some())
+        {
+            // Vim owns esc on the prompt (insert → normal, drop a pending
+            // count); a mouse selection is not the prompt's and clears on any
+            // esc. Only a panel left open under vim's normal mode is closed by
+            // the layer ladder instead.
+            state.selection.clear();
         } else {
             return handle_esc(state);
         }

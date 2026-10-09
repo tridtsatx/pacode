@@ -127,7 +127,13 @@ pub fn handle_esc(state: &mut AppState) -> Vec<Action> {
             log::debug!("close overlay: {}", overlay_name(overlay));
             state.focus = Focus::Normal;
         }
-        Focus::Normal => {}
+        // An overlay opened over a panel closes back to `Normal` and leaves
+        // the panel on screen (layout keeps it while `panel.target` is set):
+        // the next esc closes it, as it would from `Focus::Panel`.
+        Focus::Normal => {
+            state.panel.target = None;
+            state.panel.diff = None;
+        }
     }
     vec![]
 }

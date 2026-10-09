@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use pacode_types::{Event, PermissionDecision, ToastLevel, TranscriptKind};
+use pacode_types::{AgentId, Event, PermissionDecision, ToastLevel, TranscriptKind};
 
 use crate::state::session::TurnEndMatch;
 use crate::state::stats;
@@ -16,12 +16,12 @@ mod events_tests;
 pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
     match event {
         Event::SessionUpdated(meta) => {
-            let mut prefs = pacode_config::load_prefs(&state.paths);
-            prefs.model = Some(meta.model.to_string());
-            prefs.effort = Some(meta.effort);
-            prefs.mode = Some(meta.mode);
-            if let Err(e) = pacode_config::save_prefs(&state.paths, &prefs) {
-                log::warn!("failed to save prefs on session update: {e}");
+            // Only what this session changed moves the global defaults; a
+            // title touch or another session's update writes nothing. The
+            // write itself is the event loop's, off the UI thread.
+            if let Some(old) = state.meta.as_ref() {
+                let delta = crate::state::PrefsDelta::between(old, &meta);
+                state.pending_prefs.merge(delta);
             }
             let header = crate::state::transcript::HeaderInfo {
                 version: state.app_version.clone(),
@@ -97,18 +97,12 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                     }
                     state.turn_started_at = None;
                 } else {
-                    let is_panel_target = state.panel.target.as_ref().is_some_and(|t| match t {
-                        PanelTarget::Agent(id) => *id == agent,
-                        _ => false,
-                    });
-                    if is_panel_target {
-                        state.panel.agent_transcript.flush_stream();
+                    if let Some(transcript) = transcript_for_agent(state, &agent) {
+                        transcript.flush_stream();
                         if let Some(ref u) = usage
                             && u.output_tokens > 0
                         {
-                            let last_ts = state
-                                .panel
-                                .agent_transcript
+                            let last_ts = transcript
                                 .cells
                                 .iter()
                                 .rev()
@@ -125,7 +119,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                                 .unwrap_or(0);
                             let duration_ms = pacode_types::time::now_ms().saturating_sub(last_ts);
                             if let Some(stats) = compute_turn_stats(duration_ms, u) {
-                                attach_turn_stats(&mut state.panel.agent_transcript, stats);
+                                attach_turn_stats(transcript, stats);
                             }
                         }
                     }
@@ -138,24 +132,25 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                 let input = serde_json::json!({ "path": arg });
                 state.files.observe_tool_item(name, &input, item.ts_ms);
             }
-            if item.agent.is_main() {
-                state.transcript.upsert(item, now);
-            } else if let Focus::Panel {
-                target: PanelTarget::Agent(ref id),
-                ..
-            } = state.focus
-                && *id == item.agent
-            {
-                state.panel.agent_transcript.upsert(item, now);
+            let agent = item.agent.clone();
+            if let Some(transcript) = transcript_for_agent(state, &agent) {
+                transcript.upsert(item, now);
             }
         }
-        Event::ToolOutput { item_seq, text, .. } => {
+        Event::ToolOutput {
+            agent,
+            item_seq,
+            text,
+        } => {
             // The cell grows while the process runs. `push_tool_output` refuses
             // anything that is not a running tool row, so a chunk that arrives
             // after the call finished is dropped rather than appended to a
-            // result the model has already read.
-            state.transcript.push_tool_output(item_seq, &text);
-            state.dirty = true;
+            // result the model has already read. Item seqs are per agent, so
+            // the chunk only goes to its own agent's transcript.
+            if let Some(transcript) = transcript_for_agent(state, &agent) {
+                transcript.push_tool_output(item_seq, &text);
+                state.dirty = true;
+            }
         }
         Event::ItemUpdated(item) => {
             // The finished call's `DiffStat` lands here — fold it into the
@@ -174,15 +169,9 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                     .files
                     .apply_diff(name, &input, call_id, *diff, item.ts_ms);
             }
-            if item.agent.is_main() {
-                state.transcript.upsert(item, now);
-            } else if let Focus::Panel {
-                target: PanelTarget::Agent(ref id),
-                ..
-            } = state.focus
-                && *id == item.agent
-            {
-                state.panel.agent_transcript.upsert(item, now);
+            let agent = item.agent.clone();
+            if let Some(transcript) = transcript_for_agent(state, &agent) {
+                transcript.upsert(item, now);
             }
         }
         Event::TextDelta {
@@ -190,18 +179,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             item_seq,
             text,
         } => {
-            if agent.is_main() {
-                state.transcript.push_delta(item_seq, &text, false, now);
-            } else if let Focus::Panel {
-                target: PanelTarget::Agent(ref id),
-                ..
-            } = state.focus
-                && *id == agent
-            {
-                state
-                    .panel
-                    .agent_transcript
-                    .push_delta(item_seq, &text, false, now);
+            if let Some(transcript) = transcript_for_agent(state, &agent) {
+                transcript.push_delta(item_seq, &text, false, now);
             }
         }
         Event::ReasoningDelta {
@@ -209,18 +188,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             item_seq,
             text,
         } => {
-            if agent.is_main() {
-                state.transcript.push_delta(item_seq, &text, true, now);
-            } else if let Focus::Panel {
-                target: PanelTarget::Agent(ref id),
-                ..
-            } = state.focus
-                && *id == agent
-            {
-                state
-                    .panel
-                    .agent_transcript
-                    .push_delta(item_seq, &text, true, now);
+            if let Some(transcript) = transcript_for_agent(state, &agent) {
+                transcript.push_delta(item_seq, &text, true, now);
             }
         }
         Event::PermissionRequested(req) => {
@@ -440,6 +409,32 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
     }
     let turn_active = state.turn_active;
     state.rail.update_idle(turn_active, now);
+}
+
+/// Where an agent's items, deltas and tool output land: the main agent's go to
+/// the session transcript, the agent the panel shows — whatever holds the
+/// keyboard meanwhile — to the panel's copy. Any other subagent's are dropped;
+/// `LoadPanel` fetches its history when its panel opens.
+fn transcript_for_agent<'a>(
+    state: &'a mut AppState,
+    agent: &AgentId,
+) -> Option<&'a mut Transcript> {
+    if agent.is_main() {
+        return Some(&mut state.session.transcript);
+    }
+    match state.panel_agent_target() {
+        Some(PanelTarget::Agent(id)) if id == *agent => {
+            Some(state.session.panel.agent_transcript_for(agent))
+        }
+        Some(
+            PanelTarget::Agent(_)
+            | PanelTarget::Task(_)
+            | PanelTarget::McpServer(_)
+            | PanelTarget::FileDiff { .. }
+            | PanelTarget::CommitDiff { .. },
+        )
+        | None => None,
+    }
 }
 
 fn compute_turn_stats(duration_ms: u64, usage: &pacode_types::stream::Usage) -> Option<String> {

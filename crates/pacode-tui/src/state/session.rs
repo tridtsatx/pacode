@@ -299,10 +299,6 @@ pub struct SessionUiState {
     /// overlay so a scroll does not re-ask the daemon, and so a client that
     /// reconnects while the page is open keeps what it was reading.
     pub analyze_report: Option<pacode_types::analyze::AnalyzeReport>,
-    /// Whether this client was started with `--analyze-mode`. The page is
-    /// gated on it: the reading is a scorecard, and a scorecard nobody asked
-    /// for is noise on a screen someone is trying to work in.
-    pub analyze_mode: bool,
     pub phase: Option<(Phase, Instant)>,
     pub phase_elapsed_ms: u64,
     pub started_at: Instant,
@@ -362,7 +358,6 @@ impl SessionUiState {
             anim_frame: 0,
             anim: pacode_render::AnimClock::default(),
             analyze_report: None,
-            analyze_mode: false,
             phase: None,
             phase_elapsed_ms: 0,
             started_at: Instant::now(),
@@ -398,7 +393,22 @@ impl SessionUiState {
         let next_user_message_id = self.next_user_message_id;
         let next_attach_token = self.next_attach_token;
         let next_bash_run_id = self.next_bash_run_id;
+        // The composer is the user's, not the session's: the draft, prompt and
+        // `!` histories follow them to the next session, and so do the pasted
+        // images the draft points at (dropping the store would also delete
+        // files already submitted). What is tied to the session leaves: the
+        // queue (`leave_active_slot` stashes it per session), history
+        // browsing, and the cwd-keyed completion caches.
+        let mut input = std::mem::take(&mut self.input);
+        input.prompt_queue.clear();
+        input.history_index = None;
+        input.bash_history_index = None;
+        input.at_comp = Default::default();
+        input.bash_comp = Default::default();
+        let pasted_images = std::mem::take(&mut self.pasted_images);
         *self = Self::new(transcript_cells);
+        self.input = input;
+        self.pasted_images = pasted_images;
         self.generation = generation;
         self.deferred_epoch = deferred_epoch;
         self.turn_generation = turn_generation;

@@ -68,6 +68,76 @@ pub fn picker_models<'a>(
     rows
 }
 
+/// Serializes every read-modify-write of `prefs.toml` in this process, so a
+/// write on a blocking thread and one on the UI thread cannot drop each
+/// other's field.
+static PREFS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load `prefs.toml`, apply `edit`, save it back — under [`PREFS_LOCK`].
+fn update_prefs(paths: &pacode_config::Paths, edit: impl FnOnce(&mut pacode_config::Prefs)) {
+    // A poisoned lock only means another writer panicked mid-edit; the file
+    // on disk is still whole, so the guard is taken over.
+    let _guard = PREFS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut prefs = pacode_config::load_prefs(paths);
+    edit(&mut prefs);
+    if let Err(e) = pacode_config::save_prefs(paths, &prefs) {
+        log::warn!("failed to save prefs: {e}");
+    }
+}
+
+/// The global defaults (`prefs.toml`) a session change moves: only the fields
+/// that session actually changed, so one session's untouched effort does not
+/// overwrite the default another session set.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrefsDelta {
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub mode: Option<Mode>,
+}
+
+impl PrefsDelta {
+    /// The fields `new` changed relative to `old` — empty unless both are the
+    /// same session.
+    pub fn between(old: &SessionMeta, new: &SessionMeta) -> Self {
+        if old.id != new.id {
+            return Self::default();
+        }
+        Self {
+            model: (old.model != new.model).then(|| new.model.to_string()),
+            effort: (old.effort != new.effort).then_some(new.effort),
+            mode: (old.mode != new.mode).then_some(new.mode),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.effort.is_none() && self.mode.is_none()
+    }
+
+    /// Fold a later change in: its fields win.
+    pub fn merge(&mut self, later: Self) {
+        self.model = later.model.or(self.model.take());
+        self.effort = later.effort.or(self.effort);
+        self.mode = later.mode.or(self.mode);
+    }
+
+    /// Blocking disk IO — the event loop runs it on a blocking thread.
+    pub fn save(self, paths: &pacode_config::Paths) {
+        update_prefs(paths, |prefs| {
+            if let Some(model) = self.model {
+                prefs.model = Some(model);
+            }
+            if let Some(effort) = self.effort {
+                prefs.effort = Some(effort);
+            }
+            if let Some(mode) = self.mode {
+                prefs.mode = Some(mode);
+            }
+        });
+    }
+}
+
 impl AppState {
     /// `supported_efforts` of the current route; `None` — route unknown to
     /// the model list or unrestricted — means every [`Effort`] is selectable
@@ -117,44 +187,34 @@ impl AppState {
 
     /// Remember the marketplace `/plugins <source>` pointed at.
     pub fn save_pref_marketplace(&self, source: &str) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.marketplace = Some(source.to_string());
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (marketplace): {e}");
-        }
+        update_prefs(&self.paths, |prefs| {
+            prefs.marketplace = Some(source.to_string())
+        });
     }
 
     pub fn save_pref_model(&self, model: &str) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.model = Some(model.to_string());
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (model): {e}");
-        }
+        update_prefs(&self.paths, |prefs| prefs.model = Some(model.to_string()));
     }
 
     pub fn save_pref_effort(&self, effort: Effort) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.effort = Some(effort);
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (effort): {e}");
-        }
+        update_prefs(&self.paths, |prefs| prefs.effort = Some(effort));
     }
 
     pub fn save_pref_mode(&self, mode: Mode) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.mode = Some(mode);
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (mode): {e}");
-        }
+        update_prefs(&self.paths, |prefs| prefs.mode = Some(mode));
     }
 
     /// Persist the picker `z`/`s` toggles to `prefs.toml`.
     pub fn save_pref_model_flags(&self) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.model_flags = self.model_flags.clone();
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (model_flags): {e}");
-        }
+        let flags = self.model_flags.clone();
+        update_prefs(&self.paths, |prefs| prefs.model_flags = flags);
+    }
+
+    /// The defaults change a `SessionUpdated` asked for, handed to the event
+    /// loop to write off the UI thread. `None` when nothing changed.
+    pub fn take_prefs_write(&mut self) -> Option<PrefsDelta> {
+        let delta = std::mem::take(&mut self.pending_prefs);
+        (!delta.is_empty()).then_some(delta)
     }
 
     /// ZDR badge state: config-forced `always`, or `session` mode with the

@@ -48,7 +48,7 @@ pub use notices::{
     BACKGROUND_NOTICE_MIN_MS, TOAST_EXIT_MS, TOAST_MAX, TOAST_TTL_SECS, Toast,
     background_worth_reporting,
 };
-pub use pickers::{nearest_supported_effort, picker_models, zdr_active};
+pub use pickers::{PrefsDelta, nearest_supported_effort, picker_models, zdr_active};
 pub use questions::{PendingQuestions, QuestionFocus};
 pub use rail::RailState;
 pub use render::RenderContext;
@@ -187,6 +187,19 @@ pub struct AppState {
     pub attach_error: Option<pacode_client::ClientError>,
     pub pending_attach: Option<PendingAttach>,
     pub attach_in_flight: bool,
+    /// Whether this client was started with `--analyze-mode`. Per process, so
+    /// it outlives session switches. The page is gated on it: the reading is
+    /// a scorecard, and a scorecard nobody asked for is noise on a screen
+    /// someone is trying to work in.
+    pub analyze_mode: bool,
+    /// Prompts queued behind a running turn of a session the user switched
+    /// away from, keyed by that session; handed back when it is attached
+    /// again. Capped at `NUM_SLOTS` sessions (each queue at
+    /// `PROMPT_QUEUE_CAP`); the oldest stash is dropped with a toast.
+    pub(crate) stashed_queues: VecDeque<(pacode_types::SessionId, VecDeque<String>)>,
+    /// Default changes (`prefs.toml`) waiting for the event loop to write
+    /// them on a blocking thread; coalesced, so it is at most one record.
+    pub(crate) pending_prefs: PrefsDelta,
 }
 
 impl Deref for AppState {
@@ -274,6 +287,9 @@ impl AppState {
             attach_error: None,
             pending_attach: None,
             attach_in_flight: false,
+            analyze_mode: false,
+            stashed_queues: VecDeque::new(),
+            pending_prefs: PrefsDelta::default(),
         }
     }
 

@@ -449,6 +449,7 @@ fn on_client_event(
     let pending_attach = state.pending_attach.is_some();
     let now = Instant::now();
     let snapshot_applied = state.apply_client_event(ev, now);
+    flush_prefs_write(state);
     if reset_deferred && snapshot_applied {
         state.session.cancel_deferred_work();
         clear_list_loading(state);
@@ -478,6 +479,15 @@ fn on_client_event(
     }
 }
 
+/// Write the default changes a `SessionUpdated` produced, on a blocking
+/// thread: `prefs.toml` is disk IO and the UI thread never waits on it.
+fn flush_prefs_write(state: &mut AppState) {
+    if let Some(delta) = state.take_prefs_write() {
+        let paths = state.paths.clone();
+        tokio::task::spawn_blocking(move || delta.save(&paths));
+    }
+}
+
 /// A background result: fold it in, then dispatch what it produced and
 /// whatever it unblocked — an attach retry and queued prompts.
 fn on_bg_response(
@@ -487,6 +497,7 @@ fn on_bg_response(
     bg_tx: &mpsc::UnboundedSender<BgResponse>,
 ) {
     let actions = handle_bg_response(res, state);
+    flush_prefs_write(state);
     dispatch_pending_attach_retry(state, client, bg_tx);
     for act in actions {
         dispatch_action(act, state, client, bg_tx);

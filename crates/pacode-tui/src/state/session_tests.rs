@@ -95,7 +95,9 @@ fn leaving_slot_replaces_all_session_ui_state() {
 
     assert_eq!(state.session.generation, generation + 1);
     assert!(state.meta.is_none());
-    assert!(state.input.text.is_empty());
+    // The draft is the user's and follows them (B12); the queue was the
+    // session's and is stashed for it, not carried over.
+    assert_eq!(state.input.text, "draft");
     assert!(state.input.prompt_queue.is_empty());
     assert!(state.files.rows.is_empty());
     assert!(state.files.preview_want.is_none());
