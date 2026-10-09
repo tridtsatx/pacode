@@ -8,6 +8,7 @@ fn p(line: usize, col: u16) -> Point {
 fn plain(lines: Vec<String>) -> crate::ui::dialog::PlainLines {
     crate::ui::dialog::PlainLines {
         lines,
+        leads: Vec::new(),
         first_line: 0,
     }
 }

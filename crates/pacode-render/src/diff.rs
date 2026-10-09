@@ -308,7 +308,8 @@ fn num_width(rows: &[Row]) -> usize {
 }
 
 /// A colour as RGB for band blending: RGB passes through, named ANSI colours
-/// resolve through the `rgb_to_ansi16` table, anything else is unknown.
+/// resolve to their reference RGB in the table below, anything else is
+/// unknown.
 fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
     const NAMED: &[(Color, (u8, u8, u8))] = &[
         (Color::Black, (0, 0, 0)),

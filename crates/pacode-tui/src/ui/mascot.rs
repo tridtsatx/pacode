@@ -10,7 +10,7 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-use pacode_render::rgb_to_ansi16;
+use pacode_render::theme::ansi_hue;
 
 #[cfg(test)]
 #[path = "mascot_tests.rs"]
@@ -166,7 +166,7 @@ fn color(rgb: (u8, u8, u8), truecolor: bool) -> Color {
     if truecolor {
         Color::Rgb(r, g, b)
     } else {
-        rgb_to_ansi16(r, g, b)
+        ansi_hue(r, g, b)
     }
 }
 

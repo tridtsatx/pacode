@@ -271,7 +271,7 @@ fn sections_render_as_headers_and_the_cursor_skips_them() {
     let rows = screen(&view, &MenuUiState::default(), 100, 20);
     let sel_line = rows
         .iter()
-        .position(|r| r.contains("today"))
+        .position(|r| r.contains("TODAY"))
         .expect("section");
     assert!(
         !rows[sel_line].contains('▸'),

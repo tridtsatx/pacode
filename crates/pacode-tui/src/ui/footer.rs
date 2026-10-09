@@ -7,9 +7,9 @@ use ratatui::widgets::Paragraph;
 
 use pacode_render::{RenderOptions, display_width, truncate_to_width};
 use pacode_types::TranscriptKind;
-use pacode_types::state::Mode;
 use pacode_types::time::{format_duration_ms, now_ms};
 
+use crate::binding::Action as KeyAction;
 use crate::keys::selectable_agents;
 use crate::state::transcript::CellKind;
 use crate::state::{AppState, Connection, Focus, PanelTarget};
@@ -75,15 +75,35 @@ fn context_right_spans(state: &AppState, opts: &RenderOptions) -> Vec<Span<'stat
         spans.extend(lock);
         spans.push(Span::styled(" · ", opts.theme.faint));
     }
-    spans.push(Span::styled(" · ", opts.theme.faint));
     if tokens > 0 {
-        spans.push(Span::styled(format_tokens_upper(tokens), opts.theme.faint));
         spans.push(Span::styled(" · ", opts.theme.faint));
+        spans.push(Span::styled(format_tokens_upper(tokens), opts.theme.faint));
     }
-    spans.push(Span::styled("ctrl+p", opts.theme.faint));
-    spans.push(Span::styled(" · ", opts.theme.faint));
-    spans.push(Span::styled(menu_hint(state), opts.theme.faint));
+    let keys = [
+        state.keymap.hint(KeyAction::SessionPicker),
+        menu_hint(state),
+    ];
+    for key in keys.into_iter().flatten() {
+        spans.push(Span::styled(" · ", opts.theme.faint));
+        spans.push(Span::styled(key, opts.theme.faint));
+    }
     spans
+}
+
+/// `key verb · key verb` for the actions that are bound, in the keymap's own
+/// spelling — a rebound key shows its new chord, an unbound action drops out
+/// rather than advertise a key that does nothing (B27).
+pub(crate) fn key_hints(state: &AppState, items: &[(KeyAction, &str)]) -> String {
+    items
+        .iter()
+        .filter_map(|(action, verb)| {
+            state
+                .keymap
+                .hint(*action)
+                .map(|key| format!("{key} {verb}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOptions) {
@@ -91,7 +111,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         return;
     }
 
-    let row1 = render_row1(area.width as usize, state, opts);
+    let row1 = super::footer_status::render(area.width as usize, state, opts);
     let row2 = if area.height > 1 {
         render_row2(area.width as usize, state, opts)
     } else {
@@ -99,91 +119,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
     };
 
     frame.render_widget(Paragraph::new(vec![row1, row2]), area);
-}
-
-fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'static> {
-    let mode = state.mode();
-    let model_name = state
-        .model()
-        .map(|m| m.display_name())
-        .unwrap_or_else(|| "Gemini 3.8 Flash".to_string());
-    let effort_str = state.effort().to_string();
-
-    let show_model_hint = state.config.ui.hints.model;
-    let show_effort_hint = state.config.ui.hints.effort;
-
-    let right_hint = if show_model_hint { "/model" } else { "" };
-    let right_len = display_width(right_hint);
-
-    let mode_style = match mode {
-        Mode::Bypass => opts.theme.red,
-        Mode::Plan => opts.theme.yellow,
-        Mode::Build | Mode::Auto => opts.theme.cyan,
-    };
-
-    let mut left_spans = vec![Span::styled(mode.label(), mode_style)];
-
-    if state.config.ui.vim {
-        let (vim_badge, vim_style) = match state.vim.mode {
-            crate::state::vim::VimMode::Normal => ("NOR", opts.theme.cyan),
-            crate::state::vim::VimMode::Insert => ("INS", opts.theme.green),
-            crate::state::vim::VimMode::Visual => ("VIS", opts.theme.yellow),
-        };
-        left_spans.push(Span::styled(" · ", opts.theme.faint));
-        left_spans.push(Span::styled(vim_badge, vim_style));
-    }
-
-    if state.zdr_active() {
-        left_spans.push(Span::styled(" · ", opts.theme.faint));
-        left_spans.push(Span::styled("[ZDR]", opts.theme.green));
-    }
-
-    if let Some((_, text)) = &state.plugin_status {
-        left_spans.push(Span::styled(format!(" · {text}"), opts.theme.dim));
-    }
-
-    left_spans.extend([
-        Span::styled(" · ", opts.theme.faint),
-        Span::styled(model_name, opts.theme.dim),
-        Span::styled(" | ", opts.theme.faint),
-        Span::styled(effort_str, opts.theme.accent),
-    ]);
-
-    if show_effort_hint {
-        left_spans.push(Span::styled(" /effort", opts.theme.cyan));
-    }
-
-    let left_len: usize = left_spans.iter().map(|s| display_width(&s.content)).sum();
-
-    if left_len + 2 + right_len <= width {
-        let spaces = width - left_len - right_len;
-        left_spans.push(Span::raw(" ".repeat(spaces)));
-        if !right_hint.is_empty() {
-            left_spans.push(Span::styled(right_hint, opts.theme.cyan));
-        }
-        Line::from(left_spans)
-    } else {
-        let vim_part = if state.config.ui.vim {
-            match state.vim.mode {
-                crate::state::vim::VimMode::Normal => " · NOR",
-                crate::state::vim::VimMode::Insert => " · INS",
-                crate::state::vim::VimMode::Visual => " · VIS",
-            }
-        } else {
-            ""
-        };
-        let mode_label = mode.label();
-        let display_name = state.model().map(|m| m.display_name()).unwrap_or_default();
-        let effort = state.effort();
-        let zdr_part = if state.zdr_active() { " · ZDR" } else { "" };
-        let plain = if let Some((_, text)) = &state.plugin_status {
-            format!("{mode_label}{vim_part}{zdr_part} · {text} · {display_name} | {effort}")
-        } else {
-            format!("{mode_label}{vim_part}{zdr_part} · {display_name} | {effort}")
-        };
-        let trunc = truncate_to_width(&plain, width, true);
-        Line::from(Span::styled(trunc, opts.theme.dim))
-    }
 }
 
 fn render_row2_with_right(
@@ -288,7 +223,14 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                     opts.theme.bold,
                                 ),
                                 Span::styled(
-                                    "enter open · alt+b follow · esc clear",
+                                    key_hints(
+                                        state,
+                                        &[
+                                            (KeyAction::Submit, "open"),
+                                            (KeyAction::FollowAgent, "follow"),
+                                            (KeyAction::Cancel, "clear"),
+                                        ],
+                                    ),
                                     opts.theme.dim,
                                 ),
                             ],
@@ -333,23 +275,43 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                                 .unwrap_or_default();
                             (
                                 vec![
-                                    Span::styled("FOLLOW", opts.theme.selected_bg),
+                                    crate::ui::chrome::badge("FOLLOW", opts.theme.accent, opts),
                                     Span::raw(" "),
                                     Span::styled(format!("{name} {dur} · "), opts.theme.bold),
-                                    Span::styled("pgup pause · alt+b release", opts.theme.dim),
+                                    Span::styled(
+                                        key_hints(
+                                            state,
+                                            &[
+                                                (KeyAction::ScrollUp, "pause"),
+                                                (KeyAction::FollowAgent, "release"),
+                                            ],
+                                        ),
+                                        opts.theme.dim,
+                                    ),
                                 ],
                                 false,
                             )
                         } else {
                             // A log view has no agent to follow or stop —
                             // it only scrolls.
-                            let hints = match target {
+                            let items: &[(KeyAction, &str)] = match target {
                                 PanelTarget::McpServer(_)
                                 | PanelTarget::FileDiff { .. }
-                                | PanelTarget::CommitDiff { .. } => "esc back · scroll pages",
-                                PanelTarget::Agent(_) => "esc back · alt+b follow · s stop",
-                                PanelTarget::Task(_) => "esc back · scroll pages · k kill",
+                                | PanelTarget::CommitDiff { .. } => {
+                                    &[(KeyAction::Cancel, "back"), (KeyAction::ScrollUp, "scroll")]
+                                }
+                                PanelTarget::Agent(_) => &[
+                                    (KeyAction::Cancel, "back"),
+                                    (KeyAction::FollowAgent, "follow"),
+                                    (KeyAction::StopAgent, "stop"),
+                                ],
+                                PanelTarget::Task(_) => &[
+                                    (KeyAction::Cancel, "back"),
+                                    (KeyAction::ScrollUp, "scroll"),
+                                    (KeyAction::KillTask, "kill"),
+                                ],
                             };
+                            let hints = key_hints(state, items);
                             (
                                 vec![
                                     Span::styled(
@@ -364,25 +326,35 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                         }
                     }
                     _ => {
-                        let mode = state.mode();
-                        let perm_style = match mode {
-                            Mode::Bypass => opts.theme.red,
-                            Mode::Plan => opts.theme.yellow,
-                            Mode::Build | Mode::Auto => opts.theme.cyan,
+                        // Without a session the mode is unknown: saying the
+                        // default mode's rules would be a guess (B10). Row 1
+                        // already says "no session"; this row keeps only the
+                        // slots and the keys.
+                        let Some(meta) = state.meta.as_ref() else {
+                            return render_row2_with_right(
+                                Vec::new(),
+                                context_right_spans(state, opts),
+                                width,
+                            );
                         };
+                        let perm_line = meta.mode.permission_line();
+                        let perm_style = crate::ui::chrome::mode_tone(meta.mode, &opts.theme);
+                        let hint = state
+                            .keymap
+                            .hint(KeyAction::CycleMode)
+                            .map(|key| format!(" ({key} to cycle)"))
+                            .unwrap_or_default();
 
                         let right_spans = context_right_spans(state, opts);
                         let right_len: usize =
                             right_spans.iter().map(|s| display_width(&s.content)).sum();
 
-                        let perm_base =
-                            format!("{} {}", opts.glyphs.chevrons, mode.permission_line());
+                        let perm_base = format!("{} {perm_line}", opts.glyphs.chevrons);
                         let plugin_status_str = state
                             .plugin_status
                             .as_ref()
                             .map(|(_, t)| format!(" · {t}"))
                             .unwrap_or_default();
-                        let hint = " (shift+tab to cycle)";
                         let counts_or_idle =
                             if state.rail.show_session_stats && state.rail.usage.turns > 0 {
                                 let done_count = state
@@ -420,19 +392,19 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
 
                         let perm_base_len = display_width(&perm_base);
                         let status_len = display_width(&plugin_status_str);
-                        let hint_len = display_width(hint);
+                        let hint_len = display_width(&hint);
                         let counts_len = display_width(&counts_or_idle);
 
                         let make_spans = |with_status: bool, with_hint: bool, with_counts: bool| {
                             let mut spans = vec![
                                 Span::styled(format!("{} ", opts.glyphs.chevrons), perm_style),
-                                Span::styled(mode.permission_line(), perm_style),
+                                Span::styled(perm_line, perm_style),
                             ];
                             if with_status && !plugin_status_str.is_empty() {
                                 spans.push(Span::styled(plugin_status_str.clone(), opts.theme.dim));
                             }
                             if with_hint {
-                                spans.push(Span::styled(hint, opts.theme.faint));
+                                spans.push(Span::styled(hint.clone(), opts.theme.faint));
                             }
                             if with_counts {
                                 spans.push(Span::styled(counts_or_idle.clone(), opts.theme.faint));
@@ -518,12 +490,12 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
 }
 
 /// The hub entry hint (§4.2): `shift shift` once the terminal has proven it
-/// reports the gesture, `ctrl+,` while it has not (or while the detector is
-/// switched off).
-fn menu_hint(state: &AppState) -> &'static str {
+/// reports the gesture, the `Menu` binding (`ctrl+,` by default) while it
+/// has not or while the detector is switched off. `None` when neither works.
+fn menu_hint(state: &AppState) -> Option<String> {
     if state.config.keys.double_shift_enabled() && state.double_shift.available() {
-        "shift shift"
+        Some("shift shift".to_string())
     } else {
-        "ctrl+,"
+        state.keymap.hint(KeyAction::Menu)
     }
 }

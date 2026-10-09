@@ -1075,10 +1075,13 @@ impl Transcript {
     /// already expanded. Every tool call is expandable — any status (a denied
     /// call reveals the refused command) and any preview length (expansion
     /// also shows the call's full argument, which the collapsed cell never
-    /// had room for). Returns true on change.
+    /// had room for). A `!cmd` result is drawn as a bash call and folds the
+    /// same way, so it expands too. Returns true on change.
     pub fn toggle_last_expandable(&mut self) -> bool {
         let id = self.cells.iter().rev().find_map(|c| match &c.kind {
-            CellKind::Item(TranscriptKind::ToolCall { .. }) => Some(c.id),
+            CellKind::Item(
+                TranscriptKind::ToolCall { .. } | TranscriptKind::BashCommand { .. },
+            ) => Some(c.id),
             _ => None,
         });
         let Some(id) = id else { return false };

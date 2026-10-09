@@ -9,7 +9,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear};
+use ratatui::widgets::{Block, Borders, Clear};
 
 use pacode_render::RenderOptions;
 
@@ -123,10 +123,13 @@ pub(crate) fn draw(
 pub(crate) fn menu_block(title: &str, hint: &str, opts: &RenderOptions) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(Span::styled(format!(" {title} "), opts.theme.bold))
+        .border_set(crate::ui::chrome::border_set(opts))
+        .title(Line::from(vec![
+            Span::styled(opts.glyphs.hline, opts.theme.border),
+            Span::styled(format!(" {title} "), opts.theme.bold),
+        ]))
         .title_bottom(Span::styled(hint.to_string(), opts.theme.dim))
-        .border_style(opts.theme.dim)
+        .border_style(opts.theme.border)
 }
 
 /// The selected row: every span keeps its colour over `selected_bg`, padded to

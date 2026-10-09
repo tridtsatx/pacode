@@ -18,9 +18,7 @@ pub struct RenderContext {
 
 pub(super) fn expand_hint_for(keymap: &crate::binding::Keymap) -> String {
     keymap
-        .bindings_for(crate::binding::Action::ExpandOutput)
-        .first()
-        .map(crate::binding::format_binding)
+        .hint(crate::binding::Action::ExpandOutput)
         .unwrap_or_else(|| "click".to_string())
 }
 

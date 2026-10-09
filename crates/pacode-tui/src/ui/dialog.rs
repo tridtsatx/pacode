@@ -10,16 +10,17 @@ use ratatui::widgets::Paragraph;
 
 use pacode_render::cache::CacheKey;
 use pacode_render::markdown::split_stable_tail;
-use pacode_render::{
-    LineCache, RenderOptions, display_width, render_markdown, truncate_to_width, wrap_text,
-};
+use pacode_render::{LineCache, RenderOptions};
+use pacode_types::TranscriptKind;
 use pacode_types::transcript::ToolStatus;
-use pacode_types::{ExplainLevel, RiskLevel, ToastLevel, TranscriptKind};
 
+use super::cells::{
+    assistant_markdown, assistant_stats_line, decoration_width, render_background_result,
+    render_item_inner,
+};
 use crate::state::selection::{MAX_SELECTION_BYTES, MAX_SELECTION_LINES};
 use crate::state::transcript::{
-    Cell, CellKind, HeaderInfo, PermExplain, StableRevision, ToolStreamView, ToolStreams,
-    Transcript,
+    Cell, CellKind, HeaderInfo, StableRevision, ToolStreamView, ToolStreams, Transcript,
 };
 
 #[cfg(test)]
@@ -47,9 +48,15 @@ impl PlainWindow {
 /// content line number `lines[0]` stands for, so the caller can index the
 /// result by transcript line without the copy having materialized everything
 /// above the selection.
+///
+/// `leads[i]` is how many leading columns of `lines[i]` are decoration — the
+/// user band's bar, the answer's marker and indent, a tool body's gutter. The
+/// text keeps them so columns stay aligned with the screen; the copy drops
+/// them. A missing entry means none.
 #[derive(Default)]
 pub(crate) struct PlainLines {
     pub lines: Vec<String>,
+    pub leads: Vec<usize>,
     pub first_line: usize,
 }
 
@@ -76,8 +83,9 @@ impl PlainSink {
         }
     }
 
-    fn push(&mut self, rendered: &[String], at: usize) {
-        for (offset, text) in rendered.iter().enumerate() {
+    /// `rendered` holds each row's text and its decoration width.
+    fn push(&mut self, rendered: &[(String, usize)], at: usize) {
+        for (offset, (text, lead)) in rendered.iter().enumerate() {
             let line = at.saturating_add(offset);
             if line < self.start || line > self.end {
                 continue;
@@ -87,6 +95,7 @@ impl PlainSink {
                 self.out.first_line = line;
             }
             self.out.lines.push(text.clone());
+            self.out.leads.push(*lead);
             if self.full() {
                 return;
             }
@@ -480,7 +489,7 @@ fn plan_cell(
             opts.cache_epoch,
         );
         if cache.get(stable_key).is_none() {
-            cache.insert(stable_key, render_markdown(stable, opts));
+            cache.insert(stable_key, assistant_markdown(stable, opts, true));
         }
         return CellPlan::LiveAssistant(stable_key);
     }
@@ -519,15 +528,14 @@ fn cell_block<'a>(
 
                 let mut combined = match cache.peek(*stable_key) {
                     Some(lines) => lines.to_vec(),
-                    None => render_markdown(stable, opts),
+                    None => assistant_markdown(stable, opts, true),
                 };
-                let mut tail_lines = render_markdown(tail, opts);
+                // The marker sits on the answer's first row: the tail carries
+                // it only while the stable part has drawn nothing yet.
+                let mut tail_lines = assistant_markdown(tail, opts, combined.is_empty());
                 combined.append(&mut tail_lines);
                 if let Some(stats) = cell.stats.as_deref() {
-                    combined.push(Line::from(Span::styled(
-                        stats.to_string(),
-                        opts.theme.faint,
-                    )));
+                    combined.push(assistant_stats_line(stats, opts));
                 }
                 combined.push(Line::default());
                 return Block::Owned(combined);
@@ -609,10 +617,10 @@ pub(crate) fn plain_lines(
     let mut line = 0usize;
 
     if let Some(info) = header.as_ref() {
-        let rendered: Vec<String> =
+        let rendered: Vec<(String, usize)> =
             crate::ui::header::render(info, width, opts, anim_frame, welcome_ms)
                 .iter()
-                .map(line_text)
+                .map(|l| (line_text(l), 0))
                 .collect();
         sink.push(&rendered, line);
         line += rendered.len();
@@ -628,7 +636,11 @@ pub(crate) fn plain_lines(
             stable_revision: stable_revisions.get(&cell.id).copied().unwrap_or((0, 0)),
         };
         let block = render_cell_block(cell, state, opts, cache, tool_streams, width, anim_frame);
-        let rendered: Vec<String> = block.lines().iter().map(line_text).collect();
+        let rendered: Vec<(String, usize)> = block
+            .lines()
+            .iter()
+            .map(|l| (line_text(l), decoration_width(&cell.kind, l, opts)))
+            .collect();
         sink.push(&rendered, line);
         line += rendered.len();
     }
@@ -675,47 +687,6 @@ fn render_cell(
     }
 }
 
-/// A finished background job, drawn in the tool-call idiom: symbol, what ran,
-/// then the outcome with its duration and exit code.
-fn render_background_result(
-    result: &crate::state::BackgroundResult,
-    width: u16,
-    opts: &RenderOptions,
-) -> Vec<Line<'static>> {
-    use crate::state::{BackgroundKind, BackgroundOutcome};
-
-    let noun = match result.kind {
-        BackgroundKind::Task => "Background",
-        BackgroundKind::Agent => "Agent",
-    };
-    let dur = pacode_types::time::format_duration_ms(result.duration_ms);
-    let (word, style) = match result.outcome {
-        BackgroundOutcome::Completed => ("done", opts.theme.green),
-        BackgroundOutcome::Failed => ("failed", opts.theme.red),
-        BackgroundOutcome::Killed => ("killed", opts.theme.yellow),
-    };
-    let mut tail = format!("{word} {dur}");
-    if let Some(code) = result.exit_code
-        && code != 0
-    {
-        tail.push_str(&format!(" · exit {code}"));
-    }
-
-    // The label is the part that can be arbitrarily long, so it is the part that
-    // gets an ellipsis: the outcome must stay readable at any width.
-    let sym = opts.glyphs.tool;
-    let head = format!("{sym} {noun} ");
-    let fixed = pacode_render::display_width(&head) + pacode_render::display_width(&tail) + 1;
-    let label = truncate_to_width(&result.label, (width as usize).saturating_sub(fixed), true);
-
-    vec![Line::from(vec![
-        Span::styled(head, opts.theme.cyan),
-        Span::styled(label, opts.theme.dim),
-        Span::raw(" "),
-        Span::styled(tail, style),
-    ])]
-}
-
 /// Render one item in its folded form. Only tests reach for this directly; the
 /// transcript goes through the cache, which knows whether the cell is expanded.
 #[cfg(test)]
@@ -726,386 +697,4 @@ pub(crate) fn render_item(
     anim_frame: u64,
 ) -> Vec<Line<'static>> {
     render_item_inner(kind, None, stats, None, opts, anim_frame, false)
-}
-
-/// `expanded` shows a tool call's whole output, wrapped, instead of its first
-/// few lines cut to the width. `perm_explain` rides along for permission
-/// cells — the `e`-key answer is cell state, not part of the wire item.
-/// `streamed` carries the output a tool call has produced while it is still
-/// running; only a `Running` tool call reads it.
-fn render_item_inner(
-    kind: &TranscriptKind,
-    perm_explain: Option<&PermExplain>,
-    stats: Option<&str>,
-    streamed: Option<ToolStreamView<'_>>,
-    opts: &RenderOptions,
-    anim_frame: u64,
-    expanded: bool,
-) -> Vec<Line<'static>> {
-    // The width comes from the options rather than beside them: `RenderOptions`
-    // carries it, and a second copy is a second answer to "how wide is this".
-    let width = opts.width;
-    match kind {
-        TranscriptKind::User { text } => {
-            let bar = if opts.glyphs.ascii { "|" } else { "▎" };
-            let prefix = format!("{bar} ");
-            let avail = (width as usize).saturating_sub(2).max(1);
-            let lines = wrap_text(text, avail);
-            let mut out = Vec::new();
-            for (i, l) in lines.into_iter().enumerate() {
-                let style = if i == 0 {
-                    opts.theme.bold
-                } else {
-                    opts.theme.fg
-                };
-                out.push(Line::from(vec![
-                    Span::styled(prefix.clone(), opts.theme.user_bar),
-                    Span::styled(l, style),
-                ]));
-            }
-            out.push(Line::default());
-            out
-        }
-        TranscriptKind::Assistant { text, complete } => {
-            if text.is_empty() && !complete {
-                return vec![
-                    Line::from(Span::styled("…", opts.theme.faint)),
-                    Line::default(),
-                ];
-            }
-            let mut lines = render_markdown(text, opts);
-            if let Some(stats) = stats {
-                lines.push(Line::from(Span::styled(
-                    stats.to_string(),
-                    opts.theme.faint,
-                )));
-            }
-            lines.push(Line::default());
-            lines
-        }
-        TranscriptKind::Reasoning { text, complete } => {
-            if !opts.thinking {
-                return Vec::new();
-            }
-            let line = if *complete {
-                Line::from(Span::styled("thought for a moment", opts.theme.faint))
-            } else if text.is_empty() {
-                Line::from(Span::styled("thinking…", opts.theme.faint))
-            } else {
-                Line::from(Span::styled(
-                    format!(
-                        "thinking: {}",
-                        truncate_to_width(text, (width as usize).saturating_sub(11), true)
-                    ),
-                    opts.theme.faint,
-                ))
-            };
-            vec![line, Line::default()]
-        }
-        TranscriptKind::ToolCall {
-            call_id: _,
-            name,
-            title,
-            intent: _,
-            status,
-            preview,
-            diff,
-            duration_ms,
-            task: _,
-        } => crate::ui::toolcell::render(
-            &crate::ui::toolcell::ToolCallView {
-                name,
-                title,
-                status: *status,
-                preview,
-                diff: diff.as_ref(),
-                duration_ms: *duration_ms,
-                streamed,
-            },
-            width,
-            opts,
-            anim_frame,
-            expanded,
-        ),
-        TranscriptKind::Notice { level, text } => {
-            let style = match level {
-                ToastLevel::Success => opts.theme.green,
-                ToastLevel::Warn => opts.theme.accent,
-                ToastLevel::Error => opts.theme.red,
-                ToastLevel::Info => opts.theme.faint,
-            };
-            if *level == ToastLevel::Error {
-                crate::ui::notice::render_error(text, width, opts)
-            } else {
-                let mut out: Vec<Line<'static>> = wrap_text(text, (width as usize).max(1))
-                    .into_iter()
-                    .map(|l| Line::from(Span::styled(l, style)))
-                    .collect();
-                out.push(Line::default());
-                out
-            }
-        }
-        TranscriptKind::Permission(req) => {
-            // The static classifier's risk rides the header as a chip; the
-            // title yields width first so the chip can never be cut off.
-            let head = format!("{} permission: ", opts.glyphs.chevrons);
-            let chip = req
-                .risk
-                .map(|r| (format!("risk: {}", risk_label(r)), risk_style(r, opts)));
-            let chip_w = chip
-                .as_ref()
-                .map(|(t, _)| display_width(t) + display_width(opts.glyphs.dot_sep) + 2)
-                .unwrap_or(0);
-            let title_w = (width as usize)
-                .saturating_sub(display_width(&head) + chip_w)
-                .max(1);
-            let mut head_spans = vec![
-                Span::styled(head, opts.theme.accent),
-                Span::styled(
-                    truncate_to_width(&req.title, title_w, true),
-                    opts.theme.bold,
-                ),
-            ];
-            if let Some((text, style)) = chip {
-                head_spans.push(Span::styled(
-                    format!(" {} ", opts.glyphs.dot_sep),
-                    opts.theme.faint,
-                ));
-                head_spans.push(Span::styled(text, style));
-            }
-            let mut lines = vec![Line::from(head_spans)];
-            if !req.detail.is_empty() {
-                for dl in req.detail.lines().take(4) {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "    {}",
-                            truncate_to_width(dl, (width as usize).saturating_sub(4), true)
-                        ),
-                        opts.theme.dim,
-                    )));
-                }
-            }
-            match perm_explain {
-                // `e` pressed — the aux answer is still in flight.
-                Some(PermExplain::Requested) => lines.push(Line::from(Span::styled(
-                    "    explain requested…".to_string(),
-                    opts.theme.faint,
-                ))),
-                // The aux model's answer landed — display-only, the verdict
-                // keys below stay live while it is read.
-                Some(PermExplain::Done { text, level }) => {
-                    lines.extend(render_explain_lines(text, *level, width, opts));
-                }
-                None => {}
-            }
-            lines.push(Line::from(Span::styled(
-                "y allow · a session · n deny · e explain",
-                opts.theme.cyan,
-            )));
-            lines.push(Line::default());
-            lines
-        }
-        TranscriptKind::Question { question, answer } => {
-            let mut lines = vec![Line::from(vec![
-                Span::styled(format!("{} ", opts.glyphs.chevrons), opts.theme.accent),
-                Span::styled(question.header.clone(), opts.theme.selected_bg),
-            ])];
-            for line in pacode_render::wrap_text(&question.question, width as usize) {
-                lines.push(Line::from(Span::styled(line, opts.theme.bold)));
-            }
-
-            match answer {
-                // Unanswered: the picker below is showing the options and the
-                // keys, so repeating them here would put the same card on screen
-                // twice.
-                None => lines.push(Line::from(Span::styled(
-                    "waiting for your answer",
-                    opts.theme.faint,
-                ))),
-                Some(a) if a.cancelled => {
-                    lines.push(Line::from(Span::styled("dismissed", opts.theme.faint)));
-                }
-                Some(a) => {
-                    for (i, option) in question.options.iter().enumerate() {
-                        let chosen = a.selected.contains(&i);
-                        let marker = if chosen { opts.glyphs.ok } else { " " };
-                        let mut label = format!("{}. {}", i + 1, option.label);
-                        if option.recommended {
-                            label.push_str(" (recommended)");
-                        }
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("{marker} "), opts.theme.green),
-                            Span::styled(
-                                truncate_to_width(&label, (width as usize).saturating_sub(3), true),
-                                if chosen {
-                                    opts.theme.bold
-                                } else {
-                                    opts.theme.dim
-                                },
-                            ),
-                        ]));
-                        // The chosen option keeps its description on record —
-                        // the picker's "what this means" is part of the answer.
-                        if chosen && !option.description.is_empty() {
-                            for dl in wrap_text(
-                                &option.description,
-                                (width as usize).saturating_sub(4).max(1),
-                            ) {
-                                lines.push(Line::from(Span::styled(
-                                    format!("    {dl}"),
-                                    opts.theme.dim,
-                                )));
-                            }
-                        }
-                    }
-                    if let Some(text) = a.free_text.as_ref().filter(|t| !t.trim().is_empty()) {
-                        for (j, tl) in wrap_text(text, (width as usize).saturating_sub(2).max(1))
-                            .into_iter()
-                            .enumerate()
-                        {
-                            let prefix = if j == 0 { "> " } else { "  " };
-                            lines.push(Line::from(Span::styled(
-                                format!("{prefix}{tl}"),
-                                opts.theme.faint,
-                            )));
-                        }
-                    }
-                }
-            }
-            lines.push(Line::default());
-            lines
-        }
-        TranscriptKind::BashCommand {
-            command,
-            output,
-            exit_code,
-            truncated: _,
-        } => {
-            let mut out = Vec::new();
-            let mut header_spans = vec![
-                Span::styled(
-                    "! ",
-                    opts.theme
-                        .accent
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-                Span::styled(command.clone(), opts.theme.bold),
-            ];
-
-            if let Some(code) = exit_code
-                && *code != 0
-            {
-                header_spans.push(Span::raw(" "));
-                header_spans.push(Span::styled(format!("(exit {code})"), opts.theme.red));
-            }
-            out.push(Line::from(header_spans));
-
-            if !output.is_empty() {
-                for line in output.lines() {
-                    out.push(Line::from(vec![
-                        Span::styled("  │ ", opts.theme.dim),
-                        Span::styled(
-                            truncate_to_width(line, (width as usize).saturating_sub(4), true),
-                            opts.theme.fg,
-                        ),
-                    ]));
-                }
-            }
-
-            out.push(Line::default());
-            out
-        }
-    }
-}
-
-/// The `e`-key answer under a pending permission: `explain · <level>:` in
-/// the rating's colour, then the aux model's text dim-wrapped beneath it.
-/// `level: None` is the daemon's honest-failure path — the label drops the
-/// rating word and the text says what went wrong. Capped at a few lines: the
-/// daemon already caps the answer at ~2k chars, but a narrow pane must not
-/// let it push the verdict hints off the bottom of the cell.
-fn render_explain_lines(
-    text: &str,
-    level: Option<ExplainLevel>,
-    width: u16,
-    opts: &RenderOptions,
-) -> Vec<Line<'static>> {
-    /// The most wrapped lines a permission explanation may occupy.
-    const EXPLAIN_MAX_LINES: usize = 8;
-    let indent = "    ";
-    let mut label = vec![Span::styled(format!("{indent}explain"), opts.theme.faint)];
-    if let Some(lv) = level {
-        label.push(Span::styled(
-            opts.glyphs.dot_sep.to_string(),
-            opts.theme.faint,
-        ));
-        label.push(Span::styled(
-            crate::state::transcript::explain_level_name(lv),
-            explain_level_style(lv, opts),
-        ));
-    }
-    label.push(Span::styled(": ".to_string(), opts.theme.faint));
-    let label_w: usize = label.iter().map(|s| display_width(&s.content)).sum();
-    let text_w = (width as usize).saturating_sub(label_w).max(1);
-    let wrapped = wrap_text(text, text_w);
-
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut first = label;
-    if let Some(head) = wrapped.first() {
-        first.push(Span::styled(head.clone(), opts.theme.dim));
-    }
-    out.push(Line::from(first));
-    for wl in wrapped.iter().skip(1).take(EXPLAIN_MAX_LINES - 1) {
-        out.push(Line::from(Span::styled(
-            format!("{indent}{wl}"),
-            opts.theme.dim,
-        )));
-    }
-    let hidden = wrapped.len().saturating_sub(EXPLAIN_MAX_LINES);
-    if hidden > 0 {
-        out.push(Line::from(Span::styled(
-            format!(
-                "{indent}{} {hidden} more {}",
-                opts.glyphs.ellipsis,
-                pacode_render::text::lines_noun(hidden)
-            ),
-            opts.theme.faint,
-        )));
-    }
-    out
-}
-
-/// Colour for the aux model's danger rating: `none` stays quiet, `low` is
-/// fine, `medium` asks attention, `high` is red, `catastrophic` shouts.
-fn explain_level_style(level: ExplainLevel, opts: &RenderOptions) -> ratatui::style::Style {
-    match level {
-        ExplainLevel::None => opts.theme.faint,
-        ExplainLevel::Low => opts.theme.green,
-        ExplainLevel::Medium => opts.theme.yellow,
-        ExplainLevel::High => opts.theme.red,
-        ExplainLevel::Catastrophic => opts.theme.red.add_modifier(ratatui::style::Modifier::BOLD),
-    }
-}
-
-/// The `risk: <word>` chip on a permission header — the static classifier's
-/// vocabulary (`pacode-risk`), kept lowercase like the explain rating.
-fn risk_label(risk: RiskLevel) -> &'static str {
-    match risk {
-        RiskLevel::Safe => "safe",
-        RiskLevel::Low => "low",
-        RiskLevel::Confirm => "confirm",
-        RiskLevel::Catastrophic => "catastrophic",
-    }
-}
-
-/// Same colour ladder as [`explain_level_style`], mapped onto the static
-/// risk classes: `safe` is quiet, `low` fine, `confirm` needs a look, and
-/// `catastrophic` shouts.
-fn risk_style(risk: RiskLevel, opts: &RenderOptions) -> ratatui::style::Style {
-    match risk {
-        RiskLevel::Safe => opts.theme.faint,
-        RiskLevel::Low => opts.theme.green,
-        RiskLevel::Confirm => opts.theme.yellow,
-        RiskLevel::Catastrophic => opts.theme.red.add_modifier(ratatui::style::Modifier::BOLD),
-    }
 }

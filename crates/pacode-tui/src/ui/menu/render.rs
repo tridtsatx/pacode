@@ -7,7 +7,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use pacode_render::{RenderOptions, display_width, truncate_to_width};
 
@@ -54,10 +54,10 @@ pub fn draw_in(
     let hint = bottom_hint(view, ui, rect.width.saturating_sub(2), opts);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_set(crate::ui::chrome::border_set(opts))
         .title(Line::from(breadcrumb_spans(view, ui, opts)))
         .title_bottom(Span::styled(hint, opts.theme.dim))
-        .border_style(opts.theme.dim);
+        .border_style(opts.theme.border);
 
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
@@ -199,7 +199,11 @@ fn breadcrumb_spans(view: &MenuView, ui: &MenuUiState, opts: &RenderOptions) -> 
             segs.push(tabs.items[t].label.clone());
         }
     }
-    let mut spans = vec![Span::raw(" ")];
+    // `╭─ Menu › …` — one run of the border before the title, as every frame.
+    let mut spans = vec![
+        Span::styled(opts.glyphs.hline, opts.theme.border),
+        Span::raw(" "),
+    ];
     for (i, seg) in segs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(sep, opts.theme.faint));

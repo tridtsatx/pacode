@@ -174,6 +174,21 @@ fn test_wrap_cursor_consistency() {
     assert_eq!(state.cursor_position(10), (0, 6));
 }
 
+/// B15: the cursor used to be placed by wrapping only the text before it, so
+/// inside a word that wraps it sat on the row above its letters.
+#[test]
+fn the_cursor_inside_a_wrapped_word_sits_on_the_row_with_the_word() {
+    let mut state = InputState::default();
+    state.insert_str("aaaaaaaaaaaaaa wordword");
+    // Outer width 20 -> text width 18: "wordword" wraps to line 1.
+    assert_eq!(state.wrap_lines(20), vec!["aaaaaaaaaaaaaa ", "wordword"]);
+    state.cursor = "aaaaaaaaaaaaaa wo".chars().count();
+    assert_eq!(state.cursor_position(20), (1, 4));
+    // Vertical moves read the same row.
+    assert!(state.move_up(20));
+    assert!(!state.move_up(20));
+}
+
 #[test]
 fn test_wrapped_position_of_byte() {
     // Single line: the column is the display width of the text before it.

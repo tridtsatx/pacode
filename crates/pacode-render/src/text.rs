@@ -33,12 +33,12 @@ pub fn failed_word(_n: usize) -> &'static str {
     "failed"
 }
 
-/// Display label for a built-in tool (spec §6: `Command`, `Read`, `Search`,
+/// Display label for a built-in tool (spec §6: `Bash`, `Read`, `Search`,
 /// `Write`). `None` for tools without one — the caller falls back to the raw
 /// name, capitalized.
 pub fn tool_label(name: &str) -> Option<&'static str> {
     Some(match name {
-        "bash" => "Command",
+        "bash" => "Bash",
         "read" | "read_file" => "Read",
         "grep" | "glob" | "search" => "Search",
         "ls" => "List",

@@ -399,7 +399,7 @@ pub(crate) fn prepare_scan_wants(state: &mut AppState, completion: Option<&Input
 }
 
 pub fn above_input(layout: &ScreenLayout, width: u16, rows: usize) -> Rect {
-    let height = layout.input_top.y.saturating_sub(layout.dialog.y);
+    let height = layout.preview.y.saturating_sub(layout.dialog.y);
     let container = Rect::new(layout.input.x, layout.dialog.y, layout.input.width, height);
     bottom_area(container, width, (rows.min(MAX_VISIBLE as usize)) as u16)
 }
@@ -482,17 +482,18 @@ pub(crate) fn bottom_picker_container(layout: &ScreenLayout) -> Rect {
     }
 }
 
+/// The area every centred overlay (menus, settings, analyze, the model
+/// palette) is centred in: the whole left column above the image strip and
+/// the prompt frame — the transcript *and* an open panel. Not the dialog
+/// rect: with a panel open that is 45–50 % of the column, and an overlay
+/// centred there is squeezed to a sliver beside empty space (B25).
 pub(crate) fn overlay_container(layout: &ScreenLayout) -> Rect {
-    if layout.dialog.width > 0 {
-        layout.dialog
-    } else {
-        Rect::new(
-            layout.input.x,
-            layout.dialog.y,
-            layout.input.width,
-            layout.input_top.y.saturating_sub(layout.dialog.y),
-        )
-    }
+    Rect::new(
+        layout.input_top.x,
+        layout.dialog.y,
+        layout.input_top.width,
+        layout.preview.y.saturating_sub(layout.dialog.y),
+    )
 }
 
 fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId) -> Rect {

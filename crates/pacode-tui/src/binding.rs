@@ -1137,6 +1137,13 @@ impl Keymap {
         self.bindings.get(&action).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// The key a hint should name for `action` — its first binding, spelled
+    /// the way `/keys` spells it. `None` when the action is unbound, so a hint
+    /// drops the item instead of naming a key that does nothing.
+    pub fn hint(&self, action: Action) -> Option<String> {
+        self.bindings_for(action).first().map(format_binding)
+    }
+
     /// Stable list of action names and action variants.
     pub fn action_names() -> &'static [(&'static str, Action)] {
         ACTION_NAMES

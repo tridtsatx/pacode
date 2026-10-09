@@ -50,33 +50,36 @@ fn the_model_palette_centres_on_the_frame_even_with_a_panel_open() {
 }
 
 #[test]
-fn menu_container_falls_back_to_the_panel_column_without_changing_other_tiers() {
+/// B25: with a panel open, overlays used to centre in the dialog rect — 45–50 %
+/// of the column — and came out squeezed beside empty space. The container is
+/// the whole left column above the prompt, panel or not.
+fn overlays_centre_in_the_whole_left_column_with_or_without_a_panel() {
     for cols in [60u16, 80, 100, 140] {
-        for is_task in [true, false] {
+        for panel in [None, Some(true), Some(false)] {
             let mut app = state(cols, 34);
-            app.panel.target = Some(if is_task {
-                PanelTarget::Task(TaskId::new("task"))
-            } else {
-                PanelTarget::CommitDiff {
-                    hash: "commit".to_string(),
+            app.panel.target = panel.map(|is_task| {
+                if is_task {
+                    PanelTarget::Task(TaskId::new("task"))
+                } else {
+                    PanelTarget::CommitDiff {
+                        hash: "commit".to_string(),
+                    }
                 }
             });
             let layout = crate::layout::current(&app);
             let container = popup::overlay_container(&layout);
-            if cols < 100 {
-                assert_eq!(layout.dialog.width, 0);
-                assert_eq!(
-                    container,
-                    Rect::new(
-                        layout.input.x,
-                        layout.dialog.y,
-                        layout.input.width,
-                        layout.input_top.y.saturating_sub(layout.dialog.y),
-                    )
-                );
-                assert!(container.width > 0);
-            } else {
-                assert_eq!(container, layout.dialog);
+            assert_eq!(
+                container,
+                Rect::new(
+                    layout.input_top.x,
+                    layout.dialog.y,
+                    layout.input_top.width,
+                    layout.preview.y - layout.dialog.y,
+                ),
+                "{cols} cols, panel {panel:?}"
+            );
+            if let Some(panel) = layout.panel {
+                assert!(container.width >= layout.dialog.width + panel.width);
             }
         }
     }

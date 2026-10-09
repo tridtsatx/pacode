@@ -247,7 +247,7 @@ fn draw_plan(
     let spaces = w.saturating_sub(title_text.len() + right_text.chars().count());
     let sep = " ".repeat(spaces);
     lines.push(Line::from(vec![
-        Span::styled(title_text, opts.theme.faint),
+        crate::ui::chrome::section(title_text, opts),
         Span::raw(sep),
         Span::styled(right_text, opts.theme.dim),
     ]));
@@ -356,7 +356,7 @@ fn draw_agents(
     let right_text = format!("{count} ");
     let spaces = (area.width as usize).saturating_sub(title_text.len() + right_text.len() + 1);
     lines.push(Line::from(vec![
-        Span::styled(title_text, opts.theme.faint),
+        crate::ui::chrome::section(title_text, opts),
         Span::raw(" ".repeat(spaces)),
         Span::styled(right_text, opts.theme.dim),
         Span::styled(opts.glyphs.main_dot, main_dot_style),

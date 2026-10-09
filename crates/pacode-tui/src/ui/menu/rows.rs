@@ -178,10 +178,7 @@ fn main_line(
         } => {
             // No pointer column: a section is a header, not a row.
             prefix.push(Span::raw("  "));
-            label = vec![Span::styled(
-                text.clone(),
-                opts.theme.accent.patch(opts.theme.bold),
-            )];
+            label = vec![crate::ui::chrome::section(text, opts)];
             right = tail.clone().map(|t| (t, opts.theme.faint));
         }
         MenuRow::Item {
