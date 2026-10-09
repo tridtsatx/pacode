@@ -148,6 +148,15 @@ pub fn on_row(
     }
     log::debug!("close menu: Sessions → resume {row}");
     while stack.pop().is_some() {}
+    // Already on screen: re-attaching would only flash "connecting" and
+    // rebuild what is already here.
+    if state
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.id.as_str() == row.as_str())
+    {
+        return vec![];
+    }
     let attach = Attach::Resume {
         session: SessionId::new(row.as_str()),
     };

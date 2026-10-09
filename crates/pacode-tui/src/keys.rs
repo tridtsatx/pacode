@@ -274,7 +274,17 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             }
         }
         if state.config.ui.vim && state.focus == Focus::Normal {
-            // Handled by vim::handle on the normal prompt
+            // Vim owns esc on the prompt (insert → normal, drop a pending
+            // count); a mouse selection is not the prompt's and clears on any
+            // esc. A panel left open under vim's normal mode is closed by the
+            // layer ladder — and esc still does vim's part, dropping a pending
+            // count or operator.
+            state.selection.clear();
+            if state.vim.mode == crate::state::VimMode::Normal && state.panel.target.is_some() {
+                state.vim.pending.clear();
+                state.vim.count = None;
+                return handle_esc(state);
+            }
         } else {
             return handle_esc(state);
         }
@@ -728,10 +738,9 @@ fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
     let Some(meta) = state.meta.as_ref() else {
         return vec![];
     };
+    // No optimistic `meta.zdr` write: a refused `SetZdr` emits no
+    // `SessionUpdated` to undo it, so the badge waits for the daemon's.
     if meta.zdr {
-        if let Some(m) = state.meta.as_mut() {
-            m.zdr = false;
-        }
         return vec![Action::Send(Request::SetZdr(false))];
     }
     let capable = state
@@ -739,9 +748,6 @@ fn toggle_zdr(state: &mut AppState) -> Vec<Action> {
         .get(&meta.model.to_string())
         .is_some_and(|f| f.zdr_capable);
     if capable {
-        if let Some(m) = state.meta.as_mut() {
-            m.zdr = true;
-        }
         vec![Action::Send(Request::SetZdr(true))]
     } else {
         crate::keys_palette::open(state, crate::keys_palette::Opening::Zdr)

@@ -72,6 +72,10 @@ pub struct RailState {
     tasks_version: u64,
     agent_turn_fences: HashMap<AgentId, AgentTurnFence>,
     pub usage: UsageTotals,
+    /// SCHEDULE rows the last frame drew (jobs first, so the first this-many
+    /// enabled jobs had a countdown on screen). Written by `ui::prepare_frame`;
+    /// 0 while the rail or its SCHEDULE block is not drawn.
+    pub schedule_rows_drawn: usize,
     /// When the session became idle (no live agents, no running tasks, turn over);
     /// the SESSION block replaces AGENTS after `IDLE_DEBOUNCE_MS`.
     pub idle_since: Option<Instant>,
@@ -228,29 +232,46 @@ impl RailState {
 
     /// How long until a countdown on screen would change, in milliseconds.
     ///
-    /// The rail shows seconds under a minute and whole minutes above it, so a
-    /// distant job needs one redraw a minute rather than sixty. `None` means
-    /// nothing on screen counts down and no tick is needed at all.
-    pub fn schedule_tick_ms(&self, now_ms: u64) -> Option<u64> {
-        let next = self
-            .cron_jobs
+    /// The countdown reads as `format_duration_ms` prints it: whole minutes
+    /// from an hour out (`1h23m`), seconds below (`4m59s`, `42s`), tenths
+    /// under ten seconds (`5.3s`). Each job wakes when it crosses the next
+    /// lower multiple of the unit it shows, and the soonest one wins — not
+    /// necessarily the nearest job. Under ten seconds the tenth is also the
+    /// floor, so the last second never wakes per millisecond. `None` means
+    /// nothing counts down (a job at 0 waits for the daemon's reschedule).
+    ///
+    /// Only the first `shown` enabled jobs count: those are the countdown rows
+    /// the last frame drew.
+    pub fn schedule_tick_ms(&self, now_ms: u64, shown: usize) -> Option<u64> {
+        self.cron_jobs
             .iter()
             .filter(|j| j.enabled)
+            .take(shown)
             .filter_map(|j| j.due_in_ms(now_ms))
-            .min()?;
-        if next <= 60_000 {
-            // Second resolution: wake on the next whole second of the countdown.
-            Some(next % 1000 + 1)
-        } else {
-            // Minute resolution: wake when the displayed minute changes.
-            Some(next % 60_000 + 1)
-        }
+            .filter(|&due| due > 0)
+            .map(|due| {
+                let unit = if due < 10_000 {
+                    100
+                } else if due < 3_600_000 {
+                    1_000
+                } else {
+                    60_000
+                };
+                due % unit + 1
+            })
+            .min()
     }
 
     /// Cron jobs and monitors worth a row: enabled jobs, and monitors still
     /// watching or freshly fired.
     pub fn has_schedule_rows(&self) -> bool {
-        self.cron_jobs.iter().any(|j| j.enabled) || self.monitors.iter().any(|m| m.status.is_live())
+        self.schedule_row_count() > 0
+    }
+
+    /// SCHEDULE rows: enabled jobs first, then live monitors.
+    pub fn schedule_row_count(&self) -> usize {
+        self.cron_jobs.iter().filter(|j| j.enabled).count()
+            + self.monitors.iter().filter(|m| m.status.is_live()).count()
     }
 
     pub fn upsert_task(&mut self, info: TaskInfo) {

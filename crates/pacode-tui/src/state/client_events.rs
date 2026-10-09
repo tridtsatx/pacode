@@ -251,6 +251,7 @@ impl AppState {
         }
         self.started_at = now;
         self.meta = Some(snapshot.meta.clone());
+        self.restore_stashed_queue(&snapshot.meta.id);
         self.record_slot(self.active_slot, &snapshot);
         self.transcript
             .reset(snapshot.transcript.clone(), snapshot.has_more_history);

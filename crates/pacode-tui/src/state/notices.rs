@@ -194,21 +194,12 @@ impl AppState {
     }
 
     pub fn push_notice(&mut self, text: String) {
-        let now = now_ms();
-        self.transcript.push_cell(Cell {
-            id: now,
-            kind: CellKind::Item(TranscriptKind::Notice {
-                level: ToastLevel::Info,
-                text,
-            }),
-            version: 0,
-            ts_ms: now,
-            stats: None,
-            perm_explain: None,
-        });
-        self.dirty = true;
+        self.push_notice_with_level(ToastLevel::Info, text);
     }
 
+    /// The one way a notice enters the transcript: it is the answer to
+    /// something the user just did, so the view scrolls to it even when the
+    /// user was reading further up.
     pub fn push_notice_with_level(&mut self, level: ToastLevel, text: String) {
         let now = now_ms();
         self.transcript.push_cell(Cell {

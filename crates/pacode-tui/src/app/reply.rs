@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use pacode_client::{Client, ClientEventContext};
 use pacode_types::state::ToastLevel;
-use pacode_types::time::now_ms;
-use pacode_types::{PluginCommandOutcome, Reply, Request, TranscriptKind};
+use pacode_types::{PluginCommandOutcome, Reply, Request};
 use tokio::sync::mpsc;
 
 use super::attach::apply_scoped_snapshot;
@@ -15,7 +14,6 @@ use super::bg_response::BgResponse;
 use super::dispatch::{defer_unbound_request, queue_pending_request};
 use super::prompt::{prompt_gate_open, queue_user_message_request, resolve_request};
 use crate::keys::Action;
-use crate::state::transcript::{Cell, CellKind};
 use crate::state::{AppState, SessionContext};
 
 pub(super) enum ReplyScope {
@@ -271,26 +269,16 @@ pub(super) fn handle_reply(
     use crate::cache::ListKind;
     match res {
         Ok(Reply::Error { message }) => {
-            let now = now_ms();
-            state.transcript.push_cell(Cell {
-                id: now,
-                kind: CellKind::Item(TranscriptKind::Notice {
-                    level: ToastLevel::Error,
-                    text: message,
-                }),
-                version: 0,
-                ts_ms: now,
-                stats: None,
-                perm_explain: None,
-            });
-            state.dirty = true;
+            state.push_notice_with_level(ToastLevel::Error, message);
             vec![]
         }
         Ok(Reply::Analyze { report }) => {
             // Drawn from this copy, so scrolling never re-asks and a client that
             // reconnects mid-read keeps what it was reading.
+            // `/analyze` already opened the page; a reply that lands after the
+            // user closed it, or moved to something else, must not take the
+            // screen back.
             state.analyze_report = Some(*report);
-            state.open_analyze();
             state.dirty = true;
             vec![]
         }
@@ -389,19 +377,7 @@ pub(super) fn handle_reply(
             .unwrap_or_default(),
         Ok(_) => vec![],
         Err(err) => {
-            let now = now_ms();
-            state.transcript.push_cell(Cell {
-                id: now,
-                kind: CellKind::Item(TranscriptKind::Notice {
-                    level: ToastLevel::Error,
-                    text: err.to_string(),
-                }),
-                version: 0,
-                ts_ms: now,
-                stats: None,
-                perm_explain: None,
-            });
-            state.dirty = true;
+            state.push_notice_with_level(ToastLevel::Error, err.to_string());
             vec![]
         }
     }

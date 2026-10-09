@@ -150,6 +150,13 @@ pub(crate) fn prepare(
     );
 
     let header_blocks = usize::from(header.is_some());
+    // Scrolled up, the view holds on to what it shows: the cell (and line
+    // within it) at the top of the last frame. `scroll_from_bottom` alone
+    // counts from the tail, so every line streamed in below would push the
+    // text being read up by one row.
+    let anchor = (*scroll_from_bottom > 0)
+        .then(|| line_anchor(cell_lines, *first_visible_line))
+        .flatten();
     // Both are rebuilt every frame; reusing their buffers keeps a long
     // transcript from allocating a fresh pair of index tables per frame.
     let mut spans = std::mem::take(cell_lines);
@@ -178,6 +185,17 @@ pub(crate) fn prepare(
     *rendered_lines = Some(total_lines);
     *viewport_height = Some(viewport);
     let max_scroll = total_lines.saturating_sub(viewport);
+    let top = match anchor {
+        Some(ViewAnchor::Cell { id, offset }) => cell_line_index
+            .get(&id)
+            .and_then(|&index| cell_lines.get(index))
+            .map(|(_, start, end)| (start + offset).min(end.saturating_sub(1))),
+        Some(ViewAnchor::Header { line }) => Some(line),
+        None => None,
+    };
+    if let Some(top) = top {
+        *scroll_from_bottom = max_scroll - top.min(max_scroll);
+    }
     *scroll_from_bottom = (*scroll_from_bottom).min(max_scroll);
     *first_visible_line = max_scroll.saturating_sub(*scroll_from_bottom);
 
@@ -194,8 +212,10 @@ pub(crate) fn prepare(
 
     if is_scrolled_up && !visible_lines.is_empty() {
         let last_idx = visible_lines.len() - 1;
+        let below = *scroll_from_bottom;
+        let noun = if below == 1 { "line" } else { "lines" };
         visible_lines[last_idx] = Line::from(Span::styled(
-            format!("↓ {} new lines", *scroll_from_bottom),
+            format!("↓ {below} more {noun} below"),
             opts.theme.dim,
         ));
     }
@@ -203,6 +223,29 @@ pub(crate) fn prepare(
     PreparedDialog {
         lines: visible_lines,
     }
+}
+
+/// What the top row of a scrolled-up view showed last frame.
+enum ViewAnchor {
+    /// A transcript cell, and how far into it.
+    Cell { id: u64, offset: usize },
+    /// The welcome header above every cell: it never moves, so the absolute
+    /// line holds.
+    Header { line: usize },
+}
+
+/// The anchor at content line `line` of the last frame. `None` past the end.
+fn line_anchor(spans: &[(u64, usize, usize)], line: usize) -> Option<ViewAnchor> {
+    if spans.first().is_none_or(|(_, first, _)| line < *first) {
+        return Some(ViewAnchor::Header { line });
+    }
+    let index = spans.partition_point(|(_, _, end)| *end <= line);
+    let (cell_id, start, end) = spans.get(index)?;
+    // Lazy: `line - start` must not be computed when `line` is not inside.
+    (*start <= line && line < *end).then(|| ViewAnchor::Cell {
+        id: *cell_id,
+        offset: line - start,
+    })
 }
 
 pub(crate) fn draw(frame: &mut Frame, area: Rect, prepared: &PreparedDialog) {

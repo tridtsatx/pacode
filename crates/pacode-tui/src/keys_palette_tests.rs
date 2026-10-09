@@ -526,6 +526,13 @@ fn prefs_and_recents_follow_the_daemon_not_the_pick() {
         pacode_types::Event::SessionUpdated(meta("p/b", Effort::Medium, false)),
         Instant::now(),
     );
+    assert_eq!(state.recent_models, vec!["p/b", "p/a"]);
+    // The write rides the one prefs outbox, as the event loop hands it off.
+    let delta = state
+        .take_prefs_write()
+        .expect("the switch moves the defaults");
+    state.prefs_outbox.post(delta);
+    state.prefs_outbox.flush(&state.paths);
     let prefs = pacode_config::load_prefs(&state.paths);
     assert_eq!(prefs.model.as_deref(), Some("p/b"));
     assert_eq!(prefs.recent_models, vec!["p/b", "p/a"]);
@@ -539,6 +546,13 @@ fn prefs_and_recents_follow_the_daemon_not_the_pick() {
         Instant::now(),
     );
     assert_eq!(state.recent_models, vec!["p/b", "p/a"]);
+    assert_eq!(
+        state.take_prefs_write(),
+        Some(crate::state::PrefsDelta {
+            effort: Some(Effort::Low),
+            ..Default::default()
+        })
+    );
 }
 
 #[test]

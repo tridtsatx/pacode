@@ -223,3 +223,60 @@ fn new_attaches_a_fresh_session_with_the_current_settings() {
     assert!(state.meta.is_none(), "the old session is left, not closed");
     assert!(commands::find_command("new").is_some());
 }
+
+/// The last notice in the transcript: (level, text).
+fn last_notice(state: &AppState) -> (pacode_types::ToastLevel, String) {
+    state
+        .transcript
+        .cells
+        .iter()
+        .rev()
+        .find_map(|c| {
+            if let crate::state::CellKind::Item(pacode_types::TranscriptKind::Notice {
+                level,
+                text,
+            }) = &c.kind
+            {
+                Some((*level, text.clone()))
+            } else {
+                None
+            }
+        })
+        .expect("a notice")
+}
+
+/// B16: a theme name that is neither builtin nor a user theme is refused —
+/// nothing is applied, persisted, or reported as set.
+#[test]
+fn test_theme_typo_is_refused_and_not_persisted() {
+    let root = std::env::temp_dir().join(format!("pacode-b16-{}", std::process::id()));
+    let mut state = make_test_state();
+    state.paths = pacode_config::Paths::under(&root);
+    let before = state.config.theme.name.clone();
+    commands::execute(&mut state, "/theme no-such-theme");
+    assert_eq!(state.config.theme.name, before);
+    assert!(!state.paths.config_file.exists());
+    let (level, text) = last_notice(&state);
+    assert_eq!(level, pacode_types::ToastLevel::Warn);
+    assert!(text.contains("Unknown theme 'no-such-theme'"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B18: the valid list comes from `Effort::ALL`, so `xhigh` is in it.
+#[test]
+fn test_invalid_effort_lists_every_level() {
+    let mut state = make_test_state();
+    commands::execute(&mut state, "/effort bogus");
+    let (_, text) = last_notice(&state);
+    assert!(text.ends_with("low, medium, high, xhigh, max"), "{text}");
+}
+
+/// B20: a command's notice is the answer to what the user just typed; a
+/// reader scrolled up is brought down to it.
+#[test]
+fn test_command_notice_scrolls_into_view() {
+    let mut state = make_test_state();
+    state.transcript.scroll_from_bottom = 7;
+    commands::execute(&mut state, "/no-such-command");
+    assert_eq!(state.transcript.scroll_from_bottom, 0);
+}

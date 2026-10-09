@@ -2,7 +2,7 @@
 //! in the centre): effort support and clamping, ZDR, the bottom picker's
 //! height, recent routes, and the `prefs.toml` writes the pickers make.
 
-use pacode_types::{Config, Effort, ModelRoute, SessionMeta, ToastLevel, ZdrMode};
+use pacode_types::{Config, Effort, Mode, ModelRoute, SessionMeta, ToastLevel, ZdrMode};
 
 use super::{AppState, Focus, Overlay};
 
@@ -44,6 +44,125 @@ pub(crate) fn capped_recents(loaded: Vec<String>) -> Vec<String> {
     recents
 }
 
+/// Serializes every read-modify-write of `prefs.toml` in this process, so a
+/// write on a blocking thread and one on the UI thread cannot drop each
+/// other's field.
+static PREFS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load `prefs.toml`, apply `edit`, save it back — under [`PREFS_LOCK`].
+fn update_prefs(paths: &pacode_config::Paths, edit: impl FnOnce(&mut pacode_config::Prefs)) {
+    let _guard = prefs_lock();
+    update_prefs_locked(paths, edit);
+}
+
+/// A poisoned lock only means another writer panicked mid-edit; the file on
+/// disk is still whole, so the guard is taken over.
+fn prefs_lock() -> std::sync::MutexGuard<'static, ()> {
+    PREFS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`update_prefs`] for a caller already holding [`PREFS_LOCK`].
+fn update_prefs_locked(paths: &pacode_config::Paths, edit: impl FnOnce(&mut pacode_config::Prefs)) {
+    let mut prefs = pacode_config::load_prefs(paths);
+    edit(&mut prefs);
+    if let Err(e) = pacode_config::save_prefs(paths, &prefs) {
+        log::warn!("failed to save prefs: {e}");
+    }
+}
+
+/// The global defaults (`prefs.toml`) a session change moves: only the fields
+/// that session actually changed, so one session's untouched effort does not
+/// overwrite the default another session set. `recent_models` is the whole
+/// capped list, set when the daemon accepted a route switch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrefsDelta {
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub mode: Option<Mode>,
+    pub recent_models: Option<Vec<String>>,
+}
+
+impl PrefsDelta {
+    /// The fields `new` changed relative to `old` — empty unless both are the
+    /// same session.
+    pub fn between(old: &SessionMeta, new: &SessionMeta) -> Self {
+        if old.id != new.id {
+            return Self::default();
+        }
+        Self {
+            model: (old.model != new.model).then(|| new.model.to_string()),
+            effort: (old.effort != new.effort).then_some(new.effort),
+            mode: (old.mode != new.mode).then_some(new.mode),
+            recent_models: None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.effort.is_none()
+            && self.mode.is_none()
+            && self.recent_models.is_none()
+    }
+
+    /// Fold a later change in: its fields win.
+    pub fn merge(&mut self, later: Self) {
+        self.model = later.model.or(self.model.take());
+        self.effort = later.effort.or(self.effort);
+        self.mode = later.mode.or(self.mode);
+        self.recent_models = later.recent_models.or(self.recent_models.take());
+    }
+
+    fn apply_to(self, prefs: &mut pacode_config::Prefs) {
+        if let Some(model) = self.model {
+            prefs.model = Some(model);
+        }
+        if let Some(effort) = self.effort {
+            prefs.effort = Some(effort);
+        }
+        if let Some(mode) = self.mode {
+            prefs.mode = Some(mode);
+        }
+        if let Some(recent_models) = self.recent_models {
+            prefs.recent_models = recent_models;
+        }
+    }
+}
+
+/// The one pending default change, shared between the event loop (which
+/// posts changes in the order they happened) and the blocking tasks that
+/// write it. A task takes the delta and writes it under [`PREFS_LOCK`], so
+/// whichever task runs first writes the latest merged value and later ones
+/// find nothing: a later change can never be overwritten by an earlier one,
+/// however the blocking pool orders its tasks.
+#[derive(Clone, Default)]
+pub struct PrefsOutbox(std::sync::Arc<std::sync::Mutex<PrefsDelta>>);
+
+impl PrefsOutbox {
+    fn delta(&self) -> std::sync::MutexGuard<'_, PrefsDelta> {
+        // Poisoned only if a merge panicked; the delta is plain data.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Fold a change in, on the event loop, in event order.
+    pub fn post(&self, delta: PrefsDelta) {
+        self.delta().merge(delta);
+    }
+
+    /// Blocking disk IO — the event loop runs it on a blocking thread.
+    pub fn flush(&self, paths: &pacode_config::Paths) {
+        let _guard = prefs_lock();
+        let delta = std::mem::take(&mut *self.delta());
+        if delta.is_empty() {
+            return;
+        }
+        update_prefs_locked(paths, |prefs| delta.apply_to(prefs));
+    }
+}
+
 impl AppState {
     /// `supported_efforts` of the current route; `None` — route unknown to
     /// the model list or unrestricted — means every [`Effort`] is selectable
@@ -60,6 +179,39 @@ impl AppState {
     /// Whether `effort` may be selected on the current route (spec §6).
     pub fn effort_supported(&self, effort: Effort) -> bool {
         self.supported_efforts().is_none_or(|l| l.contains(&effort))
+    }
+
+    /// Switch the session to `route` as one ordered sequence that stops at
+    /// the first refusal: `SetModel` when the route changes, `SetEffort` when
+    /// `effort` differs from the session's, then `SetZdr(true)` for the Alt+Z
+    /// enable flow. Each later step is checked by the daemon against the route
+    /// the first one sets, so they must not race. Prefs and recents follow the
+    /// daemon's `SessionUpdated`, never this request. Nothing when nothing
+    /// would change. The one builder behind `/model <route>` and the palette.
+    pub fn model_switch_actions(
+        &self,
+        route: ModelRoute,
+        effort: Option<Effort>,
+        enable_zdr: bool,
+    ) -> Vec<crate::keys::Action> {
+        use pacode_types::Request;
+        let meta = self.meta.as_ref();
+        let mut requests = Vec::new();
+        if meta.is_none_or(|meta| meta.model != route) {
+            requests.push(Request::SetModel(route));
+        }
+        if let Some(effort) = effort.filter(|e| meta.is_none_or(|meta| meta.effort != *e)) {
+            requests.push(Request::SetEffort(effort));
+        }
+        if enable_zdr {
+            requests.push(Request::SetZdr(true));
+        }
+        if requests.is_empty() {
+            return vec![];
+        }
+        vec![crate::keys::prompt_batch_action(super::PromptBatch {
+            requests,
+        })]
     }
 
     /// After a route switch: when the session effort is outside `route`'s
@@ -87,11 +239,9 @@ impl AppState {
 
     /// Remember the marketplace `/plugins <source>` pointed at.
     pub fn save_pref_marketplace(&self, source: &str) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.marketplace = Some(source.to_string());
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (marketplace): {e}");
-        }
+        update_prefs(&self.paths, |prefs| {
+            prefs.marketplace = Some(source.to_string())
+        });
     }
 
     /// Move `route` to the front of the recent routes, without duplicates and
@@ -106,11 +256,15 @@ impl AppState {
 
     /// Persist the picker `z`/`s` toggles to `prefs.toml`.
     pub fn save_pref_model_flags(&self) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.model_flags = self.model_flags.clone();
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (model_flags): {e}");
-        }
+        let flags = self.model_flags.clone();
+        update_prefs(&self.paths, |prefs| prefs.model_flags = flags);
+    }
+
+    /// The defaults change a `SessionUpdated` asked for, handed to the event
+    /// loop to write off the UI thread. `None` when nothing changed.
+    pub fn take_prefs_write(&mut self) -> Option<PrefsDelta> {
+        let delta = std::mem::take(&mut self.pending_prefs);
+        (!delta.is_empty()).then_some(delta)
     }
 
     /// ZDR badge state: config-forced `always`, or `session` mode with the

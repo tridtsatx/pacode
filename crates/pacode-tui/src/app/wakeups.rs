@@ -34,6 +34,15 @@ pub(super) async fn second(needs_second: bool, state: &AppState) {
     }
 }
 
+/// A SCHEDULE countdown on the rail stepping to its next reading: one
+/// deadline while a countdown is on screen, nothing otherwise.
+pub(super) async fn schedule(state: &AppState) {
+    match state.schedule_redraw_in(pacode_types::time::now_ms()) {
+        Some(wait) => tokio::time::sleep(wait).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// The `ctrl+c` confirmation window closing.
 pub(super) async fn ctrl_c_expiry(state: &AppState) {
     if let Some(t) = state.ctrl_c_at {

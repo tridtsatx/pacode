@@ -931,7 +931,8 @@ fn permission_explained_after_resolve_lands_as_a_notice() {
     assert!(cell.perm_explain.is_none());
 
     // The aux call finished after the verdict — the answer still lands
-    // rather than vanishing.
+    // rather than vanishing, and (it answers the user's `e`) in view.
+    state.transcript.scroll_from_bottom = 4;
     state.apply_client_event(
         ClientEvent::Event {
             context: event_context(),
@@ -951,6 +952,7 @@ fn permission_explained_after_resolve_lands_as_a_notice() {
         }
         other => panic!("expected a notice, got {other:?}"),
     }
+    assert_eq!(state.transcript.scroll_from_bottom, 0);
 }
 
 #[test]
@@ -1455,4 +1457,272 @@ fn context_cleared_drops_everything_drawn_from_the_conversation() {
     assert_eq!(state.panel.target, None);
     assert!(matches!(state.focus, Focus::Normal));
     assert_eq!(state.meta.as_ref().map(|m| m.id.as_str()), Some("ses_test"));
+}
+
+fn running_tool(seq: u64, agent: &AgentId) -> TranscriptItem {
+    TranscriptItem {
+        seq,
+        agent: agent.clone(),
+        ts_ms: seq,
+        kind: TranscriptKind::ToolCall {
+            call_id: pacode_types::CallId::new(format!("call_{seq}")),
+            name: "bash".into(),
+            title: "bash echo".into(),
+            intent: None,
+            status: pacode_types::ToolStatus::Running,
+            preview: String::new(),
+            diff: None,
+            duration_ms: None,
+            task: None,
+        },
+    }
+}
+
+/// B05: an overlay opened over a subagent panel moves the keyboard to
+/// `Focus::Overlay`, and closing it lands on `Focus::Normal` — the panel stays
+/// on screen either way, so its agent's events must keep landing in it.
+#[test]
+fn a_panel_agent_keeps_streaming_while_the_keyboard_is_elsewhere() {
+    let id = AgentId::new("agt_sub1");
+    for focus in [
+        Focus::Overlay(crate::state::Overlay::QuestionPicker),
+        Focus::Normal,
+    ] {
+        let mut state = attached_state();
+        state.panel.target = Some(PanelTarget::Agent(id.clone()));
+        state.focus = focus;
+        let now = Instant::now();
+        crate::state::events::apply_event(
+            &mut state,
+            1,
+            Event::ItemAdded(TranscriptItem {
+                seq: 1,
+                agent: id.clone(),
+                ts_ms: 1,
+                kind: TranscriptKind::Assistant {
+                    text: String::new(),
+                    complete: false,
+                },
+            }),
+            now,
+        );
+        crate::state::events::apply_event(
+            &mut state,
+            2,
+            Event::ItemAdded(running_tool(2, &id)),
+            now,
+        );
+        crate::state::events::apply_event(
+            &mut state,
+            3,
+            Event::ToolOutput {
+                agent: id.clone(),
+                item_seq: 2,
+                text: "sub out".into(),
+            },
+            now,
+        );
+        assert_eq!(state.panel.agent_transcript.cells.len(), 2);
+        assert_eq!(
+            state
+                .panel
+                .agent_transcript
+                .tool_streams
+                .get(2)
+                .map(|v| v.text),
+            Some("sub out")
+        );
+        assert!(state.transcript.cells.is_empty());
+    }
+}
+
+/// B06: item seqs are per agent, so a subagent's chunk for its seq N must not
+/// grow the main agent's running row that happens to carry seq N too.
+#[test]
+fn a_subagent_tool_output_never_lands_in_the_main_running_row() {
+    let mut state = attached_state();
+    let sub = AgentId::new("agt_sub1");
+    let now = Instant::now();
+    crate::state::events::apply_event(
+        &mut state,
+        1,
+        Event::ItemAdded(running_tool(5, &AgentId::main())),
+        now,
+    );
+    crate::state::events::apply_event(
+        &mut state,
+        2,
+        Event::ToolOutput {
+            agent: sub,
+            item_seq: 5,
+            text: "sub out".into(),
+        },
+        now,
+    );
+    assert!(state.transcript.tool_streams.get(5).is_none());
+    crate::state::events::apply_event(
+        &mut state,
+        3,
+        Event::ToolOutput {
+            agent: AgentId::main(),
+            item_seq: 5,
+            text: "main out".into(),
+        },
+        now,
+    );
+    assert_eq!(
+        state.transcript.tool_streams.get(5).map(|v| v.text),
+        Some("main out")
+    );
+}
+
+fn session_updated(state: &mut AppState, meta: SessionMeta) {
+    crate::state::events::apply_event(state, 1, Event::SessionUpdated(meta), Instant::now());
+}
+
+/// B21: folding a `SessionUpdated` does no disk IO on the UI thread — the
+/// prefs file is untouched until the event loop hands the change off.
+#[test]
+fn session_updated_does_not_touch_prefs_on_the_ui_thread() {
+    let root = std::env::temp_dir().join(format!("pacode-b21-{}", std::process::id()));
+    let mut state = attached_state();
+    state.paths = pacode_config::Paths::under(&root);
+    let mut changed = meta();
+    changed.effort = Effort::Low;
+    changed.name = Some("renamed".into());
+    session_updated(&mut state, changed);
+    assert!(!pacode_config::prefs::prefs_file(&state.paths).exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B21: only what this session changed moves the global defaults — a title
+/// touch writes nothing, and an effort change does not drag the session's
+/// model and mode along over defaults another session set.
+#[test]
+fn session_updated_hands_off_only_the_changed_defaults() {
+    let mut state = attached_state();
+    let mut renamed = meta();
+    renamed.name = Some("renamed".into());
+    session_updated(&mut state, renamed.clone());
+    assert_eq!(state.take_prefs_write(), None);
+
+    let mut changed = renamed;
+    changed.effort = Effort::Low;
+    session_updated(&mut state, changed.clone());
+    assert_eq!(
+        state.take_prefs_write(),
+        Some(crate::state::PrefsDelta {
+            effort: Some(Effort::Low),
+            ..Default::default()
+        })
+    );
+
+    // Another session's meta (a switch landing) is not a change.
+    let mut other = changed;
+    other.id = SessionId::new("ses_other");
+    other.mode = Mode::Plan;
+    session_updated(&mut state, other);
+    assert_eq!(state.take_prefs_write(), None);
+}
+
+/// B21: two quick changes (shift+tab twice: Plan, then Auto) each hand a
+/// write to the blocking pool, which may run them in either order. The file
+/// must end on the later change either way.
+#[test]
+fn prefs_writes_land_in_change_order_whatever_order_the_writers_run() {
+    for later_writer_first in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "pacode-b21-order-{}-{later_writer_first}",
+            std::process::id()
+        ));
+        let paths = pacode_config::Paths::under(&root);
+        let outbox = crate::state::PrefsOutbox::default();
+        let mode = |mode| crate::state::PrefsDelta {
+            mode: Some(mode),
+            ..Default::default()
+        };
+        // Each post is followed by its own writer task, as in the loop.
+        outbox.post(mode(Mode::Plan));
+        let first_writer = outbox.clone();
+        outbox.post(mode(Mode::Auto));
+        let second_writer = outbox.clone();
+        if later_writer_first {
+            second_writer.flush(&paths);
+            first_writer.flush(&paths);
+        } else {
+            first_writer.flush(&paths);
+            second_writer.flush(&paths);
+        }
+        assert_eq!(
+            pacode_config::load_prefs(&paths).mode,
+            Some(Mode::Auto),
+            "later writer first: {later_writer_first}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// B12: switching while ↑ shows a history entry brings the real draft back,
+/// not the previewed entry.
+#[test]
+fn a_session_switch_while_browsing_history_keeps_the_real_draft() {
+    let mut state = attached_state();
+    state.input.history.push_back("old prompt".into());
+    state.input.text = "my draft".into();
+    state.input.history_up();
+    assert_eq!(state.input.text, "old prompt");
+    state.leave_active_slot();
+    assert_eq!(state.input.text, "my draft");
+    assert_eq!(state.input.history_index, None);
+}
+
+/// B11: `--analyze-mode` is per process; a session switch must not drop it.
+#[test]
+fn a_session_switch_keeps_analyze_mode() {
+    let mut state = attached_state();
+    state.analyze_mode = true;
+    state.leave_active_slot();
+    state.open_analyze();
+    assert!(matches!(
+        state.focus,
+        Focus::Overlay(crate::state::Overlay::Analyze { .. })
+    ));
+}
+
+/// B12: the composer belongs to the user — the draft and both histories
+/// survive a switch. Prompts queued behind the left session's turn are not
+/// sent to the next one; they come back when that session is attached again.
+#[test]
+fn a_session_switch_keeps_the_composer_and_stashes_the_queue() {
+    let mut state = attached_state();
+    state.input.text = "half a prompt".into();
+    state.input.history.push_back("earlier prompt".into());
+    state.input.bash_history.push_back("ls".into());
+    assert!(state.input.queue_push("queued".into()));
+    state.leave_active_slot();
+
+    assert_eq!(state.input.text, "half a prompt");
+    assert_eq!(
+        state.input.history.back().map(String::as_str),
+        Some("earlier prompt")
+    );
+    assert_eq!(
+        state.input.bash_history.back().map(String::as_str),
+        Some("ls")
+    );
+    assert!(state.input.prompt_queue.is_empty());
+
+    // Another session lands: its queue stays empty.
+    let mut other = snapshot(1, PathBuf::from("/tmp"));
+    other.meta.id = SessionId::new("ses_other");
+    assert!(state.apply_snapshot(other, Instant::now()));
+    assert!(state.input.prompt_queue.is_empty());
+
+    // Back to the first one: its queue is handed back.
+    state.leave_active_slot();
+    assert!(state.apply_snapshot(snapshot(1, PathBuf::from("/tmp")), Instant::now()));
+    assert_eq!(
+        state.input.prompt_queue.iter().collect::<Vec<_>>(),
+        vec!["queued"]
+    );
 }

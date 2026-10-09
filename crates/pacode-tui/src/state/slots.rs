@@ -4,6 +4,8 @@
 //! one attached at a time. Inactive slots drop heavy runtime structures (transcript cells,
 //! panel transcripts, caches) and retain only summary metadata and small counters for UI display.
 
+use std::collections::VecDeque;
+
 use pacode_types::{SessionId, SessionSnapshot, SessionStatusKind};
 
 use super::{AppState, Connection};
@@ -104,6 +106,12 @@ impl AppState {
         // — and quiet lands on `Idle`, not `Done`: the session was on screen,
         // so there is nothing unseen.
         let status = self.active_slot_status();
+        if let Some(session) = self.meta.as_ref().map(|meta| meta.id.clone()) {
+            let queue = std::mem::take(&mut self.session.input.prompt_queue);
+            if !queue.is_empty() {
+                self.stash_queue(session, queue);
+            }
+        }
         if let Some(meta) = &self.meta {
             self.slots[current] = Some(SessionSlot {
                 id: meta.id.clone(),
@@ -128,5 +136,42 @@ impl AppState {
         self.lists.git = crate::cache::ListHealth::default();
         self.connection = Connection::Connecting;
         self.dirty = true;
+    }
+
+    fn stash_queue(&mut self, session: SessionId, queue: VecDeque<String>) {
+        self.stashed_queues.retain(|(id, _)| *id != session);
+        if self.stashed_queues.len() >= NUM_SLOTS
+            && let Some((_, dropped)) = self.stashed_queues.pop_front()
+        {
+            self.push_toast(
+                pacode_types::ToastLevel::Warn,
+                format!("Dropped {} queued prompt(s)", dropped.len()),
+                Some("too many sessions left with queued prompts".to_string()),
+                std::time::Instant::now(),
+            );
+        }
+        self.stashed_queues.push_back((session, queue));
+    }
+
+    /// Hand back the prompts queued in `session` before the user switched
+    /// away from it; they go out once its turn is over, as queued prompts do.
+    pub(crate) fn restore_stashed_queue(&mut self, session: &SessionId) {
+        if let Some(index) = self.stashed_queues.iter().position(|(id, _)| id == session)
+            && let Some((_, queue)) = self.stashed_queues.remove(index)
+        {
+            // The stash was queued first; anything queued while the attach
+            // was in flight goes behind it, up to the queue's cap.
+            let later = std::mem::replace(&mut self.session.input.prompt_queue, queue);
+            for text in later {
+                if !self.session.input.queue_push(text) {
+                    self.push_toast(
+                        pacode_types::ToastLevel::Warn,
+                        "Prompt queue full; a queued prompt was dropped".to_string(),
+                        None,
+                        std::time::Instant::now(),
+                    );
+                }
+            }
+        }
     }
 }

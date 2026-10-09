@@ -254,6 +254,23 @@ fn enter_resumes_and_closes_the_stack() {
     assert!(stack.is_empty());
 }
 
+/// B22: enter on the session already on screen closes the menu and leaves the
+/// attached session alone (no re-attach, no "connecting" flash).
+#[test]
+fn enter_on_the_current_session_only_closes_the_menu() {
+    let current = session("pacode-42", now_ms());
+    let mut state = make_state(vec![current.clone()]);
+    state.meta = Some(current);
+    state.input.text = "draft".into();
+    let mut stack = MenuStack::root(MenuId::Sessions);
+    let mut ui = MenuUiState::default();
+    let actions = on_row(&mut state, &mut stack, &mut ui, &RowId::new("pacode-42"));
+    assert!(actions.is_empty());
+    assert!(stack.is_empty());
+    assert!(state.meta.is_some());
+    assert!(state.pending_attach.is_none());
+}
+
 #[test]
 fn enter_on_a_gone_row_is_a_noop() {
     let mut state = make_state(vec![session("pacode-1", now_ms())]);

@@ -574,6 +574,20 @@ impl InputState {
         }
     }
 
+    /// Stop browsing history (prompt or `!`) with the user's own draft back in
+    /// the prompt — the entry on display was only a preview of the history.
+    pub fn leave_history(&mut self) {
+        if self.history_index.take().is_some() {
+            self.text = std::mem::take(&mut self.draft);
+            self.cursor = self.text.chars().count();
+        }
+        if self.bash_history_index.take().is_some() {
+            self.text = std::mem::take(&mut self.bash_draft);
+            self.cursor = self.text.chars().count();
+        }
+        self.vert_goal = None;
+    }
+
     pub fn history_up(&mut self) {
         self.vert_goal = None;
         if self.history.is_empty() {

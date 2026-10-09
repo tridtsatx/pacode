@@ -22,7 +22,7 @@ use pacode_types::{Effort, ModelRoute, Request, ToastLevel};
 
 use crate::binding::Action as KeyAction;
 use crate::keys::Action;
-use crate::state::{AppState, Focus, Overlay, PromptBatch};
+use crate::state::{AppState, Focus, Overlay};
 use crate::ui::model_palette::{Anchor, LoginLine, ModelPalette, Row, Sources};
 
 /// How far page up / page down move the selection.
@@ -221,25 +221,10 @@ fn commit(state: &mut AppState, palette: &mut ModelPalette) -> (Vec<Action>, boo
             ..
         } => (sign_in(palette, route.provider), false),
         Picked::SignIn(provider) => (sign_in(palette, provider), false),
-        Picked::Model { route, effort, .. } => {
-            let meta = state.meta.as_ref();
-            let mut requests = Vec::new();
-            if meta.is_none_or(|meta| meta.model != route) {
-                requests.push(Request::SetModel(route));
-            }
-            if let Some(effort) = effort.filter(|e| meta.is_none_or(|meta| meta.effort != *e)) {
-                requests.push(Request::SetEffort(effort));
-            }
-            if palette.for_zdr {
-                requests.push(Request::SetZdr(true));
-            }
-            let actions = if requests.is_empty() {
-                vec![]
-            } else {
-                vec![crate::keys::prompt_batch_action(PromptBatch { requests })]
-            };
-            (actions, true)
-        }
+        Picked::Model { route, effort, .. } => (
+            state.model_switch_actions(route, effort, palette.for_zdr),
+            true,
+        ),
         Picked::Nothing => (vec![], false),
     }
 }

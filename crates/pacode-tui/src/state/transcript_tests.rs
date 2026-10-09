@@ -1522,3 +1522,62 @@ fn a_tool_output_chunk_for_an_unknown_cell_is_refused() {
     t.push_tool_output(99, "orphan\n");
     assert_eq!(t.tool_streams.get(99), None);
 }
+
+fn three_line_item(seq: u64) -> TranscriptItem {
+    user_item(seq, &format!("{seq} first\n{seq} second\n{seq} third"))
+}
+
+/// The cell and the line within it at the top of the last frame.
+fn top_of_view(t: &Transcript) -> Option<(u64, usize)> {
+    let line = t.first_visible_line;
+    let id = t.cell_at_line(line)?;
+    let (_, start, _) = t.cell_lines.iter().find(|(cell, _, _)| *cell == id)?;
+    Some((id, line - start))
+}
+
+/// B08: scrolled up, the reader's text stays put while new content lands
+/// below it; the view no longer drifts up one row per streamed line.
+#[test]
+fn a_scrolled_up_view_stays_on_its_text_while_content_arrives() {
+    let opts = pacode_render::RenderOptions::new(30, false);
+    let area = ratatui::layout::Rect::new(0, 0, 30, 4);
+    let mut t = Transcript::new(64);
+    t.reset((1..=10).map(three_line_item).collect(), false);
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    t.scroll_by(5);
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    let before = top_of_view(&t);
+    let scroll_before = t.scroll_from_bottom;
+    assert!(before.is_some());
+
+    t.upsert(three_line_item(11), Instant::now());
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+
+    assert_eq!(top_of_view(&t), before);
+    assert!(t.scroll_from_bottom > scroll_before);
+}
+
+/// B08: scrolled to the very top, the reader is on the welcome header — not
+/// a cell — and the view stays there while content arrives below.
+#[test]
+fn a_view_scrolled_to_the_header_stays_at_the_top_while_content_arrives() {
+    let opts = pacode_render::RenderOptions::new(30, false);
+    let area = ratatui::layout::Rect::new(0, 0, 30, 4);
+    let mut t = Transcript::new(64);
+    t.reset((1..=10).map(three_line_item).collect(), false);
+    t.set_header(HeaderInfo {
+        version: "0.1.0".into(),
+        day: 0,
+        mascot: crate::ui::mascot::MascotKind::Pacman,
+        truecolor: true,
+    });
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    t.scroll_to_top();
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    assert_eq!(t.first_visible_line, 0);
+    assert!(t.cell_lines.first().is_some_and(|(_, start, _)| *start > 0));
+
+    t.upsert(three_line_item(11), Instant::now());
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    assert_eq!(t.first_visible_line, 0);
+}

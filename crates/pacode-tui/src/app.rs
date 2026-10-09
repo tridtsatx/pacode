@@ -295,6 +295,7 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             wakeups::deferred_draw(painter.next_draw_wait(&state, frame_interval, anim.period()));
         let menu_remote_sleep = wakeups::menu_remote(&state);
         let resync_sleep = wakeups::resync(&state);
+        let schedule_sleep = wakeups::schedule(&state);
         let anim_sleep = anim.tick();
 
         tokio::select! {
@@ -377,6 +378,9 @@ pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>
             _ = toast_expiry_sleep => {
                 state.expire_toasts(Instant::now());
             }
+            _ = schedule_sleep => {
+                state.dirty = true;
+            }
             _ = deferred_draw_sleep => {
                 // Loop iteration triggers draw
             }
@@ -449,6 +453,7 @@ fn on_client_event(
     let pending_attach = state.pending_attach.is_some();
     let now = Instant::now();
     let snapshot_applied = state.apply_client_event(ev, now);
+    flush_prefs_write(state);
     if reset_deferred && snapshot_applied {
         state.session.cancel_deferred_work();
         clear_list_loading(state);
@@ -478,6 +483,17 @@ fn on_client_event(
     }
 }
 
+/// Write the default changes a `SessionUpdated` produced, on a blocking
+/// thread: `prefs.toml` is disk IO and the UI thread never waits on it.
+fn flush_prefs_write(state: &mut AppState) {
+    if let Some(delta) = state.take_prefs_write() {
+        state.prefs_outbox.post(delta);
+        let outbox = state.prefs_outbox.clone();
+        let paths = state.paths.clone();
+        tokio::task::spawn_blocking(move || outbox.flush(&paths));
+    }
+}
+
 /// A background result: fold it in, then dispatch what it produced and
 /// whatever it unblocked — an attach retry and queued prompts.
 fn on_bg_response(
@@ -487,6 +503,7 @@ fn on_bg_response(
     bg_tx: &mpsc::UnboundedSender<BgResponse>,
 ) {
     let actions = handle_bg_response(res, state);
+    flush_prefs_write(state);
     dispatch_pending_attach_retry(state, client, bg_tx);
     for act in actions {
         dispatch_action(act, state, client, bg_tx);

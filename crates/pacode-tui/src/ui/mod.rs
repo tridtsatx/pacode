@@ -135,6 +135,9 @@ pub fn prepare_frame(area: Rect, state: &mut AppState, now: std::time::Instant) 
     popup::prepare_scan_wants(state, completion.as_ref());
     let full_popup = popup::resolve_full(state, &layout, now);
     let rail = rail::resolve(state, layout.rail);
+    // The countdown wakeup (`AppState::schedule_redraw_in`) reads what this
+    // frame draws; no rail, no countdown on screen.
+    state.rail.schedule_rows_drawn = rail.as_ref().map_or(0, |r| r.schedule_rows_drawn);
     let overlay = overlays::prepare(
         state,
         full_popup.as_ref(),
