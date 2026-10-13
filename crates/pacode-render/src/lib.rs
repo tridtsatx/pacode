@@ -13,6 +13,7 @@ pub mod stream;
 pub mod syntax;
 pub mod text;
 pub mod theme;
+mod theme_derive;
 pub mod wrap;
 
 use pacode_types::config::ShimmerMode;

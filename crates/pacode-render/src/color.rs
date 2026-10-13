@@ -68,6 +68,12 @@ pub(crate) const GREY_ROLES: &[&str] = &[
     "argument",
     "surface",
     "border",
+    "panel",
+    "tool_pending_bg",
+    "tool_success_bg",
+    "tool_error_bg",
+    "status_bg",
+    "status_bg_alt",
 ];
 
 /// Palette roles whose ANSI-16 colour is fixed by meaning, as in

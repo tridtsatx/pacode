@@ -10,6 +10,7 @@ use crate::color::{GREY_ROLES, NAMED_ROLES};
 pub use crate::color::{ansi_grey, ansi_hue, parse_color, rgb_to_ansi16};
 pub use crate::glyphs::Glyphs;
 pub use crate::palettes::builtin_palettes;
+use crate::theme_derive::{derive_border, derive_surface, relative_luminance};
 
 /// Serializable color palette. Role names match `Theme` fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,12 +60,33 @@ pub struct Theme {
     /// Foreground of frames and borders (the prompt frame at rest, menus,
     /// overlays). Derived between `faint` and `dim`.
     pub border: Style,
+    /// Solid background of overlays, popups, menus, pickers and toasts, so a
+    /// translucent terminal background never shows through them. Derived
+    /// from `selected_bg` moved away from the text (darker on a dark
+    /// palette, lighter on a light one), so a selected row stays visible on
+    /// it. Empty under ANSI-16 and mono: overlays keep the terminal's own
+    /// background, as before.
+    pub panel: Style,
+    /// Background of a tool-call block while the call runs: the neutral
+    /// tool card (halfway between `panel` and `selected_bg`) tinted a little
+    /// towards `accent`, the running colour. Empty under ANSI-16 and mono;
+    /// the status glyph and its colour carry the state there.
+    pub tool_pending_bg: Style,
+    /// Background of a finished tool-call block: the tool card tinted a
+    /// little towards `green`. Empty under ANSI-16 and mono.
+    pub tool_success_bg: Style,
+    /// Background of a failed tool-call block: the tool card tinted towards
+    /// `red`, the strongest of the three tints. Empty under ANSI-16 and mono.
+    pub tool_error_bg: Style,
+    /// Background of the odd powerline segments of the status line: `panel`
+    /// moved a quarter of the way towards `faint`. Empty under ANSI-16 and
+    /// mono, where the segments are separated by their glyphs alone.
+    pub status_bg: Style,
+    /// Background of the even status-line segments: a shade further towards
+    /// `faint` than `status_bg`. Empty under ANSI-16 and mono.
+    pub status_bg_alt: Style,
 }
 
-/// How far `surface` moves from `selected_bg` towards `faint`.
-const SURFACE_MIX: f32 = 0.35;
-/// How far `border` moves from `faint` towards `dim`.
-const BORDER_MIX: f32 = 0.4;
 /// Badge foregrounds: not pure black/white, which glare on most palettes.
 const BADGE_DARK: Color = Color::Rgb(0x16, 0x16, 0x16);
 const BADGE_LIGHT: Color = Color::Rgb(0xf6, 0xf6, 0xf4);
@@ -247,7 +269,7 @@ impl Theme {
             .map(|c| Style::default().fg(c))
             .unwrap_or_else(|| derive_border(faint, dim));
 
-        Self {
+        let mut theme = Self {
             fg,
             dim,
             faint,
@@ -268,7 +290,11 @@ impl Theme {
             bash_arg,
             surface,
             border,
-        }
+            // Only the backgrounds, which `derive_backgrounds` sets next.
+            ..Self::mono()
+        };
+        theme.derive_backgrounds(p.light, resolve);
+        theme
     }
 
     /// A badge (plaque) in `tone`: the tone's colour as the background under a
@@ -305,7 +331,7 @@ impl Theme {
         let selected_bg = Style::default().bg(Color::Rgb(0x1e, 0x24, 0x1c));
         let dim = rgb(0x75, 0x77, 0x6f);
         let faint = rgb(0x43, 0x46, 0x3f);
-        Self {
+        let mut theme = Self {
             fg: rgb(0xc9, 0xc7, 0xc0),
             dim,
             faint,
@@ -328,7 +354,11 @@ impl Theme {
             bash_arg: rgb(0xc9, 0xc7, 0xc0),
             surface: derive_surface(selected_bg, faint),
             border: derive_border(faint, dim),
-        }
+            // Only the backgrounds, which `derive_backgrounds` sets next.
+            ..Self::mono()
+        };
+        theme.derive_backgrounds(false, |_| None);
+        theme
     }
 
     /// Plain ANSI-16 palette.
@@ -358,6 +388,12 @@ impl Theme {
             bash_arg: Style::default(),
             surface: Style::default(),
             border: Style::default().fg(Color::DarkGray),
+            panel: Style::default(),
+            tool_pending_bg: Style::default(),
+            tool_success_bg: Style::default(),
+            tool_error_bg: Style::default(),
+            status_bg: Style::default(),
+            status_bg_alt: Style::default(),
         }
     }
 
@@ -383,49 +419,20 @@ impl Theme {
             bash_arg: Style::default(),
             surface: Style::default(),
             border: Style::default(),
+            panel: Style::default(),
+            tool_pending_bg: Style::default(),
+            tool_success_bg: Style::default(),
+            tool_error_bg: Style::default(),
+            status_bg: Style::default(),
+            status_bg_alt: Style::default(),
         }
     }
-}
-
-/// `selected_bg` pulled towards `faint` — only when both are RGB. A terminal
-/// limited to named colours gets no band: a named background is either the
-/// terminal's own background (invisible) or a loud block.
-fn derive_surface(selected_bg: Style, faint: Style) -> Style {
-    match (selected_bg.bg, faint.fg) {
-        (Some(Color::Rgb(r1, g1, b1)), Some(Color::Rgb(r2, g2, b2))) => {
-            Style::default().bg(mix((r1, g1, b1), (r2, g2, b2), SURFACE_MIX))
-        }
-        _ => Style::default(),
-    }
-}
-
-/// Between `faint` and `dim` when both are RGB; `faint` itself otherwise.
-fn derive_border(faint: Style, dim: Style) -> Style {
-    match (faint.fg, dim.fg) {
-        (Some(Color::Rgb(r1, g1, b1)), Some(Color::Rgb(r2, g2, b2))) => {
-            Style::default().fg(mix((r1, g1, b1), (r2, g2, b2), BORDER_MIX))
-        }
-        _ => faint,
-    }
-}
-
-fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
-    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color::Rgb(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
 }
 
 /// Near-black or near-white, whichever has the higher WCAG contrast ratio
 /// against `(r, g, b)`.
 fn contrast_fg(r: u8, g: u8, b: u8) -> Color {
-    let lin = |c: u8| {
-        let c = c as f32 / 255.0;
-        if c <= 0.039_28 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    let l = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    let l = relative_luminance(r, g, b);
     // Against black the ratio is (l + 0.05) / 0.05, against white
     // 1.05 / (l + 0.05); black wins when the first is larger.
     if (l + 0.05) * (l + 0.05) > 0.05 * 1.05 {
