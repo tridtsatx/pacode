@@ -677,12 +677,16 @@ pub async fn execute_tool_calls(
         });
     }
 
+    // Decided on the model's input. A plugin hook may still rewrite a call
+    // inside `run_single_tool`; the tool then checks and asks for the input it
+    // actually runs, so the permission stays exact, only the call keeps the
+    // group it was placed in.
+    let cwd = session.meta().cwd;
     let mut chunks: Vec<ToolChunk> = Vec::new();
     for call in prepared_calls {
         let is_concurrent = registry_snapshot
             .get(&call.name)
-            .map(|tool| matches!(tool.kind(), ToolKind::ReadOnly | ToolKind::Network))
-            .unwrap_or(false);
+            .is_some_and(|tool| tool.runs_concurrently(&call.input, &cwd));
 
         if is_concurrent {
             match chunks.last_mut() {
@@ -859,3 +863,7 @@ pub(crate) async fn stub_dangling_tool_calls(session: &Arc<Session>, agent: &Arc
 #[cfg(test)]
 #[path = "tools_tests.rs"]
 mod tools_tests;
+
+#[cfg(test)]
+#[path = "tools_bash_tests.rs"]
+mod tools_bash_tests;

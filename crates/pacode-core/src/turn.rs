@@ -14,7 +14,8 @@
 //!     match agent.take_due(now) { None → break; taken → push render_injections; continue }
 //!     // taken, not yet delivered → agent.restore_due(taken), unchanged
 //!   }
-//!   run tool calls: ReadOnly/Network in parallel (join_all), others sequentially, each:
+//!   run tool calls: consecutive `Tool::runs_concurrently` calls (reads, network, read-only
+//!   Safe bash) in parallel (join_all), others sequentially, each:
 //!     gate → maybe ask permission (WaitingApproval) → call → cap output → history.push(tool_result) (persist)
 //!     emit ItemAdded/ItemUpdated(ToolCall …); cancel → stub tool results ("cancelled") then Interrupted
 //!   // point C: urgent interrupt only (cancel token)

@@ -112,6 +112,14 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// Whether this call may run alongside its neighbours of the same model
+    /// step: it changes nothing another call could observe, so their order
+    /// does not matter. The turn joins consecutive calls that say yes and runs
+    /// the rest one at a time, in call order. Default: reads and network calls.
+    fn runs_concurrently(&self, _input: &Value, _cwd: &std::path::Path) -> bool {
+        matches!(self.kind(), ToolKind::ReadOnly | ToolKind::Network)
+    }
+
     /// The definition advertised to the model, memoised when the tool holds a
     /// cache (see [`definition_cache`](Self::definition_cache)).
     fn definition(&self) -> ToolDefinition {

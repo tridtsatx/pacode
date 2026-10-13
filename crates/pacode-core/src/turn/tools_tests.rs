@@ -93,7 +93,7 @@ fn pending_batch(index: usize) -> PendingToolCall {
     }
 }
 
-fn test_session(
+pub(super) fn test_session(
     config: Config,
     tool: Arc<dyn Tool>,
 ) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>) {
@@ -179,7 +179,7 @@ fn test_session(
     (temp, session, agent)
 }
 
-fn tool_results(agent: &Agent) -> Vec<String> {
+pub(super) fn tool_results(agent: &Agent) -> Vec<String> {
     agent
         .history
         .lock()

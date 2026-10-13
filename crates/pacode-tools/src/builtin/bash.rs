@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WaitOutcome};
 
+#[cfg(test)]
+#[path = "bash_tests.rs"]
+mod bash_tests;
 #[path = "ssh_multiplex.rs"]
 mod ssh_multiplex;
 #[cfg(test)]
@@ -63,6 +66,18 @@ impl Tool for BashTool {
 
     fn kind(&self) -> ToolKind {
         ToolKind::Exec
+    }
+
+    /// A command that only reads (the Plan-mode allowlist) and that the risk
+    /// classifier finds `Safe`, which the permission matrix allows in every
+    /// mode without a prompt. Anything else keeps its place in the sequence,
+    /// so a command that may write or ask stays ordered against its neighbours.
+    fn runs_concurrently(&self, input: &Value, cwd: &std::path::Path) -> bool {
+        let Some(command) = input.get("command").and_then(Value::as_str) else {
+            return false;
+        };
+        pacode_risk::is_read_only(command)
+            && pacode_risk::classify(command, cwd).level == pacode_risk::RiskLevel::Safe
     }
 
     /// 1. `pacode_risk::classify(command, cwd)`; in `Mode::Plan` the command must also
