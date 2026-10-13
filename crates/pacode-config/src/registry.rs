@@ -243,6 +243,8 @@ pub static SETTINGS: &[SettingEntry] = &[
     // session
     SettingEntry { dotted_key: "session.title_model", label: "Session Title Model", description: "Model used to name sessions after first reply", section: "session", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "session.history_page", label: "History Page Size", description: "Transcript items per historical page load", section: "session", default_value: "200", kind: SettingKind::Integer { min: 1, max: 5000 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "session.plan_reminders", label: "Plan Reminders", description: "Remind the agent to continue when it stops with open plan items", section: "session", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "session.plan_reminders_max", label: "Plan Reminders Max", description: "Most plan reminders per user message", section: "session", default_value: "3", kind: SettingKind::Integer { min: 1, max: 10 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "zdr", label: "ZDR Mode", description: "Zero-data-retention routing: always, session (Alt+Z toggle), or off", section: "session", default_value: "session", kind: SettingKind::Enum { options: ZDR_OPTIONS }, apply: ApplyMode::NextTurn },
 
     // plugins
@@ -412,6 +414,8 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "mcp.idle_timeout_secs" => Some(config.mcp.idle_timeout_secs.to_string()),
         "session.title_model" => Some(config.session.title_model.clone().unwrap_or_default()),
         "session.history_page" => Some(config.session.history_page.to_string()),
+        "session.plan_reminders" => Some(config.session.plan_reminders.to_string()),
+        "session.plan_reminders_max" => Some(config.session.plan_reminders_max.to_string()),
         "zdr" => Some(config.zdr.as_str().to_string()),
         "plugins.enabled" => Some(config.plugins.enabled.to_string()),
         "plugins.wasm_memory_mb" => Some(config.plugins.wasm_memory_mb.to_string()),
@@ -1046,6 +1050,16 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "session.history_page" => {
             if let toml::Value::Integer(n) = value {
                 config.session.history_page = *n as u32;
+            }
+        }
+        "session.plan_reminders" => {
+            if let toml::Value::Boolean(b) = value {
+                config.session.plan_reminders = *b;
+            }
+        }
+        "session.plan_reminders_max" => {
+            if let toml::Value::Integer(n) = value {
+                config.session.plan_reminders_max = *n as u32;
             }
         }
         "zdr" => {

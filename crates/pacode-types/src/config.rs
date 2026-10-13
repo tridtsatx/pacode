@@ -1195,6 +1195,12 @@ pub struct SessionConfig {
     pub title_model: Option<String>,
     /// Transcript items sent in a snapshot / history page.
     pub history_page: u32,
+    /// When the main agent stops on its own while the session plan still has
+    /// open items, remind it and let it continue.
+    pub plan_reminders: bool,
+    /// Most plan reminders per user message; the budget resets when the user
+    /// writes again.
+    pub plan_reminders_max: u32,
 }
 
 impl Default for SessionConfig {
@@ -1202,6 +1208,8 @@ impl Default for SessionConfig {
         Self {
             title_model: None,
             history_page: 200,
+            plan_reminders: true,
+            plan_reminders_max: 3,
         }
     }
 }
@@ -1339,6 +1347,8 @@ mod tests {
         assert!(cfg.skills.enabled);
         assert!(cfg.skills.dirs.is_empty());
         assert_eq!(cfg.skills.max_body_bytes, 16384);
+        assert!(cfg.session.plan_reminders);
+        assert_eq!(cfg.session.plan_reminders_max, 3);
         assert_eq!(cfg.ui.animation, AnimationMode::Smooth);
         // Named serde defaults, checked through a *parse*: a bare
         // `#[serde(default)]` on these would resolve to the field type's zero

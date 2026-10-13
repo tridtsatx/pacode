@@ -381,7 +381,8 @@ pub(super) fn question_key(injection: &Injection) -> Option<(&AgentId, &CallId)>
         | Injection::StatusRequest
         | Injection::AgentStatus { .. }
         | Injection::ParentMessage { .. }
-        | Injection::SendLanded { .. } => None,
+        | Injection::SendLanded { .. }
+        | Injection::PlanReminder { .. } => None,
     }
 }
 

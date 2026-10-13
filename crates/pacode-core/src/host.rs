@@ -583,25 +583,7 @@ impl ToolHost for SessionHost {
 
     fn emit_notice(&self, level: ToastLevel, text: String) {
         if let Some(agent) = self.owner_agent() {
-            let seq = agent
-                .transcript
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .next_seq();
-            let item = pacode_types::TranscriptItem {
-                seq,
-                agent: agent.id(),
-                ts_ms: pacode_types::now_ms(),
-                kind: pacode_types::TranscriptKind::Notice { level, text },
-            };
-            agent
-                .transcript
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .upsert(item.clone());
-            self.session
-                .events
-                .emit(pacode_types::Event::ItemAdded(item));
+            self.session.emit_notice(&agent, level, text);
         }
     }
 }

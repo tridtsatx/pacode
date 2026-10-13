@@ -586,6 +586,9 @@ pub struct Agent {
     /// agent in a session with no `[ui] fusion` pair. Replaced wholesale at
     /// turn start, the same point that invalidates `prompt_cache`.
     pub fusion: Mutex<Option<crate::fusion::FusionTrace>>,
+    /// Plan reminders sent for the current user message (main agent only;
+    /// see `plan_reminder`). A detached agent keeps its copy and never reads it.
+    pub(crate) plan_reminders: Mutex<crate::plan_reminder::Budget>,
 }
 
 impl Agent {
@@ -629,6 +632,7 @@ impl Agent {
             prompt_cache: Mutex::new(None),
             spawned_at: Mutex::new(None),
             fusion: Mutex::new(None),
+            plan_reminders: Mutex::new(crate::plan_reminder::Budget::default()),
         }
     }
 
@@ -688,6 +692,7 @@ impl Agent {
             prompt_cache: Mutex::new(None),
             spawned_at: Mutex::new(None),
             fusion: Mutex::new(None),
+            plan_reminders: Mutex::new(crate::plan_reminder::Budget::default()),
         }
     }
 

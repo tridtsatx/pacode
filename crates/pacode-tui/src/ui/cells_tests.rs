@@ -248,3 +248,21 @@ fn a_finished_background_job_is_tinted_by_its_outcome() {
     let lines = render_background_result(&job(BackgroundOutcome::Failed), 40, &ansi);
     assert!(lines[0].spans.iter().all(|s| s.style.bg.is_none()));
 }
+
+/// The daemon's plan-reminder line: one faint row and the separator.
+#[test]
+fn an_info_notice_is_one_faint_line() {
+    let opts = opts(60);
+    let lines = render(
+        &TranscriptKind::Notice {
+            level: ToastLevel::Info,
+            text: "↻ 2 plan items open — continuing (1/3)".into(),
+        },
+        &opts,
+        false,
+    );
+    assert_eq!(lines.len(), 2);
+    assert_eq!(text(&lines[0]), "↻ 2 plan items open — continuing (1/3)");
+    assert!(lines[0].spans.iter().all(|s| s.style == opts.theme.faint));
+    assert!(text(&lines[1]).is_empty());
+}

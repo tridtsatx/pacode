@@ -357,7 +357,8 @@ fn take_unread_report(session: &Session, parent: &Arc<Agent>, agent: &AgentId) -
         | Injection::AgentStatus { .. }
         | Injection::ParentMessage { .. }
         | Injection::AgentQuestion { .. }
-        | Injection::SendLanded { .. } => None,
+        | Injection::SendLanded { .. }
+        | Injection::PlanReminder { .. } => None,
     })
 }
 
@@ -371,7 +372,7 @@ mod edge_tests;
 #[cfg(test)]
 mod flow_tests;
 #[cfg(test)]
-mod harness;
+pub(crate) mod harness;
 #[cfg(test)]
 mod race_tests;
 #[cfg(test)]

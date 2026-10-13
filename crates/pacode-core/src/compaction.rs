@@ -461,27 +461,11 @@ pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool,
     }
     drop(_message_guard);
 
-    let notice_item = pacode_types::TranscriptItem {
-        seq: agent
-            .transcript
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .next_seq(),
-        agent: agent.id(),
-        ts_ms: pacode_types::now_ms(),
-        kind: pacode_types::TranscriptKind::Notice {
-            level: pacode_types::ToastLevel::Info,
-            text: format!("Conversation history compacted up to seq {upto_seq}"),
-        },
-    };
-    agent
-        .transcript
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .upsert(notice_item.clone());
-    session
-        .events
-        .emit(pacode_types::Event::ItemAdded(notice_item));
+    session.emit_notice(
+        agent,
+        pacode_types::ToastLevel::Info,
+        format!("Conversation history compacted up to seq {upto_seq}"),
+    );
 
     Ok(true)
 }

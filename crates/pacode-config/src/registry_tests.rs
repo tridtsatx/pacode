@@ -792,3 +792,49 @@ fn ui_powerline_is_an_immediate_bool_that_round_trips() {
     reset_in_config(&mut cfg, "ui.powerline");
     assert!(!cfg.ui.powerline);
 }
+
+#[test]
+fn plan_reminder_settings_round_trip() {
+    let parsed: Config =
+        toml::from_str("[session]\nplan_reminders = false\nplan_reminders_max = 5\n")
+            .expect("parse");
+    assert!(!parsed.session.plan_reminders);
+    assert_eq!(parsed.session.plan_reminders_max, 5);
+    let text = toml::to_string(&parsed).expect("serialize");
+    let back: Config = toml::from_str(&text).expect("reparse");
+    assert_eq!(back.session, parsed.session);
+
+    let enabled = find_entry("session.plan_reminders").expect("registered");
+    assert_eq!(enabled.section, "session");
+    assert_eq!(enabled.default_value, "true");
+    assert!(matches!(enabled.kind, SettingKind::Bool));
+    let max = find_entry("session.plan_reminders_max").expect("registered");
+    assert_eq!(max.default_value, "3");
+    assert!(matches!(max.kind, SettingKind::Integer { min: 1, max: 10 }));
+    assert!(validate_candidate(max, "0").is_err());
+
+    let mut cfg = Config::default();
+    assert_eq!(
+        read_value(&cfg, "session.plan_reminders"),
+        Some("true".into())
+    );
+    assert_eq!(
+        read_value(&cfg, "session.plan_reminders_max"),
+        Some("3".into())
+    );
+    apply_to_config(
+        &mut cfg,
+        "session.plan_reminders",
+        &toml::Value::Boolean(false),
+    );
+    apply_to_config(
+        &mut cfg,
+        "session.plan_reminders_max",
+        &toml::Value::Integer(7),
+    );
+    assert!(!cfg.session.plan_reminders);
+    assert_eq!(cfg.session.plan_reminders_max, 7);
+    reset_in_config(&mut cfg, "session.plan_reminders");
+    reset_in_config(&mut cfg, "session.plan_reminders_max");
+    assert_eq!(cfg.session, Config::default().session);
+}

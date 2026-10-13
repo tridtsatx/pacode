@@ -291,6 +291,9 @@ pub(crate) fn start_claimed_turn(
     debug_assert!(agent.turn_lock.try_lock().is_err());
     // This turn reads `agent send` messages until its post-block seals.
     agent.mailbox.unseal();
+    if admission.is_some() {
+        crate::plan_reminder::on_user_turn(&agent);
+    }
 
     let turn_id = admission
         .as_ref()

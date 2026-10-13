@@ -34,26 +34,11 @@ pub(crate) fn handle_interrupted(session: &Arc<Session>, agent: &Arc<Agent>) -> 
 /// Surface a turn failure in the transcript (error notice item) so clients and
 /// `pacode run` see why nothing happened.
 pub(crate) fn emit_failure_notice(session: &Session, agent: &Agent, message: &str) {
-    let seq = agent
-        .transcript
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .next_seq();
-    let item = pacode_types::TranscriptItem {
-        seq,
-        agent: agent.id(),
-        ts_ms: pacode_types::now_ms(),
-        kind: pacode_types::TranscriptKind::Notice {
-            level: pacode_types::ToastLevel::Error,
-            text: format!("turn failed: {message}"),
-        },
-    };
-    agent
-        .transcript
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .upsert(item.clone());
-    session.events.emit(Event::ItemAdded(item));
+    session.emit_notice(
+        agent,
+        pacode_types::ToastLevel::Error,
+        format!("turn failed: {message}"),
+    );
 }
 
 /// Log line + TurnEnd plugin hook + `Event::TurnEnded` — emitted by the spawn

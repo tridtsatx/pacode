@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use pacode_types::{AgentId, AgentInfo, CallId, Message, MessageKind, TaskInfo};
+use pacode_types::{AgentId, AgentInfo, CallId, Message, MessageKind, PlanItem, TaskInfo};
 use tokio::sync::Notify;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,6 +55,14 @@ pub enum Injection {
         name: String,
         outcome: pacode_tools::SendOutcome,
     },
+    /// The main agent stopped on its own with plan items still open
+    /// (`crate::plan_reminder`). `attempt` of `max` per user message. Folded
+    /// into history by the turn loop itself, never queued.
+    PlanReminder {
+        open: Vec<PlanItem>,
+        attempt: u32,
+        max: u32,
+    },
 }
 
 impl Injection {
@@ -66,7 +74,8 @@ impl Injection {
     /// holdable by default, and the ones that must never wait in a backlog are
     /// the ones that hang a turn — a held steer is a turn the user believes is
     /// running and is not, a held question is a subagent blocked for nothing,
-    /// and a held `SendLanded` is a message the orchestrator sends again.
+    /// and a held `SendLanded` is a message the orchestrator sends again. A
+    /// held plan reminder is a turn that was meant to go on and stalls.
     pub fn is_holdable(&self) -> bool {
         !matches!(
             self,
@@ -75,6 +84,7 @@ impl Injection {
                 | Injection::ParentMessage { .. }
                 | Injection::AgentQuestion { .. }
                 | Injection::SendLanded { .. }
+                | Injection::PlanReminder { .. }
         )
     }
 }
@@ -298,6 +308,10 @@ pub fn render_injections(items: &[Injection], cap_chars: usize) -> Message {
                      had already reached it; do not send the message again. {}\n</send_result>",
                     outcome.describe(agent)
                 ));
+            }
+            // Bounded by its own caps (item count, item length).
+            Injection::PlanReminder { open, attempt, max } => {
+                parts.push(crate::plan_reminder::render(open, *attempt, *max));
             }
         }
     }

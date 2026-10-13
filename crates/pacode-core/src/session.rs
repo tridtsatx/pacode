@@ -2088,6 +2088,20 @@ impl Session {
         self.events.emit(pacode_types::Event::PlanUpdated(plan));
     }
 
+    /// A notice line in `agent`'s transcript, live to every client.
+    pub(crate) fn emit_notice(&self, agent: &Agent, level: pacode_types::ToastLevel, text: String) {
+        let mut transcript = agent.transcript.lock().unwrap_or_else(|p| p.into_inner());
+        let item = pacode_types::TranscriptItem {
+            seq: transcript.next_seq(),
+            agent: agent.id(),
+            ts_ms: pacode_types::now_ms(),
+            kind: pacode_types::TranscriptKind::Notice { level, text },
+        };
+        transcript.upsert(item.clone());
+        drop(transcript);
+        self.events.emit(pacode_types::Event::ItemAdded(item));
+    }
+
     /// Everything a client needs to render from scratch (main agent transcript tail
     /// of `session.history_page` items).
     pub fn snapshot(&self) -> SessionSnapshot {

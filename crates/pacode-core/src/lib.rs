@@ -22,6 +22,8 @@
 //!   session ledger, under explicit caps
 //! - `fusion`: the two-model turn pipeline — a read-only planner, then an
 //!   implementer that works from the plan left in the transcript
+//! - `plan_reminder`: a main agent that stops with open plan items is
+//!   reminded and its turn goes on, under a per-user-message budget
 
 pub mod agent;
 pub mod analyze;
@@ -38,6 +40,7 @@ pub mod inject;
 pub mod naming;
 pub mod notice_lock;
 pub mod permissions;
+pub mod plan_reminder;
 pub mod prompt;
 pub mod questions;
 pub(crate) mod rpc;

@@ -22,7 +22,7 @@ use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use pacode_types::{AgentId, Event, HookRule, ToastLevel, TranscriptItem, TranscriptKind};
+use pacode_types::{AgentId, HookRule, ToastLevel};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -179,26 +179,7 @@ fn describe_outcome(event: &str, command: &str, outcome: &HookRun) -> Option<Str
 /// Surface a hook problem as a transcript notice; hook failures never abort a
 /// turn, so a warn item is as loud as they get.
 fn warn_notice(session: &Session, agent: &Agent, text: String) {
-    let seq = agent
-        .transcript
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .next_seq();
-    let item = TranscriptItem {
-        seq,
-        agent: agent.id(),
-        ts_ms: pacode_types::now_ms(),
-        kind: TranscriptKind::Notice {
-            level: ToastLevel::Warn,
-            text,
-        },
-    };
-    agent
-        .transcript
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .upsert(item.clone());
-    session.events.emit(Event::ItemAdded(item));
+    session.emit_notice(agent, ToastLevel::Warn, text);
 }
 
 /// Run the matching `pre_tool_use` rules; split from [`pre_tool_use`] so tests

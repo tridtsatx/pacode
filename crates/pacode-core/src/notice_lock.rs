@@ -202,7 +202,8 @@ impl Notice {
             | Injection::StatusRequest
             | Injection::ParentMessage { .. }
             | Injection::AgentQuestion { .. }
-            | Injection::SendLanded { .. } => None,
+            | Injection::SendLanded { .. }
+            | Injection::PlanReminder { .. } => None,
         }
     }
 
@@ -345,7 +346,8 @@ impl Held {
             | Injection::StatusRequest
             | Injection::ParentMessage { .. }
             | Injection::AgentQuestion { .. }
-            | Injection::SendLanded { .. } => {}
+            | Injection::SendLanded { .. }
+            | Injection::PlanReminder { .. } => {}
         }
         injection
     }
