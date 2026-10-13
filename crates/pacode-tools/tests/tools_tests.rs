@@ -134,13 +134,11 @@ impl ToolHost for StubHost {
         }
     }
 
-    async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError> {
-        let info = self
-            .tasks
-            .spawn(spec)
+    async fn spawn_task(&self, spec: TaskSpec) -> Result<pacode_tools::SpawnedTask, ToolError> {
+        pacode_tools::SpawnedTask::start(&self.tasks, spec)
             .await
-            .map_err(|e| ToolError::failed(e.to_string()))?;
-        Ok(info.id)
+            .map(|(_, spawned)| spawned)
+            .map_err(|e| ToolError::failed(e.to_string()))
     }
 
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {

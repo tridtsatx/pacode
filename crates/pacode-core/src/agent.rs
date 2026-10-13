@@ -534,6 +534,11 @@ pub struct Agent {
     /// finished-report path. Survives status flaps mid-unwind. Cleared by
     /// `Session::continue_agent`.
     pub stop_requested: std::sync::atomic::AtomicBool,
+    /// The user interrupted this agent's turn and has not written since: work
+    /// the agent left running (a backgrounded command, a monitor) is queued
+    /// for the user's next turn instead of starting one. An interrupt is not
+    /// undone by something that happens to finish afterwards.
+    user_interrupted: std::sync::atomic::AtomicBool,
     turn_generation: std::sync::atomic::AtomicU64,
     /// One turn at a time — and what `is_running` reads. `Arc` so
     /// `start_turn` can claim it with an owned guard and move it into the
@@ -607,6 +612,7 @@ impl Agent {
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
+            user_interrupted: std::sync::atomic::AtomicBool::new(false),
             turn_generation: std::sync::atomic::AtomicU64::new(0),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             message_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -664,6 +670,7 @@ impl Agent {
             tools: RwLock::new(tools),
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
+            user_interrupted: std::sync::atomic::AtomicBool::new(false),
             turn_generation: std::sync::atomic::AtomicU64::new(0),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             message_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1189,6 +1196,27 @@ impl Agent {
     pub fn clear_stop_request(&self) {
         self.stop_requested
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The user interrupted the turn (`Session::interrupt`).
+    pub(crate) fn note_user_interrupt(&self) {
+        self.user_interrupted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The user wrote again: queued work may drive turns once more.
+    pub(crate) fn clear_user_interrupt(&self) {
+        self.user_interrupted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether queued work may start a turn without the user: not after a
+    /// user interrupt, unless the queue holds the user's own message.
+    pub(crate) fn may_start_own_turn(&self) -> bool {
+        !self
+            .user_interrupted
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self.injections.has_user_admission()
     }
 
     /// Update status/activity; the caller emits `AgentUpdated` through the session.

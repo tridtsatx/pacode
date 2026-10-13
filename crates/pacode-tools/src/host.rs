@@ -272,6 +272,46 @@ pub enum WaitOutcome {
     Cancelled,
 }
 
+/// A task a tool call started.
+#[derive(Debug)]
+pub struct SpawnedTask {
+    pub id: TaskId,
+    /// Set for a foreground task (`!spec.background`): the call reports the
+    /// task's end and holds this until its result is in hand
+    /// ([`pacode_exec::ForegroundGuard::delivered`]); dropping it earlier — an
+    /// interrupted call — hands the task over instead.
+    pub foreground: Option<pacode_exec::ForegroundGuard>,
+}
+
+impl SpawnedTask {
+    /// Start `spec` on `tasks`, with a guard when it runs in the foreground.
+    pub async fn start(
+        tasks: &pacode_exec::TaskManager,
+        spec: TaskSpec,
+    ) -> Result<(TaskInfo, Self), pacode_exec::ExecError> {
+        if spec.background {
+            let info = tasks.spawn(spec).await?;
+            let id = info.id.clone();
+            return Ok((
+                info,
+                Self {
+                    id,
+                    foreground: None,
+                },
+            ));
+        }
+        let (info, guard) = tasks.spawn_foreground(spec).await?;
+        let id = info.id.clone();
+        Ok((
+            info,
+            Self {
+                id,
+                foreground: Some(guard),
+            },
+        ))
+    }
+}
+
 /// A named subagent type discovered from an `agents/*.md` file (Claude Code
 /// `.claude/agents` parity): frontmatter fenced by `---` (YAML-style) or `+++`
 /// (TOML) carries `name` (default: file stem), `description` (required — it is
@@ -663,15 +703,18 @@ pub trait ToolHost: Send + Sync {
     fn stop_monitor(&self, id: &pacode_types::MonitorId) -> Result<(), ToolError>;
 
     // --- background tasks (owner = session) ---
-    async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError>;
+    /// Start a task (see [`SpawnedTask::start`]). A foreground task comes with
+    /// its guard, created before any await of the host, so a call dropped
+    /// while the host records the task still hands it over.
+    async fn spawn_task(&self, spec: TaskSpec) -> Result<SpawnedTask, ToolError>;
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo>;
     fn list_tasks(&self) -> Vec<TaskInfo>;
     /// Wait, as the call that owns the task's foreground, until the task ends,
     /// `timeout` elapses, or (when `return_on_progress`) its progress changes.
     /// `Finished` makes the caller the one that reports the output: no
-    /// `<task_finished>` notice follows. Any other outcome, or dropping the
-    /// future, leaves the task backgrounded, and its end arrives as that
-    /// notice.
+    /// `<task_finished>` notice follows. Any other outcome leaves the task
+    /// backgrounded, and its end arrives as that notice; a dropped wait is the
+    /// caller's guard's to settle.
     async fn wait_task(
         &self,
         task: &TaskId,

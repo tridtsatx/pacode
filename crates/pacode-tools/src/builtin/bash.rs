@@ -168,7 +168,8 @@ pub(crate) async fn run_authorized(
         spec.call = live_row;
     }
 
-    let id = ctx.host.spawn_task(spec).await?;
+    let spawned = ctx.host.spawn_task(spec).await?;
+    let id = spawned.id;
 
     if args.background {
         let content = format!("task_id: {id}\nstatus: running\nTask started in background.");
@@ -179,6 +180,34 @@ pub(crate) async fn run_authorized(
             .with_task(id));
     }
 
+    // Held until the result is in hand; an interrupted call drops it, which
+    // backgrounds the command (its end is announced, without waking the agent
+    // after a user interrupt), or, for a plain read nobody needs any more,
+    // kills it. An end the call never delivered is announced as well.
+    let mut foreground = spawned.foreground;
+    if let Some(guard) = foreground.as_mut()
+        && pacode_risk::is_side_effect_free(&args.command)
+    {
+        guard.kill_on_drop();
+    }
+    let result = foreground_result(&id, accept_large_output, ctx, tool_title).await;
+    if let Some(guard) = foreground
+        && !matches!(result, Err(ToolError::Cancelled))
+    {
+        guard.delivered();
+    }
+    result
+}
+
+/// Wait for a foreground task and turn its end, or the hand-off to the
+/// background, into the call's result.
+async fn foreground_result(
+    id: &pacode_types::TaskId,
+    accept_large_output: bool,
+    ctx: &ToolCtx,
+    tool_title: String,
+) -> Result<ToolOutput, ToolError> {
+    let id = id.clone();
     let outcome = ctx.host.wait_task(&id, ctx.exec_yield_after, false).await;
     match outcome {
         WaitOutcome::Finished => {

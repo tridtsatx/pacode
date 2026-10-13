@@ -232,12 +232,11 @@ impl ToolHost for StubToolHost {
     async fn spawn_task(
         &self,
         spec: pacode_exec::TaskSpec,
-    ) -> Result<pacode_types::TaskId, ToolError> {
+    ) -> Result<crate::host::SpawnedTask, ToolError> {
         match &self.tasks {
-            Some(tasks) => tasks
-                .spawn(spec)
+            Some(tasks) => crate::host::SpawnedTask::start(tasks, spec)
                 .await
-                .map(|info| info.id)
+                .map(|(_, spawned)| spawned)
                 .map_err(|e| ToolError::failed(e.to_string())),
             None => Err(ToolError::Failed("no tasks in this test".to_string())),
         }

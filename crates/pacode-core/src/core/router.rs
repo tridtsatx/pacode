@@ -20,13 +20,25 @@ async fn route_task_event(
         TaskEvent::Started(info)
         | TaskEvent::Progress(info)
         | TaskEvent::Ended(info)
+        | TaskEvent::Unreported(info)
         | TaskEvent::Stalled(info) => info.id.clone(),
         TaskEvent::Output { info, .. } => info.id.clone(),
     };
-    if core.is_task_tombstoned(&task_id) {
+    // `Unreported` follows the `Ended` that tombstoned the task.
+    if !matches!(event, TaskEvent::Unreported(_)) && core.is_task_tombstoned(&task_id) {
         return;
     }
     match event {
+        TaskEvent::Unreported(info) => {
+            // The call waiting on this task was dropped after the task ended
+            // and before it delivered the output: the notice is the only
+            // report the model gets.
+            if let Some(session) = core.session(&info.session) {
+                persist_task(&session, &info).await;
+                session.events.emit(Event::TaskUpdated(info.clone()));
+                announce_end(&session, info).await;
+            }
+        }
         TaskEvent::Started(info) => {
             if let Some(session) = core.session(&info.session)
                 && persist_task(&session, &info).await
@@ -148,18 +160,17 @@ async fn finish_task(core: &Core, info: TaskInfo, ended: &mut HashSet<TaskId>) {
     if !info.backgrounded {
         return;
     }
+    announce_end(&session, info).await;
+}
 
+/// Tell the task's owner that it ended, with the tail of its output.
+async fn announce_end(session: &std::sync::Arc<crate::session::Session>, info: TaskInfo) {
     let tail_lines = session.tasks.tail(&info.id, 40).await.unwrap_or_default();
     let tail = tail_lines.join("\n");
-
-    let owner_agent = session.agent_for_host(&info.owner);
-    if let Some(agent) = owner_agent {
+    if let Some(agent) = session.agent_for_host(&info.owner) {
         session.inject_and_wake(
             &agent,
-            crate::inject::Injection::TaskFinished {
-                task: info.clone(),
-                tail,
-            },
+            crate::inject::Injection::TaskFinished { task: info, tail },
         );
     }
 }

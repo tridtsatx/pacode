@@ -105,7 +105,7 @@ impl ToolHost for DummyHost {
     async fn request_permission(&self, _draft: PermissionDraft) -> crate::PermissionOutcome {
         PermissionDecision::AllowOnce.into()
     }
-    async fn spawn_task(&self, _spec: TaskSpec) -> Result<TaskId, ToolError> {
+    async fn spawn_task(&self, _spec: TaskSpec) -> Result<crate::SpawnedTask, ToolError> {
         Err(ToolError::failed("unused"))
     }
     fn task_info(&self, _task: &TaskId) -> Option<TaskInfo> {

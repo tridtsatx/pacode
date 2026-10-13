@@ -183,7 +183,7 @@ impl Session {
         }
         let wake = agent.id().is_main();
         agent.injections.push(injection);
-        if wake && !agent.is_running() && !agent.stop_requested() {
+        if wake && !agent.is_running() && !agent.stop_requested() && agent.may_start_own_turn() {
             crate::turn::lifecycle::request_turn(self.clone(), agent.clone());
         }
     }
@@ -553,6 +553,7 @@ impl Session {
         if main.stop_requested() {
             return Err(CoreError::Invalid("session is closed".into()));
         }
+        main.clear_user_interrupt();
 
         if let Some((message_id, fingerprint)) = admission.as_ref()
             && let Some(existing) = self
@@ -1002,6 +1003,11 @@ impl Session {
 
     /// Cancel the main agent's running turn (history kept).
     pub fn interrupt(&self) {
+        // Before the token: what the cancelled calls leave running must not
+        // restart the agent once the turn has unwound (`may_start_own_turn`).
+        if let Some(main) = self.main_agent() {
+            main.note_user_interrupt();
+        }
         // Token first: a parked permission waiter must see the cancellation
         // (its biased cancel arm then beats the dropped-sender arm, so the
         // deny reason lands as "interrupted", not "aborted"). Whatever it had

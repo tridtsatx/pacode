@@ -268,8 +268,11 @@ pub(super) async fn run_single_tool(
                     call_bounded(&tool, call.input.clone(), &ctx, holds_own_workers).await;
                 match tool_res {
                     Ok(output) => {
+                        // A task in the output runs in the background: started
+                        // so, or handed over by the foreground wait, which is
+                        // the one place that decides it (`wait_foreground`).
+                        // The client still needs the row refreshed.
                         let status = if let Some(task_id) = output.task.as_ref() {
-                            session.tasks.mark_backgrounded(task_id);
                             if let Some(tinfo) = session.tasks.info(task_id) {
                                 session.events.emit(Event::TaskUpdated(tinfo));
                             }

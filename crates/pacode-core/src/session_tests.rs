@@ -507,8 +507,14 @@ async fn detach_reassigns_waiters_and_tasks_to_immutable_old_owner() {
         ))
         .await
         .unwrap();
-    assert_eq!(session.tasks.info(&after).unwrap().owner, AgentId::main());
-    session.tasks.kill(&after).await.unwrap();
+    assert_eq!(
+        session.tasks.info(&after.id).unwrap().owner,
+        AgentId::main()
+    );
+    session.tasks.kill(&after.id).await.unwrap();
+    if let Some(guard) = after.foreground {
+        guard.delivered();
+    }
     session.stop_agent(&detached_id).await.unwrap();
     session.tasks.kill(&task.id).await.unwrap();
 }
@@ -1908,7 +1914,7 @@ async fn session_host_persists_task_started_and_terminal_rows() {
         session: session.clone(),
         agent: AgentId::main(),
     };
-    let task = host
+    let spawned = host
         .spawn_task(TaskSpec::new(
             session_id.clone(),
             AgentId::main(),
@@ -1917,6 +1923,7 @@ async fn session_host_persists_task_started_and_terminal_rows() {
         ))
         .await
         .unwrap();
+    let task = spawned.id.clone();
     let running = session
         .store
         .list_tasks(&session_id)
@@ -1927,6 +1934,9 @@ async fn session_host_persists_task_started_and_terminal_rows() {
         .unwrap();
     assert_eq!(running.status, pacode_types::TaskStatus::Running);
     host.wait_task(&task, Duration::from_secs(5), false).await;
+    if let Some(guard) = spawned.foreground {
+        guard.delivered();
+    }
     let timeout = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(timeout);
     loop {
@@ -1983,9 +1993,12 @@ async fn a_task_that_ends_in_the_foreground_is_not_announced_again() {
         "printf done",
         tmp.path(),
     );
-    let task = host.spawn_task(spec).await.unwrap();
+    let spawned = host.spawn_task(spec).await.unwrap();
+    let task = spawned.id.clone();
 
     let outcome = host.wait_task(&task, Duration::from_secs(10), false).await;
+    // The call has its result: `bash` releases the guard here.
+    spawned.foreground.unwrap().delivered();
 
     assert_eq!(outcome, pacode_tools::WaitOutcome::Finished);
     task_ended_event(&mut rx, &task).await;
@@ -2010,11 +2023,13 @@ async fn a_task_that_outlives_its_foreground_wait_is_announced_when_it_ends() {
     };
     mock.push(MockResponse::Text("noted".into()));
     let spec = TaskSpec::new(session_id.clone(), AgentId::main(), "sleep 0.3", tmp.path());
-    let task = host.spawn_task(spec).await.unwrap();
+    let spawned = host.spawn_task(spec).await.unwrap();
+    let task = spawned.id.clone();
 
     let outcome = host
         .wait_task(&task, Duration::from_millis(50), false)
         .await;
+    spawned.foreground.unwrap().delivered();
 
     assert_eq!(outcome, pacode_tools::WaitOutcome::Timeout);
     let notice = format!("<task_finished id=\"{task}\"");
@@ -2029,6 +2044,142 @@ async fn a_task_that_outlives_its_foreground_wait_is_announced_when_it_ends() {
     })
     .await
     .expect("a backgrounded task's end reaches the model");
+}
+
+/// Wait until a request to the model carries `needle`; returns its text.
+async fn request_containing(mock: &MockProvider, needle: &str) -> String {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let found = mock.requests().iter().find_map(|req| {
+                let text: String = req.messages.iter().map(|m| m.text()).collect();
+                text.contains(needle).then_some(text)
+            });
+            if let Some(text) = found {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no request carried {needle:?}"))
+}
+
+/// The window between the process starting and the call's wait: the host is
+/// writing the task row when the call is dropped. The guard already exists,
+/// so the task is handed over and its end still reaches the model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_dropped_while_its_task_row_is_written_still_hands_the_task_over() {
+    let (core, mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    mock.push(MockResponse::Text("noted".into()));
+    let spec = TaskSpec::new(session_id.clone(), AgentId::main(), "sleep 0.3", tmp.path());
+
+    let mut call = Box::pin(host.spawn_task(spec));
+    let task = loop {
+        if let std::task::Poll::Ready(result) = futures::poll!(&mut call) {
+            panic!("the call finished before it could be dropped: {result:?}");
+        }
+        // Pending with its task started: the call is awaiting the store.
+        if let Some(info) = session.tasks.list(Some(&session_id)).into_iter().next() {
+            break info.id;
+        }
+        tokio::task::yield_now().await;
+    };
+    drop(call);
+
+    assert!(session.tasks.info(&task).unwrap().backgrounded);
+    request_containing(&mock, &format!("<task_finished id=\"{task}\"")).await;
+}
+
+/// The window after the end: the wait returned, but the call was dropped
+/// before its result was delivered (a cancel won the same poll, or it was
+/// reading the output back). Its result reached nobody, so the notice does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_dropped_after_its_task_ended_still_tells_the_model() {
+    let (core, mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    mock.push(MockResponse::Text("noted".into()));
+    let spec = TaskSpec::new(
+        session_id.clone(),
+        AgentId::main(),
+        "printf delivered-late",
+        tmp.path(),
+    );
+    let spawned = host.spawn_task(spec).await.unwrap();
+    let task = spawned.id.clone();
+    let outcome = host.wait_task(&task, Duration::from_secs(10), false).await;
+    assert_eq!(outcome, pacode_tools::WaitOutcome::Finished);
+
+    drop(spawned);
+
+    let text = request_containing(&mock, &format!("<task_finished id=\"{task}\"")).await;
+    assert!(text.contains("delivered-late"), "{text}");
+}
+
+/// Esc stops the agent, and nothing it left running restarts it: a command
+/// handed to the background by the interrupted call, and a notice already
+/// queued when the user pressed Esc, both wait for the user's next message.
+#[tokio::test(flavor = "multi_thread")]
+async fn work_left_running_by_a_user_interrupt_waits_for_the_users_next_turn() {
+    let (core, mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    mock.push(MockResponse::ToolCalls {
+        text: None,
+        calls: vec![("block_tool".into(), serde_json::json!({}))],
+    });
+    session.submit_user_message("first".into()).await.unwrap();
+    wait_until(|| main.status() == AgentStatus::RunningTool).await;
+    let spawned = host
+        .spawn_task(TaskSpec::new(
+            session_id.clone(),
+            AgentId::main(),
+            "sleep 0.3; echo left-running",
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+    let task = spawned.id.clone();
+    drop(spawned);
+    session.inject_and_wake(
+        &main,
+        crate::inject::Injection::SystemNotice("queued-before-esc".into()),
+    );
+
+    session.interrupt();
+    wait_until(|| !main.is_running()).await;
+    task_ended_event(&mut rx, &task).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "nothing may restart the agent after the user interrupted it"
+    );
+    assert!(!main.is_running());
+    assert!(!main.injections.is_empty(), "the notices wait in the queue");
+
+    mock.push(MockResponse::Text("ok".into()));
+    session.submit_user_message("go on".into()).await.unwrap();
+    let text = request_containing(&mock, "go on").await;
+    assert!(
+        text.contains(&format!("<task_finished id=\"{task}\"")),
+        "{text}"
+    );
+    assert!(text.contains("queued-before-esc"), "{text}");
 }
 
 /// A running `bash` row for `call` in the main agent's transcript.
@@ -2065,6 +2216,9 @@ async fn live_output_of_side_by_side_calls_reaches_each_calls_own_row() {
         agent: AgentId::main(),
     };
     let mut rows = std::collections::HashMap::new();
+    // The calls are still waiting: their guards keep the tasks in the
+    // foreground, which is what the live rows are for.
+    let mut calls = Vec::new();
     for name in ["first", "second"] {
         let call = CallId::new(format!("call-{name}"));
         let seq = running_bash_row(&session, &call);
@@ -2075,7 +2229,7 @@ async fn live_output_of_side_by_side_calls_reaches_each_calls_own_row() {
             tmp.path(),
         );
         spec.call = Some(call);
-        host.spawn_task(spec).await.unwrap();
+        calls.push(host.spawn_task(spec).await.unwrap());
         rows.insert(format!("{name}\n"), seq);
     }
 

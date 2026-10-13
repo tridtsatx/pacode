@@ -189,7 +189,7 @@ impl Tool for StubTriggerBgTask {
         );
         spec.background = true;
         spec.label = Some("bg-calc".into());
-        let task_id = ctx.host.spawn_task(spec).await?;
+        let task_id = ctx.host.spawn_task(spec).await?.id;
         let _ = ctx
             .host
             .wait_task(&task_id, Duration::from_secs(2), false)

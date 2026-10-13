@@ -30,7 +30,7 @@ mod state;
 mod supervisor;
 
 pub use buffer::HeadTailBuffer;
-pub use manager::{ExecError, TaskEvent, TaskManager, WaitResult};
+pub use manager::{ExecError, ForegroundGuard, TaskEvent, TaskManager, WaitResult};
 pub use memcap::{LimitKind, MemoryCeiling, MemoryPolicy};
 pub use memlimit::{
     DeniedBy, LimitBackend, MemoryLimiter, RaiseGate, RaiseOutcome, RaiseRequest, RaiseTarget,

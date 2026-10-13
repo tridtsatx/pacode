@@ -497,7 +497,7 @@ async fn test_session_management_and_lifecycle() {
 
     let mut spec1 = test_spec("sleep 10");
     spec1.session = s1.clone();
-    let info1 = mgr.spawn(spec1).await.unwrap();
+    let (info1, foreground) = mgr.spawn_foreground(spec1).await.unwrap();
 
     let mut spec2 = test_spec("sleep 10");
     spec2.session = s2.clone();
@@ -510,7 +510,8 @@ async fn test_session_management_and_lifecycle() {
     let list_all = mgr.list(None);
     assert_eq!(list_all.len(), 2);
 
-    mgr.mark_backgrounded(&info1.id);
+    assert!(!mgr.info(&info1.id).unwrap().backgrounded);
+    drop(foreground);
     assert!(mgr.info(&info1.id).unwrap().backgrounded);
 
     mgr.ack(&info1.id);

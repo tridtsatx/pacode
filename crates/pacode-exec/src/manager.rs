@@ -35,6 +35,10 @@ pub enum TaskEvent {
     Started(TaskInfo),
     Progress(TaskInfo),
     Ended(TaskInfo),
+    /// A foreground task ended, but the call waiting on it was dropped before
+    /// its result was delivered (see [`crate::ForegroundGuard`]): nothing told
+    /// the model, so it is announced like a background end. Follows `Ended`.
+    Unreported(TaskInfo),
     /// No output and no progress for `exec.stall_secs`; the task is still running.
     Stalled(TaskInfo),
     /// Output the process produced, on whole lines, while it is still running.
@@ -525,14 +529,6 @@ impl TaskManager {
         Ok(())
     }
 
-    /// The foreground wait gave up: the task now shows in the BACKGROUND rail.
-    pub fn mark_backgrounded(&self, id: &TaskId) {
-        let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = tasks.get_mut(id) {
-            entry.info.backgrounded = true;
-        }
-    }
-
     /// Clear the failed-unacked flag.
     pub fn ack(&self, id: &TaskId) {
         let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -575,6 +571,7 @@ mod stop;
 
 #[path = "foreground.rs"]
 mod foreground;
+pub use foreground::ForegroundGuard;
 
 #[cfg(test)]
 #[path = "manager_tests.rs"]

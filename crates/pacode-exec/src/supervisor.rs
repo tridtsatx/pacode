@@ -228,7 +228,7 @@ pub(crate) async fn run_supervisor(
     let exit_code = child_status.and_then(|s| s.code());
     let now_timestamp = now_ms();
 
-    let (ended_info, evicted) = {
+    let evicted = {
         let mut tasks = state
             .tasks
             .lock()
@@ -259,14 +259,15 @@ pub(crate) async fn run_supervisor(
         } else {
             None
         };
-        let evicted = state.prune_terminal_overflow(&mut tasks);
-        (ended_info, evicted)
+        // Sent under the lock (a broadcast send never blocks): whoever sees
+        // the task terminal under this lock afterwards — a dropped
+        // `ForegroundGuard` sending `Unreported` — is ordered after `Ended`.
+        if let Some(info) = ended_info {
+            let _ = state.events.send(TaskEvent::Ended(info));
+        }
+        state.prune_terminal_overflow(&mut tasks)
     };
     drop(evicted);
-
-    if let Some(info) = ended_info {
-        let _ = state.events.send(TaskEvent::Ended(info));
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

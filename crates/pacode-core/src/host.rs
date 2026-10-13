@@ -6,7 +6,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pacode_exec::TaskSpec;
 use pacode_tools::host::{AgentKindDef, PermissionDraft, PermissionOutcome};
-use pacode_tools::{AgentSpec, ParentReply, SendOutcome, ToolError, ToolHost, WaitOutcome};
+use pacode_tools::{
+    AgentSpec, ParentReply, SendOutcome, SpawnedTask, ToolError, ToolHost, WaitOutcome,
+};
 use pacode_types::{
     AgentId, AgentInfo, CallId, ModelRoute, PermissionDecision, Plan, TaskId, TaskInfo,
     TaskProgress, ToastLevel,
@@ -316,24 +318,27 @@ impl ToolHost for SessionHost {
         Ok(())
     }
 
-    async fn spawn_task(&self, mut spec: TaskSpec) -> Result<TaskId, ToolError> {
+    async fn spawn_task(&self, mut spec: TaskSpec) -> Result<SpawnedTask, ToolError> {
         if spec.session != self.session.id {
             return Err(ToolError::Failed(
                 "task does not belong to this session".to_string(),
             ));
         }
         spec.owner = self.owner_id();
-        let info = self
-            .session
-            .tasks
-            .spawn(spec)
+        // The guard exists before the row is written: a call dropped while
+        // the store answers still hands its task over.
+        let (info, spawned) = SpawnedTask::start(&self.session.tasks, spec)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         if let Err(error) = self.session.store.upsert_task(&info).await {
             let _ = self.session.tasks.kill(&info.id).await;
+            // This error is the call's report of the task.
+            if let Some(guard) = spawned.foreground {
+                guard.delivered();
+            }
             return Err(ToolError::Failed(error.to_string()));
         }
-        Ok(info.id)
+        Ok(spawned)
     }
 
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {

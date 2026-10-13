@@ -265,8 +265,9 @@ async fn unwind_unclaimed_turn(
     turn_guard: OwnedMutexGuard<()>,
 ) {
     *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    let redrive =
-        (!agent.injections.is_empty() || agent.notice_lock.wants_work()) && !agent.stop_requested();
+    let redrive = (!agent.injections.is_empty() || agent.notice_lock.wants_work())
+        && !agent.stop_requested()
+        && agent.may_start_own_turn();
     if !redrive {
         *agent
             .history_before_turn
@@ -546,10 +547,11 @@ pub(crate) fn start_claimed_turn(
         // released — see the second call at the end of this task.
         // An `agent send` that reached a subagent's queue is owed a turn like a
         // user admission is: the orchestrator was told it was delivered.
+        // After a user interrupt only the user's own message is owed a turn.
         let owes_turn = |agent: &Agent, has_recovery: bool| {
             !agent.stop_requested()
                 && !agent.injections.is_empty()
-                && (agent.id().is_main()
+                && ((agent.id().is_main() && agent.may_start_own_turn())
                     || has_recovery
                     || agent.injections.has_user_admission()
                     || agent.injections.has_parent_message())

@@ -72,7 +72,7 @@ impl ToolHost for DummyHost {
     async fn spawn_task(
         &self,
         _spec: pacode_exec::TaskSpec,
-    ) -> Result<pacode_types::TaskId, ToolError> {
+    ) -> Result<crate::SpawnedTask, ToolError> {
         Err(ToolError::failed("not implemented"))
     }
     fn task_info(&self, _task: &pacode_types::TaskId) -> Option<pacode_types::TaskInfo> {
