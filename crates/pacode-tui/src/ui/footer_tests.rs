@@ -58,44 +58,210 @@ fn no_session_shows_no_model_mode_or_effort() {
     );
 }
 
+/// Row 1 under a truecolor theme (status shades present), with or without
+/// a font that has the powerline arrows.
+fn opts_truecolor(width: u16, powerline: bool) -> RenderOptions {
+    RenderOptions::with_theme_color(
+        width,
+        false,
+        pacode_render::Theme::truecolor(),
+        pacode_render::ColorMode::Truecolor,
+    )
+    .glyphs(pacode_render::Glyphs::new(false).with_powerline(powerline))
+}
+
+/// Row 1 under ANSI-16: no status shades, the flat look.
+fn opts_ansi(width: u16, powerline: bool) -> RenderOptions {
+    RenderOptions::with_theme_color(
+        width,
+        false,
+        pacode_render::Theme::ansi(),
+        pacode_render::ColorMode::Ansi,
+    )
+    .glyphs(pacode_render::Glyphs::new(false).with_powerline(powerline))
+}
+
+/// Every look the row has: flat, abutting segments, powerline arrows.
+fn all_looks(width: u16) -> [RenderOptions; 3] {
+    [
+        opts_ansi(width, true),
+        opts_truecolor(width, false),
+        opts_truecolor(width, true),
+    ]
+}
+
+/// A state with every row-1 piece present.
+fn full_state() -> AppState {
+    let mut state = make_test_state();
+    state.config.ui.hints.effort = true;
+    state.config.ui.hints.model = true;
+    state.rail.usage.context_tokens = 12_000;
+    state.rail.usage.context_window = Some(100_000);
+    state.plugin_status = Some(("git".into(), "git-sync".into()));
+    state
+}
+
+fn model_name() -> String {
+    test_meta().model.display_name()
+}
+
+/// The bg of the span reading exactly `content`.
+fn bg_of(line: &Line<'_>, content: &str) -> Option<ratatui::style::Color> {
+    line.spans
+        .iter()
+        .find(|s| s.content == content)
+        .and_then(|s| s.style.bg)
+}
+
 /// The model name is the part that yields, with a visible `…`, and the
 /// effort after it survives whole.
 #[test]
 fn a_narrow_status_row_cuts_the_model_not_the_effort() {
     let state = make_test_state();
-    // " BUILD " + " " + model + " · " + "high" = 15 cells + the model.
-    let opts = RenderOptions::new(22, false);
-    let text = line_text(&render_row1(22, &state, &opts));
-    assert_eq!(pacode_render::display_width(&text), 22, "{text}");
+    // model + " · " + "high" = 7 cells + the model.
+    let opts = opts_ansi(12, false);
+    let text = line_text(&render_row1(12, &state, &opts));
+    assert_eq!(pacode_render::display_width(&text), 12, "{text}");
     assert!(text.ends_with(" · high"), "{text}");
+    assert!(text.contains('…'), "{text}");
+
+    // Powerline: " model " + arrow + " high " + the closing arrow = 9 cells.
+    let opts = opts_truecolor(12, true);
+    let text = line_text(&render_row1(12, &state, &opts));
+    assert_eq!(pacode_render::display_width(&text), 12, "{text}");
+    assert!(text.ends_with(" high \u{e0b0}"), "{text}");
     assert!(text.contains('…'), "{text}");
 }
 
+/// The permission mode lives on row 2 alone; row 1 used to repeat it as a
+/// badge.
 #[test]
-fn the_status_row_is_a_mode_badge_model_effort_and_context() {
-    let mut state = make_test_state();
-    state.rail.usage.context_tokens = 12_000;
-    state.rail.usage.context_window = Some(100_000);
-    let opts = RenderOptions::new(100, false);
-    let row1 = render_row1(100, &state, &opts);
-    let text = line_text(&row1);
-    assert!(text.starts_with(" BUILD  "), "row1 was: {text}");
-    assert_eq!(row1.spans[0].style, opts.theme.badge(opts.theme.cyan));
-    assert!(text.contains("high"));
-    assert!(text.contains("ctx 12%"), "row1 was: {text}");
-    assert_eq!(pacode_render::display_width(&text), 100);
+fn row_1_has_no_mode_badge() {
+    use pacode_types::state::Mode;
+    let mut state = full_state();
+    for mode in [Mode::Build, Mode::Auto, Mode::Plan, Mode::Bypass] {
+        state.meta.as_mut().unwrap().mode = mode;
+        for opts in all_looks(120) {
+            let text = line_text(&render_row1(120, &state, &opts));
+            let label = mode.label().to_uppercase();
+            assert!(!text.contains(&label), "{mode:?}: {text}");
+            assert!(text.trim_start().starts_with(&model_name()), "{text}");
+        }
+    }
 }
 
 #[test]
+fn the_status_row_is_model_effort_and_context() {
+    let state = full_state();
+    let opts = opts_truecolor(100, false);
+    let text = line_text(&render_row1(100, &state, &opts));
+    assert!(text.starts_with(&format!(" {} ", model_name())), "{text}");
+    assert!(text.contains(" high /effort "), "{text}");
+    assert!(text.ends_with(" ctx 12% · /model "), "{text}");
+    assert_eq!(pacode_render::display_width(&text), 100);
+}
+
+/// Segments sit on `status_bg` / `status_bg_alt` in turn; a VIM badge keeps
+/// its own plaque.
+#[test]
+fn segment_backgrounds_alternate() {
+    let mut state = full_state();
+    state.config.ui.vim = true;
+    let opts = opts_truecolor(120, false);
+    let theme = &opts.theme;
+    let row1 = render_row1(120, &state, &opts);
+    let (bg, alt) = (theme.status_bg.bg, theme.status_bg_alt.bg);
+    assert!(bg.is_some() && alt.is_some() && bg != alt);
+    assert_eq!(bg_of(&row1, " NOR "), theme.badge(theme.cyan).bg);
+    assert_eq!(bg_of(&row1, &model_name()), bg);
+    assert_eq!(bg_of(&row1, "high"), alt);
+    assert_eq!(bg_of(&row1, "git-sync"), bg);
+    assert_eq!(bg_of(&row1, "ctx 12%"), bg);
+    // The text keeps its tone on the shade.
+    let effort = row1.spans.iter().find(|s| s.content == "high").unwrap();
+    assert_eq!(effort.style.fg, theme.accent.fg);
+}
+
+/// The arrows appear only with the powerline glyph set, coloured from the
+/// segment they leave into the one they enter.
+#[test]
+fn separators_only_with_the_powerline_glyph_set() {
+    let state = full_state();
+    let has_arrow = |opts: &RenderOptions| {
+        let text = line_text(&render_row1(120, &state, opts));
+        text.contains('\u{e0b0}') || text.contains('\u{e0b2}')
+    };
+    assert!(!has_arrow(&opts_truecolor(120, false)));
+    assert!(!has_arrow(&opts_ansi(120, true)), "the flat look has none");
+    let opts = opts_truecolor(120, true);
+    assert!(has_arrow(&opts));
+
+    let row1 = render_row1(120, &state, &opts);
+    let theme = &opts.theme;
+    let arrows: Vec<_> = row1
+        .spans
+        .iter()
+        .filter(|s| s.content == "\u{e0b0}" || s.content == "\u{e0b2}")
+        .map(|s| (s.content.to_string(), s.style.fg, s.style.bg))
+        .collect();
+    let (bg, alt) = (theme.status_bg.bg, theme.status_bg_alt.bg);
+    let left = "\u{e0b0}".to_string();
+    let right = "\u{e0b2}".to_string();
+    assert_eq!(
+        arrows,
+        vec![
+            (left.clone(), bg, alt), // model -> effort
+            (left.clone(), alt, bg), // effort -> plugin
+            (left, bg, None),        // closes the left group
+            (right, bg, None),       // opens the right group
+        ]
+    );
+}
+
+/// Under ANSI-16 and mono there are no shades to draw segments on: the row
+/// is the flat ` · ` line it always was, glyph set or not.
+#[test]
+fn the_ansi_fallback_is_the_flat_row() {
+    let state = full_state();
+    let left = format!("{} · high /effort · git-sync", model_name());
+    let right = "ctx 12% · /model";
+    let pad = " ".repeat(100 - left.chars().count() - right.chars().count());
+    let expected = format!("{left}{pad}{right}");
+    let mono = RenderOptions::with_theme_color(
+        100,
+        false,
+        pacode_render::Theme::mono(),
+        pacode_render::ColorMode::Mono,
+    );
+    for opts in [opts_ansi(100, false), opts_ansi(100, true), mono] {
+        let row1 = render_row1(100, &state, &opts);
+        assert_eq!(line_text(&row1), expected);
+        assert!(row1.spans.iter().all(|s| s.style.bg.is_none()));
+    }
+}
+
+/// Every width, every look: never wider than the row, and the pieces drop
+/// in the ladder's order — the `/effort` hint, the `/model` hint, the plugin
+/// status, the context fill.
+#[test]
 fn the_status_row_degrades_without_overflowing() {
-    let state = make_test_state();
-    for width in [8usize, 20, 30, 44, 60] {
-        let opts = RenderOptions::new(width as u16, false);
-        let text = line_text(&render_row1(width, &state, &opts));
-        assert!(
-            pacode_render::display_width(&text) <= width,
-            "{width}: {text}"
-        );
+    let state = full_state();
+    for width in 0..=120usize {
+        for opts in all_looks(width as u16) {
+            let text = line_text(&render_row1(width, &state, &opts));
+            assert!(
+                pacode_render::display_width(&text) <= width,
+                "{width}: {text}"
+            );
+            let has = |piece: &str| text.contains(piece);
+            let ladder = [has("/effort"), has("/model"), has("git-sync"), has("ctx")];
+            for pair in ladder.windows(2) {
+                assert!(!pair[0] || pair[1], "{width}: {text}");
+            }
+            if width >= 80 {
+                assert_eq!(ladder, [true; 4], "{width}: {text}");
+            }
+        }
     }
 }
 
@@ -158,11 +324,12 @@ fn test_footer_render_plugin_status() {
 
     let row1 = render_row1(120, &state, &opts);
     let row1_text: String = row1.spans.iter().map(|s| s.content.as_ref()).collect();
-    // The mode badge is followed by the plugin status
+    // The plugin status is the left group's last segment.
     assert!(
-        row1_text.contains(" BUILD  git-sync: rebasing"),
+        row1_text.contains("git-sync: rebasing"),
         "row1_text was: {row1_text}"
     );
+    assert!(!row1_text.contains("BUILD"), "row1_text was: {row1_text}");
 
     let row2 = render_row2(120, &state, &opts);
     let row2_text: String = row2.spans.iter().map(|s| s.content.as_ref()).collect();

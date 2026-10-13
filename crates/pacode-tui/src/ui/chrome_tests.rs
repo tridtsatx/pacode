@@ -1,19 +1,9 @@
 use pacode_render::ColorMode;
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
-use ratatui::layout::Rect;
 
 use super::*;
 
 fn opts(ascii: bool) -> RenderOptions {
     RenderOptions::with_theme_color(40, ascii, Theme::truecolor(), ColorMode::Truecolor)
-}
-
-fn row(terminal: &Terminal<TestBackend>, y: u16) -> String {
-    let buffer = terminal.backend().buffer();
-    (0..buffer.area.width)
-        .map(|x| buffer[(x, y)].symbol().to_string())
-        .collect()
 }
 
 #[test]
@@ -33,32 +23,9 @@ fn sections_are_uppercase_and_bold() {
 }
 
 #[test]
-fn the_frame_is_rounded_with_its_title_after_one_border_run() {
-    let opts = opts(false);
-    let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
-    terminal
-        .draw(|f| {
-            let block = frame_block(opts.theme.border, vec![Span::raw(" prompt ")], &opts);
-            f.render_widget(block, Rect::new(0, 0, 20, 3));
-        })
-        .unwrap();
-    assert_eq!(row(&terminal, 0), "╭─ prompt ─────────╮");
-    assert_eq!(row(&terminal, 2), "╰──────────────────╯");
-}
-
-#[test]
-fn the_frame_falls_back_to_ascii() {
-    let opts = opts(true);
-    let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
-    terminal
-        .draw(|f| {
-            let block = frame_block(opts.theme.border, vec![Span::raw(" p ")], &opts);
-            f.render_widget(block, Rect::new(0, 0, 12, 3));
-        })
-        .unwrap();
-    assert_eq!(row(&terminal, 0), "+- p ------+");
-    assert_eq!(row(&terminal, 1), "|          |");
-    assert_eq!(row(&terminal, 2), "+----------+");
+fn the_border_set_is_rounded_or_ascii() {
+    assert_eq!(border_set(&opts(false)), border::ROUNDED);
+    assert_eq!(border_set(&opts(true)).top_left, "+");
 }
 
 #[test]

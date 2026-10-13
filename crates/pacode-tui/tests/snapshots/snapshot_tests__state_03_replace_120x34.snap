@@ -34,5 +34,5 @@ expression: view
 "────────────────────────────────────────────────────────────────────────────────────── │BACKGROUND                  1 ◍ "
 "❯                                                                                      │◍ cargo test --all 214/380      "
 "────────────────────────────────────────────────────────────────────────────────────── │       ~/zed/pacode:master      "
-" BUILD  Claude 3 7 Sonnet · high /effort                               ctx 1% · /model │                                "
+" Claude 3 7 Sonnet  high /effort                                      ctx 1% · /model  │                                "
 "» codegen · esc back · alt+b follow · s stop                                           │                                "

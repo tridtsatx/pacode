@@ -1,6 +1,10 @@
 //! The glyph table with its ASCII fallback. Colour is never the only carrier
 //! of meaning: every status has a glyph too (spec §13).
 
+#[cfg(test)]
+#[path = "glyphs_tests.rs"]
+mod glyphs_tests;
+
 /// Glyphs with ASCII fallback (`ui.ascii_only`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Glyphs {
@@ -30,6 +34,12 @@ pub struct Glyphs {
     pub chevrons: &'static str,
     pub disabled: &'static str,
     pub stopped: &'static str,
+    /// The powerline arrow between status-line segments of a left-aligned
+    /// group (U+E0B0), and its mirror for a right-aligned group (U+E0B2).
+    /// Empty unless the font is known to carry them (`with_powerline`):
+    /// segments then simply abut, the background change being the separator.
+    pub seg_sep_left: &'static str,
+    pub seg_sep_right: &'static str,
 }
 
 impl Glyphs {
@@ -61,6 +71,8 @@ impl Glyphs {
                 chevrons: ">>",
                 disabled: "o",
                 stopped: "-",
+                seg_sep_left: "",
+                seg_sep_right: "",
             }
         } else {
             Self {
@@ -89,8 +101,22 @@ impl Glyphs {
                 chevrons: "»",
                 disabled: "⊘",
                 stopped: "■",
+                seg_sep_left: "",
+                seg_sep_right: "",
             }
         }
+    }
+
+    /// The table with the powerline separators when `available`. A terminal
+    /// cannot be asked which glyphs its font has, so the caller decides (the
+    /// `ui.powerline` flag, or [`font_has_powerline`]); `ascii_only` always
+    /// wins.
+    pub fn with_powerline(mut self, available: bool) -> Self {
+        if available && !self.ascii {
+            self.seg_sep_left = "\u{e0b0}";
+            self.seg_sep_right = "\u{e0b2}";
+        }
+        self
     }
 
     /// Braille spinner frame for `frame` (`-\|/` under ASCII). A method rather
@@ -120,4 +146,16 @@ impl Glyphs {
         }
         out
     }
+}
+
+/// Whether a font family name advertises the powerline glyphs: a Nerd Font
+/// (`… Nerd Font`, `… NF`, `… NFM`, `… NFP`) or a powerline-patched font
+/// (`… for Powerline`). Anything else may draw them as tofu, so it does not.
+pub fn font_has_powerline(family: &str) -> bool {
+    let family = family.to_ascii_lowercase();
+    family.contains("nerd")
+        || family.contains("powerline")
+        || family
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| matches!(word, "nf" | "nfm" | "nfp"))
 }

@@ -7,6 +7,10 @@ use pacode_types::config::ShimmerMode;
 
 use super::AppState;
 
+#[cfg(test)]
+#[path = "render_tests.rs"]
+mod render_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderContext {
     pub theme: pacode_render::Theme,
@@ -14,6 +18,20 @@ pub struct RenderContext {
     pub color: ColorMode,
     pub thinking: bool,
     pub expand_hint: String,
+}
+
+/// The glyph table for this config: ASCII under `ui.ascii_only`, and the
+/// powerline separators when the user says the font has them (`ui.powerline`)
+/// or the font pacode asks the terminal for (`font.family`) is known to.
+/// A terminal cannot report its font, so the flag is the primary signal.
+pub(super) fn glyphs_for(config: &pacode_types::Config) -> Glyphs {
+    let powerline = config.ui.powerline
+        || config
+            .font
+            .family
+            .as_deref()
+            .is_some_and(pacode_render::glyphs::font_has_powerline);
+    Glyphs::new(config.ui.ascii_only).with_powerline(powerline)
 }
 
 pub(super) fn expand_hint_for(keymap: &crate::binding::Keymap) -> String {
@@ -30,6 +48,7 @@ impl AppState {
             self.theme.clone(),
             self.color_mode,
         )
+        .glyphs(glyphs_for(&self.config))
         .thinking(self.config.ui.thinking)
         .expand_hint(expand_hint_for(&self.keymap))
         .cache_epoch(self.render_epoch)
@@ -54,7 +73,7 @@ impl AppState {
     pub fn sync_render_context(&mut self) {
         let next = RenderContext {
             theme: self.theme.clone(),
-            glyphs: Glyphs::new(self.config.ui.ascii_only),
+            glyphs: glyphs_for(&self.config),
             color: self.color_mode,
             thinking: self.config.ui.thinking,
             expand_hint: expand_hint_for(&self.keymap),

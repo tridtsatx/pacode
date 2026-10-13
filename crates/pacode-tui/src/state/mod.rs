@@ -33,7 +33,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use pacode_render::{ColorMode, Glyphs};
+use pacode_render::ColorMode;
 use pacode_types::time::now_ms;
 use pacode_types::{
     Config, Effort, MarketplacePluginInfo, McpServerInfo, Mode, ModelFlags, ModelInfo, ModelRoute,
@@ -236,7 +236,7 @@ impl AppState {
         let (keymap, keymap_warnings) = crate::binding::Keymap::from_config(&config.keys);
         let render_context = RenderContext {
             theme: theme.clone(),
-            glyphs: Glyphs::new(config.ui.ascii_only),
+            glyphs: render::glyphs_for(&config),
             color: color_mode,
             thinking: config.ui.thinking,
             expand_hint: render::expand_hint_for(&keymap),

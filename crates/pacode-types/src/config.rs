@@ -739,6 +739,9 @@ fn default_analyze_checkpoint_every() -> u32 {
 pub struct UiConfig {
     pub hints: UiHints,
     pub ascii_only: bool,
+    /// The terminal font has Powerline/Nerd Font glyphs: draw arrow
+    /// separators in the status line.
+    pub powerline: bool,
     pub mouse: bool,
     pub auto_copy: bool,
     #[serde(default)]
@@ -954,6 +957,7 @@ impl Default for UiConfig {
         Self {
             hints: UiHints::default(),
             ascii_only: false,
+            powerline: false,
             mouse: true,
             auto_copy: true,
             ups: Ups::default(),

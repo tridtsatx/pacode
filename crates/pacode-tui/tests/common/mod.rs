@@ -280,6 +280,9 @@ pub fn create_state(cols: u16, rows: u16, snapshot: SessionSnapshot) -> AppState
     let mut config = Config::default();
     config.ui.hints.effort = true;
     config.ui.hints.model = true;
+    // Row 1 of the footer pads its segments only where the theme has status
+    // shades; pin the colour mode so the text does not follow COLORTERM.
+    config.ui.color = "truecolor".into();
     let mut state = AppState::new(config, "0.1.0-dev".into(), cols, rows);
     // The mascot is random per run; pin it so snapshots stay deterministic.
     state.mascot = pacode_tui::ui::mascot::MascotKind::Pacman;

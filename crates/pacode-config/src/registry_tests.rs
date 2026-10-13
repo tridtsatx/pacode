@@ -764,3 +764,31 @@ fn value_origin_covers_default_global_and_env() {
     // is part of the contract even though nothing returns it.
     assert_eq!(Origin::Project.as_str(), "project");
 }
+
+/// `ui.powerline` defaults off, survives a TOML round trip, and is an
+/// immediate bool the Settings overlay can read and write.
+#[test]
+fn ui_powerline_is_an_immediate_bool_that_round_trips() {
+    let cfg = Config::default();
+    assert!(!cfg.ui.powerline);
+
+    let parsed: Config = toml::from_str("[ui]\npowerline = true\n").expect("parse");
+    assert!(parsed.ui.powerline);
+    let text = toml::to_string(&parsed).expect("serialize");
+    let back: Config = toml::from_str(&text).expect("reparse");
+    assert!(back.ui.powerline);
+
+    let entry = find_entry("ui.powerline").expect("registered");
+    assert_eq!(entry.section, "ui");
+    assert_eq!(entry.default_value, "false");
+    assert!(matches!(entry.kind, SettingKind::Bool));
+    assert_eq!(entry.apply, ApplyMode::Immediate);
+
+    let mut cfg = Config::default();
+    assert_eq!(read_value(&cfg, "ui.powerline"), Some("false".to_string()));
+    apply_to_config(&mut cfg, "ui.powerline", &toml::Value::Boolean(true));
+    assert!(cfg.ui.powerline);
+    assert_eq!(read_value(&cfg, "ui.powerline"), Some("true".to_string()));
+    reset_in_config(&mut cfg, "ui.powerline");
+    assert!(!cfg.ui.powerline);
+}

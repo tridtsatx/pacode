@@ -93,6 +93,11 @@ impl RenderOptions {
         self
     }
 
+    pub fn glyphs(mut self, glyphs: Glyphs) -> Self {
+        self.glyphs = glyphs;
+        self
+    }
+
     pub fn thinking(mut self, thinking: bool) -> Self {
         self.thinking = thinking;
         self

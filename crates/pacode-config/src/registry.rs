@@ -184,6 +184,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "ui.hints.model", label: "Model Hint", description: "Show model route hint in prompt area", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.hints.effort", label: "Effort Hint", description: "Show reasoning effort hint in prompt area", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.ascii_only", label: "ASCII Only", description: "Render plain ASCII box drawing and icons", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.powerline", label: "Powerline Glyphs", description: "The terminal font has Powerline/Nerd Font glyphs: draw arrow separators in the status line", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.mouse", label: "Mouse Support", description: "Enable terminal mouse tracking and scrolling; applied to the live terminal", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.auto_copy", label: "Auto Copy", description: "Automatically copy mouse selections to clipboard", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.ups", label: "Updates Per Second", description: "Render update rate: auto, dynamic, or fixed 1..=240", section: "ui", default_value: "10", kind: SettingKind::String, apply: ApplyMode::Immediate },
@@ -341,6 +342,7 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "ui.hints.model" => Some(config.ui.hints.model.to_string()),
         "ui.hints.effort" => Some(config.ui.hints.effort.to_string()),
         "ui.ascii_only" => Some(config.ui.ascii_only.to_string()),
+        "ui.powerline" => Some(config.ui.powerline.to_string()),
         "ui.mouse" => Some(config.ui.mouse.to_string()),
         "ui.auto_copy" => Some(config.ui.auto_copy.to_string()),
         "ui.ups" => Some(match config.ui.ups {
@@ -800,6 +802,11 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "ui.ascii_only" => {
             if let toml::Value::Boolean(b) = value {
                 config.ui.ascii_only = *b;
+            }
+        }
+        "ui.powerline" => {
+            if let toml::Value::Boolean(b) = value {
+                config.ui.powerline = *b;
             }
         }
         "ui.mouse" => {
