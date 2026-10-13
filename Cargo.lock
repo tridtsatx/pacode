@@ -2967,6 +2967,7 @@ dependencies = [
  "pacode-mcp",
  "pacode-plugin",
  "pacode-provider",
+ "pacode-risk",
  "pacode-skills",
  "pacode-store",
  "pacode-tools",

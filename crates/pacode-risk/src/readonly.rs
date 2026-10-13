@@ -1,9 +1,12 @@
 //! Read-only allowlist for Plan mode.
 //!
-//! The allowlist answers "does this command only read?", so it has to survive
-//! commands that read *and* write through their own flags: `fd -x`, `rg
-//! --pre`, `sort -o`, `find -fprintf`, `sed w`, `awk 'print > "f"'`, `git
-//! diff --output=` all execute or write while looking like a read.
+//! The allowlist answers "does this command only read?" for every command the
+//! line runs ([`crate::shell`] finds them, wrappers included), so it has to
+//! survive commands that read *and* write or execute through their own
+//! arguments: `fd -x`, `rg --pre`, `sort -o`, `uniq IN OUT`, `find -fprintf`,
+//! `sed w`, `awk 'print > "f"'`, `git diff --output=` (see [`crate::writers`]).
+//! A substitution, a writing redirection, or grammar the parser cannot follow
+//! makes the line not read-only.
 //!
 //! Reads are gated too, at the only level that needs no working directory:
 //! credential stores and credential-shaped file names (the `paths` policy that
@@ -16,16 +19,18 @@
 #[path = "readonly_tests.rs"]
 mod readonly_tests;
 
+use crate::git::GitCall;
 use crate::paths::{ProtectedPaths, is_safe_redirect_sink};
-use crate::tokenize::{self, Token};
+use crate::shell::{self, Script, SimpleCommand, expand_braces};
+use crate::tokenize::Token;
+use crate::wrappers::{self, Inner};
+use crate::writers::{awk_writes, sed_writes, writes_through_own_arguments};
 
 const READONLY_COMMANDS: &[&str] = &[
     "ls",
     "cat",
     "head",
     "tail",
-    "less",
-    "more",
     "wc",
     "grep",
     "egrep",
@@ -65,175 +70,115 @@ const READONLY_COMMANDS: &[&str] = &[
     "readlink",
 ];
 
-const SHELL_CONTROL_PREFIXES: &[&str] = &[
-    "then", "do", "else", "elif", "if", "while", "until", "case", "in", "select",
+/// Wrappers that change only scheduling, limits or the environment, so the
+/// command they run may still be a read.
+const READ_WRAPPERS: &[&str] = &[
+    "env", "nice", "ionice", "time", "timeout", "nohup", "command", "builtin", "exec", "xargs",
+    "stdbuf", "setsid",
 ];
 
 /// System password databases: readable by anyone, a dump of every account's
 /// hash, and never a legitimate thing to pull into a model's context.
 const SYSTEM_SECRET_FILES: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/master.passwd"];
 
+/// Brace patterns expanded for the path checks before giving up.
+const MAX_BRACE_WORDS: usize = 64;
+
 pub fn is_read_only(command: &str) -> bool {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    if trimmed.contains("$(") || trimmed.contains('`') {
-        return false;
-    }
-
-    let tokens = tokenize::tokenize(trimmed);
-    if tokens.is_empty() {
-        return false;
-    }
-
-    for token in &tokens {
-        if token.is_truncating_redirect_target && !is_safe_redirect_sink(&token.text) {
-            return false;
-        }
-        if token.is_operator && (token.text == ">>" || token.text.ends_with(">>")) {
-            return false;
-        }
-    }
-
-    let segments = tokenize::split_segments(trimmed);
-    if segments.is_empty() {
-        return false;
-    }
-
-    for segment in &segments {
-        if !is_segment_read_only(segment) {
-            return false;
-        }
-    }
-
-    true
+    read_only_script(&shell::parse(command))
 }
 
-fn is_segment_read_only(tokens: &[Token]) -> bool {
-    let mut tokens = tokens;
-    while tokens.len() > 1
-        && tokens
-            .first()
-            .is_some_and(|t| SHELL_CONTROL_PREFIXES.contains(&t.text.as_str()))
-    {
-        tokens = &tokens[1..];
-    }
+pub(crate) fn read_only_script(script: &Script) -> bool {
+    !script.commands.is_empty()
+        && script.unresolved.is_empty()
+        && script.substitutions == 0
+        && script.commands.iter().all(command_is_read_only)
+}
 
-    loop {
-        let Some(first) = tokens.first() else {
-            return false;
+fn command_is_read_only(command: &SimpleCommand) -> bool {
+    let redirects_read = command.redirects.iter().all(|redirect| {
+        let Some(target) = &redirect.target else {
+            return true;
         };
-        let name = first.basename();
-
-        if name == "sudo" || name == "doas" || name == "tee" {
-            return false;
+        if redirect.writes() {
+            is_safe_redirect_sink(&target.text)
+        } else {
+            !escapes(&target.text)
         }
+    });
+    redirects_read
+        && !command
+            .assignments
+            .iter()
+            .any(|a| assignment_runs_code(&a.text))
+        && (command.words.is_empty() || words_are_read_only(&command.words))
+}
 
-        if name == "xargs" {
-            let rest = &tokens[1..];
-            let mut idx = 0;
-            while idx < rest.len() {
-                let token = &rest[idx];
-                if token.is_operator {
-                    idx += 1;
-                    continue;
-                }
-                if token.is_flag() {
-                    idx += 1;
-                    if matches!(
-                        token.text.as_str(),
-                        "-n" | "--max-args"
-                            | "-P"
-                            | "--max-procs"
-                            | "-s"
-                            | "--max-chars"
-                            | "-d"
-                            | "-E"
-                            | "-I"
-                            | "-L"
-                    ) && idx < rest.len()
-                    {
-                        idx += 1;
-                    }
-                    continue;
-                }
-                break;
-            }
-            let inner = &rest[idx..];
-            if inner.is_empty() {
-                return true;
-            }
-            return is_segment_read_only(inner);
-        }
-
-        if matches!(
-            name.as_str(),
-            "env"
-                | "nice"
-                | "ionice"
-                | "time"
-                | "timeout"
-                | "nohup"
-                | "command"
-                | "builtin"
-                | "exec"
-        ) {
-            let rest = &tokens[1..];
-            let mut idx = 0;
-            while idx < rest.len() {
-                let token = &rest[idx];
-                if token.is_operator || token.text.contains('=') {
-                    idx += 1;
-                    continue;
-                }
-                if token.is_flag() {
-                    idx += 1;
-                    if matches!(
-                        token.text.as_str(),
-                        "-n" | "--adjustment" | "-c" | "-p" | "-s" | "-k" | "-u"
-                    ) && idx < rest.len()
-                    {
-                        idx += 1;
-                    }
-                    continue;
-                }
-                if token.text.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                    idx += 1;
-                    continue;
-                }
-                break;
-            }
-            // `env` on its own (or with only assignments) prints the whole
-            // environment — every token in it — and nothing else.
-            if idx >= rest.len() {
-                return false;
-            }
-            tokens = &rest[idx..];
-            continue;
-        }
-
-        break;
-    }
-
-    let Some(program) = tokens.first() else {
+/// An environment assignment that makes a reader run other code: the search
+/// path, preloaded libraries, shell start-up files, pagers and editors, git's
+/// external helpers.
+fn assignment_runs_code(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
         return false;
     };
-    let program_name = program.basename();
+    matches!(
+        name,
+        "PATH"
+            | "IFS"
+            | "BASH_ENV"
+            | "ENV"
+            | "SHELLOPTS"
+            | "BASHOPTS"
+            | "PS4"
+            | "PROMPT_COMMAND"
+            | "LESSOPEN"
+            | "LESSCLOSE"
+            | "VISUAL"
+            | "NODE_OPTIONS"
+            | "GIT_EXTERNAL_DIFF"
+            | "GIT_SSH"
+            | "GIT_SSH_COMMAND"
+            | "GIT_ASKPASS"
+            | "SSH_ASKPASS"
+            | "GIT_EXEC_PATH"
+    ) || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || name.starts_with("GIT_CONFIG")
+        || name.contains("PAGER")
+        || name.contains("EDITOR")
+}
 
-    if reads_escape_workspace(&program_name, tokens) {
+fn words_are_read_only(words: &[Token]) -> bool {
+    if let Some(unwrapped) = wrappers::unwrap(words) {
+        let name = unwrapped.name.as_str();
+        if !READ_WRAPPERS.contains(&name) || !unwrapped.writes.is_empty() {
+            return false;
+        }
+        if name == "env" && words.iter().any(|w| assignment_runs_code(&w.text)) {
+            return false;
+        }
+        return match unwrapped.inner {
+            Inner::Argv(rest) => words_are_read_only(rest),
+            // `env` alone prints the whole environment — every token in it.
+            Inner::Nothing => name != "env",
+            Inner::Scripts(_) | Inner::Opaque(_) | Inner::Unknown(_) => false,
+        };
+    }
+    let Some(program) = words.first() else {
+        return true;
+    };
+    let program_name = program.basename();
+    if reads_escape_workspace(&program_name, words) {
         return false;
     }
-
+    let args: Vec<&str> = words.iter().skip(1).map(|t| t.text.as_str()).collect();
     if READONLY_COMMANDS.contains(&program_name.as_str()) {
-        return !writes_through_own_flags(&program_name, tokens);
+        return !writes_through_own_arguments(&program_name, words);
     }
-
     match program_name.as_str() {
-        "find" => !tokens.iter().any(|t| {
+        "find" => !args.iter().any(|a| {
             matches!(
-                t.text.as_str(),
+                *a,
                 "-delete"
                     | "-exec"
                     | "-execdir"
@@ -246,43 +191,11 @@ fn is_segment_read_only(tokens: &[Token]) -> bool {
                     | "-fls"
             )
         }),
-        "awk" | "gawk" | "mawk" => !tokens.iter().any(|t| {
-            t.text.contains("system(")
-                || t.text.contains("system (")
-                || (!t.is_flag() && redirects_print_to_file(&t.text))
-        }),
-        "sed" => !tokens.iter().skip(1).any(|t| {
-            t.text == "-i"
-                || t.text.starts_with("-i")
-                || t.text.starts_with("--in-place")
-                || (!t.is_flag() && sed_writes_file(&t.text))
-        }),
-        "git" => is_git_read_only(tokens),
-        "cargo" => is_cargo_read_only(tokens),
-        "rustc" => is_version_only(tokens),
-        "python" | "python3" => is_version_only(tokens),
-        "node" | "nodejs" => is_version_only(tokens),
-        _ => false,
-    }
-}
-
-/// Allowlisted commands that write or execute anyway when handed a flag, and
-/// `printenv` with no variable named.
-fn writes_through_own_flags(program: &str, tokens: &[Token]) -> bool {
-    let args: Vec<&str> = tokens.iter().skip(1).map(|t| t.text.as_str()).collect();
-    match program {
-        // `fd -x/-X/--exec` runs a command per match.
-        "fd" => args
-            .iter()
-            .any(|a| matches!(*a, "-x" | "-X" | "--exec" | "--exec-batch")),
-        // `rg --pre` pipes every file it reads through a command.
-        "rg" => args.iter().any(|a| a.starts_with("--pre")),
-        // `sort -o` rewrites (or truncates) the file it sorts.
-        "sort" => args
-            .iter()
-            .any(|a| *a == "-o" || *a == "--output" || a.starts_with("--output=")),
-        // A bare `printenv` dumps every variable, keys included.
-        "printenv" => args.is_empty(),
+        "awk" | "gawk" | "mawk" => !awk_writes(&args),
+        "sed" => !sed_writes(&args),
+        "git" => is_git_read_only(&args),
+        "cargo" => is_cargo_read_only(&args),
+        "rustc" | "python" | "python3" | "node" | "nodejs" => is_version_only(&args),
         _ => false,
     }
 }
@@ -297,9 +210,6 @@ fn path_operands<'a>(program: &str, tokens: &'a [Token]) -> Vec<&'a str> {
     let mut want_pattern = matches!(program, "grep" | "egrep" | "fgrep" | "rg" | "awk" | "sed");
     let mut flag_takes_pattern = false;
     for token in tokens.iter().skip(1) {
-        if token.is_operator {
-            continue;
-        }
         if token.is_flag() {
             flag_takes_pattern |= matches!(
                 token.text.as_str(),
@@ -331,15 +241,33 @@ fn path_operands<'a>(program: &str, tokens: &'a [Token]) -> Vec<&'a str> {
 /// credential-shaped file names that `paths` protects from deletion, the system
 /// password databases, and operands that climb out of the workspace.
 fn reads_escape_workspace(program: &str, tokens: &[Token]) -> bool {
-    if tokens
+    tokens.iter().any(|t| {
+        !t.is_flag()
+            && expansions(&t.text)
+                .iter()
+                .any(|word| is_protected_read(word))
+    }) || path_operands(program, tokens).into_iter().any(climbs_out)
+}
+
+/// A redirection's file: protected, or outside the workspace.
+fn escapes(target: &str) -> bool {
+    expansions(target)
         .iter()
-        .any(|t| !t.is_operator && !t.is_flag() && is_protected_read(&t.text))
-    {
-        return true;
-    }
-    path_operands(program, tokens)
-        .into_iter()
-        .any(|operand| operand.split('/').any(|part| part == ".."))
+        .any(|word| is_protected_read(word))
+        || climbs_out(target)
+}
+
+/// `operand`, brace patterns included, has a `..` path component.
+fn climbs_out(operand: &str) -> bool {
+    expansions(operand)
+        .iter()
+        .any(|word| word.split('/').any(|part| part == ".."))
+}
+
+/// The words a brace pattern expands to; a pattern too large to expand is
+/// kept as one word with every `..` it might produce made explicit.
+fn expansions(word: &str) -> Vec<String> {
+    expand_braces(word, MAX_BRACE_WORDS).unwrap_or_else(|| vec!["..".to_string()])
 }
 
 /// Whether this word names a credential store, a credential file, or a system
@@ -364,98 +292,29 @@ fn is_protected_read(word: &str) -> bool {
         .is_some_and(|name| ProtectedPaths::is_credential_file_name(name))
 }
 
-/// `print > "file"` and `print >> "f"` are awk's write path. A comparison
-/// (`$3 > 5`) is not, so only an arrow whose right-hand side is a quoted string
-/// counts — that is the only form awk accepts for a filename.
-fn redirects_print_to_file(script: &str) -> bool {
-    let lower = script.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(found) = lower[from..].find("print") {
-        let at = from + found;
-        let tail = &lower[at + "print".len()..];
-        let Some(arrow) = tail.find('>') else {
-            return false;
-        };
-        let target = tail[arrow + 1..].trim_start_matches('>').trim_start();
-        if target.starts_with('"') || target.starts_with('\'') {
-            return true;
-        }
-        from = at + "print".len();
-    }
-    false
+fn is_version_only(args: &[&str]) -> bool {
+    !args.is_empty() && args.iter().all(|a| matches!(*a, "--version" | "-V" | "-v"))
 }
 
-/// `w` is sed's write command: `sed 'w out'` and the `s/a/b/w out` tail both
-/// create a file while the command still reads like a filter.
-fn sed_writes_file(token: &str) -> bool {
-    if token.is_empty() || token.starts_with('-') {
+/// `cargo --version`, and `metadata` / `tree` only when they may not rewrite
+/// `Cargo.lock` (`--locked` / `--frozen`). `check` is not a read: it runs
+/// build scripts and proc macros (project code) and writes `target/`. A
+/// `--config` / `-Z` override can point cargo at any program.
+fn is_cargo_read_only(args: &[&str]) -> bool {
+    if args
+        .iter()
+        .any(|a| *a == "--config" || a.starts_with("--config=") || a.starts_with("-Z"))
+    {
         return false;
     }
-    let chars: Vec<char> = token.chars().collect();
-    let mut idx = 0;
-    let mut at_command_start = true;
-    while idx < chars.len() {
-        let c = chars[idx];
-        if c == ';' {
-            at_command_start = true;
-            idx += 1;
-            continue;
-        }
-        if c.is_whitespace() {
-            idx += 1;
-            continue;
-        }
-        // Skip an `s///` command to its closing delimiter, where a `w` tail may
-        // follow.
-        if c == 's' && at_command_start {
-            let Some(delim) = chars.get(idx + 1).copied().filter(|d| !d.is_whitespace()) else {
-                at_command_start = false;
-                idx += 1;
-                continue;
-            };
-            let mut cursor = idx + 2;
-            let mut delimiters = 0;
-            while cursor < chars.len() && delimiters < 2 {
-                if chars[cursor] == '\\' {
-                    cursor += 2;
-                    continue;
-                }
-                if chars[cursor] == delim {
-                    delimiters += 1;
-                }
-                cursor += 1;
-            }
-            at_command_start = true;
-            idx = cursor;
-            continue;
-        }
-        if (c == 'w' || c == 'W') && at_command_start {
-            return true;
-        }
-        at_command_start = false;
-        idx += 1;
-    }
-    false
-}
-
-fn is_version_only(tokens: &[Token]) -> bool {
-    let args: Vec<&str> = tokens.iter().skip(1).map(|t| t.text.as_str()).collect();
-    if args.is_empty() {
-        return false;
-    }
-    args.iter().any(|a| matches!(*a, "--version" | "-V" | "-v"))
-        && args.iter().all(|a| matches!(*a, "--version" | "-V" | "-v"))
-}
-
-fn is_cargo_read_only(tokens: &[Token]) -> bool {
-    let args: Vec<&str> = tokens.iter().skip(1).map(|t| t.text.as_str()).collect();
     if args.iter().any(|a| matches!(*a, "--version" | "-V")) {
         return true;
     }
     let Some(subcmd) = args.iter().find(|a| !a.starts_with('-')) else {
         return false;
     };
-    matches!(*subcmd, "check" | "metadata" | "tree")
+    matches!(*subcmd, "metadata" | "tree")
+        && args.iter().any(|a| matches!(*a, "--locked" | "--frozen"))
 }
 
 /// `--flag` and `--flag=value` name the same option to git; the value may
@@ -468,44 +327,86 @@ fn git_flag(arg: &str) -> &str {
     }
 }
 
-fn is_git_read_only(tokens: &[Token]) -> bool {
-    let args: Vec<&str> = tokens.iter().skip(1).map(|t| t.text.as_str()).collect();
-    if args.iter().any(|a| matches!(*a, "--version" | "-v")) {
+fn is_git_read_only(words: &[&str]) -> bool {
+    let call = GitCall::parse(words);
+    if call.unknown.is_some() {
+        return false;
+    }
+    if call.only_asks_version() {
         return true;
     }
-    // `--output=<file>` writes the result to disk (`git diff --output=patch`).
-    if args.iter().any(|a| git_flag(a) == "--output") {
+    // `-c` / `--config-env` can name any program as a pager, diff driver or
+    // alias; `--exec-path` swaps git's own helpers.
+    if call
+        .globals
+        .iter()
+        .any(|(option, _)| matches!(*option, "-c" | "--config-env" | "--exec-path"))
+    {
         return false;
     }
-    let Some(subcmd) = args.iter().find(|a| !a.starts_with('-')) else {
+    let Some(subcmd) = call.subcommand else {
         return false;
     };
-    match *subcmd {
+    let args = &call.args;
+    // `--output=<file>` writes the result to disk (`git diff --output=patch`).
+    if args
+        .iter()
+        .any(|a| a.starts_with("--o") && "--output".starts_with(git_flag(a)))
+    {
+        return false;
+    }
+    match subcmd {
         "status" | "log" | "diff" | "show" | "blame" | "rev-parse" | "ls-files" | "describe" => {
             true
         }
-        "branch" => !args.iter().any(|a| {
-            matches!(
-                git_flag(a),
-                "-d" | "-D"
-                    | "-m"
-                    | "-M"
-                    | "--delete"
-                    | "--move"
-                    | "-c"
-                    | "-C"
-                    | "--copy"
-                    | "--edit-description"
-                    | "-u"
-                    | "--set-upstream-to"
-                    | "--unset-upstream"
-            )
-        }),
-        "tag" => is_git_tag_listing(&args),
-        "stash" => {
-            let stash_sub = args.iter().skip_while(|a| **a != "stash").nth(1).copied();
-            matches!(stash_sub, Some("list" | "show"))
-        }
+        "branch" => is_git_ref_listing(
+            args,
+            &[
+                "-d",
+                "-D",
+                "-m",
+                "-M",
+                "--delete",
+                "--move",
+                "-c",
+                "-C",
+                "--copy",
+                "--edit-description",
+                "-u",
+                "--set-upstream-to",
+                "--unset-upstream",
+                "-f",
+                "--force",
+                "-t",
+                "--track",
+                "--no-track",
+                "--create-reflog",
+                "--recurse-submodules",
+            ],
+        ),
+        "tag" => is_git_ref_listing(
+            args,
+            &[
+                "-d",
+                "--delete",
+                "-a",
+                "--annotate",
+                "-m",
+                "--message",
+                "-F",
+                "--file",
+                "-f",
+                "--force",
+                "-s",
+                "--sign",
+                "-u",
+                "--local-user",
+                "--edit",
+                "-e",
+                "--create-reflog",
+            ],
+        ),
+        "stash" => matches!(args.first(), Some(&"list" | &"show")),
         "remote" => !args.iter().any(|a| {
             matches!(
                 *a,
@@ -520,36 +421,38 @@ fn is_git_read_only(tokens: &[Token]) -> bool {
                     | "set-branches"
             )
         }),
-        "list" => true,
         _ => false,
     }
 }
 
-/// `git tag <name>` creates a tag and moves a ref; only the listing forms read.
-fn is_git_tag_listing(args: &[&str]) -> bool {
-    if args.iter().any(|a| {
-        matches!(
-            git_flag(a),
-            "-d" | "--delete"
-                | "-a"
-                | "--annotate"
-                | "-m"
-                | "--message"
-                | "-f"
-                | "--force"
-                | "-s"
-                | "--sign"
-                | "-u"
-                | "--local-user"
-                | "--edit"
-                | "-e"
-                | "--create-reflog"
-        )
-    }) {
+/// `git branch` / `git tag` list refs only without a writing flag, and with
+/// a name given only as a `-l`/`--list` pattern or a filter's value:
+/// `git branch NAME` creates a branch, `git tag NAME` a tag.
+fn is_git_ref_listing(args: &[&str], writing: &[&str]) -> bool {
+    const FILTERS: &[&str] = &[
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--sort",
+        "--format",
+    ];
+    if args.iter().any(|a| writing.contains(&git_flag(a))) {
         return false;
     }
-    if args.iter().any(|a| matches!(git_flag(a), "-l" | "--list")) {
-        return true;
+    let mut listing = false;
+    let mut names = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        index += 1;
+        if FILTERS.contains(arg) && args.get(index).is_some_and(|v| !v.starts_with('-')) {
+            index += 1;
+        } else if matches!(*arg, "-l" | "--list") {
+            listing = true;
+        } else if !arg.starts_with('-') {
+            names = true;
+        }
     }
-    !args.iter().skip(1).any(|a| !a.starts_with('-'))
+    !names || listing
 }

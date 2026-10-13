@@ -1,17 +1,20 @@
-//! Shell tokenizer: words, quotes, escapes, and control operators.
+//! Shell lexer: words, quotes, escapes, expansions, and control operators.
 //!
-//! Tuned for risk classification: fails loud rather than quiet so ambiguous
-//! segments escalate to confirmation.
+//! Tuned for risk classification. A word carries the text the shell sees after
+//! quote removal, with every expansion kept verbatim (`$x`, `$(..)`, `` `..` ``)
+//! so a computed word still looks computed. The source of every command
+//! substitution, wherever it sits — unquoted, inside double quotes, inside
+//! `${..}`, in an unquoted here-document — is handed back separately, because
+//! the shell runs it. What the lexer cannot follow (an unterminated quote, a
+//! `(` glued to a word) is reported, never guessed: the caller then refuses to
+//! call the line safe.
 
-/// One shell word or operator with classification metadata.
+/// One shell word or operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
     pub text: String,
-    /// True when this segment's stdin comes from a pipe.
-    pub receives_pipe: bool,
-    /// True for `>` / `>|` redirect destinations, which are truncated on open.
-    pub is_truncating_redirect_target: bool,
-    /// True for control operators like `&&`, `|`, `2>&1`, which are never path targets.
+    /// Control and redirection operators (`&&`, `|`, `2>&1`, `<<`), which are
+    /// never words of a command.
     pub is_operator: bool,
 }
 
@@ -19,8 +22,6 @@ impl Token {
     pub fn word(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            receives_pipe: false,
-            is_truncating_redirect_target: false,
             is_operator: false,
         }
     }
@@ -28,8 +29,6 @@ impl Token {
     pub fn operator(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            receives_pipe: false,
-            is_truncating_redirect_target: false,
             is_operator: true,
         }
     }
@@ -44,7 +43,7 @@ impl Token {
     }
 
     pub fn is_flag(&self) -> bool {
-        self.text.starts_with('-') && self.text.len() > 1
+        !self.is_operator && self.text.starts_with('-') && self.text.len() > 1
     }
 
     /// Whether this flag requests recursion, including bundles like `-rf` or `-Rf`.
@@ -59,333 +58,423 @@ impl Token {
     }
 }
 
-/// Operators that separate one simple command from the next.
-const SEGMENT_SEPARATORS: &[&str] = &["&&", "||", ";", "|", "\n", "(", ")", "$(", "`"];
+/// What the lexer could not resolve. Each one makes the whole line
+/// unclassifiable.
+pub(crate) const UNTERMINATED: &str = "an unterminated quote or substitution";
+pub(crate) const GLUED_PAREN: &str =
+    "a `(` glued to a word (an extended glob, a zsh glob qualifier or a fish substitution)";
+pub(crate) const CASE_IN_SUBSTITUTION: &str = "a `case` statement inside a command substitution";
 
-/// Split a command line into individual simple command segments.
-pub fn split_segments(command: &str) -> Vec<Vec<Token>> {
-    let tokens = tokenize(command);
-    let mut segments = Vec::new();
-    let mut current = Vec::new();
-
-    let mut next_receives_pipe = false;
-    for token in tokens {
-        if token.is_operator && SEGMENT_SEPARATORS.contains(&token.text.as_str()) {
-            if !current.is_empty() {
-                segments.push(std::mem::take(&mut current));
-            }
-            next_receives_pipe = token.text == "|";
-            continue;
-        }
-        let mut token = token;
-        token.receives_pipe = next_receives_pipe;
-        next_receives_pipe = false;
-        current.push(token);
-    }
-    if !current.is_empty() {
-        segments.push(current);
-    }
-    segments
+/// A lexed command line.
+#[derive(Debug, Default)]
+pub(crate) struct Lexed {
+    pub(crate) tokens: Vec<Token>,
+    /// Source of every command and process substitution in the line.
+    pub(crate) nested: Vec<String>,
+    pub(crate) unresolved: Vec<&'static str>,
 }
 
 /// Tokenize a shell command line, resolving quotes and escapes.
 pub fn tokenize(command: &str) -> Vec<Token> {
-    let command = without_heredoc_bodies(command);
-    let mut tokens: Vec<Token> = Vec::new();
-    let mut current = String::new();
-    let mut has_content = false;
-    let mut chars = command.chars().peekable();
-    let mut pending_redirect = false;
+    lex(command).tokens
+}
 
-    macro_rules! flush {
-        () => {
-            if has_content {
-                let mut token = Token::word(std::mem::take(&mut current));
-                #[allow(unused_assignments)]
-                {
-                    if pending_redirect {
-                        token.is_truncating_redirect_target = true;
-                        pending_redirect = false;
-                    }
-                    has_content = false;
-                }
-                tokens.push(token);
-            }
-        };
+/// The words of every simple command the line runs, substitutions included.
+pub fn split_segments(command: &str) -> Vec<Vec<Token>> {
+    crate::shell::parse(command)
+        .commands
+        .into_iter()
+        .map(|command| command.words)
+        .filter(|words| !words.is_empty())
+        .collect()
+}
+
+pub(crate) fn lex(src: &str) -> Lexed {
+    let mut lexer = Lexer {
+        chars: src.chars().collect(),
+        pos: 0,
+        out: Lexed::default(),
+        heredocs: Vec::new(),
+    };
+    lexer.run();
+    lexer.out
+}
+
+mod scan;
+
+struct Heredoc {
+    delimiter: String,
+    strip_tabs: bool,
+    /// Unquoted delimiter: the body is expanded like a double-quoted string.
+    expands: bool,
+}
+
+struct Lexer {
+    chars: Vec<char>,
+    pos: usize,
+    out: Lexed,
+    heredocs: Vec<Heredoc>,
+}
+
+/// Characters that end a word.
+fn ends_word(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n' | ';' | '&' | '|' | ')')
+}
+
+impl Lexer {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
     }
 
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                has_content = true;
-                for q in chars.by_ref() {
-                    if q == '\'' {
-                        break;
+    fn at(&self, index: usize) -> Option<char> {
+        self.chars.get(index).copied()
+    }
+
+    fn op(&mut self, text: &str, len: usize) {
+        self.pos += len;
+        self.out.tokens.push(Token::operator(text));
+    }
+
+    fn run(&mut self) {
+        while let Some(c) = self.peek() {
+            let next = self.at(self.pos + 1);
+            match c {
+                ' ' | '\t' | '\r' => self.pos += 1,
+                '\\' if next == Some('\n') => self.pos += 2,
+                '#' => {
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.pos += 1;
                     }
-                    current.push(q);
                 }
-            }
-            '"' => {
-                has_content = true;
-                while let Some(q) = chars.next() {
-                    if q == '"' {
-                        break;
-                    }
-                    if q == '\\'
-                        && let Some(&next) = chars.peek()
-                        && matches!(next, '"' | '\\' | '$' | '`')
+                '\n' => {
+                    self.op("\n", 1);
+                    self.read_heredoc_bodies();
+                }
+                ';' => match (next, self.at(self.pos + 2)) {
+                    (Some(';'), Some('&')) => self.op(";;&", 3),
+                    (Some(';'), _) => self.op(";;", 2),
+                    (Some('&'), _) => self.op(";&", 2),
+                    _ => self.op(";", 1),
+                },
+                '&' => match (next, self.at(self.pos + 2)) {
+                    (Some('&'), _) => self.op("&&", 2),
+                    (Some('>'), Some('>')) => self.op("&>>", 3),
+                    (Some('>'), _) => self.op("&>", 2),
+                    _ => self.op("&", 1),
+                },
+                '|' => match next {
+                    Some('|') => self.op("||", 2),
+                    Some('&') => self.op("|&", 2),
+                    _ => self.op("|", 1),
+                },
+                '(' => {
+                    if next == Some('(')
+                        && let Some(end) = self.arithmetic_end(self.pos)
                     {
-                        current.push(next);
-                        chars.next();
-                        continue;
-                    }
-                    current.push(q);
-                }
-            }
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    has_content = true;
-                    current.push(next);
-                }
-            }
-            ' ' | '\t' => flush!(),
-            '\n' | ';' => {
-                flush!();
-                tokens.push(Token::operator(c.to_string()));
-            }
-            '&' => {
-                flush!();
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                    tokens.push(Token::operator("&&"));
-                } else if chars.peek() == Some(&'>') {
-                    chars.next();
-                    pending_redirect = true;
-                    tokens.push(Token::operator("&>"));
-                } else {
-                    tokens.push(Token::operator("&"));
-                }
-            }
-            '|' => {
-                flush!();
-                if chars.peek() == Some(&'|') {
-                    chars.next();
-                    tokens.push(Token::operator("||"));
-                } else {
-                    tokens.push(Token::operator("|"));
-                }
-            }
-            '(' => {
-                flush!();
-                tokens.push(Token::operator("("));
-            }
-            ')' => {
-                flush!();
-                tokens.push(Token::operator(")"));
-            }
-            '`' => {
-                flush!();
-                tokens.push(Token::operator("`"));
-            }
-            '$' => {
-                if chars.peek() == Some(&'(') {
-                    flush!();
-                    chars.next();
-                    tokens.push(Token::operator("$("));
-                } else {
-                    has_content = true;
-                    current.push('$');
-                }
-            }
-            '>' => {
-                // Check if current is fd prefix like "2" or "1"
-                let is_fd_prefix = has_content && current.chars().all(|d| d.is_ascii_digit());
-                if is_fd_prefix {
-                    let fd = std::mem::take(&mut current);
-                    has_content = false;
-                    // Check for fd duplication: >&1 or >&2 or >&-
-                    if chars.peek() == Some(&'&') {
-                        let mut lookahead = chars.clone();
-                        lookahead.next(); // skip '&'
-                        if let Some(target) = lookahead.next()
-                            && (target.is_ascii_digit() || target == '-')
-                        {
-                            chars.next(); // consume '&'
-                            chars.next(); // consume target
-                            tokens.push(Token::operator(format!("{fd}>&{target}")));
-                            continue;
-                        }
-                    }
-                    if chars.peek() == Some(&'>') {
-                        chars.next();
-                        tokens.push(Token::operator(format!("{fd}>>")));
-                        continue;
-                    }
-                    if chars.peek() == Some(&'|') {
-                        chars.next();
-                    }
-                    pending_redirect = true;
-                    tokens.push(Token::operator(format!("{fd}>")));
-                } else {
-                    flush!();
-                    if chars.peek() == Some(&'&') {
-                        let mut lookahead = chars.clone();
-                        lookahead.next();
-                        if let Some(target) = lookahead.next()
-                            && (target.is_ascii_digit() || target == '-')
-                        {
-                            chars.next();
-                            chars.next();
-                            tokens.push(Token::operator(format!(">&{target}")));
-                            continue;
-                        }
-                    }
-                    if chars.peek() == Some(&'>') {
-                        chars.next();
-                        tokens.push(Token::operator(">>"));
+                        self.arithmetic_command(end);
                     } else {
-                        if chars.peek() == Some(&'|') {
-                            chars.next();
-                        }
-                        pending_redirect = true;
-                        tokens.push(Token::operator(">"));
+                        self.op("(", 1);
                     }
                 }
-            }
-            '<' => {
-                flush!();
-                if chars.peek() == Some(&'<') {
-                    chars.next();
-                    if chars.peek() == Some(&'<') {
-                        chars.next();
-                        tokens.push(Token::operator("<<<"));
-                    } else {
-                        tokens.push(Token::operator("<<"));
-                    }
-                } else {
-                    tokens.push(Token::operator("<"));
+                ')' => self.op(")", 1),
+                '<' | '>' if next == Some('(') => {
+                    self.word();
                 }
-            }
-            _ => {
-                has_content = true;
-                current.push(c);
+                '<' | '>' => self.redirect(String::new()),
+                _ => {
+                    self.word();
+                }
             }
         }
     }
-    flush!();
 
-    tokens
-}
+    /// `((expr))` as a command: arithmetic, whose only commands are the
+    /// substitutions inside it. `end` is the index of the closing `)`.
+    fn arithmetic_command(&mut self, end: usize) {
+        let body: String = self.chars[self.pos + 2..end - 1].iter().collect();
+        self.scan_expansions(&body);
+        self.pos = end + 1;
+        self.out.tokens.push(Token::word(format!("(({body}))")));
+    }
 
-/// Strip heredoc payload lines before tokenizing.
-fn without_heredoc_bodies(command: &str) -> String {
-    let lines: Vec<&str> = command.split_inclusive('\n').collect();
-    let mut output = String::with_capacity(command.len());
-    let mut index = 0;
+    fn unterminated(&mut self) {
+        self.out.unresolved.push(UNTERMINATED);
+        self.pos = self.chars.len();
+    }
 
-    while index < lines.len() {
-        let line = lines[index];
-        output.push_str(line);
-        let delimiters = heredoc_delimiters(line.trim_end_matches('\n'));
-        index += 1;
+    /// A redirection operator at `pos`, `fd` being the digits before it.
+    fn redirect(&mut self, fd: String) {
+        let c = self.peek();
+        let next = self.at(self.pos + 1);
+        let after = self.at(self.pos + 2);
+        let dup_target = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit() || c == '-');
+        if c == Some('>') {
+            match next {
+                Some('>') => self.op(&format!("{fd}>>"), 2),
+                Some('|') => self.op(&format!("{fd}>|"), 2),
+                Some('&') if dup_target(after) => {
+                    let target = after.unwrap_or('-');
+                    self.op(&format!("{fd}>&{target}"), 3);
+                }
+                Some('&') => self.op(&format!("{fd}>&"), 2),
+                _ => self.op(&format!("{fd}>"), 1),
+            }
+            return;
+        }
+        match next {
+            Some('<') if after == Some('<') => self.op(&format!("{fd}<<<"), 3),
+            Some('<') => {
+                let strip_tabs = after == Some('-');
+                let op = if strip_tabs { "<<-" } else { "<<" };
+                self.op(&format!("{fd}{op}"), if strip_tabs { 3 } else { 2 });
+                self.heredoc_delimiter(strip_tabs);
+            }
+            Some('&') if dup_target(after) => {
+                let target = after.unwrap_or('-');
+                self.op(&format!("{fd}<&{target}"), 3);
+            }
+            Some('&') => self.op(&format!("{fd}<&"), 2),
+            Some('>') => self.op(&format!("{fd}<>"), 2),
+            _ => self.op(&format!("{fd}<"), 1),
+        }
+    }
 
-        for (delimiter, strip_tabs) in delimiters {
-            while index < lines.len() {
-                let candidate = lines[index].trim_end_matches(['\r', '\n']);
-                let candidate = if strip_tabs {
-                    candidate.trim_start_matches('\t')
-                } else {
-                    candidate
-                };
-                index += 1;
-                if candidate == delimiter {
-                    output.push('\n');
+    fn heredoc_delimiter(&mut self, strip_tabs: bool) {
+        while self.peek().is_some_and(|c| c == ' ' || c == '\t') {
+            self.pos += 1;
+        }
+        if self
+            .peek()
+            .is_none_or(|c| ends_word(c) || c == '<' || c == '>')
+        {
+            return;
+        }
+        let quoted = self.word();
+        if let Some(token) = self.out.tokens.last() {
+            self.heredocs.push(Heredoc {
+                delimiter: token.text.clone(),
+                strip_tabs,
+                expands: !quoted,
+            });
+        }
+    }
+
+    /// At the start of the line after a here-document operator: consume each
+    /// pending body up to its delimiter line.
+    fn read_heredoc_bodies(&mut self) {
+        let heredocs = std::mem::take(&mut self.heredocs);
+        let (bodies, end) = self.bodies(self.pos, &heredocs);
+        self.pos = end;
+        for (heredoc, body) in heredocs.iter().zip(bodies) {
+            if heredoc.expands {
+                self.scan_expansions(&body);
+            }
+        }
+    }
+
+    /// Read one word; returns whether any part of it was quoted or escaped.
+    fn word(&mut self) -> bool {
+        let mut text = String::new();
+        let mut quoted = false;
+        while let Some(c) = self.peek() {
+            if ends_word(c) {
+                break;
+            }
+            match c {
+                '<' | '>' if self.at(self.pos + 1) == Some('(') => {
+                    self.substitution(&mut text, c, self.pos + 1);
+                }
+                '<' | '>' => {
+                    if !quoted && !text.is_empty() && text.chars().all(|d| d.is_ascii_digit()) {
+                        self.redirect(text);
+                        return quoted;
+                    }
                     break;
                 }
-            }
-        }
-    }
-
-    output
-}
-
-fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
-    let bytes = line.as_bytes();
-    let mut found = Vec::new();
-    let mut index = 0;
-    let mut quote = None;
-
-    while index + 1 < bytes.len() {
-        let byte = bytes[index];
-        if let Some(end) = quote {
-            if byte == b'\\' && end == b'"' {
-                index += 2;
-                continue;
-            }
-            if byte == end {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if matches!(byte, b'\'' | b'"') {
-            quote = Some(byte);
-            index += 1;
-            continue;
-        }
-        if byte == b'\\' {
-            index += 2;
-            continue;
-        }
-        if byte != b'<' || bytes[index + 1] != b'<' {
-            index += 1;
-            continue;
-        }
-
-        index += 2;
-        if bytes.get(index) == Some(&b'<') {
-            index += 1;
-            continue;
-        }
-        let strip_tabs = bytes.get(index) == Some(&b'-');
-        if strip_tabs {
-            index += 1;
-        }
-        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-            index += 1;
-        }
-
-        let mut delimiter = String::new();
-        let mut delimiter_quote = None;
-        while index < bytes.len() {
-            let byte = bytes[index];
-            if let Some(end) = delimiter_quote {
-                if byte == end {
-                    delimiter_quote = None;
-                } else if byte == b'\\' && end == b'"' && index + 1 < bytes.len() {
-                    index += 1;
-                    delimiter.push(bytes[index] as char);
-                } else {
-                    delimiter.push(byte as char);
+                '(' => {
+                    if text.is_empty() || self.at(self.pos + 1) == Some(')') {
+                        break;
+                    }
+                    self.out.unresolved.push(GLUED_PAREN);
+                    self.substitution(&mut text, '(', self.pos);
                 }
-            } else if matches!(byte, b'\'' | b'"') {
-                delimiter_quote = Some(byte);
-            } else if byte == b'\\' && index + 1 < bytes.len() {
-                index += 1;
-                delimiter.push(bytes[index] as char);
-            } else if byte.is_ascii_whitespace() || matches!(byte, b';' | b'&' | b'|') {
-                break;
-            } else {
-                delimiter.push(byte as char);
+                '\'' => {
+                    quoted = true;
+                    let Some(end) = self.skip_until(self.pos + 1, '\'') else {
+                        self.unterminated();
+                        break;
+                    };
+                    text.extend(&self.chars[self.pos + 1..end]);
+                    self.pos = end + 1;
+                }
+                '"' => {
+                    quoted = true;
+                    self.double_quoted(&mut text);
+                }
+                '\\' => {
+                    quoted = true;
+                    match self.at(self.pos + 1) {
+                        // A line continuation joins the two lines.
+                        Some('\n') => self.pos += 2,
+                        Some(escaped) => {
+                            text.push(escaped);
+                            self.pos += 2;
+                        }
+                        None => self.pos += 1,
+                    }
+                }
+                '$' => self.dollar(&mut text, false),
+                '`' => self.backtick(&mut text),
+                _ => {
+                    text.push(c);
+                    self.pos += 1;
+                }
             }
-            index += 1;
         }
-        if !delimiter.is_empty() {
-            found.push((delimiter, strip_tabs));
+        self.out.tokens.push(Token::word(text));
+        quoted
+    }
+
+    fn double_quoted(&mut self, text: &mut String) {
+        self.pos += 1;
+        loop {
+            match self.peek() {
+                None => return self.unterminated(),
+                Some('"') => {
+                    self.pos += 1;
+                    return;
+                }
+                Some('\\') => {
+                    match self.at(self.pos + 1) {
+                        Some('\n') => {}
+                        Some(c @ ('"' | '\\' | '$' | '`')) => text.push(c),
+                        Some(c) => {
+                            text.push('\\');
+                            text.push(c);
+                        }
+                        None => return self.unterminated(),
+                    }
+                    self.pos += 2;
+                }
+                Some('$') => self.dollar(text, true),
+                Some('`') => self.backtick(text),
+                Some(c) => {
+                    text.push(c);
+                    self.pos += 1;
+                }
+            }
         }
     }
 
-    found
+    /// A `$` expansion at `pos`, appended to `text` verbatim.
+    fn dollar(&mut self, text: &mut String, in_quotes: bool) {
+        match self.at(self.pos + 1) {
+            Some('(') => {
+                if self.at(self.pos + 2) == Some('(')
+                    && let Some(end) = self.arithmetic_end(self.pos + 1)
+                {
+                    let body: String = self.chars[self.pos + 3..end - 1].iter().collect();
+                    self.scan_expansions(&body);
+                    text.push_str(&format!("$(({body}))"));
+                    self.pos = end + 1;
+                } else {
+                    self.substitution(text, '$', self.pos + 1);
+                }
+            }
+            Some('{') => {
+                let Some(end) = self.matching_brace(self.pos + 1) else {
+                    return self.unterminated();
+                };
+                let body: String = self.chars[self.pos + 2..end].iter().collect();
+                self.scan_expansions(&body);
+                text.push_str(&format!("${{{body}}}"));
+                self.pos = end + 1;
+            }
+            Some('\'') if !in_quotes => {
+                let Some(end) = self.ansi_c_end(self.pos + 2) else {
+                    return self.unterminated();
+                };
+                text.extend(&self.chars[self.pos..=end]);
+                self.pos = end + 1;
+            }
+            _ => {
+                text.push('$');
+                self.pos += 1;
+            }
+        }
+    }
+
+    /// The closing quote of `$'..'`, where a backslash escapes the next char.
+    fn ansi_c_end(&self, from: usize) -> Option<usize> {
+        let mut index = from;
+        while let Some(c) = self.at(index) {
+            match c {
+                '\\' => index += 1,
+                '\'' => return Some(index),
+                _ => {}
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// `$( .. )`, `<( .. )`, `>( .. )` or a glued `( .. )`: the parenthesised
+    /// source is a nested command line. `open` is the index of the `(`.
+    fn substitution(&mut self, text: &mut String, sigil: char, open: usize) {
+        let Some(end) = self.matching_paren(open) else {
+            return self.unterminated();
+        };
+        let body: String = self.chars[open + 1..end].iter().collect();
+        if lex(&body)
+            .tokens
+            .iter()
+            .any(|t| !t.is_operator && t.text == "case")
+        {
+            // A `case` pattern's `)` closes the substitution early in the
+            // count above, so what follows it would be read as the outer line.
+            self.out.unresolved.push(CASE_IN_SUBSTITUTION);
+        }
+        if sigil != '(' {
+            text.push(sigil);
+        }
+        text.push('(');
+        text.push_str(&body);
+        text.push(')');
+        self.out.nested.push(body);
+        self.pos = end + 1;
+    }
+
+    /// `` `..` ``: a command substitution whose body unescapes `\``, `\\`, `\$`.
+    fn backtick(&mut self, text: &mut String) {
+        let mut body = String::new();
+        let mut index = self.pos + 1;
+        loop {
+            match self.at(index) {
+                None => return self.unterminated(),
+                Some('`') => break,
+                Some('\\') => {
+                    match self.at(index + 1) {
+                        Some(c @ ('`' | '\\' | '$')) => body.push(c),
+                        Some(c) => {
+                            body.push('\\');
+                            body.push(c);
+                        }
+                        None => {}
+                    }
+                    index += 2;
+                }
+                Some(c) => {
+                    body.push(c);
+                    index += 1;
+                }
+            }
+        }
+        text.push('`');
+        text.push_str(&body);
+        text.push('`');
+        self.out.nested.push(body);
+        self.pos = index + 1;
+    }
 }
 
 #[cfg(test)]

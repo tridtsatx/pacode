@@ -11,8 +11,6 @@ fn basic_allowlist_commands_are_read_only() {
         "cat file.txt",
         "head -n 20 src/main.rs",
         "tail -f log.txt",
-        "less README.md",
-        "more README.md",
         "wc -l Cargo.toml",
         "grep -rn 'TODO' src/",
         "egrep 'foo|bar' file.txt",
@@ -97,12 +95,113 @@ fn git_read_only_subcommands() {
 }
 
 #[test]
-fn cargo_read_only_subcommands() {
-    assert!(is_read_only("cargo check"));
-    assert!(is_read_only("cargo check --workspace"));
-    assert!(is_read_only("cargo metadata --format-version 1"));
-    assert!(is_read_only("cargo tree"));
+fn cargo_reads_only_what_cannot_rewrite_the_lock_file() {
+    assert!(is_read_only("cargo metadata --locked --format-version 1"));
+    assert!(is_read_only("cargo tree --frozen"));
     assert!(is_read_only("cargo --version"));
+    // `check` runs build scripts and proc macros and writes `target/`;
+    // `metadata` / `tree` rewrite a missing or stale `Cargo.lock`.
+    assert!(!is_read_only("cargo check"));
+    assert!(!is_read_only("cargo check --workspace"));
+    assert!(!is_read_only("cargo metadata --format-version 1"));
+    assert!(!is_read_only("cargo tree"));
+    assert!(!is_read_only(
+        "cargo --config build.rustc-wrapper=x tree --locked"
+    ));
+}
+
+#[test]
+fn pagers_are_not_on_the_allowlist() {
+    // Interactive, and `LESSOPEN` runs a preprocessor on every file.
+    assert!(!is_read_only("less README.md"));
+    assert!(!is_read_only("more README.md"));
+}
+
+#[test]
+fn git_global_options_do_not_hide_the_subcommand() {
+    assert!(!is_read_only("git -C log commit -am x"));
+    assert!(!is_read_only("git -c diff.external=x diff"));
+    assert!(!is_read_only("git -c core.pager=less log"));
+    assert!(!is_read_only("git --config-env=core.pager=X log"));
+    assert!(!is_read_only("git list"));
+    assert!(is_read_only("git -C crates/x status"));
+    assert!(is_read_only("git --no-pager log -5"));
+    assert!(!is_read_only("git -C .. status"));
+}
+
+#[test]
+fn git_branch_and_tag_with_a_name_create_a_ref() {
+    assert!(!is_read_only("git branch newbranch"));
+    assert!(!is_read_only("git branch newbranch main"));
+    assert!(!is_read_only("git branch -f main HEAD~1"));
+    assert!(!is_read_only("git tag v2"));
+    assert!(is_read_only("git branch --list 'feat*'"));
+    assert!(is_read_only("git branch --contains HEAD"));
+    assert!(is_read_only("git branch -a -v"));
+    assert!(is_read_only("git tag --points-at HEAD"));
+    assert!(is_read_only("git tag -l 'v*'"));
+}
+
+#[test]
+fn environment_that_runs_code_is_not_a_read() {
+    for command in [
+        "PATH=. ls",
+        "LD_PRELOAD=./x.so cat f",
+        "GIT_EXTERNAL_DIFF=x git diff",
+        "PAGER=x git log",
+        "env PATH=. ls",
+        "env LD_PRELOAD=x cat f",
+    ] {
+        assert!(!is_read_only(command), "{command:?}");
+    }
+    assert!(is_read_only("LC_ALL=C sort f"));
+    assert!(is_read_only("env TZ=UTC date"));
+}
+
+#[test]
+fn brace_patterns_are_expanded_for_the_path_policy() {
+    assert!(!is_read_only("cat {..,x}/secret"));
+    assert!(!is_read_only("cat x/{a,.env}"));
+    assert!(is_read_only("cat src/{a,b}.rs"));
+}
+
+#[test]
+fn readers_that_write_or_execute_through_their_arguments() {
+    for command in [
+        "sort -uo out in",
+        "sort --out=f in",
+        "sort --compress-program=gzip in",
+        "uniq in out",
+        "uniq -f 1 in out",
+        "tree -o out",
+        "tree -R",
+        "date -s now",
+        "date --set=x",
+        "file -C -m magic",
+        "fd -Hx rm",
+        "sed 's/a/b/e' f",
+        "sed 'e ls' f",
+        "sed '1w out' f",
+        "awk 'BEGIN{print \"x\" | \"sh\"}'",
+        "awk '{print > $2}' f",
+        "xargs -a ls rm",
+        "xargs --arg-file=x rm",
+    ] {
+        assert!(!is_read_only(command), "{command:?}");
+    }
+    for command in [
+        "uniq in",
+        "uniq -c in",
+        "uniq -f 1 in",
+        "sort -k1,1 in",
+        "date -d yesterday",
+        "date +%s",
+        "fd -e rs",
+        "rg --pre-glob '*.pdf' x",
+        "awk '/a|b/ {print}' f",
+    ] {
+        assert!(is_read_only(command), "{command:?}");
+    }
 }
 
 #[test]

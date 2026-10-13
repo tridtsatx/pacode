@@ -64,33 +64,93 @@ fn piped_commands_are_separate_segments() {
 }
 
 #[test]
-fn truncating_redirect_target_is_marked_but_append_is_not() {
-    let clobber = tokenize("echo x > important.conf");
-    assert!(
-        clobber
-            .iter()
-            .any(|t| t.is_truncating_redirect_target && t.text == "important.conf")
-    );
-
-    let append = tokenize("echo x >> log.txt");
-    assert!(
-        !append.iter().any(|t| t.is_truncating_redirect_target),
-        "append does not truncate and must not be flagged"
-    );
-}
-
-#[test]
 fn fd_redirection_tokenization() {
     let tokens = tokenize("cmd 2>&1");
     assert!(tokens.iter().any(|t| t.text == "2>&1" && t.is_operator));
 
     let tokens = tokenize("find / 2>/dev/null");
+    assert!(tokens.iter().any(|t| t.text == "2>" && t.is_operator));
     assert!(
         tokens
             .iter()
-            .any(|t| t.is_truncating_redirect_target && t.text == "/dev/null")
+            .any(|t| t.text == "/dev/null" && !t.is_operator)
     );
     assert!(!tokens.iter().any(|t| t.text == "2" && !t.is_operator));
+}
+
+#[test]
+fn background_and_both_stream_operators_are_their_own_tokens() {
+    let ops = |command: &str| -> Vec<String> {
+        tokenize(command)
+            .into_iter()
+            .filter(|t| t.is_operator)
+            .map(|t| t.text)
+            .collect()
+    };
+    assert_eq!(ops("a & b"), ["&"]);
+    assert_eq!(ops("a |& b"), ["|&"]);
+    assert_eq!(ops("a &> f"), ["&>"]);
+    assert_eq!(ops("a &>> f"), ["&>>"]);
+    assert_eq!(ops("a >& f"), [">&"]);
+    assert_eq!(ops("a >&2"), [">&2"]);
+    assert_eq!(ops("a <> f"), ["<>"]);
+    assert_eq!(ops("a <&-"), ["<&-"]);
+    assert_eq!(ops("a ;; b ;& c ;;& d"), [";;", ";&", ";;&"]);
+}
+
+#[test]
+fn substitutions_keep_their_text_and_hand_back_their_source() {
+    let lexed = lex("echo \"a$(rm -rf ~)b\" `id` ${x:-$(pwd)} <(ls) 'q$(no)'");
+    let words: Vec<_> = lexed.tokens.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(
+        words,
+        [
+            "echo",
+            "a$(rm -rf ~)b",
+            "`id`",
+            "${x:-$(pwd)}",
+            "<(ls)",
+            "q$(no)"
+        ]
+    );
+    assert_eq!(lexed.nested, ["rm -rf ~", "id", "pwd", "ls"]);
+    assert!(lexed.unresolved.is_empty());
+}
+
+#[test]
+fn comments_and_line_continuations_follow_the_shell() {
+    assert_eq!(texts("ls # rm -rf ~"), ["ls"]);
+    assert_eq!(texts("ls a#b"), ["ls", "a#b"]);
+    assert_eq!(texts("rm -rf \\\n~"), ["rm", "-rf", "~"]);
+    assert_eq!(texts("echo \"a\\\nb\""), ["echo", "ab"]);
+}
+
+#[test]
+fn arithmetic_is_one_word_and_only_its_substitutions_are_commands() {
+    let lexed = lex("(( x > $(id) )) && echo $((1 > 2))");
+    let words: Vec<_> = lexed.tokens.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(words, ["(( x > $(id) ))", "&&", "echo", "$((1 > 2))"]);
+    assert_eq!(lexed.nested, ["id"]);
+    // A `((` closed by `) )` is a subshell in a subshell.
+    assert_eq!(lex("$((echo hi) )").nested, ["(echo hi) "]);
+}
+
+#[test]
+fn unreadable_constructs_are_reported() {
+    for (command, reason) in [
+        ("echo 'open", UNTERMINATED),
+        ("echo \"open", UNTERMINATED),
+        ("echo $(open", UNTERMINATED),
+        ("echo `open", UNTERMINATED),
+        ("ls *(e:x:)", GLUED_PAREN),
+        ("echo $(case x in a) ls;; esac)", CASE_IN_SUBSTITUTION),
+    ] {
+        assert!(
+            lex(command).unresolved.contains(&reason),
+            "{command:?} must report {reason:?}"
+        );
+    }
+    assert!(lex("f() { ls; }").unresolved.is_empty());
 }
 
 #[test]
@@ -127,6 +187,18 @@ fn tokenizing_is_total_and_never_panics() {
         ">",
         "&&",
         "rm -rf \"unterminated",
+        "$(",
+        "`",
+        "${",
+        "<<",
+        "cat <<EOF",
+        "((",
+        "$((",
+        "a <(",
+        "f(",
+        "\"$(\"",
+        "case",
+        "[[",
     ] {
         let _ = split_segments(command);
     }
@@ -139,8 +211,5 @@ fn parentheses_split_subshell_and_command_substitution_bodies() {
         .into_iter()
         .map(|segment| segment.into_iter().map(|token| token.text).collect())
         .collect();
-    assert_eq!(
-        texts,
-        vec![vec!["x="], vec!["rm", "-rf", "~"], vec!["echo", "ok"]]
-    );
+    assert_eq!(texts, vec![vec!["echo", "ok"], vec!["rm", "-rf", "~"]]);
 }

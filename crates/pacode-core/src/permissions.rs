@@ -231,6 +231,36 @@ mod tests {
         );
     }
 
+    /// What `bash` hands the matrix for a command is `pacode_risk`'s level: a
+    /// destructive command hidden behind shell grammar must not come out
+    /// `Safe`, which is the one exec level allowed in every mode unasked.
+    #[test]
+    fn hidden_destructive_commands_are_never_allowed_unasked() {
+        let cwd = std::path::Path::new("/home/tester/proj");
+        let home = std::path::Path::new("/home/tester");
+        for command in [
+            "ls & rm -rf ~",
+            "ls |& rm -rf ~",
+            "{ rm -rf ~; }",
+            "! rm -rf ~",
+            "X=1 rm -rf ~",
+            ">/dev/null rm -rf ~",
+            "echo \"$(rm -rf ~)\"",
+            "eval 'rm -rf ~'",
+            "env -u X rm -rf ~",
+            "$CMD -rf ~",
+        ] {
+            let risk = pacode_risk::classify_with_home(command, cwd, home).level;
+            for mode in [Mode::Build, Mode::Auto, Mode::Plan] {
+                assert_ne!(
+                    gate(mode, ToolKind::Exec, Some(risk), false),
+                    GateDecision::Allow,
+                    "{command:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
     fn perm_req(agent: &AgentId, tool: &str) -> PermissionRequest {
         PermissionRequest {
             id: PermissionId::generate(),
