@@ -20,7 +20,8 @@ impl Transcript {
     /// call reveals the refused command) and any preview length (expansion
     /// also shows the call's full argument, which the collapsed cell never
     /// had room for). A `!cmd` result is drawn as a bash call and folds the
-    /// same way, so it expands too. When the newest call is drawn inside an
+    /// same way, so it expands too, and so does an orchestrator <-> subagent
+    /// exchange, folded to its first line. When the newest call is drawn inside an
     /// exploration group, the whole run opens; when it is open itself, its
     /// run folds back into its group; drawn on its own (a neighbour was
     /// opened by a click), it opens alone. Returns true on change.
@@ -32,7 +33,9 @@ impl Transcript {
             .rev()
             .find_map(|(index, c)| match &c.kind {
                 CellKind::Item(
-                    TranscriptKind::ToolCall { .. } | TranscriptKind::BashCommand { .. },
+                    TranscriptKind::ToolCall { .. }
+                    | TranscriptKind::BashCommand { .. }
+                    | TranscriptKind::AgentMessage { .. },
                 ) => Some((index, c.id)),
                 _ => None,
             });

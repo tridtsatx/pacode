@@ -292,6 +292,12 @@ fn agent_dot(
         AgentStatus::Failed => (opts.glyphs.fail, opts.theme.red),
         AgentStatus::Finished => (opts.glyphs.ok, opts.theme.green),
         AgentStatus::Stopped => (opts.glyphs.agent_dot, opts.theme.dim),
+        // Blocked on the orchestrator: a question mark, still breathing, in
+        // the attention tone — it is live but waiting on someone else.
+        AgentStatus::WaitingParent => (
+            "?",
+            crate::ui::anim::pulse(&opts.theme, opts.theme.yellow, lit),
+        ),
         AgentStatus::Idle
         | AgentStatus::Thinking
         | AgentStatus::RunningTool

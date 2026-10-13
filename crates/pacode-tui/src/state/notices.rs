@@ -275,7 +275,8 @@ impl AppState {
                     pacode_types::AgentStatus::Idle
                     | pacode_types::AgentStatus::Thinking
                     | pacode_types::AgentStatus::RunningTool
-                    | pacode_types::AgentStatus::WaitingApproval => return,
+                    | pacode_types::AgentStatus::WaitingApproval
+                    | pacode_types::AgentStatus::WaitingParent => return,
                 };
                 let duration_ms = info.duration_ms(now_ms());
                 if !background_worth_reporting(outcome, duration_ms) {

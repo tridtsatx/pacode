@@ -119,6 +119,7 @@ fn preferred_keys(tool: &str) -> &'static [&'static str] {
     match tool {
         "agent" => &["name", "prompt", "agent_id", "kind", "action"],
         "ask_question" => &["question", "header"],
+        "ask_parent" => &["question"],
         "bg" => &["task_id", "action", "message"],
         "cron" => &["name", "schedule", "job_id", "action"],
         "monitor" => &["label", "monitor_id", "action"],

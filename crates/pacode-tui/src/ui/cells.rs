@@ -108,7 +108,8 @@ pub(crate) fn decoration_width(kind: &CellKind, line: &Line<'_>, opts: &RenderOp
             TranscriptKind::Notice { level, .. } => *level == ToastLevel::Error && gutter(lead),
             TranscriptKind::Reasoning { .. }
             | TranscriptKind::Permission(_)
-            | TranscriptKind::Question { .. } => false,
+            | TranscriptKind::Question { .. }
+            | TranscriptKind::AgentMessage { .. } => false,
         },
     };
     if decorated { display_width(lead) } else { 0 }
@@ -406,6 +407,22 @@ pub(super) fn render_item_inner(
             },
             opts,
             anim_frame,
+            expanded,
+        ),
+        TranscriptKind::AgentMessage {
+            subagent: _,
+            subagent_name,
+            direction,
+            text,
+            reply,
+        } => crate::ui::agent_message::render(
+            &crate::ui::agent_message::AgentMessageView {
+                subagent_name,
+                direction: *direction,
+                text,
+                reply: reply.as_ref(),
+            },
+            opts,
             expanded,
         ),
     }

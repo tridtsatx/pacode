@@ -6,8 +6,8 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use pacode_types::TranscriptKind;
 use pacode_types::state::ToastLevel;
+use pacode_types::{AgentMessageDirection, AgentReply, TranscriptKind};
 
 use crate::keys::Action;
 use crate::state::AppState;
@@ -143,6 +143,31 @@ fn item(md: &mut String, kind: &TranscriptKind) -> std::fmt::Result {
                 md.push_str("*(output truncated)*\n\n");
             }
             Ok(())
+        }
+        TranscriptKind::AgentMessage {
+            subagent_name,
+            direction,
+            text,
+            reply,
+            ..
+        } => {
+            match direction {
+                AgentMessageDirection::ToSubagent => {
+                    write!(md, "*To {subagent_name}:*\n\n{text}\n\n")?
+                }
+                AgentMessageDirection::Question => {
+                    write!(md, "*{subagent_name} asks:*\n\n{text}\n\n")?
+                }
+            }
+            match reply {
+                Some(AgentReply::Answered { text }) => write!(md, "**Answer:** {text}\n\n"),
+                Some(AgentReply::Unanswered) => md.write_str("*No answer.*\n\n"),
+                Some(AgentReply::Failed) => {
+                    md.write_str("*No answer: the orchestrator's turn failed.*\n\n")
+                }
+                Some(AgentReply::Cancelled) => md.write_str("*Cancelled.*\n\n"),
+                None => Ok(()),
+            }
         }
     }
 }

@@ -1141,6 +1141,31 @@ fn ctrl_o_expands_a_bang_command_result() {
     assert!(!t.is_expanded(1));
 }
 
+/// The orchestrator <-> subagent exchange folds to its first line, so
+/// `ctrl+o` must reach it like a tool call.
+#[test]
+fn ctrl_o_expands_an_agent_exchange_cell() {
+    let mut t = Transcript::new(8);
+    t.cells.push_back(tool_cell(1, "older tool call"));
+    t.cells.push_back(Cell {
+        id: 2,
+        kind: CellKind::Item(pacode_types::TranscriptKind::AgentMessage {
+            subagent: pacode_types::AgentId::new("agt_1"),
+            subagent_name: "tests".into(),
+            direction: pacode_types::AgentMessageDirection::Question,
+            text: "which db?\nwith details".into(),
+            reply: None,
+        }),
+        version: 0,
+        ts_ms: 2,
+        stats: None,
+        perm_explain: None,
+    });
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(2));
+    assert!(!t.is_expanded(1));
+}
+
 #[test]
 fn ctrl_o_expands_short_and_denied_cells_too() {
     // A single-line output still expands — the expanded cell also spells out

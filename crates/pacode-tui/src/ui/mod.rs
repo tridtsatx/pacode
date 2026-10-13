@@ -1,6 +1,7 @@
 //! Widgets. [`prepare_frame`](prepare_frame) reconciles render state before
 //! [`draw`](draw), which paints one frame from an immutable `AppState`.
 
+mod agent_message;
 pub mod analyze;
 pub mod anim;
 mod cells;
