@@ -39,18 +39,30 @@ async fn a_user_stop_during_a_resume_wins_and_stays_the_users() {
         });
     }
 
-    let err = super::send(&h.session, &h.main(), &sub.id(), "go on")
-        .await
-        .unwrap_err();
+    let err = super::send(
+        &h.session,
+        &h.main(),
+        &sub.id(),
+        "go on",
+        super::Consent::Absent,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("stopped by the user"), "{err}");
     wait_for("the user stop to land", || {
         sub.status() == AgentStatus::Stopped && !sub.is_running()
     })
     .await;
     assert_eq!(sub.mailbox.stopped_by(), Some(StopOrigin::User));
-    let err = super::send(&h.session, &h.main(), &sub.id(), "go on")
-        .await
-        .unwrap_err();
+    let err = super::send(
+        &h.session,
+        &h.main(),
+        &sub.id(),
+        "go on",
+        super::Consent::Absent,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("stopped by the user"), "{err}");
     gate.add_permits(1);
     h.core.shutdown().await;
@@ -88,9 +100,15 @@ async fn closing_the_session_during_a_resume_starts_no_turn() {
         });
     }
 
-    let err = super::send(&h.session, &h.main(), &sub.id(), "go on")
-        .await
-        .unwrap_err();
+    let err = super::send(
+        &h.session,
+        &h.main(),
+        &sub.id(),
+        "go on",
+        super::Consent::Absent,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("closed"), "{err}");
     let close = close.lock().unwrap().take().unwrap();
     wait_for("the close", || close.is_finished()).await;
@@ -128,7 +146,7 @@ async fn a_send_behind_the_orchestrators_stop_resumes_the_agent_after_it() {
     );
     let send = tokio::spawn({
         let (session, main, id) = (h.session.clone(), h.main(), id.clone());
-        async move { super::send(&session, &main, &id, "part two").await }
+        async move { super::send(&session, &main, &id, "part two", super::Consent::Absent).await }
     });
     drop(held);
     stop.await.unwrap();
@@ -176,7 +194,7 @@ async fn a_user_stop_during_continue_wins_and_stays_the_users() {
         agent: pacode_types::AgentId::main(),
     };
     assert!(
-        pacode_tools::ToolHost::continue_agent(&host, &sub.id())
+        pacode_tools::ToolHost::continue_agent(&host, &sub.id(), None)
             .await
             .is_err()
     );
@@ -185,7 +203,7 @@ async fn a_user_stop_during_continue_wins_and_stays_the_users() {
     })
     .await;
     assert_eq!(sub.mailbox.stopped_by(), Some(StopOrigin::User));
-    let err = pacode_tools::ToolHost::continue_agent(&host, &sub.id())
+    let err = pacode_tools::ToolHost::continue_agent(&host, &sub.id(), None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stopped by the user"), "{err}");
@@ -302,7 +320,13 @@ async fn an_answer_the_stop_beat_is_not_an_answer() {
 
     let (main, id) = (h.main(), sub.id());
     let waker = futures::task::noop_waker();
-    let mut send = Box::pin(super::send(&h.session, &main, &id, "postgres"));
+    let mut send = Box::pin(super::send(
+        &h.session,
+        &main,
+        &id,
+        "postgres",
+        super::Consent::Absent,
+    ));
     let first = send.as_mut().poll(&mut Context::from_waker(&waker));
     let mut stop = Box::pin(h.session.stop_agent(&id));
     let _ = stop.as_mut().poll(&mut Context::from_waker(&waker));
@@ -335,7 +359,13 @@ async fn an_answer_the_orchestrators_stop_beat_resumes_the_agent() {
 
     let (main, id) = (h.main(), sub.id());
     let waker = futures::task::noop_waker();
-    let mut send = Box::pin(super::send(&h.session, &main, &id, "postgres"));
+    let mut send = Box::pin(super::send(
+        &h.session,
+        &main,
+        &id,
+        "postgres",
+        super::Consent::Absent,
+    ));
     let first = send.as_mut().poll(&mut Context::from_waker(&waker));
     let mut stop = Box::pin(h.session.stop_agent_by(&id, StopOrigin::Orchestrator));
     let _ = stop.as_mut().poll(&mut Context::from_waker(&waker));
@@ -378,7 +408,13 @@ async fn an_answer_whose_send_was_dropped_is_reported_to_the_orchestrator() {
 
     let (main, id) = (h.main(), sub.id());
     let waker = futures::task::noop_waker();
-    let mut send = Box::pin(super::send(&h.session, &main, &id, "postgres"));
+    let mut send = Box::pin(super::send(
+        &h.session,
+        &main,
+        &id,
+        "postgres",
+        super::Consent::Absent,
+    ));
     let _ = send.as_mut().poll(&mut Context::from_waker(&waker));
     drop(send);
 

@@ -67,21 +67,33 @@ fn queued_messages(agent: &Agent) -> usize {
 fn a_running_turn_queues_the_message() {
     let sub = agent("sub");
     let _turn = sub.turn_lock.try_lock().unwrap();
-    assert!(matches!(sub.mailbox.offer(&sub, "hi"), Offer::Queued));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "hi", Consent::Absent),
+        Offer::Queued
+    ));
     assert_eq!(queued_messages(&sub), 1);
 }
 
 #[test]
 fn an_idle_sealed_or_stopping_agent_is_resumed_instead() {
     let sub = agent("sub");
-    assert!(matches!(sub.mailbox.offer(&sub, "hi"), Offer::Ended));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "hi", Consent::Absent),
+        Offer::Ended
+    ));
 
     let turn = sub.turn_lock.try_lock().unwrap();
     assert!(sub.mailbox.seal_unless_message(&sub.injections));
-    assert!(matches!(sub.mailbox.offer(&sub, "hi"), Offer::Ended));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "hi", Consent::Absent),
+        Offer::Ended
+    ));
     sub.mailbox.unseal();
     sub.mailbox.note_stop(&sub, StopOrigin::Orchestrator);
-    assert!(matches!(sub.mailbox.offer(&sub, "hi"), Offer::Ended));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "hi", Consent::Absent),
+        Offer::Ended
+    ));
     drop(turn);
     assert_eq!(queued_messages(&sub), 0);
 }
@@ -90,13 +102,19 @@ fn an_idle_sealed_or_stopping_agent_is_resumed_instead() {
 fn a_message_that_beat_the_seal_keeps_the_turn_alive() {
     let sub = agent("sub");
     let _turn = sub.turn_lock.try_lock().unwrap();
-    assert!(matches!(sub.mailbox.offer(&sub, "late"), Offer::Queued));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "late", Consent::Absent),
+        Offer::Queued
+    ));
     assert!(
         !sub.mailbox.seal_unless_message(&sub.injections),
         "a queued message must re-drive the turn, not be sealed away"
     );
     // Still unsealed: the next message rides the same re-drive.
-    assert!(matches!(sub.mailbox.offer(&sub, "later"), Offer::Queued));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "later", Consent::Absent),
+        Offer::Queued
+    ));
 }
 
 #[tokio::test]
@@ -117,7 +135,7 @@ async fn an_open_question_takes_the_message_as_its_answer() {
     let Offer::Answered {
         call_id: call,
         taken,
-    } = sub.mailbox.offer(&sub, "postgres")
+    } = sub.mailbox.offer(&sub, "postgres", Consent::Absent)
     else {
         panic!("the open question takes the message");
     };
@@ -140,7 +158,10 @@ fn a_question_whose_call_is_gone_does_not_swallow_the_message() {
     let sub = agent("sub");
     let _turn = sub.turn_lock.try_lock().unwrap();
     drop(ask(&sub, &parent, "c1"));
-    assert!(matches!(sub.mailbox.offer(&sub, "hi"), Offer::Queued));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "hi", Consent::Absent),
+        Offer::Queued
+    ));
 }
 
 #[tokio::test]
@@ -167,7 +188,10 @@ async fn a_stopping_agent_takes_no_answer() {
     let _turn = sub.turn_lock.try_lock().unwrap();
     let mut rx = ask(&sub, &parent, "c1");
     sub.mailbox.note_stop(&sub, StopOrigin::Orchestrator);
-    assert!(matches!(sub.mailbox.offer(&sub, "late"), Offer::Ended));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "late", Consent::Absent),
+        Offer::Ended
+    ));
     assert!(
         rx.try_recv().is_err(),
         "no answer to a question being cancelled"
@@ -175,7 +199,7 @@ async fn a_stopping_agent_takes_no_answer() {
 
     sub.mailbox.note_stop(&sub, StopOrigin::User);
     assert!(matches!(
-        sub.mailbox.offer(&sub, "late"),
+        sub.mailbox.offer(&sub, "late", Consent::Absent),
         Offer::StoppedByUser
     ));
     sub.mailbox.note_stop(&sub, StopOrigin::Orchestrator);
@@ -194,7 +218,7 @@ async fn an_answer_the_call_never_took_fails_its_send() {
     let sub = agent("sub");
     let _turn = sub.turn_lock.try_lock().unwrap();
     let rx = ask(&sub, &parent, "c1");
-    let Offer::Answered { taken, .. } = sub.mailbox.offer(&sub, "postgres") else {
+    let Offer::Answered { taken, .. } = sub.mailbox.offer(&sub, "postgres", Consent::Absent) else {
         panic!("the open question takes the message");
     };
     drop(rx);
@@ -261,7 +285,7 @@ async fn questions_stop_being_sent_after_too_many_go_unanswered() {
     // Any message from the orchestrator counts as engaging again.
     let _turn = sub.turn_lock.try_lock().unwrap();
     assert!(matches!(
-        sub.mailbox.offer(&sub, "still here"),
+        sub.mailbox.offer(&sub, "still here", Consent::Absent),
         Offer::Queued
     ));
     drop(ask(&sub, &parent, "after"));
@@ -294,5 +318,29 @@ async fn failed_parent_turns_do_not_count_as_unanswered() {
     assert!(matches!(
         sub.mailbox.open(&parent, question("next")).unwrap(),
         Opened::Asked(_)
+    ));
+}
+
+/// The user's leave to lift their stop names that stop: it does not cover a
+/// stop they made after they were asked.
+#[test]
+fn leave_to_lift_a_user_stop_names_that_stop() {
+    let sub = agent("sub");
+    assert_eq!(sub.mailbox.user_stop(), None);
+    sub.mailbox.note_stop(&sub, StopOrigin::User);
+    let stop = sub.mailbox.user_stop().unwrap();
+    assert!(sub.mailbox.held_by_user(Consent::Absent));
+    assert!(!sub.mailbox.held_by_user(Consent::Given(stop)));
+    assert!(!sub.mailbox.held_by_user(Consent::Own));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "hi", Consent::Given(stop)),
+        Offer::Ended
+    ));
+
+    sub.mailbox.note_stop(&sub, StopOrigin::User);
+    assert!(sub.mailbox.held_by_user(Consent::Given(stop)));
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "hi", Consent::Given(stop)),
+        Offer::StoppedByUser
     ));
 }

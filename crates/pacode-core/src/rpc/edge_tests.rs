@@ -144,16 +144,22 @@ async fn a_subagent_the_user_stopped_is_not_resumed_by_send() {
     h.session.stop_agent(&sub.id()).await.unwrap();
     wait_for("the stop", || !sub.is_running()).await;
 
-    let err = super::send(&h.session, &h.main(), &sub.id(), "go on")
-        .await
-        .unwrap_err();
+    let err = super::send(
+        &h.session,
+        &h.main(),
+        &sub.id(),
+        "go on",
+        super::Consent::Absent,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("stopped by the user"), "{err}");
     // `agent continue` follows the same rule.
     let host = crate::host::SessionHost {
         session: h.session.clone(),
         agent: pacode_types::AgentId::main(),
     };
-    let err = pacode_tools::ToolHost::continue_agent(&host, &sub.id())
+    let err = pacode_tools::ToolHost::continue_agent(&host, &sub.id(), None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stopped by the user"), "{err}");
@@ -174,9 +180,15 @@ async fn a_subagent_the_orchestrator_stopped_is_resumed_by_send() {
     wait_for("the stop", || !sub.is_running()).await;
     h.provider.script(true, vec![text("resumed work")]);
 
-    let outcome = super::send(&h.session, &h.main(), &sub.id(), "go on")
-        .await
-        .unwrap();
+    let outcome = super::send(
+        &h.session,
+        &h.main(),
+        &sub.id(),
+        "go on",
+        super::Consent::Absent,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         outcome,
         pacode_tools::SendOutcome::Resumed {

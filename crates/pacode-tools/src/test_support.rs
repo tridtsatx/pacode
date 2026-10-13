@@ -347,7 +347,11 @@ impl ToolHost for StubToolHost {
         Err(ToolError::Failed("no agents in this test".to_string()))
     }
 
-    async fn continue_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
+    async fn continue_agent(
+        &self,
+        _agent: &AgentId,
+        _consent: Option<u64>,
+    ) -> Result<(), ToolError> {
         Err(ToolError::Failed("no agents in this test".to_string()))
     }
 
@@ -363,6 +367,7 @@ impl ToolHost for StubToolHost {
         &self,
         agent: &AgentId,
         message: String,
+        _consent: Option<u64>,
     ) -> Result<SendOutcome, ToolError> {
         self.sent
             .lock()

@@ -9,7 +9,9 @@
 //!   A turn that is about to finish checks the queue under the same lock
 //!   before it seals itself (`seal_unless_message`), so a message that lands
 //!   in its last moments re-drives it instead of being dropped with it;
-//! - **stopped by the user** — refused: resuming it is the user's call;
+//! - **stopped by the user** — refused, unless the user, asked by the
+//!   `agent` tool, agreed to lift that very stop ([`Consent`]): resuming it
+//!   is the user's call;
 //! - **ended** — no turn, a sealed one, or one the orchestrator is stopping:
 //!   `send` takes the turn lock and resumes the agent with the message as its
 //!   new input (a finished agent's history is reloaded from the store first).
@@ -59,18 +61,20 @@ use crate::session::Session;
 pub(crate) use ask::ask_parent;
 pub use mailbox::Mailbox;
 use mailbox::Offer;
-pub(crate) use mailbox::{Lift, StopOrigin};
+pub(crate) use mailbox::{Consent, Lift, StopOrigin};
 use route::post;
 pub(crate) use route::{
     mark_delivered, reroute_questions, resolve_delivered, resolve_undeliverable,
 };
 
-/// `agent send` from `from` to its subagent `target`.
+/// `agent send` from `from` to its subagent `target`; `consent` is the
+/// user's leave to resume it if they stopped it.
 pub(crate) async fn send(
     session: &Arc<Session>,
     from: &Arc<Agent>,
     target: &AgentId,
     text: &str,
+    consent: Consent,
 ) -> Result<SendOutcome, ToolError> {
     let agent = session
         .agent(target)
@@ -95,7 +99,7 @@ pub(crate) async fn send(
         let changed = agent.mailbox.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        match agent.mailbox.offer(&agent, &text) {
+        match agent.mailbox.offer(&agent, &text, consent) {
             Offer::Answered { call_id, taken } => {
                 // Before returning, not in the asker's cleanup: the parent's
                 // next drain must not show it a question it just answered.
@@ -115,7 +119,7 @@ pub(crate) async fn send(
                 post(session, &agent, item);
                 return Ok(SendOutcome::Delivered);
             }
-            Offer::StoppedByUser => return Err(ToolError::failed(stopped_by_user(target))),
+            Offer::StoppedByUser => return Err(ToolError::failed(kept_stopped(target, consent))),
             Offer::Ended => {}
         }
         // Waits only for a turn that is finishing or being stopped — both
@@ -133,7 +137,7 @@ pub(crate) async fn send(
                 let (session, from, agent) = (session.clone(), from.clone(), agent.clone());
                 tokio::spawn(async move {
                     let result =
-                        resume(session.clone(), from, agent.clone(), turn, text, item).await;
+                        resume(session.clone(), from, agent.clone(), turn, text, item, consent).await;
                     landed::deliver(tx, result, landed::resumed, &session, &agent);
                 });
                 return match resumed.get().await {
@@ -147,9 +151,18 @@ pub(crate) async fn send(
     }
 }
 
-/// Why the orchestrator may not resume `agent` (`send` and `continue`).
-pub(crate) fn stopped_by_user(agent: &AgentId) -> String {
-    format!("agent {agent} was stopped by the user; ask the user before resuming it")
+/// Why the orchestrator may not resume `agent`, which the user stopped
+/// (`send` and `continue`).
+pub(crate) fn kept_stopped(agent: &AgentId, consent: Consent) -> String {
+    match consent {
+        Consent::Given(_) => format!(
+            "agent {agent} was stopped again while the user was being asked; it stays stopped"
+        ),
+        Consent::Own | Consent::Absent => format!(
+            "agent {agent} was stopped by the user; send or continue again to ask the user \
+             whether to resume it"
+        ),
+    }
 }
 
 /// Re-drive an ended subagent with `text` as its new input; `turn` is its turn
@@ -162,6 +175,7 @@ async fn resume(
     turn: OwnedMutexGuard<()>,
     text: String,
     item: TranscriptKind,
+    consent: Consent,
 ) -> Result<Option<String>, ToolError> {
     let _submit = session.submit_lock.lock().await;
     let id = agent.id();
@@ -201,8 +215,8 @@ async fn resume(
     if session.closed.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ToolError::failed("session is closed"));
     }
-    if agent.mailbox.stopped_by() == Some(StopOrigin::User) {
-        return Err(ToolError::failed(stopped_by_user(&id)));
+    if agent.mailbox.held_by_user(consent) {
+        return Err(ToolError::failed(kept_stopped(&id, consent)));
     }
     let cleared = {
         let history = agent.history.lock().unwrap_or_else(|p| p.into_inner());
@@ -350,6 +364,8 @@ fn take_unread_report(session: &Session, parent: &Arc<Agent>, agent: &AgentId) -
 #[cfg(test)]
 pub(crate) mod hooks;
 
+#[cfg(test)]
+mod consent_tests;
 #[cfg(test)]
 mod edge_tests;
 #[cfg(test)]

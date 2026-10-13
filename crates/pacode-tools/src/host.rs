@@ -239,6 +239,15 @@ impl SendOutcome {
     }
 }
 
+/// A subagent the user stopped. The orchestrator resumes it only with the
+/// user's say-so: `stop` names this stop, and leave given for it does not
+/// carry over to a stop made after the user was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserStop {
+    pub name: String,
+    pub stop: u64,
+}
+
 /// How an `ask_parent` question ended, when it did not end in a stop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParentReply {
@@ -690,10 +699,17 @@ pub trait ToolHost: Send + Sync {
     /// provider — against the session's provider registry.
     fn parse_model_route(&self, s: &str) -> Option<ModelRoute>;
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError>;
+    /// The caller's subagent `agent`, if the user stopped it: resuming it
+    /// takes the user's say-so ([`Self::ask_question`]), passed as `consent`
+    /// to [`Self::continue_agent`] or [`Self::send_to_agent`].
+    fn user_stop(&self, _agent: &AgentId) -> Option<UserStop> {
+        None
+    }
     /// Re-drive a `Stopped` agent: appends a resume nudge to its retained
     /// history and starts a fresh turn. Errors while the agent is still running
-    /// or already in a terminal state.
-    async fn continue_agent(&self, agent: &AgentId) -> Result<(), ToolError>;
+    /// or already in a terminal state, and for one the user stopped unless
+    /// `consent` is the [`UserStop::stop`] the user agreed to lift.
+    async fn continue_agent(&self, agent: &AgentId, consent: Option<u64>) -> Result<(), ToolError>;
     /// Orchestrator → subagent: ask for a brief status. Delivered to the subagent as a
     /// `<status_request>` injection at its next step; it answers with `report_status`.
     fn request_agent_status(&self, agent: &AgentId) -> Result<(), ToolError>;
@@ -703,11 +719,14 @@ pub trait ToolHost: Send + Sync {
     /// Orchestrator → its own subagent. A running subagent gets the message as
     /// an `<orchestrator_message>` at its next step; one blocked in
     /// `ask_parent` gets it as the answer; one that has ended is resumed with
-    /// it. A failed subagent cannot be resumed and is an error.
+    /// it. A failed subagent cannot be resumed and is an error, and so is one
+    /// the user stopped unless `consent` is the [`UserStop::stop`] the user
+    /// agreed to lift.
     async fn send_to_agent(
         &self,
         agent: &AgentId,
         message: String,
+        consent: Option<u64>,
     ) -> Result<SendOutcome, ToolError>;
     /// Subagent → orchestrator: deliver the question as `<agent_question>` and
     /// wait until the orchestrator answers it with `agent send` or completes a

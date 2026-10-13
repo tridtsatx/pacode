@@ -253,6 +253,7 @@ impl ToolHost for StubHost {
         &self,
         _agent: &pacode_types::AgentId,
         _message: String,
+        _consent: Option<u64>,
     ) -> Result<pacode_tools::host::SendOutcome, ToolError> {
         Err(ToolError::Failed("no agents in this test".to_string()))
     }
@@ -278,7 +279,11 @@ impl ToolHost for StubHost {
         Ok(())
     }
 
-    async fn continue_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
+    async fn continue_agent(
+        &self,
+        agent: &AgentId,
+        _consent: Option<u64>,
+    ) -> Result<(), ToolError> {
         if let Some(a) = self
             .agents
             .lock()

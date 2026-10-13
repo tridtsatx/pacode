@@ -217,6 +217,7 @@ async fn a_message_to_a_running_subagent_is_read_at_its_next_step() {
         &h.session.main_agent().unwrap(),
         &sub.id(),
         "also cover the edge case",
+        crate::rpc::Consent::Absent,
     )
     .await
     .unwrap();
@@ -301,6 +302,7 @@ async fn a_failed_subagent_cannot_be_resumed() {
         &h.session.main_agent().unwrap(),
         &sub.id(),
         "try again",
+        crate::rpc::Consent::Absent,
     )
     .await
     .unwrap_err();
@@ -317,15 +319,22 @@ async fn only_the_parent_may_message_a_subagent() {
     let h = Harness::new().await;
     let gate = spawn_parked(&h, text("report")).await;
     let sub = h.sub();
-    let err = crate::rpc::send(&h.session, &sub, &sub.id(), "hi")
-        .await
-        .unwrap_err();
+    let err = crate::rpc::send(
+        &h.session,
+        &sub,
+        &sub.id(),
+        "hi",
+        crate::rpc::Consent::Absent,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("not your subagent"), "{err}");
     let err = crate::rpc::send(
         &h.session,
         &h.session.main_agent().unwrap(),
         &AgentId::new("agt_missing"),
         "hi",
+        crate::rpc::Consent::Absent,
     )
     .await
     .unwrap_err();

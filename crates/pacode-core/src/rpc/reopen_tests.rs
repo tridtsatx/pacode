@@ -85,7 +85,7 @@ async fn who_stopped_a_subagent_survives_a_reopen() {
 
     let session = reopen(&h).await;
     let main = session.main_agent().unwrap();
-    let err = super::send(&session, &main, &by_user, "go on")
+    let err = super::send(&session, &main, &by_user, "go on", super::Consent::Absent)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stopped by the user"), "{err}");
@@ -93,15 +93,21 @@ async fn who_stopped_a_subagent_survives_a_reopen() {
         session: session.clone(),
         agent: AgentId::main(),
     };
-    let err = pacode_tools::ToolHost::continue_agent(&host, &by_user)
+    let err = pacode_tools::ToolHost::continue_agent(&host, &by_user, None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stopped by the user"), "{err}");
 
     h.provider.script(true, vec![text("resumed")]);
-    let outcome = super::send(&session, &main, &by_orchestrator, "go on")
-        .await
-        .unwrap();
+    let outcome = super::send(
+        &session,
+        &main,
+        &by_orchestrator,
+        "go on",
+        super::Consent::Absent,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         outcome,
         SendOutcome::Resumed {

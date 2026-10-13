@@ -495,11 +495,12 @@ impl ToolHost for SessionHost {
         &self,
         agent: &AgentId,
         message: String,
+        consent: Option<u64>,
     ) -> Result<SendOutcome, ToolError> {
         let me = self
             .owner_agent()
             .ok_or_else(|| ToolError::failed("agent not found"))?;
-        crate::rpc::send(&self.session, &me, agent, &message).await
+        crate::rpc::send(&self.session, &me, agent, &message, consent.into()).await
     }
 
     async fn ask_parent(
@@ -520,11 +521,25 @@ impl ToolHost for SessionHost {
             .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
-    async fn continue_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
+    fn user_stop(&self, agent: &AgentId) -> Option<pacode_tools::UserStop> {
+        let owner = self.owner_id();
+        let agent = self.session.agent(agent)?;
+        let info = agent.info();
+        if info.parent.as_ref() != Some(&owner) {
+            return None;
+        }
+        let stop = agent.mailbox.user_stop()?;
+        Some(pacode_tools::UserStop {
+            name: info.name,
+            stop,
+        })
+    }
+
+    async fn continue_agent(&self, agent: &AgentId, consent: Option<u64>) -> Result<(), ToolError> {
         // The orchestrator resumes what it stopped; what the user stopped is
         // the user's to resume (the same rule `agent send` follows).
         self.session
-            .continue_agent_by(agent, crate::rpc::StopOrigin::Orchestrator)
+            .continue_agent_by(agent, consent.into())
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))
     }

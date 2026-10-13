@@ -13,7 +13,8 @@ pub mod walk;
 
 pub use builtin::{builtin_tools, orchestrator_tools, subagent_tool_names};
 pub use host::{
-    AgentSpec, ParentReply, PermissionOutcome, SendOutcome, ToolCtx, ToolHost, WaitOutcome,
+    AgentSpec, ParentReply, PermissionOutcome, SendOutcome, ToolCtx, ToolHost, UserStop,
+    WaitOutcome,
 };
 pub use output::{ToolError, ToolOutput};
 pub use registry::ToolRegistry;

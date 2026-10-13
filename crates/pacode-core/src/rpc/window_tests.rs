@@ -28,7 +28,14 @@ async fn a_message_just_before_the_seal_redrives_without_a_finished_flash() {
         let (session, main, id) = (h.session.clone(), h.main(), sub.id());
         let outcome = outcome.clone();
         hooks::install(sub.id(), Point::BeforeSeal, move || {
-            let sent = super::send(&session, &main, &id, "one more thing").now_or_never();
+            let sent = super::send(
+                &session,
+                &main,
+                &id,
+                "one more thing",
+                super::Consent::Absent,
+            )
+            .now_or_never();
             *outcome.lock().unwrap() = sent;
         });
     }
@@ -102,8 +109,9 @@ async fn a_message_just_after_the_seal_resumes_and_takes_back_the_report() {
         let (session, main, id) = (h.session.clone(), h.main(), sub.id());
         let resumed = resumed.clone();
         hooks::install(sub.id(), Point::AfterSeal, move || {
-            let mut send =
-                Box::pin(async move { super::send(&session, &main, &id, "now part two").await });
+            let mut send = Box::pin(async move {
+                super::send(&session, &main, &id, "now part two", super::Consent::Absent).await
+            });
             // One poll finds the turn sealed and queues on its lock...
             let waker = futures::task::noop_waker();
             assert!(
@@ -184,9 +192,15 @@ async fn resuming_takes_back_an_unread_report() {
             assert_eq!(h.main().notice_lock.held(), 1);
         }
 
-        let outcome = super::send(&h.session, &h.main(), &sub.id(), "part two")
-            .await
-            .unwrap();
+        let outcome = super::send(
+            &h.session,
+            &h.main(),
+            &sub.id(),
+            "part two",
+            super::Consent::Absent,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome,
             SendOutcome::Resumed {
@@ -222,7 +236,13 @@ async fn a_send_dropped_mid_resume_still_resumes_the_subagent() {
     // One poll takes the turn lock and starts the resume; then the call is
     // dropped, as an interrupted orchestrator's tool call is.
     let (main, id) = (h.main(), sub.id());
-    let mut send = Box::pin(super::send(&h.session, &main, &id, "part two"));
+    let mut send = Box::pin(super::send(
+        &h.session,
+        &main,
+        &id,
+        "part two",
+        super::Consent::Absent,
+    ));
     let waker = futures::task::noop_waker();
     assert!(
         send.as_mut()
@@ -271,7 +291,13 @@ async fn a_send_dropped_mid_resume_hands_back_the_unread_report() {
     .await;
 
     let (main, id) = (h.main(), sub.id());
-    let mut send = Box::pin(super::send(&h.session, &main, &id, "part two"));
+    let mut send = Box::pin(super::send(
+        &h.session,
+        &main,
+        &id,
+        "part two",
+        super::Consent::Absent,
+    ));
     let waker = futures::task::noop_waker();
     assert!(
         send.as_mut()

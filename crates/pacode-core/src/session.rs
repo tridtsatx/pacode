@@ -1592,21 +1592,20 @@ impl Session {
 
     /// Re-drive a `Stopped` agent on the user's behalf — whoever stopped it.
     pub async fn continue_agent(self: &Arc<Self>, id: &AgentId) -> Result<(), CoreError> {
-        self.continue_agent_by(id, crate::rpc::StopOrigin::User)
-            .await
+        self.continue_agent_by(id, crate::rpc::Consent::Own).await
     }
 
     /// Re-drive a `Stopped` agent: append the resume nudge to its retained
     /// history and start a fresh turn on a new cancel token — the same path
     /// `spawn_agent` takes. Errors while the agent is still running (let the
-    /// stop land first) or already in a terminal state, and — `by` the
-    /// orchestrator — for an agent the user stopped: that one is the user's to
-    /// resume. A stop or a close landing meanwhile wins (`rpc::resume` does
-    /// the same).
+    /// stop land first) or already in a terminal state, and for an agent the
+    /// user stopped without their `consent` to lift that stop: it is the
+    /// user's to resume. A stop or a close landing meanwhile wins
+    /// (`rpc::resume` does the same).
     pub(crate) async fn continue_agent_by(
         self: &Arc<Self>,
         id: &AgentId,
-        by: crate::rpc::StopOrigin,
+        consent: crate::rpc::Consent,
     ) -> Result<(), CoreError> {
         let _submit_guard = self.submit_lock.lock().await;
         let agent = self
@@ -1627,10 +1626,8 @@ impl Session {
                 agent.status()
             )));
         }
-        if by == crate::rpc::StopOrigin::Orchestrator
-            && agent.mailbox.stopped_by() == Some(crate::rpc::StopOrigin::User)
-        {
-            return Err(CoreError::Invalid(crate::rpc::stopped_by_user(id)));
+        if agent.mailbox.held_by_user(consent) {
+            return Err(CoreError::Invalid(crate::rpc::kept_stopped(id, consent)));
         }
 
         let message_guard = agent.message_write_lock.clone().lock_owned().await;

@@ -139,6 +139,7 @@ impl ToolHost for DummyHost {
         &self,
         _agent: &pacode_types::AgentId,
         _message: String,
+        _consent: Option<u64>,
     ) -> Result<crate::host::SendOutcome, ToolError> {
         Err(ToolError::Failed("no agents in this test".to_string()))
     }
@@ -153,7 +154,11 @@ impl ToolHost for DummyHost {
     async fn stop_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Ok(())
     }
-    async fn continue_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
+    async fn continue_agent(
+        &self,
+        _agent: &AgentId,
+        _consent: Option<u64>,
+    ) -> Result<(), ToolError> {
         Ok(())
     }
     fn plan(&self) -> pacode_types::Plan {

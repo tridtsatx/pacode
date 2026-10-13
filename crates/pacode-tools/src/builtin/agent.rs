@@ -1,7 +1,7 @@
 //! `agent`: spawn and manage subagents (spec §8).
 
 use async_trait::async_trait;
-use pacode_types::AgentId;
+use pacode_types::{AgentId, QuestionOption};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -10,6 +10,10 @@ use crate::host::{AgentKindDef, AgentSpec};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "agent";
+
+/// How much of the orchestrator's message the user sees when asked whether
+/// to resume an agent they stopped.
+const MESSAGE_PREVIEW_CHARS: usize = 300;
 
 /// Model-facing description; see `prompts/agent.md`.
 const DESCRIPTION: &str = include_str!("../prompts/agent.md");
@@ -214,7 +218,8 @@ impl AgentTool {
                     .message
                     .filter(|m| !m.trim().is_empty())
                     .ok_or_else(|| ToolError::invalid("message is required for send"))?;
-                let outcome = ctx.host.send_to_agent(&id, message).await?;
+                let consent = user_consent(ctx, &id, Some(&message)).await?;
+                let outcome = ctx.host.send_to_agent(&id, message, consent).await?;
                 Ok(ToolOutput::text(outcome.describe(&id))
                     .with_title(format!("Agent send {id}"))
                     .with_preview(outcome.preview()))
@@ -235,7 +240,8 @@ impl AgentTool {
                     .agent_id
                     .ok_or_else(|| ToolError::invalid("agent_id is required for continue"))?;
                 let id = AgentId::new(agent_id_str);
-                ctx.host.continue_agent(&id).await?;
+                let consent = user_consent(ctx, &id, None).await?;
+                ctx.host.continue_agent(&id, consent).await?;
                 let content = format!("Agent {id} resumed.");
                 Ok(ToolOutput::text(content)
                     .with_title(format!("Agent continue {id}"))
@@ -343,3 +349,52 @@ fn resolve_kind(ctx: &ToolCtx, name: &str) -> (Option<AgentKindDef>, String) {
 #[cfg(test)]
 #[path = "agent_tests.rs"]
 mod agent_tests;
+
+/// Leave to resume `id` when the user stopped it: the user is asked directly
+/// — a question, not a permission, so no mode answers it for them. `None`
+/// when the user did not stop it; an error when they keep it stopped or do
+/// not answer. `message` is what the orchestrator is about to send it.
+async fn user_consent(
+    ctx: &ToolCtx,
+    id: &AgentId,
+    message: Option<&str>,
+) -> Result<Option<u64>, ToolError> {
+    let Some(stop) = ctx.host.user_stop(id) else {
+        return Ok(None);
+    };
+    let name = &stop.name;
+    let mut question = format!("Resume {name}? You stopped it.");
+    if let Some(message) = message {
+        let shown = pacode_types::truncate_head_tail(message.trim(), MESSAGE_PREVIEW_CHARS);
+        question.push_str(&format!("\n\nThe orchestrator wants to send it:\n{shown}"));
+    }
+    let options = vec![
+        QuestionOption::new("Resume", "Lift your stop; it goes on with its context"),
+        QuestionOption::new("Keep stopped", "It stays stopped; the orchestrator is told"),
+    ];
+    let answer = ctx
+        .host
+        .ask_question(
+            &ctx.call_id,
+            "Resume agent".into(),
+            question,
+            options,
+            false,
+        )
+        .await?;
+    if answer.cancelled {
+        return Err(ToolError::failed(format!(
+            "the user did not answer; {name} ({id}) stays stopped"
+        )));
+    }
+    if answer.selected.first() == Some(&0) {
+        return Ok(Some(stop.stop));
+    }
+    let mut refusal = format!("the user chose to keep {name} ({id}) stopped");
+    if let Some(said) = answer.free_text.as_deref().map(str::trim)
+        && !said.is_empty()
+    {
+        refusal.push_str(&format!("; they said: {said}"));
+    }
+    Err(ToolError::failed(refusal))
+}

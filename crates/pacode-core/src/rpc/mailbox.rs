@@ -44,6 +44,35 @@ impl StopOrigin {
     }
 }
 
+/// What entitles a resume to lift a stop the user made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Consent {
+    /// The user is the one resuming.
+    Own,
+    /// The user, asked, agreed to lift their stop — this one, by its number
+    /// ([`Mailbox::user_stop`]): a stop made since is not covered.
+    Given(u64),
+    /// Nobody asked the user.
+    Absent,
+}
+
+impl From<Option<u64>> for Consent {
+    /// The orchestrator's: the stop the user agreed to lift, if it asked.
+    fn from(given: Option<u64>) -> Self {
+        given.map_or(Self::Absent, Self::Given)
+    }
+}
+
+impl Consent {
+    fn covers(self, stop: u64) -> bool {
+        match self {
+            Self::Own => true,
+            Self::Given(given) => given == stop,
+            Self::Absent => false,
+        }
+    }
+}
+
 /// One per agent; only a subagent ever has anything in it.
 #[derive(Default)]
 pub struct Mailbox {
@@ -64,6 +93,8 @@ struct MailboxState {
     /// Questions in a row that ended without an answer; any message from the
     /// orchestrator resets it.
     unanswered_in_row: u8,
+    /// Stops recorded so far: the number a user's leave to lift one names.
+    stops: u64,
 }
 
 pub(super) struct OpenQuestion {
@@ -150,6 +181,7 @@ impl Mailbox {
         if state.stopped_by != Some(StopOrigin::User) {
             state.stopped_by = Some(origin);
         }
+        state.stops += 1;
         agent.invalidate_turn_generation();
     }
 
@@ -175,6 +207,19 @@ impl Mailbox {
         Lift::Lifted {
             was: state.stopped_by.take(),
         }
+    }
+
+    /// The number of the stop the user made, while it stands: what the user
+    /// is asked about, and what their leave ([`Consent::Given`]) names.
+    pub(crate) fn user_stop(&self) -> Option<u64> {
+        let state = self.state();
+        (state.stopped_by == Some(StopOrigin::User)).then_some(state.stops)
+    }
+
+    /// Whether a stop the user made stands against a resume with `consent`.
+    pub(crate) fn held_by_user(&self, consent: Consent) -> bool {
+        let state = self.state();
+        state.stopped_by == Some(StopOrigin::User) && !consent.covers(state.stops)
     }
 
     pub(crate) fn stopped_by(&self) -> Option<StopOrigin> {
@@ -285,14 +330,16 @@ impl Mailbox {
 
     /// The one decision of `send`, under the lock the turn seals and a stop
     /// lands under.
-    pub(super) fn offer(&self, agent: &Agent, text: &str) -> Offer {
+    pub(super) fn offer(&self, agent: &Agent, text: &str, consent: Consent) -> Offer {
         let mut state = self.state();
         match state.stopped_by {
-            Some(StopOrigin::User) => return Offer::StoppedByUser,
-            // Being stopped by the orchestrator itself: no answer for a call
-            // that is about to be dropped; the stop is waited out and the
-            // message resumes the agent.
-            Some(StopOrigin::Orchestrator) => return Offer::Ended,
+            Some(StopOrigin::User) if !consent.covers(state.stops) => {
+                return Offer::StoppedByUser;
+            }
+            // Being stopped: no answer for a call that is about to be
+            // dropped; the stop is waited out and the message resumes the
+            // agent — one the user stopped only with their leave.
+            Some(StopOrigin::User | StopOrigin::Orchestrator) => return Offer::Ended,
             None => {}
         }
         // An asking call that is already gone takes no answer: the message
