@@ -106,6 +106,23 @@ pub fn shared() -> &'static ThreadBudget {
     })
 }
 
+/// Return freed heap pages to the OS. Memory a worker thread freed stays in
+/// that thread's malloc arena, and glibc keeps the arena after the thread
+/// exits, so work that fanned out over several threads (or grew one large
+/// buffer) would otherwise leave its peak resident for the daemon's life.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn release_freed_memory() {
+    // SAFETY: `malloc_trim` only releases free heap memory back to the OS; it
+    // takes no pointers and is thread-safe in glibc. The return value (whether
+    // anything was released) needs no handling.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn release_freed_memory() {}
+
 #[cfg(test)]
 #[path = "threads_tests.rs"]
 mod threads_tests;

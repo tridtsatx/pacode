@@ -65,7 +65,7 @@ fn lane() -> Option<&'static Sender<Job>> {
                     next = match queue.try_recv() {
                         Ok(job) => Some(job),
                         Err(mpsc::TryRecvError::Empty) => {
-                            release_freed_memory();
+                            crate::threads::release_freed_memory();
                             queue.recv().ok()
                         }
                         Err(mpsc::TryRecvError::Disconnected) => None,
@@ -96,7 +96,7 @@ pub(super) fn search_long_lines(query: &Query, path: &Path, display: &str) -> La
         }
     }
     let result = search_at_lane_limit(query, path, display);
-    release_freed_memory();
+    crate::threads::release_freed_memory();
     result
 }
 
@@ -124,18 +124,3 @@ fn search_at_lane_limit(query: &Query, path: &Path, display: &str) -> LaneResult
 fn is_heap_limit_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::Other && err.to_string().contains("allocation limit")
 }
-
-/// Every lane job grew a buffer past the normal 1 MiB cap; return the freed
-/// pages to the OS instead of leaving them in the arena for the daemon's life.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn release_freed_memory() {
-    // SAFETY: `malloc_trim` only releases free heap memory back to the OS; it
-    // takes no pointers and is thread-safe in glibc. The return value (whether
-    // anything was released) needs no handling.
-    unsafe {
-        libc::malloc_trim(0);
-    }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn release_freed_memory() {}

@@ -6,12 +6,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use pacode_symbols::{FileSymbols, Language, MAX_PARSE_BYTES, Symbol, SymbolKind, extract};
+use pacode_symbols::{FileSymbols, Language, Symbol, SymbolKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use symbols_parse::ParseAhead;
 
 pub const NAME: &str = "symbols";
 
@@ -30,8 +31,6 @@ const MAX_SYMBOLS_CAP: usize = 2000;
 const DEFAULT_HEAD_LINES: usize = 3;
 const DEFAULT_TAIL_LINES: usize = 1;
 const MAX_CONTEXT_LINES: usize = 20;
-/// NUL sniff window — same as `read`.
-const SNIFF_BYTES: usize = 8192;
 /// Context lines longer than this are abbreviated with `…`.
 const MAX_LINE_CHARS: usize = 160;
 /// When more files than this are skipped, only the aggregate counts are shown.
@@ -67,8 +66,15 @@ enum Mode {
     Context,
 }
 
+/// A candidate file's place in the scan, decided before any file is read.
+enum Step {
+    Skip(String, SkipReason),
+    /// Display path and grammar of a file queued for parsing.
+    Parse(String, Language),
+}
+
 /// Why a candidate file produced no section — always reported, never silent.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SkipReason {
     Binary,
     NotUtf8,
@@ -356,24 +362,41 @@ fn scan_path(
         )));
     };
 
+    // The cheap verdicts (generated, no grammar) need no read; the files left
+    // are queued for parsing, which runs ahead of the budget checks below.
+    let mut plan = Vec::with_capacity(files.len());
+    let mut queue = Vec::new();
     for (path, display) in files {
-        if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
-        scan.visited += 1;
-
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         if lang_override.is_none() && meta.is_dir() && is_generated(name) {
-            scan.skipped.push((display, SkipReason::Generated));
+            plan.push(Step::Skip(display, SkipReason::Generated));
             continue;
         }
+        match lang_override.or_else(|| Language::from_path(&path)) {
+            Some(lang) => {
+                queue.push((path, lang));
+                plan.push(Step::Parse(display, lang));
+            }
+            None => plan.push(Step::Skip(display, SkipReason::NoGrammar)),
+        }
+    }
+    let mut parsed = ParseAhead::new(queue, opts.mode == Mode::Context);
 
-        let Some(lang) = lang_override.or_else(|| Language::from_path(&path)) else {
-            scan.skipped.push((display, SkipReason::NoGrammar));
-            continue;
+    for step in plan {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        scan.visited += 1;
+
+        let (display, lang) = match step {
+            Step::Skip(display, reason) => {
+                scan.skipped.push((display, reason));
+                continue;
+            }
+            Step::Parse(display, lang) => (display, lang),
         };
 
         if scan.attempted >= opts.max_files {
@@ -386,16 +409,13 @@ fn scan_path(
         }
 
         scan.attempted += 1;
-        match parse_file(&path, lang) {
+        // `source` is empty unless `context` mode asked `ParseAhead` to keep it.
+        match parsed.next(opts.max_files - scan.attempted + 1, cancel)? {
             Ok((source, symbols)) => {
                 scan.symbols_shown += count_shown(&symbols.symbols, opts);
                 scan.reports.push(FileReport {
                     display,
-                    source: if opts.mode == Mode::Context {
-                        source
-                    } else {
-                        String::new()
-                    },
+                    source,
                     symbols,
                     lang,
                 });
@@ -417,24 +437,6 @@ fn count_shown(symbols: &[Symbol], opts: &Options) -> usize {
                 && s.depth(symbols) <= opts.depth
         })
         .count()
-}
-
-/// Read + extract one file; every failure mode maps to a [`SkipReason`] so the
-/// file always lands in the `skipped` ledger. Size is checked before reading
-/// so an oversized file costs a stat, not a 2 MiB+ read.
-fn parse_file(path: &Path, lang: Language) -> Result<(String, FileSymbols), SkipReason> {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if size > MAX_PARSE_BYTES as u64 {
-        return Err(SkipReason::TooLarge);
-    }
-    let bytes = std::fs::read(path).map_err(|_| SkipReason::Unreadable)?;
-    if bytes[..bytes.len().min(SNIFF_BYTES)].contains(&0) {
-        return Err(SkipReason::Binary);
-    }
-    let source = String::from_utf8(bytes).map_err(|_| SkipReason::NotUtf8)?;
-    let symbols =
-        extract(&source, lang, Default::default()).map_err(|_| SkipReason::ParseFailed)?;
-    Ok((source, symbols))
 }
 
 fn render(scan: &Scan, opts: &Options) -> String {
@@ -582,6 +584,9 @@ fn plural(n: usize, one: &str, many: &str) -> String {
         format!("{n} {many}")
     }
 }
+
+#[path = "symbols_parse.rs"]
+mod symbols_parse;
 
 #[cfg(test)]
 #[path = "symbols_tests.rs"]

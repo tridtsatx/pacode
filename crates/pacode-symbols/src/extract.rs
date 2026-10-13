@@ -4,6 +4,7 @@
 //! `Parser` is `!Sync` and parse is CPU-bound — callers are expected to run
 //! [`extract`] inside `spawn_blocking` (the `symbols` tool does exactly that).
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use tree_sitter::{ParseOptions, ParseState, Parser, Query, QueryCursor, StreamingIterator};
@@ -168,6 +169,30 @@ impl Default for ExtractOptions {
     }
 }
 
+/// Run `f` with `lang`'s symbol query, compiled once per process.
+///
+/// Compiling a query (`ts_query_new` and its analysis pass) costs about as much
+/// as parsing a file and running the query over it: a 100-file directory scan
+/// spent nearly half its CPU compiling the same query 100 times. The query is a
+/// pure function of `lang`, so nothing ever invalidates it; the cache holds at
+/// most one entry per [`Language::ALL`] member for the life of the process. A
+/// query that fails to compile is not cached and fails again on the next call.
+fn with_query<T>(lang: Language, f: impl FnOnce(&Query) -> T) -> Result<T, SymbolsError> {
+    static QUERIES: [OnceLock<Query>; Language::ALL.len()] =
+        [const { OnceLock::new() }; Language::ALL.len()];
+    let slot = Language::ALL.iter().position(|known| *known == lang);
+    if let Some(query) = slot.and_then(|slot| QUERIES[slot].get()) {
+        return Ok(f(query));
+    }
+    let query = Query::new(&lang.ts_language(), queries::query_src(lang))
+        .map_err(|source| SymbolsError::Query { lang, source })?;
+    Ok(match slot {
+        // Two threads may both compile on a first use; the cell keeps one.
+        Some(slot) => f(QUERIES[slot].get_or_init(|| query)),
+        None => f(&query),
+    })
+}
+
 /// A raw query match before parenting/dedup.
 struct Candidate {
     kind: SymbolKind,
@@ -231,10 +256,7 @@ pub fn extract(
         .ok_or(SymbolsError::NoTree { lang })?;
     let root = tree.root_node();
 
-    let query = Query::new(&ts_lang, queries::query_src(lang))
-        .map_err(|source| SymbolsError::Query { lang, source })?;
-
-    let candidates = collect_candidates(bytes, root, &query, lang);
+    let candidates = with_query(lang, |query| collect_candidates(bytes, root, query, lang))?;
     let symbols = build_symbols(candidates, lang);
 
     let parsed_with_errors = root.has_error();
@@ -426,3 +448,7 @@ fn build_symbols(mut candidates: Vec<Candidate>, lang: Language) -> Vec<Symbol> 
     }
     symbols
 }
+
+#[cfg(test)]
+#[path = "extract_tests.rs"]
+mod extract_tests;
