@@ -2095,6 +2095,52 @@ async fn a_call_dropped_while_its_task_row_is_written_still_hands_the_task_over(
     request_containing(&mock, &format!("<task_finished id=\"{task}\"")).await;
 }
 
+/// The same window for a plain read: its kill policy came with the spec, so
+/// a call dropped before it ever held the guard still kills it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_dropped_while_its_task_row_is_written_is_killed() {
+    let (core, _mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    let mut spec = TaskSpec::new(
+        session_id.clone(),
+        AgentId::main(),
+        "timeout 30 tail -f /dev/null",
+        tmp.path(),
+    );
+    spec.kill_if_abandoned = true;
+
+    let mut call = Box::pin(host.spawn_task(spec));
+    let task = loop {
+        if let std::task::Poll::Ready(result) = futures::poll!(&mut call) {
+            panic!("the call finished before it could be dropped: {result:?}");
+        }
+        if let Some(info) = session.tasks.list(Some(&session_id)).into_iter().next() {
+            break info.id;
+        }
+        tokio::task::yield_now().await;
+    };
+    drop(call);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !session
+            .tasks
+            .info(&task)
+            .is_some_and(|info| info.status.is_terminal())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the read is killed");
+    let info = session.tasks.info(&task).unwrap();
+    assert_eq!(info.status, pacode_types::TaskStatus::Killed);
+    assert!(!info.backgrounded, "a killed read is never announced");
+}
+
 /// The window after the end: the wait returned, but the call was dropped
 /// before its result was delivered (a cancel won the same poll, or it was
 /// reading the output back). Its result reached nobody, so the notice does.

@@ -151,12 +151,24 @@ async fn a_call_dropped_after_its_task_ended_leaves_it_unreported() {
     assert!(mgr.info(&info.id).unwrap().backgrounded);
 }
 
+/// A read nobody needs once its call is gone. The policy travels with the
+/// spec, so the guard has it from the moment the task exists — a call dropped
+/// before it ever saw the guard (while the host wrote the task row) still
+/// kills it.
+fn abandoned_read(cmd: &str) -> TaskSpec {
+    let mut spec = spec(cmd);
+    spec.kill_if_abandoned = true;
+    spec
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interrupted_read_is_killed_and_never_announced() {
     let (mgr, _tmp) = manager();
     let mut events = mgr.subscribe();
-    let (info, mut guard) = mgr.spawn_foreground(spec("sleep 30")).await.unwrap();
-    guard.kill_on_drop();
+    let (info, guard) = mgr
+        .spawn_foreground(abandoned_read("sleep 30"))
+        .await
+        .unwrap();
 
     drop(guard);
 
@@ -170,8 +182,7 @@ async fn an_interrupted_read_is_killed_and_never_announced() {
 async fn an_interrupted_read_that_already_ended_is_not_announced_either() {
     let (mgr, _tmp) = manager();
     let mut events = mgr.subscribe();
-    let (info, mut guard) = mgr.spawn_foreground(spec("true")).await.unwrap();
-    guard.kill_on_drop();
+    let (info, guard) = mgr.spawn_foreground(abandoned_read("true")).await.unwrap();
     let _ = mgr
         .wait_foreground(&info.id, Duration::from_secs(10), false)
         .await;

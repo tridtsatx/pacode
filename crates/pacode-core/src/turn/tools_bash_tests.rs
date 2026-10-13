@@ -178,7 +178,7 @@ async fn ended_tasks(
     session: &crate::session::Session,
     count: usize,
 ) -> Vec<pacode_types::TaskInfo> {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let tasks = session.tasks.list(Some(&session.id));
             if tasks.len() == count && tasks.iter().all(|t| t.status.is_terminal()) {
@@ -187,8 +187,16 @@ async fn ended_tasks(
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("every task ends")
+    .await;
+    ended.unwrap_or_else(|_| {
+        let states: Vec<_> = session
+            .tasks
+            .list(Some(&session.id))
+            .into_iter()
+            .map(|t| (t.command, t.status, t.backgrounded))
+            .collect();
+        panic!("not every task ended: {states:?}")
+    })
 }
 
 /// Cancel the step once `count` of its tasks are running: the interrupt
@@ -219,7 +227,12 @@ async fn interrupt_when_running(
 /// are killed — not left to finish and announce themselves one by one.
 #[tokio::test(flavor = "multi_thread")]
 async fn interrupted_reads_are_killed_not_announced() {
-    let (_temp, session, agent) = bash_session().await;
+    // A wait that reaches `yield_after` hands its task to the background,
+    // after which it is no longer the call's to kill: keep the calls in the
+    // foreground however slowly a loaded machine starts the three.
+    let mut config = Config::default();
+    config.exec.yield_after_secs = 600;
+    let (_temp, session, agent) = bash_session_with(config, pacode_plugin::PluginHost::new()).await;
     let cancel = CancellationToken::new();
     let interrupt = interrupt_when_running(&session, &cancel, 3);
 

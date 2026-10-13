@@ -167,6 +167,10 @@ pub(crate) async fn run_authorized(
     spec.timeout = timeout;
     if !args.background {
         spec.call = live_row;
+        // An interrupted call drops its guard: a plain read is killed then,
+        // anything else is handed to the background and announced. Decided
+        // here, with the spec, so it holds from the moment the task exists.
+        spec.kill_if_abandoned = pacode_risk::is_side_effect_free(&args.command);
     }
 
     let spawned = ctx.host.spawn_task(spec).await?;
@@ -183,14 +187,9 @@ pub(crate) async fn run_authorized(
 
     // Held until the result is in hand; an interrupted call drops it, which
     // backgrounds the command (its end is announced, without waking the agent
-    // after a user interrupt), or, for a plain read nobody needs any more,
-    // kills it. An end the call never delivered is announced as well.
-    let mut foreground = spawned.foreground;
-    if let Some(guard) = foreground.as_mut()
-        && pacode_risk::is_side_effect_free(&args.command)
-    {
-        guard.kill_on_drop();
-    }
+    // after a user interrupt), or kills a plain read nobody needs any more.
+    // An end the call never delivered is announced as well.
+    let foreground = spawned.foreground;
     let result = foreground_result(&id, accept_large_output, ctx, tool_title).await;
     if let Some(guard) = foreground
         && !matches!(result, Err(ToolError::Cancelled))

@@ -22,6 +22,10 @@ pub struct TaskSpec {
     /// The tool call waiting on this task in the foreground, whose transcript
     /// row its live output belongs to. `None`: nobody draws it live.
     pub call: Option<CallId>,
+    /// For a foreground task: if the call waiting on it is dropped while it
+    /// runs, kill it instead of moving it to the background — a read whose
+    /// output only that call wanted (see `ForegroundGuard`).
+    pub kill_if_abandoned: bool,
 }
 
 impl TaskSpec {
@@ -41,6 +45,7 @@ impl TaskSpec {
             background: false,
             timeout: None,
             call: None,
+            kill_if_abandoned: false,
         }
     }
 }

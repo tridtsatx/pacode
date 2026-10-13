@@ -15,7 +15,8 @@
 //! back — hands the task over in the guard's `Drop`:
 //! - still running: the task is backgrounded and its end is announced; or,
 //!   for a plain read nobody needs once its call is gone
-//!   ([`ForegroundGuard::kill_on_drop`]), killed and never announced;
+//!   ([`TaskSpec::kill_if_abandoned`], fixed at spawn), killed and never
+//!   announced;
 //! - already ended: its result reached nobody, so [`TaskEvent::Unreported`]
 //!   carries it to the router, which announces it like a background end.
 //!
@@ -55,12 +56,6 @@ impl std::fmt::Debug for ForegroundGuard {
 impl ForegroundGuard {
     pub fn id(&self) -> &TaskId {
         &self.id
-    }
-
-    /// If the call is dropped while the task runs, kill it instead of
-    /// backgrounding it: for a read whose output only its call wanted.
-    pub fn kill_on_drop(&mut self) {
-        self.kill_on_drop = true;
     }
 
     /// The call has its result: it reports the task itself (an end inside the
@@ -113,12 +108,13 @@ impl TaskManager {
         mut spec: TaskSpec,
     ) -> Result<(TaskInfo, ForegroundGuard), ExecError> {
         spec.background = false;
+        let kill_on_drop = spec.kill_if_abandoned;
         let info = self.spawn(spec).await?;
         let guard = ForegroundGuard {
             state: Arc::clone(&self.state),
             id: info.id.clone(),
             armed: true,
-            kill_on_drop: false,
+            kill_on_drop,
         };
         Ok((info, guard))
     }
