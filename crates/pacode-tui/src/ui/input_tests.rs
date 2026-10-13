@@ -185,20 +185,115 @@ fn line_offsets_replay_newlines_and_empty_lines() {
     assert_eq!(line_offsets(text, &lines), vec![0, 3, 4, 8]);
 }
 
-#[test]
-fn the_prompt_sits_in_a_titled_frame_with_the_mode_tone() {
-    let mut state = AppState::new(pacode_types::Config::default(), "t".into(), 80, 24);
-    let (terminal, layout) = draw_screen(&mut state, 80, 24);
-    let top = row_text(&terminal, layout.input_top, layout.input_top.y);
-    assert!(top.starts_with("╭─ prompt ─"), "{top}");
-    assert!(top.ends_with('╮'), "{top}");
-    let bottom = row_text(&terminal, layout.input_bottom, layout.input_bottom.y);
-    assert!(bottom.starts_with('╰') && bottom.ends_with('╯'), "{bottom}");
+fn rule_styles(
+    terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    row: ratatui::layout::Rect,
+) -> Vec<ratatui::style::Style> {
+    let buffer = terminal.backend().buffer();
+    (row.x..row.right())
+        .map(|x| buffer[(x, row.y)].style())
+        .collect()
+}
 
+fn session_meta(mode: pacode_types::Mode) -> pacode_types::SessionMeta {
+    pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_rules"),
+        name: None,
+        cwd: std::path::PathBuf::from("/work"),
+        git_branch: None,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        model: pacode_types::ModelRoute::new("prov", "model-x"),
+        effort: pacode_types::Effort::Max,
+        mode,
+        first_prompt: None,
+        zdr: false,
+    }
+}
+
+/// The prompt is two plain full-width rules and the text between them: no
+/// side borders, no padding, no title — at every width.
+#[test]
+fn the_prompt_is_two_full_width_rules_at_every_width() {
+    for w in [8u16, 11, 12, 40, 80, 140] {
+        let mut state = AppState::new(pacode_types::Config::default(), "t".into(), w, 24);
+        state.input.insert_str("hi");
+        let (mut terminal, layout) = draw_screen(&mut state, w, 24);
+        let hline = state.render_options(w).glyphs.hline;
+        for row in [layout.input_top, layout.input_bottom] {
+            assert_eq!(row.height, 1, "w={w}");
+            let text = row_text(&terminal, row, row.y);
+            assert_eq!(text, hline.repeat(row.width as usize), "w={w}");
+        }
+        assert_eq!(layout.input.x, layout.input_top.x, "w={w}");
+        assert_eq!(layout.input.width, layout.input_top.width, "w={w}");
+        let first = row_text(&terminal, layout.input, layout.input.y);
+        assert!(first.starts_with("❯ hi"), "w={w}: {first}");
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (layout.input.x + 4, layout.input.y),
+            "w={w}"
+        );
+    }
+}
+
+/// The rules stay in the border grey whatever the permission mode, in bash
+/// mode, and while a captured command runs.
+#[test]
+fn the_rules_are_grey_regardless_of_mode_and_bash() {
+    let mut state = AppState::new(pacode_types::Config::default(), "t".into(), 80, 24);
+    let grey = state.render_options(80).theme.border;
+    let check = |state: &mut AppState, ctx: &str| {
+        let (terminal, layout) = draw_screen(state, 80, 24);
+        for row in [layout.input_top, layout.input_bottom] {
+            assert!(
+                rule_styles(&terminal, row).iter().all(|s| s.fg == grey.fg),
+                "{ctx}"
+            );
+            let text = row_text(&terminal, row, row.y);
+            assert!(
+                !text.contains("prompt") && !text.contains("bash"),
+                "{ctx}: {text}"
+            );
+        }
+    };
+    check(&mut state, "no session");
+    for mode in pacode_types::Mode::CYCLE {
+        state.meta = Some(session_meta(mode));
+        check(&mut state, &format!("{mode:?}"));
+    }
     state.input.insert_str("!ls");
+    check(&mut state, "bash");
+    let (cancel, _rx) = tokio::sync::oneshot::channel();
+    state.running_bash = Some(cancel);
+    check(&mut state, "bash running");
+}
+
+/// A running captured command shows in the running glyph that replaces `❯`.
+#[test]
+fn a_running_bash_command_swaps_the_prompt_glyph() {
+    let mut state = AppState::new(pacode_types::Config::default(), "t".into(), 80, 24);
+    state.input.insert_str("!sleep 9");
+    let (cancel, _rx) = tokio::sync::oneshot::channel();
+    state.running_bash = Some(cancel);
     let (terminal, layout) = draw_screen(&mut state, 80, 24);
-    let top = row_text(&terminal, layout.input_top, layout.input_top.y);
-    assert!(top.starts_with("╭─ bash ─"), "{top}");
+    let first = row_text(&terminal, layout.input, layout.input.y);
+    let running = state.render_options(80).glyphs.running;
+    assert!(first.starts_with(&format!("{running} !sleep 9")), "{first}");
+}
+
+/// The wrap takes the whole column minus the two-cell prefix.
+#[test]
+fn the_wrap_width_is_the_full_column_minus_the_prefix() {
+    let mut state = AppState::new(pacode_types::Config::default(), "t".into(), 60, 20);
+    // Exactly one full row of text, then one more character.
+    state.input.insert_str(&"x".repeat(59));
+    let (terminal, layout) = draw_screen(&mut state, 60, 20);
+    assert_eq!(layout.input.width, 60);
+    assert_eq!(layout.input.height, 2);
+    let first = row_text(&terminal, layout.input, layout.input.y);
+    assert_eq!(first, format!("❯ {}", "x".repeat(58)));
 }
 
 #[test]

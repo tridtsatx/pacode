@@ -1,8 +1,6 @@
 use ratatui::layout::Rect;
 
-use crate::layout::{
-    PROMPT_FRAME_MIN_WIDTH, PROMPT_INSET, RailDemand, WidthTier, compute, compute_rail,
-};
+use crate::layout::{RailDemand, WidthTier, compute, compute_rail};
 
 #[test]
 fn test_width_tiers() {
@@ -215,19 +213,22 @@ fn test_anchor_rows() {
     assert_eq!(rail_layout.background.bottom(), rail_layout.anchor.y);
 }
 
-/// The prompt frame takes its side borders from the input's width, never a
-/// row from anything: at every size the frame, the input and the footer
-/// stack without overlap and nothing runs past the screen.
+/// The prompt is two full-width rules around full-width text rows: at every
+/// size the rules, the input and the footer stack without overlap, the text
+/// takes the whole left column, and nothing runs past the screen.
 #[test]
-fn the_prompt_frame_fits_at_every_size() {
-    for (w, h) in [(60, 20), (80, 24), (120, 34), (200, 60)] {
+fn the_prompt_rules_fit_at_every_size() {
+    for (w, h) in [(8, 10), (11, 10), (60, 20), (80, 24), (120, 34), (200, 60)] {
         for lines in [1, 3, 6] {
             for (preview, toast) in [(0, 0), (4, 2)] {
                 let l = compute(Rect::new(0, 0, w, h), lines, false, preview, toast);
                 let ctx = format!("{w}x{h} lines={lines} preview={preview}");
-                assert!(l.prompt_framed(), "{ctx}");
-                assert_eq!(l.input.x, l.input_top.x + PROMPT_INSET, "{ctx}");
-                assert_eq!(l.input.right() + PROMPT_INSET, l.input_top.right(), "{ctx}");
+                assert_eq!(l.input_top.height, 1, "{ctx}");
+                assert_eq!(l.input_bottom.height, 1, "{ctx}");
+                for rect in [l.input_top, l.input, l.input_bottom] {
+                    assert_eq!(rect.x, l.footer.x, "{ctx}");
+                    assert_eq!(rect.width, l.footer.width, "{ctx}");
+                }
                 assert_eq!(l.input_top.bottom(), l.input.y, "{ctx}");
                 assert_eq!(l.input.bottom(), l.input_bottom.y, "{ctx}");
                 assert_eq!(l.input_bottom.bottom(), l.footer.y, "{ctx}");
@@ -236,24 +237,12 @@ fn the_prompt_frame_fits_at_every_size() {
                 assert_eq!(l.toast.bottom(), l.preview.y, "{ctx}");
                 assert_eq!(l.dialog.bottom(), l.toast.y, "{ctx}");
                 assert!(l.input.height >= 1, "{ctx}");
-                assert_eq!(l.prompt_frame().height, l.input.height + 2, "{ctx}");
             }
         }
     }
-    // Too narrow for side borders: the input keeps the whole column.
-    let narrow = compute(
-        Rect::new(0, 0, PROMPT_FRAME_MIN_WIDTH - 1, 10),
-        1,
-        false,
-        0,
-        0,
-    );
-    assert!(!narrow.prompt_framed());
-    assert_eq!(narrow.input.width, PROMPT_FRAME_MIN_WIDTH - 1);
-    // Too short for the top border: no frame, so no inset either.
+    // Too short for the top rule: the text still keeps the whole column.
     let short = compute(Rect::new(0, 0, 80, 3), 1, false, 0, 0);
     assert_eq!(short.input_top.height, 0);
-    assert!(!short.prompt_framed());
     assert_eq!(short.input.x, short.input_bottom.x);
     assert_eq!(short.input.width, short.input_bottom.width);
 }

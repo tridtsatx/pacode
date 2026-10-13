@@ -53,7 +53,7 @@ fn palette_area_with(app: &AppState) -> (Rect, Rect, Rect) {
 }
 
 /// B25: the palette sits in the shared overlay container (the left column
-/// above the prompt frame, panel or not), 44..=84 wide and centred across;
+/// above the prompt rules, panel or not), 44..=84 wide and centred across;
 /// its height follows its rows up to the tallest box, whose centred top it
 /// keeps.
 #[test]

@@ -1,8 +1,7 @@
-//! The prompt (spec §3, "plaques and bands"): a rounded frame whose colour
-//! follows the permission mode, its title on the top border (`prompt`, or
-//! `bash` once the line starts with `!`), then `❯` + text + block cursor.
-//! Multi-line up to 6 rows. ASCII `+-|` under `ascii_only`; plain rules when
-//! the column is too narrow for side borders.
+//! The prompt (spec §3): two full-width horizontal rules in the neutral
+//! border grey — independent of the permission mode and of bash mode — with
+//! `❯` + text + block cursor between them. No side borders, no padding, no
+//! title. Multi-line up to 6 rows. ASCII `-` rules under `ascii_only`.
 //!
 //! Bash mode draws the same wrapped rows as a plain prompt — the `!` is part
 //! of the text — so the cursor, the scroll and the layout height share one
@@ -125,7 +124,7 @@ pub(crate) fn draw(
 ) {
     let text = &state.input.text;
     let is_bash = text.starts_with('!');
-    draw_frame(frame, layout, state, opts, is_bash);
+    draw_rules(frame, layout, opts);
 
     if layout.input.height == 0 || layout.input.width == 0 {
         return;
@@ -148,39 +147,13 @@ pub(crate) fn draw(
     }
 }
 
-/// The frame around the prompt, in the permission mode's tone (the border
-/// colour while no session says which mode is on). Too narrow for side
-/// borders, the top and bottom rows fall back to plain rules.
-fn draw_frame(
-    frame: &mut Frame,
-    layout: &ScreenLayout,
-    state: &AppState,
-    opts: &RenderOptions,
-    is_bash: bool,
-) {
-    let style = match state.meta.as_ref() {
-        Some(meta) => crate::ui::chrome::mode_tone(meta.mode, &opts.theme),
-        None => opts.theme.border,
-    };
-    let rect = layout.prompt_frame();
-    if layout.prompt_framed() {
-        let title = match (is_bash, state.is_running_bash()) {
-            (true, true) => " bash · running ",
-            (true, false) => " bash ",
-            (false, _) => " prompt ",
-        };
-        let block = crate::ui::chrome::frame_block(
-            style,
-            vec![Span::styled(title, style.add_modifier(Modifier::BOLD))],
-            opts,
-        );
-        frame.render_widget(block, rect);
-        return;
-    }
+/// The rules above and below the prompt text, always in the border grey.
+fn draw_rules(frame: &mut Frame, layout: &ScreenLayout, opts: &RenderOptions) {
     for row in [layout.input_top, layout.input_bottom] {
         if row.height > 0 {
             let rule = opts.glyphs.hline.repeat(row.width as usize);
-            frame.render_widget(Paragraph::new(Line::from(Span::styled(rule, style))), row);
+            let line = Line::from(Span::styled(rule, opts.theme.border));
+            frame.render_widget(Paragraph::new(line), row);
         }
     }
 }
@@ -234,7 +207,7 @@ fn row_prefix(row: usize, style: Style, opts: &RenderOptions) -> Span<'static> {
 /// Bash mode: the same wrapped rows, each cut along the token spans of one
 /// tokenization of the whole command, so a token that wraps keeps its colour
 /// and the cursor lands where the text is (B09). A running captured command
-/// turns the prompt glyph into the running glyph; the frame title says so.
+/// turns the prompt glyph into the running glyph.
 fn bash_rows(
     text: &str,
     view: &PreparedInput,

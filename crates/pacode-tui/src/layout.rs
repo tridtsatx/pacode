@@ -4,17 +4,17 @@
 //! ┌──────────────────────────────┬────────────┐
 //! │ dialog  /  agent panel       │ rail       │
 //! │ toast strip · image strip    │            │
-//! │ ╭─ prompt ─────────────────╮ │            │
-//! │ │ ❯ input                  │ │            │
-//! │ ╰──────────────────────────╯ │            │
+//! │ ──────────────────────────── │            │
+//! │ ❯ input                      │            │
+//! │ ──────────────────────────── │            │
 //! │ footer row 1                 │            │
 //! │ footer row 2                 │ anchor     │
 //! └──────────────────────────────┴────────────┘
 //! ```
 //!
-//! The prompt frame's top and bottom borders are the `input_top` /
-//! `input_bottom` rows; its side borders and one cell of padding each side
-//! come out of the input's width (`PROMPT_INSET`), never its height.
+//! The prompt is two plain full-width rules — the `input_top` and
+//! `input_bottom` rows — with the text rows between them. No side borders:
+//! the text gets the whole left column.
 
 use std::time::Instant;
 
@@ -69,12 +69,6 @@ impl WidthTier {
 pub const INPUT_MIN_LINES: u16 = 1;
 pub const INPUT_MAX_LINES: u16 = 6;
 pub const FOOTER_LINES: u16 = 2;
-/// Columns the prompt frame takes from each side of the input: the border and
-/// one cell of padding.
-pub const PROMPT_INSET: u16 = 2;
-/// Below this left-column width the prompt has no side borders — the frame
-/// would eat the text — and the top/bottom rows draw as plain rules.
-pub const PROMPT_FRAME_MIN_WIDTH: u16 = 12;
 /// Toast strip capacity: up to this many plain text lines directly above the
 /// input separator (spec §7).
 pub const TOAST_STRIP_MAX: u16 = 2;
@@ -89,15 +83,15 @@ pub struct ScreenLayout {
     pub panel: Option<Rect>,
     /// The vertical separator between dialog and panel (1 col), if a panel is open.
     pub panel_separator: Option<Rect>,
-    /// The prompt frame's top border row (full left-column width).
+    /// The rule row above the prompt text (full left-column width).
     pub input_top: Rect,
-    /// Pasted-image preview strip directly above the prompt frame;
+    /// Pasted-image preview strip directly above the prompt's top rule;
     /// zero-height when no `[Image N]` tokens are live (spec §1).
     pub preview: Rect,
-    /// The prompt's text rows inside the frame: prompt glyph + text, inset by
-    /// `PROMPT_INSET` from each side when the frame has side borders.
+    /// The prompt's text rows between the rules: prompt glyph + text, full
+    /// left-column width.
     pub input: Rect,
-    /// The prompt frame's bottom border row.
+    /// The rule row below the prompt text.
     pub input_bottom: Rect,
     pub footer: Rect,
     /// Rail column (right), full height; zero-sized on `Tiny`.
@@ -105,26 +99,9 @@ pub struct ScreenLayout {
     /// Vertical line between dialog column and rail.
     pub rail_separator: Rect,
     /// Toast strip: up to `TOAST_STRIP_MAX` plain lines above the preview
-    /// strip and the prompt frame, borrowing rows from the dialog like the
+    /// strip and the prompt's top rule, borrowing rows from the dialog like the
     /// preview strip. Zero-height when no toast is live.
     pub toast: Rect,
-}
-
-impl ScreenLayout {
-    /// Whether the prompt frame has side borders at this width.
-    pub fn prompt_framed(&self) -> bool {
-        self.input.x > self.input_top.x
-    }
-
-    /// The whole prompt frame: top border through bottom border.
-    pub fn prompt_frame(&self) -> Rect {
-        Rect::new(
-            self.input_top.x,
-            self.input_top.y,
-            self.input_top.width,
-            self.input_bottom.bottom().saturating_sub(self.input_top.y),
-        )
-    }
 }
 
 pub fn current(state: &AppState) -> ScreenLayout {
@@ -193,21 +170,11 @@ pub fn compute(
     let clamped_input = input_lines.clamp(INPUT_MIN_LINES, INPUT_MAX_LINES);
     let input_h = clamped_input.min(rem_for_input);
     let input_y = input_bottom_y.saturating_sub(input_h);
-    // Above the input: the frame's top border, then the preview strip above
-    // the frame. The strip takes space from the dialog (which can scroll),
-    // never from the input.
+    // Above the input: the top rule, then the preview strip above it. The
+    // strip takes space from the dialog (which can scroll), never from the
+    // input.
     let input_top_h = if input_y > left_area.y { 1 } else { 0 };
-    // Side borders only when the whole frame is there: both border rows and
-    // room for the text. Otherwise the input keeps the full column and the
-    // rows that exist draw as plain rules.
-    let framed = left_area.width >= PROMPT_FRAME_MIN_WIDTH && input_top_h > 0 && input_bottom_h > 0;
-    let inset = if framed { PROMPT_INSET } else { 0 };
-    let input = Rect::new(
-        left_area.x + inset,
-        input_y,
-        left_area.width.saturating_sub(inset * 2),
-        input_h,
-    );
+    let input = Rect::new(left_area.x, input_y, left_area.width, input_h);
 
     let input_top_y = input_y.saturating_sub(input_top_h);
     let input_top = Rect::new(left_area.x, input_top_y, left_area.width, input_top_h);
@@ -216,7 +183,7 @@ pub fn compute(
     let preview = Rect::new(left_area.x, preview_y, left_area.width, preview_h);
 
     // The toast strip borrows rows from the bottom of the dialog, directly
-    // above the preview strip and the frame — the same mechanism as the
+    // above the preview strip and the top rule — the same mechanism as the
     // preview strip, so the strip's lines never overdraw transcript text.
     let dialog_y = left_area.y;
     let toast_h = toast_lines

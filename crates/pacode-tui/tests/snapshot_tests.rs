@@ -713,7 +713,7 @@ fn palette_view(cols: u16, rows: u16) -> String {
         })
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
-    // The box is centred in the left column above the prompt frame (B25):
+    // The box is centred in the left column above the prompt rules (B25):
     // the column the transcript and any panel share.
     let row_text = |y: u16| -> String {
         (0..cols)

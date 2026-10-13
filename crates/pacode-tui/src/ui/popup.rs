@@ -510,7 +510,7 @@ pub(crate) fn bottom_picker_container(layout: &ScreenLayout) -> Rect {
 
 /// The area every centred overlay (menus, settings, analyze, the model
 /// palette) is centred in: the whole left column above the image strip and
-/// the prompt frame — the transcript *and* an open panel. Not the dialog
+/// the prompt's top rule — the transcript *and* an open panel. Not the dialog
 /// rect: with a panel open that is 45–50 % of the column, and an overlay
 /// centred there is squeezed to a sliver beside empty space (B25).
 pub(crate) fn overlay_container(layout: &ScreenLayout) -> Rect {
@@ -547,7 +547,7 @@ fn full_area(state: &AppState, layout: &ScreenLayout, now: Instant, id: PopupId)
 /// `height` rows tall up to [`PALETTE_MAX_HEIGHT`] and the container. The top
 /// sits where the tallest box would sit centred, so a filter that shrinks the
 /// list shortens the box from below without moving its search line. The
-/// container already leaves out the prompt frame and the footer.
+/// container already leaves out the prompt rules and the footer.
 pub(crate) fn palette_area(container: Rect, height: u16) -> Rect {
     if container.width == 0 || container.height == 0 {
         return Rect::new(container.x, container.y, 0, 0);
