@@ -526,3 +526,51 @@ async fn the_body_stays_inside_the_call_budget_when_ops_overfill_it() {
         out.content
     );
 }
+
+/// The `call` every `Output` event of the batch's tasks was addressed to.
+async fn output_rows(ops: serde_json::Value) -> Vec<Option<pacode_types::CallId>> {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = host_with_tasks(tmp.path().join("spool"));
+    let ctx = ctx_with(
+        host.clone(),
+        tmp.path().to_path_buf(),
+        builtin_tools(&WebConfig::default()),
+    );
+    let mut events = host.tasks.as_ref().unwrap().subscribe();
+    BatchTool::default()
+        .call(json!({ "ops": ops }), &ctx)
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let pacode_exec::TaskEvent::Output { call, .. } = event {
+            rows.push(call);
+        }
+    }
+    rows
+}
+
+#[tokio::test]
+async fn a_lone_shell_op_streams_into_the_batch_row() {
+    let rows = output_rows(json!([
+        {"tool": "bash", "input": {"command": "echo streamed"}},
+        {"tool": "ls", "input": {}},
+    ]))
+    .await;
+    assert!(!rows.is_empty(), "the command printed a line");
+    assert!(
+        rows.iter()
+            .all(|row| row.as_ref().map(|c| c.as_str()) == Some("call_sched")),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn several_shell_ops_do_not_share_the_row() {
+    let rows = output_rows(json!([
+        {"tool": "bash", "input": {"command": "echo one"}},
+        {"tool": "bash", "input": {"command": "echo two"}},
+    ]))
+    .await;
+    assert!(rows.iter().all(Option::is_none), "{rows:?}");
+}

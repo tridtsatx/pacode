@@ -167,9 +167,17 @@ impl Tool for BatchTool {
             (ctx.output_cap_chars / runnable).max(1)
         };
 
+        // A lone shell op streams its output into the batch's own row, as a
+        // `bash` call would; several would interleave there, so they do not.
+        let shell_ops = ops
+            .iter()
+            .filter(|op| matches!(op, PreparedOp::Ready { name, .. } if name.as_str() == "bash"))
+            .count();
+        let live_row = (shell_ops == 1).then(|| ctx.call_id.clone());
         let futures = ops.into_iter().map(|op| {
             let ctx = ctx.clone();
-            async move { run_op(op, &ctx, per_op_cap).await }
+            let live_row = live_row.clone();
+            async move { run_op(op, &ctx, per_op_cap, live_row).await }
         });
         let results = futures::future::join_all(futures)
             .await
@@ -406,7 +414,12 @@ async fn ask_batch_permission(ops: &[PreparedOp], ctx: &ToolCtx) -> Result<(), T
         .map(|_| ())
 }
 
-async fn run_op(op: PreparedOp, ctx: &ToolCtx, per_op_cap: usize) -> Result<OpResult, ToolError> {
+async fn run_op(
+    op: PreparedOp,
+    ctx: &ToolCtx,
+    per_op_cap: usize,
+    live_row: Option<pacode_types::CallId>,
+) -> Result<OpResult, ToolError> {
     match op {
         PreparedOp::Rejected { label, reason } => Ok(OpResult {
             label,
@@ -433,7 +446,7 @@ async fn run_op(op: PreparedOp, ctx: &ToolCtx, per_op_cap: usize) -> Result<OpRe
                         tokio::select! {
                             biased;
                             _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
-                            result = run_authorized(args, accept, &sub_ctx, None) => result,
+                            result = run_authorized(args, accept, &sub_ctx, live_row) => result,
                         }
                     }
                     Err(err) => Err(err),

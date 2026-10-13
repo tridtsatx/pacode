@@ -6,9 +6,12 @@
 //! Parsing is pure, so it can run ahead of those checks: when no result is
 //! ready, the next wave of files the scan may still reach is parsed in parallel
 //! and handed back in path order. A wave never goes past `max_files`; what it
-//! parsed past a `max_symbols` stop is dropped unread. Waves start at four files
-//! and double up to [`WAVE`], so a scan that `max_symbols` ends after three big
-//! files parses four, not thirty-two.
+//! parsed past a `max_symbols` stop is dropped unread — up to one wave's size
+//! minus one files of parsing for nothing. Waves start at four files and double
+//! up to [`WAVE`], so a scan that `max_symbols` ends after three big files
+//! parses four, not thirty-two, while one that stops late may discard up to
+//! thirty-one. In `context` mode a wave also holds every file's text until the
+//! scan reads it, so it is cut at [`WAVE_SOURCE_BYTES`] as well.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -28,6 +31,10 @@ pub(super) type Parsed = Result<(String, FileSymbols), SkipReason>;
 const FIRST_WAVE: usize = 4;
 /// Largest wave: bounds the outlines held before the scan reads them.
 const WAVE: usize = 32;
+/// Source bytes one wave may hold in `context` mode, where each file's text is
+/// kept for the caller: thirty-two files of up to `MAX_PARSE_BYTES` would
+/// otherwise sit in memory at once. A wave always takes at least one file.
+const WAVE_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 /// Helper threads one wave may ask for (the scanning thread works too).
 /// Measured on 100-500 file scans: one helper keeps the resident heap at the
 /// serial scan's level for a +6 MB peak; three were another 1.3x faster but
@@ -76,10 +83,13 @@ impl ParseAhead {
         cancel: &CancellationToken,
     ) -> Result<Parsed, ToolError> {
         if self.ready.is_empty() {
-            let end = self
+            let mut end = self
                 .files
                 .len()
                 .min(self.next + allowed.clamp(1, self.wave));
+            if self.keep_source {
+                end = self.next + within_bytes(&self.files[self.next..end], WAVE_SOURCE_BYTES);
+            }
             let wave = &self.files[self.next..end];
             let (parsed, fanned_out) = parse_wave(wave, self.keep_source, cancel)?;
             self.ready = parsed.into();
@@ -101,6 +111,26 @@ impl Drop for ParseAhead {
             crate::threads::release_freed_memory();
         }
     }
+}
+
+/// How many of `files`, from the first, fit in `budget` bytes of source — at
+/// least one. A file over `MAX_PARSE_BYTES` is skipped unread and costs
+/// nothing.
+fn within_bytes(files: &[(PathBuf, Language)], budget: u64) -> usize {
+    let mut used = 0u64;
+    for (taken, (path, _)) in files.iter().enumerate() {
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        let size = if size > MAX_PARSE_BYTES as u64 {
+            0
+        } else {
+            size
+        };
+        used = used.saturating_add(size);
+        if used > budget && taken > 0 {
+            return taken;
+        }
+    }
+    files.len()
 }
 
 /// Parse `wave` on this thread plus whatever helpers the budget grants;

@@ -132,7 +132,8 @@ impl Tool for BashTool {
 /// `pacode_risk::is_read_only` and covered with its combined permission request,
 /// so the command must already be authorized. `live_row`: the call whose
 /// transcript row draws a foreground run's output as it comes; `batch` passes
-/// `None`, since its ops run side by side under one row.
+/// its own row for a lone shell op and `None` for several, which run side by
+/// side under that one row.
 pub(crate) async fn run_authorized(
     args: BashInput,
     accept_large_output: bool,

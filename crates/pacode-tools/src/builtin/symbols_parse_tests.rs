@@ -6,7 +6,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::super::SymbolsTool;
-use super::{ParseAhead, WAVE, parse_file};
+use super::{ParseAhead, WAVE, parse_file, within_bytes};
 use crate::Tool;
 use crate::test_support::{StubToolHost, stub_ctx};
 
@@ -94,4 +94,25 @@ async fn max_files_parses_exactly_that_many() {
     assert!(out.contains("max_files hit"), "{out}");
     // The text files before the stop are skipped in path order.
     assert!(out.contains("skipped: 4 (4 no grammar)"), "{out}");
+}
+
+/// `context` mode keeps every file's text until the scan reads it, so a wave
+/// stops at a byte budget — but always takes the first file, however big.
+#[test]
+fn a_wave_that_keeps_sources_stops_at_its_byte_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files: Vec<(PathBuf, Language)> = [300, 300, 300, 300]
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            let path = tmp.path().join(format!("f{i}.rs"));
+            std::fs::write(&path, "x".repeat(*bytes)).unwrap();
+            (path, Language::Rust)
+        })
+        .collect();
+
+    assert_eq!(within_bytes(&files, 700), 2);
+    assert_eq!(within_bytes(&files, 1200), 4);
+    assert_eq!(within_bytes(&files, 10), 1);
+    assert_eq!(within_bytes(&files[..0], 10), 0);
 }
