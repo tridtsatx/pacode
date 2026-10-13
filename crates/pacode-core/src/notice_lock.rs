@@ -15,8 +15,9 @@
 //!
 //! # What is never holdable
 //!
-//! [`Injection::UserSteer`] and [`Injection::StatusRequest`] — the user's own
-//! input, and the orchestrator asking its own subagent a question. A held steer
+//! [`Injection::UserSteer`], [`Injection::StatusRequest`] and the two legs of
+//! the orchestrator <-> subagent exchange (`ParentMessage`, `AgentQuestion`) —
+//! the user's own input, and one agent waiting on the other. A held steer
 //! is a turn the user believes is running and is not, so
 //! [`Injection::is_holdable`] is the single definition and
 //! [`NoticeLock::hold_if_locked`] hands them straight back whatever the switch
@@ -197,7 +198,10 @@ impl Notice {
                 text: text.clone(),
             }),
             Injection::SystemNotice(text) => Some(Self::SystemNotice(text.clone())),
-            Injection::UserSteer { .. } | Injection::StatusRequest => None,
+            Injection::UserSteer { .. }
+            | Injection::StatusRequest
+            | Injection::ParentMessage { .. }
+            | Injection::AgentQuestion { .. } => None,
         }
     }
 
@@ -336,7 +340,10 @@ impl Held {
             Injection::AgentFinished { answer, .. } => prepend(answer),
             Injection::AgentStatus { text, .. } => prepend(text),
             Injection::SystemNotice(text) => prepend(text),
-            Injection::UserSteer { .. } | Injection::StatusRequest => {}
+            Injection::UserSteer { .. }
+            | Injection::StatusRequest
+            | Injection::ParentMessage { .. }
+            | Injection::AgentQuestion { .. } => {}
         }
         injection
     }
@@ -489,6 +496,22 @@ impl NoticeLock {
         state.dropped += state.queue.len() as u64;
         state.queue.clear();
         state.next_due = None;
+    }
+
+    /// Take `agent`'s parked reports out of the backlog: a resumed subagent's
+    /// earlier report must not be released after the resume, posing as the
+    /// reply to the message that resumed it. The caller hands it over instead.
+    pub(crate) fn take_agent_finished(&self, agent: &pacode_types::AgentId) -> Vec<Injection> {
+        let mut state = self.state();
+        let (taken, kept): (VecDeque<Held>, VecDeque<Held>) =
+            state.queue.drain(..).partition(|held| {
+                matches!(&held.injection, Injection::AgentFinished { agent: info, .. } if &info.id == agent)
+            });
+        state.queue = kept;
+        if state.queue.is_empty() {
+            state.next_due = None;
+        }
+        taken.into_iter().map(|held| held.injection).collect()
     }
 
     /// Drop the backlog and unlock — the notices belonged to the session that

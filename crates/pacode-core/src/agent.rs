@@ -512,6 +512,8 @@ pub struct Agent {
     /// (`request_turn` and `drain_injections`) read from one and put back into
     /// the other, and a take they later undo must not have spent a release.
     pub notice_lock: crate::notice_lock::NoticeLock,
+    /// The subagent's side of `agent send` / `ask_parent` (see `rpc`).
+    pub(crate) mailbox: crate::rpc::Mailbox,
     /// The context-quality checkpoints this agent has been asked, and the words
     /// it is still holding. Driven entirely by the turn loop — ask at the top of
     /// a turn, settle at the bottom — so it costs nothing while idle.
@@ -599,6 +601,7 @@ impl Agent {
             stream_usage: Mutex::new(Usage::default()),
             injections: InjectionQueue::default(),
             notice_lock: crate::notice_lock::NoticeLock::new(),
+            mailbox: crate::rpc::Mailbox::default(),
             checkpoints: Mutex::new(crate::analyze::Checkpoints::default()),
             compaction_generation: std::sync::atomic::AtomicU64::new(0),
             tools: RwLock::new(tools),
@@ -655,6 +658,7 @@ impl Agent {
             stream_usage: Mutex::new(Usage::default()),
             injections: InjectionQueue::default(),
             notice_lock: crate::notice_lock::NoticeLock::new(),
+            mailbox: crate::rpc::Mailbox::default(),
             checkpoints: Mutex::new(crate::analyze::Checkpoints::default()),
             compaction_generation: std::sync::atomic::AtomicU64::new(0),
             tools: RwLock::new(tools),

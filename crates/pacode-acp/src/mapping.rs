@@ -199,7 +199,8 @@ fn tool_view(kind: &TranscriptKind) -> ToolView {
         | TranscriptKind::Notice { .. }
         | TranscriptKind::Permission(_)
         | TranscriptKind::Question { .. }
-        | TranscriptKind::BashCommand { .. } => ToolView::default(),
+        | TranscriptKind::BashCommand { .. }
+        | TranscriptKind::AgentMessage { .. } => ToolView::default(),
     }
 }
 
@@ -635,7 +636,8 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
             TranscriptKind::User { .. }
             | TranscriptKind::Notice { .. }
             | TranscriptKind::Permission(_)
-            | TranscriptKind::Question { .. } => vec![],
+            | TranscriptKind::Question { .. }
+            | TranscriptKind::AgentMessage { .. } => vec![],
         },
         Event::ItemUpdated(item) => match &item.kind {
             TranscriptKind::ToolCall {
@@ -674,7 +676,8 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
             | TranscriptKind::User { .. }
             | TranscriptKind::Notice { .. }
             | TranscriptKind::Permission(_)
-            | TranscriptKind::Question { .. } => vec![],
+            | TranscriptKind::Question { .. }
+            | TranscriptKind::AgentMessage { .. } => vec![],
         },
         Event::PlanUpdated(plan) => {
             vec![SessionUpdate::Plan(plan_to_acp(plan))]
@@ -828,7 +831,9 @@ pub fn transcript_item_to_session_updates(item: &TranscriptItem) -> Vec<SessionU
                 ContentBlock::Text(TextContent::new(format!("[{level:?}] {text}\n"))),
             ))]
         }
-        TranscriptKind::Permission(_) | TranscriptKind::Question { .. } => vec![],
+        TranscriptKind::Permission(_)
+        | TranscriptKind::Question { .. }
+        | TranscriptKind::AgentMessage { .. } => vec![],
     }
 }
 

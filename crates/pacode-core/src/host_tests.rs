@@ -24,6 +24,7 @@ fn test_every_builtin_tool_reports_expected_kind() {
         ("webfetch", ToolKind::Network),
         ("websearch", ToolKind::Network),
         ("report_status", ToolKind::Control),
+        ("ask_parent", ToolKind::Control),
         ("memory_write", ToolKind::Edit),
         ("memory_read", ToolKind::ReadOnly),
     ];

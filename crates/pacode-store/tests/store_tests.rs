@@ -149,6 +149,15 @@ async fn round_trip_agents() {
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0], info);
 
+    // A subagent blocked on `ask_parent` round-trips its own status.
+    let mut waiting = info.clone();
+    waiting.status = AgentStatus::WaitingParent;
+    store.upsert_agent(&session, &waiting, None).await.unwrap();
+    assert_eq!(
+        store.list_agents(&session).await.unwrap()[0].status,
+        AgentStatus::WaitingParent
+    );
+
     // Update status to finished
     let mut updated = info.clone();
     updated.status = AgentStatus::Finished;

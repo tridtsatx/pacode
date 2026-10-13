@@ -17,7 +17,10 @@ use pacode_types::{
 use tokio_util::sync::CancellationToken;
 
 use crate::ToolError;
-use crate::host::{AgentKindDef, AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
+use crate::host::{
+    AgentKindDef, AgentSpec, ParentReply, PermissionDraft, SendOutcome, ToolCtx, ToolHost,
+    WaitOutcome,
+};
 
 #[derive(Default)]
 pub struct ScheduleStub {
@@ -117,13 +120,18 @@ impl ScheduleStub {
 /// Permission drafts are recorded in `drafts` and answered with `decision`
 /// (default `AllowOnce`) plus the optional deny `reason`. When `tasks` is set,
 /// task calls delegate to a real `TaskManager`, so tests can run actual
-/// commands.
+/// commands. `agent send` and `ask_parent` are recorded in `sent` / `asked`
+/// and answered with `send_outcome` / `parent_reply` (`None` = refused).
 pub struct StubToolHost {
     pub schedule: ScheduleStub,
     pub drafts: Mutex<Vec<PermissionDraft>>,
     pub decision: Mutex<PermissionDecision>,
     pub reason: Mutex<Option<String>>,
     pub tasks: Option<Arc<pacode_exec::TaskManager>>,
+    pub sent: Mutex<Vec<(AgentId, String)>>,
+    pub send_outcome: Mutex<Option<SendOutcome>>,
+    pub asked: Mutex<Vec<(CallId, String)>>,
+    pub parent_reply: Mutex<Option<ParentReply>>,
 }
 
 impl Default for StubToolHost {
@@ -134,6 +142,10 @@ impl Default for StubToolHost {
             decision: Mutex::new(PermissionDecision::AllowOnce),
             reason: Mutex::new(None),
             tasks: None,
+            sent: Mutex::new(Vec::new()),
+            send_outcome: Mutex::new(None),
+            asked: Mutex::new(Vec::new()),
+            parent_reply: Mutex::new(None),
         }
     }
 }
@@ -345,6 +357,38 @@ impl ToolHost for StubToolHost {
 
     fn report_status(&self, _text: String) -> Result<(), ToolError> {
         Ok(())
+    }
+
+    async fn send_to_agent(
+        &self,
+        agent: &AgentId,
+        message: String,
+    ) -> Result<SendOutcome, ToolError> {
+        self.sent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((agent.clone(), message));
+        self.send_outcome
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| ToolError::failed("no agents in this test"))
+    }
+
+    async fn ask_parent(
+        &self,
+        call_id: &CallId,
+        question: String,
+    ) -> Result<ParentReply, ToolError> {
+        self.asked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((call_id.clone(), question));
+        self.parent_reply
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| ToolError::invalid("only subagents can ask the orchestrator"))
     }
 
     fn plan(&self) -> pacode_types::Plan {

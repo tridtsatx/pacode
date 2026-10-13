@@ -249,6 +249,22 @@ impl ToolHost for StubHost {
         Ok(())
     }
 
+    async fn send_to_agent(
+        &self,
+        _agent: &pacode_types::AgentId,
+        _message: String,
+    ) -> Result<pacode_tools::host::SendOutcome, ToolError> {
+        Err(ToolError::Failed("no agents in this test".to_string()))
+    }
+
+    async fn ask_parent(
+        &self,
+        _call_id: &pacode_types::CallId,
+        _question: String,
+    ) -> Result<pacode_tools::host::ParentReply, ToolError> {
+        Err(ToolError::Failed("no parent in this test".to_string()))
+    }
+
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         if let Some(a) = self
             .agents

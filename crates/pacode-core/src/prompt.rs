@@ -46,7 +46,7 @@ pub fn system_static() -> &'static str {
     ## Background-First Thesis\n\
     When starting long-running builds, tests, or servers, run them in the background. Continue executing other steps while background tasks run. You will receive task completions and output via injected events between steps.\n\n\
     ## Subagents\n\
-    Use the `agent` tool to run independent work in parallel. `spawn` returns immediately; the subagent's final report and its `report_status` updates arrive as `<agent_finished>` / `<agent_status>` events between your steps. Use `agent ask_status` to request a brief status from a running subagent; if you need the result before continuing, end your turn and the report will wake you.\n\n\
+    Use the `agent` tool to run independent work in parallel. `spawn` returns immediately; the subagent's final report and its `report_status` updates arrive as `<agent_finished>` / `<agent_status>` events between your steps. Use `agent ask_status` to request a brief status from a running subagent; if you need the result before continuing, end your turn and the report will wake you. `agent send` messages a subagent; an `<agent_question>` blocks its subagent until you answer it with `agent send`.\n\n\
     ## Planning\n\
     For any task with 3 or more steps, use the `plan` tool to create and maintain a clear plan. Keep items up to date. Report `progress` only when it is measurable.\n\n\
     ## Permissions\n\
@@ -68,7 +68,7 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
 
     if ctx.is_subagent {
         out.push_str("\n## Subagent Role\n");
-        out.push_str("You are a subagent working on a dedicated subtask. The `agent` tool is not available to you. Focus on completing your assigned prompt and return your findings or results. When you receive a `<status_request>`, call `report_status` with a brief status first, then continue. Your final message is delivered to the orchestrator as your report.\n");
+        out.push_str(&subagent_role(ctx));
     }
 
     if !ctx.plan.is_empty() {
@@ -114,6 +114,41 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
     out.push_str("\n## Tools\n");
     out.push_str(&tools_section(ctx.tools, ctx.provider));
     out
+}
+
+/// The subagent's role. The channel tools are named only when the subagent
+/// has them (a kind or `tools` list may narrow them away; telling the model
+/// to call a tool it lacks costs a failed call), and by their wire names.
+fn subagent_role(ctx: &DynamicContext<'_>) -> String {
+    let named = |name: &str| {
+        ctx.tools
+            .iter()
+            .any(|tool| tool.name == name)
+            .then(|| ctx.provider.wire_tool_name(name).into_owned())
+    };
+    let mut role = String::from(
+        "You are a subagent working on a dedicated subtask. The `agent` tool is not available \
+         to you. Focus on completing your assigned prompt and return your findings or results.",
+    );
+    if let Some(report) = named("report_status") {
+        role.push_str(&format!(
+            " When you receive a `<status_request>`, call `{report}` with a brief status \
+             first, then continue."
+        ));
+    }
+    role.push_str(
+        " An `<orchestrator_message>` is an instruction from the orchestrator; where it \
+         conflicts with your original brief, it wins.",
+    );
+    if let Some(ask) = named("ask_parent") {
+        role.push_str(&format!(
+            " Use `{ask}` only when you are genuinely blocked on a decision the orchestrator \
+             or the user must make; otherwise proceed on a reasonable assumption and state it \
+             in your report — do not ping-pong."
+        ));
+    }
+    role.push_str(" Your final message is delivered to the orchestrator as your report.\n");
+    role
 }
 
 /// One line per tool, `- name: first sentence`, capped at [`MAX_LISTED_TOOLS`]

@@ -138,6 +138,26 @@ fn transcript_item_bytes(item: &TranscriptItem) -> usize {
         pacode_types::TranscriptKind::BashCommand {
             command, output, ..
         } => sum_bytes([command.capacity(), output.capacity()]),
+        pacode_types::TranscriptKind::AgentMessage {
+            subagent,
+            subagent_name,
+            text,
+            reply,
+            ..
+        } => sum_bytes([
+            subagent.as_str().len(),
+            subagent_name.capacity(),
+            text.capacity(),
+            match reply {
+                Some(pacode_types::AgentReply::Answered { text }) => text.capacity(),
+                Some(
+                    pacode_types::AgentReply::Unanswered
+                    | pacode_types::AgentReply::Failed
+                    | pacode_types::AgentReply::Cancelled,
+                )
+                | None => 0,
+            },
+        ]),
     };
     sum_bytes([base, kind])
 }

@@ -159,7 +159,7 @@ async fn hydrate_agent_history(
     agent_id: &pacode_types::AgentId,
     compaction: Option<(String, u64)>,
     window: u64,
-    prompt_fallback: Option<String>,
+    prompt: Option<String>,
 ) -> Result<HydratedHistory, CoreError> {
     let (summary, upto_seq) = match compaction {
         Some((summary, upto_seq)) => (Some(summary), Some(upto_seq)),
@@ -185,12 +185,20 @@ async fn hydrate_agent_history(
     if page.has_more && rows.len() > window as usize {
         rows.drain(..rows.len() - window as usize);
     }
+    // A window that opens on the results of a call whose request fell outside
+    // it would show the model answers to nothing: it starts at the first row
+    // that is not one. The rows left out stay in the store, below the floor.
+    let orphans = rows
+        .iter()
+        .take_while(|(_, message)| message.role == pacode_types::Role::Tool)
+        .count();
+    rows.drain(..orphans);
     let mut next_seq = max_seq
         .map(|seq| seq.saturating_add(1))
         .or_else(|| upto_seq.map(|upto_seq| upto_seq.saturating_add(1)))
         .unwrap_or(0);
     if rows.is_empty()
-        && let Some(prompt) = prompt_fallback
+        && let Some(prompt) = &prompt
     {
         // The prompt is a real message of this agent: it takes the seq the next
         // persisted message would, and moves the cursor past it. Parking it on
@@ -199,6 +207,25 @@ async fn hydrate_agent_history(
         rows.push((next_seq, Arc::new(pacode_types::Message::user(prompt))));
         next_seq = next_seq.saturating_add(1);
     }
+    // A window that does not reach the start lost the agent's task with it
+    // (a subagent's brief is its first message): the brief leads whatever
+    // stands for the messages before the window, unless the window holds it.
+    let summary = match prompt {
+        Some(prompt)
+            if after.is_some()
+                && !rows.iter().any(|(_, message)| {
+                    message.role == pacode_types::Role::User && message.text() == prompt
+                }) =>
+        {
+            let earlier = summary
+                .as_deref()
+                .unwrap_or("(the earlier messages are not loaded)");
+            Some(format!(
+                "Your original task:\n{prompt}\n\nSince then:\n{earlier}"
+            ))
+        }
+        Some(_) | None => summary,
+    };
     let estimated_tokens = rows
         .iter()
         .map(|(_, message)| message.estimate_tokens())
@@ -219,6 +246,29 @@ async fn hydrate_agent_history(
         estimated_tokens,
     };
     Ok(HydratedHistory { history, rows })
+}
+
+/// A subagent's history as resume loads it: the compaction summary plus the
+/// newest window of messages. Also what `agent send` reloads for a finished
+/// subagent, whose in-memory history was dropped when it reported.
+pub(crate) async fn load_subagent_history(
+    store: &pacode_store::Store,
+    session_id: &SessionId,
+    agent_id: &pacode_types::AgentId,
+    prompt: Option<String>,
+    history_page: u32,
+) -> Result<crate::agent::History, CoreError> {
+    let compaction = store.load_compaction(session_id, agent_id).await?;
+    let hydrated = hydrate_agent_history(
+        store,
+        session_id,
+        agent_id,
+        compaction,
+        resume_window(history_page, SUB_HISTORY_PAGES),
+        prompt,
+    )
+    .await?;
+    Ok(hydrated.history)
 }
 
 async fn open_session_unlocked(
@@ -321,7 +371,7 @@ async fn open_session_unlocked(
                 pacode_types::AgentId::main(),
                 main_info,
                 crate::agent::History::default(),
-                session_tools.clone(),
+                pacode_tools::orchestrator_tools(&session_tools),
                 core.deps.config.session.history_page,
                 None,
             ));
@@ -502,7 +552,7 @@ async fn open_session_unlocked(
                 pacode_types::AgentId::main(),
                 main_info,
                 main_history,
-                session_tools.clone(),
+                pacode_tools::orchestrator_tools(&session_tools),
                 transcript_state,
                 None,
             ));
@@ -523,25 +573,23 @@ async fn open_session_unlocked(
                     .store
                     .agent_prompt(&session_id, &sub_info.id)
                     .await?;
-                let sub_compaction = core
-                    .deps
-                    .store
-                    .load_compaction(&session_id, &sub_info.id)
-                    .await?;
-                let sub_hydrated = hydrate_agent_history(
+                let sub_history = load_subagent_history(
                     &core.deps.store,
                     &session_id,
                     &sub_info.id,
-                    sub_compaction,
-                    resume_window(core.deps.config.session.history_page, SUB_HISTORY_PAGES),
                     sub_prompt.clone(),
+                    core.deps.config.session.history_page,
                 )
                 .await?;
                 let sub_agent = Arc::new(crate::agent::Agent::new(
                     sub_info.id.clone(),
                     sub_info.clone(),
-                    sub_hydrated.history,
-                    session_tools.clone(),
+                    sub_history,
+                    session_tools.subset(
+                        pacode_tools::subagent_tool_names(&session_tools)
+                            .iter()
+                            .map(String::as_str),
+                    ),
                     core.deps.config.session.history_page,
                     sub_prompt,
                 ));
@@ -893,5 +941,110 @@ mod tests {
             store.list_agents(&session_id).await.unwrap()[0].status,
             AgentStatus::Finished
         );
+    }
+
+    /// A window that does not reach the start of a long history still opens
+    /// on the task the agent was given, and never on the results of a call
+    /// whose request fell outside it.
+    #[tokio::test]
+    async fn a_truncated_window_keeps_the_brief_and_starts_on_a_valid_boundary() {
+        use pacode_types::{AgentId, CallId, Message, Role};
+        use std::path::PathBuf;
+
+        let store = pacode_store::Store::open_in_memory().unwrap();
+        let session_id = SessionId::new("resume-truncated-window");
+        store
+            .upsert_session(&SessionMeta {
+                id: session_id.clone(),
+                name: None,
+                cwd: PathBuf::from("."),
+                git_branch: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                model: pacode_types::ModelRoute::new("mock", "mock-model"),
+                effort: pacode_types::Effort::Low,
+                mode: pacode_types::Mode::Build,
+                first_prompt: None,
+                zdr: false,
+            })
+            .await
+            .unwrap();
+        let agent_id = AgentId::new("agt_truncated_window");
+        let call = |id: &str| {
+            Message::new(
+                Role::Assistant,
+                vec![pacode_types::ContentBlock::ToolUse {
+                    id: CallId::new(id),
+                    name: "read".into(),
+                    input: serde_json::json!({"path": "x"}),
+                }],
+            )
+        };
+        let history = [
+            Message::user("the brief"),
+            call("a"),
+            Message::tool_result(CallId::new("a"), "result a", false),
+            call("b"),
+            Message::tool_result(CallId::new("b"), "result b", false),
+            Message::assistant_text("progress"),
+            Message::user("more"),
+            call("c"),
+            Message::tool_result(CallId::new("c"), "result c", false),
+            Message::assistant_text("done"),
+        ];
+        for (seq, message) in history.iter().enumerate() {
+            store
+                .append_message(&session_id, &agent_id, seq as u64, message)
+                .await
+                .unwrap();
+        }
+
+        // Six rows back from the end lands on the result of `b`.
+        let hydrated = hydrate_agent_history(
+            &store,
+            &session_id,
+            &agent_id,
+            None,
+            6,
+            Some("the brief".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hydrated.history.message_seqs, vec![5, 6, 7, 8, 9]);
+        assert_ne!(hydrated.history.messages[0].role, Role::Tool);
+        let shown = hydrated.history.for_model();
+        assert!(shown[0].text().contains("the brief"), "{shown:#?}");
+
+        // With a compaction summary, the brief leads it.
+        let compacted = hydrate_agent_history(
+            &store,
+            &session_id,
+            &agent_id,
+            Some(("summary of 0..=4".into(), 4)),
+            6,
+            Some("the brief".into()),
+        )
+        .await
+        .unwrap();
+        let summary = compacted.history.summary.unwrap();
+        assert!(
+            summary.starts_with("Your original task:\nthe brief"),
+            "{summary}"
+        );
+        assert!(summary.contains("summary of 0..=4"));
+
+        // A window that reaches the start changes nothing.
+        let whole = hydrate_agent_history(
+            &store,
+            &session_id,
+            &agent_id,
+            None,
+            128,
+            Some("the brief".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(whole.history.message_seqs.len(), 10);
+        assert!(whole.history.summary.is_none());
     }
 }

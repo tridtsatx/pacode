@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pacode_exec::TaskSpec;
 use pacode_tools::host::{AgentKindDef, PermissionDraft, PermissionOutcome};
-use pacode_tools::{AgentSpec, ToolError, ToolHost, WaitOutcome};
+use pacode_tools::{AgentSpec, ParentReply, SendOutcome, ToolError, ToolHost, WaitOutcome};
 use pacode_types::{
     AgentId, AgentInfo, CallId, ModelRoute, PermissionDecision, Plan, TaskId, TaskInfo,
     TaskProgress, ToastLevel,
@@ -803,14 +803,47 @@ impl ToolHost for SessionHost {
         Ok(())
     }
 
+    async fn send_to_agent(
+        &self,
+        agent: &AgentId,
+        message: String,
+    ) -> Result<SendOutcome, ToolError> {
+        let me = self
+            .owner_agent()
+            .ok_or_else(|| ToolError::failed("agent not found"))?;
+        crate::rpc::send(&self.session, &me, agent, &message).await
+    }
+
+    async fn ask_parent(
+        &self,
+        call_id: &CallId,
+        question: String,
+    ) -> Result<ParentReply, ToolError> {
+        let me = self
+            .owner_agent()
+            .ok_or_else(|| ToolError::failed("agent not found"))?;
+        crate::rpc::ask_parent(&self.session, &me, call_id, &question).await
+    }
+
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         self.session
-            .stop_agent(agent)
+            .stop_agent_by(agent, crate::rpc::StopOrigin::Orchestrator)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
     async fn continue_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
+        // The orchestrator resumes what it stopped; what the user stopped is
+        // the user's to resume (the same rule `agent send` follows).
+        if self
+            .session
+            .agent(agent)
+            .is_some_and(|a| a.mailbox.stopped_by() == Some(crate::rpc::StopOrigin::User))
+        {
+            return Err(ToolError::failed(format!(
+                "agent {agent} was stopped by the user; ask the user before resuming it"
+            )));
+        }
         self.session
             .continue_agent(agent)
             .await

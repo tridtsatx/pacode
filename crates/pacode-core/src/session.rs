@@ -1392,6 +1392,15 @@ impl Session {
                     .collect(),
                 None => pacode_tools::subagent_tool_names(&g),
             };
+            // The channel back to the orchestrator is not part of what a kind
+            // or a `tools` list narrows: a subagent asked for its status, or
+            // blocked on a decision, needs it whatever work it was given.
+            // `exclude_tools` can still drop it on purpose.
+            for name in pacode_tools::builtin::SUBAGENT_ONLY {
+                if !names.iter().any(|n| n == name) {
+                    names.push((*name).to_string());
+                }
+            }
             if let Some(dropped) = &spec.exclude_tools {
                 let dropped: std::collections::HashSet<&str> = dropped
                     .iter()
@@ -1659,6 +1668,7 @@ impl Session {
             .upsert(item.clone());
         self.events.emit(pacode_types::Event::ItemAdded(item));
 
+        agent.mailbox.clear_stop();
         agent.clear_stop_request();
         agent.set_status(pacode_types::AgentStatus::Idle, None);
         if agent.turn_generation() != generation || self.closed.load(Ordering::SeqCst) {
@@ -1675,11 +1685,24 @@ impl Session {
         Ok(())
     }
 
+    /// Stop an agent on the user's behalf (the TUI, `InterruptAll`, a clear):
+    /// the orchestrator may not resume it without asking the user.
     pub async fn stop_agent(&self, id: &AgentId) -> Result<(), CoreError> {
+        self.stop_agent_by(id, crate::rpc::StopOrigin::User).await
+    }
+
+    pub(crate) async fn stop_agent_by(
+        &self,
+        id: &AgentId,
+        origin: crate::rpc::StopOrigin,
+    ) -> Result<(), CoreError> {
         let agent = self
             .agent(id)
             .ok_or_else(|| CoreError::AgentNotFound(id.clone()))?;
         let expected_id = agent.id();
+        // First, under the lock `agent send` decides under: from here no
+        // answer is handed to a question this stop is about to cancel.
+        agent.mailbox.note_stop(origin);
         agent.invalidate_turn_generation();
         let _message_guard = agent.message_write_lock.clone().lock_owned().await;
         let current = self.agent(&expected_id);
@@ -1782,7 +1805,8 @@ impl Session {
             let names = pacode_tools::subagent_tool_names(&tools);
             tools.subset(names.iter().map(String::as_str))
         };
-        let main_tools = self.tools.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let main_tools =
+            pacode_tools::orchestrator_tools(&self.tools.read().unwrap_or_else(|p| p.into_inner()));
         let fresh_main_info = pacode_types::AgentInfo {
             id: AgentId::main(),
             name: "main".to_string(),
@@ -1923,6 +1947,9 @@ impl Session {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
         agents.insert(new_id.clone(), main.clone());
+        // The detached agent cannot answer its former subagents (it has no
+        // `agent` tool): their open questions go to the fresh orchestrator.
+        crate::rpc::reroute_questions(&agents, main, &fresh_main);
         agents.insert(AgentId::main(), fresh_main);
         Ok((new_id, detached_info))
     }
@@ -2000,6 +2027,9 @@ impl Session {
         if let Some(fresh_main) = self.main_agent() {
             self.events
                 .emit(pacode_types::Event::AgentUpdated(fresh_main.info()));
+            // Questions handed over by the detach wake it like any injection
+            // reaching an idle orchestrator; with nothing queued this is a no-op.
+            crate::turn::lifecycle::request_turn(self.clone(), fresh_main);
         }
 
         log::info!(

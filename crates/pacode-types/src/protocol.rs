@@ -71,8 +71,9 @@ pub const SNAPSHOT_MAX_PENDING_PERMISSIONS: usize = 64;
 /// replies before session events; v8 adds the session `Resync` control marker
 /// and separates attach request ids from stable idempotency keys; v9 adds
 /// `SetNoticeLock` and the `NoticeLockChanged` broadcast; v12 adds
-/// `ClearContext` and the `ContextCleared` broadcast.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// `ClearContext` and the `ContextCleared` broadcast; v13 adds the
+/// `waiting_parent` agent status and the `agent_message` transcript item.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {

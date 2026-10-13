@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use pacode_types::{AgentInfo, Message, MessageKind, TaskInfo};
+use pacode_types::{AgentId, AgentInfo, CallId, Message, MessageKind, TaskInfo};
 use tokio::sync::Notify;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +35,18 @@ pub enum Injection {
         agent: AgentInfo,
         text: String,
     },
+    /// `agent send` to a subagent that is mid-turn (already capped).
+    ParentMessage {
+        text: String,
+    },
+    /// A subagent's `ask_parent` question; its call `call_id` is blocked until
+    /// the parent answers it with `agent send` (already capped).
+    AgentQuestion {
+        agent: AgentId,
+        name: String,
+        call_id: CallId,
+        question: String,
+    },
 }
 
 impl Injection {
@@ -45,9 +57,15 @@ impl Injection {
     /// The rule is stated as an exclusion on purpose: a new variant is
     /// holdable by default, and the ones that must never wait in a backlog are
     /// the ones that hang a turn — a held steer is a turn the user believes is
-    /// running and is not.
+    /// running and is not, a held question is a subagent blocked for nothing.
     pub fn is_holdable(&self) -> bool {
-        !matches!(self, Injection::UserSteer { .. } | Injection::StatusRequest)
+        !matches!(
+            self,
+            Injection::UserSteer { .. }
+                | Injection::StatusRequest
+                | Injection::ParentMessage { .. }
+                | Injection::AgentQuestion { .. }
+        )
     }
 }
 
@@ -97,6 +115,53 @@ impl InjectionQueue {
 
     pub fn is_empty(&self) -> bool {
         self.queue.lock().map(|q| q.is_empty()).unwrap_or(true)
+    }
+
+    /// An `agent send` is waiting: the subagent owes the orchestrator a turn.
+    pub fn has_parent_message(&self) -> bool {
+        self.queue
+            .lock()
+            .map(|q| {
+                q.iter()
+                    .any(|item| matches!(item, Injection::ParentMessage { .. }))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Drop `agent`'s queued question of `call_id`, if it is still
+    /// undelivered: once answered or cancelled it would only show the parent a
+    /// stale ask. Keyed by the asker too — call ids are only unique per agent
+    /// (a provider without its own ids numbers them `call_0`, `call_1`, …).
+    pub fn retract_question(&self, agent: &AgentId, call_id: &CallId) {
+        if let Ok(mut q) = self.queue.lock() {
+            q.retain(|item| {
+                !matches!(
+                    item,
+                    Injection::AgentQuestion { agent: a, call_id: c, .. } if a == agent && c == call_id
+                )
+            });
+        }
+    }
+
+    /// Take every queued question out (the agent can no longer answer them).
+    pub fn take_questions(&self) -> Vec<Injection> {
+        self.take_where(|item| matches!(item, Injection::AgentQuestion { .. }))
+    }
+
+    /// Take `agent`'s queued reports out.
+    pub fn take_agent_finished(&self, agent: &AgentId) -> Vec<Injection> {
+        self.take_where(|item| {
+            matches!(item, Injection::AgentFinished { agent: info, .. } if &info.id == agent)
+        })
+    }
+
+    fn take_where(&self, take: impl Fn(&Injection) -> bool) -> Vec<Injection> {
+        let Ok(mut q) = self.queue.lock() else {
+            return Vec::new();
+        };
+        let (taken, kept): (VecDeque<_>, VecDeque<_>) = q.drain(..).partition(|item| take(item));
+        *q = kept;
+        taken.into()
     }
 
     /// Wait until at least one injection is queued.
@@ -190,6 +255,27 @@ pub fn render_injections(items: &[Injection], cap_chars: usize) -> Message {
                 let capped = pacode_types::truncate_head_tail(text, cap_chars);
                 parts.push(format!("<notice>{capped}</notice>"));
             }
+            // Both legs of the exchange were capped at the door
+            // (`AGENT_MESSAGE_CAP_CHARS`); the injection cap is for reports,
+            // and cutting an instruction or a question in half would change
+            // what it says.
+            Injection::ParentMessage { text } => {
+                parts.push(format!(
+                    "<orchestrator_message>\n{text}\n</orchestrator_message>"
+                ));
+            }
+            Injection::AgentQuestion {
+                agent,
+                name,
+                question,
+                ..
+            } => {
+                parts.push(format!(
+                    "<agent_question id=\"{agent}\" name=\"{name}\">\n{question}\n\
+                     (It is blocked until you answer with `agent send`; ending your turn \
+                     without an answer lets it proceed on its own judgment.)\n</agent_question>"
+                ));
+            }
         }
     }
 
@@ -277,5 +363,67 @@ mod tests {
                 .text()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn exchange_injections_are_tagged_whole_and_never_held() {
+        let question = Injection::AgentQuestion {
+            agent: AgentId::new("agt_1"),
+            name: "tests".into(),
+            call_id: CallId::new("call_1"),
+            question: "Q".repeat(300),
+        };
+        let message = Injection::ParentMessage {
+            text: "M".repeat(300),
+        };
+        assert!(!question.is_holdable());
+        assert!(!message.is_holdable());
+
+        // Capped at the door, so the report cap does not cut them again.
+        let text = render_injections(&[message, question], 100).text();
+        assert!(text.contains(&format!(
+            "<orchestrator_message>\n{}\n</orchestrator_message>",
+            "M".repeat(300)
+        )));
+        assert!(text.contains("<agent_question id=\"agt_1\" name=\"tests\">"));
+        assert!(text.contains(&"Q".repeat(300)));
+        assert!(text.contains("`agent send`"));
+        assert!(!text.contains("truncated"));
+    }
+
+    #[test]
+    fn queue_reports_messages_and_retracts_questions() {
+        let question = |agent: &str, call: &str| Injection::AgentQuestion {
+            agent: AgentId::new(agent),
+            name: agent.into(),
+            call_id: CallId::new(call),
+            question: "q".into(),
+        };
+        let queue = InjectionQueue::default();
+        queue.push(question("agt_1", "c1"));
+        queue.push(Injection::SystemNotice("n".into()));
+        assert!(!queue.has_parent_message());
+        queue.push(Injection::ParentMessage { text: "m".into() });
+        assert!(queue.has_parent_message());
+
+        queue.retract_question(&AgentId::new("agt_1"), &CallId::new("other"));
+        assert_eq!(queue.drain().len(), 3);
+    }
+
+    /// Call ids repeat across agents (`call_0`, …): retracting one agent's
+    /// question must leave another's with the same id alone.
+    #[test]
+    fn a_retract_is_keyed_by_the_asking_agent() {
+        let question = |agent: &str| Injection::AgentQuestion {
+            agent: AgentId::new(agent),
+            name: agent.into(),
+            call_id: CallId::new("call_0"),
+            question: "q".into(),
+        };
+        let queue = InjectionQueue::default();
+        queue.push(question("agt_1"));
+        queue.push(question("agt_2"));
+        queue.retract_question(&AgentId::new("agt_1"), &CallId::new("call_0"));
+        assert_eq!(queue.drain(), vec![question("agt_2")]);
     }
 }

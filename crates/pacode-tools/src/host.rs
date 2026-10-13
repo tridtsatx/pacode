@@ -187,6 +187,36 @@ pub struct AgentSpec {
     pub exclude_tools: Option<Vec<String>>,
 }
 
+/// What `agent send` did with the message — the tool output names it, so the
+/// orchestrator knows whether the subagent is reading it now or starting over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The subagent is mid-turn and reads the message at its next step.
+    Delivered,
+    /// The subagent was blocked in `ask_parent`: the message is its answer.
+    Answered,
+    /// The subagent had ended (finished or stopped): the message started a
+    /// new turn on its retained context. `previous_report` is the report it
+    /// ended with when the orchestrator had not read it yet — handed back here
+    /// so it cannot arrive after the resume, posing as the reply.
+    Resumed { previous_report: Option<String> },
+}
+
+/// How an `ask_parent` question ended, when it did not end in a stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParentReply {
+    /// The orchestrator's `agent send`, capped.
+    Answered(String),
+    /// The orchestrator completed a turn that showed it the question without
+    /// answering.
+    Unanswered,
+    /// The orchestrator's turn failed after it was shown the question, or the
+    /// question could not be delivered at all.
+    ParentFailed,
+    /// Too many questions in a row went unanswered: this one was not sent.
+    NotAnswering,
+}
+
 /// Result of waiting on tasks.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WaitOutcome {
@@ -633,6 +663,23 @@ pub trait ToolHost: Send + Sync {
     /// Subagent → parent: a short status line, delivered as `<agent_status>` at the
     /// parent's next step.
     fn report_status(&self, text: String) -> Result<(), ToolError>;
+    /// Orchestrator → its own subagent. A running subagent gets the message as
+    /// an `<orchestrator_message>` at its next step; one blocked in
+    /// `ask_parent` gets it as the answer; one that has ended is resumed with
+    /// it. A failed subagent cannot be resumed and is an error.
+    async fn send_to_agent(
+        &self,
+        agent: &AgentId,
+        message: String,
+    ) -> Result<SendOutcome, ToolError>;
+    /// Subagent → orchestrator: deliver the question as `<agent_question>` and
+    /// wait until the orchestrator answers it with `agent send` or completes a
+    /// turn without doing so. A stop ends the wait as `Cancelled`.
+    async fn ask_parent(
+        &self,
+        call_id: &CallId,
+        question: String,
+    ) -> Result<ParentReply, ToolError>;
 
     // --- plan ---
     fn plan(&self) -> Plan;

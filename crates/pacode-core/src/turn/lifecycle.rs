@@ -620,7 +620,7 @@ async fn unwind_unclaimed_turn(
     }
 }
 
-fn start_claimed_turn(
+pub(crate) fn start_claimed_turn(
     session: Arc<Session>,
     agent: Arc<Agent>,
     turn_guard: OwnedMutexGuard<()>,
@@ -628,6 +628,8 @@ fn start_claimed_turn(
     admission: Option<String>,
 ) {
     debug_assert!(agent.turn_lock.try_lock().is_err());
+    // This turn reads `agent send` messages until its post-block seals.
+    agent.mailbox.unseal();
 
     let turn_id = admission
         .as_ref()
@@ -731,9 +733,9 @@ fn start_claimed_turn(
             async move { super::run_turn(session, agent, cancel, turn_id, admission).await }
         });
 
-        let (stop, returned_usage, crashed) = match turn_task.await {
-            Ok((stop, usage)) => (stop, Some(usage), false),
-            Err(err) => (report_turn_crash(&session, &agent, &err), None, true),
+        let (stop, returned_usage, crashed, preempted) = match turn_task.await {
+            Ok(end) => (end.stop, Some(end.usage), false, end.preempted),
+            Err(err) => (report_turn_crash(&session, &agent, &err), None, true, false),
         };
         let usage = {
             let recorded = agent.take_turn_usage();
@@ -743,6 +745,26 @@ fn start_claimed_turn(
                 Some(recorded)
             }
         };
+        // The questions an orchestrator turn delivered end with it when the
+        // turn ends on the model's terms (unanswered) or fails (the user is
+        // not left with a subagent blocked on a turn that broke). A turn the
+        // user interrupted, or a user message preempted, never had its say:
+        // its questions stay open for the next one.
+        if agent.id().is_main() {
+            match &stop {
+                TurnStop::Completed if !preempted => crate::rpc::resolve_delivered(
+                    &session,
+                    &agent,
+                    pacode_tools::ParentReply::Unanswered,
+                ),
+                TurnStop::Failed { .. } => crate::rpc::resolve_delivered(
+                    &session,
+                    &agent,
+                    pacode_tools::ParentReply::ParentFailed,
+                ),
+                TurnStop::Completed | TurnStop::Interrupted => {}
+            }
+        }
         let completed_admission = agent.finish_admission_turn(&turn_id, &stop);
         if let Some(admission) = completed_admission {
             if admission.terminal || agent.stop_requested() {
@@ -862,12 +884,34 @@ fn start_claimed_turn(
         // Whether this turn owes the agent another one. Computed here for the
         // subagent-finalization branch below, and recomputed once the lock is
         // released — see the second call at the end of this task.
+        // An `agent send` that reached a subagent's queue is owed a turn like a
+        // user admission is: the orchestrator was told it was delivered.
         let owes_turn = |agent: &Agent, has_recovery: bool| {
             !agent.stop_requested()
                 && !agent.injections.is_empty()
-                && (agent.id().is_main() || has_recovery || agent.injections.has_user_admission())
+                && (agent.id().is_main()
+                    || has_recovery
+                    || agent.injections.has_user_admission()
+                    || agent.injections.has_parent_message())
         };
-        let should_redrive = owes_turn(&agent, has_recovery);
+        let mut should_redrive = owes_turn(&agent, has_recovery);
+        // A subagent about to finish seals its mailbox first, under the lock
+        // `agent send` decides under: a message that got in before the seal
+        // re-drives this agent, one after it resumes the finished agent. Without
+        // the seal a message landing here would be dropped with the history.
+        if !agent.id().is_main()
+            && !matches!(stop, TurnStop::Interrupted)
+            && !agent.stop_requested()
+            && !should_redrive
+        {
+            #[cfg(test)]
+            crate::rpc::seal_hooks::run(&agent.id(), crate::rpc::seal_hooks::Point::BeforeSeal);
+            should_redrive = !agent.mailbox.seal_unless_message(&agent.injections);
+            #[cfg(test)]
+            if !should_redrive {
+                crate::rpc::seal_hooks::run(&agent.id(), crate::rpc::seal_hooks::Point::AfterSeal);
+            }
+        }
 
         // A stopped subagent keeps `Stopped` and its history so `continue` can
         // re-drive it later. No report is injected into the parent: it learned

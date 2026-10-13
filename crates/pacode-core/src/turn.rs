@@ -42,6 +42,27 @@ use crate::notice_lock::{DueOrigin, Taken};
 use crate::prompt::DynamicContext;
 use crate::session::Session;
 
+/// How [`run_turn`] ended, for its supervisor.
+pub(crate) struct TurnEnd {
+    pub stop: TurnStop,
+    pub usage: Usage,
+    /// The turn yielded to a user message before the model chose to end it:
+    /// `stop` is `Completed` (nothing failed), but the model never saw the
+    /// results of its last step, so what it was shown is not yet answered —
+    /// or ignored.
+    pub preempted: bool,
+}
+
+impl TurnEnd {
+    fn new(stop: TurnStop, usage: Usage) -> Self {
+        Self {
+            stop,
+            usage,
+            preempted: false,
+        }
+    }
+}
+
 /// Run one turn loop. `start_turn` claims `agent.turn_lock` before spawning
 /// this and holds it across the task and its post-block, so a turn always has
 /// the agent to itself. `turn_id` is minted by the caller: the supervisor needs
@@ -49,13 +70,13 @@ use crate::session::Session;
 /// and the supervisor emits the event itself, AFTER the cancel token is
 /// cleared (an observer reacting to `TurnEnded` must never see the agent
 /// still "running"), which also covers this task dying mid-turn.
-pub async fn run_turn(
+pub(crate) async fn run_turn(
     session: Arc<Session>,
     agent: Arc<Agent>,
     cancel: CancellationToken,
     turn_id: TurnId,
     admission: Option<String>,
-) -> (TurnStop, Usage) {
+) -> TurnEnd {
     // `start_turn` holds `agent.turn_lock` for the whole call — a bare
     // `run_turn` would race that turn's cleanup, so fail loudly in debug.
     debug_assert!(agent.turn_lock.try_lock().is_err());
@@ -75,7 +96,7 @@ pub async fn run_turn(
             turn: turn_id,
         });
         session.emit_session_status();
-        return (
+        return TurnEnd::new(
             lifecycle::handle_interrupted(&session, &agent),
             Usage::default(),
         );
@@ -129,11 +150,12 @@ pub async fn run_turn(
     // pre-fusion path untouched, `Pending` runs the planner on the first
     // iteration and then becomes `Planned` or `Degraded` for good.
     let mut phase = crate::fusion::start_phase(&session, &agent);
+    let mut preempted = false;
 
     loop {
         if cancel.is_cancelled() {
             *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            return (lifecycle::handle_interrupted(&session, &agent), turn_usage);
+            return TurnEnd::new(lifecycle::handle_interrupted(&session, &agent), turn_usage);
         }
 
         // Fold queued injections into history BEFORE building the request: a
@@ -145,7 +167,7 @@ pub async fn run_turn(
             Ok(DrainOutcome::DeferredAdmission) => break,
             Ok(DrainOutcome::Idle | DrainOutcome::Continue) => {}
             Err(error) => {
-                return (
+                return TurnEnd::new(
                     lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
                     turn_usage,
                 );
@@ -209,7 +231,7 @@ pub async fn run_turn(
                     if let Err(error) =
                         crate::fusion::commit_plan(&session, &agent, &artifact).await
                     {
-                        return (
+                        return TurnEnd::new(
                             lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
                             turn_usage,
                         );
@@ -291,7 +313,7 @@ pub async fn run_turn(
         let provider = match provider {
             Ok(p) => p,
             Err(e) => {
-                return (
+                return TurnEnd::new(
                     lifecycle::finish_failed_turn(
                         &session,
                         &agent,
@@ -336,7 +358,7 @@ pub async fn run_turn(
         let complete_res = tokio::select! {
             _ = cancel.cancelled() => {
                 *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                return (
+                return TurnEnd::new(
                     lifecycle::handle_interrupted(&session, &agent),
                     turn_usage,
                 );
@@ -347,7 +369,7 @@ pub async fn run_turn(
         let stream = match complete_res {
             Ok(s) => s,
             Err(e) => {
-                return (
+                return TurnEnd::new(
                     lifecycle::finish_failed_turn(
                         &session,
                         &agent,
@@ -371,7 +393,7 @@ pub async fn run_turn(
                     ),
                     TurnStop::Completed | TurnStop::Interrupted => stop,
                 };
-                return (stop, turn_usage);
+                return TurnEnd::new(stop, turn_usage);
             }
         };
 
@@ -402,7 +424,7 @@ pub async fn run_turn(
 
         if outcome.interrupted {
             *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            return (lifecycle::handle_interrupted(&session, &agent), turn_usage);
+            return TurnEnd::new(lifecycle::handle_interrupted(&session, &agent), turn_usage);
         }
 
         let mut content_blocks = Vec::new();
@@ -459,7 +481,7 @@ pub async fn run_turn(
         )
         .await
         {
-            return (
+            return TurnEnd::new(
                 lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
                 turn_usage,
             );
@@ -513,7 +535,7 @@ pub async fn run_turn(
                 Ok(DrainOutcome::DeferredAdmission | DrainOutcome::Idle) => break,
                 Ok(DrainOutcome::Continue) => continue,
                 Err(error) => {
-                    return (
+                    return TurnEnd::new(
                         lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
                         turn_usage,
                     );
@@ -525,14 +547,19 @@ pub async fn run_turn(
             tools::execute_tool_calls(&session, &agent, &cancel, outcome.tool_calls).await;
         if tool_interrupted || cancel.is_cancelled() {
             *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            return (lifecycle::handle_interrupted(&session, &agent), turn_usage);
+            return TurnEnd::new(lifecycle::handle_interrupted(&session, &agent), turn_usage);
         }
 
         match drain_injections(&session, &agent, admission.as_deref(), true).await {
-            Ok(DrainOutcome::DeferredAdmission) => break,
+            // The user's message takes over before the model has seen the
+            // results of this step: the turn ends, but not on its own terms.
+            Ok(DrainOutcome::DeferredAdmission) => {
+                preempted = true;
+                break;
+            }
             Ok(DrainOutcome::Idle | DrainOutcome::Continue) => {}
             Err(error) => {
-                return (
+                return TurnEnd::new(
                     lifecycle::finish_failed_turn(&session, &agent, error.to_string()),
                     turn_usage,
                 );
@@ -573,20 +600,24 @@ pub async fn run_turn(
         crate::fusion::complete_trace(&agent, implementer_usage);
     }
 
-    let final_status = if agent.id().is_main() {
-        AgentStatus::Idle
-    } else {
-        AgentStatus::Finished
-    };
-    if matches!(final_status, AgentStatus::Idle | AgentStatus::Finished) {
-        agent.clear_error();
+    agent.clear_error();
+    // A subagent's terminal status is not this loop's to publish: the
+    // post-block first decides whether the agent owes another turn (a message
+    // or an admission that landed on the last step) and stamps `Finished`
+    // only when it does not — a `Finished` published here would flash on the
+    // card, and as a finished toast, for an agent that is about to go on.
+    if agent.id().is_main() {
+        agent.set_status(AgentStatus::Idle, None);
+        session.events.emit(Event::AgentUpdated(agent.info()));
     }
-    agent.set_status(final_status, None);
-    session.events.emit(Event::AgentUpdated(agent.info()));
 
     *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
-    (TurnStop::Completed, turn_usage)
+    TurnEnd {
+        stop: TurnStop::Completed,
+        usage: turn_usage,
+        preempted,
+    }
 }
 
 fn compaction_input_tokens(last_input_tokens: Option<u64>, estimated_tokens: u32) -> u32 {
@@ -648,6 +679,10 @@ async fn drain_injections(
 
     if let Err(error) = hide_other_admission_messages(session, agent, admission).await {
         agent.restore_due(Taken::new(deferred, prev_due));
+        // What was taken is lost with the failed turn (re-queueing it would
+        // spin the next turn on the same broken store), but a question must
+        // not vanish: its subagent would wait for an answer forever.
+        crate::rpc::resolve_undeliverable(session, &active);
         return Err(error);
     }
 
@@ -676,8 +711,11 @@ async fn drain_injections(
         crate::inject::render_injections(&renderable, session.config.context.injection_cap_chars);
     if let Err(error) = persist_history_message(session, agent, injection_msg).await {
         agent.restore_due(Taken::new(deferred, prev_due));
+        crate::rpc::resolve_undeliverable(session, &renderable);
         return Err(error);
     }
+    // In the history now: a completed turn from here on has seen them.
+    crate::rpc::mark_delivered(session, &renderable);
     agent.restore_due(Taken::new(deferred, prev_due));
     Ok(DrainOutcome::Continue)
 }

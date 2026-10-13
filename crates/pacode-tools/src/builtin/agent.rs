@@ -6,10 +6,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::host::{AgentKindDef, AgentSpec};
+use crate::host::{AgentKindDef, AgentSpec, SendOutcome};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "agent";
+
+/// Model-facing description; see `prompts/agent.md`.
+const DESCRIPTION: &str = include_str!("../prompts/agent.md");
 
 #[derive(Default)]
 pub struct AgentTool {
@@ -43,6 +46,7 @@ struct AgentInput {
     tools: Option<Vec<String>>,
     exclude_tools: Option<Vec<String>>,
     agent_id: Option<String>,
+    message: Option<String>,
 }
 
 #[async_trait]
@@ -52,15 +56,7 @@ impl Tool for AgentTool {
     }
 
     fn description(&self) -> &str {
-        "Run work in parallel with subagents. `spawn` returns an agent id \
-         immediately; the finished agent's report is delivered to you as a message \
-         — continue working or end your turn rather than polling. A `kind` names a \
-         subagent type defined in `<cwd>/.pacode/agents/*.md` or the global config's \
-         `agents/` dir; the file supplies the brief, tools and model. Run `kinds` \
-         (or `list`) to see which kinds this session has — do not invent a name. \
-         `stop` cancels; `continue` resumes a stopped agent with its context intact; \
-         `ask_status` delivers a brief status at your next step. Subagents cannot \
-         spawn agents."
+        DESCRIPTION.trim()
     }
 
     fn schema(&self) -> Value {
@@ -68,7 +64,8 @@ impl Tool for AgentTool {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "stop", "continue", "list", "kinds", "ask_status"]},
+                "action": {"type": "string", "enum": ["spawn", "send", "stop", "continue", "list", "kinds", "ask_status"]},
+                "message": {"type": "string", "description": "Text for the subagent (send)."},
                 "prompt": {"type": "string", "description": "Full task description for the subagent (spawn)."},
                 "kind": {"type": "string", "description": "Named subagent type from `agents/*.md` files; `kinds` shows what this session has."},
                 "name": {"type": "string", "description": "Short name shown in the UI, e.g. `tests`."},
@@ -208,6 +205,44 @@ impl AgentTool {
                 .with_title(format!("Agent status {id}"))
                 .with_preview("requested"))
             }
+            "send" => {
+                let id = AgentId::new(
+                    args.agent_id
+                        .ok_or_else(|| ToolError::invalid("agent_id is required for send"))?,
+                );
+                let message = args
+                    .message
+                    .filter(|m| !m.trim().is_empty())
+                    .ok_or_else(|| ToolError::invalid("message is required for send"))?;
+                let (content, preview) = match ctx.host.send_to_agent(&id, message).await? {
+                    SendOutcome::Delivered => (
+                        format!("Message delivered to agent {id}; it reads it at its next step."),
+                        "delivered",
+                    ),
+                    SendOutcome::Answered => (
+                        format!(
+                            "Agent {id} was waiting on its question; your message answered it."
+                        ),
+                        "answered",
+                    ),
+                    SendOutcome::Resumed { previous_report } => {
+                        let mut content = format!(
+                            "Agent {id} had ended; your message resumed it with its context. \
+                             Its next report arrives as <agent_finished>."
+                        );
+                        if let Some(report) = previous_report {
+                            content.push_str(&format!(
+                                "\n\nIt had finished with this report, which you had not \
+                                 read yet:\n{report}"
+                            ));
+                        }
+                        (content, "resumed")
+                    }
+                };
+                Ok(ToolOutput::text(content)
+                    .with_title(format!("Agent send {id}"))
+                    .with_preview(preview))
+            }
             "stop" => {
                 let agent_id_str = args
                     .agent_id
@@ -328,3 +363,7 @@ fn resolve_kind(ctx: &ToolCtx, name: &str) -> (Option<AgentKindDef>, String) {
     };
     (found, available)
 }
+
+#[cfg(test)]
+#[path = "agent_tests.rs"]
+mod agent_tests;

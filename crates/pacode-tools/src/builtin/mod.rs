@@ -11,6 +11,7 @@
 //!   (spec §6.3 "writes stay inside cwd").
 
 pub mod agent;
+pub mod ask_parent;
 pub mod ask_question;
 pub mod bash;
 pub mod batch;
@@ -65,10 +66,15 @@ pub fn builtin_tools(web: &WebConfig) -> ToolRegistry {
         .with(Arc::new(webfetch::WebFetchTool::default()))
         .with(Arc::new(websearch::WebSearchTool::with_config(web.clone())))
         .with(Arc::new(report_status::ReportStatusTool::default()))
+        .with(Arc::new(ask_parent::AskParentTool::default()))
         .with(Arc::new(memory::MemoryWriteTool::default()))
         .with(Arc::new(memory::MemoryReadTool::default()))
         .with(Arc::new(batch::BatchTool::default()))
 }
+
+/// The tools that talk to the agent that spawned the caller. A subagent always
+/// gets them (they are its only channel back); the orchestrator never does.
+pub const SUBAGENT_ONLY: &[&str] = &[report_status::NAME, ask_parent::NAME];
 
 /// Tool names a subagent gets by default: everything except `agent` (depth 1).
 pub fn subagent_tool_names(all: &ToolRegistry) -> Vec<String> {
@@ -76,4 +82,9 @@ pub fn subagent_tool_names(all: &ToolRegistry) -> Vec<String> {
         .filter(|name| *name != agent::NAME)
         .map(str::to_string)
         .collect()
+}
+
+/// The orchestrator's set: everything except [`SUBAGENT_ONLY`].
+pub fn orchestrator_tools(all: &ToolRegistry) -> ToolRegistry {
+    all.subset(all.names().filter(|name| !SUBAGENT_ONLY.contains(name)))
 }

@@ -165,6 +165,22 @@ impl ToolHost for DummyHost {
     fn report_status(&self, _text: String) -> Result<(), ToolError> {
         Ok(())
     }
+
+    async fn send_to_agent(
+        &self,
+        _agent: &pacode_types::AgentId,
+        _message: String,
+    ) -> Result<crate::host::SendOutcome, ToolError> {
+        Err(ToolError::Failed("no agents in this test".to_string()))
+    }
+
+    async fn ask_parent(
+        &self,
+        _call_id: &pacode_types::CallId,
+        _question: String,
+    ) -> Result<crate::host::ParentReply, ToolError> {
+        Err(ToolError::Failed("no parent in this test".to_string()))
+    }
     fn plan(&self) -> Plan {
         Plan::default()
     }

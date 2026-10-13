@@ -900,6 +900,23 @@ fn replay_item_bytes(item: &pacode_types::TranscriptItem) -> usize {
         pacode_types::TranscriptKind::BashCommand {
             command, output, ..
         } => command.len() + output.len(),
+        pacode_types::TranscriptKind::AgentMessage {
+            subagent_name,
+            text,
+            reply,
+            ..
+        } => {
+            let reply = match reply {
+                Some(pacode_types::AgentReply::Answered { text }) => text.len(),
+                Some(
+                    pacode_types::AgentReply::Unanswered
+                    | pacode_types::AgentReply::Failed
+                    | pacode_types::AgentReply::Cancelled,
+                )
+                | None => 0,
+            };
+            subagent_name.len() + text.len() + reply
+        }
         pacode_types::TranscriptKind::Permission(permission) => {
             permission.title.len() + permission.detail.len()
         }

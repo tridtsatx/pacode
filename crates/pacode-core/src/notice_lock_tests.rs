@@ -127,6 +127,8 @@ fn texts(taken: &Taken) -> Vec<String> {
                 format!("steer {}", admission.as_deref().unwrap_or("none"))
             }
             Injection::StatusRequest => "status".to_string(),
+            Injection::ParentMessage { text } => format!("message {text}"),
+            Injection::AgentQuestion { question, .. } => format!("question {question}"),
         })
         .collect()
 }

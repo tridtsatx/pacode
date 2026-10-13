@@ -272,6 +272,8 @@ pub enum AgentStatus {
     Thinking,
     RunningTool,
     WaitingApproval,
+    /// A subagent blocked in `ask_parent` until the orchestrator answers.
+    WaitingParent,
     Finished,
     Failed,
     Stopped,
@@ -285,6 +287,7 @@ impl AgentStatus {
                 | AgentStatus::Thinking
                 | AgentStatus::RunningTool
                 | AgentStatus::WaitingApproval
+                | AgentStatus::WaitingParent
         )
     }
 
@@ -292,7 +295,10 @@ impl AgentStatus {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            AgentStatus::Thinking | AgentStatus::RunningTool | AgentStatus::WaitingApproval
+            AgentStatus::Thinking
+                | AgentStatus::RunningTool
+                | AgentStatus::WaitingApproval
+                | AgentStatus::WaitingParent
         )
     }
 }
@@ -691,6 +697,30 @@ pub enum ToastLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire names are what the store and old clients already hold: adding
+    /// `waiting_parent` must not move any of them, and the new one is live.
+    #[test]
+    fn agent_status_wire_names_are_stable() {
+        let names = [
+            (AgentStatus::Idle, "idle"),
+            (AgentStatus::Thinking, "thinking"),
+            (AgentStatus::RunningTool, "running_tool"),
+            (AgentStatus::WaitingApproval, "waiting_approval"),
+            (AgentStatus::WaitingParent, "waiting_parent"),
+            (AgentStatus::Finished, "finished"),
+            (AgentStatus::Failed, "failed"),
+            (AgentStatus::Stopped, "stopped"),
+        ];
+        for (status, name) in names {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            let back: AgentStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+        assert!(AgentStatus::WaitingParent.is_live());
+        assert!(AgentStatus::WaitingParent.is_active());
+    }
 
     fn item(status: PlanStatus, progress: Option<u8>) -> PlanItem {
         PlanItem {

@@ -11,8 +11,10 @@ pub mod test_support;
 pub mod threads;
 pub mod walk;
 
-pub use builtin::{builtin_tools, subagent_tool_names};
-pub use host::{AgentSpec, PermissionOutcome, ToolCtx, ToolHost, WaitOutcome};
+pub use builtin::{builtin_tools, orchestrator_tools, subagent_tool_names};
+pub use host::{
+    AgentSpec, ParentReply, PermissionOutcome, SendOutcome, ToolCtx, ToolHost, WaitOutcome,
+};
 pub use output::{ToolError, ToolOutput};
 pub use registry::ToolRegistry;
 

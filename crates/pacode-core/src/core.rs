@@ -367,7 +367,7 @@ impl Core {
                     if let Some(main) = session.main_agent()
                         && let Ok(mut g) = main.tools.write()
                     {
-                        *g = new_tools.clone();
+                        *g = pacode_tools::orchestrator_tools(&new_tools);
                     }
                 }
             }

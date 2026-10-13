@@ -447,6 +447,33 @@ fn subagent_tools_section_matches_its_reduced_set() {
     assert!(section.contains("- read: "));
 }
 
+/// The role text names the channel tools only when the subagent has them: a
+/// narrowed tool set must not be told to call a tool it was not given.
+#[test]
+fn subagent_role_mentions_only_the_channel_tools_it_has() {
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let role_of = |out: &str| -> String {
+        out.split("## Subagent Role\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .expect("a role section")
+            .to_string()
+    };
+
+    let full = vec![tool("ask_parent", "Ask."), tool("report_status", "Report.")];
+    let role = role_of(&system_dynamic(&tools_ctx(&cwd, &plan, &full, true)));
+    assert!(role.contains("`ask_parent`"), "{role}");
+    assert!(role.contains("`report_status`"), "{role}");
+    assert!(role.contains("<orchestrator_message>"), "{role}");
+
+    let narrow = vec![tool("read", "Read.")];
+    let role = role_of(&system_dynamic(&tools_ctx(&cwd, &plan, &narrow, true)));
+    assert!(!role.contains("ask_parent"), "{role}");
+    assert!(!role.contains("report_status"), "{role}");
+    assert!(role.contains("<orchestrator_message>"), "{role}");
+}
+
 #[test]
 fn tools_section_lists_mcp_and_summarises_the_first_sentence() {
     let cwd = std::path::PathBuf::from("/test/cwd");

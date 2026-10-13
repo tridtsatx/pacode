@@ -40,6 +40,7 @@ pub mod notice_lock;
 pub mod permissions;
 pub mod prompt;
 pub mod questions;
+pub(crate) mod rpc;
 pub mod sampling;
 pub mod schedule;
 pub mod session;
