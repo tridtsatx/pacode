@@ -356,7 +356,8 @@ mod zdr {
         AgentId, CallId, Mode, ModelFlags, ModelRoute, PermissionDecision, SessionMeta, ZdrMode,
     };
 
-    use crate::host::{SessionHost, permission_target};
+    use crate::host::SessionHost;
+    use crate::host::permission::permission_target;
     use crate::session::Session;
 
     /// Smallest live `Session` for host-level checks (in-memory store, temp cwd).
