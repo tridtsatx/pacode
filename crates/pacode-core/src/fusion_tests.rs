@@ -470,6 +470,14 @@ async fn planner_request_carries_only_the_read_only_allowlist() {
         scripts.cheap.tool_names(0).contains(&"edit".to_string()),
         "the implementer keeps the agent's own tools"
     );
+    // The `## Tools` inventory follows each request's own schemas.
+    assert!(requests[0].system_dynamic.contains("\n- read: "));
+    assert!(!requests[0].system_dynamic.contains("\n- edit: "));
+    assert!(
+        scripts.cheap.requests()[0]
+            .system_dynamic
+            .contains("\n- edit: ")
+    );
 }
 
 #[tokio::test]

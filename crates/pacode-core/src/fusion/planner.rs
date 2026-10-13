@@ -38,6 +38,15 @@ use super::{FusionRoutes, PlanArtifact, PlanOutcome};
 /// any kind it likes. Names are the only thing here that cannot be argued with.
 pub(crate) const ALLOWED_TOOLS: &[&str] = &["read", "ls", "glob", "grep", "symbols", "websearch"];
 
+/// The planner's read-only registry: [`ALLOWED_TOOLS`] out of the agent's own.
+pub(crate) fn registry(agent: &Agent) -> ToolRegistry {
+    agent
+        .tools
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .subset(ALLOWED_TOOLS.iter().copied())
+}
+
 /// Model calls one planner turn may spend. Past this the planner has not
 /// converged on a plan and the expensive model is being used as a very slow
 /// `grep`; the turn degrades to the primary rather than billing more.
@@ -180,11 +189,7 @@ pub(crate) async fn run(
     system_static: &str,
     system_dynamic: &str,
 ) -> PlanOutcome {
-    let registry = agent
-        .tools
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .subset(ALLOWED_TOOLS.iter().copied());
+    let registry = registry(agent);
 
     // Which model is running, on the channel the client already renders.
     agent.set_status(

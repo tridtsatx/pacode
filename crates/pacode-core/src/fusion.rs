@@ -187,10 +187,18 @@ pub(crate) fn start_phase(session: &Session, agent: &Agent) -> Phase {
     }
 }
 
+/// The tool definitions the planner's requests carry; the caller renders the
+/// planner's `system_dynamic` from them so its `## Tools` inventory matches.
+pub(crate) fn planner_tool_definitions(agent: &Agent) -> Vec<pacode_types::ToolDefinition> {
+    planner::registry(agent).definitions()
+}
+
 /// Run the planner half of the turn. The planner sees the very request the
 /// implementer is about to see, minus the tools: `system_static`/`system_dynamic`
-/// are passed in rather than rebuilt so the two halves cannot drift apart, and
-/// the history is the agent's own, read at this point in the loop.
+/// are passed in rather than rebuilt so the two halves cannot drift apart (the
+/// dynamic part's `## Tools` inventory is rendered from
+/// [`planner_tool_definitions`]), and the history is the agent's own, read at
+/// this point in the loop.
 pub(crate) async fn run_planner(
     session: &Arc<Session>,
     agent: &Arc<Agent>,

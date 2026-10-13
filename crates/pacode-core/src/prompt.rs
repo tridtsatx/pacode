@@ -2,7 +2,14 @@
 
 use std::path::Path;
 
-use pacode_types::{Mode, Plan};
+use pacode_types::{Mode, Plan, ToolDefinition};
+
+/// Tools listed in the `## Tools` section before the "... and N more" marker.
+pub const MAX_LISTED_TOOLS: usize = 64;
+/// Total size cap of the `## Tools` section lines (spec §6.4).
+pub const MAX_TOOLS_SECTION_CHARS: usize = 6000;
+/// Cap of one tool's one-line summary.
+const TOOL_SUMMARY_CHARS: usize = 120;
 
 /// Inputs of the dynamic part.
 pub struct DynamicContext<'a> {
@@ -18,6 +25,10 @@ pub struct DynamicContext<'a> {
     pub skills: &'a [pacode_skills::Skill],
     pub skills_enabled: bool,
     pub max_listed_skills: usize,
+    /// The exact tool definitions sent with this request, in request order:
+    /// the `## Tools` inventory is rendered from them so it cannot disagree
+    /// with the schemas.
+    pub tools: &'a [ToolDefinition],
 }
 
 /// Identity, tool rules, the background-first thesis, plan rules, permission notes.
@@ -26,6 +37,8 @@ pub fn system_static() -> &'static str {
     "You are pacode, an autonomous CLI coding agent built around background work.\n\n\
     ## Tool Semantics\n\
     You have access to tools to inspect, modify, and manage the workspace. Use tools to execute tasks directly rather than giving instructions whenever possible.\n\n\
+    ## Self-Knowledge\n\
+    The `## Tools` section below lists every tool you have. Answer questions about your own capabilities, tools, model or configuration from this prompt alone: never read files, search the repository, or inspect pacode's source or config to answer them; if the prompt does not say, say you do not know. A tool that is not listed is one you do not have: say so plainly and, when sensible, offer a listed tool that can do the job.\n\n\
     ## Background-First Thesis\n\
     When starting long-running builds, tests, or servers, run them in the background. Continue executing other steps while background tasks run. You will receive task completions and output via injected events between steps.\n\n\
     ## Subagents\n\
@@ -94,7 +107,63 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
         }
     }
 
+    out.push_str("\n## Tools\n");
+    out.push_str(&tools_section(ctx.tools));
     out
+}
+
+/// One line per tool, `- name: first sentence`, capped at [`MAX_LISTED_TOOLS`]
+/// lines and [`MAX_TOOLS_SECTION_CHARS`] chars with a visible marker for the rest.
+fn tools_section(tools: &[ToolDefinition]) -> String {
+    if tools.is_empty() {
+        return "(none)\n".to_string();
+    }
+    let mut out = String::new();
+    let mut chars = 0;
+    for (listed, tool) in tools.iter().enumerate() {
+        let line = format!("- {}: {}\n", tool.name, tool_summary(&tool.description));
+        let line_chars = line.chars().count();
+        if listed == MAX_LISTED_TOOLS || chars + line_chars > MAX_TOOLS_SECTION_CHARS {
+            let rest = tools.len() - listed;
+            out.push_str(&format!(
+                "- ... and {rest} more not listed here; check the attached tool schemas before saying a tool is missing.\n"
+            ));
+            break;
+        }
+        chars += line_chars;
+        out.push_str(&line);
+    }
+    out
+}
+
+/// First sentence of the first paragraph, whitespace flattened to one line
+/// (descriptions wrap mid-sentence), capped at [`TOOL_SUMMARY_CHARS`].
+fn tool_summary(description: &str) -> String {
+    let paragraph = description
+        .split("\n\n")
+        .find(|p| !p.trim().is_empty())
+        .unwrap_or("");
+    let line = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A ". " after "e.g" / "i.e" is not a sentence end.
+    let end = line
+        .match_indices(". ")
+        .map(|(i, _)| i)
+        .find(|&i| !line[..i].ends_with("e.g") && !line[..i].ends_with("i.e"));
+    let sentence = match end {
+        Some(end) => &line[..=end],
+        None => line.as_str(),
+    };
+    if sentence.chars().count() <= TOOL_SUMMARY_CHARS {
+        return sentence.to_string();
+    }
+    let cut: String = sentence.chars().take(TOOL_SUMMARY_CHARS - 3).collect();
+    // Back off to the last word boundary so the line never ends mid-word; a
+    // single word longer than the cap is cut hard.
+    let cut = match cut.rfind(char::is_whitespace) {
+        Some(space) => &cut[..space],
+        None => cut.as_str(),
+    };
+    format!("{}...", cut.trim_end_matches([' ', ',', ';', ':']))
 }
 
 pub const DEFAULT_MEMORY_CAP_CHARS: usize = 8000;

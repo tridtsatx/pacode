@@ -150,9 +150,16 @@ pub async fn run_turn(
                 );
             }
         }
-        let system_dynamic = {
+        // Read once and used both for the request's schemas and for the
+        // prompt's `## Tools` inventory, so the two cannot disagree.
+        let tools_def = agent
+            .tools
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .definitions();
+        let render_dynamic = |tools: &[pacode_types::ToolDefinition]| {
             let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
-            let dyn_ctx = DynamicContext {
+            crate::prompt::system_dynamic(&DynamicContext {
                 cwd: &meta.cwd,
                 git_branch: prompt_cache.git_branch.as_deref(),
                 date: &prompt_cache.date,
@@ -163,9 +170,10 @@ pub async fn run_turn(
                 skills: session.skills.skills(),
                 skills_enabled: session.config.skills.enabled,
                 max_listed_skills: session.config.skills.max_listed,
-            };
-            crate::prompt::system_dynamic(&dyn_ctx)
+                tools,
+            })
         };
+        let system_dynamic = render_dynamic(&tools_def);
         let system_static = crate::prompt::system_static().to_string();
         // The fusion seam. Inside the loop, after the injection drain and
         // before the request is built: the planner must see the same history
@@ -180,7 +188,7 @@ pub async fn run_turn(
                 &cancel,
                 &routes,
                 &system_static,
-                &system_dynamic,
+                &render_dynamic(&crate::fusion::planner_tool_definitions(&agent)),
             )
             .await
             {
@@ -266,12 +274,6 @@ pub async fn run_turn(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .for_model();
-        let tools_def = agent
-            .tools
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .definitions();
-
         // Taken here because this is the last point where the parts the split
         // needs are still owned: the request below moves all of them, and the
         // reported counts only arrive once the model has answered. The cost is
