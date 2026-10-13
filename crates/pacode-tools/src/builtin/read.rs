@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
 use super::helpers::{cap_output, parse_input, preview_body};
+use crate::host::PermissionDraft;
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "read";
@@ -207,6 +208,34 @@ impl Tool for ReadTool {
             return Err(ToolError::invalid("path cannot be empty"));
         }
         let full_path = ctx.resolve(Path::new(&args.path));
+        // Reading a credential or secret file pulls it into the model's
+        // context. `read` is ToolKind::ReadOnly (allowed in every mode without
+        // a prompt), so route a secret read through the same predicate the
+        // shell gate uses and ask with Exec/Confirm semantics (Build and Auto
+        // ask, Plan denies). grep/glob/ls/symbols skip hidden files, so they do
+        // not surface `.env`/`.ssh`; `read` with an explicit path is the one
+        // tool that otherwise reads a secret unprompted.
+        if pacode_risk::is_protected_read(&args.path)
+            || pacode_risk::is_protected_read(&full_path.to_string_lossy())
+        {
+            let draft = PermissionDraft::new(
+                ctx.agent.clone(),
+                ctx.agent_name.clone(),
+                ctx.call_id.clone(),
+                format!("Read secret file: {}", args.path),
+                format!(
+                    "{} is a credential or secret file; reading it pulls it into the model's \
+                     context.",
+                    args.path
+                ),
+                Some(pacode_risk::RiskLevel::Confirm),
+            )
+            .with_tool(NAME, ToolKind::Exec);
+            ctx.host
+                .request_permission(draft)
+                .await
+                .into_result("user denied reading the secret file")?;
+        }
         let meta = tokio::fs::metadata(&full_path).await?;
         if !meta.is_file() {
             return Err(ToolError::failed(format!(

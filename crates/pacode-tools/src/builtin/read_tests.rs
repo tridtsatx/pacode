@@ -207,3 +207,56 @@ async fn a_non_regular_file_is_refused_before_it_can_block() {
 
     assert!(format!("{err}").contains("not a regular file"), "{err}");
 }
+
+#[tokio::test]
+async fn reading_a_secret_file_asks_with_exec_confirm() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    tokio::fs::write(tmp.path().join(".env"), "TOKEN=abc\n")
+        .await
+        .expect("write");
+    tokio::fs::write(tmp.path().join("notes.txt"), "hi\n")
+        .await
+        .expect("write");
+    let host = Arc::new(StubToolHost::default());
+    let mut ctx = stub_ctx(host.clone());
+    ctx.cwd = tmp.path().to_path_buf();
+
+    // A secret read records an Exec/Confirm permission draft before reading.
+    ReadTool::default()
+        .call(json!({"path": ".env"}), &ctx)
+        .await
+        .expect("read .env");
+    {
+        let drafts = host.drafts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(drafts.len(), 1, "a secret read must ask once");
+        assert_eq!(drafts[0].tool_kind, Some(ToolKind::Exec));
+        assert_eq!(drafts[0].risk, Some(pacode_risk::RiskLevel::Confirm));
+    }
+
+    // An ordinary file is read without a prompt.
+    ReadTool::default()
+        .call(json!({"path": "notes.txt"}), &ctx)
+        .await
+        .expect("read notes.txt");
+    let drafts_len = host.drafts.lock().unwrap_or_else(|p| p.into_inner()).len();
+    assert_eq!(drafts_len, 1, "an ordinary read must not ask");
+}
+
+#[tokio::test]
+async fn a_denied_secret_read_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    tokio::fs::write(tmp.path().join(".env"), "TOKEN=abc\n")
+        .await
+        .expect("write");
+    let host = Arc::new(StubToolHost::default());
+    *host.decision.lock().unwrap_or_else(|p| p.into_inner()) =
+        pacode_types::state::PermissionDecision::Deny;
+    let mut ctx = stub_ctx(host.clone());
+    ctx.cwd = tmp.path().to_path_buf();
+
+    let err = ReadTool::default()
+        .call(json!({"path": ".env"}), &ctx)
+        .await
+        .expect_err("a denied secret read is refused");
+    assert!(matches!(err, ToolError::Denied(_)), "{err:?}");
+}
