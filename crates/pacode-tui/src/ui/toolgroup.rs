@@ -38,6 +38,13 @@ use crate::ui::toolcell::{self, ToolCallView};
 #[path = "toolgroup_tests.rs"]
 mod toolgroup_tests;
 
+#[cfg(test)]
+thread_local! {
+    /// Row memo lookups `warm_rows` made on this thread: the dialog test
+    /// asserts a cached finished group makes none per frame.
+    pub(crate) static ROW_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Member rows a group shows; older members fold into a `… N more` row.
 pub(crate) const MAX_GROUP_ROWS: usize = 8;
 
@@ -151,7 +158,18 @@ pub(crate) fn run_around(
     index: usize,
     thinking: bool,
 ) -> Option<Range<usize>> {
-    segments(cells.iter(), &HashSet::new(), thinking)
+    group_around(cells, index, &HashSet::new(), thinking)
+}
+
+/// The group the cell at `index` is drawn in with `expanded` open — `None`
+/// when it is drawn as its own cell.
+pub(crate) fn group_around(
+    cells: &VecDeque<Cell>,
+    index: usize,
+    expanded: &HashSet<u64>,
+    thinking: bool,
+) -> Option<Range<usize>> {
+    segments(cells.iter(), expanded, thinking)
         .into_iter()
         .find_map(|segment| match segment {
             Segment::Group(range) => range.contains(&index).then_some(range),
@@ -212,9 +230,14 @@ pub(crate) fn warm_rows(
     let members: Vec<Member<'_>> = calls(cells, range).collect();
     let hidden = members.len().saturating_sub(MAX_GROUP_ROWS);
     for member in &members[hidden..] {
-        if let Some(key) = member.row_key(opts)
-            && cache.get(key).is_none()
-        {
+        let Some(key) = member.row_key(opts) else {
+            continue;
+        };
+        #[cfg(test)]
+        ROW_LOOKUPS.with(|n| n.set(n.get() + 1));
+        // `peek`: presence only. The rows are read by the draw that follows,
+        // and a lookup here must not keep them young on its own.
+        if cache.peek(key).is_none() {
             let row = toolcell::compact_row(&member.call, opts.width as usize, opts);
             cache.insert(key, vec![row]);
         }

@@ -135,8 +135,11 @@ fn segment_block<'a>(
     }
 }
 
-/// Lines the first `prefix` cells draw, folded the way the view folds them.
-/// A group straddling the prefix's end is measured as the prefix alone has it.
+/// How far the cells from `prefix` on moved down when the first `prefix`
+/// cells were put in front of them: the lines the view now draws up to the
+/// end of the block the first of them sits in, minus what those same cells
+/// drew there on their own. Without a group straddling `prefix` that is the
+/// prefix's own lines; with one, the group is measured whole on both sides.
 pub(crate) fn measure_cell_lines(
     cells: &VecDeque<Cell>,
     prefix: usize,
@@ -158,12 +161,37 @@ pub(crate) fn measure_cell_lines(
         welcome_ms: 0,
     };
     let opts = &profile.options;
-    let mut lines = 0usize;
-    for segment in toolgroup::segments(cells.iter().take(prefix), expanded, opts.thinking) {
+    let mut now = 0usize;
+    let mut through = prefix;
+    for segment in toolgroup::segments(cells.iter(), expanded, opts.thinking) {
+        let (start, end) = match &segment {
+            Segment::Cell(index) => (*index, index + 1),
+            Segment::Group(range) => (range.start, range.end),
+        };
+        if start >= prefix {
+            break;
+        }
+        through = through.max(end);
         let block = segment_block(&src, &segment, opts, cache);
-        lines = lines.saturating_add(block.lines().len());
+        now = now.saturating_add(block.lines().len());
     }
-    lines
+    // The cells of a straddling group that were already there, segmented as
+    // the view drew them before the page landed (its block is likely still
+    // cached from that draw).
+    let mut before = 0usize;
+    let old = cells
+        .iter()
+        .skip(prefix)
+        .take(through.saturating_sub(prefix));
+    for segment in toolgroup::segments(old, expanded, opts.thinking) {
+        let segment = match segment {
+            Segment::Cell(index) => Segment::Cell(prefix + index),
+            Segment::Group(range) => Segment::Group(prefix + range.start..prefix + range.end),
+        };
+        let block = segment_block(&src, &segment, opts, cache);
+        before = before.saturating_add(block.lines().len());
+    }
+    now.saturating_sub(before)
 }
 
 pub(crate) fn plain_lines(

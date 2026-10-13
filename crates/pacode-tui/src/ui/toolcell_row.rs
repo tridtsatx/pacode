@@ -8,7 +8,7 @@ use pacode_render::text as rtext;
 use pacode_render::{RenderOptions, display_width, truncate_to_width};
 use pacode_types::transcript::ToolStatus;
 
-use super::{GUTTER_W, ToolCallView, capitalize, gutter, header, short_arg};
+use super::{GUTTER_W, ToolCallView, capitalize, gutter, header, short_arg, strip_ansi};
 use crate::ui::anim::sweep_spans;
 
 #[cfg(test)]
@@ -112,9 +112,11 @@ pub(crate) fn more_row(hidden: usize, opts: &RenderOptions) -> Line<'static> {
 fn outcome(call: &ToolCallView<'_>) -> String {
     #[cfg(test)]
     OUTCOMES_COUNTED.with(|n| n.set(n.get() + 1));
-    let capped = call.preview.contains(" characters truncated ...]");
-    let rows: Vec<&str> = call
-        .preview
+    // Escapes stripped as the full cell strips them: a lone row is shown
+    // verbatim, and colour codes would print as text.
+    let preview = strip_ansi(call.preview);
+    let capped = preview.contains(" characters truncated ...]");
+    let rows: Vec<&str> = preview
         .lines()
         .map(str::trim)
         .filter(|l| {

@@ -20,18 +20,34 @@ impl Transcript {
     /// call reveals the refused command) and any preview length (expansion
     /// also shows the call's full argument, which the collapsed cell never
     /// had room for). A `!cmd` result is drawn as a bash call and folds the
-    /// same way, so it expands too. When the newest call is part of an
-    /// exploration run, the whole run opens (or folds back into its group).
-    /// Returns true on change.
+    /// same way, so it expands too. When the newest call is drawn inside an
+    /// exploration group, the whole run opens; when it is open itself, its
+    /// run folds back into its group; drawn on its own (a neighbour was
+    /// opened by a click), it opens alone. Returns true on change.
     pub fn toggle_last_expandable(&mut self) -> bool {
-        let id = self.cells.iter().rev().find_map(|c| match &c.kind {
-            CellKind::Item(
-                TranscriptKind::ToolCall { .. } | TranscriptKind::BashCommand { .. },
-            ) => Some(c.id),
-            _ => None,
-        });
-        let Some(id) = id else { return false };
-        self.toggle_run(id)
+        let found = self
+            .cells
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, c)| match &c.kind {
+                CellKind::Item(
+                    TranscriptKind::ToolCall { .. } | TranscriptKind::BashCommand { .. },
+                ) => Some((index, c.id)),
+                _ => None,
+            });
+        let Some((index, id)) = found else {
+            return false;
+        };
+        let thinking = self.thinking();
+        if !self.expanded.contains(&id)
+            && toolgroup::group_around(&self.cells, index, &self.expanded, thinking).is_some()
+            && let Some(run) = toolgroup::run_around(&self.cells, index, thinking)
+        {
+            self.set_run_expanded(run, true);
+            return true;
+        }
+        self.toggle_expanded(id)
     }
 
     /// A click on content line `line` of the most recent draw: a group's
@@ -69,23 +85,6 @@ impl Transcript {
         }
         // The rendered height changes, so the cached lines for that cell are stale.
         self.cache.invalidate_cell(cell_id);
-        true
-    }
-
-    /// Open the run around `cell_id` call by call, or fold it back when any
-    /// call of it is open; a cell in no run toggles alone.
-    fn toggle_run(&mut self, cell_id: u64) -> bool {
-        let Some(index) = self.cell_index(cell_id) else {
-            return false;
-        };
-        let Some(run) = toolgroup::run_around(&self.cells, index, self.thinking()) else {
-            return self.toggle_expanded(cell_id);
-        };
-        let open = !self
-            .cells
-            .range(run.clone())
-            .any(|cell| self.expanded.contains(&cell.id));
-        self.set_run_expanded(run, open);
         true
     }
 

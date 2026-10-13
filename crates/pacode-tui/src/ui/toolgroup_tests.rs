@@ -416,3 +416,23 @@ fn only_the_finished_shown_calls_rows_are_memoized() {
     let fresh = render(&cells, 0..11, &opts, 0, &LineCache::new(1));
     assert_eq!(render(&cells, 0..11, &opts, 0, &cache), fresh);
 }
+
+#[test]
+fn a_row_outcome_drops_ansi_escapes() {
+    let opts = truecolor(70);
+    let cells = deque(vec![
+        tool(
+            1,
+            "grep",
+            "\"error\"",
+            ToolStatus::Ok,
+            "\u{1b}[31merror\u{1b}[0m",
+        ),
+        read(2, "b.rs"),
+    ]);
+    let rows: Vec<String> = render(&cells, 0..2, &opts, 0, &LineCache::new(64))
+        .iter()
+        .map(text)
+        .collect();
+    assert!(rows[1].ends_with("→ error"), "{:?}", rows[1]);
+}

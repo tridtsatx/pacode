@@ -142,7 +142,18 @@ pub(crate) fn prepare(
         Some(ViewAnchor::Cell { id, offset }) => cell_line_index
             .get(&id)
             .and_then(|&index| cell_lines.get(index))
-            .map(|(_, start, end)| (start + offset).min(end.saturating_sub(1))),
+            .map(|&(_, start, end)| {
+                if start < end {
+                    return (start + offset).min(end - 1);
+                }
+                // Drawn as no line: a call that slid into its group's
+                // `… N more` row (its empty span sits on the group's header)
+                // holds on to the last head row, not the line above it.
+                group_heads
+                    .iter()
+                    .find(|head| head.lines.start == start)
+                    .map_or(start, |head| head.lines.end.saturating_sub(1))
+            }),
         Some(ViewAnchor::Header { line }) => Some(line),
         None => None,
     };
@@ -383,9 +394,10 @@ fn build_cell_lines<'a>(
 }
 
 /// The phase-one decision for a group: fresh while a member runs, cached
-/// otherwise under a key that changes with every member. Either way the
-/// finished members' rows are memoized first, so a fresh draw redraws only
-/// the header and the running rows.
+/// otherwise under a key that changes with every member. Whenever the group
+/// is drawn (fresh, or a block miss) the finished members' rows are memoized
+/// first, so a draw redraws only the header and the running rows; a block
+/// hit touches no row.
 fn plan_group(
     cells: &VecDeque<Cell>,
     range: std::ops::Range<usize>,
@@ -394,12 +406,13 @@ fn plan_group(
     width: u16,
     anim_frame: u64,
 ) -> CellPlan {
-    toolgroup::warm_rows(cells, range.clone(), opts, cache);
     if toolgroup::has_running(cells, range.clone()) {
+        toolgroup::warm_rows(cells, range, opts, cache);
         return CellPlan::Fresh;
     }
     let key = toolgroup::cache_key(cells, range.clone(), width, opts.cache_epoch);
     if cache.get(key).is_none() {
+        toolgroup::warm_rows(cells, range.clone(), opts, cache);
         let lines = toolgroup::render(cells, range, opts, anim_frame, cache);
         cache.insert(key, lines);
     }
