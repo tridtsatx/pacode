@@ -10,7 +10,7 @@ use pacode_provider::ProviderRegistry;
 use pacode_store::Store;
 use pacode_tools::{AgentSpec, ToolRegistry};
 use pacode_types::{
-    AgentId, AgentInfo, Config, Effort, Mode, ModelFlags, ModelRoute, PermissionDecision,
+    AgentId, AgentInfo, CallId, Config, Effort, Mode, ModelFlags, ModelRoute, PermissionDecision,
     PermissionId, PermissionRequest, Plan, SessionId, SessionMeta, SessionSnapshot, TaskInfo,
     TurnId, UsageTotals, ZdrMode,
 };
@@ -231,12 +231,13 @@ impl Session {
         self.agents.read().ok()?.get(id).cloned()
     }
 
-    /// The transcript row a running call is drawing into, when the agent has
-    /// exactly one. See `sole_running_tool_call_seq` for why "exactly one".
-    pub(crate) fn sole_running_tool_call_seq(&self, agent: &AgentId) -> Option<u64> {
+    /// The transcript row `call` is drawing into, while it is still running.
+    /// Output arriving after the call finished has nowhere to go: its result
+    /// already replaced the live preview.
+    pub(crate) fn running_tool_call_seq(&self, agent: &AgentId, call: &CallId) -> Option<u64> {
         let agent = self.agent_for_host(agent)?;
         let transcript = agent.transcript.lock().unwrap_or_else(|p| p.into_inner());
-        transcript.sole_running_tool_call_seq()
+        transcript.running_tool_call_seq(call)
     }
 
     pub(crate) fn agent_for_host(&self, id: &AgentId) -> Option<Arc<Agent>> {

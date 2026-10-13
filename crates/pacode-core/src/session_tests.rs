@@ -2031,6 +2031,67 @@ async fn a_task_that_outlives_its_foreground_wait_is_announced_when_it_ends() {
     .expect("a backgrounded task's end reaches the model");
 }
 
+/// A running `bash` row for `call` in the main agent's transcript.
+fn running_bash_row(session: &Session, call: &CallId) -> u64 {
+    let main = session.main_agent().unwrap();
+    let mut transcript = main.transcript.lock().unwrap();
+    let seq = transcript.next_seq();
+    transcript.upsert(pacode_types::TranscriptItem {
+        seq,
+        agent: AgentId::main(),
+        ts_ms: seq,
+        kind: TranscriptKind::ToolCall {
+            call_id: call.clone(),
+            name: "bash".into(),
+            title: "bash".into(),
+            intent: None,
+            status: pacode_types::ToolStatus::Running,
+            preview: String::new(),
+            diff: None,
+            duration_ms: None,
+            task: None,
+        },
+    });
+    seq
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_output_of_side_by_side_calls_reaches_each_calls_own_row() {
+    let (core, _mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    let mut rows = std::collections::HashMap::new();
+    for name in ["first", "second"] {
+        let call = CallId::new(format!("call-{name}"));
+        let seq = running_bash_row(&session, &call);
+        let mut spec = TaskSpec::new(
+            session_id.clone(),
+            AgentId::main(),
+            format!("echo {name}; sleep 0.2"),
+            tmp.path(),
+        );
+        spec.call = Some(call);
+        host.spawn_task(spec).await.unwrap();
+        rows.insert(format!("{name}\n"), seq);
+    }
+
+    let mut seen = std::collections::HashMap::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while seen.len() < rows.len() {
+            if let Ok((_, Event::ToolOutput { item_seq, text, .. })) = rx.recv().await {
+                seen.insert(text, item_seq);
+            }
+        }
+    })
+    .await
+    .expect("both rows stream");
+    assert_eq!(seen, rows, "each output lands in the row of its own call");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn close_reopen_keeps_task_router_tombstone() {
     let (core, _mock, tmp, session_id) = setup_test_session().await;

@@ -357,15 +357,16 @@ async fn handle_chunk(
         let _ = state.events.send(TaskEvent::Progress(info));
     }
     if !live_text.is_empty() {
-        let info = state
+        let entry = state
             .tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
-            .map(|entry| entry.info.clone());
-        if let Some(info) = info {
+            .map(|entry| (entry.info.clone(), entry.call.clone()));
+        if let Some((info, call)) = entry {
             let _ = state.events.send(TaskEvent::Output {
                 info,
+                call,
                 text: live_text,
             });
         }

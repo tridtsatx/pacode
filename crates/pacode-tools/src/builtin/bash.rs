@@ -117,18 +117,21 @@ impl Tool for BashTool {
         ctx.require_permission(perm_title, detail, Some(assessment.level))
             .await?;
 
-        run_authorized(args, accept_large_output, ctx).await
+        run_authorized(args, accept_large_output, ctx, Some(ctx.call_id.clone())).await
     }
 }
 
 /// Spawn/wait/output — everything `call` does after classification and the
 /// permission gate. `batch` reaches this for ops it has already checked with
 /// `pacode_risk::is_read_only` and covered with its combined permission request,
-/// so the command must already be authorized.
+/// so the command must already be authorized. `live_row`: the call whose
+/// transcript row draws a foreground run's output as it comes; `batch` passes
+/// `None`, since its ops run side by side under one row.
 pub(crate) async fn run_authorized(
     args: BashInput,
     accept_large_output: bool,
     ctx: &ToolCtx,
+    live_row: Option<pacode_types::CallId>,
 ) -> Result<ToolOutput, ToolError> {
     ssh_multiplex::check_and_warn(&args.command, ctx.host.as_ref()).await;
 
@@ -155,6 +158,9 @@ pub(crate) async fn run_authorized(
     spec.label = args.label.clone();
     spec.background = args.background;
     spec.timeout = timeout;
+    if !args.background {
+        spec.call = live_row;
+    }
 
     let id = ctx.host.spawn_task(spec).await?;
 

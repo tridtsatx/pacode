@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pacode_types::{AgentId, SessionId};
+use pacode_types::{AgentId, CallId, SessionId};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskSpec {
@@ -19,6 +19,9 @@ pub struct TaskSpec {
     pub background: bool,
     /// Hard timeout; the task is killed and marked failed when it elapses.
     pub timeout: Option<Duration>,
+    /// The tool call waiting on this task in the foreground, whose transcript
+    /// row its live output belongs to. `None`: nobody draws it live.
+    pub call: Option<CallId>,
 }
 
 impl TaskSpec {
@@ -37,6 +40,7 @@ impl TaskSpec {
             label: None,
             background: false,
             timeout: None,
+            call: None,
         }
     }
 }

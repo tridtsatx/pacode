@@ -50,6 +50,8 @@ pub enum TaskEvent {
     /// later anyway.
     Output {
         info: TaskInfo,
+        /// The foreground call the output belongs to ([`TaskSpec::call`]).
+        call: Option<pacode_types::CallId>,
         text: String,
     },
 }
@@ -279,6 +281,7 @@ impl TaskManager {
 
         let mut entry = TaskEntry {
             info: info.clone(),
+            call: spec.call.clone(),
             spool: Arc::new(ManagedSpool::new(spool_path, true)),
             buffer: head_tail_buf,
             parser,
@@ -392,6 +395,7 @@ impl TaskManager {
                     TaskEntry {
                         spool,
                         info,
+                        call: None,
                         buffer: HeadTailBuffer::new(16 * 1024, self.state.config.tail_bytes),
                         parser: ProgressParser::new(),
                         version_tx,

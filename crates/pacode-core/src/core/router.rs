@@ -50,7 +50,7 @@ async fn route_task_event(
             last_progress.remove(&info.id);
             finish_task(core, info, ended).await;
         }
-        TaskEvent::Output { info, text } => {
+        TaskEvent::Output { info, call, text } => {
             // Only for a task the client is watching as a *foreground* call: a
             // background task already has its own live view, and sending its
             // tail into the transcript as well would put the same output in two
@@ -58,13 +58,16 @@ async fn route_task_event(
             if info.backgrounded {
                 return;
             }
+            let Some(call) = call else {
+                return;
+            };
             let Some(session) = core.session(&info.session) else {
                 return;
             };
             let Some(agent) = session.agent_for_host(&info.owner) else {
                 return;
             };
-            let Some(seq) = session.sole_running_tool_call_seq(&info.owner) else {
+            let Some(seq) = session.running_tool_call_seq(&info.owner, &call) else {
                 return;
             };
             session.events.emit(Event::ToolOutput {

@@ -44,6 +44,8 @@ impl Drop for ManagedSpool {
 
 pub(crate) struct TaskEntry {
     pub(crate) info: TaskInfo,
+    /// [`crate::spec::TaskSpec::call`], carried on every `Output` event.
+    pub(crate) call: Option<pacode_types::CallId>,
     pub(crate) spool: Arc<ManagedSpool>,
     pub(crate) buffer: HeadTailBuffer,
     pub(crate) parser: ProgressParser,

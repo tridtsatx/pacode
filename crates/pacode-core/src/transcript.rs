@@ -216,31 +216,20 @@ impl TranscriptState {
         })
     }
 
-    /// Seq of the *only* running tool call in the tail, or `None` when there is
-    /// none or more than one.
+    /// Seq of `call`'s row while the call is still running, else `None`.
     ///
-    /// Live output arrives from the exec layer addressed to a task, but a
-    /// running call's cell does not know its task id yet — that arrives with the
-    /// result, once the process has already finished. So the row is found by the
-    /// one running call the agent has, and **only when there is exactly one**:
-    /// with two calls in flight, guessing would put a build's output under
-    /// someone else's command, and dropped output is a far smaller failure than
-    /// output in the wrong row.
-    pub fn sole_running_tool_call_seq(&self) -> Option<u64> {
-        let mut found = None;
-        for item in self.tail.iter().rev() {
-            if let pacode_types::TranscriptKind::ToolCall {
+    /// Live output arrives from the exec layer addressed to the call that
+    /// started the task, so the row is exact even with several calls of a step
+    /// in flight. A row that finished keeps its result: output still in transit
+    /// when the call ended is dropped, never appended under the final result.
+    pub fn running_tool_call_seq(&self, call: &CallId) -> Option<u64> {
+        self.tool_item(call).and_then(|item| match item.kind {
+            pacode_types::TranscriptKind::ToolCall {
                 status: pacode_types::ToolStatus::Running,
                 ..
-            } = item.kind
-            {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(item.seq);
-            }
-        }
-        found
+            } => Some(item.seq),
+            _ => None,
+        })
     }
 
     /// Seq of the item carrying the `Permission` cell for `id`, while it is
@@ -641,30 +630,23 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn the_running_tool_row_is_found_only_when_there_is_exactly_one() {
-        // Live output arrives from the exec layer addressed to a task, but a
-        // running call's cell does not know its task id yet. So the row is the
-        // agent's only running call — and with two in flight the answer has to
-        // be "none", because guessing would file a build's output under
-        // someone else's command.
+    fn live_output_finds_its_own_row_and_only_while_it_runs() {
+        // Two calls of one step in flight: each task's output goes to the row
+        // of the call that started it, never to its neighbour's.
+        let (a, b) = (CallId::new("a"), CallId::new("b"));
         let mut transcript = TranscriptState::new(64);
-        assert_eq!(transcript.sole_running_tool_call_seq(), None);
+        assert_eq!(transcript.running_tool_call_seq(&a), None);
 
-        transcript.upsert(test_tool_item(1, &CallId::new("a"), ToolStatus::Running));
-        assert_eq!(transcript.sole_running_tool_call_seq(), Some(1));
+        transcript.upsert(test_tool_item(1, &a, ToolStatus::Running));
+        transcript.upsert(test_tool_item(2, &b, ToolStatus::Running));
+        assert_eq!(transcript.running_tool_call_seq(&a), Some(1));
+        assert_eq!(transcript.running_tool_call_seq(&b), Some(2));
 
-        transcript.upsert(test_tool_item(2, &CallId::new("b"), ToolStatus::Running));
-        assert_eq!(
-            transcript.sole_running_tool_call_seq(),
-            None,
-            "two calls in flight: no row is safe to attribute output to"
-        );
-
-        // One of them finishes: the survivor is unambiguous again.
-        let mut done = test_tool_item(2, &CallId::new("b"), ToolStatus::Ok);
-        done.seq = 2;
-        transcript.upsert(done);
-        assert_eq!(transcript.sole_running_tool_call_seq(), Some(1));
+        // `b` finished: output still in transit for it is dropped rather than
+        // appended under its result, and `a` keeps its row.
+        transcript.upsert(test_tool_item(2, &b, ToolStatus::Ok));
+        assert_eq!(transcript.running_tool_call_seq(&b), None);
+        assert_eq!(transcript.running_tool_call_seq(&a), Some(1));
     }
 
     fn test_tool_item(seq: u64, call_id: &CallId, status: ToolStatus) -> TranscriptItem {

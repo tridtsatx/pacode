@@ -427,7 +427,7 @@ async fn run_op(op: PreparedOp, ctx: &ToolCtx, per_op_cap: usize) -> Result<OpRe
                         tokio::select! {
                             biased;
                             _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
-                            result = run_authorized(args, accept, &sub_ctx) => result,
+                            result = run_authorized(args, accept, &sub_ctx, None) => result,
                         }
                     }
                     Err(err) => Err(err),
