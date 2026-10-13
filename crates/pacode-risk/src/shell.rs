@@ -65,13 +65,23 @@ pub struct SimpleCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Redirect {
     pub op: String,
-    /// `None` for a descriptor copy (`2>&1`, `<&-`).
+    /// `None` for a descriptor copy (`2>&1`, `<&-`). For a here-document it is
+    /// the delimiter word.
     pub target: Option<Token>,
+    /// The here-document body, for `<<` / `<<-`, so a shell reading its program
+    /// from the heredoc can be assessed like a `-c` payload.
+    pub heredoc_body: Option<String>,
 }
 
 impl Redirect {
     fn bare_op(&self) -> &str {
         self.op.trim_start_matches(|c: char| c.is_ascii_digit())
+    }
+
+    /// The leading file descriptor, empty when the default is used.
+    fn fd(&self) -> &str {
+        let digits = self.op.len() - self.bare_op().len();
+        &self.op[..digits]
     }
 
     /// Opens its target for writing (`>`, `>>`, `>|`, `&>`, `&>>`, `>&f`, `<>`).
@@ -82,6 +92,23 @@ impl Redirect {
     /// Truncates its target on open.
     pub fn truncates(&self) -> bool {
         self.target.is_some() && matches!(self.bare_op(), ">" | ">|" | "&>" | ">&")
+    }
+
+    /// Feeds the command's standard input from this redirection: `<`, `<<`,
+    /// `<<-`, `<<<` or `<>` on fd 0 (the default). A shell whose stdin comes
+    /// this way runs what it reads.
+    pub fn reads_stdin(&self) -> bool {
+        matches!(self.fd(), "" | "0") && matches!(self.bare_op(), "<" | "<<" | "<<-" | "<<<" | "<>")
+    }
+
+    /// A here-document (`<<`, `<<-`): its body is in [`Self::heredoc_body`].
+    pub fn is_heredoc(&self) -> bool {
+        matches!(self.bare_op(), "<<" | "<<-")
+    }
+
+    /// A here-string (`<<<`): its body is the target word.
+    pub fn is_here_string(&self) -> bool {
+        self.bare_op() == "<<<"
     }
 }
 
@@ -115,6 +142,8 @@ fn parse_into(src: &str, depth: usize, script: &mut Script) {
         current: SimpleCommand::default(),
         dash_split: None,
         cases: Vec::new(),
+        heredoc_bodies: &lexed.heredoc_bodies,
+        heredoc_index: 0,
     }
     .run();
     for nested in &lexed.nested {
@@ -168,6 +197,9 @@ struct Parser<'a> {
     /// Where dash's reading of `&>` starts a command in `current.words`.
     dash_split: Option<usize>,
     cases: Vec<Case>,
+    /// Here-document bodies in source order; the next `<<` / `<<-` takes one.
+    heredoc_bodies: &'a [String],
+    heredoc_index: usize,
 }
 
 impl Parser<'_> {
@@ -209,9 +241,18 @@ impl Parser<'_> {
             if matches!(op, "&>" | "&>>") && self.dash_split.is_none() {
                 self.dash_split = Some(self.current.words.len());
             }
+            let bare = op.trim_start_matches(|c: char| c.is_ascii_digit());
+            let heredoc_body = if matches!(bare, "<<" | "<<-") {
+                let body = self.heredoc_bodies.get(self.heredoc_index).cloned();
+                self.heredoc_index += 1;
+                body
+            } else {
+                None
+            };
             self.current.redirects.push(Redirect {
                 op: op.to_string(),
                 target,
+                heredoc_body,
             });
             return;
         }

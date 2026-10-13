@@ -205,6 +205,39 @@ fn readers_that_write_or_execute_through_their_arguments() {
 }
 
 #[test]
+fn pure_filters_are_read_only() {
+    for command in [
+        "tr a-z A-Z < f",
+        "rev file",
+        "nl file",
+        "tac file",
+        "fold file",
+        "comm a b",
+        "join a b",
+        "paste a b",
+        "cmp a b",
+        "column -t file",
+        "od -An -tx1 file",
+        "hexdump -C file",
+        "xxd file",
+        "strings binary",
+        "base64 file",
+        "seq 1 100",
+        "fmt -w 72 file",
+        "sha1sum file",
+        "sha512sum file",
+        "b2sum file",
+        "cksum file",
+        "sum file",
+    ] {
+        assert!(is_read_only(command), "{command:?} should be read-only");
+    }
+    // `xxd -r` and a second (output) operand write.
+    assert!(!is_read_only("xxd -r dump"));
+    assert!(!is_read_only("xxd in out"));
+}
+
+#[test]
 fn version_flag_invocations_are_read_only() {
     assert!(is_read_only("rustc --version"));
     assert!(is_read_only("python3 --version"));
@@ -458,10 +491,16 @@ fn credential_stores_and_files_are_not_read_only() {
     for cmd in commands {
         assert!(!is_read_only(cmd), "{cmd:?} must not be a Plan-mode read");
     }
-    // Ordinary files next to them stay readable. (`ProtectedPaths` treats
-    // `.env.example` as a credential name, so it is covered by the rules above.)
+    // Ordinary files next to them stay readable, and the `.env` templates are
+    // not secrets. `/etc/passwd` is world-readable and holds no secret.
     assert!(is_read_only("cat src/config.rs"));
     assert!(is_read_only("cut -d: -f1 /etc/passwd"));
+    assert!(is_read_only("cat .env.example"));
+    assert!(is_read_only("cat config/.env.sample"));
+    // New secrets the gate and Plan mode both refuse to read.
+    assert!(!is_read_only("cat /proc/self/environ"));
+    assert!(!is_read_only("cat ~/.netrc"));
+    assert!(!is_read_only("cat ~/.pgpass"));
 }
 
 #[test]

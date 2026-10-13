@@ -60,6 +60,31 @@ const READONLY_COMMANDS: &[&str] = &[
     "diff",
     "md5sum",
     "sha256sum",
+    // Pure filters: read stdin or a file operand and print to stdout.
+    "tr",
+    "rev",
+    "nl",
+    "tac",
+    "fold",
+    "comm",
+    "join",
+    "paste",
+    "cmp",
+    "column",
+    "od",
+    "hexdump",
+    "xxd",
+    "strings",
+    "base64",
+    "seq",
+    "fmt",
+    "sha1sum",
+    "sha224sum",
+    "sha384sum",
+    "sha512sum",
+    "b2sum",
+    "cksum",
+    "sum",
     "true",
     "false",
     "test",
@@ -116,8 +141,9 @@ fn command_is_read_only(command: &SimpleCommand) -> bool {
 
 /// An environment assignment that makes a reader run other code: the search
 /// path, preloaded libraries, shell start-up files, pagers and editors, git's
-/// external helpers.
-fn assignment_runs_code(word: &str) -> bool {
+/// external helpers. Shared by the Plan-mode check and the reflection gate, so
+/// both judge the same variables.
+pub(crate) fn assignment_runs_code(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
     };
@@ -146,6 +172,31 @@ fn assignment_runs_code(word: &str) -> bool {
         || name.starts_with("GIT_CONFIG")
         || name.contains("PAGER")
         || name.contains("EDITOR")
+}
+
+/// When an assignment's value is itself a command line a tool will run (a git
+/// diff/ssh/pager hook, a `$PAGER`/`$EDITOR`, `PROMPT_COMMAND`, `PS4`), the
+/// value, so the gate can assess it recursively like a `-c` payload. Loader and
+/// path variables (`LD_*`, `PATH`, `BASH_ENV`, `IFS`, …) name a file or a
+/// directory, not a command line, so they return `None` and are gated by
+/// [`assignment_runs_code`] alone.
+pub(crate) fn assignment_command_value(word: &str) -> Option<&str> {
+    let (name, value) = word.split_once('=')?;
+    let is_command = matches!(
+        name,
+        "PS4"
+            | "PROMPT_COMMAND"
+            | "LESSOPEN"
+            | "LESSCLOSE"
+            | "VISUAL"
+            | "GIT_EXTERNAL_DIFF"
+            | "GIT_SSH"
+            | "GIT_SSH_COMMAND"
+            | "GIT_ASKPASS"
+            | "SSH_ASKPASS"
+    ) || name.contains("PAGER")
+        || name.contains("EDITOR");
+    is_command.then_some(value)
 }
 
 fn words_are_read_only(words: &[Token]) -> bool {
@@ -270,10 +321,22 @@ fn expansions(word: &str) -> Vec<String> {
     expand_braces(word, MAX_BRACE_WORDS).unwrap_or_else(|| vec!["..".to_string()])
 }
 
-/// Whether this word names a credential store, a credential file, or a system
-/// password database — `~/.ssh/id_rsa`, `./.aws/credentials`, `app/.env`,
-/// `server.key`, `/etc/shadow`.
-fn is_protected_read(word: &str) -> bool {
+/// Credential dotfiles that live directly in a home directory and are not
+/// caught by the credential-subpath or credential-name rules.
+const SECRET_DOTFILES: &[&str] = &[".netrc", ".pgpass"];
+
+/// `.env` names that are templates, not real credential files, so reading one
+/// is not an exfiltration.
+const ENV_TEMPLATES: &[&str] = &[".env.example", ".env.sample", ".env.template"];
+
+/// Whether this word names a credential store, a credential file, or another
+/// secret the model must not pull into context — `~/.ssh/id_rsa`,
+/// `./.aws/credentials`, `app/.env`, `server.key`, `~/.netrc`, `/etc/shadow`,
+/// `/proc/self/environ`. `.env.example` and the other templates are not secret.
+///
+/// Shared by Plan mode (read allowlist) and the reflection gate (Build/Auto
+/// ask before a secret is read), so one predicate decides what is a secret.
+pub fn is_protected_read(word: &str) -> bool {
     if SYSTEM_SECRET_FILES.contains(&word) {
         return true;
     }
@@ -281,15 +344,24 @@ fn is_protected_read(word: &str) -> bool {
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
         .collect();
+    // `/proc/<pid>/environ` (and `/proc/self/environ`) dumps a process's whole
+    // environment, API keys included.
+    if matches!(parts.as_slice(), ["proc", _, "environ", ..]) {
+        return true;
+    }
     if parts
         .iter()
         .any(|part| ProtectedPaths::credential_subpaths().contains(part))
     {
         return true;
     }
-    parts
-        .last()
-        .is_some_and(|name| ProtectedPaths::is_credential_file_name(name))
+    let Some(name) = parts.last() else {
+        return false;
+    };
+    if ENV_TEMPLATES.contains(name) {
+        return false;
+    }
+    SECRET_DOTFILES.contains(name) || ProtectedPaths::is_credential_file_name(name)
 }
 
 fn is_version_only(args: &[&str]) -> bool {

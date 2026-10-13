@@ -3,19 +3,21 @@
 //! [`crate::shell`] lists every simple command the line runs and
 //! [`crate::wrappers`] finds the command behind `sudo`, `env`, `xargs`, `sh -c`
 //! and the rest; this module judges each one: destructive programs and their
-//! targets, truncating redirections, known tools with dangerous subcommands.
-//! What cannot be read statically — a computed program name, an option a
-//! wrapper table does not know, grammar the parser cannot follow — is a
-//! `Confirm` finding, never `Safe`.
+//! targets, every writing redirection, non-`rm` writers into protected paths,
+//! a shell reading its program from stdin, environment assignments that run
+//! code, inline interpreter code, secret reads, and known tools with dangerous
+//! subcommands. What cannot be read statically — a computed program name, an
+//! option a wrapper table does not know, grammar the parser cannot follow — is
+//! a `Confirm` finding, never `Safe`.
 
 use std::path::Path;
 
 use crate::git::{GitCall, command_in_config};
 use crate::paths::{self, is_safe_redirect_sink};
-use crate::shell::{self, SimpleCommand, expand_braces};
+use crate::shell::{self, Redirect, SimpleCommand, expand_braces, is_assignment};
 use crate::tokenize::Token;
 use crate::wrappers::{self, Inner, SHELLS};
-use crate::{RiskFinding, RiskLevel};
+use crate::{RiskFinding, RiskLevel, readonly, sinks};
 
 /// Commands that destroy data as their primary purpose.
 const DESTRUCTIVE_COMMANDS: &[&str] = &[
@@ -32,6 +34,55 @@ const CONDITIONALLY_DESTRUCTIVE: &[(&str, &[&str])] = &[
 
 /// Wrappers that run their command with someone else's privileges.
 const ELEVATING: &[&str] = &["sudo", "doas", "su", "pkexec", "runuser"];
+
+/// Commands that read a file operand's contents (not just its name), so a
+/// credential or secret operand means the secret is pulled into context.
+/// `printf`/`echo`/`ls` only print or list a name, so they are left out.
+const SECRET_READERS: &[&str] = &[
+    "cat",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "od",
+    "hexdump",
+    "xxd",
+    "strings",
+    "base64",
+    "nl",
+    "tac",
+    "rev",
+    "fold",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "cut",
+    "wc",
+    "diff",
+    "cmp",
+    "comm",
+    "join",
+    "paste",
+    "column",
+    "fmt",
+    "sort",
+    "uniq",
+    "jq",
+    "sed",
+    "awk",
+    "gawk",
+    "mawk",
+    "md5sum",
+    "sha1sum",
+    "sha224sum",
+    "sha256sum",
+    "sha384sum",
+    "sha512sum",
+    "b2sum",
+    "cksum",
+    "sum",
+];
 
 /// Inline shells (`sh -c "sh -c '...'"`) are followed this deep.
 const MAX_DEPTH: usize = 8;
@@ -129,24 +180,108 @@ impl<'a> Assessor<'a> {
     }
 
     fn command(&mut self, command: &SimpleCommand, via: Via<'_>, depth: usize) {
+        let feeds_shell = bare_shell(&command.words);
         for redirect in &command.redirects {
-            if let Some(target) = &redirect.target
-                && redirect.truncates()
-            {
-                self.redirect_target(target);
+            if let Some(target) = &redirect.target {
+                // A truncating redirect keeps every tier; a non-truncating
+                // write (`>>`, `<>`, `&>>`) only flags a dangerous target, so
+                // appends to an ordinary file stay Safe.
+                if redirect.truncates() {
+                    self.redirect_target(target, true);
+                } else if redirect.writes() {
+                    self.redirect_target(target, false);
+                }
             }
+            if redirect.reads_stdin() {
+                if feeds_shell {
+                    self.shell_reads(redirect, depth);
+                } else if let Some(target) = &redirect.target
+                    && !redirect.writes()
+                {
+                    self.protected_read(&target.text);
+                }
+            }
+        }
+        for assignment in &command.assignments {
+            self.assignment(assignment, depth);
         }
         self.words(&command.words, command.receives_pipe, via, depth);
     }
 
-    fn redirect_target(&mut self, target: &Token) {
+    /// Check a redirection target. `keep_bounded` keeps a `Low` finding (a
+    /// truncate inside cwd); an append passes `false`, so only a catastrophic
+    /// or escaping target is flagged.
+    fn redirect_target(&mut self, target: &Token, keep_bounded: bool) {
         if is_safe_redirect_sink(&target.text) {
             return;
         }
         if let Some(finding) =
             paths::classify_target(&target.text, false, self.cwd, self.home, true)
+            && (keep_bounded || finding.level >= RiskLevel::Confirm)
         {
             self.findings.push(finding);
+        }
+    }
+
+    /// A shell that reads its program from standard input runs whatever it
+    /// reads. A static heredoc or here-string body is parsed and assessed like
+    /// a `-c` payload; a file or a computed body cannot be read in advance.
+    fn shell_reads(&mut self, redirect: &Redirect, depth: usize) {
+        if redirect.is_heredoc() {
+            if let Some(body) = &redirect.heredoc_body {
+                self.script(body, false, depth + 1);
+            }
+            return;
+        }
+        if redirect.is_here_string() {
+            if let Some(target) = &redirect.target {
+                if target.text.contains(['$', '`']) {
+                    self.findings.push(confirm(
+                        "a shell runs a here-string computed at runtime, which cannot be \
+                         checked before it runs"
+                            .into(),
+                    ));
+                } else {
+                    self.script(&target.text, false, depth + 1);
+                }
+            }
+            return;
+        }
+        self.findings.push(confirm(
+            "a shell runs a script read from its standard input, which cannot be checked \
+             before it runs"
+                .into(),
+        ));
+    }
+
+    /// Flag a read of a credential or secret file (Build and Auto ask).
+    fn protected_read(&mut self, raw: &str) {
+        if readonly::is_protected_read(raw) {
+            self.findings.push(RiskFinding {
+                level: RiskLevel::Confirm,
+                reason: "reads a credential or secret file into the model's context".to_string(),
+                target: Some(raw.to_string()),
+            });
+        }
+    }
+
+    /// An environment assignment that makes a later command run chosen code:
+    /// flag it, and when its value is itself a command line, assess that too.
+    fn assignment(&mut self, assignment: &Token, depth: usize) {
+        if !readonly::assignment_runs_code(&assignment.text) {
+            return;
+        }
+        let name = assignment
+            .text
+            .split_once('=')
+            .map(|(name, _)| name)
+            .unwrap_or(&assignment.text);
+        self.findings.push(confirm(format!(
+            "sets `{name}`, an environment variable that can make a later command run \
+             attacker-chosen code"
+        )));
+        if let Some(value) = readonly::assignment_command_value(&assignment.text) {
+            self.script(value, false, depth + 1);
         }
     }
 
@@ -168,7 +303,14 @@ impl<'a> Assessor<'a> {
                 },
             };
             for file in &unwrapped.writes {
-                self.redirect_target(file);
+                self.redirect_target(file, true);
+            }
+            if name == "env" {
+                for word in &words[1..] {
+                    if is_assignment(&word.text) {
+                        self.assignment(word, depth);
+                    }
+                }
             }
             match unwrapped.inner {
                 Inner::Argv(rest) => self.words(rest, receives_pipe, inner_via, depth),
@@ -192,6 +334,13 @@ impl<'a> Assessor<'a> {
                         "`{name}` runs another command that could not be identified statically"
                     )))
                 }
+                // `env` / `env VAR=…` with no command prints the whole
+                // environment, every secret in it included.
+                Inner::Nothing if name == "env" => self.findings.push(confirm(
+                    "`env` with no command prints the whole environment, leaking every secret \
+                     in it"
+                        .into(),
+                )),
                 Inner::Nothing => {}
                 Inner::Opaque(rest) => {
                     for start in (0..rest.len()).take(MAX_OPAQUE_STARTS) {
@@ -219,6 +368,83 @@ impl<'a> Assessor<'a> {
         self.known_tool(&name, words, depth);
         self.runners(&name, words, depth);
         self.destructive(&name, words, receives_pipe, via);
+        self.interpreters(&name, words);
+        self.protected_writes(&name, words);
+        self.exec_env(&name, words, depth);
+        self.reads(&name, words);
+    }
+
+    /// Inline interpreter code (`python -c`, `node -e`, `deno eval`, and `awk`
+    /// programs that shell out) — `Low`, or `Confirm` with a destructive
+    /// payload. A script file (`python app.py`) is left alone.
+    fn interpreters(&mut self, name: &str, words: &[Token]) {
+        if matches!(name, "awk" | "gawk" | "mawk") {
+            let args: Vec<&str> = words.iter().skip(1).map(|t| t.text.as_str()).collect();
+            if crate::writers::awk_shells_out(&args) {
+                let destructive = args.iter().any(|a| sinks::code_is_destructive(a));
+                self.findings.push(inline_code_finding(name, destructive));
+            }
+            return;
+        }
+        let codes = sinks::inline_code(name, words);
+        if !codes.is_empty() {
+            let destructive = codes.iter().any(|code| sinks::code_is_destructive(code));
+            self.findings.push(inline_code_finding(name, destructive));
+        }
+    }
+
+    /// Non-`rm` writers (`cp`, `mv`, `ln`, `tee`, `install`, `rsync`, `sponge`)
+    /// whose destination is a credential, system, device or escaping path.
+    /// Ordinary destinations stay Safe, so `cp a b` is unchanged.
+    fn protected_writes(&mut self, name: &str, words: &[Token]) {
+        for dest in sinks::write_destinations(name, words) {
+            if is_safe_redirect_sink(dest) {
+                continue;
+            }
+            if let Some(finding) = paths::classify_target(dest, false, self.cwd, self.home, false)
+                && finding.level >= RiskLevel::Confirm
+            {
+                self.findings.push(finding);
+            }
+        }
+    }
+
+    /// `export`/`declare`/`typeset`/`local` that set an env-hook variable, and
+    /// `source`/`.` which run a file: both affect what the rest of the line
+    /// runs.
+    fn exec_env(&mut self, name: &str, words: &[Token], depth: usize) {
+        if matches!(name, "export" | "declare" | "typeset" | "local") {
+            for word in &words[1..] {
+                if is_assignment(&word.text) {
+                    self.assignment(word, depth);
+                }
+            }
+        }
+        if matches!(name, "source" | ".") && words[1..].iter().any(|w| !w.is_flag()) {
+            self.findings.push(confirm(format!(
+                "`{name}` runs the commands in a file, which cannot be checked before they run"
+            )));
+        }
+    }
+
+    /// A command that reads file contents, given a credential or secret file,
+    /// and a bare environment dump (`printenv`).
+    fn reads(&mut self, name: &str, words: &[Token]) {
+        if name == "printenv" && !words[1..].iter().any(|w| !w.is_flag()) {
+            self.findings.push(confirm(
+                "`printenv` with no variable prints the whole environment, leaking every secret \
+                 in it"
+                    .into(),
+            ));
+            return;
+        }
+        if SECRET_READERS.contains(&name) {
+            for word in &words[1..] {
+                if !word.is_flag() {
+                    self.protected_read(&word.text);
+                }
+            }
+        }
     }
 
     /// `words` with every brace pattern expanded, or `None` when nothing
@@ -423,6 +649,40 @@ fn until_terminator(words: &[Token]) -> &[Token] {
         .position(|t| matches!(t.text.as_str(), ";" | "+"))
         .unwrap_or(words.len());
     &words[..end]
+}
+
+/// Whether `words` runs a shell with no inline script (no `-c`), so its
+/// program comes from standard input. Looks through passthrough wrappers
+/// (`sudo`, `env`, `timeout`, …) that keep the shell's standard input.
+fn bare_shell(words: &[Token]) -> bool {
+    match wrappers::unwrap(words) {
+        Some(unwrapped) => match unwrapped.inner {
+            Inner::Argv(rest) => bare_shell(rest),
+            Inner::Scripts(scripts) => {
+                SHELLS.contains(&unwrapped.name.as_str()) && scripts.is_empty()
+            }
+            Inner::Nothing | Inner::Opaque(_) | Inner::Unknown(_) => false,
+        },
+        None => false,
+    }
+}
+
+/// A finding for inline interpreter code: `Low` normally (Build asks, Auto
+/// allows), `Confirm` when it carries an obvious destructive payload.
+fn inline_code_finding(name: &str, destructive: bool) -> RiskFinding {
+    if destructive {
+        RiskFinding {
+            level: RiskLevel::Confirm,
+            reason: format!("`{name}` runs inline code that contains a destructive payload"),
+            target: None,
+        }
+    } else {
+        RiskFinding {
+            level: RiskLevel::Low,
+            reason: format!("`{name}` runs inline code passed on the command line"),
+            target: None,
+        }
+    }
 }
 
 /// The program `words` finally runs, through wrappers that pass an argv on.

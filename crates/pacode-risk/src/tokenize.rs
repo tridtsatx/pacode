@@ -71,6 +71,9 @@ pub(crate) struct Lexed {
     pub(crate) tokens: Vec<Token>,
     /// Source of every command and process substitution in the line.
     pub(crate) nested: Vec<String>,
+    /// Body text of each top-level here-document, in source order, so a shell
+    /// that reads its program from `<<` can be assessed like a `-c` payload.
+    pub(crate) heredoc_bodies: Vec<String>,
     pub(crate) unresolved: Vec<&'static str>,
 }
 
@@ -269,6 +272,7 @@ impl Lexer {
             if heredoc.expands {
                 self.scan_expansions(&body);
             }
+            self.out.heredoc_bodies.push(body);
         }
     }
 

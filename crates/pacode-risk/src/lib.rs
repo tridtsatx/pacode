@@ -21,6 +21,7 @@ pub mod paths;
 mod pure;
 pub mod readonly;
 pub mod shell;
+mod sinks;
 pub mod tokenize;
 mod wrappers;
 mod writers;
@@ -29,6 +30,7 @@ use std::path::Path;
 
 pub use pacode_types::RiskLevel;
 pub use pure::is_side_effect_free;
+pub use readonly::is_protected_read;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RiskFinding {

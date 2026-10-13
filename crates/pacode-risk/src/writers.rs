@@ -32,8 +32,45 @@ pub(crate) fn writes_through_own_arguments(program: &str, words: &[Token]) -> bo
         "file" => has_short(&args, "efFmP", 'C') || has_long(&args, "compile", 2),
         // A bare `printenv` dumps every variable, keys included.
         "printenv" => args.is_empty(),
+        // `xxd -r` converts a hex dump back to binary; a second operand is the
+        // output file. Plain `xxd file` prints a hex dump to stdout.
+        "xxd" => xxd_writes(&args),
         _ => false,
     }
+}
+
+/// `xxd`: `-r`/`-revert` reverses (writes binary), and a second non-flag
+/// operand is the output file. Short flags that take a value (`-c`, `-g`,
+/// `-s`, `-l`, `-o`, `-b` has none) consume the next word.
+fn xxd_writes(args: &[&str]) -> bool {
+    let mut operands = 0;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        index += 1;
+        if *arg == "-r" || *arg == "-revert" {
+            return true;
+        }
+        if is_short_bundle(arg) {
+            if arg.contains('r') {
+                return true;
+            }
+            // `-c N`, `-g N`, `-s N`, `-l N`, `-o N`: value in the next word
+            // when the flag ends the bundle.
+            if arg
+                .chars()
+                .last()
+                .is_some_and(|c| matches!(c, 'c' | 'g' | 's' | 'l' | 'o'))
+            {
+                index += 1;
+            }
+            continue;
+        }
+        if arg.starts_with("--") {
+            continue;
+        }
+        operands += 1;
+    }
+    operands >= 2
 }
 
 fn is_short_bundle(arg: &str) -> bool {
@@ -265,28 +302,45 @@ fn sed_script_writes(script: &str) -> bool {
 /// `"cmd" | getline`), redirects `print`/`printf` output, calls `system`,
 /// reads with `getline`, or uses a gawk `@` directive.
 pub(crate) fn awk_writes(args: &[&str]) -> bool {
+    awk_program(args).is_none_or(awk_program_writes)
+}
+
+/// The awk program string of a command (its first non-flag operand). `None`
+/// when it is not visible here — read from a `-f` file, after an unknown
+/// option, or absent — which both callers treat as "assume it writes / shells
+/// out".
+fn awk_program<'a>(args: &[&'a str]) -> Option<&'a str> {
     let mut index = 0;
-    let mut program = None;
     while let Some(arg) = args.get(index) {
         index += 1;
         match *arg {
             "-F" | "-v" | "--field-separator" | "--assign" => index += 1,
-            "--" => {
-                program = args.get(index).copied();
-                break;
-            }
+            "--" => return args.get(index).copied(),
             a if a.starts_with("-F")
                 || a.starts_with("-v")
                 || a.starts_with("--field-separator=")
                 || a.starts_with("--assign=") => {}
-            a if a.starts_with('-') && a.len() > 1 => return true,
-            a => {
-                program = Some(a);
-                break;
-            }
+            a if a.starts_with('-') && a.len() > 1 => return None,
+            a => return Some(a),
         }
     }
-    program.is_none_or(awk_program_writes)
+    None
+}
+
+/// Whether an awk program line runs an external command — a pipe to/from a
+/// command, `system()`, `getline` from a command, or a gawk `@` directive.
+/// Used by the gate to treat such a program as inline interpreter code that
+/// shells out, separately from a plain `print > file` write.
+pub(crate) fn awk_program_shells_out(program: &str) -> bool {
+    let code = awk_code_only(program);
+    code.contains(['|', '@']) || code.contains("system") || code.contains("getline")
+}
+
+/// Whether the awk program of a command (its first non-flag operand) shells
+/// out. `None` program (reads from `-f` files or stdin) counts as shelling out,
+/// since its code is not visible here.
+pub(crate) fn awk_shells_out(args: &[&str]) -> bool {
+    awk_program(args).is_none_or(awk_program_shells_out)
 }
 
 fn awk_program_writes(program: &str) -> bool {

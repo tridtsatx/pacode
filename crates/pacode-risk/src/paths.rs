@@ -10,6 +10,29 @@ use crate::{RiskFinding, RiskLevel};
 /// Credential stores protected recursively under home directory.
 const PROTECTED_CREDENTIAL_SUBPATHS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube", ".docker"];
 
+/// Shell and login start-up files directly under the home directory: writing
+/// any of them runs attacker code on the next shell or login, so a write that
+/// targets one is treated like a credential write.
+const PROTECTED_STARTUP_FILES: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".bash_aliases",
+    ".profile",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".kshrc",
+    ".cshrc",
+    ".tcshrc",
+    ".login",
+    ".logout",
+    ".inputrc",
+];
+
 /// Directory roots under home protected wholesale, but individual files within them
 /// are allowed to be modified.
 const PROTECTED_HOME_SUBPATHS: &[&str] = &[
@@ -206,6 +229,16 @@ pub fn is_catastrophic_target(path: &Path, home: &Path) -> bool {
         if PROTECTED_HOME_SUBPATHS
             .iter()
             .any(|sub| path == home.join(sub))
+        {
+            return true;
+        }
+        // `~/.bashrc`, `~/.zshrc`, … — only directly under home, so a project's
+        // own file that happens to share the name stays an ordinary target.
+        if path.parent() == Some(home.as_path())
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| PROTECTED_STARTUP_FILES.contains(&name))
         {
             return true;
         }
