@@ -1,5 +1,5 @@
 use super::*;
-use pacode_types::AgentId;
+use pacode_types::{AgentId, ExplainLevel};
 use std::time::Duration;
 
 #[test]

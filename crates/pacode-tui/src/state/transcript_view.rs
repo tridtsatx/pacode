@@ -1,6 +1,7 @@
-//! Which cells show their whole output: a click on a row, `ctrl+o` on the
-//! newest call, and the exploration groups (`ui::toolgroup`) a run of calls
-//! opens out of and folds back into.
+//! The transcript as the last draw left it: where the view is scrolled,
+//! which cell sits under a row, and which cells show their whole output — a
+//! click on a row, `ctrl+o` on the newest call, and the exploration groups
+//! (`ui::toolgroup`) a run of calls opens out of and folds back into.
 
 use super::{CellKind, Transcript};
 use crate::ui::toolgroup;
@@ -121,5 +122,94 @@ impl Transcript {
 
     pub fn is_expanded(&self, cell_id: u64) -> bool {
         self.expanded.contains(&cell_id)
+    }
+
+    /// Record the rendered line count and viewport height from the most recent draw,
+    /// clamping `scroll_from_bottom` so the view can never sit past the top.
+    pub fn record_render(&mut self, total_lines: usize, viewport: usize) {
+        self.rendered_lines = Some(total_lines);
+        self.viewport_height = Some(viewport);
+        let max_scroll = total_lines.saturating_sub(viewport);
+        self.scroll_from_bottom = self.scroll_from_bottom.min(max_scroll);
+        self.first_visible_line = max_scroll.saturating_sub(self.scroll_from_bottom);
+    }
+
+    pub fn scroll_by(&mut self, delta: i32) {
+        let max_scroll = match (self.rendered_lines, self.viewport_height) {
+            (Some(total), Some(vp)) => total.saturating_sub(vp),
+            _ => 0,
+        };
+        let new_scroll =
+            (self.scroll_from_bottom as i64 + delta as i64).clamp(0, max_scroll as i64);
+        self.scroll_from_bottom = new_scroll as usize;
+        self.first_visible_line = max_scroll.saturating_sub(self.scroll_from_bottom);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        let max_scroll = match (self.rendered_lines, self.viewport_height) {
+            (Some(total), Some(vp)) => total.saturating_sub(vp),
+            _ => 0,
+        };
+        self.scroll_from_bottom = max_scroll;
+        self.first_visible_line = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_from_bottom = 0;
+        self.first_visible_line = self
+            .rendered_lines
+            .zip(self.viewport_height)
+            .map_or(0, |(total, viewport)| total.saturating_sub(viewport));
+    }
+
+    pub fn is_at_top(&self) -> bool {
+        match (self.rendered_lines, self.viewport_height) {
+            (Some(total), Some(vp)) => {
+                if total == 0 {
+                    return false;
+                }
+                let max_scroll = total.saturating_sub(vp);
+                self.scroll_from_bottom >= max_scroll
+            }
+            _ => false,
+        }
+    }
+
+    /// Screen position (0-based line offset from the top of the viewport) for a cell.
+    /// Returns `None` if the cell is not currently within the visible viewport.
+    pub fn cell_screen_position(&mut self, cell_id: u64, viewport: usize) -> Option<usize> {
+        if viewport == 0 {
+            return None;
+        }
+        self.sync_cell_line_index();
+        let index = *self.cell_line_index.get(&cell_id)?;
+        let (id, start, end) = self.cell_lines.get(index)?;
+        if *id != cell_id {
+            return None;
+        }
+        let first = self.first_visible_line;
+        let viewport_end = first.saturating_add(viewport);
+        if *end <= first || *start >= viewport_end {
+            None
+        } else {
+            Some(start.saturating_sub(first))
+        }
+    }
+
+    /// `cell_lines` is rewritten by the render pass, which keeps the index in
+    /// step; anything that clears the spans without the index (a reset) leaves
+    /// a map pointing at rows that no longer exist, so rebuild on the length
+    /// mismatch before trusting a position.
+    fn sync_cell_line_index(&mut self) {
+        if self.cell_line_index.len() == self.cell_lines.len() {
+            return;
+        }
+        self.cell_line_index.clear();
+        self.cell_line_index.extend(
+            self.cell_lines
+                .iter()
+                .enumerate()
+                .map(|(index, (id, _, _))| (*id, index)),
+        );
     }
 }
