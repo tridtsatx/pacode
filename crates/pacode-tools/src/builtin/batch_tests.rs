@@ -234,13 +234,22 @@ async fn non_readonly_bash_is_rejected_but_batch_continues() {
                 {"tool": "bash", "input": {"command": "echo ok"}},
                 {"tool": "write", "input": {"path": "x", "content": "y"}},
                 {"tool": "bash", "input": {"command": "sleep 1", "background": true}},
+                // Plan mode would allow it; side by side with other ops it is a script.
+                {"tool": "bash", "input": {"command": "sed -n 1p a.txt"}},
             ]}),
             &ctx,
         )
         .await
         .unwrap();
 
-    assert!(out.content.contains("not a read-only command"));
+    assert!(out.content.contains("not a plain read-only command"));
+    assert!(
+        out.content.contains(
+            "not a plain read-only command (batch ops run side by side): sed -n 1p a.txt"
+        ),
+        "{}",
+        out.content
+    );
     assert!(out.content.contains("not allowed in batch"));
     assert!(
         out.content.contains("background tasks are not allowed"),

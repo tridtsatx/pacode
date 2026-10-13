@@ -3,7 +3,9 @@
 //! Ops resolve through `ctx.tools` — the agent's live registry — so a tool
 //! disabled via `tools.<name>.enabled = false` fails inside a batch exactly as
 //! it would standalone. `bash` ops must additionally satisfy
-//! `pacode_risk::is_read_only`; instead of bash's own per-call permission the
+//! `pacode_risk::is_side_effect_free` — the ops run side by side, so a read
+//! that only Plan mode's looser `is_read_only` admits (a `sed` script, `xargs`,
+//! `cargo metadata`) is refused; instead of bash's own per-call permission the
 //! batch asks once for the whole set through a single `PermissionDraft` that
 //! lists every op, carrying the max risk across the commands.
 
@@ -35,7 +37,8 @@ const MAX_OPS_BYTES: usize = 256 * 1024;
 const CUT_NOTE_RESERVE: usize = 96;
 
 /// Read-only tools an op may invoke. `bash` is further restricted to commands
-/// passing `pacode_risk::is_read_only` (the same check Plan mode applies).
+/// passing `pacode_risk::is_side_effect_free` (a subset of what Plan mode
+/// allows).
 const ALLOWED_OPS: &[&str] = &["read", "grep", "glob", "ls", "symbols", "bash"];
 
 #[derive(Default)]
@@ -309,10 +312,13 @@ fn prepare(raw: &Value, ctx: &ToolCtx) -> PreparedOp {
                 reason: "background tasks are not allowed in batch".to_string(),
             };
         }
-        if !pacode_risk::is_read_only(&args.command) {
+        if !pacode_risk::is_side_effect_free(&args.command) {
             return PreparedOp::Rejected {
                 label,
-                reason: format!("not a read-only command: {}", args.command),
+                reason: format!(
+                    "not a plain read-only command (batch ops run side by side): {}",
+                    args.command
+                ),
             };
         }
         return PreparedOp::Ready {

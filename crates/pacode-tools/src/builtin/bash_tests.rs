@@ -53,6 +53,22 @@ fn anything_that_may_write_or_ask_keeps_its_place() {
     );
 }
 
+/// Plan mode's allowlist admits these, but each runs a script, a program from
+/// its arguments, or project code: nothing to run beside another call.
+#[test]
+fn reads_by_interpretation_still_run_one_at_a_time() {
+    for command in [
+        "cargo metadata --locked --format-version 1",
+        "sed -n 1p file",
+        "awk '{print $1}' file",
+        "find . -type f | xargs grep TODO",
+        "env FOO=1 ls",
+        "node --version",
+    ] {
+        assert!(!concurrent(command), "{command:?} must stay sequential");
+    }
+}
+
 /// The call never reaches a task: the stub host has none, and the decision it
 /// returns is a denial, so even a misclassified command could not run.
 fn denying_host() -> Arc<StubToolHost> {

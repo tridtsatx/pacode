@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use pacode_risk::{RiskLevel, classify_with_home, is_read_only};
+use pacode_risk::{RiskLevel, classify_with_home, is_read_only, is_side_effect_free};
 
 use RiskLevel::{Catastrophic, Confirm, Low, Safe};
 
@@ -349,3 +349,41 @@ fn ordinary_command_lines_keep_their_verdicts() {
     ]);
 }
 
+/// The concurrency predicate is a strict subset of the read-only one.
+#[test]
+fn side_effect_free_is_stricter_than_read_only() {
+    for command in [
+        "git status",
+        "git log --oneline -5",
+        "git diff HEAD~1",
+        "git show HEAD:Cargo.toml",
+        "ls -la crates",
+        "rg -n foo src",
+        "wc -l src/main.rs",
+        "cat Cargo.toml | head -20",
+        "timeout 0.3 tail -f /dev/null; echo done",
+        "grep -rn TODO src 2>/dev/null",
+        "stat Cargo.toml",
+    ] {
+        assert!(is_side_effect_free(command), "{command:?} is a plain read");
+        assert!(is_read_only(command), "{command:?} must also be read-only");
+    }
+    for command in [
+        "ls & touch x",
+        "cargo check",
+        "cargo metadata --locked --format-version 1",
+        "sed -n 1p file",
+        "awk '{print $1}' file",
+        "find . -type f | xargs grep TODO",
+        "env FOO=bar ls",
+        "python3 --version",
+        "git diff --output=x",
+        "echo $(pwd)",
+        "",
+    ] {
+        assert!(
+            !is_side_effect_free(command),
+            "{command:?} must not run side by side with other calls"
+        );
+    }
+}

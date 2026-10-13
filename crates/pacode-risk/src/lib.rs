@@ -11,13 +11,14 @@
 //!
 //! Layers: [`tokenize`] lexes, [`shell`] finds every simple command the line
 //! runs, `wrappers` finds the command behind `sudo`/`env`/`xargs`/`sh -c`; the
-//! gate ([`classify`]) and the Plan-mode check ([`is_read_only`]) both judge
-//! that one list.
+//! gate ([`classify`]), the Plan-mode check ([`is_read_only`]) and the
+//! concurrency check ([`is_side_effect_free`]) all judge that one list.
 
 mod assess;
 pub mod gate;
 mod git;
 pub mod paths;
+mod pure;
 pub mod readonly;
 pub mod shell;
 pub mod tokenize;
@@ -27,6 +28,7 @@ mod writers;
 use std::path::Path;
 
 pub use pacode_types::RiskLevel;
+pub use pure::is_side_effect_free;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RiskFinding {

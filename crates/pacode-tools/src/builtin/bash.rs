@@ -68,15 +68,21 @@ impl Tool for BashTool {
         ToolKind::Exec
     }
 
-    /// A command that only reads (the Plan-mode allowlist) and that the risk
+    /// A plain read (`pacode_risk::is_side_effect_free`) that the risk
     /// classifier finds `Safe`, which the permission matrix allows in every
     /// mode without a prompt. Anything else keeps its place in the sequence,
     /// so a command that may write or ask stays ordered against its neighbours.
+    ///
+    /// Stricter than the Plan-mode allowlist (`is_read_only`) on purpose:
+    /// that one also admits `sed`/`awk` scripts, `xargs`, `env` and tool
+    /// versions by reading their arguments, which is fine for "leaves the
+    /// project as it was" but not for "may run while another call runs" — a
+    /// miss there is a silent race, not a refused command.
     fn runs_concurrently(&self, input: &Value, cwd: &std::path::Path) -> bool {
         let Some(command) = input.get("command").and_then(Value::as_str) else {
             return false;
         };
-        pacode_risk::is_read_only(command)
+        pacode_risk::is_side_effect_free(command)
             && pacode_risk::classify(command, cwd).level == pacode_risk::RiskLevel::Safe
     }
 
