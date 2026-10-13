@@ -5,6 +5,8 @@ use std::mem::size_of;
 use std::time::Instant;
 
 use pacode_render::{LineCache, RenderOptions, StreamBuffer, StreamKind, StreamOp};
+
+use crate::ui::toolgroup::GroupHead;
 use pacode_types::{
     ExplainLevel, PermissionId, PermissionRequest, Question, ToolStatus, TranscriptItem,
     TranscriptKind,
@@ -12,6 +14,8 @@ use pacode_types::{
 
 #[path = "tool_stream.rs"]
 mod tool_stream;
+#[path = "transcript_expand.rs"]
+mod transcript_expand;
 
 pub use tool_stream::{MAX_TOOL_STREAM_CHARS, MAX_TOOL_STREAMS, ToolStreamView, ToolStreams};
 
@@ -265,6 +269,9 @@ pub struct Transcript {
     /// `(cell id, first line, one past the last)`. This is how a click on a row
     /// finds the cell under it.
     pub cell_lines: Vec<(u64, usize, usize)>,
+    /// The header rows of every exploration group of the most recent draw: a
+    /// click there opens the whole group rather than one call of it.
+    pub(crate) group_heads: Vec<GroupHead>,
     pub cache: LineCache,
     pub(crate) stable_revisions: HashMap<u64, StableRevision>,
     pub(crate) cell_line_index: HashMap<u64, usize>,
@@ -305,6 +312,7 @@ impl Transcript {
             first_visible_line: 0,
             expanded: HashSet::new(),
             cell_lines: Vec::new(),
+            group_heads: Vec::new(),
             cache: LineCache::new(20_000),
             stable_revisions: HashMap::new(),
             cell_line_index: HashMap::new(),
@@ -336,6 +344,7 @@ impl Transcript {
         self.pending_final = None;
         self.expanded.clear();
         self.cell_lines.clear();
+        self.group_heads.clear();
         self.scroll_from_bottom = 0;
         self.first_visible_line = 0;
         self.loading_history = false;
@@ -596,13 +605,12 @@ impl Transcript {
         } = self;
         render_profile.as_ref().map_or(0, |profile| {
             crate::ui::dialog::measure_cell_lines(
-                cells.iter().take(retained_prefix),
+                cells,
+                retained_prefix,
                 expanded,
                 cache,
                 tool_streams,
-                &profile.options,
-                profile.width,
-                profile.anim_frame,
+                profile,
             )
         })
     }
@@ -1064,47 +1072,6 @@ impl Transcript {
 
     /// Record the rendered line count and viewport height from the most recent draw,
     /// clamping `scroll_from_bottom` so the view can never sit past the top.
-    /// The cell drawn at content line `line`, from the most recent draw.
-    pub fn cell_at_line(&self, line: usize) -> Option<u64> {
-        let index = self.cell_lines.partition_point(|(_, _, end)| *end <= line);
-        let (cell_id, start, end) = self.cell_lines.get(index)?;
-        (*start <= line && line < *end).then_some(*cell_id)
-    }
-
-    /// `ctrl+o`: expand the newest tool cell, or collapse it back when it is
-    /// already expanded. Every tool call is expandable — any status (a denied
-    /// call reveals the refused command) and any preview length (expansion
-    /// also shows the call's full argument, which the collapsed cell never
-    /// had room for). A `!cmd` result is drawn as a bash call and folds the
-    /// same way, so it expands too. Returns true on change.
-    pub fn toggle_last_expandable(&mut self) -> bool {
-        let id = self.cells.iter().rev().find_map(|c| match &c.kind {
-            CellKind::Item(
-                TranscriptKind::ToolCall { .. } | TranscriptKind::BashCommand { .. },
-            ) => Some(c.id),
-            _ => None,
-        });
-        let Some(id) = id else { return false };
-        self.toggle_expanded(id)
-    }
-
-    /// Show or hide a cell's full output. Returns true when something changed.
-    pub fn toggle_expanded(&mut self, cell_id: u64) -> bool {
-        if self.cell_index(cell_id).is_none() {
-            return false;
-        }
-        if !self.expanded.remove(&cell_id) {
-            self.expanded.insert(cell_id);
-        }
-        // The rendered height changes, so the cached lines for that cell are stale.
-        self.cache.invalidate_cell(cell_id);
-        true
-    }
-
-    pub fn is_expanded(&self, cell_id: u64) -> bool {
-        self.expanded.contains(&cell_id)
-    }
-
     pub fn record_render(&mut self, total_lines: usize, viewport: usize) {
         self.rendered_lines = Some(total_lines);
         self.viewport_height = Some(viewport);

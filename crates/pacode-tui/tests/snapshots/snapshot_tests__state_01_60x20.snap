@@ -2,13 +2,13 @@
 source: crates/pacode-tui/tests/snapshot_tests.rs
 expression: view
 ---
-"▄▀▀▀▀▀▀▀▀▀▀▀▀                                               "
-"▀▀▀▀▀▀▀▀▀▀        pacode  v0.1.0-dev                        "
 "▀▀▀▀▀▀▀▀▀▄       made by tridtsat                           "
 "▀▀▀▀▀▀▀▀▀▀▀▀▄                                               "
 "  ▀▀▀▀▀▀▀▀▀▀                                                "
 "                                                            "
+"▌                                                           "
 "▌ Refactor TUI layout and split into modules                "
+"▌                                                           "
 "                                                            "
 "● I'll help you organize the TUI crate with a persistent    "
 "  rail and separate dialog column.                          "

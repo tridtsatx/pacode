@@ -19,23 +19,26 @@ mod cells_tests;
 const ASSISTANT_INDENT: usize = 2;
 
 /// The user's message as a plaque: a full-width band on `surface`, the accent
-/// bar `▌` at its left edge, the text bold. Under ANSI-16 and mono the band has
-/// no background, and the bar plus the weight carry it.
+/// bar `▌` at its left edge, the text bold, one empty band row above and below
+/// the text so the plaque reads as a block (omp's user bubble). Under ANSI-16
+/// and mono the band has no background, and the bar plus the weight carry it.
 fn user_band(text: &str, opts: &RenderOptions) -> Vec<Line<'static>> {
     let width = opts.width as usize;
     let band = opts.theme.surface;
     let prefix = format!("{} ", crate::ui::chrome::band_bar(opts));
     let prefix_w = display_width(&prefix);
     let avail = width.saturating_sub(prefix_w).max(1);
-    let mut out = Vec::new();
-    for l in wrap_text(text, avail) {
+    let row = |l: String| {
         let pad = width.saturating_sub(prefix_w + display_width(&l));
-        out.push(Line::from(vec![
+        Line::from(vec![
             Span::styled(prefix.clone(), opts.theme.user_bar.patch(band)),
             Span::styled(l, opts.theme.bold.patch(band)),
             Span::styled(" ".repeat(pad), band),
-        ]));
-    }
+        ])
+    };
+    let mut out = vec![row(String::new())];
+    out.extend(wrap_text(text, avail).into_iter().map(row));
+    out.push(row(String::new()));
     out.push(Line::default());
     out
 }
@@ -144,12 +147,21 @@ pub(super) fn render_background_result(
     let fixed = pacode_render::display_width(&head) + pacode_render::display_width(&tail) + 1;
     let label = truncate_to_width(&result.label, (width as usize).saturating_sub(fixed), true);
 
-    vec![Line::from(vec![
+    // The job's outcome tints the row the way a tool call's does; a job
+    // stopped on purpose is no failure, so it takes the neutral pending tint.
+    let bg = match result.outcome {
+        BackgroundOutcome::Completed => opts.theme.tool_success_bg,
+        BackgroundOutcome::Failed => opts.theme.tool_error_bg,
+        BackgroundOutcome::Killed => opts.theme.tool_pending_bg,
+    };
+    let mut lines = vec![Line::from(vec![
         Span::styled(head, opts.theme.cyan),
         Span::styled(label, opts.theme.dim),
         Span::raw(" "),
         Span::styled(tail, style),
-    ])]
+    ])];
+    crate::ui::toolcell::paint_block(&mut lines, bg, width as usize);
+    lines
 }
 
 /// `expanded` shows a tool call's whole output, wrapped, instead of its first

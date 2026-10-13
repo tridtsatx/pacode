@@ -31,7 +31,8 @@ fn scroll_panel(state: &mut AppState, delta: i32) {
     }
 }
 
-/// Show or hide the full output of the cell under a clicked row.
+/// Show or hide the full output of the cell under a clicked row; a click on
+/// an exploration group's header opens the whole group.
 fn toggle_cell_under(state: &mut AppState, row: u16, dialog: ratatui::layout::Rect) {
     let replaced = state.agent_replaces_dialog();
     let transcript = if replaced {
@@ -40,10 +41,7 @@ fn toggle_cell_under(state: &mut AppState, row: u16, dialog: ratatui::layout::Re
         &mut state.transcript
     };
     let line = transcript.first_visible_line + row.saturating_sub(dialog.y) as usize;
-    let Some(cell_id) = transcript.cell_at_line(line) else {
-        return;
-    };
-    if transcript.toggle_expanded(cell_id) {
+    if transcript.toggle_at_line(line) {
         state.dirty = true;
     }
 }

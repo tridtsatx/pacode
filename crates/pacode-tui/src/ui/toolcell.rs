@@ -32,8 +32,17 @@ use pacode_types::transcript::{DiffStat, ToolStatus};
 
 #[path = "toolcell_args.rs"]
 mod args;
+#[path = "toolcell_bg.rs"]
+mod bg;
+#[path = "toolcell_row.rs"]
+mod row;
 #[path = "toolcell_stream.rs"]
 mod stream;
+
+pub(crate) use bg::{paint_block, status_bg};
+#[cfg(test)]
+pub(crate) use row::OUTCOMES_COUNTED;
+pub(crate) use row::{compact_row, group_header, more_row};
 
 #[cfg(test)]
 use args::title_arg;
@@ -65,7 +74,38 @@ pub struct ToolCallView<'a> {
     pub streamed: Option<crate::state::transcript::ToolStreamView<'a>>,
 }
 
-/// Header + body on the outcome gutter + the blank separator every cell ends with.
+impl<'a> ToolCallView<'a> {
+    /// The view of a `ToolCall` item; `None` for every other kind.
+    pub fn of(
+        kind: &'a pacode_types::TranscriptKind,
+        streamed: Option<crate::state::transcript::ToolStreamView<'a>>,
+    ) -> Option<Self> {
+        let pacode_types::TranscriptKind::ToolCall {
+            name,
+            title,
+            status,
+            preview,
+            diff,
+            duration_ms,
+            ..
+        } = kind
+        else {
+            return None;
+        };
+        Some(Self {
+            name,
+            title,
+            status: *status,
+            preview,
+            diff: diff.as_ref(),
+            duration_ms: *duration_ms,
+            streamed,
+        })
+    }
+}
+
+/// Header + body on the outcome gutter, all on the status band, + the blank
+/// separator every cell ends with (never painted).
 pub fn render(
     call: &ToolCallView<'_>,
     width: u16,
@@ -217,6 +257,7 @@ pub fn render(
         ]));
     }
 
+    paint_block(&mut out, status_bg(call.status, opts), width);
     out.push(Line::default());
     out
 }

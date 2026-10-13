@@ -2,7 +2,9 @@ use std::time::Instant;
 
 use pacode_types::{ExplainLevel, RiskLevel, ToastLevel};
 
+use super::plain::line_text;
 use super::*;
+use crate::state::selection::{MAX_SELECTION_BYTES, MAX_SELECTION_LINES};
 use crate::state::transcript::PermExplain;
 
 fn whole() -> super::PlainWindow {

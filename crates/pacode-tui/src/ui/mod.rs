@@ -30,6 +30,7 @@ pub mod settings_ui;
 pub mod theme_picker;
 pub mod toast;
 pub mod toolcell;
+pub(crate) mod toolgroup;
 
 use std::rc::Rc;
 

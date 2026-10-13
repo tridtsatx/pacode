@@ -46,11 +46,21 @@ fn running_capped<'a>(streamed: &'a str, dropped: usize) -> ToolCallView<'a> {
     }
 }
 
+/// Each row's text, the status band's trailing padding trimmed off — what a
+/// copy of the row holds.
 fn text_of(lines: &[Line<'static>]) -> Vec<String> {
     lines
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .map(|l| {
+            let row: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            row.trim_end().to_string()
+        })
         .collect()
+}
+
+/// `style` on the status band of a call that ended `status`.
+fn banded(style: Style, status: ToolStatus, opts: &RenderOptions) -> Style {
+    style.patch(status_bg(status, opts))
 }
 
 fn lines_preview(n: usize) -> String {
@@ -90,7 +100,10 @@ fn header_is_label_arg_and_the_outcome_sits_flush_right() {
     let expected_left = format!(" {ok} {label}  docker ps");
     assert!(header.starts_with(&expected_left), "{header}");
     assert_eq!(lines[0].spans[0].style, opts.theme.badge(opts.theme.green));
-    assert_eq!(lines[0].spans[2].style, opts.theme.fg);
+    assert_eq!(
+        lines[0].spans[2].style,
+        banded(opts.theme.fg, ToolStatus::Ok, &opts)
+    );
 
     // Genuinely flush right: the row is exactly `width` wide and ends with the
     // duration — the exit code moved into the `└` footer.
@@ -261,13 +274,14 @@ fn ansi_escapes_are_stripped_and_cannot_restyle_the_gutter() {
     );
 
     // The gutter is painted by US — not by the program.
-    assert_eq!(lines[1].spans[0].style, opts.theme.dim);
+    let dim = banded(opts.theme.dim, ToolStatus::Ok, &opts);
+    assert_eq!(lines[1].spans[0].style, dim);
     assert_eq!(
         lines[1].spans[0].content,
         format!(" {} ", opts.glyphs.vline)
     );
     // …while the program's text itself stays dim.
-    assert_eq!(lines[1].spans[1].style, opts.theme.dim);
+    assert_eq!(lines[1].spans[1].style, dim);
 }
 
 #[test]
@@ -436,13 +450,19 @@ fn bash_commands_get_a_dollar_line_with_syntax_highlighting() {
         .iter()
         .find(|s| s.content == "cargo")
         .expect("the command word is its own span");
-    assert_eq!(cmd_span.style, opts.theme.bash_command);
+    assert_eq!(
+        cmd_span.style,
+        banded(opts.theme.bash_command, ToolStatus::Ok, &opts)
+    );
     let flag_span = lines[1]
         .spans
         .iter()
         .find(|s| s.content == "--release")
         .expect("the flag is its own span");
-    assert_eq!(flag_span.style, opts.theme.bash_flag);
+    assert_eq!(
+        flag_span.style,
+        banded(opts.theme.bash_flag, ToolStatus::Ok, &opts)
+    );
 }
 
 #[test]
@@ -607,7 +627,10 @@ fn a_diff_preview_renders_on_the_gutter() {
     assert!(joined.contains("@@"), "{joined}");
     // The quiet gutter fronts the diff renderer's output, and the header
     // still carries the +A −R stat.
-    assert_eq!(lines[1].spans[0].style, opts.theme.dim);
+    assert_eq!(
+        lines[1].spans[0].style,
+        banded(opts.theme.dim, ToolStatus::Ok, &opts)
+    );
     assert!(text[0].contains("+1"), "{}", text[0]);
     // No `$` line, no line cap — the diff renderer owns this body.
     assert!(body.iter().all(|l| !l.contains("$ ")), "{body:?}");

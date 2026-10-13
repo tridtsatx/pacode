@@ -37,9 +37,9 @@ fn the_user_message_is_a_full_width_band_with_a_bar_and_bold_text() {
         &opts,
         false,
     );
-    // Two wrapped rows and the blank separator.
-    assert_eq!(lines.len(), 3);
-    for row in &lines[..2] {
+    // A padding row, two wrapped rows, a padding row, the blank separator.
+    assert_eq!(lines.len(), 5);
+    for row in &lines[..4] {
         assert!(text(row).starts_with("▌ "));
         assert_eq!(width_of(row), 30, "the band spans the whole row");
         for span in &row.spans {
@@ -52,20 +52,51 @@ fn the_user_message_is_a_full_width_band_with_a_bar_and_bold_text() {
                 .contains(ratatui::style::Modifier::BOLD)
         );
     }
+    assert!(text(&lines[1]).contains("make me"));
+    for pad in [&lines[0], &lines[3]] {
+        assert_eq!(
+            text(pad).trim_end(),
+            "▌",
+            "a padding row is the bar on an empty band"
+        );
+    }
     assert_eq!(
-        lines[2],
+        lines[4],
         Line::default(),
         "the separator is not part of the band"
     );
 }
 
 #[test]
+fn the_user_band_padding_rows_copy_as_blank_lines() {
+    let opts = opts(30);
+    let kind = TranscriptKind::User { text: "hi".into() };
+    let lines = render(&kind, &opts, false);
+    let cell = CellKind::Item(kind.clone());
+    for row in &lines[..3] {
+        let lead = decoration_width(&cell, row, &opts);
+        assert_eq!(lead, 2, "the bar is decoration on every band row");
+    }
+    let copied: Vec<String> = lines[..3]
+        .iter()
+        .map(|row| {
+            let t = text(row);
+            t.chars().skip(2).collect::<String>().trim_end().to_string()
+        })
+        .collect();
+    assert_eq!(copied, ["", "hi", ""]);
+}
+
+#[test]
 fn the_user_band_falls_back_to_an_ascii_bar() {
     let opts = RenderOptions::with_theme_color(20, true, Theme::ansi(), ColorMode::Ansi);
     let lines = render(&TranscriptKind::User { text: "hi".into() }, &opts, false);
-    assert!(text(&lines[0]).starts_with("| hi"));
+    assert!(text(&lines[0]).starts_with("| "));
+    assert!(text(&lines[1]).starts_with("| hi"));
     // ANSI-16 has no band background.
-    assert!(lines[0].spans.iter().all(|s| s.style.bg.is_none()));
+    for row in &lines {
+        assert!(row.spans.iter().all(|s| s.style.bg.is_none()));
+    }
 }
 
 #[test]
@@ -171,4 +202,49 @@ fn a_failed_bang_command_gets_a_failed_badge_and_its_exit_code() {
         "failure is a red plaque"
     );
     assert!(lines.iter().any(|l| text(l).contains("Exited with code 1")));
+}
+
+#[test]
+fn a_bang_command_sits_on_the_band_of_its_exit_code() {
+    let opts = opts(40);
+    for (code, band) in [
+        (0, opts.theme.tool_success_bg),
+        (2, opts.theme.tool_error_bg),
+    ] {
+        let lines = render(&bash("make", "out", Some(code), false), &opts, false);
+        let (gap, block) = lines.split_last().expect("a block and its gap");
+        assert_eq!(*gap, Line::default());
+        for row in block {
+            assert_eq!(width_of(row), 40);
+            assert_eq!(row.spans.last().and_then(|s| s.style.bg), band.bg);
+        }
+    }
+}
+
+#[test]
+fn a_finished_background_job_is_tinted_by_its_outcome() {
+    use crate::state::{BackgroundKind, BackgroundOutcome, BackgroundResult};
+
+    let job = |outcome| BackgroundResult {
+        kind: BackgroundKind::Task,
+        label: "cargo build".into(),
+        outcome,
+        exit_code: None,
+        duration_ms: 1500,
+    };
+    let opts = opts(40);
+    for (outcome, band) in [
+        (BackgroundOutcome::Completed, opts.theme.tool_success_bg),
+        (BackgroundOutcome::Failed, opts.theme.tool_error_bg),
+        (BackgroundOutcome::Killed, opts.theme.tool_pending_bg),
+    ] {
+        let lines = render_background_result(&job(outcome), 40, &opts);
+        assert_eq!(width_of(&lines[0]), 40);
+        for span in &lines[0].spans {
+            assert_eq!(span.style.bg, band.bg, "{outcome:?}: {:?}", span.content);
+        }
+    }
+    let ansi = RenderOptions::with_theme_color(40, false, Theme::ansi(), ColorMode::Ansi);
+    let lines = render_background_result(&job(BackgroundOutcome::Failed), 40, &ansi);
+    assert!(lines[0].spans.iter().all(|s| s.style.bg.is_none()));
 }

@@ -1,7 +1,6 @@
 //! The transcript (main dialog and the agent panel share this renderer).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::RangeInclusive;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -15,97 +14,25 @@ use pacode_types::TranscriptKind;
 use pacode_types::transcript::ToolStatus;
 
 use super::cells::{
-    assistant_markdown, assistant_stats_line, decoration_width, render_background_result,
-    render_item_inner,
+    assistant_markdown, assistant_stats_line, render_background_result, render_item_inner,
 };
-use crate::state::selection::{MAX_SELECTION_BYTES, MAX_SELECTION_LINES};
+use super::toolgroup::{self, Segment};
 use crate::state::transcript::{
     Cell, CellKind, HeaderInfo, StableRevision, ToolStreamView, ToolStreams, Transcript,
 };
+
+#[path = "dialog_plain.rs"]
+mod plain;
+
+pub(crate) use plain::{PlainLines, PlainWindow, measure_cell_lines, plain_lines};
 
 #[cfg(test)]
 #[path = "dialog_tests.rs"]
 mod dialog_tests;
 
-/// How much of a transcript a copy needs: the lines it reads, and how much
-/// plain text it may hold.
-#[derive(Clone, Debug)]
-pub(crate) struct PlainWindow {
-    pub lines: Option<RangeInclusive<usize>>,
-    pub max_bytes: usize,
-}
-
-impl PlainWindow {
-    pub fn for_lines(lines: RangeInclusive<usize>) -> Self {
-        Self {
-            lines: Some(lines),
-            max_bytes: MAX_SELECTION_BYTES,
-        }
-    }
-}
-
-/// Transcript lines as plain text, for the clipboard. `first_line` is the
-/// content line number `lines[0]` stands for, so the caller can index the
-/// result by transcript line without the copy having materialized everything
-/// above the selection.
-///
-/// `leads[i]` is how many leading columns of `lines[i]` are decoration — the
-/// user band's bar, the answer's marker and indent, a tool body's gutter. The
-/// text keeps them so columns stay aligned with the screen; the copy drops
-/// them. A missing entry means none.
-#[derive(Default)]
-pub(crate) struct PlainLines {
-    pub lines: Vec<String>,
-    pub leads: Vec<usize>,
-    pub first_line: usize,
-}
-
-/// Collects the lines a window covers, under the line and byte caps.
-struct PlainSink {
-    out: PlainLines,
-    bytes: usize,
-    start: usize,
-    end: usize,
-    max_bytes: usize,
-}
-
-impl PlainSink {
-    fn new(window: PlainWindow) -> Self {
-        Self {
-            out: PlainLines::default(),
-            bytes: 0,
-            start: window.lines.as_ref().map_or(0, |range| *range.start()),
-            end: window
-                .lines
-                .as_ref()
-                .map_or(usize::MAX, |range| *range.end()),
-            max_bytes: window.max_bytes,
-        }
-    }
-
-    /// `rendered` holds each row's text and its decoration width.
-    fn push(&mut self, rendered: &[(String, usize)], at: usize) {
-        for (offset, (text, lead)) in rendered.iter().enumerate() {
-            let line = at.saturating_add(offset);
-            if line < self.start || line > self.end {
-                continue;
-            }
-            self.bytes = self.bytes.saturating_add(text.len());
-            if self.out.lines.is_empty() {
-                self.out.first_line = line;
-            }
-            self.out.lines.push(text.clone());
-            self.out.leads.push(*lead);
-            if self.full() {
-                return;
-            }
-        }
-    }
-
-    fn full(&self) -> bool {
-        self.bytes > self.max_bytes || self.out.lines.len() >= MAX_SELECTION_LINES
-    }
-}
+#[cfg(test)]
+#[path = "dialog_group_tests.rs"]
+mod dialog_group_tests;
 
 #[derive(Default)]
 pub(crate) struct PreparedDialog {
@@ -139,10 +66,11 @@ pub(crate) fn prepare(
         first_visible_line,
         live_cell,
         tool_streams,
+        group_heads,
         ..
     } = transcript;
 
-    let blocks = build_cell_lines(
+    let (blocks, segments) = build_cell_lines(
         CellsSource {
             cells,
             expanded,
@@ -171,13 +99,29 @@ pub(crate) fn prepare(
     let mut spans = std::mem::take(cell_lines);
     spans.clear();
     spans.reserve(cells.len());
+    group_heads.clear();
+    let mut block_starts = Vec::with_capacity(blocks.len());
     let mut total_lines = 0usize;
     for (index, block) in blocks.iter().enumerate() {
+        block_starts.push(total_lines);
         let end = total_lines + block.lines().len();
-        if index >= header_blocks
-            && let Some(cell) = cells.get(index - header_blocks)
+        match index
+            .checked_sub(header_blocks)
+            .and_then(|segment| segments.get(segment))
         {
-            spans.push((cell.id, total_lines, end));
+            Some(Segment::Cell(cell)) => {
+                if let Some(cell) = cells.get(*cell) {
+                    spans.push((cell.id, total_lines, end));
+                }
+            }
+            Some(Segment::Group(range)) => toolgroup::push_spans(
+                cells,
+                range.clone(),
+                total_lines..end,
+                &mut spans,
+                group_heads,
+            ),
+            None => {}
         }
         total_lines = end;
     }
@@ -216,8 +160,7 @@ pub(crate) fn prepare(
         (start, scroll > 0)
     };
 
-    let mut visible_lines =
-        collect_visible_lines(&blocks, cell_lines, header_blocks > 0, start_line, viewport);
+    let mut visible_lines = collect_visible_lines(&blocks, &block_starts, start_line, viewport);
 
     if is_scrolled_up && !visible_lines.is_empty() {
         let last_idx = visible_lines.len() - 1;
@@ -264,10 +207,11 @@ pub(crate) fn draw(frame: &mut Frame, area: Rect, prepared: &PreparedDialog) {
     frame.render_widget(Paragraph::new(prepared.lines.clone()), area);
 }
 
-fn collect_visible_lines<'a>(
-    blocks: &[Block<'a>],
-    spans: &[(u64, usize, usize)],
-    has_header: bool,
+/// The rows from content line `start_line` down, `viewport` of them at most.
+/// `starts[i]` is the first content line of `blocks[i]`.
+fn collect_visible_lines(
+    blocks: &[Block<'_>],
+    starts: &[usize],
     start_line: usize,
     viewport: usize,
 ) -> Vec<Line<'static>> {
@@ -275,27 +219,12 @@ fn collect_visible_lines<'a>(
     if viewport == 0 || blocks.is_empty() {
         return visible;
     }
-
-    let (block_index, offset) = if start_line == 0 {
-        (0, 0)
-    } else {
-        let header_lines = spans
-            .first()
-            .map(|(_, start, _)| *start)
-            .unwrap_or_else(|| blocks[0].lines().len());
-        if start_line < header_lines {
-            (0, start_line)
-        } else {
-            let cell_index = spans.partition_point(|(_, _, end)| *end <= start_line);
-            let Some((_, cell_start, _)) = spans.get(cell_index) else {
-                return visible;
-            };
-            (
-                (if has_header { 1 } else { 0 }) + cell_index,
-                start_line.saturating_sub(*cell_start),
-            )
-        }
-    };
+    // The last block starting at or above the line: an empty block shares
+    // its start with the next one, which is the one holding the line.
+    let block_index = starts
+        .partition_point(|start| *start <= start_line)
+        .saturating_sub(1);
+    let offset = start_line.saturating_sub(starts.get(block_index).copied().unwrap_or(0));
 
     if let Some(block) = blocks.get(block_index) {
         extend_visible(&mut visible, block.lines(), offset, viewport);
@@ -364,20 +293,23 @@ struct CellsSource<'a> {
 
 /// Render every block of the transcript in display order: the header banner
 /// first (it lives outside `cells` so a transcript seq can never collide with
-/// it), then one block per cell.
+/// it), then one block per segment — a cell, or a run of exploration calls
+/// folded into one group (`toolgroup`). The segments come back with the
+/// blocks, one per block after the banner.
 ///
 /// §8.1: the cells and the render cache are borrowed as separate fields —
 /// the previous per-frame `CellKind` clone of every cell (each potentially a
 /// whole markdown document) is gone. The per-frame `to_vec` of every cached
 /// cell is gone too, in two phases: first a `&mut` pass makes sure every
-/// cacheable cell is in the cache (rendering misses, refreshing recency), then
-/// a `&` pass collects the blocks as borrows. Live assistant cells and running
-/// tool calls still render fresh every frame and stay `Owned`.
+/// cacheable block is in the cache (rendering misses, refreshing recency),
+/// then a `&` pass collects the blocks as borrows. Live assistant cells and
+/// running tool calls (and groups holding one) still render fresh every
+/// frame and stay `Owned`.
 fn build_cell_lines<'a>(
     src: CellsSource<'a>,
     cache: &'a mut LineCache,
     opts: &RenderOptions,
-) -> Vec<Block<'a>> {
+) -> (Vec<Block<'a>>, Vec<Segment>) {
     let CellsSource {
         cells,
         expanded,
@@ -389,7 +321,8 @@ fn build_cell_lines<'a>(
         anim_frame,
         welcome_ms,
     } = src;
-    let mut blocks: Vec<Block<'a>> = Vec::with_capacity(cells.len() + 1);
+    let segments = toolgroup::segments(cells.iter(), expanded, opts.thinking);
+    let mut blocks: Vec<Block<'a>> = Vec::with_capacity(segments.len() + 1);
 
     if let Some(info) = header {
         blocks.push(Block::Owned(crate::ui::header::render(
@@ -397,39 +330,98 @@ fn build_cell_lines<'a>(
         )));
     }
 
-    // Phase one, `&mut cache`: plan every cell and fill cache misses.
-    let mut plans: Vec<CellPlan> = Vec::with_capacity(cells.len());
-    for cell in cells.iter() {
-        plans.push(plan_cell(
-            cell,
-            CellRenderState {
-                live: live_id == Some(cell.id),
-                expanded: expanded.contains(&cell.id),
-                stable_revision: stable_revisions.get(&cell.id).copied().unwrap_or((0, 0)),
-            },
-            opts,
-            cache,
-            width,
-            anim_frame,
-        ));
+    // Phase one, `&mut cache`: plan every block and fill cache misses. The
+    // segment indices come from `cells` itself, so they are in bounds.
+    let mut plans: Vec<CellPlan> = Vec::with_capacity(segments.len());
+    for segment in &segments {
+        plans.push(match segment {
+            Segment::Cell(index) => {
+                let cell = &cells[*index];
+                plan_cell(
+                    cell,
+                    CellRenderState {
+                        live: live_id == Some(cell.id),
+                        expanded: expanded.contains(&cell.id),
+                        stable_revision: stable_revisions.get(&cell.id).copied().unwrap_or((0, 0)),
+                    },
+                    opts,
+                    cache,
+                    width,
+                    anim_frame,
+                )
+            }
+            Segment::Group(range) => {
+                plan_group(cells, range.clone(), opts, cache, width, anim_frame)
+            }
+        });
     }
 
     // Phase two, `& cache`: no more `&mut` calls, so the cached blocks can be
     // borrowed out of the entries phase one left behind.
     let cache: &'a LineCache = cache;
-    for (cell, plan) in cells.iter().zip(plans.iter()) {
-        blocks.push(cell_block(
-            cell,
-            plan,
-            expanded.contains(&cell.id),
-            opts,
-            cache,
-            tool_streams,
-            anim_frame,
-        ));
+    for (segment, plan) in segments.iter().zip(plans.iter()) {
+        blocks.push(match segment {
+            Segment::Cell(index) => {
+                let cell = &cells[*index];
+                cell_block(
+                    cell,
+                    plan,
+                    expanded.contains(&cell.id),
+                    opts,
+                    cache,
+                    tool_streams,
+                    anim_frame,
+                )
+            }
+            Segment::Group(range) => {
+                group_block(cells, range.clone(), plan, opts, cache, anim_frame)
+            }
+        });
     }
 
-    blocks
+    (blocks, segments)
+}
+
+/// The phase-one decision for a group: fresh while a member runs, cached
+/// otherwise under a key that changes with every member. Either way the
+/// finished members' rows are memoized first, so a fresh draw redraws only
+/// the header and the running rows.
+fn plan_group(
+    cells: &VecDeque<Cell>,
+    range: std::ops::Range<usize>,
+    opts: &RenderOptions,
+    cache: &mut LineCache,
+    width: u16,
+    anim_frame: u64,
+) -> CellPlan {
+    toolgroup::warm_rows(cells, range.clone(), opts, cache);
+    if toolgroup::has_running(cells, range.clone()) {
+        return CellPlan::Fresh;
+    }
+    let key = toolgroup::cache_key(cells, range.clone(), width, opts.cache_epoch);
+    if cache.get(key).is_none() {
+        let lines = toolgroup::render(cells, range, opts, anim_frame, cache);
+        cache.insert(key, lines);
+    }
+    CellPlan::Cached(key)
+}
+
+/// The phase-two block for a group: a borrow of what phase one cached, or a
+/// fresh render while a member runs.
+fn group_block<'a>(
+    cells: &VecDeque<Cell>,
+    range: std::ops::Range<usize>,
+    plan: &CellPlan,
+    opts: &RenderOptions,
+    cache: &'a LineCache,
+    anim_frame: u64,
+) -> Block<'a> {
+    if let CellPlan::Cached(key) = plan
+        && let Some(lines) = cache.peek(*key)
+    {
+        return Block::Cached(lines);
+    }
+    Block::Owned(toolgroup::render(cells, range, opts, anim_frame, cache))
 }
 
 #[derive(Clone, Copy)]
@@ -570,88 +562,6 @@ fn render_cell_block<'a>(
         tool_streams,
         anim_frame,
     )
-}
-
-pub(crate) fn measure_cell_lines<'a>(
-    cells: impl Iterator<Item = &'a Cell>,
-    expanded: &HashSet<u64>,
-    cache: &mut LineCache,
-    tool_streams: &ToolStreams,
-    opts: &RenderOptions,
-    width: u16,
-    anim_frame: u64,
-) -> usize {
-    let mut lines = 0usize;
-    for cell in cells {
-        let state = CellRenderState {
-            live: false,
-            expanded: expanded.contains(&cell.id),
-            stable_revision: (0, 0),
-        };
-        let block = render_cell_block(cell, state, opts, cache, tool_streams, width, anim_frame);
-        lines = lines.saturating_add(block.lines().len());
-    }
-    lines
-}
-
-pub(crate) fn plain_lines(
-    transcript: &mut Transcript,
-    width: u16,
-    opts: &RenderOptions,
-    anim_frame: u64,
-    welcome_ms: u64,
-    window: PlainWindow,
-) -> PlainLines {
-    transcript.set_render_profile(width, opts, anim_frame);
-    let Transcript {
-        cells,
-        expanded,
-        cache,
-        stable_revisions,
-        header,
-        live_cell,
-        tool_streams,
-        ..
-    } = &mut *transcript;
-    let mut sink = PlainSink::new(window);
-    let mut line = 0usize;
-
-    if let Some(info) = header.as_ref() {
-        let rendered: Vec<(String, usize)> =
-            crate::ui::header::render(info, width, opts, anim_frame, welcome_ms)
-                .iter()
-                .map(|l| (line_text(l), 0))
-                .collect();
-        sink.push(&rendered, line);
-        line += rendered.len();
-    }
-
-    for cell in cells.iter() {
-        if line > sink.end || sink.full() {
-            break;
-        }
-        let state = CellRenderState {
-            live: *live_cell == Some(cell.id),
-            expanded: expanded.contains(&cell.id),
-            stable_revision: stable_revisions.get(&cell.id).copied().unwrap_or((0, 0)),
-        };
-        let block = render_cell_block(cell, state, opts, cache, tool_streams, width, anim_frame);
-        let rendered: Vec<(String, usize)> = block
-            .lines()
-            .iter()
-            .map(|l| (line_text(l), decoration_width(&cell.kind, l, opts)))
-            .collect();
-        sink.push(&rendered, line);
-        line += rendered.len();
-    }
-    sink.out
-}
-
-fn line_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect()
 }
 
 /// Test-only entry point: render one cell exactly as the transcript would.

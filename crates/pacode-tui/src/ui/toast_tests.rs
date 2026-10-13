@@ -302,9 +302,10 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
 
     let dialog_area = Rect::new(0, 0, 60, 20);
 
-    // 1. Selection with CopyRequest::Auto
-    state.selection.start(2, 0, dialog_area, 0);
-    state.selection.drag(15, 0, dialog_area, 0);
+    // 1. Selection with CopyRequest::Auto — on row 1, the message's text:
+    // row 0 is the user band's padding, which copies as nothing.
+    state.selection.start(2, 1, dialog_area, 0);
+    state.selection.drag(15, 1, dialog_area, 0);
     state.selection.finish(); // Sets copy_request = CopyRequest::Auto
     assert_eq!(state.selection.copy_request, CopyRequest::Auto);
 
@@ -361,8 +362,8 @@ fn test_autocopy_toast_detail_auto_vs_explicit() {
     }
 
     // 2. Selection with CopyRequest::Explicit
-    state.selection.start(2, 0, dialog_area, 0);
-    state.selection.drag(15, 0, dialog_area, 0);
+    state.selection.start(2, 1, dialog_area, 0);
+    state.selection.drag(15, 1, dialog_area, 0);
     state.selection.finish();
     state.selection.request_explicit_copy(); // Sets copy_request = CopyRequest::Explicit
     assert_eq!(state.selection.copy_request, CopyRequest::Explicit);

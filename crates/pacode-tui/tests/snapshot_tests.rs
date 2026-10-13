@@ -782,3 +782,84 @@ fn test_model_palette_120x34() {
     }
     insta::assert_snapshot!("model_palette_120x34", view);
 }
+
+/// Consecutive exploration calls fold into one group; a failed read ends the
+/// group and keeps its own cell; the next run folds again, running last.
+#[test]
+fn test_explore_group_120x34() {
+    let mut snapshot = make_base_snapshot();
+    let call =
+        |seq: u64, name: &str, arg: &str, status: ToolStatus, preview: &str| TranscriptItem {
+            seq,
+            agent: AgentId::main(),
+            ts_ms: 1020 + seq,
+            kind: TranscriptKind::ToolCall {
+                call_id: format!("call_{seq}").as_str().into(),
+                name: name.into(),
+                title: format!("{name} {arg}"),
+                intent: None,
+                status,
+                preview: preview.into(),
+                diff: None,
+                duration_ms: Some(4),
+                task: None,
+            },
+        };
+    snapshot.transcript.extend([
+        call(
+            4,
+            "read",
+            "crates/pacode-tui/src/ui/input.rs",
+            ToolStatus::Ok,
+            "     1\tuse a;\n     2\tuse b;\n     3\tfn x() {}",
+        ),
+        call(
+            5,
+            "grep",
+            "\"prompt_frame\"",
+            ToolStatus::Ok,
+            "a.rs:1:x\nb.rs:2:y\nc.rs:3:z\nd.rs:4:w",
+        ),
+        call(
+            6,
+            "ls",
+            "crates/pacode-tui/src",
+            ToolStatus::Ok,
+            "ui/\nstate/\nlib.rs (2 KB)",
+        ),
+        call(
+            7,
+            "read",
+            "crates/pacode-tui/src/gone.rs",
+            ToolStatus::Error,
+            "no such file: crates/pacode-tui/src/gone.rs",
+        ),
+        call(
+            8,
+            "glob",
+            "\"**/layout*.rs\"",
+            ToolStatus::Ok,
+            "crates/pacode-tui/src/layout.rs",
+        ),
+        call(
+            9,
+            "read",
+            "crates/pacode-tui/src/layout.rs",
+            ToolStatus::Running,
+            "",
+        ),
+    ]);
+    let mut state = create_state(120, 34, snapshot);
+
+    let backend = TestBackend::new(120, 34);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            prepare_and_draw_frame(f, &mut state);
+        })
+        .unwrap();
+
+    let view = format!("{}", terminal.backend());
+    assert_eq!(view.matches("EXPLORE").count(), 2, "{view}");
+    insta::assert_snapshot!("explore_group_120x34", view);
+}

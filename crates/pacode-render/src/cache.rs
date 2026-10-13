@@ -14,6 +14,21 @@ pub struct StablePrefixKey {
     pub len: usize,
 }
 
+/// Which rendering of `CacheKey::cell` an entry holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyPart {
+    /// The whole cell.
+    Whole,
+    /// The stable prefix of a live answer.
+    StablePrefix(StablePrefixKey),
+    /// A run of cells drawn as one block, starting at `cell`: a fingerprint
+    /// of every member's id and version. Invalidating the first cell drops
+    /// the block too.
+    Group(u64),
+    /// The one-row summary of a cell drawn inside a group.
+    Row,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub cell: u64,
@@ -21,7 +36,7 @@ pub struct CacheKey {
     pub width: u16,
     pub expanded: bool,
     pub context: u64,
-    pub stable_prefix: Option<StablePrefixKey>,
+    pub part: KeyPart,
 }
 
 impl CacheKey {
@@ -32,7 +47,32 @@ impl CacheKey {
             width,
             expanded,
             context,
-            stable_prefix: None,
+            part: KeyPart::Whole,
+        }
+    }
+
+    /// The block of a run of cells starting at `first_cell`; `fingerprint`
+    /// changes whenever a member is added, dropped or updated.
+    pub fn group(first_cell: u64, fingerprint: u64, width: u16, context: u64) -> Self {
+        Self {
+            cell: first_cell,
+            version: 0,
+            width,
+            expanded: false,
+            context,
+            part: KeyPart::Group(fingerprint),
+        }
+    }
+
+    /// The one-row summary of `cell` at `version` inside a group.
+    pub fn row(cell: u64, version: u32, width: u16, context: u64) -> Self {
+        Self {
+            cell,
+            version,
+            width,
+            expanded: false,
+            context,
+            part: KeyPart::Row,
         }
     }
 
@@ -43,7 +83,7 @@ impl CacheKey {
             width,
             expanded: false,
             context,
-            stable_prefix: Some(StablePrefixKey { revision, len }),
+            part: KeyPart::StablePrefix(StablePrefixKey { revision, len }),
         }
     }
 }
