@@ -730,3 +730,64 @@ async fn a_file_store_meets_the_storage_contract_and_reports_its_durability() {
     );
     memory_store.close().await;
 }
+
+/// The stop origin and the spawn-time tool set are written by their own
+/// calls only: the `AgentInfo` upserts every status change makes leave them
+/// as they are.
+#[tokio::test]
+async fn a_subagents_restore_state_outlives_its_info_upserts() {
+    let store = Store::open_in_memory().unwrap();
+    let meta = sample_meta("ses_restore");
+    store.upsert_session(&meta).await.unwrap();
+    let mut info = pacode_types::AgentInfo {
+        id: AgentId::new("agt_sub"),
+        name: "sub".into(),
+        kind: pacode_types::AgentKind::Sub,
+        status: pacode_types::AgentStatus::Idle,
+        activity: None,
+        started_at_ms: 1,
+        finished_at_ms: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("mock", "mock-model"),
+        effort: Effort::Low,
+        parent: Some(AgentId::main()),
+        summary: None,
+        error: None,
+    };
+    let tools = vec!["read".to_string(), "report_status".to_string()];
+    store
+        .create_agent_with_history(&meta.id, &info, Some("brief"), &tools, &[])
+        .await
+        .unwrap();
+    store
+        .set_agent_stopped_by(&meta.id, &info.id, Some("user"))
+        .await
+        .unwrap();
+    info.status = pacode_types::AgentStatus::Stopped;
+    store.upsert_agent(&meta.id, &info, None).await.unwrap();
+
+    let restore = store.agent_restore(&meta.id, &info.id).await.unwrap();
+    assert_eq!(
+        restore,
+        crate::AgentRestore {
+            prompt: Some("brief".into()),
+            stopped_by: Some("user".into()),
+            tools: Some(tools),
+        }
+    );
+    store
+        .set_agent_stopped_by(&meta.id, &info.id, None)
+        .await
+        .unwrap();
+    let restore = store.agent_restore(&meta.id, &info.id).await.unwrap();
+    assert_eq!(restore.stopped_by, None);
+    assert_eq!(
+        store
+            .agent_restore(&meta.id, &AgentId::new("agt_missing"))
+            .await
+            .unwrap(),
+        crate::AgentRestore::default()
+    );
+    store.close().await;
+}

@@ -16,7 +16,17 @@
 //!   A report it ended with that the orchestrator has not read yet is taken
 //!   back and returned with the call, so it cannot arrive after the resume
 //!   posing as the reply. `Failed` is refused: the turn broke, and a new
-//!   agent is the honest retry.
+//!   agent is the honest retry. A stop or a close that lands while the resume
+//!   is under way wins: the resume reads the agent's turn generation before
+//!   its checks, and takes effect only if no stop moved it since
+//!   ([`Mailbox::lift_stop`]).
+//!
+//! An answer counts once the asking call took it: a stop can cancel the call
+//! between the hand-over and its next poll, and that call's result says
+//! cancelled — so the answer was not given, and `send` decides again (as a
+//! message to a stopped agent). A `send` the orchestrator's interruption
+//! drops after its message took effect is reported at its next step instead
+//! (see `landed`), report included.
 //!
 //! A question ends exactly once, because every resolver takes it out of the
 //! mailbox under that lock: answered by `send`; unanswered when the parent's
@@ -31,6 +41,7 @@
 //! like any other tool call that was in flight.
 
 mod ask;
+mod landed;
 mod mailbox;
 mod route;
 
@@ -40,7 +51,7 @@ use pacode_tools::{SendOutcome, ToolError};
 use pacode_types::{
     AGENT_MESSAGE_CAP_CHARS, AgentId, AgentMessageDirection, AgentStatus, Event, TranscriptKind,
 };
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::{OwnedMutexGuard, oneshot};
 
 use crate::agent::Agent;
 use crate::inject::Injection;
@@ -48,7 +59,7 @@ use crate::session::Session;
 pub(crate) use ask::ask_parent;
 pub use mailbox::Mailbox;
 use mailbox::Offer;
-pub(crate) use mailbox::StopOrigin;
+pub(crate) use mailbox::{Lift, StopOrigin};
 use route::post;
 pub(crate) use route::{
     mark_delivered, reroute_questions, resolve_delivered, resolve_undeliverable,
@@ -85,18 +96,26 @@ pub(crate) async fn send(
         tokio::pin!(changed);
         changed.as_mut().enable();
         match agent.mailbox.offer(&agent, &text) {
-            Offer::Answered(call_id) => {
+            Offer::Answered { call_id, taken } => {
                 // Before returning, not in the asker's cleanup: the parent's
                 // next drain must not show it a question it just answered.
                 from.injections.retract_question(&info.id, &call_id);
-                return Ok(SendOutcome::Answered);
+                if landed::Awaited::new(taken, landed::answered, session, &agent)
+                    .get()
+                    .await
+                    .is_ok()
+                {
+                    return Ok(SendOutcome::Answered);
+                }
+                // A stop dropped the asking call before it took the answer.
+                continue;
             }
             Offer::Queued => {
                 post(session, from, item.clone());
                 post(session, &agent, item);
                 return Ok(SendOutcome::Delivered);
             }
-            Offer::StoppedByUser => return Err(stopped_by_user(target)),
+            Offer::StoppedByUser => return Err(ToolError::failed(stopped_by_user(target))),
             Offer::Ended => {}
         }
         // Waits only for a turn that is finishing or being stopped — both
@@ -107,20 +126,20 @@ pub(crate) async fn send(
             turn = agent.turn_lock.clone().lock_owned() => {
                 // From here the resume runs to its end on a task of its own:
                 // the orchestrator being interrupted mid-call must not leave
-                // the message half-persisted or the agent half-resumed.
-                let resume = tokio::spawn(resume(
-                    session.clone(),
-                    from.clone(),
-                    agent.clone(),
-                    turn,
-                    text,
-                    item,
-                ));
-                return match resume.await {
+                // the message half-persisted or the agent half-resumed — and
+                // what it did reaches the orchestrator either way.
+                let (tx, rx) = oneshot::channel();
+                let resumed = landed::Awaited::new(rx, landed::resumed, session, &agent);
+                let (session, from, agent) = (session.clone(), from.clone(), agent.clone());
+                tokio::spawn(async move {
+                    let result =
+                        resume(session.clone(), from, agent.clone(), turn, text, item).await;
+                    landed::deliver(tx, result, landed::resumed, &session, &agent);
+                });
+                return match resumed.get().await {
                     Ok(result) => result.map(|previous_report| SendOutcome::Resumed { previous_report }),
-                    Err(error) => Err(ToolError::failed(format!(
-                        "resuming agent {target} failed: {error}"
-                    ))),
+                    // The task ended without a result: it panicked.
+                    Err(_) => Err(ToolError::failed(format!("resuming agent {target} failed"))),
                 };
             }
             _ = &mut changed => {}
@@ -128,10 +147,9 @@ pub(crate) async fn send(
     }
 }
 
-fn stopped_by_user(agent: &AgentId) -> ToolError {
-    ToolError::failed(format!(
-        "agent {agent} was stopped by the user; ask the user before resuming it"
-    ))
+/// Why the orchestrator may not resume `agent` (`send` and `continue`).
+pub(crate) fn stopped_by_user(agent: &AgentId) -> String {
+    format!("agent {agent} was stopped by the user; ask the user before resuming it")
 }
 
 /// Re-drive an ended subagent with `text` as its new input; `turn` is its turn
@@ -147,18 +165,11 @@ async fn resume(
 ) -> Result<Option<String>, ToolError> {
     let _submit = session.submit_lock.lock().await;
     let id = agent.id();
-    if session.closed.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(ToolError::failed("session is closed"));
-    }
     if !session
         .agent(&id)
         .is_some_and(|current| Arc::ptr_eq(&current, &agent))
     {
         return Err(ToolError::failed(format!("agent not found: {id}")));
-    }
-    // The user may have stopped it while this call waited for the lock.
-    if agent.mailbox.stopped_by() == Some(StopOrigin::User) {
-        return Err(stopped_by_user(&id));
     }
     let info = agent.info();
     match info.status {
@@ -176,11 +187,23 @@ async fn resume(
         | AgentStatus::Finished
         | AgentStatus::Stopped => {}
     }
-    // Held until the turn is started, as `continue_agent` does: a stop waits
-    // for it, and one that began earlier already moved the generation, which
-    // cancels the new turn at its start.
+    #[cfg(test)]
+    hooks::run(&id, hooks::Point::ResumeChecked);
+    // Held until the turn is started, as `continue_agent` does. A stop moves
+    // the generation before it waits for this lock, and a close sets
+    // `closed` before it moves it, so the generation read here, with the
+    // checks after it, draws the line: a stop or a close already in is seen
+    // now, and one that lands later is seen where the resume takes effect —
+    // it wins either way. An orchestrator stop that finished first is simply
+    // what the message resumes the agent from.
     let _messages = agent.message_write_lock.clone().lock_owned().await;
     let generation = agent.turn_generation();
+    if session.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ToolError::failed("session is closed"));
+    }
+    if agent.mailbox.stopped_by() == Some(StopOrigin::User) {
+        return Err(ToolError::failed(stopped_by_user(&id)));
+    }
     let cleared = {
         let history = agent.history.lock().unwrap_or_else(|p| p.into_inner());
         history.messages.is_empty() && history.summary.is_none()
@@ -227,13 +250,31 @@ async fn resume(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .commit_reserved(&reservation);
+    #[cfg(test)]
+    hooks::run(&id, hooks::Point::ResumeCommitted);
+    // Every await is behind: the resume takes effect here, or yields to a
+    // stop or a close that came in meanwhile.
+    let lifted = if session.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        Lift::Superseded
+    } else {
+        agent.mailbox.lift_stop(&agent, generation)
+    };
+    let Lift::Lifted { was } = lifted else {
+        if cleared {
+            // Back to how a finished agent is kept; the store has it all.
+            agent
+                .history
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        }
+        return Err(superseded(&session, &agent));
+    };
     // The ended turn's finalization has run (this call holds the lock it ran
     // under), so its report is queued or parked on `from` by now, if unread.
     let previous_report = take_unread_report(&session, &from, &id);
     post(&session, &from, item.clone());
     post(&session, &agent, item);
-    agent.mailbox.clear_stop();
-    agent.clear_stop_request();
     agent.set_status(AgentStatus::Idle, None);
     session.events.emit(Event::AgentUpdated(agent.info()));
     crate::turn::lifecycle::start_claimed_turn(
@@ -243,7 +284,44 @@ async fn resume(
         generation,
         None,
     );
+    if was.is_some() {
+        persist_stop_origin(&session, &agent).await;
+    }
     Ok(previous_report)
+}
+
+/// Why a resume that already persisted its message did not take effect.
+fn superseded(session: &Session, agent: &Agent) -> ToolError {
+    let id = agent.id();
+    if session.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        return ToolError::failed("session is closed");
+    }
+    let by = match agent.mailbox.stopped_by() {
+        Some(StopOrigin::User) => " by the user",
+        Some(StopOrigin::Orchestrator) | None => "",
+    };
+    ToolError::failed(format!(
+        "agent {id} was stopped{by} while your message was being delivered; the message is \
+         in its history, for when it is resumed"
+    ))
+}
+
+/// Bring the stored stop origin in line with `agent`'s mailbox, for a reopen
+/// to restore. Called under the agent's message lock, as every write of it
+/// is, so the store applies them in the order the origin changed.
+pub(crate) async fn persist_stop_origin(session: &Session, agent: &Agent) {
+    let origin = agent.mailbox.stopped_by().map(StopOrigin::as_str);
+    if let Err(error) = session
+        .store
+        .set_agent_stopped_by(&session.id, &agent.id(), origin)
+        .await
+    {
+        log::warn!(
+            "failed to persist the stop origin of agent {} in {}: {error}",
+            agent.id(),
+            session.id
+        );
+    }
 }
 
 /// Take `agent`'s unread report off `parent` — queued, or parked by the
@@ -264,12 +342,13 @@ fn take_unread_report(session: &Session, parent: &Arc<Agent>, agent: &AgentId) -
         | Injection::StatusRequest
         | Injection::AgentStatus { .. }
         | Injection::ParentMessage { .. }
-        | Injection::AgentQuestion { .. } => None,
+        | Injection::AgentQuestion { .. }
+        | Injection::SendLanded { .. } => None,
     })
 }
 
 #[cfg(test)]
-pub(crate) mod seal_hooks;
+pub(crate) mod hooks;
 
 #[cfg(test)]
 mod edge_tests;
@@ -277,5 +356,9 @@ mod edge_tests;
 mod flow_tests;
 #[cfg(test)]
 mod harness;
+#[cfg(test)]
+mod race_tests;
+#[cfg(test)]
+mod reopen_tests;
 #[cfg(test)]
 mod window_tests;

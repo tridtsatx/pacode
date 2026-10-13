@@ -18,11 +18,30 @@ use crate::inject::{Injection, InjectionQueue};
 pub(crate) const MAX_UNANSWERED_IN_ROW: u8 = 3;
 
 /// Who stopped an agent. The orchestrator may resume an agent it stopped
-/// itself; one the user stopped is the user's to resume.
+/// itself; one the user stopped is the user's to resume. Stored with the
+/// agent (`rpc::persist_stop_origin`), so a daemon restart keeps it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopOrigin {
     User,
     Orchestrator,
+}
+
+impl StopOrigin {
+    /// As the store records it, so a reopen restores it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Orchestrator => "orchestrator",
+        }
+    }
+
+    pub(crate) fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "user" => Some(Self::User),
+            "orchestrator" => Some(Self::Orchestrator),
+            _ => None,
+        }
+    }
 }
 
 /// One per agent; only a subagent ever has anything in it.
@@ -55,23 +74,47 @@ pub(super) struct OpenQuestion {
     /// The parent's history holds the question: the end of the parent's turn
     /// settles it.
     delivered: bool,
-    reply: oneshot::Sender<ParentReply>,
+    reply: oneshot::Sender<Reply>,
+}
+
+/// How a question ended, as the asking call receives it.
+pub(super) struct Reply {
+    pub(super) reply: ParentReply,
+    /// Set for an answer: the asking call confirms on it that it took the
+    /// answer. A stop can drop the call before it does, and an answer the
+    /// call never took was never given — its result says cancelled, so the
+    /// orchestrator must not hear `Answered` (`send` decides again instead).
+    pub(super) taken: Option<oneshot::Sender<()>>,
 }
 
 /// What [`Mailbox::open`] did.
 pub(super) enum Opened {
-    Asked(oneshot::Receiver<ParentReply>),
+    Asked(oneshot::Receiver<Reply>),
     /// Too many questions in a row went unanswered; this one was not queued.
     NotAnswering,
 }
 
 /// What [`Mailbox::offer`] did with a message.
 pub(super) enum Offer {
-    Answered(CallId),
+    /// Handed to the asking call of `call_id`; `taken` resolves once the call
+    /// took it, and fails if a stop dropped the call first.
+    Answered {
+        call_id: CallId,
+        taken: oneshot::Receiver<()>,
+    },
     Queued,
     /// The user stopped the agent: resuming it is the user's call.
     StoppedByUser,
     Ended,
+}
+
+/// What [`Mailbox::lift_stop`] found.
+pub(crate) enum Lift {
+    /// The stop no longer stands; `was` is who had stopped the agent.
+    Lifted { was: Option<StopOrigin> },
+    /// A stop or a close landed after the resume read its generation: it
+    /// stands, and the resume does not take effect.
+    Superseded,
 }
 
 impl Mailbox {
@@ -96,21 +139,42 @@ impl Mailbox {
         true
     }
 
-    /// A stop is landing. Recorded before the turn is cancelled and under the
-    /// lock `send` decides under, so no answer is handed to a call that is
-    /// about to be dropped. A user stop is never downgraded by a later one.
-    pub(crate) fn note_stop(&self, origin: StopOrigin) {
+    /// A stop is landing on `agent` (this mailbox's owner). Recorded before
+    /// the turn is cancelled and under the lock `send` decides under, so no
+    /// answer is handed to a call that is about to be dropped; and in one
+    /// step with a move of the agent's turn generation, so a resume deciding
+    /// under this lock ([`Self::lift_stop`]) either sees the stop or ran
+    /// before it. A user stop is never downgraded by a later one.
+    pub(crate) fn note_stop(&self, agent: &Agent, origin: StopOrigin) {
         let mut state = self.state();
         if state.stopped_by != Some(StopOrigin::User) {
             state.stopped_by = Some(origin);
         }
+        agent.invalidate_turn_generation();
     }
 
-    /// The agent is being resumed: the stop no longer stands.
-    pub(crate) fn clear_stop(&self) {
+    /// A resume of `agent` that read `generation` before its checks is about
+    /// to take effect: the stop is lifted — its origin, the stop request, and
+    /// the unanswered count (resuming is the orchestrator engaging again) —
+    /// unless a stop or a close moved the generation since; that one stands.
+    ///
+    /// A close moves the generation without this lock, so the request is
+    /// cleared first and the generation read again after: a close that
+    /// slipped in between gets its request back.
+    pub(crate) fn lift_stop(&self, agent: &Agent, generation: u64) -> Lift {
         let mut state = self.state();
-        state.stopped_by = None;
+        if agent.turn_generation() != generation {
+            return Lift::Superseded;
+        }
+        agent.clear_stop_request();
+        if agent.turn_generation() != generation {
+            agent.request_stop();
+            return Lift::Superseded;
+        }
         state.unanswered_in_row = 0;
+        Lift::Lifted {
+            was: state.stopped_by.take(),
+        }
     }
 
     pub(crate) fn stopped_by(&self) -> Option<StopOrigin> {
@@ -200,11 +264,14 @@ impl Mailbox {
         };
         match &reply {
             ParentReply::Answered(_) => state.unanswered_in_row = 0,
-            ParentReply::Unanswered | ParentReply::ParentFailed | ParentReply::NotAnswering => {
+            // A turn that broke says nothing about whether the orchestrator
+            // would have answered.
+            ParentReply::ParentFailed => {}
+            ParentReply::Unanswered | ParentReply::NotAnswering => {
                 state.unanswered_in_row = state.unanswered_in_row.saturating_add(1);
             }
         }
-        let _ = question.reply.send(reply);
+        let _ = question.reply.send(Reply { reply, taken: None });
     }
 
     /// The parent this question was queued on is gone (detach): the open
@@ -230,14 +297,19 @@ impl Mailbox {
         }
         // An asking call that is already gone takes no answer: the message
         // goes on as if no question were open.
-        if let Some(question) = state.question.take()
-            && question
-                .reply
-                .send(ParentReply::Answered(text.to_string()))
-                .is_ok()
-        {
-            state.unanswered_in_row = 0;
-            return Offer::Answered(question.call_id);
+        if let Some(question) = state.question.take() {
+            let (taken, taken_rx) = oneshot::channel();
+            let reply = Reply {
+                reply: ParentReply::Answered(text.to_string()),
+                taken: Some(taken),
+            };
+            if question.reply.send(reply).is_ok() {
+                state.unanswered_in_row = 0;
+                return Offer::Answered {
+                    call_id: question.call_id,
+                    taken: taken_rx,
+                };
+            }
         }
         if agent.is_running() && !state.sealed && !agent.stop_requested() {
             agent.injections.push(Injection::ParentMessage {
@@ -261,7 +333,8 @@ pub(super) fn question_key(injection: &Injection) -> Option<(&AgentId, &CallId)>
         | Injection::SystemNotice(_)
         | Injection::StatusRequest
         | Injection::AgentStatus { .. }
-        | Injection::ParentMessage { .. } => None,
+        | Injection::ParentMessage { .. }
+        | Injection::SendLanded { .. } => None,
     }
 }
 

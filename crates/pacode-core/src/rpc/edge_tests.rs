@@ -97,7 +97,7 @@ async fn a_question_that_cannot_be_delivered_fails_instead_of_hanging() {
         .expect("the question was left waiting")
         .unwrap();
     h.session.store.set_fault_injection(false);
-    assert_eq!(reply, pacode_tools::ParentReply::ParentFailed);
+    assert_eq!(reply.reply, pacode_tools::ParentReply::ParentFailed);
     gate.add_permits(1);
     h.core.shutdown().await;
 }

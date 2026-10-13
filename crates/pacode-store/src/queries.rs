@@ -25,10 +25,24 @@ pub use session::{
     upsert_session,
 };
 pub use state::{
-    add_usage, add_usage_for_turn, agent_prompt, create_agent_with_history, detach_agent,
+    add_usage, add_usage_for_turn, agent_restore, create_agent_with_history, detach_agent,
     list_agents, list_tasks, load_compaction, load_plan, reassign_task_owner, rollback_detach,
-    save_compaction, save_plan, upsert_agent, upsert_task, upsert_task_checked, usage_totals,
+    save_compaction, save_plan, set_agent_stopped_by, upsert_agent, upsert_task,
+    upsert_task_checked, usage_totals,
 };
+
+/// A subagent's restore state beyond its `AgentInfo` (see
+/// [`agent_restore`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentRestore {
+    /// The brief it was spawned with.
+    pub prompt: Option<String>,
+    /// Who stopped it, as recorded (`"user"` / `"orchestrator"`).
+    pub stopped_by: Option<String>,
+    /// The tool names it was spawned with; `None` for an agent created
+    /// without a narrowing on record (older rows, a detached turn).
+    pub tools: Option<Vec<String>>,
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SessionFilter {

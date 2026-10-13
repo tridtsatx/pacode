@@ -129,6 +129,7 @@ fn texts(taken: &Taken) -> Vec<String> {
             Injection::StatusRequest => "status".to_string(),
             Injection::ParentMessage { text } => format!("message {text}"),
             Injection::AgentQuestion { question, .. } => format!("question {question}"),
+            Injection::SendLanded { name, .. } => format!("landed {name}"),
         })
         .collect()
 }

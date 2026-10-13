@@ -202,6 +202,43 @@ pub enum SendOutcome {
     Resumed { previous_report: Option<String> },
 }
 
+impl SendOutcome {
+    /// What the message did to agent `id`, as the orchestrator reads it — in
+    /// the call's result, or after the fact when the call was interrupted.
+    pub fn describe(&self, id: &AgentId) -> String {
+        match self {
+            Self::Delivered => {
+                format!("Message delivered to agent {id}; it reads it at its next step.")
+            }
+            Self::Answered => {
+                format!("Agent {id} was waiting on its question; your message answered it.")
+            }
+            Self::Resumed { previous_report } => {
+                let mut text = format!(
+                    "Agent {id} had ended; your message resumed it with its context. \
+                     Its next report arrives as <agent_finished>."
+                );
+                if let Some(report) = previous_report {
+                    text.push_str(&format!(
+                        "\n\nIt had finished with this report, which you had not read \
+                         yet:\n{report}"
+                    ));
+                }
+                text
+            }
+        }
+    }
+
+    /// The short word the call's transcript row shows.
+    pub fn preview(&self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Answered => "answered",
+            Self::Resumed { .. } => "resumed",
+        }
+    }
+}
+
 /// How an `ask_parent` question ended, when it did not end in a stop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParentReply {

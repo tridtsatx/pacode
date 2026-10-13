@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input, preview_body};
-use crate::host::{AgentKindDef, AgentSpec, SendOutcome};
+use crate::host::{AgentKindDef, AgentSpec};
 use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "agent";
@@ -214,34 +214,10 @@ impl AgentTool {
                     .message
                     .filter(|m| !m.trim().is_empty())
                     .ok_or_else(|| ToolError::invalid("message is required for send"))?;
-                let (content, preview) = match ctx.host.send_to_agent(&id, message).await? {
-                    SendOutcome::Delivered => (
-                        format!("Message delivered to agent {id}; it reads it at its next step."),
-                        "delivered",
-                    ),
-                    SendOutcome::Answered => (
-                        format!(
-                            "Agent {id} was waiting on its question; your message answered it."
-                        ),
-                        "answered",
-                    ),
-                    SendOutcome::Resumed { previous_report } => {
-                        let mut content = format!(
-                            "Agent {id} had ended; your message resumed it with its context. \
-                             Its next report arrives as <agent_finished>."
-                        );
-                        if let Some(report) = previous_report {
-                            content.push_str(&format!(
-                                "\n\nIt had finished with this report, which you had not \
-                                 read yet:\n{report}"
-                            ));
-                        }
-                        (content, "resumed")
-                    }
-                };
-                Ok(ToolOutput::text(content)
+                let outcome = ctx.host.send_to_agent(&id, message).await?;
+                Ok(ToolOutput::text(outcome.describe(&id))
                     .with_title(format!("Agent send {id}"))
-                    .with_preview(preview))
+                    .with_preview(outcome.preview()))
             }
             "stop" => {
                 let agent_id_str = args

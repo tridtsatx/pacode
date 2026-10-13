@@ -812,27 +812,51 @@ impl Store {
         session: &SessionId,
         info: &AgentInfo,
         prompt: Option<&str>,
+        tools: &[String],
         rows: &[(u64, Arc<Message>)],
     ) -> Result<(), StoreError> {
         let session = session.clone();
         let info = info.clone();
         let prompt = prompt.map(str::to_string);
+        let tools = tools.to_vec();
         let rows = rows.to_vec();
         self.call(move |conn| {
-            queries::create_agent_with_history(conn, &session, &info, prompt.as_deref(), &rows)
+            queries::create_agent_with_history(
+                conn,
+                &session,
+                &info,
+                prompt.as_deref(),
+                &tools,
+                &rows,
+            )
         })
         .await
     }
 
-    pub async fn agent_prompt(
+    pub async fn agent_restore(
         &self,
         session: &SessionId,
         agent: &AgentId,
-    ) -> Result<Option<String>, StoreError> {
+    ) -> Result<crate::AgentRestore, StoreError> {
         let session = session.clone();
         let agent = agent.clone();
-        self.call(move |conn| queries::agent_prompt(conn, &session, &agent))
+        self.call(move |conn| queries::agent_restore(conn, &session, &agent))
             .await
+    }
+
+    pub async fn set_agent_stopped_by(
+        &self,
+        session: &SessionId,
+        agent: &AgentId,
+        stopped_by: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let session = session.clone();
+        let agent = agent.clone();
+        let stopped_by = stopped_by.map(str::to_string);
+        self.call(move |conn| {
+            queries::set_agent_stopped_by(conn, &session, &agent, stopped_by.as_deref())
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

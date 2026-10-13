@@ -568,31 +568,47 @@ async fn open_session_unlocked(
                     sub_info.status = pacode_types::AgentStatus::Finished;
                     stale_subagents.push(sub_info.clone());
                 }
-                let sub_prompt = core
+                let restore = core
                     .deps
                     .store
-                    .agent_prompt(&session_id, &sub_info.id)
+                    .agent_restore(&session_id, &sub_info.id)
                     .await?;
                 let sub_history = load_subagent_history(
                     &core.deps.store,
                     &session_id,
                     &sub_info.id,
-                    sub_prompt.clone(),
+                    restore.prompt.clone(),
                     core.deps.config.session.history_page,
                 )
                 .await?;
+                // The set it was narrowed to at spawn; the default for rows
+                // that carry none (older ones, a detached turn).
+                let names = restore
+                    .tools
+                    .unwrap_or_else(|| pacode_tools::subagent_tool_names(&session_tools));
                 let sub_agent = Arc::new(crate::agent::Agent::new(
                     sub_info.id.clone(),
                     sub_info.clone(),
                     sub_history,
+                    // Depth 1 holds whatever the row says.
                     session_tools.subset(
-                        pacode_tools::subagent_tool_names(&session_tools)
+                        names
                             .iter()
-                            .map(String::as_str),
+                            .map(String::as_str)
+                            .filter(|name| *name != pacode_tools::builtin::agent::NAME),
                     ),
                     core.deps.config.session.history_page,
-                    sub_prompt,
+                    restore.prompt,
                 ));
+                // Who stopped it outlives the daemon: an agent the user
+                // stopped stays the user's to resume.
+                if let Some(origin) = restore
+                    .stopped_by
+                    .as_deref()
+                    .and_then(crate::rpc::StopOrigin::parse)
+                {
+                    sub_agent.mailbox.note_stop(&sub_agent, origin);
+                }
                 agents.insert(sub_info.id, sub_agent);
             }
 

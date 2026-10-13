@@ -5,7 +5,7 @@ use rusqlite::{Connection, Transaction, params};
 
 use crate::StoreError;
 
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 const MESSAGE_TEXT_CHUNK: usize = 64;
 
@@ -525,6 +525,17 @@ pub fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         )?;
         tx.commit()?;
     }
+    if current_version < 10 {
+        // What a reopened subagent must come back with that `AgentInfo` does
+        // not carry: who stopped it (`'user'` / `'orchestrator'`) and the tool
+        // names it was spawned with (a JSON array). NULL — every row written
+        // before — means no stop on record and the default subagent set.
+        let tx = conn.transaction()?;
+        add_column_if_missing(&tx, "agents", "stopped_by", "TEXT")?;
+        add_column_if_missing(&tx, "agents", "tools_json", "TEXT")?;
+        tx.execute_batch("PRAGMA user_version = 10;")?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -748,6 +759,50 @@ mod tests {
         validate_schema_version(&conn).unwrap();
     }
 
+    fn agent_columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("PRAGMA table_info(agents)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// A v9 agents table gains the stop origin and the spawn-time tool set as
+    /// NULL — no stop on record, the default tools — and keeps its rows.
+    #[test]
+    fn migrate_v10_adds_the_subagent_restore_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            r#"
+            ALTER TABLE agents DROP COLUMN stopped_by;
+            ALTER TABLE agents DROP COLUMN tools_json;
+            INSERT INTO sessions (id, cwd, created_at, updated_at, model, effort, mode)
+            VALUES ('ses_v9', '.', 0, 0, 'mock/mock', 'low', 'build');
+            INSERT INTO agents (id, session_id, name, kind, status, model, effort, started_at)
+            VALUES ('agt_sub', 'ses_v9', 'sub', 'sub', 'stopped', 'mock/mock', 'low', 0);
+            PRAGMA user_version = 9;
+            "#,
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let columns = agent_columns(&conn);
+        assert!(columns.iter().any(|c| c == "stopped_by"), "{columns:?}");
+        assert!(columns.iter().any(|c| c == "tools_json"), "{columns:?}");
+        let (stopped_by, tools): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT stopped_by, tools_json FROM agents WHERE id = 'agt_sub';",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((stopped_by, tools), (None, None));
+    }
+
     #[test]
     fn migrate_from_every_version_boundary_is_idempotent() {
         for start in 0..=SCHEMA_VERSION {
@@ -765,6 +820,13 @@ mod tests {
                 "boundary {start} did not converge"
             );
             assert!(table_exists(&conn, "task_admissions"), "boundary {start}");
+            let columns = agent_columns(&conn);
+            for expected in ["stopped_by", "tools_json"] {
+                assert!(
+                    columns.iter().any(|c| c == expected),
+                    "boundary {start} is missing agents.{expected}"
+                );
+            }
             let indices = index_names(&conn);
             for expected in [
                 "idx_usage_legacy_turn",

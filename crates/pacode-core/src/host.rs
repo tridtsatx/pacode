@@ -523,17 +523,8 @@ impl ToolHost for SessionHost {
     async fn continue_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         // The orchestrator resumes what it stopped; what the user stopped is
         // the user's to resume (the same rule `agent send` follows).
-        if self
-            .session
-            .agent(agent)
-            .is_some_and(|a| a.mailbox.stopped_by() == Some(crate::rpc::StopOrigin::User))
-        {
-            return Err(ToolError::failed(format!(
-                "agent {agent} was stopped by the user; ask the user before resuming it"
-            )));
-        }
         self.session
-            .continue_agent(agent)
+            .continue_agent_by(agent, crate::rpc::StopOrigin::Orchestrator)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))
     }

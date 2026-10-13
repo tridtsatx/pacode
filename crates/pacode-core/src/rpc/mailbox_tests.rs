@@ -47,7 +47,7 @@ fn question(call: &str) -> Injection {
     }
 }
 
-fn ask(sub: &Agent, parent: &Agent, call: &str) -> oneshot::Receiver<ParentReply> {
+fn ask(sub: &Agent, parent: &Agent, call: &str) -> oneshot::Receiver<Reply> {
     match sub.mailbox.open(parent, question(call)).unwrap() {
         Opened::Asked(rx) => rx,
         Opened::NotAnswering => panic!("the question was not sent"),
@@ -80,7 +80,7 @@ fn an_idle_sealed_or_stopping_agent_is_resumed_instead() {
     assert!(sub.mailbox.seal_unless_message(&sub.injections));
     assert!(matches!(sub.mailbox.offer(&sub, "hi"), Offer::Ended));
     sub.mailbox.unseal();
-    sub.mailbox.note_stop(StopOrigin::Orchestrator);
+    sub.mailbox.note_stop(&sub, StopOrigin::Orchestrator);
     assert!(matches!(sub.mailbox.offer(&sub, "hi"), Offer::Ended));
     drop(turn);
     assert_eq!(queued_messages(&sub), 0);
@@ -114,11 +114,19 @@ async fn an_open_question_takes_the_message_as_its_answer() {
         "one open question per subagent"
     );
 
-    let Offer::Answered(call) = sub.mailbox.offer(&sub, "postgres") else {
+    let Offer::Answered {
+        call_id: call,
+        taken,
+    } = sub.mailbox.offer(&sub, "postgres")
+    else {
         panic!("the open question takes the message");
     };
     assert_eq!(call, CallId::new("c1"));
-    assert_eq!(rx.await.unwrap(), ParentReply::Answered("postgres".into()));
+    let reply = rx.await.unwrap();
+    assert_eq!(reply.reply, ParentReply::Answered("postgres".into()));
+    // The asking call confirms it took the answer.
+    reply.taken.unwrap().send(()).unwrap();
+    assert!(taken.await.is_ok());
     parent
         .injections
         .retract_question(&AgentId::new("sub"), &call);
@@ -145,7 +153,7 @@ async fn only_a_delivered_question_ends_with_the_turn() {
     sub.mailbox.resolve_delivered(ParentReply::Unanswered);
     sub.mailbox.mark_delivered(&CallId::new("c1"));
     sub.mailbox.resolve_delivered(ParentReply::ParentFailed);
-    assert_eq!(rx.await.unwrap(), ParentReply::ParentFailed);
+    assert_eq!(rx.await.unwrap().reply, ParentReply::ParentFailed);
     assert!(!sub.mailbox.take_question(&CallId::new("c1")));
 }
 
@@ -158,26 +166,76 @@ async fn a_stopping_agent_takes_no_answer() {
     let sub = agent("sub");
     let _turn = sub.turn_lock.try_lock().unwrap();
     let mut rx = ask(&sub, &parent, "c1");
-    sub.mailbox.note_stop(StopOrigin::Orchestrator);
+    sub.mailbox.note_stop(&sub, StopOrigin::Orchestrator);
     assert!(matches!(sub.mailbox.offer(&sub, "late"), Offer::Ended));
     assert!(
         rx.try_recv().is_err(),
         "no answer to a question being cancelled"
     );
 
-    sub.mailbox.note_stop(StopOrigin::User);
+    sub.mailbox.note_stop(&sub, StopOrigin::User);
     assert!(matches!(
         sub.mailbox.offer(&sub, "late"),
         Offer::StoppedByUser
     ));
-    sub.mailbox.note_stop(StopOrigin::Orchestrator);
+    sub.mailbox.note_stop(&sub, StopOrigin::Orchestrator);
     assert_eq!(
         sub.mailbox.stopped_by(),
         Some(StopOrigin::User),
         "a user stop is never downgraded"
     );
-    sub.mailbox.clear_stop();
+}
+
+/// An answer the asking call never took — a stop dropped the call first —
+/// is not an answer: the `send` that handed it over learns so.
+#[tokio::test]
+async fn an_answer_the_call_never_took_fails_its_send() {
+    let parent = agent("main");
+    let sub = agent("sub");
+    let _turn = sub.turn_lock.try_lock().unwrap();
+    let rx = ask(&sub, &parent, "c1");
+    let Offer::Answered { taken, .. } = sub.mailbox.offer(&sub, "postgres") else {
+        panic!("the open question takes the message");
+    };
+    drop(rx);
+    assert!(taken.await.is_err());
+}
+
+/// A resume lifts the stop only if no stop and no close landed after it read
+/// the generation; one that did stands, origin and request included.
+#[test]
+fn a_resume_yields_to_a_stop_that_landed_after_it_looked() {
+    let sub = agent("sub");
+    sub.mailbox.note_stop(&sub, StopOrigin::Orchestrator);
+    sub.request_stop();
+
+    let generation = sub.turn_generation();
+    sub.mailbox.note_stop(&sub, StopOrigin::User);
+    assert!(matches!(
+        sub.mailbox.lift_stop(&sub, generation),
+        Lift::Superseded
+    ));
+    assert_eq!(sub.mailbox.stopped_by(), Some(StopOrigin::User));
+    assert!(sub.stop_requested());
+
+    // A close stops the agent without the mailbox lock.
+    let generation = sub.turn_generation();
+    sub.request_stop();
+    assert!(matches!(
+        sub.mailbox.lift_stop(&sub, generation),
+        Lift::Superseded
+    ));
+    assert!(sub.stop_requested());
+
+    let generation = sub.turn_generation();
+    assert!(matches!(
+        sub.mailbox.lift_stop(&sub, generation),
+        Lift::Lifted {
+            was: Some(StopOrigin::User)
+        }
+    ));
     assert_eq!(sub.mailbox.stopped_by(), None);
+    assert!(!sub.stop_requested());
 }
 
 #[tokio::test]
@@ -188,7 +246,7 @@ async fn questions_stop_being_sent_after_too_many_go_unanswered() {
         let rx = ask(&sub, &parent, &format!("c{n}"));
         sub.mailbox.mark_delivered(&CallId::new(format!("c{n}")));
         sub.mailbox.resolve_delivered(ParentReply::Unanswered);
-        assert_eq!(rx.await.unwrap(), ParentReply::Unanswered);
+        assert_eq!(rx.await.unwrap().reply, ParentReply::Unanswered);
     }
     parent.injections.drain();
     assert!(matches!(
@@ -219,4 +277,22 @@ fn a_detach_hands_the_open_question_over_undelivered() {
     // Undelivered again: the old turn's end no longer settles it.
     sub.mailbox.resolve_delivered(ParentReply::Unanswered);
     assert!(sub.mailbox.take_question(&CallId::new("c1")));
+}
+
+/// A turn that failed is not an orchestrator that chose not to answer: a run
+/// of provider or store failures never stops the questions from being sent.
+#[tokio::test]
+async fn failed_parent_turns_do_not_count_as_unanswered() {
+    let parent = agent("main");
+    let sub = agent("sub");
+    for n in 0..MAX_UNANSWERED_IN_ROW {
+        let rx = ask(&sub, &parent, &format!("c{n}"));
+        sub.mailbox.mark_delivered(&CallId::new(format!("c{n}")));
+        sub.mailbox.resolve_delivered(ParentReply::ParentFailed);
+        assert_eq!(rx.await.unwrap().reply, ParentReply::ParentFailed);
+    }
+    assert!(matches!(
+        sub.mailbox.open(&parent, question("next")).unwrap(),
+        Opened::Asked(_)
+    ));
 }

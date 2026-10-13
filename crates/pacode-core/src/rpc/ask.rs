@@ -10,7 +10,8 @@ use pacode_types::{
 };
 use tokio::sync::oneshot;
 
-use super::mailbox::Opened;
+use super::landed;
+use super::mailbox::{Opened, Reply};
 use super::route::{post, update};
 use crate::agent::Agent;
 use crate::inject::Injection;
@@ -28,19 +29,31 @@ pub(crate) async fn ask_parent(
         .parent
         .as_ref()
         .ok_or_else(|| ToolError::invalid("only subagents can ask the orchestrator"))?;
-    let parent = session
-        .agent(parent_id)
-        .ok_or_else(|| ToolError::failed("the orchestrator is gone"))?;
     let question = pacode_types::truncate_head_tail(question.trim(), AGENT_MESSAGE_CAP_CHARS);
-    let opened = me.mailbox.open(
-        &parent,
-        Injection::AgentQuestion {
-            agent: info.id.clone(),
-            name: info.name.clone(),
-            call_id: call_id.clone(),
-            question: question.clone(),
-        },
-    )?;
+    let (parent, opened) = {
+        // Found and queued on under one read of the agent map, in the order
+        // a detach hands questions over in (map, mailbox, queue): a detach
+        // swaps the orchestrator under the write lock, so the question is
+        // either queued on the new one or found on the old one by the
+        // hand-over — never left on an orchestrator that can no longer answer.
+        let agents = session.agents.read().unwrap_or_else(|p| p.into_inner());
+        let parent = agents
+            .get(parent_id)
+            .cloned()
+            .ok_or_else(|| ToolError::failed("the orchestrator is gone"))?;
+        #[cfg(test)]
+        super::hooks::run(&info.id, super::hooks::Point::AskLookedUp);
+        let opened = me.mailbox.open(
+            &parent,
+            Injection::AgentQuestion {
+                agent: info.id.clone(),
+                name: info.name.clone(),
+                call_id: call_id.clone(),
+                question: question.clone(),
+            },
+        )?;
+        (parent, opened)
+    };
     let rx = match opened {
         Opened::Asked(rx) => rx,
         // Not queued, so nothing to wake and nothing to show: the call's own
@@ -49,13 +62,23 @@ pub(crate) async fn ask_parent(
     };
     // Every exit from here — answer, no answer, a stop dropping this future —
     // passes through the guard.
-    let mut waiting = Waiting::start(session, me, &parent, call_id, &info, &question, rx);
-    // It wakes an idle parent the way a finished report does.
-    if parent.id().is_main() {
-        crate::turn::lifecycle::request_turn(session.clone(), parent.clone());
+    let mut waiting = Waiting::start(
+        session, me, &parent, parent_id, call_id, &info, &question, rx,
+    );
+    // It wakes an idle parent the way a finished report does — whoever holds
+    // the parent's place by now.
+    if parent_id.is_main()
+        && let Some(parent) = session.agent(parent_id)
+    {
+        crate::turn::lifecycle::request_turn(session.clone(), parent);
     }
     match (&mut waiting.rx).await {
-        Ok(reply) => {
+        Ok(Reply { reply, taken }) => {
+            // Taken here, in the same poll the call returns it in: from now
+            // on the call's result is this reply, whatever cancels the turn.
+            if let Some(taken) = taken {
+                landed::deliver(taken, (), landed::answered, session, me);
+            }
             waiting.finish(shown(&reply));
             Ok(reply)
         }
@@ -85,19 +108,21 @@ struct Waiting<'a> {
     item: TranscriptKind,
     seqs: [u64; 2],
     prev: (AgentStatus, Option<String>),
-    rx: oneshot::Receiver<ParentReply>,
+    rx: oneshot::Receiver<Reply>,
     done: bool,
 }
 
 impl<'a> Waiting<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         session: &'a Arc<Session>,
         me: &'a Arc<Agent>,
         parent: &Arc<Agent>,
+        parent_id: &AgentId,
         call_id: &CallId,
         info: &pacode_types::AgentInfo,
         question: &str,
-        rx: oneshot::Receiver<ParentReply>,
+        rx: oneshot::Receiver<Reply>,
     ) -> Self {
         let item = TranscriptKind::AgentMessage {
             subagent: info.id.clone(),
@@ -120,7 +145,7 @@ impl<'a> Waiting<'a> {
             session,
             me,
             shown_in: parent.clone(),
-            parent_id: parent.id(),
+            parent_id: parent_id.clone(),
             call_id: call_id.clone(),
             item,
             seqs,
@@ -164,15 +189,11 @@ impl<'a> Waiting<'a> {
 }
 
 impl Drop for Waiting<'_> {
-    /// The call was dropped (a stop cancelled the turn). An answer that had
-    /// already been handed over stays on record as the answer it was; anything
-    /// else ends as cancelled.
+    /// The call was dropped (a stop cancelled the turn) before it took a
+    /// reply: its result says cancelled, and so does every view of the
+    /// question. A reply waiting in the channel was never taken — an answer
+    /// among them tells its `send` so by dropping its `taken` unconfirmed.
     fn drop(&mut self) {
-        let reply = self
-            .rx
-            .try_recv()
-            .map(|reply| shown(&reply))
-            .unwrap_or(AgentReply::Cancelled);
-        self.finish(reply);
+        self.finish(AgentReply::Cancelled);
     }
 }

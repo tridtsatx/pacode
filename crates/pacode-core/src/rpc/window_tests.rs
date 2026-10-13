@@ -14,7 +14,7 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 
 use super::harness::*;
-use super::seal_hooks::{self, Point};
+use super::hooks::{self, Point};
 
 /// A message landing between the subagent's last step and its seal re-drives
 /// it — and its card never says `Finished` in between.
@@ -27,7 +27,7 @@ async fn a_message_just_before_the_seal_redrives_without_a_finished_flash() {
     {
         let (session, main, id) = (h.session.clone(), h.main(), sub.id());
         let outcome = outcome.clone();
-        seal_hooks::install(sub.id(), Point::BeforeSeal, move || {
+        hooks::install(sub.id(), Point::BeforeSeal, move || {
             let sent = super::send(&session, &main, &id, "one more thing").now_or_never();
             *outcome.lock().unwrap() = sent;
         });
@@ -101,7 +101,7 @@ async fn a_message_just_after_the_seal_resumes_and_takes_back_the_report() {
     {
         let (session, main, id) = (h.session.clone(), h.main(), sub.id());
         let resumed = resumed.clone();
-        seal_hooks::install(sub.id(), Point::AfterSeal, move || {
+        hooks::install(sub.id(), Point::AfterSeal, move || {
             let mut send =
                 Box::pin(async move { super::send(&session, &main, &id, "now part two").await });
             // One poll finds the turn sealed and queues on its lock...
@@ -238,5 +238,68 @@ async fn a_send_dropped_mid_resume_still_resumes_the_subagent() {
         sub.status() == AgentStatus::Finished && !sub.is_running()
     })
     .await;
+    h.core.shutdown().await;
+}
+
+/// The orchestrator is interrupted while its `send` resumes a subagent whose
+/// report it has not read. The call is gone, but neither the report nor the
+/// fact that the message landed is: the orchestrator's next step is told
+/// both — once, and not as an `<agent_finished>` posing as the reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_dropped_mid_resume_hands_back_the_unread_report() {
+    let h = Harness::new().await;
+    h.provider.script(
+        false,
+        vec![
+            tool(
+                "agent",
+                json!({"action": "spawn", "name": "tests", "prompt": "work"}),
+            ),
+            // Busy, so the report waits unread.
+            tool("gate", json!({})),
+            text("ok"),
+        ],
+    );
+    h.provider
+        .script(true, vec![text("first report"), text("second report")]);
+    h.session.submit_user_message("go".into()).await.unwrap();
+    h.gate_entered().await;
+    let sub = h.sub();
+    wait_for("the first report", || {
+        sub.status() == AgentStatus::Finished && !sub.is_running()
+    })
+    .await;
+
+    let (main, id) = (h.main(), sub.id());
+    let mut send = Box::pin(super::send(&h.session, &main, &id, "part two"));
+    let waker = futures::task::noop_waker();
+    assert!(
+        send.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(send);
+
+    wait_for("the second report to be queued", || {
+        sub.status() == AgentStatus::Finished
+            && !sub.is_running()
+            && h.provider.seen(true).len() == 2
+    })
+    .await;
+    h.gate.release.add_permits(1);
+    wait_for("the second report", || {
+        h.provider
+            .seen(false)
+            .iter()
+            .any(|r| r.contains("second report"))
+    })
+    .await;
+    let last = h.provider.seen(false).last().unwrap().clone();
+    assert_eq!(last.matches("first report").count(), 1, "{last}");
+    // Inside what the orchestrator is told about its send, and nowhere else.
+    let open = last.find("<send_result").expect("told what the send did");
+    let close = open + last[open..].find("</send_result>").unwrap();
+    let report = last.find("first report").unwrap();
+    assert!(open < report && report < close, "{last}");
     h.core.shutdown().await;
 }

@@ -11,6 +11,7 @@ use pacode_types::{
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use super::AgentRestore;
 use crate::StoreError;
 use crate::txn::Txn;
 
@@ -126,15 +127,27 @@ pub fn upsert_agent(
     Ok(())
 }
 
+/// A spawned subagent's row, the tool names it was given and its first
+/// messages, in one unit: a reopen must never find the agent without the
+/// set it was narrowed to.
 pub fn create_agent_with_history(
     conn: &mut Connection,
     session: &SessionId,
     info: &AgentInfo,
     prompt: Option<&str>,
+    tools: &[String],
     rows: &[(u64, Arc<Message>)],
 ) -> Result<(), StoreError> {
     let tx = Txn::open(conn)?;
     upsert_agent_in_unit_of_work(&tx, session, info, prompt)?;
+    tx.execute(
+        "UPDATE agents SET tools_json = ?3 WHERE session_id = ?1 AND id = ?2;",
+        params![
+            session.as_str(),
+            info.id.as_str(),
+            serde_json::to_string(tools)?
+        ],
+    )?;
     for (seq, message) in rows {
         super::message::append_message_in_unit_of_work(
             &tx,
@@ -381,19 +394,48 @@ pub fn list_agents(conn: &Connection, session: &SessionId) -> Result<Vec<AgentIn
     Ok(result)
 }
 
-pub fn agent_prompt(
+/// What a reopen restores a subagent with beyond its `AgentInfo`; all `None`
+/// for an agent with no row.
+pub fn agent_restore(
     conn: &Connection,
     session: &SessionId,
     agent: &AgentId,
-) -> Result<Option<String>, StoreError> {
-    let mut stmt =
-        conn.prepare_cached("SELECT prompt FROM agents WHERE session_id = ?1 AND id = ?2;")?;
-    Ok(stmt
+) -> Result<AgentRestore, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT prompt, stopped_by, tools_json FROM agents WHERE session_id = ?1 AND id = ?2;",
+    )?;
+    let row = stmt
         .query_row(params![session.as_str(), agent.as_str()], |row| {
-            row.get::<_, Option<String>>(0)
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })
-        .optional()?
-        .flatten())
+        .optional()?;
+    let Some((prompt, stopped_by, tools)) = row else {
+        return Ok(AgentRestore::default());
+    };
+    Ok(AgentRestore {
+        prompt,
+        stopped_by,
+        tools: tools.map(|json| serde_json::from_str(&json)).transpose()?,
+    })
+}
+
+/// Record who stopped `agent` (`None`: the stop no longer stands). Only this
+/// writes the column: an `AgentInfo` upsert leaves it as it is.
+pub fn set_agent_stopped_by(
+    conn: &Connection,
+    session: &SessionId,
+    agent: &AgentId,
+    stopped_by: Option<&str>,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE agents SET stopped_by = ?3 WHERE session_id = ?1 AND id = ?2;",
+        params![session.as_str(), agent.as_str(), stopped_by],
+    )?;
+    Ok(())
 }
 
 pub fn upsert_task(conn: &mut Connection, info: &TaskInfo) -> Result<(), StoreError> {

@@ -1465,6 +1465,8 @@ impl Session {
                 &self.id,
                 &info,
                 Some(spec.prompt.as_str()),
+                // The set as narrowed, so a reopen restores it.
+                &tools.names().map(str::to_string).collect::<Vec<_>>(),
                 &persisted_history,
             )
             .await;
@@ -1588,18 +1590,34 @@ impl Session {
         self.mark_admissions_terminal(recovery, "interrupted").await;
     }
 
-    /// Re-drive a `Stopped` agent: append the orchestrator's resume nudge to
-    /// its retained history and start a fresh turn on a new cancel token — the
-    /// same path `spawn_agent` takes. Errors while the agent is still running
-    /// (let the stop land first) or already in a terminal state.
+    /// Re-drive a `Stopped` agent on the user's behalf — whoever stopped it.
     pub async fn continue_agent(self: &Arc<Self>, id: &AgentId) -> Result<(), CoreError> {
+        self.continue_agent_by(id, crate::rpc::StopOrigin::User)
+            .await
+    }
+
+    /// Re-drive a `Stopped` agent: append the resume nudge to its retained
+    /// history and start a fresh turn on a new cancel token — the same path
+    /// `spawn_agent` takes. Errors while the agent is still running (let the
+    /// stop land first) or already in a terminal state, and — `by` the
+    /// orchestrator — for an agent the user stopped: that one is the user's to
+    /// resume. A stop or a close landing meanwhile wins (`rpc::resume` does
+    /// the same).
+    pub(crate) async fn continue_agent_by(
+        self: &Arc<Self>,
+        id: &AgentId,
+        by: crate::rpc::StopOrigin,
+    ) -> Result<(), CoreError> {
         let _submit_guard = self.submit_lock.lock().await;
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(CoreError::Invalid("session is closed".into()));
-        }
         let agent = self
             .agent(id)
             .ok_or_else(|| CoreError::AgentNotFound(id.clone()))?;
+        // Read before anything is checked: a stop or a close from here on
+        // moves it, and the resume yields to it where it would take effect.
+        let generation = agent.turn_generation();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CoreError::Invalid("session is closed".into()));
+        }
         if agent.is_running() {
             return Err(CoreError::Invalid(format!("agent {id} is still running")));
         }
@@ -1609,8 +1627,12 @@ impl Session {
                 agent.status()
             )));
         }
+        if by == crate::rpc::StopOrigin::Orchestrator
+            && agent.mailbox.stopped_by() == Some(crate::rpc::StopOrigin::User)
+        {
+            return Err(CoreError::Invalid(crate::rpc::stopped_by_user(id)));
+        }
 
-        let generation = agent.turn_generation();
         let message_guard = agent.message_write_lock.clone().lock_owned().await;
         let current = self
             .agent(id)
@@ -1648,6 +1670,21 @@ impl Session {
             )));
         }
 
+        #[cfg(test)]
+        crate::rpc::hooks::run(id, crate::rpc::hooks::Point::ContinueCommitted);
+        // Every await is behind: the resume takes effect here, or yields to a
+        // stop or a close that came in meanwhile.
+        let lifted = if self.closed.load(Ordering::SeqCst) {
+            crate::rpc::Lift::Superseded
+        } else {
+            agent.mailbox.lift_stop(&agent, generation)
+        };
+        let crate::rpc::Lift::Lifted { was } = lifted else {
+            return Err(CoreError::Invalid(format!(
+                "agent {id} was stopped again before it resumed"
+            )));
+        };
+
         let item = pacode_types::TranscriptItem {
             seq: agent
                 .transcript
@@ -1667,20 +1704,13 @@ impl Session {
             .unwrap_or_else(|p| p.into_inner())
             .upsert(item.clone());
         self.events.emit(pacode_types::Event::ItemAdded(item));
-
-        agent.mailbox.clear_stop();
-        agent.clear_stop_request();
         agent.set_status(pacode_types::AgentStatus::Idle, None);
-        if agent.turn_generation() != generation || self.closed.load(Ordering::SeqCst) {
-            agent.request_stop();
-            agent.set_status(pacode_types::AgentStatus::Stopped, None);
-            return Err(CoreError::Invalid(format!(
-                "agent {id} changed before restart"
-            )));
-        }
         self.events
             .emit(pacode_types::Event::AgentUpdated(agent.info()));
-        crate::turn::lifecycle::start_turn(self.clone(), agent);
+        crate::turn::lifecycle::start_turn(self.clone(), agent.clone());
+        if was.is_some() {
+            crate::rpc::persist_stop_origin(self, &agent).await;
+        }
         drop(message_guard);
         Ok(())
     }
@@ -1700,10 +1730,11 @@ impl Session {
             .agent(id)
             .ok_or_else(|| CoreError::AgentNotFound(id.clone()))?;
         let expected_id = agent.id();
-        // First, under the lock `agent send` decides under: from here no
-        // answer is handed to a question this stop is about to cancel.
-        agent.mailbox.note_stop(origin);
-        agent.invalidate_turn_generation();
+        // First, under the lock `agent send` decides under and in one step
+        // with a move of the turn generation: from here no answer is handed
+        // to a question this stop is about to cancel, and no resume under way
+        // takes effect.
+        agent.mailbox.note_stop(&agent, origin);
         let _message_guard = agent.message_write_lock.clone().lock_owned().await;
         let current = self.agent(&expected_id);
         if !current.is_some_and(|current| Arc::ptr_eq(&current, &agent)) {
@@ -1743,6 +1774,7 @@ impl Session {
             .store
             .upsert_agent(&self.id, &info, agent.prompt().as_deref())
             .await;
+        crate::rpc::persist_stop_origin(self, &agent).await;
         self.events.emit(pacode_types::Event::AgentUpdated(info));
         Ok(())
     }

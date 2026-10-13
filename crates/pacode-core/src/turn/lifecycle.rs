@@ -565,11 +565,11 @@ pub(crate) fn start_claimed_turn(
             && !should_redrive
         {
             #[cfg(test)]
-            crate::rpc::seal_hooks::run(&agent.id(), crate::rpc::seal_hooks::Point::BeforeSeal);
+            crate::rpc::hooks::run(&agent.id(), crate::rpc::hooks::Point::BeforeSeal);
             should_redrive = !agent.mailbox.seal_unless_message(&agent.injections);
             #[cfg(test)]
             if !should_redrive {
-                crate::rpc::seal_hooks::run(&agent.id(), crate::rpc::seal_hooks::Point::AfterSeal);
+                crate::rpc::hooks::run(&agent.id(), crate::rpc::hooks::Point::AfterSeal);
             }
         }
 

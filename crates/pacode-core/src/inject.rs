@@ -47,6 +47,14 @@ pub enum Injection {
         call_id: CallId,
         question: String,
     },
+    /// An `agent send` whose call was dropped (the orchestrator was
+    /// interrupted) after its message had taken effect: what it did, so the
+    /// orchestrator neither sends it again nor loses a report it took back.
+    SendLanded {
+        agent: AgentId,
+        name: String,
+        outcome: pacode_tools::SendOutcome,
+    },
 }
 
 impl Injection {
@@ -57,7 +65,8 @@ impl Injection {
     /// The rule is stated as an exclusion on purpose: a new variant is
     /// holdable by default, and the ones that must never wait in a backlog are
     /// the ones that hang a turn — a held steer is a turn the user believes is
-    /// running and is not, a held question is a subagent blocked for nothing.
+    /// running and is not, a held question is a subagent blocked for nothing,
+    /// and a held `SendLanded` is a message the orchestrator sends again.
     pub fn is_holdable(&self) -> bool {
         !matches!(
             self,
@@ -65,6 +74,7 @@ impl Injection {
                 | Injection::StatusRequest
                 | Injection::ParentMessage { .. }
                 | Injection::AgentQuestion { .. }
+                | Injection::SendLanded { .. }
         )
     }
 }
@@ -276,6 +286,19 @@ pub fn render_injections(items: &[Injection], cap_chars: usize) -> Message {
                      without an answer lets it proceed on its own judgment.)\n</agent_question>"
                 ));
             }
+            // Whole, like the exchange itself: a report it carries was capped
+            // when it was first queued.
+            Injection::SendLanded {
+                agent,
+                name,
+                outcome,
+            } => {
+                parts.push(format!(
+                    "<send_result id=\"{agent}\" name=\"{name}\">\nYour interrupted `agent send` \
+                     had already reached it; do not send the message again. {}\n</send_result>",
+                    outcome.describe(agent)
+                ));
+            }
         }
     }
 
@@ -376,11 +399,22 @@ mod tests {
         let message = Injection::ParentMessage {
             text: "M".repeat(300),
         };
+        let landed = Injection::SendLanded {
+            agent: AgentId::new("agt_1"),
+            name: "tests".into(),
+            outcome: pacode_tools::SendOutcome::Resumed {
+                previous_report: Some("R".repeat(300)),
+            },
+        };
         assert!(!question.is_holdable());
         assert!(!message.is_holdable());
+        assert!(!landed.is_holdable());
 
         // Capped at the door, so the report cap does not cut them again.
-        let text = render_injections(&[message, question], 100).text();
+        let text = render_injections(&[message, question, landed], 100).text();
+        assert!(text.contains("<send_result id=\"agt_1\" name=\"tests\">"));
+        assert!(text.contains("do not send the message again"));
+        assert!(text.contains(&"R".repeat(300)));
         assert!(text.contains(&format!(
             "<orchestrator_message>\n{}\n</orchestrator_message>",
             "M".repeat(300)

@@ -201,7 +201,8 @@ impl Notice {
             Injection::UserSteer { .. }
             | Injection::StatusRequest
             | Injection::ParentMessage { .. }
-            | Injection::AgentQuestion { .. } => None,
+            | Injection::AgentQuestion { .. }
+            | Injection::SendLanded { .. } => None,
         }
     }
 
@@ -343,7 +344,8 @@ impl Held {
             Injection::UserSteer { .. }
             | Injection::StatusRequest
             | Injection::ParentMessage { .. }
-            | Injection::AgentQuestion { .. } => {}
+            | Injection::AgentQuestion { .. }
+            | Injection::SendLanded { .. } => {}
         }
         injection
     }

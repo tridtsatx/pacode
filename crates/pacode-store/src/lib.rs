@@ -16,7 +16,7 @@ mod batch;
 mod txn;
 
 pub use queries::{
-    AdmissionCursor, MessageAdmission, MessageAdmissionPage, MessageAdmissionResult,
+    AdmissionCursor, AgentRestore, MessageAdmission, MessageAdmissionPage, MessageAdmissionResult,
     MessageAdmissionState, MessagePage, MessageRow, SearchHit, SessionCursor, SessionFilter,
     SessionPage, TaskAdmission, TaskAdmissionResult,
 };
