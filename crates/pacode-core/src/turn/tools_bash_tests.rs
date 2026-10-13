@@ -8,7 +8,7 @@ use pacode_types::{CallId, Config, Mode};
 use tokio_util::sync::CancellationToken;
 
 use super::execute_tool_calls;
-use super::tools_tests::{test_session, tool_results};
+use super::tools_tests::{test_session_with_plugins, tool_results};
 use crate::turn::stream::PendingToolCall;
 
 /// A read-only command the classifier calls `Safe` that takes `SLOW`.
@@ -31,9 +31,81 @@ async fn bash_session() -> (
     Arc<crate::session::Session>,
     Arc<crate::agent::Agent>,
 ) {
-    let (temp, session, agent) = test_session(Config::default(), Arc::new(BashTool::default()));
+    bash_session_with(Config::default(), pacode_plugin::PluginHost::new()).await
+}
+
+async fn bash_session_with(
+    config: Config,
+    plugins: pacode_plugin::PluginHost,
+) -> (
+    tempfile::TempDir,
+    Arc<crate::session::Session>,
+    Arc<crate::agent::Agent>,
+) {
+    let (temp, session, agent) =
+        test_session_with_plugins(config, Arc::new(BashTool::default()), plugins);
     session.store.upsert_session(&session.meta()).await.unwrap();
     (temp, session, agent)
+}
+
+/// A plugin whose `PreToolCall` hook rewrites one bash command into another.
+struct Rewrite {
+    from: &'static str,
+    to: &'static str,
+}
+
+#[async_trait::async_trait]
+impl pacode_plugin::PluginRuntime for Rewrite {
+    fn name(&self) -> &str {
+        "rewrite"
+    }
+    fn version(&self) -> &str {
+        "0"
+    }
+    fn kind(&self) -> pacode_plugin::PluginKind {
+        pacode_plugin::PluginKind::Lua
+    }
+    fn description(&self) -> Option<&str> {
+        None
+    }
+    fn tools(&self) -> Vec<pacode_plugin::PluginToolDef> {
+        Vec::new()
+    }
+    fn commands(&self) -> Vec<pacode_plugin::PluginCommandDef> {
+        Vec::new()
+    }
+    async fn call_tool(
+        &self,
+        name: &str,
+        _input: serde_json::Value,
+    ) -> Result<serde_json::Value, pacode_plugin::PluginError> {
+        Err(pacode_plugin::PluginError::ToolNotFound {
+            name: name.to_string(),
+        })
+    }
+    async fn run_command(
+        &self,
+        name: &str,
+        _args: String,
+    ) -> Result<pacode_plugin::CommandOutcome, pacode_plugin::PluginError> {
+        Err(pacode_plugin::PluginError::CommandNotFound {
+            name: name.to_string(),
+        })
+    }
+    async fn hook(
+        &self,
+        event: pacode_plugin::HookEvent,
+    ) -> Result<pacode_plugin::HookResult, pacode_plugin::PluginError> {
+        Ok(match event {
+            pacode_plugin::HookEvent::PreToolCall { name, mut input }
+                if name == "bash" && input["command"] == self.from =>
+            {
+                input["command"] = serde_json::Value::from(self.to);
+                pacode_plugin::HookResult::ModifyInput(input)
+            }
+            _ => pacode_plugin::HookResult::Continue,
+        })
+    }
 }
 
 /// The text of each result, without the `[exit code …]` line.
@@ -195,4 +267,65 @@ async fn an_interrupted_write_finishes_in_the_background() {
     assert_eq!(tasks[0].status, pacode_types::TaskStatus::Completed);
     assert!(tasks[0].backgrounded, "its end is the router's to announce");
     assert!(temp.path().join("marker.txt").exists());
+}
+
+/// A plugin hook turns a read the model sent into a write: the call is placed
+/// on the input it will run, so the write runs alone, after the read before
+/// it and before the read after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_a_hook_rewrites_into_a_write_leaves_the_group() {
+    let mut plugins = pacode_plugin::PluginHost::new();
+    plugins.plugins.push(Box::new(Rewrite {
+        from: "ls",
+        to: "sleep 0.3; echo written > marker.txt",
+    }));
+    let (_temp, session, agent) = bash_session_with(Config::default(), plugins).await;
+    session.meta.write().unwrap().mode = Mode::Bypass;
+
+    execute_tool_calls(
+        &session,
+        &agent,
+        &CancellationToken::new(),
+        vec![
+            bash("before", &format!("{SLOW_READ}; echo before")),
+            bash("rewritten", "ls"),
+            bash("after", "cat marker.txt"),
+        ],
+    )
+    .await;
+
+    assert_eq!(outputs(&agent), ["before", "", "written"]);
+}
+
+/// The user's `[hooks]` scripts were written for one call at a time: the
+/// `post_tool_use` hooks of calls that ran side by side take turns.
+#[tokio::test(flavor = "multi_thread")]
+async fn hook_commands_of_side_by_side_calls_take_turns() {
+    let mut config = Config::default();
+    config.hooks.post_tool_use = vec![pacode_types::HookRule {
+        matcher: "bash".to_string(),
+        // Overlap shows as a failed `mkdir` of the shared lock directory.
+        command: "if mkdir hook.lock 2>/dev/null; then sleep 0.2; rmdir hook.lock; \
+                  else echo overlap >> overlaps; fi"
+            .to_string(),
+        timeout_secs: 10,
+    }];
+    let (temp, session, agent) = bash_session_with(config, pacode_plugin::PluginHost::new()).await;
+
+    execute_tool_calls(
+        &session,
+        &agent,
+        &CancellationToken::new(),
+        ["one", "two", "three"]
+            .iter()
+            .map(|id| bash(id, &format!("echo {id}")))
+            .collect(),
+    )
+    .await;
+
+    assert_eq!(outputs(&agent), ["one", "two", "three"]);
+    assert!(
+        !temp.path().join("overlaps").exists(),
+        "two hook commands ran at once"
+    );
 }

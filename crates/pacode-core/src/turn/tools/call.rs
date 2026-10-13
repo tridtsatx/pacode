@@ -106,15 +106,31 @@ pub(crate) async fn call_bounded(
     }
 }
 
-pub(super) async fn run_single_tool(
-    session: Arc<Session>,
-    agent: Arc<Agent>,
-    cancel: CancellationToken,
-    registry_snapshot: pacode_tools::ToolRegistry,
-    budget: Arc<TurnBudget>,
+/// What the checks before dispatch decided for one call.
+#[derive(Default)]
+pub(super) struct Precheck {
+    budget_denied: Option<String>,
+    hook_denied: Option<String>,
+    user_hook_block: Option<String>,
+}
+
+/// Everything before dispatch, in call order and before the call joins a
+/// group: charge the turn's budget, run plugin `PreToolCall` hooks (which may
+/// deny the call or rewrite its input) and `[hooks].pre_tool_use`. The turn
+/// decides whether the call runs alongside its neighbours on the input these
+/// leave, so a hook cannot turn a grouped read into a write.
+///
+/// A cancel while a hook runs leaves the rest undecided: the token is set,
+/// and `run_single_tool` answers the call as cancelled.
+pub(super) async fn precheck(
+    session: &Arc<Session>,
+    agent: &Arc<Agent>,
+    cancel: &CancellationToken,
+    registry_snapshot: &pacode_tools::ToolRegistry,
+    budget: &TurnBudget,
     limits: BudgetLimits,
-    mut call: ToolCallInfo,
-) -> ToolOutcome {
+    call: &mut ToolCallInfo,
+) -> Precheck {
     log::debug!(
         "tool call start: session={} agent={} tool={} call_id={}",
         session.id,
@@ -124,21 +140,17 @@ pub(super) async fn run_single_tool(
     );
     agent.set_status(AgentStatus::RunningTool, Some(call.title.clone()));
     session.events.emit(Event::AgentUpdated(agent.info()));
-
+    let mut checks = Precheck::default();
     if cancel.is_cancelled() {
-        return cancelled_outcome(&session, &agent, call);
+        return checks;
     }
 
-    let tool_opt = registry_snapshot.get(&call.name);
-    let budget_denied = budget
-        .reserve(
-            limits,
-            tool_opt.as_ref().map(|tool| tool.kind()) == Some(ToolKind::Exec),
-        )
-        .err();
+    let is_exec = registry_snapshot
+        .get(&call.name)
+        .is_some_and(|tool| tool.kind() == ToolKind::Exec);
+    checks.budget_denied = budget.reserve(limits, is_exec).err();
 
-    let mut hook_denied = None;
-    if budget_denied.is_none() && call.parse_err.is_none() {
+    if checks.budget_denied.is_none() && call.parse_err.is_none() {
         let event = pacode_plugin::HookEvent::PreToolCall {
             name: call.name.clone(),
             input: call.input.clone(),
@@ -146,19 +158,19 @@ pub(super) async fn run_single_tool(
         let hook = session.plugins.run_hooks(&event);
         let hook_result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return cancelled_outcome(&session, &agent, call),
+            _ = cancel.cancelled() => return checks,
             result = hook => result,
         };
         match hook_result {
             Ok(pacode_plugin::HookResult::Deny { reason }) => {
-                hook_denied = Some(reason);
+                checks.hook_denied = Some(reason);
             }
             Ok(pacode_plugin::HookResult::ModifyInput(new_input)) => {
                 call.input = new_input;
             }
             Ok(pacode_plugin::HookResult::Continue) => {}
             Err(e) => {
-                hook_denied = Some(format!("plugin hook error: {e}"));
+                checks.hook_denied = Some(format!("plugin hook error: {e}"));
             }
         }
     }
@@ -166,19 +178,40 @@ pub(super) async fn run_single_tool(
     // `[hooks].pre_tool_use` runs after plugin hooks so it sees the final
     // input; skipped when the call is already dead. Exit code 2 blocks the
     // call and the hook's stderr goes back to the model as the tool error.
-    let mut user_hook_block = None;
-    if budget_denied.is_none() && hook_denied.is_none() && call.parse_err.is_none() {
-        let hook = crate::hooks::pre_tool_use(&session, &agent, &call.name, &call.input);
+    if checks.budget_denied.is_none() && checks.hook_denied.is_none() && call.parse_err.is_none() {
+        let hook = crate::hooks::pre_tool_use(session, agent, &call.name, &call.input);
         let decision = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return cancelled_outcome(&session, &agent, call),
+            _ = cancel.cancelled() => return checks,
             decision = hook => decision,
         };
         match decision {
             crate::hooks::PreToolDecision::Allow => {}
-            crate::hooks::PreToolDecision::Block(reason) => user_hook_block = Some(reason),
+            crate::hooks::PreToolDecision::Block(reason) => checks.user_hook_block = Some(reason),
         }
     }
+    checks
+}
+
+/// Dispatch one call that went through [`precheck`], and turn the outcome
+/// into its transcript row and result message.
+pub(super) async fn run_single_tool(
+    session: Arc<Session>,
+    agent: Arc<Agent>,
+    cancel: CancellationToken,
+    registry_snapshot: pacode_tools::ToolRegistry,
+    call: ToolCallInfo,
+    checks: Precheck,
+) -> ToolOutcome {
+    if cancel.is_cancelled() {
+        return cancelled_outcome(&session, &agent, call);
+    }
+    let Precheck {
+        budget_denied,
+        hook_denied,
+        user_hook_block,
+    } = checks;
+    let tool_opt = registry_snapshot.get(&call.name);
 
     // ZDR hard isolation: network tools (webfetch/websearch bypass the
     // permission gate) and every MCP call (`<server>__<tool>`, `__resource`)

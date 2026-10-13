@@ -539,6 +539,10 @@ pub struct Agent {
     /// for the user's next turn instead of starting one. An interrupt is not
     /// undone by something that happens to finish afterwards.
     user_interrupted: std::sync::atomic::AtomicBool,
+    /// Held while one of this agent's `[hooks]` commands runs. Calls of one
+    /// step may run side by side; the user's hook scripts were written for
+    /// one call at a time and may share files, so they still take turns.
+    pub(crate) hook_lock: tokio::sync::Mutex<()>,
     turn_generation: std::sync::atomic::AtomicU64,
     /// One turn at a time — and what `is_running` reads. `Arc` so
     /// `start_turn` can claim it with an owned guard and move it into the
@@ -613,6 +617,7 @@ impl Agent {
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             user_interrupted: std::sync::atomic::AtomicBool::new(false),
+            hook_lock: tokio::sync::Mutex::new(()),
             turn_generation: std::sync::atomic::AtomicU64::new(0),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             message_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -671,6 +676,7 @@ impl Agent {
             cancel: Mutex::new(None),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             user_interrupted: std::sync::atomic::AtomicBool::new(false),
+            hook_lock: tokio::sync::Mutex::new(()),
             turn_generation: std::sync::atomic::AtomicU64::new(0),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             message_write_lock: Arc::new(tokio::sync::Mutex::new(())),

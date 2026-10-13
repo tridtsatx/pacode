@@ -256,7 +256,9 @@ pub async fn pre_tool_use(
         input: Some(input.clone()),
         output: None,
     };
+    let serial = agent.hook_lock.lock().await;
     let (decision, warnings) = eval_pre(rules, tool, &ctx).await;
+    drop(serial);
     for text in warnings {
         warn_notice(session, agent, text);
     }
@@ -283,7 +285,10 @@ pub async fn post_tool_use(
         input: Some(input.clone()),
         output: Some(output.clone()),
     };
-    for text in eval_post(rules, tool, &ctx).await {
+    let serial = agent.hook_lock.lock().await;
+    let warnings = eval_post(rules, tool, &ctx).await;
+    drop(serial);
+    for text in warnings {
         warn_notice(session, agent, text);
     }
 }

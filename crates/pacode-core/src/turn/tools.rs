@@ -20,7 +20,7 @@ use budget::{turn_budget, turn_budget_limits};
 pub(crate) use call::call_bounded;
 #[cfg(test)]
 use call::split_result_for_consumers;
-use call::{ToolCallInfo, ToolOutcome, cancelled_outcome, run_single_tool};
+use call::{Precheck, ToolCallInfo, ToolOutcome, precheck, run_single_tool};
 
 async fn commit_tool_outcome(session: &Arc<Session>, agent: &Arc<Agent>, outcome: ToolOutcome) {
     agent.commit_pending_user_messages();
@@ -32,11 +32,6 @@ async fn commit_tool_outcome(session: &Arc<Session>, agent: &Arc<Agent>, outcome
     let _ = session
         .append_agent_message(agent.as_ref(), seq, &message)
         .await;
-}
-
-enum ToolChunk {
-    Concurrent(Vec<ToolCallInfo>),
-    Sequential(ToolCallInfo),
 }
 
 /// Input keys that name what the tool acts on, in priority order — `path`
@@ -145,86 +140,96 @@ pub async fn execute_tool_calls(
         });
     }
 
-    // Decided on the model's input. A plugin hook may still rewrite a call
-    // inside `run_single_tool`; the tool then checks and asks for the input it
-    // actually runs, so the permission stays exact, only the call keeps the
-    // group it was placed in.
+    // Consecutive calls that may run side by side form a group; any other
+    // call runs alone, in call order. Each call's pre-dispatch checks
+    // (budget, plugin and user hooks) run before it joins: a plugin hook may
+    // rewrite the input, so whether it runs alongside its neighbours is
+    // decided on the input it will actually run. A call that runs alone
+    // first lets the reads queued before it finish, so its hooks still run
+    // right before it.
     let cwd = session.meta().cwd;
-    let mut chunks: Vec<ToolChunk> = Vec::new();
-    for call in prepared_calls {
-        let is_concurrent = registry_snapshot
+    let runs_concurrently = |call: &ToolCallInfo| {
+        registry_snapshot
             .get(&call.name)
-            .is_some_and(|tool| tool.runs_concurrently(&call.input, &cwd));
-
-        if is_concurrent {
-            match chunks.last_mut() {
-                Some(ToolChunk::Concurrent(list)) => list.push(call),
-                _ => chunks.push(ToolChunk::Concurrent(vec![call])),
-            }
-        } else {
-            chunks.push(ToolChunk::Sequential(call));
-        }
-    }
-
+            .is_some_and(|tool| tool.runs_concurrently(&call.input, &cwd))
+    };
+    let run = Run {
+        session,
+        agent,
+        cancel,
+        registry: &registry_snapshot,
+    };
     let mut interrupted = false;
-    for chunk in chunks {
-        if cancel.is_cancelled() {
-            interrupted = true;
-            match chunk {
-                ToolChunk::Concurrent(list) => {
-                    for call in list {
-                        commit_tool_outcome(
-                            session,
-                            agent,
-                            cancelled_outcome(session, agent, call),
-                        )
-                        .await;
-                    }
-                }
-                ToolChunk::Sequential(call) => {
-                    commit_tool_outcome(session, agent, cancelled_outcome(session, agent, call))
-                        .await;
-                }
-            }
-            continue;
+    let mut group: Vec<(ToolCallInfo, Precheck)> = Vec::new();
+    for mut call in prepared_calls {
+        if !runs_concurrently(&call) {
+            interrupted |= run.group(std::mem::take(&mut group)).await;
         }
-
-        match chunk {
-            ToolChunk::Concurrent(list) => {
-                let futures = list.into_iter().map(|call| {
-                    let session = session.clone();
-                    let agent = agent.clone();
-                    let cancel = cancel.clone();
-                    let registry = registry_snapshot.clone();
-                    let budget = Arc::clone(&budget);
-                    async move {
-                        run_single_tool(session, agent, cancel, registry, budget, limits, call)
-                            .await
-                    }
-                });
-                for outcome in futures::future::join_all(futures).await {
-                    interrupted |= outcome.interrupted;
-                    commit_tool_outcome(session, agent, outcome).await;
-                }
-            }
-            ToolChunk::Sequential(call) => {
-                let outcome = run_single_tool(
-                    session.clone(),
-                    agent.clone(),
-                    cancel.clone(),
-                    registry_snapshot.clone(),
-                    Arc::clone(&budget),
-                    limits,
-                    call,
-                )
-                .await;
-                interrupted |= outcome.interrupted;
-                commit_tool_outcome(session, agent, outcome).await;
-            }
+        let checks = precheck(
+            session,
+            agent,
+            cancel,
+            &registry_snapshot,
+            &budget,
+            limits,
+            &mut call,
+        )
+        .await;
+        if runs_concurrently(&call) {
+            group.push((call, checks));
+        } else {
+            interrupted |= run.group(std::mem::take(&mut group)).await;
+            interrupted |= run.one(call, checks).await;
         }
     }
-
+    interrupted |= run.group(group).await;
     interrupted
+}
+
+/// What every call of one step is dispatched with.
+struct Run<'a> {
+    session: &'a Arc<Session>,
+    agent: &'a Arc<Agent>,
+    cancel: &'a CancellationToken,
+    registry: &'a pacode_tools::ToolRegistry,
+}
+
+impl Run<'_> {
+    /// Run one call and commit its result; whether it was interrupted.
+    async fn one(&self, call: ToolCallInfo, checks: Precheck) -> bool {
+        let outcome = run_single_tool(
+            self.session.clone(),
+            self.agent.clone(),
+            self.cancel.clone(),
+            self.registry.clone(),
+            call,
+            checks,
+        )
+        .await;
+        let interrupted = outcome.interrupted;
+        commit_tool_outcome(self.session, self.agent, outcome).await;
+        interrupted
+    }
+
+    /// Run a group side by side and commit the results in call order.
+    async fn group(&self, group: Vec<(ToolCallInfo, Precheck)>) -> bool {
+        let futures = group.into_iter().map(|(call, checks)| {
+            run_single_tool(
+                self.session.clone(),
+                self.agent.clone(),
+                self.cancel.clone(),
+                self.registry.clone(),
+                call,
+                checks,
+            )
+        });
+        let mut interrupted = false;
+        for outcome in futures::future::join_all(futures).await {
+            interrupted |= outcome.interrupted;
+            commit_tool_outcome(self.session, self.agent, outcome).await;
+        }
+        interrupted
+    }
 }
 
 /// Append+persist a synthetic error `tool_result` for every `tool_use` in the

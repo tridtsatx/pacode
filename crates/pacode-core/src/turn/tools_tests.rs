@@ -14,7 +14,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BudgetLimits, ToolCallInfo, TurnBudget, execute_tool_calls, run_single_tool,
+    BudgetLimits, ToolCallInfo, TurnBudget, execute_tool_calls, precheck, run_single_tool,
     split_result_for_consumers, turn_budget,
 };
 use crate::agent::{Agent, History};
@@ -97,6 +97,14 @@ pub(super) fn test_session(
     config: Config,
     tool: Arc<dyn Tool>,
 ) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>) {
+    test_session_with_plugins(config, tool, pacode_plugin::PluginHost::new())
+}
+
+pub(super) fn test_session_with_plugins(
+    config: Config,
+    tool: Arc<dyn Tool>,
+    plugins: pacode_plugin::PluginHost,
+) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>) {
     let temp = tempfile::tempdir().unwrap();
     let session_id = pacode_types::SessionId::new("tools-test-session");
     let agent_id = AgentId::main();
@@ -168,7 +176,7 @@ pub(super) fn test_session(
         providers: Arc::new(pacode_provider::ProviderRegistry::empty()),
         tools: RwLock::new(tools),
         mcp: pacode_mcp::McpPool::new(Default::default(), None, None),
-        plugins: Arc::new(pacode_plugin::PluginHost::new()),
+        plugins: Arc::new(plugins),
         app_version: "test".to_string(),
         skills: Arc::new(pacode_skills::SkillRegistry::default()),
         scheduler: crate::schedule::Scheduler::new(),
@@ -539,7 +547,7 @@ async fn call_with_budget(
     name: &str,
     label: &str,
 ) -> String {
-    let call = ToolCallInfo {
+    let mut call = ToolCallInfo {
         call_id: CallId::new(format!(
             "call-{name}-{label}-{}",
             BUDGET_CALL_SEQ.fetch_add(1, Ordering::SeqCst)
@@ -556,14 +564,18 @@ async fn call_with_budget(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .snapshot();
+    let cancel = CancellationToken::new();
+    let checks = precheck(
+        session, agent, &cancel, &registry, &budget, limits, &mut call,
+    )
+    .await;
     let outcome = run_single_tool(
         session.clone(),
         agent.clone(),
-        CancellationToken::new(),
+        cancel,
         registry,
-        budget,
-        limits,
         call,
+        checks,
     )
     .await;
     match outcome.result.content.first() {
