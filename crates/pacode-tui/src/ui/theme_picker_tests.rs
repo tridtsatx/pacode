@@ -17,6 +17,9 @@ fn setup_state_with_picker() -> (AppState, TempDir) {
     let paths = Paths::under(tmp.path());
     let mut config = Config::default();
     config.theme.name = "pacode-dark".to_string();
+    // Pinned: under ANSI-16 the dark and light palettes resolve to the same
+    // named colours, so a preview could not be told from the original.
+    config.ui.color = "truecolor".to_string();
 
     let mut state = AppState::new(config, "0.1.0-dev".into(), 80, 24);
     state.paths = paths;

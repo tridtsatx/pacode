@@ -334,7 +334,9 @@ mod tests {
     fn a_named_colour_bar_keeps_the_span_colours() {
         let mut theme = pacode_render::Theme::ansi();
         theme.selected_bg = ratatui::style::Style::default().bg(ratatui::style::Color::Blue);
-        let opts = RenderOptions::with_theme(40, false, theme);
+        // ANSI pinned: `NO_COLOR` in the environment would swap in the mono theme.
+        let opts =
+            RenderOptions::with_theme_color(40, false, theme, pacode_render::ColorMode::Ansi);
         let line = Line::from(vec![
             Span::styled("▸ ".to_string(), opts.theme.accent),
             Span::styled(" signed in".to_string(), opts.theme.green),
@@ -351,7 +353,14 @@ mod tests {
 
     #[test]
     fn selected_row_pads_to_the_full_width() {
-        let opts = RenderOptions::new(40, false);
+        // Pinned to truecolor: under ANSI the bar is `REVERSED`, which swaps
+        // the pointer's colour on purpose (see `selected_row`).
+        let opts = RenderOptions::with_theme_color(
+            40,
+            false,
+            pacode_render::Theme::truecolor(),
+            pacode_render::ColorMode::Truecolor,
+        );
         let line = Line::from(vec![
             Span::styled("▸ ".to_string(), opts.theme.accent),
             Span::styled("name".to_string(), opts.theme.bold),

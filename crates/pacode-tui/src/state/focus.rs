@@ -84,7 +84,8 @@ pub enum Overlay {
     ModelPalette {
         palette: crate::ui::model_palette::ModelPalette,
     },
-    /// The settings page: sections across the top, `setting → value` rows, a
+    /// The settings page: a section column on the left (a text tab row on top
+    /// when the overlay is too narrow for it), `setting → value` rows, a
     /// description line for the highlighted row, and a search that filters
     /// across every section.
     Settings {

@@ -11,13 +11,25 @@ use pacode_types::Config;
 use super::*;
 use crate::ui::settings::model::on_key;
 
+/// Options pinned to a truecolor theme: the assertions read backgrounds and
+/// modifiers, which the ambient `COLORTERM` would otherwise decide (under
+/// ANSI the selected row is `REVERSED`, the same mark the scrollbar thumb uses).
+fn opts(width: u16, ascii: bool) -> RenderOptions {
+    RenderOptions::with_theme_color(
+        width,
+        ascii,
+        pacode_render::Theme::truecolor(),
+        pacode_render::ColorMode::Truecolor,
+    )
+}
+
 /// The overlay's rows as the backend holds them, unquoted and untrimmed.
 fn render(config: &Config, ui: &SettingsState, width: u16, height: u16) -> Vec<String> {
     render_maybe_ascii(config, ui, width, height, false)
 }
 
 fn buffer(config: &Config, ui: &SettingsState, width: u16, height: u16) -> ratatui::buffer::Buffer {
-    let opts = RenderOptions::new(width, false);
+    let opts = opts(width, false);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     let area = Rect::new(0, 0, width, height);
     terminal
@@ -33,7 +45,7 @@ fn render_maybe_ascii(
     height: u16,
     ascii: bool,
 ) -> Vec<String> {
-    let opts = RenderOptions::new(width, ascii);
+    let opts = opts(width, ascii);
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let area = Rect::new(0, 0, width, height);
@@ -252,7 +264,7 @@ fn a_narrow_overlay_trades_the_section_column_for_a_text_tab_row() {
     );
 
     // The active tab sits on the selection bar.
-    let opts = RenderOptions::new(width, false);
+    let opts = opts(width, false);
     let buf = buffer(&config, &ui, width, 12);
     let at = tab_row.find("provider").expect("tab") as u16;
     assert_eq!(
@@ -265,7 +277,7 @@ fn a_narrow_overlay_trades_the_section_column_for_a_text_tab_row() {
 fn the_scrollbar_is_drawn_only_while_the_rows_overflow() {
     let config = Config::default();
     let ui = SettingsState::new();
-    let opts = RenderOptions::new(120, false);
+    let opts = opts(120, false);
     let column = 118;
     let rows = ui.row_count();
 

@@ -242,7 +242,11 @@ fn the_prompt_is_two_full_width_rules_at_every_width() {
 /// mode, and while a captured command runs.
 #[test]
 fn the_rules_are_grey_regardless_of_mode_and_bash() {
-    let mut state = AppState::new(pacode_types::Config::default(), "t".into(), 80, 24);
+    // Truecolor pinned: under `NO_COLOR` every tone is empty and the check
+    // could not tell the grey from a mode colour.
+    let mut config = pacode_types::Config::default();
+    config.ui.color = "truecolor".to_string();
+    let mut state = AppState::new(config, "t".into(), 80, 24);
     let grey = state.render_options(80).theme.border;
     let check = |state: &mut AppState, ctx: &str| {
         let (terminal, layout) = draw_screen(state, 80, 24);
