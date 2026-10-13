@@ -207,7 +207,7 @@ pub(crate) fn draw(
     let on_plaque = index == count;
     lines.push(Line::from(Span::styled(
         format!("   {}. Type something.", count + 1),
-        opts.theme.faint,
+        opts.theme.dim,
     )));
 
     let plaque_row = lines.len();

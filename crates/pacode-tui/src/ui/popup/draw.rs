@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use pacode_render::RenderOptions;
 
@@ -25,7 +25,7 @@ fn draw_slash(
     commands: &[SlashCommand],
     opts: &RenderOptions,
 ) {
-    frame.render_widget(Clear, popup.area);
+    crate::ui::overlays::clear_panel(frame, popup.area, opts);
     let lines: Vec<Line<'static>> = commands
         .iter()
         .enumerate()
@@ -70,7 +70,7 @@ fn draw_at(
     candidates: &[AtCandidate],
     opts: &RenderOptions,
 ) {
-    frame.render_widget(Clear, popup.area);
+    crate::ui::overlays::clear_panel(frame, popup.area, opts);
     let lines: Vec<Line<'static>> = candidates
         .iter()
         .enumerate()
@@ -98,7 +98,7 @@ fn draw_bash(
     candidates: &[Candidate],
     opts: &RenderOptions,
 ) {
-    frame.render_widget(Clear, popup.area);
+    crate::ui::overlays::clear_panel(frame, popup.area, opts);
     let lines: Vec<Line<'static>> = candidates
         .iter()
         .enumerate()
@@ -123,7 +123,7 @@ fn draw_queue(
     queue: &[String],
     opts: &RenderOptions,
 ) {
-    frame.render_widget(Clear, popup.area);
+    crate::ui::overlays::clear_panel(frame, popup.area, opts);
     let lines: Vec<Line<'static>> = queue
         .iter()
         .enumerate()

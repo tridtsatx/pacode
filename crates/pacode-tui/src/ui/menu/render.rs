@@ -7,7 +7,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use pacode_render::{RenderOptions, display_width, truncate_to_width};
 
@@ -60,7 +60,7 @@ pub fn draw_in(
         .border_style(opts.theme.border);
 
     let inner = block.inner(rect);
-    frame.render_widget(Clear, rect);
+    crate::ui::overlays::clear_panel(frame, rect, opts);
     frame.render_widget(block, rect);
     if inner.is_empty() {
         return;
@@ -213,7 +213,7 @@ fn breadcrumb_spans(view: &MenuView, ui: &MenuUiState, opts: &RenderOptions) -> 
             if i == 0 {
                 opts.theme.bold
             } else {
-                opts.theme.faint
+                opts.theme.dim
             },
         ));
     }
@@ -230,7 +230,7 @@ fn tab_line(tabs: &Tabs, current: usize, opts: &RenderOptions) -> Line<'static> 
         let style = if i == cur {
             opts.theme.selected_bg
         } else {
-            opts.theme.faint
+            opts.theme.dim
         };
         spans.push(Span::styled(format!(" {} ", tab.label), style));
         spans.push(Span::styled(format!("{} ", tab.count), opts.theme.dim));

@@ -50,13 +50,15 @@ pub enum SettingsResult {
 }
 
 /// The body rows a key press pages by, measured with the same slot arithmetic
-/// the overlay draws with: the border pair, the tab row, the description.
+/// the overlay draws with: the border pair, the tab row (only when the section
+/// column is dropped for width), the description.
 pub fn rows_visible(area: Rect) -> usize {
     let inner = area.inner(Margin::new(1, 1));
     if inner.height == 0 {
         return 1;
     }
-    usize::from(inner.height).saturating_sub(3).max(1)
+    let tab_row = usize::from(settings::shows_tab_row(inner.width));
+    usize::from(inner.height).saturating_sub(2 + tab_row).max(1)
 }
 
 /// Feed one key to the overlay and carry out whatever it asks for.

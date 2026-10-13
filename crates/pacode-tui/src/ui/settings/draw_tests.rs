@@ -3,7 +3,6 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use pacode_config::registry;
-use pacode_render::Glyphs;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -11,11 +10,20 @@ use pacode_types::Config;
 
 use super::*;
 use crate::ui::settings::model::on_key;
-use crate::ui::settings::tabs::section_icon;
 
 /// The overlay's rows as the backend holds them, unquoted and untrimmed.
 fn render(config: &Config, ui: &SettingsState, width: u16, height: u16) -> Vec<String> {
     render_maybe_ascii(config, ui, width, height, false)
+}
+
+fn buffer(config: &Config, ui: &SettingsState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let opts = RenderOptions::new(width, false);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let area = Rect::new(0, 0, width, height);
+    terminal
+        .draw(|frame| draw(frame, area, config, ui, &opts))
+        .expect("draw");
+    terminal.backend().buffer().clone()
 }
 
 fn render_maybe_ascii(
@@ -68,15 +76,12 @@ fn renders_the_documented_shape_at_120x40() {
     assert!(lines[0].contains("Settings"), "{}", lines[0]);
     assert!(lines[0].contains('╭'), "no border: {}", lines[0]);
 
-    // Tab row: the active tab spells its section out, the rest are icons.
-    let tab_row = &lines[1];
+    // No tab row while the section column is there: the body starts on the
+    // first inner row.
     assert!(
-        tab_row.contains("provider"),
-        "the active tab names its section: {tab_row}"
-    );
-    assert!(
-        tab_row.contains(section_icon("tools", &Glyphs::new(false))),
-        "inactive tabs are icons: {tab_row}"
+        lines[1].contains("provider") && lines[1].contains("Default Route"),
+        "the body starts under the border: {}",
+        lines[1]
     );
 
     // Two columns: the section name, then the setting and its value.
@@ -172,7 +177,7 @@ fn the_footer_is_one_row_whatever_the_description_says() {
 
 #[test]
 fn ascii_mode_drops_the_unicode_the_page_owns() {
-    // The page's own glyphs — icons, bullets, arrows, the scrollbar — must all
+    // The page's own glyphs — bullets, arrows, the scrollbar — must all
     // fall back to ASCII on a terminal that cannot draw them.
     //
     // The *frame* is the one thing this cannot cover, and it is not a gap in
@@ -217,5 +222,83 @@ fn a_search_with_no_hits_says_so_instead_of_showing_nothing() {
     assert!(
         lines.iter().any(|line| line.contains("no settings match")),
         "{lines:?}"
+    );
+}
+
+#[test]
+fn a_narrow_overlay_trades_the_section_column_for_a_text_tab_row() {
+    let config = Config::default();
+    let ui = SettingsState::new();
+    // 20 cells: an 18-cell inner width, one short of the section column.
+    let width = 20;
+    assert!(shows_tab_row(width - 2) && !shows_tab_row(MIN_LEFT_COLUMN + 1));
+    let lines = render(&config, &ui, width, 12);
+    let tab_row = &lines[1];
+    assert!(
+        tab_row.contains("provider"),
+        "the tab row names the open section: {tab_row:?}"
+    );
+    assert!(
+        tab_row
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace() || c == '…' || c == '│'),
+        "the tab row is words, not icons: {tab_row:?}"
+    );
+    // The body follows the tab row, with no section column before it.
+    assert!(
+        !lines[2].contains("provider") && lines[2].contains("Default"),
+        "{:?}",
+        lines[2]
+    );
+
+    // The active tab sits on the selection bar.
+    let opts = RenderOptions::new(width, false);
+    let buf = buffer(&config, &ui, width, 12);
+    let at = tab_row.find("provider").expect("tab") as u16;
+    assert_eq!(
+        buf[(at, 1)].bg,
+        opts.theme.selected_bg.bg.unwrap_or_default()
+    );
+}
+
+#[test]
+fn the_scrollbar_is_drawn_only_while_the_rows_overflow() {
+    let config = Config::default();
+    let ui = SettingsState::new();
+    let opts = RenderOptions::new(120, false);
+    let column = 118;
+    let rows = ui.row_count();
+
+    // Tall enough for every row of the section: no bar, and the values take
+    // the column back.
+    let height = rows as u16 + 6;
+    let buf = buffer(&config, &ui, 120, height);
+    for y in 1..height - 3 {
+        let cell = &buf[(column, y)];
+        assert!(
+            cell.symbol() != opts.glyphs.vline && !cell.modifier.contains(Modifier::REVERSED),
+            "a bar at row {y} with nothing to scroll: {cell:?}"
+        );
+    }
+    assert!(
+        (1..height - 3).any(|y| buf[(column, y)].symbol() != " "),
+        "the values stopped short of the freed column"
+    );
+
+    // One row short (the description is a single row at this width): a quiet
+    // track and a solid thumb in the last column.
+    let height = rows as u16 + 2;
+    let buf = buffer(&config, &ui, 120, height);
+    let cells: Vec<_> = (1..height - 2).map(|y| buf[(column, y)].clone()).collect();
+    assert!(
+        cells.iter().any(|cell| cell.symbol() == opts.glyphs.vline
+            && cell.fg == opts.theme.border.fg.unwrap_or_default()),
+        "no track: {cells:?}"
+    );
+    assert!(
+        cells
+            .iter()
+            .any(|cell| cell.modifier.contains(Modifier::REVERSED)),
+        "no thumb: {cells:?}"
     );
 }

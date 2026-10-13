@@ -3,7 +3,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use pacode_render::RenderOptions;
 
@@ -14,7 +14,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         return;
     }
 
-    frame.render_widget(Clear, area);
+    crate::ui::overlays::clear_panel(frame, area, opts);
 
     match &state.focus {
         Focus::Overlay(Overlay::EffortPicker { index }) => {

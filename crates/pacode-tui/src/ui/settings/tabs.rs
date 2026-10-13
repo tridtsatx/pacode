@@ -1,40 +1,30 @@
-//! The tab row: one tab per registry section, drawn from the shared glyph
-//! table so a terminal without the glyphs falls back to ASCII instead of tofu.
+//! The tab row: one tab per registry section, spelled out. It is drawn only
+//! when the section column has been dropped for width, so it is the one place
+//! left that says which section is open.
 //!
 //! A terminal wide enough shows every tab. A narrow one shows a window around
-//! the active tab, marked with ellipses, because a bar of icons that says
-//! nothing about which section is open is worse than a bar with fewer icons.
+//! the active tab, marked with ellipses.
 
 use std::ops::Range;
 
-use pacode_render::Glyphs;
 use pacode_render::display_width;
 
 #[cfg(test)]
 #[path = "tabs_tests.rs"]
 mod tabs_tests;
 
-/// One section's tab. Inactive tabs are an icon alone; the active one spells
-/// its section out, so the bar answers "where am I" on its own when the section
-/// column has been dropped for width.
+/// One section's tab, drawn as ` name `.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tab {
     pub section: usize,
     pub name: &'static str,
-    pub icon: &'static str,
     pub active: bool,
 }
 
 impl Tab {
-    /// Cells this tab costs: a leading separator, the icon, and the name on the
-    /// active one.
+    /// Cells this tab costs: the name and a space either side.
     pub fn width(&self) -> usize {
-        1 + display_width(self.icon)
-            + if self.active {
-                1 + display_width(self.name)
-            } else {
-                0
-            }
+        display_width(self.name) + 2
     }
 }
 
@@ -59,46 +49,16 @@ impl TabBar {
 
 /// One tab per section, in [`super::model::section_order`] order. The active
 /// tab is the one whose section the overlay is showing.
-pub fn tabs(sections: &[&'static str], glyphs: &Glyphs, active: usize) -> Vec<Tab> {
+pub fn tabs(sections: &[&'static str], active: usize) -> Vec<Tab> {
     sections
         .iter()
         .enumerate()
         .map(|(index, &name)| Tab {
             section: index,
             name,
-            icon: section_icon(name, glyphs),
             active: index == active,
         })
         .collect()
-}
-
-/// The tab row's icon for `section`.
-///
-/// The glyph table has no per-domain icons, so the mapping reuses marks that
-/// already mean something — a filled bar is a ceiling, a caret is a bigger
-/// font, a corner is a leaf capability. A section the map does not know gets
-/// the main dot rather than nothing: an added section has to be reachable, and
-/// a reachable section has to look like a tab.
-pub fn section_icon(section: &str, glyphs: &Glyphs) -> &'static str {
-    match section {
-        "provider" => glyphs.running,
-        "ui" => glyphs.pointer,
-        "exec" => glyphs.prompt,
-        "limits" => glyphs.bar_full,
-        "daemon" => glyphs.main_dot,
-        "context" => glyphs.vline,
-        "permissions" => glyphs.ok,
-        "mcp" => glyphs.agent_dot,
-        "session" => glyphs.chevrons,
-        "plugins" => glyphs.hline,
-        "skills" => glyphs.vcorner,
-        "tools" => glyphs.tool,
-        "theme" => glyphs.bar_empty,
-        "font" => glyphs.arrow_up,
-        "keys" => glyphs.arrow_right,
-        "web" => glyphs.arrow_down,
-        _ => glyphs.main_dot,
-    }
 }
 
 /// The window of tabs a bar `width` cells wide shows, always holding the active
@@ -117,8 +77,8 @@ pub fn window(tabs: &[Tab], width: usize, ellipsis: &str) -> TabBar {
         .position(|tab| tab.active)
         .unwrap_or(0)
         .min(count - 1);
-    // An ellipsis plus the space that separates it from the next tab.
-    let marker = display_width(ellipsis) + 1;
+    // A tab carries its own padding, so a marker is the ellipsis alone.
+    let marker = display_width(ellipsis);
     // Reserve the markers only on the ends the window actually cuts. The
     // reservation is a promise to the renderer, so each candidate is measured
     // against the row it would really draw.

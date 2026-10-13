@@ -2,7 +2,8 @@
 //! (Tiny tier). Width 78% of the dialog column, top offset 2, rounded border,
 //! bold title on the top edge, dim key hints on the bottom edge.
 //!
-//! Shared chrome lives here: `menu_block` draws the border, `selected_row`
+//! Shared chrome lives here: `clear_panel` gives every floating element its
+//! solid background, `menu_block` draws the border, `selected_row`
 //! paints the highlighted row as a full-width bar, and `window_groups`
 //! scrolls variable-height rows so the selected one stays fully visible.
 
@@ -78,12 +79,12 @@ pub(crate) fn draw(
             crate::ui::menu::draw_in(frame, popup.area, &menu.view, &menu.ui, opts);
         }
         crate::ui::popup::PopupId::RailOverlay => {
-            frame.render_widget(Clear, popup.area);
+            clear_panel(frame, popup.area, opts);
             draw_rail_overlay(frame, popup.area, prepared, state, opts);
         }
         crate::ui::popup::PopupId::ModelPalette => {
             if let Some(palette) = popup.palette.as_ref() {
-                crate::ui::model_palette_view::draw(frame, popup.area, palette);
+                crate::ui::model_palette_view::draw(frame, popup.area, palette, opts);
             }
         }
         crate::ui::popup::PopupId::Settings => {
@@ -92,7 +93,7 @@ pub(crate) fn draw(
             else {
                 return;
             };
-            frame.render_widget(Clear, popup.area);
+            clear_panel(frame, popup.area, opts);
             crate::ui::settings_ui::draw(frame, popup.area, state, ui, opts);
         }
         crate::ui::popup::PopupId::Analyze => {
@@ -103,7 +104,7 @@ pub(crate) fn draw(
                 // blank frame beats a page reading someone else's session.
                 return;
             };
-            frame.render_widget(Clear, popup.area);
+            clear_panel(frame, popup.area, opts);
             crate::ui::analyze::draw(frame, popup.area, report, view, opts);
         }
         crate::ui::popup::PopupId::Slash
@@ -115,6 +116,17 @@ pub(crate) fn draw(
         | crate::ui::popup::PopupId::QuestionPicker
         | crate::ui::popup::PopupId::ThemePicker => {}
     }
+}
+
+/// Wipe `area` and paint it with the solid `panel` background: the one way
+/// an overlay, popup or picker claims its rect. A terminal with a translucent
+/// default background would otherwise show its wallpaper through every
+/// floating element. Spans drawn afterwards keep the panel unless they carry
+/// a background of their own (the selection bar, a badge). Under ANSI-16 and
+/// mono `panel` is empty and this is a plain `Clear`.
+pub(crate) fn clear_panel(frame: &mut Frame, area: Rect, opts: &RenderOptions) {
+    frame.render_widget(Clear, area);
+    frame.buffer_mut().set_style(area, opts.theme.panel);
 }
 
 /// The shared overlay frame: rounded border, bold title on the top edge, dim
@@ -266,6 +278,10 @@ fn rail_overlay_inner(area: Rect) -> Rect {
         area.height.saturating_sub(2),
     )
 }
+
+#[cfg(test)]
+#[path = "overlays_tests.rs"]
+mod overlays_tests;
 
 #[cfg(test)]
 mod tests {

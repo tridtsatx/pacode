@@ -8,7 +8,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -75,7 +75,9 @@ pub fn draw(
     let text_width = area.width.saturating_sub(2).max(1) as usize;
     let wrapped = wrap_text(&description, text_width);
     let inner = area.inner(Margin::new(1, 1));
-    let (tabs_area, body, desc_area) = slots(inner, wrapped.len().min(MAX_DESC_ROWS) as u16);
+    let tab_row = shows_tab_row(inner.width);
+    let (tabs_area, body, desc_area) =
+        slots(inner, tab_row, wrapped.len().min(MAX_DESC_ROWS) as u16);
 
     let title = if ui.query().is_empty() {
         "Settings".to_string()
@@ -134,22 +136,34 @@ fn describe(ui: &SettingsState) -> String {
     }
 }
 
-/// Tabs, body and description rows inside the border. A body of zero rows is a
-/// legitimate answer for a short terminal — the tabs and the hint still draw.
-fn slots(inner: Rect, desc_rows: u16) -> (Rect, Rect, Rect) {
+/// Whether the section column is dropped for width, leaving the tab row to
+/// name the open section. Measured with the scrollbar column reserved, so the
+/// section column does not come and go as the rows start or stop overflowing.
+pub fn shows_tab_row(inner_width: u16) -> bool {
+    inner_width.saturating_sub(1) < MIN_LEFT_COLUMN
+}
+
+/// Tabs, body and description rows inside the border. The tab row exists only
+/// when `tab_row` is set; otherwise the body starts on the first inner row. A
+/// body of zero rows is a legitimate answer for a short terminal — the tabs and
+/// the hint still draw.
+fn slots(inner: Rect, tab_row: bool, desc_rows: u16) -> (Rect, Rect, Rect) {
     let none = Rect::new(inner.x, inner.y, 0, 0);
     if inner.width == 0 || inner.height == 0 {
         return (none, none, none);
     }
-    let tabs = Rect::new(inner.x, inner.y, inner.width, 1);
-    let rest = inner.height - 1;
+    let tabs_h = u16::from(tab_row);
+    let tabs = Rect::new(inner.x, inner.y, inner.width, tabs_h);
+    let rest = inner.height - tabs_h;
     let desc_h = desc_rows.min(rest.saturating_sub(1));
     let body_h = rest - desc_h;
-    let body = Rect::new(inner.x, inner.y + 1, inner.width, body_h);
+    let body = Rect::new(inner.x, inner.y + tabs_h, inner.width, body_h);
     let desc = Rect::new(inner.x, body.y + body_h, inner.width, desc_h);
     (tabs, body, desc)
 }
 
+/// The text tab row: ` name ` per section, the active one on the selection
+/// bar, an ellipsis on each end the window cuts.
 fn draw_tabs(
     frame: &mut Frame,
     area: Rect,
@@ -160,7 +174,7 @@ fn draw_tabs(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let bar = tabs::tabs(order, &opts.glyphs, shown);
+    let bar = tabs::tabs(order, shown);
     let window = tabs::window(&bar, area.width as usize, opts.glyphs.ellipsis);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(window.range.len() + 2);
     if window.clipped_left {
@@ -168,20 +182,17 @@ fn draw_tabs(
     }
     for tab in &bar[window.range.clone()] {
         let style = if tab.active {
-            opts.theme.bold.patch(opts.theme.accent)
+            opts.theme
+                .selected_bg
+                .patch(opts.theme.accent)
+                .patch(opts.theme.bold)
         } else {
-            opts.theme.faint
+            opts.theme.dim
         };
-        spans.push(Span::styled(format!(" {}", tab.icon), style));
-        if tab.active {
-            spans.push(Span::styled(format!(" {}", tab.name), style));
-        }
+        spans.push(Span::styled(format!(" {} ", tab.name), style));
     }
     if window.clipped_right {
-        spans.push(Span::styled(
-            format!(" {}", opts.glyphs.ellipsis),
-            opts.theme.dim,
-        ));
+        spans.push(Span::styled(opts.glyphs.ellipsis, opts.theme.dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -198,12 +209,17 @@ fn draw_body(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // The scrollbar owns the last column; the two columns share what is left.
-    let columns = area.width.saturating_sub(1);
-    let left_w = if columns < MIN_LEFT_COLUMN {
-        0
+    // The scrollbar takes the last column only while the rows overflow; the
+    // section column is sized as if it were always there, so it holds still.
+    // The body spans the whole inner width, so it answers the same question
+    // the tab row did.
+    let total = ui.row_count();
+    let overflow = total > area.height as usize;
+    let columns = area.width.saturating_sub(u16::from(overflow));
+    let left_w = if !shows_tab_row(area.width) {
+        (area.width.saturating_sub(1) / 4).clamp(9, 22)
     } else {
-        (columns / 4).clamp(9, 22)
+        0
     };
     let gap = u16::from(left_w > 0);
     let right_x = area.x + left_w + gap;
@@ -216,7 +232,7 @@ fn draw_body(
                 let name = order.get(index).copied().unwrap_or("");
                 let line = Line::from(Span::styled(
                     truncate_to_width(name, left_w as usize, !opts.glyphs.ascii),
-                    opts.theme.faint,
+                    opts.theme.dim,
                 ));
                 if index == shown {
                     selected_row(line, left_w, opts)
@@ -231,7 +247,6 @@ fn draw_body(
         );
     }
 
-    let total = ui.row_count();
     let window = ui.window(total, area.height as usize);
     let editing = ui.editing();
     let window_start = window.start;
@@ -253,19 +268,29 @@ fn draw_body(
         Rect::new(right_x, area.y, right_w, area.height),
     );
 
-    let mut scrollbar = ScrollbarState::new(total.max(1))
-        .position(window_start)
-        .viewport_content_length(area.height as usize);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .thumb_symbol(opts.glyphs.bar_full)
-            .track_symbol(Some(opts.glyphs.bar_empty))
-            .style(opts.theme.dim),
-        Rect::new(area.x + columns, area.y, 1, area.height),
-        &mut scrollbar,
-    );
+    if overflow {
+        let mut scrollbar = ScrollbarState::new(total)
+            .position(window_start)
+            .viewport_content_length(area.height as usize);
+        frame.render_stateful_widget(
+            scrollbar_widget(opts),
+            Rect::new(area.x + columns, area.y, 1, area.height),
+            &mut scrollbar,
+        );
+    }
+}
+
+/// A quiet track — the thin rule in the border colour — under a solid thumb.
+/// The thumb is a reversed blank cell, so it reads as a block in every colour
+/// mode (mono included) without a glyph of its own.
+fn scrollbar_widget(opts: &RenderOptions) -> Scrollbar<'static> {
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some(opts.glyphs.vline))
+        .track_style(opts.theme.border)
+        .thumb_symbol(" ")
+        .thumb_style(opts.theme.dim.add_modifier(Modifier::REVERSED))
 }
 
 /// One `Setting  value` row. The label takes what the value leaves, so a long
@@ -297,7 +322,7 @@ fn row_line(
     let label_style = if selected {
         opts.theme.bold.patch(opts.theme.fg)
     } else {
-        opts.theme.faint
+        opts.theme.dim
     };
     let mut spans = vec![
         Span::styled(

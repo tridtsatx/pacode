@@ -39,7 +39,7 @@ pub(super) fn draw_list(
         if !view.empty.hint.is_empty() {
             lines.push(Line::from(Span::styled(
                 view.empty.hint.clone(),
-                opts.theme.faint,
+                opts.theme.dim,
             )));
         }
         frame.render_widget(Paragraph::new(lines), area);
@@ -383,7 +383,7 @@ fn collapsed_lines(row: &MenuRow, width: u16, opts: &RenderOptions) -> Vec<Line<
             Span::raw("    "),
             Span::styled(
                 truncate_to_width(&detail_text(line), w, ascii),
-                opts.theme.faint,
+                opts.theme.dim,
             ),
         ]));
     }

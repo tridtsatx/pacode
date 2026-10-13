@@ -5,7 +5,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use pacode_render::{RenderOptions, display_width, truncate_to_width};
 use pacode_types::ModelInfo;
@@ -79,12 +79,17 @@ pub(crate) fn store_scroll(state: &mut AppState, prepared: &PreparedPalette) {
     }
 }
 
-pub(crate) fn draw(frame: &mut Frame, area: Rect, prepared: &PreparedPalette) {
+pub(crate) fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    prepared: &PreparedPalette,
+    opts: &RenderOptions,
+) {
     let Some(content) = prepared.content.as_ref() else {
         return;
     };
     let inner = content.block.inner(area);
-    frame.render_widget(Clear, area);
+    crate::ui::overlays::clear_panel(frame, area, opts);
     frame.render_widget(content.block.clone(), area);
     frame.render_widget(Paragraph::new(content.lines.clone()), inner);
     if let Some(position) = content.cursor {
