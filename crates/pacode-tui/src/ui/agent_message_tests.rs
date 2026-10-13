@@ -138,3 +138,46 @@ fn the_header_fits_the_width_whatever_the_name() {
         }
     }
 }
+
+/// A plain-ASCII glyph set gets its own ellipsis wherever a row is cut —
+/// the folded message, the answer and the name — never a literal `…`.
+#[test]
+fn rows_are_cut_with_the_glyph_sets_ellipsis() {
+    let ascii = |width| {
+        RenderOptions::with_theme_color(width, true, Theme::truecolor(), ColorMode::Truecolor)
+    };
+    let joined = |lines: Vec<Line<'static>>| -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    };
+    let rows = joined(render(
+        &view(
+            AgentMessageDirection::ToSubagent,
+            "also cover the empty case\nand the rest",
+            None,
+        ),
+        &ascii(60),
+        false,
+    ));
+    assert_eq!(rows[0], "-> tests: also cover the empty case...");
+
+    let long = "word ".repeat(40);
+    let answer = AgentReply::Answered { text: long.clone() };
+    let name = "a-very-long-subagent-name-".repeat(4);
+    for width in [12u16, 20, 40] {
+        let view = AgentMessageView {
+            subagent_name: &name,
+            direction: AgentMessageDirection::Question,
+            text: &long,
+            reply: Some(&answer),
+        };
+        let rows = joined(render(&view, &ascii(width), false));
+        assert!(rows.iter().all(|r| !r.contains('\u{2026}')), "{rows:?}");
+        assert!(rows[0].ends_with("..."), "{rows:?}");
+        for row in &rows {
+            assert!(display_width(row) <= width as usize, "{row}");
+        }
+    }
+}

@@ -6,7 +6,7 @@
 
 use ratatui::text::{Line, Span};
 
-use pacode_render::{RenderOptions, display_width, truncate_spans, truncate_to_width, wrap_text};
+use pacode_render::{RenderOptions, display_width, truncate_spans, wrap_text};
 use pacode_types::{AgentMessageDirection, AgentReply};
 
 #[cfg(test)]
@@ -48,10 +48,10 @@ pub(super) fn render(
     } else {
         display_width(first_line(view.text)).min(MIN_TEXT)
     };
-    let name = truncate_to_width(
+    let name = cut(
         view.subagent_name,
         width.saturating_sub(fixed + text_room).max(1),
-        true,
+        opts.glyphs.ellipsis,
     );
     let mut head = vec![lead, Span::styled(name, opts.theme.bold), sep];
     let mut lines = Vec::new();
@@ -61,7 +61,7 @@ pub(super) fn render(
     } else {
         let used: usize = head.iter().map(|s| display_width(&s.content)).sum();
         head.push(Span::styled(
-            folded(view.text, width.saturating_sub(used)),
+            folded(view.text, width.saturating_sub(used), opts.glyphs.ellipsis),
             opts.theme.fg,
         ));
         lines.push(fit(head, width, opts));
@@ -115,7 +115,7 @@ fn outcome(
                 vec![
                     Span::styled(lead, opts.theme.faint),
                     Span::styled(label, opts.theme.green),
-                    Span::styled(folded(text, room), opts.theme.dim),
+                    Span::styled(folded(text, room, opts.glyphs.ellipsis), opts.theme.dim),
                 ],
                 width,
                 opts,
@@ -138,13 +138,21 @@ fn first_line(text: &str) -> &str {
 }
 
 /// The first line cut to `room`, with an ellipsis when anything was left out.
-fn folded(text: &str, room: usize) -> String {
+fn folded(text: &str, room: usize, ellipsis: &str) -> String {
     let text = text.trim();
     let first = first_line(text);
     if first.len() < text.len() {
-        return truncate_to_width(&format!("{first}…"), room, true);
+        return cut(&format!("{first}{ellipsis}"), room, ellipsis);
     }
-    truncate_to_width(first, room, true)
+    cut(first, room, ellipsis)
+}
+
+/// `text` cut to `room` cells, ending in the glyph set's `ellipsis` when cut.
+fn cut(text: &str, room: usize, ellipsis: &str) -> String {
+    truncate_spans(&[Span::raw(text.to_string())], room, ellipsis)
+        .into_iter()
+        .map(|span| span.content.into_owned())
+        .collect()
 }
 
 fn body(text: &str, width: usize, style: ratatui::style::Style) -> Vec<Line<'static>> {
