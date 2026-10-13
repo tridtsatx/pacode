@@ -14,9 +14,6 @@
 //!   whatever is left as killed.
 
 use std::collections::HashMap;
-use std::io::SeekFrom;
-#[cfg(any(target_os = "android", target_os = "linux"))]
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +21,6 @@ use std::time::Duration;
 use pacode_types::{
     AgentId, ExecConfig, ProgressSource, SessionId, TaskId, TaskInfo, TaskProgress, TaskStatus,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::broadcast;
 
 use crate::buffer::HeadTailBuffer;
@@ -85,8 +81,6 @@ pub struct TaskManager {
     /// visible to every later spawn.
     memory: MemoryLimiter,
 }
-
-const MIN_TAIL_SPOOL_BYTES: usize = 64 * 1024;
 
 struct AdmissionGuard<'a> {
     state: &'a SharedState,
@@ -513,124 +507,6 @@ impl TaskManager {
         }
     }
 
-    fn request_kill(
-        &self,
-        id: &TaskId,
-    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, ExecError> {
-        let mut tasks = self
-            .state
-            .tasks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let entry = tasks
-            .get_mut(id)
-            .ok_or_else(|| ExecError::NotFound(id.clone()))?;
-        if entry.info.status.is_terminal() {
-            return Ok(None);
-        }
-        entry.kill_requested = true;
-        entry.kill_tx.send_modify(|requested| *requested = true);
-        Ok(Some(entry.version_tx.subscribe()))
-    }
-
-    fn force_kill_if_running(&self, id: &TaskId) {
-        let child_pid = {
-            let mut tasks = self
-                .state
-                .tasks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            match tasks.get_mut(id) {
-                Some(entry) if !entry.info.status.is_terminal() => entry.child_pid,
-                _ => return,
-            }
-        };
-        crate::supervisor::force_kill(child_pid);
-    }
-
-    pub async fn kill(&self, id: &TaskId) -> Result<(), ExecError> {
-        let Some(mut rx) = self.request_kill(id)? else {
-            return Ok(());
-        };
-        let timeout = Duration::from_secs(self.state.config.kill_grace_secs.saturating_add(2));
-        wait_terminal_until(
-            id,
-            &self.state.tasks,
-            &mut rx,
-            tokio::time::Instant::now() + timeout,
-        )
-        .await;
-        self.force_kill_if_running(id);
-        Ok(())
-    }
-
-    pub async fn kill_session(&self, session: &SessionId) {
-        let to_kill: Vec<TaskId> = {
-            let tasks = self
-                .state
-                .tasks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            tasks
-                .values()
-                .filter(|entry| {
-                    entry.info.session == *session && entry.info.status == TaskStatus::Running
-                })
-                .map(|entry| entry.info.id.clone())
-                .collect()
-        };
-        let waiters = to_kill
-            .iter()
-            .filter_map(|id| {
-                self.request_kill(id)
-                    .ok()
-                    .flatten()
-                    .map(|rx| (id.clone(), rx))
-            })
-            .collect::<Vec<_>>();
-        let timeout = Duration::from_secs(self.state.config.kill_grace_secs.saturating_add(2));
-        let deadline = tokio::time::Instant::now() + timeout;
-        for (id, mut rx) in waiters {
-            wait_terminal_until(&id, &self.state.tasks, &mut rx, deadline).await;
-        }
-        for id in &to_kill {
-            self.force_kill_if_running(id);
-        }
-    }
-
-    pub async fn tail(&self, id: &TaskId, lines: usize) -> Result<Vec<String>, ExecError> {
-        let (buffer_lines, spool) = {
-            let tasks = self
-                .state
-                .tasks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let entry = tasks
-                .get(id)
-                .ok_or_else(|| ExecError::NotFound(id.clone()))?;
-            (entry.buffer.tail_lines(lines), Arc::clone(&entry.spool))
-        };
-
-        if lines == 0 || !buffer_lines.is_empty() {
-            return Ok(buffer_lines);
-        }
-        Ok(tail_spool(
-            spool.as_ref(),
-            lines,
-            self.state.config.tail_bytes.max(MIN_TAIL_SPOOL_BYTES),
-        )
-        .await)
-    }
-
-    /// Head+tail rendering capped to `max_chars` (for tool results).
-    pub async fn output(&self, id: &TaskId, max_chars: usize) -> Result<String, ExecError> {
-        let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = tasks
-            .get(id)
-            .ok_or_else(|| ExecError::NotFound(id.clone()))?;
-        Ok(entry.buffer.render(max_chars))
-    }
-
     /// Agent-reported progress (`bg progress`). Wins over parsed progress.
     pub fn report_progress(&self, id: &TaskId, progress: TaskProgress) -> Result<(), ExecError> {
         let info = {
@@ -690,198 +566,12 @@ impl TaskManager {
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {
         self.state.events.subscribe()
     }
-
-    pub async fn shutdown(&self) {
-        let live = self.take_live_supervisors();
-        for task in &live {
-            let _ = self.request_kill(&task.id);
-        }
-
-        let grace = Duration::from_secs(self.state.config.kill_grace_secs)
-            + crate::supervisor::DRAIN_GRACE
-            + Duration::from_secs(2);
-        let mut stuck = await_supervisors(live, tokio::time::Instant::now() + grace).await;
-        for task in &stuck {
-            crate::supervisor::force_kill(task.child_pid);
-        }
-        stuck = await_supervisors(
-            stuck,
-            tokio::time::Instant::now() + crate::supervisor::DRAIN_GRACE,
-        )
-        .await;
-        for task in &stuck {
-            task.handle.abort();
-        }
-
-        self.finalize_running();
-    }
-
-    fn take_live_supervisors(&self) -> Vec<LiveTask> {
-        let mut tasks = self
-            .state
-            .tasks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        tasks
-            .values_mut()
-            .filter(|entry| !entry.info.status.is_terminal())
-            .filter_map(|entry| {
-                let handle = entry.supervisor.take()?;
-                Some(LiveTask {
-                    id: entry.info.id.clone(),
-                    handle,
-                    child_pid: entry.child_pid.take(),
-                })
-            })
-            .collect()
-    }
-
-    fn finalize_running(&self) {
-        let mut ended = Vec::new();
-        {
-            let mut tasks = self
-                .state
-                .tasks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let now = pacode_types::now_ms();
-            for entry in tasks
-                .values_mut()
-                .filter(|entry| !entry.info.status.is_terminal())
-            {
-                crate::supervisor::force_kill(entry.child_pid.take());
-                entry.info.status = TaskStatus::Killed;
-                entry.info.exit_code = None;
-                entry.info.ended_at_ms = Some(now);
-                entry.version_tx.send_modify(|version| *version += 1);
-                ended.push(entry.info.clone());
-            }
-        }
-        for info in ended {
-            let _ = self.state.events.send(TaskEvent::Ended(info));
-        }
-    }
 }
 
-struct LiveTask {
-    id: TaskId,
-    handle: tokio::task::JoinHandle<()>,
-    child_pid: Option<u32>,
-}
-
-async fn await_supervisors(live: Vec<LiveTask>, deadline: tokio::time::Instant) -> Vec<LiveTask> {
-    let mut stuck = Vec::new();
-    for mut task in live {
-        if tokio::time::timeout_at(deadline, &mut task.handle)
-            .await
-            .is_ok()
-        {
-            continue;
-        }
-        stuck.push(task);
-    }
-    stuck
-}
-
-async fn wait_terminal_until(
-    id: &TaskId,
-    tasks: &Mutex<HashMap<TaskId, TaskEntry>>,
-    rx: &mut tokio::sync::watch::Receiver<u64>,
-    deadline: tokio::time::Instant,
-) {
-    loop {
-        {
-            let tasks = tasks.lock().unwrap_or_else(|error| error.into_inner());
-            if tasks
-                .get(id)
-                .is_none_or(|entry| entry.info.status.is_terminal())
-            {
-                return;
-            }
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero()
-            || !matches!(
-                tokio::time::timeout(remaining, rx.changed()).await,
-                Ok(Ok(()))
-            )
-        {
-            return;
-        }
-    }
-}
-
-#[cfg(any(target_os = "android", target_os = "linux"))]
-fn first_data_offset(file: &tokio::fs::File, offset: u64) -> u64 {
-    let Ok(offset) = libc::off_t::try_from(offset) else {
-        return offset;
-    };
-    let original = u64::try_from(offset).unwrap_or_default();
-    let data_offset = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_DATA) };
-    if data_offset < 0 {
-        original
-    } else {
-        u64::try_from(data_offset).unwrap_or(original)
-    }
-}
-
-#[cfg(not(any(target_os = "android", target_os = "linux")))]
-fn first_data_offset(_file: &tokio::fs::File, offset: u64) -> u64 {
-    offset
-}
-
-async fn tail_spool(spool: &ManagedSpool, lines: usize, max_bytes: usize) -> Vec<String> {
-    if lines == 0 || max_bytes == 0 {
-        return Vec::new();
-    }
-    let mut file = match tokio::fs::File::open(spool.path()).await {
-        Ok(file) => file,
-        Err(_) => return Vec::new(),
-    };
-    let file_len = match file.metadata().await {
-        Ok(metadata) => metadata.len(),
-        Err(_) => return Vec::new(),
-    };
-    let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-    let read_len = file_len.min(max_bytes);
-    if read_len == 0 {
-        return Vec::new();
-    }
-    let requested_start = file_len - read_len;
-    let start = first_data_offset(&file, requested_start).min(file_len);
-    let read_len = file_len - start;
-    if read_len == 0 {
-        return Vec::new();
-    }
-    if file.seek(SeekFrom::Start(start)).await.is_err() {
-        return Vec::new();
-    }
-    let capacity = usize::try_from(read_len).unwrap_or(usize::MAX);
-    let mut bytes = Vec::with_capacity(capacity);
-    if file.take(read_len).read_to_end(&mut bytes).await.is_err() {
-        return Vec::new();
-    }
-
-    let text = String::from_utf8_lossy(&bytes);
-    let text = if start != requested_start {
-        text.trim_start_matches('\0')
-    } else if start > 0 {
-        match text.find('\n') {
-            Some(newline) => &text[newline + 1..],
-            None => text.as_ref(),
-        }
-    } else {
-        text.as_ref()
-    };
-    let mut result = text
-        .lines()
-        .rev()
-        .take(lines)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    result.reverse();
-    result
-}
+#[path = "output.rs"]
+mod output;
+#[path = "stop.rs"]
+mod stop;
 
 #[path = "foreground.rs"]
 mod foreground;
