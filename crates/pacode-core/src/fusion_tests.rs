@@ -103,12 +103,23 @@ struct ScriptedProvider {
     id: &'static str,
     script: Arc<Script>,
     fail: bool,
+    /// Sends tool names upper-cased on the wire, like a provider that renames
+    /// tools (Anthropic OAuth).
+    renames_tools: bool,
 }
 
 #[async_trait]
 impl Provider for ScriptedProvider {
     fn id(&self) -> &str {
         self.id
+    }
+
+    fn wire_tool_name<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.renames_tools {
+            std::borrow::Cow::Owned(name.to_uppercase())
+        } else {
+            std::borrow::Cow::Borrowed(name)
+        }
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<EventStream, ProviderError> {
@@ -239,16 +250,19 @@ async fn harness(fusion: Option<(&str, &str)>, cast: Cast) -> (Harness, Provider
         id: "planner",
         script: scripts.planner.clone(),
         fail: cast.planner_fails,
+        renames_tools: false,
     }));
     providers.insert(Arc::new(ScriptedProvider {
         id: "cheap",
         script: scripts.cheap.clone(),
         fail: cast.cheap_fails,
+        renames_tools: true,
     }));
     providers.insert(Arc::new(ScriptedProvider {
         id: "primary",
         script: scripts.primary.clone(),
         fail: false,
+        renames_tools: false,
     }));
     providers.set_default_route(Some(primary_route));
 
@@ -470,14 +484,13 @@ async fn planner_request_carries_only_the_read_only_allowlist() {
         scripts.cheap.tool_names(0).contains(&"edit".to_string()),
         "the implementer keeps the agent's own tools"
     );
-    // The `## Tools` inventory follows each request's own schemas.
+    // The `## Tools` inventory follows each request's own schemas, named
+    // the way that request's provider sends them on the wire.
     assert!(requests[0].system_dynamic.contains("\n- read: "));
     assert!(!requests[0].system_dynamic.contains("\n- edit: "));
-    assert!(
-        scripts.cheap.requests()[0]
-            .system_dynamic
-            .contains("\n- edit: ")
-    );
+    let implementer = &scripts.cheap.requests()[0].system_dynamic;
+    assert!(implementer.contains("\n- EDIT: "), "{implementer}");
+    assert!(!implementer.contains("\n- edit: "), "{implementer}");
 }
 
 #[tokio::test]

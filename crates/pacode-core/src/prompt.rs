@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use pacode_provider::Provider;
 use pacode_types::{Mode, Plan, ToolDefinition};
 
 /// Tools listed in the `## Tools` section before the "... and N more" marker.
@@ -29,6 +30,9 @@ pub struct DynamicContext<'a> {
     /// the `## Tools` inventory is rendered from them so it cannot disagree
     /// with the schemas.
     pub tools: &'a [ToolDefinition],
+    /// The provider the request goes to: the inventory names each tool the
+    /// way this provider sends it on the wire ([`Provider::wire_tool_name`]).
+    pub provider: &'a dyn Provider,
 }
 
 /// Identity, tool rules, the background-first thesis, plan rules, permission notes.
@@ -108,20 +112,22 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
     }
 
     out.push_str("\n## Tools\n");
-    out.push_str(&tools_section(ctx.tools));
+    out.push_str(&tools_section(ctx.tools, ctx.provider));
     out
 }
 
 /// One line per tool, `- name: first sentence`, capped at [`MAX_LISTED_TOOLS`]
 /// lines and [`MAX_TOOLS_SECTION_CHARS`] chars with a visible marker for the rest.
-fn tools_section(tools: &[ToolDefinition]) -> String {
+/// `name` is the wire name `provider` sends in the schemas.
+fn tools_section(tools: &[ToolDefinition], provider: &dyn Provider) -> String {
     if tools.is_empty() {
         return "(none)\n".to_string();
     }
     let mut out = String::new();
     let mut chars = 0;
     for (listed, tool) in tools.iter().enumerate() {
-        let line = format!("- {}: {}\n", tool.name, tool_summary(&tool.description));
+        let name = provider.wire_tool_name(&tool.name);
+        let line = format!("- {name}: {}\n", tool_summary(&tool.description));
         let line_chars = line.chars().count();
         if listed == MAX_LISTED_TOOLS || chars + line_chars > MAX_TOOLS_SECTION_CHARS {
             let rest = tools.len() - listed;

@@ -406,6 +406,15 @@ impl Provider for Anthropic {
         self.fetch_models().await
     }
 
+    /// The same mapping `build_body` applies to the request's tool schemas.
+    fn wire_tool_name<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.is_oauth() {
+            std::borrow::Cow::Owned(map_tool_name_for_oauth(name))
+        } else {
+            std::borrow::Cow::Borrowed(name)
+        }
+    }
+
     fn model_info(&self, model: &str) -> ModelInfo {
         let model_cfg = self.cfg.models.iter().find(|m| m.id == model);
 

@@ -157,23 +157,27 @@ pub async fn run_turn(
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .definitions();
-        let render_dynamic = |tools: &[pacode_types::ToolDefinition]| {
-            let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
-            crate::prompt::system_dynamic(&DynamicContext {
-                cwd: &meta.cwd,
-                git_branch: prompt_cache.git_branch.as_deref(),
-                date: &prompt_cache.date,
-                mode: meta.mode,
-                plan: &plan_guard,
-                instructions: prompt_cache.instructions.as_deref(),
-                is_subagent: !agent.id().is_main(),
-                skills: session.skills.skills(),
-                skills_enabled: session.config.skills.enabled,
-                max_listed_skills: session.config.skills.max_listed,
-                tools,
-            })
-        };
-        let system_dynamic = render_dynamic(&tools_def);
+        // Rendered per request against the provider it goes to: the inventory
+        // names tools as that provider sends them on the wire, and the planner
+        // and the implementer may sit on different providers.
+        let render_dynamic =
+            |tools: &[pacode_types::ToolDefinition], provider: &dyn pacode_provider::Provider| {
+                let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
+                crate::prompt::system_dynamic(&DynamicContext {
+                    cwd: &meta.cwd,
+                    git_branch: prompt_cache.git_branch.as_deref(),
+                    date: &prompt_cache.date,
+                    mode: meta.mode,
+                    plan: &plan_guard,
+                    instructions: prompt_cache.instructions.as_deref(),
+                    is_subagent: !agent.id().is_main(),
+                    skills: session.skills.skills(),
+                    skills_enabled: session.config.skills.enabled,
+                    max_listed_skills: session.config.skills.max_listed,
+                    tools,
+                    provider,
+                })
+            };
         let system_static = crate::prompt::system_static().to_string();
         // The fusion seam. Inside the loop, after the injection drain and
         // before the request is built: the planner must see the same history
@@ -188,7 +192,9 @@ pub async fn run_turn(
                 &cancel,
                 &routes,
                 &system_static,
-                &render_dynamic(&crate::fusion::planner_tool_definitions(&agent)),
+                |provider| {
+                    render_dynamic(&crate::fusion::planner_tool_definitions(&agent), provider)
+                },
             )
             .await
             {
@@ -269,32 +275,6 @@ pub async fn run_turn(
                 .await;
         }
 
-        let history_msgs = agent
-            .history
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .for_model();
-        // Taken here because this is the last point where the parts the split
-        // needs are still owned: the request below moves all of them, and the
-        // reported counts only arrive once the model has answered. The cost is
-        // a walk over the definitions and the history, both of which are
-        // walked again to build the request.
-        let attribution = crate::analyze::RequestAttribution::from_request(
-            &system_static,
-            &system_dynamic,
-            &tools_def,
-            &history_msgs,
-        );
-        let req = pacode_provider::CompletionRequest {
-            model: model_route.model.clone(),
-            system_static,
-            system_dynamic,
-            messages: history_msgs,
-            tools: tools_def,
-            effort: Some(agent_info.effort),
-            max_output_tokens: None,
-        };
-
         // Re-check the ZDR flag at the resolve point: `SetZdr`/`SetModel`/
         // `SetModelFlag` guards cover the request path, but a turn re-driven
         // by injections or `continue_agent` reaches here without them.
@@ -319,6 +299,33 @@ pub async fn run_turn(
                     turn_usage,
                 );
             }
+        };
+
+        let system_dynamic = render_dynamic(&tools_def, provider.as_ref());
+        let history_msgs = agent
+            .history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .for_model();
+        // Taken here because this is the last point where the parts the split
+        // needs are still owned: the request below moves all of them, and the
+        // reported counts only arrive once the model has answered. The cost is
+        // a walk over the definitions and the history, both of which are
+        // walked again to build the request.
+        let attribution = crate::analyze::RequestAttribution::from_request(
+            &system_static,
+            &system_dynamic,
+            &tools_def,
+            &history_msgs,
+        );
+        let req = pacode_provider::CompletionRequest {
+            model: model_route.model.clone(),
+            system_static,
+            system_dynamic,
+            messages: history_msgs,
+            tools: tools_def,
+            effort: Some(agent_info.effort),
+            max_output_tokens: None,
         };
 
         // A provider that accepted the request but never streams back must not

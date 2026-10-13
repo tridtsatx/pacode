@@ -194,18 +194,19 @@ pub(crate) fn planner_tool_definitions(agent: &Agent) -> Vec<pacode_types::ToolD
 }
 
 /// Run the planner half of the turn. The planner sees the very request the
-/// implementer is about to see, minus the tools: `system_static`/`system_dynamic`
-/// are passed in rather than rebuilt so the two halves cannot drift apart (the
-/// dynamic part's `## Tools` inventory is rendered from
-/// [`planner_tool_definitions`]), and the history is the agent's own, read at
-/// this point in the loop.
+/// implementer is about to see, minus the tools: `system_static` and the
+/// `system_dynamic` renderer are passed in rather than rebuilt so the two halves
+/// cannot drift apart (the dynamic part's `## Tools` inventory is rendered from
+/// [`planner_tool_definitions`], against the planner's provider once it is
+/// resolved, so it carries that provider's wire names), and the history is the
+/// agent's own, read at this point in the loop.
 pub(crate) async fn run_planner(
     session: &Arc<Session>,
     agent: &Arc<Agent>,
     cancel: &CancellationToken,
     routes: &FusionRoutes,
     system_static: &str,
-    system_dynamic: &str,
+    system_dynamic: impl FnOnce(&dyn pacode_provider::Provider) -> String,
 ) -> PlanOutcome {
     if cancel.is_cancelled() {
         return PlanOutcome::skipped("interrupted before the planner ran");
@@ -222,6 +223,7 @@ pub(crate) async fn run_planner(
         Ok(provider) => provider,
         Err(error) => return PlanOutcome::skipped(error.to_string()),
     };
+    let system_dynamic = system_dynamic(provider.as_ref());
     planner::run(
         session,
         agent,
@@ -229,7 +231,7 @@ pub(crate) async fn run_planner(
         provider,
         routes,
         system_static,
-        system_dynamic,
+        &system_dynamic,
     )
     .await
 }

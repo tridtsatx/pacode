@@ -218,6 +218,7 @@ fn test_prompt_prefix_byte_identical_across_steps_of_turn() {
         skills_enabled: false,
         max_listed_skills: 10,
         tools: &[],
+        provider: native_provider(),
     };
     let step1_prompt = system_dynamic(&dyn_ctx_step1);
     assert!(step1_prompt.contains("Git branch: main"));
@@ -240,6 +241,7 @@ fn test_prompt_prefix_byte_identical_across_steps_of_turn() {
         skills_enabled: false,
         max_listed_skills: 10,
         tools: &[],
+        provider: native_provider(),
     };
     let step2_prompt = system_dynamic(&dyn_ctx_step2);
 
@@ -264,6 +266,7 @@ fn test_prompt_prefix_byte_identical_across_steps_of_turn() {
         skills_enabled: false,
         max_listed_skills: 10,
         tools: &[],
+        provider: native_provider(),
     };
     let next_turn_prompt = system_dynamic(&dyn_ctx_next_turn);
     assert!(next_turn_prompt.contains("Git branch: feature-branch"));
@@ -311,6 +314,7 @@ fn test_system_dynamic_skills_section() {
         skills_enabled: true,
         max_listed_skills: 2,
         tools: &[],
+        provider: native_provider(),
     };
     let out = system_dynamic(&ctx);
     assert!(out.contains("## Skills\n"));
@@ -334,6 +338,7 @@ fn test_system_dynamic_skills_section() {
         skills_enabled: false,
         max_listed_skills: 10,
         tools: &[],
+        provider: native_provider(),
     };
     let out_disabled = system_dynamic(&ctx_disabled);
     assert!(!out_disabled.contains("## Skills"));
@@ -352,6 +357,7 @@ fn test_system_dynamic_skills_section() {
         skills_enabled: true,
         max_listed_skills: 10,
         tools: &[],
+        provider: native_provider(),
     };
     let out_empty = system_dynamic(&ctx_empty);
     assert!(!out_empty.contains("## Skills"));
@@ -375,7 +381,15 @@ fn tools_ctx<'a>(
         skills_enabled: false,
         max_listed_skills: 10,
         tools,
+        provider: native_provider(),
     }
+}
+
+/// A provider that sends native tool names on the wire.
+fn native_provider() -> &'static pacode_provider::mock::MockProvider {
+    static NATIVE: std::sync::LazyLock<pacode_provider::mock::MockProvider> =
+        std::sync::LazyLock::new(|| pacode_provider::mock::MockProvider::new("mock"));
+    &NATIVE
 }
 
 fn tool(name: &str, description: &str) -> ToolDefinition {
@@ -510,4 +524,45 @@ fn static_prompt_has_the_self_knowledge_rule() {
     assert!(s.contains("## Self-Knowledge"));
     assert!(s.contains("never read files, search the repository, or inspect pacode's source"));
     assert!(s.contains("A tool that is not listed is one you do not have"));
+}
+
+#[test]
+fn tools_section_uses_the_names_the_provider_sends_on_the_wire() {
+    use pacode_provider::Provider;
+
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let defs = builtin_definitions();
+
+    let native = system_dynamic(&tools_ctx(&cwd, &plan, &defs, false));
+    let native = tools_section_of(&native);
+    assert!(native.contains("- bash: "), "{native}");
+    assert!(native.contains("- read: "), "{native}");
+    assert!(!native.contains("- Bash: "), "{native}");
+
+    let oauth = pacode_provider::anthropic::Anthropic::from_oauth(
+        "anthropic",
+        pacode_types::ProviderConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            ..Default::default()
+        },
+        pacode_types::ProviderDefaults::default(),
+        "sk-ant-oat-test".to_string(),
+        Default::default(),
+    )
+    .expect("oauth provider");
+    let mut ctx = tools_ctx(&cwd, &plan, &defs, false);
+    ctx.provider = &oauth;
+    let out = system_dynamic(&ctx);
+    let section = tools_section_of(&out);
+    for def in &defs {
+        let wire = oauth.wire_tool_name(&def.name);
+        assert!(
+            section.contains(&format!("- {wire}: ")),
+            "{wire} listed:\n{section}"
+        );
+    }
+    assert!(section.contains("- Bash: "), "{section}");
+    assert!(section.contains("- Read: "), "{section}");
+    assert!(!section.contains("- bash: "), "{section}");
 }

@@ -26,6 +26,7 @@ pub mod registry;
 mod retry;
 pub mod sse;
 
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -215,4 +216,10 @@ pub trait Provider: Send + Sync {
     }
     /// Static knowledge about a model (context window, reasoning) without a network call.
     fn model_info(&self, model: &str) -> ModelInfo;
+    /// The name the model sees for the native tool `name`: what this provider
+    /// puts in the request's tool schemas. Prompt text that names tools must
+    /// go through it, or it names tools the model was never offered.
+    fn wire_tool_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
+        Cow::Borrowed(name)
+    }
 }

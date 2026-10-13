@@ -80,6 +80,33 @@ fn test_tool_name_remapping_table() {
 }
 
 #[test]
+fn wire_tool_name_follows_the_auth_mode() {
+    let oauth = make_anthropic_provider(
+        "https://api.anthropic.com/v1".to_string(),
+        Some(AnthropicAuth::OAuth("sk-ant-oat-test".to_string())),
+        vec![],
+        None,
+        None,
+    );
+    assert_eq!(oauth.wire_tool_name("bash"), "Bash");
+    assert_eq!(oauth.wire_tool_name("grep"), "Grep");
+    assert_eq!(
+        oauth.wire_tool_name("agent"),
+        map_tool_name_for_oauth("agent")
+    );
+    assert_eq!(oauth.wire_tool_name("custom_tool"), "custom_tool");
+
+    let api_key = make_anthropic_provider(
+        "https://api.anthropic.com/v1".to_string(),
+        Some(AnthropicAuth::ApiKey("sk-ant-api03-test".to_string())),
+        vec![],
+        None,
+        None,
+    );
+    assert_eq!(api_key.wire_tool_name("bash"), "bash");
+}
+
+#[test]
 fn test_request_shape_api_key_mode() {
     let auth = AnthropicAuth::ApiKey("sk-ant-api-testkey123".to_string());
     let provider = make_anthropic_provider(
