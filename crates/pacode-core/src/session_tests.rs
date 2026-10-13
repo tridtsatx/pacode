@@ -1948,6 +1948,89 @@ async fn session_host_persists_task_started_and_terminal_rows() {
     }
 }
 
+/// Wait for the router to publish `task`'s terminal `TaskUpdated`, the step it
+/// takes right before deciding whether the model hears about the end.
+async fn task_ended_event(
+    rx: &mut tokio::sync::broadcast::Receiver<(u64, Event)>,
+    task: &pacode_types::TaskId,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok((_, Event::TaskUpdated(info))) = rx.recv().await
+                && &info.id == task
+                && info.status.is_terminal()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("terminal TaskUpdated");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_that_ends_in_the_foreground_is_not_announced_again() {
+    let (core, mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let mut rx = core.subscribe(&session_id).unwrap();
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    let spec = TaskSpec::new(
+        session_id.clone(),
+        AgentId::main(),
+        "printf done",
+        tmp.path(),
+    );
+    let task = host.spawn_task(spec).await.unwrap();
+
+    let outcome = host.wait_task(&task, Duration::from_secs(10), false).await;
+
+    assert_eq!(outcome, pacode_tools::WaitOutcome::Finished);
+    task_ended_event(&mut rx, &task).await;
+    // The router's skip happens right after that event; give a wrongly queued
+    // notice time to land before asserting there is none.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let main = session.main_agent().unwrap();
+    assert!(
+        main.injections.is_empty(),
+        "the call's result already said it"
+    );
+    assert!(mock.requests().is_empty(), "no turn may be woken for it");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_that_outlives_its_foreground_wait_is_announced_when_it_ends() {
+    let (core, mock, tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let host = crate::host::SessionHost {
+        session: session.clone(),
+        agent: AgentId::main(),
+    };
+    mock.push(MockResponse::Text("noted".into()));
+    let spec = TaskSpec::new(session_id.clone(), AgentId::main(), "sleep 0.3", tmp.path());
+    let task = host.spawn_task(spec).await.unwrap();
+
+    let outcome = host
+        .wait_task(&task, Duration::from_millis(50), false)
+        .await;
+
+    assert_eq!(outcome, pacode_tools::WaitOutcome::Timeout);
+    let notice = format!("<task_finished id=\"{task}\"");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !mock
+            .requests()
+            .iter()
+            .any(|req| req.messages.iter().any(|m| m.text().contains(&notice)))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a backgrounded task's end reaches the model");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn close_reopen_keeps_task_router_tombstone() {
     let (core, _mock, tmp, session_id) = setup_test_session().await;

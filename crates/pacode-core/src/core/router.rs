@@ -137,6 +137,15 @@ async fn finish_task(core: &Core, info: TaskInfo, ended: &mut HashSet<TaskId>) {
     // reports a finished task from, as one transcript line.
     // A popup on top of it said the same thing twice.
 
+    // A task that ended in the foreground was reported by the call waiting on
+    // it (`TaskManager::wait_foreground`): its result already holds the output
+    // and the exit code. A notice on top of that repeated up to 40 lines to the
+    // model, and one landing after the turn's last drain cost a model round
+    // trip of its own — or woke a new turn to say nothing new.
+    if !info.backgrounded {
+        return;
+    }
+
     let tail_lines = session.tasks.tail(&info.id, 40).await.unwrap_or_default();
     let tail = tail_lines.join("\n");
 

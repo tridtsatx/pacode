@@ -668,7 +668,7 @@ impl ToolHost for SessionHost {
         let res = self
             .session
             .tasks
-            .wait(task, timeout, return_on_progress)
+            .wait_foreground(task, timeout, return_on_progress)
             .await;
         match res {
             pacode_exec::WaitResult::Ended(_) => WaitOutcome::Finished,

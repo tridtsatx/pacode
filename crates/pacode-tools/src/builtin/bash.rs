@@ -76,7 +76,8 @@ impl Tool for BashTool {
     ///    `host.task_output` (head+tail, capped) + exit code line; `Timeout` → the task
     ///    keeps running: output `Command still running after Ns; moved to background as
     ///    task <id>. Latest output:\n<tail>`, `ToolOutput.task = Some(id)`.
-    ///    The core marks the task backgrounded when `task` is set on a foreground call.
+    ///    The wait itself hands the task to the background, so its end arrives as
+    ///    `<task_finished>`; a `Finished` wait means this result is the only report.
     /// `yield_after` comes from `ctx` (`ToolCtx::exec_yield_after`, added below).
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<BashInput>(input)?;

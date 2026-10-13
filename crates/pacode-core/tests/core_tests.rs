@@ -1655,15 +1655,11 @@ async fn task_router_recovers_after_lag_and_keeps_routing() {
     let session = core.session(&session_id).unwrap();
     let tasks = session.tasks.clone();
     let mut events = core.subscribe(&session_id).unwrap();
-    let first = tasks
-        .spawn(TaskSpec::new(
-            session_id.clone(),
-            AgentId::main(),
-            "sleep 30",
-            tmp.path(),
-        ))
-        .await
-        .unwrap();
+    // Backgrounded: a foreground task's end is reported by the call waiting on
+    // it, so only a background one reaches the model as `<task_finished>`.
+    let mut spec = TaskSpec::new(session_id.clone(), AgentId::main(), "sleep 30", tmp.path());
+    spec.background = true;
+    let first = tasks.spawn(spec).await.unwrap();
     tokio::task::yield_now().await;
 
     for current in 0..300 {

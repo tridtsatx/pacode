@@ -590,8 +590,12 @@ pub trait ToolHost: Send + Sync {
     async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError>;
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo>;
     fn list_tasks(&self) -> Vec<TaskInfo>;
-    /// Wait until the task ends, `timeout` elapses, or (when `return_on_progress`) its
-    /// progress changes.
+    /// Wait, as the call that owns the task's foreground, until the task ends,
+    /// `timeout` elapses, or (when `return_on_progress`) its progress changes.
+    /// `Finished` makes the caller the one that reports the output: no
+    /// `<task_finished>` notice follows. Any other outcome, or dropping the
+    /// future, leaves the task backgrounded, and its end arrives as that
+    /// notice.
     async fn wait_task(
         &self,
         task: &TaskId,

@@ -879,6 +879,9 @@ async fn tail_spool(spool: &ManagedSpool, lines: usize, max_bytes: usize) -> Vec
     result
 }
 
+#[path = "foreground.rs"]
+mod foreground;
+
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod manager_tests;
