@@ -42,6 +42,36 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    /// An image. Only metadata lives here: the bytes are stored once, content-addressed
+    /// by `hash`, in the image store (`pacode-image`) and loaded lazily by whoever needs
+    /// pixels. In a `Role::Tool` message an `Image` block belongs to the tool result
+    /// that precedes it.
+    Image {
+        /// `image/png` or `image/jpeg` (prepared images) and friends.
+        mime: String,
+        /// Lowercase hex SHA-256 of the stored bytes.
+        hash: String,
+        /// Where the image came from (file path), for placeholders and stubs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+    },
+}
+
+impl ContentBlock {
+    /// Block for a stored image.
+    pub fn image(image: &crate::ImageRef) -> Self {
+        ContentBlock::Image {
+            mime: image.mime.clone(),
+            hash: image.hash.clone(),
+            source_path: image.name.clone(),
+            width: image.width,
+            height: image.height,
+        }
+    }
 }
 
 /// Why a message exists. Drives UI visibility and compaction rules.
@@ -93,6 +123,55 @@ impl Message {
         Self::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
     }
 
+    /// User message with `text` first (when non-empty) and the images in order.
+    pub fn user_with_images(text: impl Into<String>, images: &[crate::ImageRef]) -> Self {
+        let text = text.into();
+        let mut content = Vec::with_capacity(1 + images.len());
+        if !text.is_empty() || images.is_empty() {
+            content.push(ContentBlock::Text { text });
+        }
+        content.extend(images.iter().map(ContentBlock::image));
+        Self::new(Role::User, content)
+    }
+
+    /// Tool result followed by the images it produced.
+    pub fn tool_result_with_images(
+        call_id: CallId,
+        content: impl Into<String>,
+        is_error: bool,
+        images: &[crate::ImageRef],
+    ) -> Self {
+        let mut msg = Self::tool_result(call_id, content, is_error);
+        msg.content.extend(images.iter().map(ContentBlock::image));
+        msg
+    }
+
+    /// The images of this message in order.
+    pub fn image_refs(&self) -> Vec<crate::ImageRef> {
+        self.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image {
+                    mime,
+                    hash,
+                    source_path,
+                    width,
+                    height,
+                } => Some(crate::ImageRef {
+                    hash: hash.clone(),
+                    mime: mime.clone(),
+                    width: *width,
+                    height: *height,
+                    name: source_path.clone(),
+                }),
+                ContentBlock::Text { .. }
+                | ContentBlock::Reasoning { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. } => None,
+            })
+            .collect()
+    }
+
     pub fn assistant_text(text: impl Into<String>) -> Self {
         Self::new(
             Role::Assistant,
@@ -140,8 +219,16 @@ impl Message {
             ContentBlock::ToolUse { id, name, input } => Some((id, name.as_str(), input)),
             ContentBlock::Text { .. }
             | ContentBlock::Reasoning { .. }
-            | ContentBlock::ToolResult { .. } => None,
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. } => None,
         })
+    }
+
+    /// Whether any block is an image.
+    pub fn has_images(&self) -> bool {
+        self.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. }))
     }
 
     pub fn has_tool_uses(&self) -> bool {
@@ -157,6 +244,10 @@ impl Message {
                 ContentBlock::Reasoning { text, .. } => text.chars().count(),
                 ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
                 ContentBlock::ToolResult { content, .. } => content.chars().count(),
+                // Fixed estimate (4 chars per token), never the payload size.
+                ContentBlock::Image { width, height, .. } => {
+                    crate::estimate_image_tokens(*width, *height) as usize * 4
+                }
             })
             .sum()
     }

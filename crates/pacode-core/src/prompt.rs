@@ -26,10 +26,12 @@ pub fn system_static() -> &'static str {
     "You are pacode, an autonomous CLI coding agent built around background work.\n\n\
     ## Tool Semantics\n\
     You have access to tools to inspect, modify, and manage the workspace. Use tools to execute tasks directly rather than giving instructions whenever possible.\n\n\
+    ## Large Files\n\
+    `read` returns a big source file as an outline: every declaration's signature, the first lines of its body and its closing line, with `… N lines hidden (La-Lb) …` markers in between. Hidden lines carry no anchors and do not count as read: before editing code inside a hidden region, show it with `read` `symbol:\"name\"` or `expand:[\"a-b\"]`. Use `mode:\"full\"` (or offset/limit) for the plain text.\n\n\
     ## Background-First Thesis\n\
     When starting long-running builds, tests, or servers, run them in the background. Continue executing other steps while background tasks run. You will receive task completions and output via injected events between steps.\n\n\
     ## Subagents\n\
-    Use the `agent` tool to run independent work in parallel. `spawn` returns immediately; the subagent's final report and its `report_status` updates arrive as `<agent_finished>` / `<agent_status>` events between your steps. Use `agent ask_status` to request a brief status from a running subagent; if you need the result before continuing, end your turn and the report will wake you.\n\n\
+    Use the `agent` tool to run independent work in parallel. `spawn` returns immediately; the subagent's final report and its `report_status` updates arrive as `<agent_finished>` / `<agent_status>` events between your steps. Use `agent ask_status` to request a brief status from a running subagent; if you need the result before continuing, end your turn and the report will wake you. Use `agent message` to give a running subagent extra instructions or a correction. A subagent can ask you a question (`<question_from_agent>`): answer it with `agent answer`, briefly; do not escalate to the user unless you truly cannot decide.\n\n\
     ## Planning\n\
     For any task with 3 or more steps, use the `plan` tool to create and maintain a clear plan. Keep items up to date. Report `progress` only when it is measurable.\n\n\
     ## Permissions\n\
@@ -52,6 +54,7 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
     if ctx.is_subagent {
         out.push_str("\n## Subagent Role\n");
         out.push_str("You are a subagent working on a dedicated subtask. The `agent` tool is not available to you. Focus on completing your assigned prompt and return your findings or results. When you receive a `<status_request>`, call `report_status` with a brief status first, then continue. Your final message is delivered to the orchestrator as your report.\n");
+        out.push_str("The orchestrator may send you `<message_from_orchestrator>` (new instructions, todo items or corrections): take it into account and continue. Use `report_status` for progress. If you are truly blocked, `ask_parent` puts a short question (with options) to the orchestrator; prefer making a reasonable assumption and stating it, because questions are limited and an unanswered one times out. Never ask for something you can find in the code.\n");
     }
 
     if !ctx.plan.is_empty() {
@@ -99,11 +102,14 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
 
 pub const DEFAULT_MEMORY_CAP_CHARS: usize = 8000;
 
-/// Load global (`~/.config/pacode/memory.md`) and project (`<cwd>/.pacode/memory.md`)
-/// memory files, formatted under `# Memory (global)` and `# Memory (project)`.
-/// Missing or empty files are skipped. Total text is capped at `memory_cap_chars`
-/// by truncating oldest entries first (i.e. keeping the tail), with a visible marker
-/// consistent with [`pacode_types::truncate_head_tail`].
+/// Memory section of the system prompt, built from the global (`<config dir>/memory.db`)
+/// and project (`<cwd>/.pacode/memory.db`) stores: every pinned entry (20 per scope), a
+/// one-line index (title + id) of the 10 most recently updated others per scope, and a
+/// sentence pointing the model at `memory_recall` / `memory_write`. Capped at
+/// `memory_cap_chars` (index lines are dropped first). Output is deterministic for an
+/// unchanged store, which keeps the prompt prefix cache-friendly. Scopes without a
+/// database (or a legacy `memory.md`, imported on first open) are skipped and nothing
+/// is created on disk; `None` when there is nothing to show.
 pub fn load_memory(
     cwd: &Path,
     home_config: Option<&Path>,
@@ -112,75 +118,17 @@ pub fn load_memory(
     if memory_cap_chars == 0 {
         return None;
     }
-
-    let global_file = home_config
-        .map(|h| h.join("memory.md"))
-        .unwrap_or_else(|| pacode_config::Paths::discover().memory_file());
-
-    let global_content = std::fs::read_to_string(global_file)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let project_file = cwd.join(".pacode").join("memory.md");
-    let project_content = std::fs::read_to_string(project_file)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    if global_content.is_none() && project_content.is_none() {
-        return None;
-    }
-
-    let g_lines: Vec<&str> = global_content
-        .as_deref()
-        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect())
-        .unwrap_or_default();
-
-    let p_lines: Vec<&str> = project_content
-        .as_deref()
-        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect())
-        .unwrap_or_default();
-
-    if g_lines.is_empty() && p_lines.is_empty() {
-        return None;
-    }
-
-    let render = |g: &[&str], p: &[&str]| -> String {
-        let mut parts = Vec::new();
-        if !g.is_empty() {
-            parts.push(format!("# Memory (global)\n\n{}", g.join("\n")));
-        }
-        if !p.is_empty() {
-            parts.push(format!("# Memory (project)\n\n{}", p.join("\n")));
-        }
-        parts.join("\n\n")
-    };
-
-    let full = render(&g_lines, &p_lines);
-    let total_chars = full.chars().count();
-    if total_chars <= memory_cap_chars {
-        return Some(full);
-    }
-
-    // When cap is too small to fit the visible marker (consistent with pacode_types::truncate_head_tail),
-    // truncate directly on character boundary keeping the tail.
-    if memory_cap_chars < 64 {
-        let tail: String = full
-            .chars()
-            .skip(total_chars.saturating_sub(memory_cap_chars))
-            .collect();
-        return if tail.is_empty() { None } else { Some(tail) };
-    }
-
-    // Visible marker consistent with truncate_head_tail format: [... N characters truncated ...]
-    let marker_estimate = format!("[... {total_chars} characters truncated ...]\n\n");
-    let marker_chars = marker_estimate.chars().count();
-    let keep_tail_chars = memory_cap_chars.saturating_sub(marker_chars);
-    let dropped = total_chars.saturating_sub(keep_tail_chars);
-    let marker = format!("[... {dropped} characters truncated ...]\n\n");
-    let tail: String = full.chars().skip(dropped).collect();
-    Some(format!("{marker}{tail}"))
+    let global_dir = home_config
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            pacode_config::Paths::discover()
+                .memory_file()
+                .parent()
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".pacode"));
+    let store = pacode_tools::builtin::memory::store_for_dirs(&global_dir, cwd);
+    pacode_memory::render_prompt_section(&store.snapshot(), memory_cap_chars)
 }
 
 /// Collect `AGENTS.md`, `PACODE.md`, and `CLAUDE.md` from `cwd` up to the filesystem root
@@ -196,12 +144,32 @@ pub fn load_instructions(
     load_instructions_with_memory(cwd, home_config, cap_chars, DEFAULT_MEMORY_CAP_CHARS)
 }
 
-/// Variant of `load_instructions` with explicit memory cap chars.
+/// Variant of `load_instructions` with explicit memory cap chars. Foreign-agent
+/// instruction files are discovered (see [`load_instructions_with_options`]).
 pub fn load_instructions_with_memory(
     cwd: &Path,
     home_config: Option<&Path>,
     instructions_cap_chars: usize,
     memory_cap_chars: usize,
+) -> Option<String> {
+    load_instructions_with_options(
+        cwd,
+        home_config,
+        instructions_cap_chars,
+        memory_cap_chars,
+        true,
+    )
+}
+
+/// Full variant. `discover_foreign` mirrors `[context] discover_foreign_instructions`: when
+/// true, instruction files written for other agents (`.cursor/rules`, `.clinerules`, Copilot,
+/// Windsurf, Gemini, Codex) found in `cwd` and its ancestors are appended after the files above.
+pub fn load_instructions_with_options(
+    cwd: &Path,
+    home_config: Option<&Path>,
+    instructions_cap_chars: usize,
+    memory_cap_chars: usize,
+    discover_foreign: bool,
 ) -> Option<String> {
     let mut files = Vec::new();
 
@@ -245,6 +213,17 @@ pub fn load_instructions_with_memory(
                 combined.push_str("\n\n");
             }
             combined.push_str(&format!("# {}\n\n{}", file.display(), content.trim()));
+        }
+    }
+
+    if discover_foreign {
+        let foreign = pacode_import::instructions::discover_instructions(cwd);
+        let section = pacode_import::instructions::render_prompt_section(&foreign, cwd);
+        if !section.is_empty() {
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&section);
         }
     }
 

@@ -1,9 +1,15 @@
 //! Request body construction for the OpenAI Responses API.
+//!
+//! Images: user messages carry `input_image` parts (`image_url` = `data:` URL, bytes
+//! loaded lazily from the image store) next to the `input_text` parts. Images returned
+//! by tools go into one user follow-up message after the whole run of
+//! `function_call_output` items (a plain-string `output` cannot hold pixels).
 
 use pacode_types::{ContentBlock, Effort, ProviderConfig, ProviderDefaults, Role};
 use serde_json::Value;
 
 use crate::CompletionRequest;
+use crate::vision;
 
 pub const REASONING_KEYWORDS: &[&str] = &[
     "codex",
@@ -52,16 +58,17 @@ pub fn build_responses_body(
     }
 
     let mut input = Vec::new();
+    let mut pending_tool_images: Vec<Value> = Vec::new();
     for msg in &req.messages {
+        if msg.role != Role::Tool && !pending_tool_images.is_empty() {
+            input.push(tool_images_item(std::mem::take(&mut pending_tool_images)));
+        }
         match msg.role {
             Role::User => {
                 input.push(serde_json::json!({
                     "type": "message",
                     "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": msg.text(),
-                    }]
+                    "content": user_parts(msg),
                 }));
             }
             Role::Assistant => {
@@ -99,27 +106,35 @@ pub fn build_responses_body(
             }
             Role::Tool => {
                 for block in &msg.content {
-                    if let ContentBlock::ToolResult {
-                        call_id,
-                        content,
-                        is_error,
-                    } = block
-                    {
-                        let output = if *is_error {
-                            format!("[Error] {content}")
-                        } else {
-                            content.clone()
-                        };
-                        input.push(serde_json::json!({
-                            "type": "function_call_output",
-                            "call_id": call_id.as_str(),
-                            "output": output,
-                        }));
+                    match block {
+                        ContentBlock::ToolResult {
+                            call_id,
+                            content,
+                            is_error,
+                        } => {
+                            let output = if *is_error {
+                                format!("[Error] {content}")
+                            } else {
+                                content.clone()
+                            };
+                            input.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": call_id.as_str(),
+                                "output": output,
+                            }));
+                        }
+                        ContentBlock::Image { .. } => pending_tool_images.push(image_part(block)),
+                        ContentBlock::Text { .. }
+                        | ContentBlock::Reasoning { .. }
+                        | ContentBlock::ToolUse { .. } => {}
                     }
                 }
             }
             Role::System => {}
         }
+    }
+    if !pending_tool_images.is_empty() {
+        input.push(tool_images_item(pending_tool_images));
     }
 
     let mut body = serde_json::Map::new();
@@ -215,4 +230,58 @@ pub fn deep_merge(target: &mut Value, source: &Value) {
             *target = source.clone();
         }
     }
+}
+
+/// Content parts of a user message: text and `input_image` parts in block order.
+fn user_parts(msg: &pacode_types::Message) -> Vec<Value> {
+    if !msg.has_images() {
+        return vec![serde_json::json!({ "type": "input_text", "text": msg.text() })];
+    }
+    let mut parts = Vec::new();
+    for block in &msg.content {
+        match block {
+            ContentBlock::Text { text } => {
+                if !text.is_empty() {
+                    parts.push(serde_json::json!({ "type": "input_text", "text": text }));
+                }
+            }
+            ContentBlock::Image { .. } => parts.push(image_part(block)),
+            ContentBlock::Reasoning { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => {}
+        }
+    }
+    parts
+}
+
+/// `input_image` part, or an `input_text` note when the bytes are gone.
+fn image_part(block: &ContentBlock) -> Value {
+    let ContentBlock::Image {
+        mime,
+        hash,
+        source_path,
+        ..
+    } = block
+    else {
+        return serde_json::json!({ "type": "input_text", "text": "[image omitted]" });
+    };
+    match vision::data_url(mime, hash) {
+        Ok(url) => serde_json::json!({ "type": "input_image", "image_url": url }),
+        Err(err) => {
+            log::warn!("image {hash} left out of the request: {err}");
+            serde_json::json!({
+                "type": "input_text",
+                "text": vision::omitted_note(source_path.as_deref()),
+            })
+        }
+    }
+}
+
+fn tool_images_item(parts: Vec<Value>) -> Value {
+    let mut content = vec![serde_json::json!({
+        "type": "input_text",
+        "text": "Images returned by the tool call(s) above:",
+    })];
+    content.extend(parts);
+    serde_json::json!({ "type": "message", "role": "user", "content": content })
 }

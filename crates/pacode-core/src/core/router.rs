@@ -67,6 +67,34 @@ pub(crate) fn start_task_router(
                         }
                     }
                 }
+                TaskEvent::Resource(notice) => {
+                    // Machine-wide, so every open session gets the toast. A toast has
+                    // no dismiss event: `Clear` is a Success toast that replaces it.
+                    let (level, title, detail) = match notice.level {
+                        pacode_exec::NoticeLevel::Warn => (
+                            ToastLevel::Warn,
+                            format!("low resources: {}% free", notice.free_percent),
+                            Some(notice.message.clone()),
+                        ),
+                        pacode_exec::NoticeLevel::Breach => (
+                            ToastLevel::Error,
+                            format!("low resources: {}% free", notice.free_percent),
+                            Some(notice.message.clone()),
+                        ),
+                        pacode_exec::NoticeLevel::Clear => {
+                            (ToastLevel::Success, "resources recovered".to_string(), None)
+                        }
+                    };
+                    for id in core.session_ids() {
+                        if let Some(session) = core.session(&id) {
+                            session.events.emit(Event::Toast {
+                                level,
+                                title: title.clone(),
+                                detail: detail.clone(),
+                            });
+                        }
+                    }
+                }
                 TaskEvent::Stalled(info) => {
                     if let Some(session) = core.session(&info.session) {
                         let toast = Event::Toast {

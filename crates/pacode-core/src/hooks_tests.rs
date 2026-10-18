@@ -98,6 +98,7 @@ fn test_session(config: Config) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>)
         app_version: "test".to_string(),
         skills: Arc::new(pacode_skills::SkillRegistry::default()),
         scheduler: crate::schedule::Scheduler::new(),
+        ledger: crate::ledger::FileLedger::new(),
     });
     (temp, session, agent)
 }

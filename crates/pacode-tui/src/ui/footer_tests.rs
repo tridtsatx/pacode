@@ -186,3 +186,56 @@ fn test_footer_vim_mode_badges() {
     assert!(row1_text.contains("VIS"), "row1_text was: {row1_text}");
     assert!(!row1_text.contains("NOR"));
 }
+
+fn footer_state(model: &str, efforts: &[Effort]) -> AppState {
+    let mut state = make_test_state();
+    let route = ModelRoute::new("p", model);
+    state.meta = Some(pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_1"),
+        name: None,
+        cwd: std::path::PathBuf::from("/tmp"),
+        git_branch: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        model: route.clone(),
+        effort: Effort::High,
+        mode: pacode_types::Mode::Build,
+        first_prompt: None,
+    });
+    state.models = vec![pacode_types::ModelInfo {
+        route,
+        display_name: model.to_string(),
+        supports_reasoning: !efforts.is_empty(),
+        efforts: efforts.to_vec(),
+        ..Default::default()
+    }];
+    state
+}
+
+#[test]
+fn footer_hides_the_effort_for_a_model_without_reasoning_control() {
+    let opts = RenderOptions::new(120, false);
+    let state = footer_state("plain", &[]);
+    for width in [120usize, 20] {
+        let row1: String = render_row1(width, &state, &opts)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(row1.contains("Build · Plain"), "row1 was: {row1}");
+        assert!(!row1.contains("high"), "row1 was: {row1}");
+        assert!(!row1.trim_end().ends_with('·'), "row1 was: {row1}");
+    }
+}
+
+#[test]
+fn footer_shows_the_effort_when_the_model_supports_one() {
+    let opts = RenderOptions::new(120, false);
+    let state = footer_state("thinker", &[Effort::Low, Effort::High]);
+    let row1: String = render_row1(120, &state, &opts)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(row1.contains("Build · Thinker · high"), "row1 was: {row1}");
+}

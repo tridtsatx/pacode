@@ -271,6 +271,15 @@ pub async fn post_tool_use(
     input: &serde_json::Value,
     output: &serde_json::Value,
 ) {
+    // A command may have changed files the ledger tracks: stat those (no tree walk)
+    // and attribute what moved to the agent that ran it.
+    if tool == "bash" {
+        let info = agent.info();
+        session
+            .ledger
+            .refresh_after_exec(&info.id, &info.name)
+            .await;
+    }
     let rules = &session.config.hooks.post_tool_use;
     if rules.is_empty() {
         return;

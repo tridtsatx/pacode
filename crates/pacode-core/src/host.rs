@@ -1,12 +1,16 @@
 //! `ToolHost` implementation: the session as seen by tools.
 
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_exec::TaskSpec;
 use pacode_tools::host::{AgentKindDef, PermissionDraft};
-use pacode_tools::{AgentSpec, ToolError, ToolHost, WaitOutcome};
+use pacode_tools::{
+    AgentSpec, LedgerPass, ToolError, ToolHost, WaitOutcome, WriteIntent, WriteLock,
+};
 use pacode_types::{
     AgentId, AgentInfo, CallId, ModelRoute, PermissionDecision, Plan, TaskId, TaskInfo,
     TaskProgress, ToastLevel,
@@ -514,6 +518,31 @@ impl ToolHost for SessionHost {
         Ok(())
     }
 
+    fn message_agent(&self, agent: &AgentId, text: String) -> Result<(), ToolError> {
+        Ok(self.session.message_agent(agent, &text)?)
+    }
+
+    fn answer_agent(
+        &self,
+        agent: &AgentId,
+        question_id: &str,
+        text: String,
+    ) -> Result<(), ToolError> {
+        Ok(self.session.answer_agent(agent, question_id, &text)?)
+    }
+
+    async fn ask_parent(
+        &self,
+        question: String,
+        options: Vec<String>,
+        wait: bool,
+    ) -> Result<pacode_tools::builtin::ask_parent::ParentReply, ToolError> {
+        Ok(self
+            .session
+            .ask_parent(&self.agent, question, options, wait)
+            .await?)
+    }
+
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         self.session
             .stop_agent(agent)
@@ -575,6 +604,53 @@ impl ToolHost for SessionHost {
                 .events
                 .emit(pacode_types::Event::ItemAdded(item));
         }
+    }
+
+    async fn ledger_lock(&self, paths: &[PathBuf]) -> WriteLock {
+        WriteLock::holding(self.session.ledger.lock(paths).await)
+    }
+
+    async fn ledger_check(
+        &self,
+        agent: &AgentId,
+        path: &Path,
+        intent: WriteIntent,
+        current: Option<&str>,
+        proposed: Option<&str>,
+    ) -> Result<LedgerPass, ToolError> {
+        let shown = crate::ledger::shown_path(path, &self.session.meta().cwd);
+        self.session
+            .ledger
+            .check(agent, path, &shown, intent, current, proposed)
+            .await
+            .map(|note| LedgerPass { note })
+            .map_err(ToolError::Failed)
+    }
+
+    async fn ledger_record_read(
+        &self,
+        agent: &AgentId,
+        path: &Path,
+        content: &str,
+        lines: Range<usize>,
+    ) {
+        self.session
+            .ledger
+            .record_read(agent, path, content, lines)
+            .await;
+    }
+
+    async fn ledger_record_write(&self, agent: &AgentId, path: &Path, content: &str) {
+        // Rejections name the writer by its display name.
+        let name = self
+            .session
+            .agent(agent)
+            .map(|a| a.info().name)
+            .unwrap_or_else(|| agent.to_string());
+        self.session
+            .ledger
+            .record_write(agent, &name, path, content)
+            .await;
     }
 }
 

@@ -189,6 +189,8 @@ fn agent_dot(
         AgentStatus::Failed => (opts.glyphs.fail, opts.theme.red),
         AgentStatus::Finished => (opts.glyphs.ok, opts.theme.green),
         AgentStatus::Stopped => (opts.glyphs.agent_dot, opts.theme.dim),
+        // Blocked on a question to the orchestrator: a `?` in the accent style.
+        AgentStatus::WaitingOrchestrator => ("?", opts.theme.accent),
         AgentStatus::Idle
         | AgentStatus::Thinking
         | AgentStatus::RunningTool

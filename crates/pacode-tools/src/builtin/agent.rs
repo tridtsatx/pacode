@@ -11,6 +11,9 @@ use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "agent";
 
+/// Longest `message` / `answer` text, in characters.
+pub const MAX_MESSAGE_CHARS: usize = 4000;
+
 pub struct AgentTool;
 
 #[derive(Deserialize, Default)]
@@ -20,11 +23,11 @@ struct AgentInput {
     prompt: Option<String>,
     kind: Option<String>,
     name: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
     context: Option<String>,
     tools: Option<Vec<String>>,
     agent_id: Option<String>,
+    text: Option<String>,
+    question_id: Option<String>,
 }
 
 #[async_trait]
@@ -39,9 +42,15 @@ impl Tool for AgentTool {
          delivered to you automatically as a message, so continue with other work or \
          end your turn rather than polling. `spawn` takes an optional `kind`: a named \
          subagent type from `<cwd>/.pacode/agents/*.md` or the global config's \
-         `agents/` dir whose file supplies the brief, tools, and model — `list` shows \
+         `agents/` dir whose file supplies the brief and tools — `list` shows \
          the available kinds. `stop` cancels, `ask_status` asks a running subagent for \
-         a brief status that arrives at your next step. Subagents cannot spawn agents."
+         a brief status that arrives at your next step. `message {agent_id, text}` \
+         sends a running subagent an extra instruction, todo item or correction \
+         (delivered between its steps; fails if it already finished). A subagent may \
+         ask you a question: it arrives as `<question_from_agent id=\"q1\">`; reply \
+         with `answer {agent_id, question_id, text}`. Prefer a reasonable assumption \
+         over asking, ask only when blocked, and keep questions and answers short. \
+         Subagents cannot spawn agents."
     }
 
     fn schema(&self) -> Value {
@@ -49,15 +58,15 @@ impl Tool for AgentTool {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "stop", "list", "ask_status"]},
+                "action": {"type": "string", "enum": ["spawn", "stop", "list", "ask_status", "message", "answer"]},
                 "prompt": {"type": "string", "description": "Full task description for the subagent (spawn)."},
                 "kind": {"type": "string", "description": "Named subagent type from `agents/*.md` files; `list` shows what is available."},
                 "name": {"type": "string", "description": "Short name shown in the UI, e.g. `tests`."},
-                "model": {"type": "string", "description": "`provider/model` override."},
-                "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
                 "context": {"type": "string", "enum": ["fresh", "fork"], "default": "fresh", "description": "`fork` copies your conversation so far."},
                 "tools": {"type": "array", "items": {"type": "string"}, "description": "Restrict the subagent to these tools."},
-                "agent_id": {"type": "string"}
+                "agent_id": {"type": "string"},
+                "text": {"type": "string", "description": "Message or answer text, max 4000 chars (message, answer)."},
+                "question_id": {"type": "string", "description": "Id of the subagent's question, e.g. `q3` (answer)."}
             }
         })
     }
@@ -67,8 +76,10 @@ impl Tool for AgentTool {
     }
 
     /// `spawn` → `host.spawn_agent(AgentSpec{..})` → output `Spawned agent <id>
-    /// (<name>)`; a `kind` merges the discovered file's prompt/tools/model unless the
-    /// call overrides them, an unknown `kind` fails listing the available kinds.
+    /// (<name>)`; a `kind` merges the discovered file's prompt/tools/model. The model
+    /// comes only from the kind file; otherwise the session inherits the parent's.
+    /// Any model/effort the LLM sends is ignored. An unknown `kind` fails listing
+    /// the available kinds.
     /// `stop`; `list` → one line per agent `<id> <name> <status> <duration>
     /// ↓<tokens>` plus the available kinds.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
@@ -88,22 +99,22 @@ impl Tool for AgentTool {
                     Some(kind_name) => Some(resolve_kind(ctx, kind_name)?),
                     None => None,
                 };
-                let mut model = args
-                    .model
-                    .as_deref()
-                    .and_then(pacode_types::ModelRoute::parse_lossy);
-                if model.is_none()
-                    && let Some(def) = &kind
-                    && let Some(route) = def.model.as_deref()
-                {
-                    model = Some(ctx.host.parse_model_route(route).ok_or_else(|| {
-                        ToolError::invalid(format!(
-                            "agent kind '{}' sets an unresolvable model route '{route}'",
-                            def.name
-                        ))
-                    })?);
-                }
-                let effort = args.effort.as_deref().and_then(pacode_types::Effort::parse);
+                // Model is never chosen by the LLM: only a kind file may pin one.
+                // `None` lets the session inherit the parent's model.
+                let model = match &kind {
+                    Some(def) => match def.model.as_deref() {
+                        Some(route) => {
+                            Some(ctx.host.parse_model_route(route).ok_or_else(|| {
+                                ToolError::invalid(format!(
+                                    "agent kind '{}' sets an unresolvable model route '{route}'",
+                                    def.name
+                                ))
+                            })?)
+                        }
+                        None => None,
+                    },
+                    None => None,
+                };
                 let fork = args.context.as_deref() == Some("fork");
                 // The kind file's body is the subagent's brief; the call's prompt
                 // is the concrete task, appended after it.
@@ -118,7 +129,8 @@ impl Tool for AgentTool {
                         .clone()
                         .or_else(|| kind.as_ref().map(|k| k.name.clone())),
                     model,
-                    effort,
+                    // Kind files carry no effort; `None` inherits the session default.
+                    effort: None,
                     fork,
                     tools: args
                         .tools
@@ -147,6 +159,37 @@ impl Tool for AgentTool {
                 ))
                 .with_title(format!("Agent status {id}"))
                 .with_preview("requested"))
+            }
+            "message" => {
+                let id = AgentId::new(
+                    args.agent_id
+                        .ok_or_else(|| ToolError::invalid("agent_id is required for message"))?,
+                );
+                let text = check_text(args.text, "message")?;
+                ctx.host.message_agent(&id, text)?;
+                Ok(ToolOutput::text(format!(
+                    "Message queued for agent {id}; it reads it at its next step."
+                ))
+                .with_title(format!("Message {id}"))
+                .with_preview("queued"))
+            }
+            "answer" => {
+                let id = AgentId::new(
+                    args.agent_id
+                        .ok_or_else(|| ToolError::invalid("agent_id is required for answer"))?,
+                );
+                let question_id = args
+                    .question_id
+                    .map(|q| q.trim().to_string())
+                    .filter(|q| !q.is_empty())
+                    .ok_or_else(|| ToolError::invalid("question_id is required for answer"))?;
+                let text = check_text(args.text, "answer")?;
+                ctx.host.answer_agent(&id, &question_id, text)?;
+                Ok(
+                    ToolOutput::text(format!("Answer to {question_id} delivered to agent {id}."))
+                        .with_title(format!("Answer {id}"))
+                        .with_preview("delivered"),
+                )
             }
             "stop" => {
                 let agent_id_str = args
@@ -195,6 +238,21 @@ impl Tool for AgentTool {
             other => Err(ToolError::invalid(format!("unknown action: {other}"))),
         }
     }
+}
+
+/// Trim and validate the text of `message` / `answer`.
+fn check_text(text: Option<String>, what: &str) -> Result<String, ToolError> {
+    let text = text
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| ToolError::invalid(format!("text is required for {what}")))?;
+    let len = text.chars().count();
+    if len > MAX_MESSAGE_CHARS {
+        return Err(ToolError::invalid(format!(
+            "text is {len} characters; the limit is {MAX_MESSAGE_CHARS}"
+        )));
+    }
+    Ok(text)
 }
 
 /// Look up `name` among the host's discovered agent kinds; an unknown name

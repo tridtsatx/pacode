@@ -4,6 +4,66 @@ use pacode_types::KeysConfig;
 use super::*;
 
 #[test]
+fn test_cycle_mode_default_keys_match() {
+    let keymap = Keymap::defaults();
+    // BackTab with and without SHIFT
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+        Some(Action::CycleMode)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        Some(Action::CycleMode)
+    );
+    // Tab+SHIFT
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)),
+        Some(Action::CycleMode)
+    );
+    // alt+m fallback
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)),
+        Some(Action::CycleMode)
+    );
+    // Plain Tab, plain m and ctrl+backtab do not cycle
+    assert_ne!(
+        keymap.action_for(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        Some(Action::CycleMode)
+    );
+    assert_ne!(
+        keymap.action_for(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        Some(Action::CycleMode)
+    );
+    assert_ne!(
+        keymap.action_for(KeyEvent::new(KeyCode::BackTab, KeyModifiers::CONTROL)),
+        Some(Action::CycleMode)
+    );
+}
+
+#[test]
+fn test_matches_key_backtab_with_shift_and_tab_shift() {
+    let backtab = Binding {
+        code: KeyCode::BackTab,
+        mods: KeyModifiers::NONE,
+    };
+    let tab_shift = Binding {
+        code: KeyCode::Tab,
+        mods: KeyModifiers::SHIFT,
+    };
+    let backtab_shift = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+    let tab_shift_key = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+    assert!(matches_key(&backtab, backtab_shift));
+    assert!(matches_key(&tab_shift, backtab_shift));
+    assert!(matches_key(&backtab, tab_shift_key));
+    assert!(matches_key(&tab_shift, tab_shift_key));
+    // Plain Tab is not a shift+tab
+    assert!(!matches_key(
+        &tab_shift,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+    ));
+}
+
+#[test]
 fn test_parse_binding_valid() {
     assert_eq!(
         parse_binding("alt+f").unwrap(),

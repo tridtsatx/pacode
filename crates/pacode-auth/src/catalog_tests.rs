@@ -17,21 +17,35 @@ fn test_ids_and_aliases_unique() {
         }
     }
 
-    // Exactly the 9 providers required by the specification
-    assert_eq!(LOGIN_PROVIDERS.len(), 9);
+    assert_eq!(LOGIN_PROVIDERS.len(), 14);
+
+    let mut orders: Vec<u8> = LOGIN_PROVIDERS.iter().map(|p| p.order).collect();
+    let sorted = {
+        let mut o = orders.clone();
+        o.sort_unstable();
+        o.dedup();
+        o
+    };
+    orders.dedup();
+    assert_eq!(orders, sorted, "orders must be unique and listed ascending");
 }
 
 #[test]
 fn test_find_by_id() {
     let ids = [
-        "claude",
         "openai",
-        "devin",
-        "anthropic-api",
         "openai-api",
         "openrouter",
-        "gemini-api",
+        "moonshot",
+        "kimi-code",
+        "zai",
+        "zai-coding",
+        "opencode-zen",
+        "opencode-go",
+        "gemini",
+        "devin",
         "ollama",
+        "lmstudio",
         "custom",
     ];
 
@@ -43,20 +57,32 @@ fn test_find_by_id() {
 }
 
 #[test]
-fn test_find_by_alias() {
-    let claude = find("anthropic").expect("find claude via anthropic");
-    assert_eq!(claude.id, "claude");
-    assert_eq!(claude.auth_kind, AuthKind::OAuth);
+fn test_anthropic_is_not_supported() {
+    for name in ["claude", "anthropic", "anthropic-api", "claude-api"] {
+        assert!(find(name).is_none(), "{name} must not resolve");
+    }
+    for p in LOGIN_PROVIDERS {
+        assert!(!p.id.contains("claude") && !p.id.contains("anthropic"));
+        assert!(!p.display_name.to_ascii_lowercase().contains("claude"));
+        assert!(!p.display_name.to_ascii_lowercase().contains("anthropic"));
+    }
+}
 
+#[test]
+fn test_find_by_alias() {
     let openai = find("chatgpt").expect("find openai via chatgpt");
     assert_eq!(openai.id, "openai");
     assert_eq!(openai.auth_kind, AuthKind::OAuth);
 
+    let kimi = find("kimi").expect("find moonshot via kimi");
+    assert_eq!(kimi.id, "moonshot");
+    assert_eq!(kimi.auth_kind, AuthKind::ApiKey);
+
+    let gemini = find("google-ai-studio").expect("find gemini");
+    assert_eq!(gemini.id, "gemini");
+
     let devin = find("cognition").expect("find devin via cognition");
     assert_eq!(devin.id, "devin");
-
-    let anthropic_api = find("claude-api").expect("find anthropic-api");
-    assert_eq!(anthropic_api.id, "anthropic-api");
 
     let custom = find("compat").expect("find custom via compat");
     assert_eq!(custom.id, "custom");
@@ -64,9 +90,10 @@ fn test_find_by_alias() {
 
 #[test]
 fn test_find_case_insensitive_and_whitespace() {
-    assert_eq!(find("  CLAUDE  ").map(|p| p.id), Some("claude"));
+    assert_eq!(find("  OPENAI  ").map(|p| p.id), Some("openai"));
     assert_eq!(find("ChatGPT").map(|p| p.id), Some("openai"));
     assert_eq!(find("  OpenRouter  ").map(|p| p.id), Some("openrouter"));
+    assert_eq!(find("Z.AI Coding Plan").map(|p| p.id), Some("zai-coding"));
 }
 
 #[test]

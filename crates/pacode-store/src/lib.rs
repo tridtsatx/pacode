@@ -11,7 +11,7 @@ pub mod queries;
 pub mod schema;
 pub mod worker;
 
-pub use queries::{MessageRow, SearchHit, SessionFilter};
+pub use queries::{CompactionRecord, MessageRow, SearchHit, SessionFilter};
 pub use worker::Store;
 
 #[derive(Debug, thiserror::Error)]

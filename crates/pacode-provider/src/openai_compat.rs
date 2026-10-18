@@ -11,6 +11,14 @@
 //! mapped `low/medium/high`, `max` → `high` unless `effort_map` overrides, and
 //! `extra_body` merged last.
 //!
+//! Images: a user message with images becomes a `content` array of
+//! `{"type":"text"}` and `{"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}`
+//! parts (bytes are loaded lazily from the image store). Chat completions cannot carry
+//! images inside `tool` messages, so images returned by tools are sent as one `user`
+//! follow-up message placed right after the whole run of `tool` messages (never between
+//! them: every `tool_call_id` must be answered contiguously). Models without vision
+//! fail before the request with `model <id> does not accept images`.
+//!
 //! SSE parsing is tolerant: `delta.content`, `delta.reasoning_content` or
 //! `delta.reasoning` or `delta.thinking` (string), `delta.tool_calls[i]` with `index`
 //! (missing index = position in array), `finish_reason` (`stop` → EndTurn,
@@ -31,37 +39,25 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_types::{
-    ContentBlock, Effort, ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, Role,
+    ContentBlock, ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, Role,
     prettify_model_name,
 };
 use serde_json::Value;
 
+use crate::compat::{Compat, PLACEHOLDER, ReasoningWire};
 pub use crate::sse::{ChunkState, SseParser, chunk_to_events};
+use crate::vision;
 use crate::{CompletionRequest, EventStream, Provider, ProviderError};
 
 #[cfg(test)]
 #[path = "openai_compat_tests.rs"]
 mod openai_compat_tests;
 
-const REASONING_KEYWORDS: &[&str] = &[
-    "gemini",
-    "o1",
-    "o3",
-    "o4",
-    "gpt-5",
-    "deepseek-r",
-    "qwq",
-    "thinking",
-    "reason",
-    "glm-5",
-    "kimi-k2",
-    "claude",
-    "minimax",
-];
-
 pub struct OpenAiCompat {
     id: String,
     cfg: ProviderConfig,
+    /// Wire quirks of the endpoint behind `cfg.base_url`.
+    compat: Compat,
     defaults: ProviderDefaults,
     api_key: Option<String>,
     pricing: BTreeMap<String, Pricing>,
@@ -100,9 +96,12 @@ impl OpenAiCompat {
             .build()
             .map_err(|e| ProviderError::Config(format!("failed to build HTTP client: {e}")))?;
 
+        let compat = Compat::for_base_url(&cfg.base_url);
+
         Ok(Self {
             id,
             cfg,
+            compat,
             defaults,
             api_key,
             pricing,
@@ -129,18 +128,26 @@ impl OpenAiCompat {
             format!("{}\n\n{}", req.system_static, req.system_dynamic)
         };
 
+        let reasoning_on = self.reasoning_enabled_for(&req.model);
+
         let mut messages = Vec::with_capacity(1 + req.messages.len());
         messages.push(serde_json::json!({
             "role": "system",
             "content": system_content,
         }));
 
+        let mut pending_tool_images: Vec<Value> = Vec::new();
         for msg in &req.messages {
+            if msg.role != Role::Tool && !pending_tool_images.is_empty() {
+                messages.push(tool_images_message(std::mem::take(
+                    &mut pending_tool_images,
+                )));
+            }
             match msg.role {
                 Role::User => {
                     messages.push(serde_json::json!({
                         "role": "user",
-                        "content": msg.text(),
+                        "content": user_content(msg),
                     }));
                 }
                 Role::System => {
@@ -150,12 +157,12 @@ impl OpenAiCompat {
                     }));
                 }
                 Role::Assistant => {
-                    let text = msg.text();
+                    let mut text = msg.text();
                     let mut tool_calls = Vec::new();
                     for block in &msg.content {
                         if let ContentBlock::ToolUse { id, name, input } = block {
                             tool_calls.push(serde_json::json!({
-                                "id": id.as_str(),
+                                "id": self.compat.tool_id(id.as_str()),
                                 "type": "function",
                                 "function": {
                                     "name": name,
@@ -170,6 +177,9 @@ impl OpenAiCompat {
                     if tool_calls.is_empty() {
                         assistant_msg.insert("content".to_string(), serde_json::json!(text));
                     } else {
+                        if text.is_empty() && self.compat.text_for_tool_calls {
+                            text = PLACEHOLDER.to_string();
+                        }
                         let content_val = if text.is_empty() {
                             Value::Null
                         } else {
@@ -177,24 +187,40 @@ impl OpenAiCompat {
                         };
                         assistant_msg.insert("content".to_string(), content_val);
                         assistant_msg.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                        if reasoning_on && self.compat.reasoning_content_for_tool_calls {
+                            assistant_msg.insert(
+                                "reasoning_content".to_string(),
+                                serde_json::json!(PLACEHOLDER),
+                            );
+                        }
                     }
                     messages.push(Value::Object(assistant_msg));
                 }
                 Role::Tool => {
                     for block in &msg.content {
-                        if let ContentBlock::ToolResult {
-                            call_id, content, ..
-                        } = block
-                        {
-                            messages.push(serde_json::json!({
-                                "role": "tool",
-                                "tool_call_id": call_id.as_str(),
-                                "content": content,
-                            }));
+                        match block {
+                            ContentBlock::ToolResult {
+                                call_id, content, ..
+                            } => {
+                                messages.push(serde_json::json!({
+                                    "role": "tool",
+                                    "tool_call_id": self.compat.tool_id(call_id.as_str()),
+                                    "content": content,
+                                }));
+                            }
+                            ContentBlock::Image { .. } => {
+                                pending_tool_images.extend(image_parts(block));
+                            }
+                            ContentBlock::Text { .. }
+                            | ContentBlock::Reasoning { .. }
+                            | ContentBlock::ToolUse { .. } => {}
                         }
                     }
                 }
             }
+        }
+        if !pending_tool_images.is_empty() {
+            messages.push(tool_images_message(pending_tool_images));
         }
 
         let mut body = serde_json::Map::new();
@@ -216,7 +242,7 @@ impl OpenAiCompat {
                         "function": {
                             "name": t.name,
                             "description": t.description,
-                            "parameters": t.input_schema,
+                            "parameters": self.compat.clean_schema(&t.input_schema),
                         }
                     })
                 })
@@ -225,24 +251,42 @@ impl OpenAiCompat {
             body.insert("tool_choice".to_string(), serde_json::json!("auto"));
         }
 
-        if let Some(max_tokens) = req.max_output_tokens {
-            body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+        let max_tokens = req.max_output_tokens.or(self.compat.default_max_tokens);
+        if let Some(max_tokens) = max_tokens {
+            body.insert(
+                self.compat.max_tokens_field.key().to_string(),
+                serde_json::json!(max_tokens),
+            );
         }
 
-        if self.reasoning_enabled_for(&req.model) {
+        if reasoning_on {
+            let wire = self.compat.reasoning_wire(&req.model);
             let effort = req.effort.unwrap_or(self.defaults.effort);
             let effort_str = match self.cfg.effort_map.get(effort.as_str()) {
                 Some(override_val) => override_val.clone(),
-                None => match effort {
-                    Effort::Low => "low".to_string(),
-                    Effort::Medium => "medium".to_string(),
-                    Effort::High | Effort::XHigh | Effort::Max => "high".to_string(),
-                },
+                None => Compat::effort_str(wire, effort).to_string(),
             };
-            body.insert(
-                "reasoning_effort".to_string(),
-                serde_json::json!(effort_str),
-            );
+            match wire {
+                ReasoningWire::Unsupported => {}
+                ReasoningWire::ReasoningEffort | ReasoningWire::ReasoningEffortTiered => {
+                    body.insert(
+                        "reasoning_effort".to_string(),
+                        serde_json::json!(effort_str),
+                    );
+                }
+                ReasoningWire::ReasoningObject => {
+                    body.insert(
+                        "reasoning".to_string(),
+                        serde_json::json!({ "effort": effort_str }),
+                    );
+                }
+                ReasoningWire::ThinkingToggle => {
+                    body.insert(
+                        "thinking".to_string(),
+                        serde_json::json!({ "type": "enabled" }),
+                    );
+                }
+            }
         }
 
         let mut body_val = Value::Object(body);
@@ -252,6 +296,30 @@ impl OpenAiCompat {
             deep_merge(&mut body_val, extra);
         }
         body_val
+    }
+
+    /// Vision flag of `model`: the live catalogue when it declared one, else the id
+    /// heuristic.
+    fn vision_for(&self, model: &str) -> bool {
+        if let Ok(guard) = self.catalog_cache.lock()
+            && let Some(found) = guard
+                .as_ref()
+                .and_then(|list| list.iter().find(|m| m.route.model == model))
+        {
+            return found.vision;
+        }
+        vision::heuristic_vision(model)
+    }
+
+    /// Reject images for text-only models; strip stale ones from old history.
+    fn gate_images(&self, mut req: CompletionRequest) -> Result<CompletionRequest, ProviderError> {
+        if !req.messages.iter().any(pacode_types::Message::has_images) {
+            return Ok(req);
+        }
+        let vision = self.vision_for(&req.model);
+        let gated = vision::gate_images(&req.messages, &req.model, vision)?.into_owned();
+        req.messages = gated;
+        Ok(req)
     }
 
     fn reasoning_enabled_for(&self, model: &str) -> bool {
@@ -264,7 +332,7 @@ impl OpenAiCompat {
         if let Some(r) = self.cfg.reasoning {
             return r;
         }
-        model_heuristic_reasoning(model)
+        self.compat.heuristic_reasoning(model)
     }
 
     pub fn clear_catalog_cache(&self) {
@@ -358,10 +426,24 @@ impl OpenAiCompat {
         let mut all_models = configured_models;
         if let Some(data) = json_val.get("data").and_then(|v| v.as_array()) {
             for item in data {
-                if let Some(id) = item.get("id").and_then(|v| v.as_str())
+                if let Some(id) = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|id| self.compat.model_id(id))
                     && seen.insert(id.to_string())
                 {
-                    all_models.push(self.model_info(id));
+                    let mut info = self.model_info(id);
+                    if let Some(declared) = vision::catalog_vision(item) {
+                        info.vision = declared;
+                    }
+                    let pinned = self.cfg.reasoning.is_some();
+                    crate::model_meta::apply_catalog_item(
+                        &mut info,
+                        item,
+                        self.compat.reasoning_wire(id),
+                        !pinned,
+                    );
+                    all_models.push(info);
                 }
             }
         }
@@ -373,9 +455,62 @@ impl OpenAiCompat {
     }
 }
 
-fn model_heuristic_reasoning(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    REASONING_KEYWORDS.iter().any(|&k| lower.contains(k))
+/// `content` of a user message: a plain string, or a parts array when it has images.
+fn user_content(msg: &pacode_types::Message) -> Value {
+    if !msg.has_images() {
+        return Value::String(msg.text());
+    }
+    let mut parts = Vec::new();
+    for block in &msg.content {
+        match block {
+            ContentBlock::Text { text } => {
+                if !text.is_empty() {
+                    parts.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+            }
+            ContentBlock::Image { .. } => parts.extend(image_parts(block)),
+            ContentBlock::Reasoning { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => {}
+        }
+    }
+    Value::Array(parts)
+}
+
+/// One `image_url` part for an image block, or a text note when the bytes are gone.
+fn image_parts(block: &ContentBlock) -> Vec<Value> {
+    let ContentBlock::Image {
+        mime,
+        hash,
+        source_path,
+        ..
+    } = block
+    else {
+        return Vec::new();
+    };
+    match vision::data_url(mime, hash) {
+        Ok(url) => vec![serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": url },
+        })],
+        Err(err) => {
+            log::warn!("image {hash} left out of the request: {err}");
+            vec![serde_json::json!({
+                "type": "text",
+                "text": vision::omitted_note(source_path.as_deref()),
+            })]
+        }
+    }
+}
+
+/// The user follow-up carrying images that tools returned.
+fn tool_images_message(parts: Vec<Value>) -> Value {
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": "Images returned by the tool call(s) above:",
+    })];
+    content.extend(parts);
+    serde_json::json!({ "role": "user", "content": content })
 }
 
 fn deep_merge(target: &mut Value, source: &Value) {
@@ -658,6 +793,7 @@ impl Provider for OpenAiCompat {
             "{}/chat/completions",
             self.cfg.base_url.trim_end_matches('/')
         );
+        let req = self.gate_images(req)?;
         let body = self.build_body(&req);
         let max_retries = self.defaults.max_retries;
 
@@ -670,7 +806,7 @@ impl Provider for OpenAiCompat {
         log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
 
         let serialized_body = serde_json::to_string(&body).unwrap_or_default();
-        let body_redacted = redact(&serialized_body);
+        let body_redacted = redact(&vision::redact_data_urls(&serialized_body));
         log::trace!("request body: {body_redacted}");
 
         let effort = req.effort.unwrap_or(self.defaults.effort);
@@ -726,16 +862,21 @@ impl Provider for OpenAiCompat {
         let supports_reasoning = model_cfg
             .and_then(|m| m.reasoning)
             .or(self.cfg.reasoning)
-            .unwrap_or_else(|| model_heuristic_reasoning(model));
+            .unwrap_or_else(|| self.compat.heuristic_reasoning(model));
 
         let pricing = self.pricing.get(model).copied();
 
-        ModelInfo {
+        let mut info = ModelInfo {
             route: ModelRoute::new(self.id.clone(), model),
             display_name,
             context_window,
             supports_reasoning,
+            vision: self.vision_for(model),
             pricing,
-        }
+            kind: crate::model_meta::kind_from_id(model),
+            ..ModelInfo::default()
+        };
+        crate::model_meta::finish(&mut info, self.compat.reasoning_wire(model));
+        info
     }
 }

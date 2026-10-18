@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use pacode_exec::{TaskManager, TaskSpec};
 use pacode_tools::Tool;
 use pacode_tools::builtin::memory::{
-    MemoryReadTool, MemoryWriteTool, global_memory_path, project_memory_path,
+    MemoryForgetTool, MemoryListTool, MemoryReadTool, MemoryRecallTool, MemoryWriteTool,
 };
 use pacode_tools::host::{
     AgentKindDef, AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome,
@@ -221,185 +221,156 @@ fn make_ctx(cwd: PathBuf, host: Arc<dyn ToolHost>) -> ToolCtx {
     }
 }
 
+/// Point the global scope at a temp dir for the duration of a test.
+fn set_global(dir: &std::path::Path) {
+    // SAFETY: serialised by ENV_MUTEX in every test of this file.
+    unsafe {
+        std::env::set_var("PACODE_HOME", dir);
+    }
+}
+
+fn clear_global() {
+    // SAFETY: serialised by ENV_MUTEX in every test of this file.
+    unsafe {
+        std::env::remove_var("PACODE_HOME");
+    }
+}
+
+fn id_of(out: &str) -> String {
+    out.split_whitespace().nth(1).unwrap().to_string()
+}
+
 #[tokio::test]
 async fn test_memory_write_and_read_project_scope() {
+    let _lock = ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
+    set_global(&tmp.path().join("global"));
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
-    let out = write_tool
+    // Old call shape: scope + text only.
+    let out = MemoryWriteTool
         .call(
             json!({"scope": "project", "text": "use rust edition 2024"}),
             &ctx,
         )
         .await
         .unwrap();
+    assert!(out.content.starts_with("stored "), "{}", out.content);
 
-    assert_eq!(out.content, "stored");
+    assert!(ctx.cwd.join(".pacode").join("memory.db").exists());
 
-    // Parent dir .pacode must have been created and file written
-    let project_file = project_memory_path(&ctx.cwd);
-    assert!(project_file.exists());
-    let text = tokio::fs::read_to_string(&project_file).await.unwrap();
-    assert_eq!(text, "- use rust edition 2024\n");
-
-    // Permission draft was requested for project write
+    // Permission draft was requested for the project write.
     let drafts = host.drafts.lock().unwrap().clone();
     assert_eq!(drafts.len(), 1);
-    assert_eq!(drafts[0].title, "Write .pacode/memory.md");
-    assert!(drafts[0].detail.contains("- use rust edition 2024"));
+    assert_eq!(drafts[0].title, "Write .pacode/memory.db");
+    assert!(drafts[0].detail.contains("use rust edition 2024"));
 
-    // Read back project scope
-    let read_tool = MemoryReadTool;
-    let read_out = read_tool
+    // Old alias reads it back.
+    let read_out = MemoryReadTool
         .call(json!({"scope": "project"}), &ctx)
         .await
         .unwrap();
-    assert!(read_out.content.contains("- use rust edition 2024"));
+    assert!(read_out.content.contains("use rust edition 2024"));
+    clear_global();
 }
 
 #[tokio::test]
-async fn test_memory_write_and_read_global_scope_no_permission_prompt() {
+async fn test_memory_global_scope_no_permission_prompt_and_recall() {
     let _lock = ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let global_dir = tmp.path().join("home_pacode");
-    // Set PACODE_HOME so global_memory_path points to global_dir/memory.md
-    unsafe {
-        std::env::set_var("PACODE_HOME", &global_dir);
-    }
-
+    set_global(&global_dir);
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
-    let out = write_tool
+    let out = MemoryWriteTool
         .call(
-            json!({"scope": "global", "text": "prefer concise code"}),
+            json!({"scope": "global", "kind": "preference", "title": "Code style",
+                   "text": "prefer concise code", "tags": ["style"]}),
             &ctx,
         )
         .await
         .unwrap();
-
-    assert_eq!(out.content, "stored");
-
-    let global_file = global_memory_path();
-    assert!(global_file.exists());
-    let text = tokio::fs::read_to_string(&global_file).await.unwrap();
-    assert_eq!(text, "- prefer concise code\n");
-
-    // Global scope is pacode-owned: allowed WITHOUT permission prompt!
-    let drafts = host.drafts.lock().unwrap().clone();
+    assert!(out.content.starts_with("stored "));
+    assert!(global_dir.join("memory.db").exists());
     assert_eq!(
-        drafts.len(),
+        host.drafts.lock().unwrap().len(),
         0,
-        "global scope should not trigger a permission prompt"
+        "global writes never prompt"
     );
 
-    // Read back global scope
-    let read_tool = MemoryReadTool;
-    let read_out = read_tool
-        .call(json!({"scope": "global"}), &ctx)
+    let found = MemoryRecallTool
+        .call(json!({"query": "concise", "scope": "global"}), &ctx)
         .await
         .unwrap();
-    assert!(read_out.content.contains("- prefer concise code"));
-
-    unsafe {
-        std::env::remove_var("PACODE_HOME");
-    }
+    assert!(found.content.contains("[global/preference]"));
+    assert!(found.content.contains("prefer concise code"));
+    clear_global();
 }
 
 #[tokio::test]
-async fn test_memory_write_dedup() {
+async fn test_memory_dedupe_update_and_forget() {
+    let _lock = ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
+    set_global(&tmp.path().join("global"));
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
-
-    // First write: stored
-    let out1 = write_tool
-        .call(json!({"scope": "project", "text": "unique note"}), &ctx)
-        .await
-        .unwrap();
-    assert_eq!(out1.content, "stored");
-
-    // Exact duplicate: already stored
-    let out2 = write_tool
-        .call(json!({"scope": "project", "text": "unique note"}), &ctx)
-        .await
-        .unwrap();
-    assert_eq!(out2.content, "already stored");
-
-    // Whitespace variation that trims to same content: already stored
-    let out3 = write_tool
+    let first = MemoryWriteTool
         .call(
-            json!({"scope": "project", "text": "  unique note  \n"}),
+            json!({"scope": "global", "title": "Unique", "text": "unique note"}),
             &ctx,
         )
         .await
         .unwrap();
-    assert_eq!(out3.content, "already stored");
+    assert!(first.content.starts_with("stored "));
+    let second = MemoryWriteTool
+        .call(
+            json!({"scope": "global", "title": "unique", "text": "unique note v2"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(second.content.starts_with("updated "));
+    assert_eq!(id_of(&first.content), id_of(&second.content));
 
-    // File only contains 1 line
-    let project_file = project_memory_path(&ctx.cwd);
-    let text = tokio::fs::read_to_string(&project_file).await.unwrap();
-    assert_eq!(text, "- unique note\n");
+    let listed = MemoryListTool.call(json!({}), &ctx).await.unwrap();
+    assert!(listed.content.starts_with("1 memories"));
+
+    let id = id_of(&first.content);
+    let f = MemoryForgetTool
+        .call(json!({"id": id}), &ctx)
+        .await
+        .unwrap();
+    assert!(f.content.starts_with("forgot "));
+    let gone = MemoryRecallTool
+        .call(json!({"query": "unique"}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(gone.content, "no memories found");
+    assert!(
+        MemoryForgetTool
+            .call(json!({"id": id}), &ctx)
+            .await
+            .is_err()
+    );
+    clear_global();
 }
 
 #[tokio::test]
-async fn test_memory_write_newline_collapse_and_cap() {
-    let tmp = tempfile::tempdir().unwrap();
-    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
-    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
-
-    let write_tool = MemoryWriteTool;
-
-    // Newline collapse
-    let multi_line_text = "first line\nsecond line\r\nthird line\n  fourth line  ";
-    let out = write_tool
-        .call(json!({"scope": "project", "text": multi_line_text}), &ctx)
-        .await
-        .unwrap();
-    assert_eq!(out.content, "stored");
-
-    let project_file = project_memory_path(&ctx.cwd);
-    let text = tokio::fs::read_to_string(&project_file).await.unwrap();
-    assert_eq!(text, "- first line second line third line fourth line\n");
-
-    // Cap to 500 characters
-    let very_long = "a".repeat(600);
-    let out_cap = write_tool
-        .call(json!({"scope": "project", "text": very_long}), &ctx)
-        .await
-        .unwrap();
-    assert_eq!(out_cap.content, "stored");
-
-    let text_after = tokio::fs::read_to_string(&project_file).await.unwrap();
-    let lines: Vec<&str> = text_after.lines().collect();
-    assert_eq!(lines.len(), 2);
-    let expected_line = format!("- {}", "a".repeat(500));
-    assert_eq!(lines[1], expected_line);
-}
-
-#[tokio::test]
-async fn test_memory_read_both_scopes() {
+async fn test_memory_recall_merges_both_scopes() {
     let _lock = ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let global_dir = tmp.path().join("global_home");
-    unsafe {
-        std::env::set_var("PACODE_HOME", &global_dir);
-    }
-
+    set_global(&tmp.path().join("global_home"));
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
-    write_tool
+    MemoryWriteTool
         .call(json!({"scope": "global", "text": "global knowledge"}), &ctx)
         .await
         .unwrap();
-    write_tool
+    MemoryWriteTool
         .call(
             json!({"scope": "project", "text": "project knowledge"}),
             &ctx,
@@ -407,28 +378,51 @@ async fn test_memory_read_both_scopes() {
         .await
         .unwrap();
 
-    let read_tool = MemoryReadTool;
-    let read_both = read_tool.call(json!({}), &ctx).await.unwrap();
+    let both = MemoryRecallTool
+        .call(json!({"query": "knowledge"}), &ctx)
+        .await
+        .unwrap();
+    assert!(both.content.contains("[global/fact]"));
+    assert!(both.content.contains("[project/fact]"));
+    clear_global();
+}
 
-    assert!(read_both.content.contains("# Memory (global)"));
-    assert!(read_both.content.contains("- global knowledge"));
-    assert!(read_both.content.contains("# Memory (project)"));
-    assert!(read_both.content.contains("- project knowledge"));
+#[tokio::test]
+async fn test_memory_legacy_markdown_is_migrated() {
+    let _lock = ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let global_dir = tmp.path().join("global_home");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    std::fs::write(
+        global_dir.join("memory.md"),
+        "- legacy bullet one\n- legacy bullet two\n",
+    )
+    .unwrap();
+    set_global(&global_dir);
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    unsafe {
-        std::env::remove_var("PACODE_HOME");
-    }
+    let out = MemoryRecallTool
+        .call(json!({"query": "legacy", "scope": "global"}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.contains("legacy bullet one"));
+    assert!(out.content.contains("legacy bullet two"));
+    assert!(!global_dir.join("memory.md").exists());
+    assert!(global_dir.join("memory.md.migrated").exists());
+    clear_global();
 }
 
 #[tokio::test]
 async fn test_memory_write_permission_denied() {
+    let _lock = ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
+    set_global(&tmp.path().join("global"));
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     *host.decision.lock().unwrap() = PermissionDecision::Deny;
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let write_tool = MemoryWriteTool;
-    let err = write_tool
+    let err = MemoryWriteTool
         .call(
             json!({"scope": "project", "text": "should be rejected"}),
             &ctx,
@@ -436,5 +430,6 @@ async fn test_memory_write_permission_denied() {
         .await;
 
     assert!(matches!(err, Err(ToolError::Denied(_))));
-    assert!(!project_memory_path(&ctx.cwd).exists());
+    assert!(!ctx.cwd.join(".pacode").join("memory.db").exists());
+    clear_global();
 }

@@ -41,6 +41,8 @@ pub struct Session {
     pub skills: Arc<pacode_skills::SkillRegistry>,
     /// Cron jobs and monitors of this session. Dropping the session stops them.
     pub scheduler: Arc<crate::schedule::Scheduler>,
+    /// Who read and wrote which file version (in memory; see `crate::ledger`).
+    pub ledger: crate::ledger::FileLedger,
 }
 
 impl Session {
@@ -140,9 +142,31 @@ impl Session {
     /// Start a turn on the main agent, or queue a steer injection when a turn is
     /// running. Persists the user message. Returns immediately.
     pub async fn submit_user_message(self: &Arc<Self>, text: String) -> Result<(), CoreError> {
+        self.submit_user_message_with(text, Vec::new()).await
+    }
+
+    /// `submit_user_message` with images. Attachments are validated, prepared and
+    /// stored before any state changes, so a rejected image leaves history untouched.
+    pub async fn submit_user_message_with(
+        self: &Arc<Self>,
+        text: String,
+        attachments: Vec<pacode_types::Attachment>,
+    ) -> Result<(), CoreError> {
         let main = self
             .main_agent()
             .ok_or_else(|| CoreError::AgentNotFound(AgentId::main()))?;
+
+        if !attachments.is_empty() {
+            let route = self.meta().model;
+            let provider = self.providers.resolve(&route).await?;
+            if !provider.model_info(&route.model).vision {
+                return Err(CoreError::Invalid(format!(
+                    "model {} does not accept images",
+                    route.model
+                )));
+            }
+        }
+        let images = crate::attach::store_attachments(attachments).await?;
 
         let cwd = self.meta().cwd;
         let expanded_text = crate::expand::expand_user_message(
@@ -163,11 +187,9 @@ impl Session {
                 .unwrap_or_else(|p| p.into_inner()) = Some(hist_snapshot);
         }
 
-        let (seq, arc_msg) = main
-            .history
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(pacode_types::Message::user(&expanded_text));
+        let (seq, arc_msg) = main.history.lock().unwrap_or_else(|p| p.into_inner()).push(
+            pacode_types::Message::user_with_images(&expanded_text, &images),
+        );
         self.store
             .append_message(&self.id, &main.id(), seq, &arc_msg)
             .await?;
@@ -188,6 +210,26 @@ impl Session {
             .unwrap_or_else(|p| p.into_inner())
             .upsert(item.clone());
         self.events.emit(pacode_types::Event::ItemAdded(item));
+
+        if !images.is_empty() {
+            let images_seq = main
+                .transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .next_seq();
+            let images_item = pacode_types::TranscriptItem {
+                seq: images_seq,
+                agent: main.id(),
+                ts_ms: pacode_types::now_ms(),
+                kind: pacode_types::TranscriptKind::Images { images },
+            };
+            main.transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .upsert(images_item.clone());
+            self.events
+                .emit(pacode_types::Event::ItemAdded(images_item));
+        }
 
         let needs_touch = {
             let mut meta = self.meta.write().unwrap_or_else(|p| p.into_inner());
@@ -280,12 +322,23 @@ impl Session {
         })
         .await;
 
+        // The new model may not offer the current effort: move it to the nearest
+        // level it does support so every client sees a valid pair.
+        let current = self.meta().effort;
+        let clamped = self.clamp_effort_for(&route, current).await;
+        if clamped != current {
+            self.set_effort(clamped).await;
+        }
+
         self.touch();
         Ok(())
     }
 
-    /// Same propagation as `set_model`, for the reasoning effort.
+    /// Same propagation as `set_model`, for the reasoning effort. An effort the
+    /// session model does not support is clamped to the nearest one it does.
     pub async fn set_effort(&self, effort: Effort) {
+        let model = self.meta().model;
+        let effort = self.clamp_effort_for(&model, effort).await;
         let old_effort = {
             let mut meta = self.meta.write().unwrap_or_else(|p| p.into_inner());
             std::mem::replace(&mut meta.effort, effort)
@@ -349,6 +402,7 @@ impl Session {
 
     /// Spawn a subagent (depth 1, `agents.max_live` cap) and start its turn.
     pub async fn spawn_agent(self: &Arc<Self>, spec: AgentSpec) -> Result<AgentId, CoreError> {
+        self.tasks.admit_agent()?;
         let live_count = self
             .agents
             .read()
@@ -400,6 +454,8 @@ impl Session {
             .effort
             .or(self.config.agents.default_effort)
             .unwrap_or_else(|| self.meta().effort);
+        // Inherited or configured efforts may not exist on the subagent's model.
+        let effort = self.clamp_effort_for(&model, effort).await;
 
         let mut history = crate::agent::History::default();
         if spec.fork
@@ -467,6 +523,7 @@ impl Session {
             cancel.cancel();
         }
         self.cancel_questions_for(id);
+        self.drop_agent_questions(id);
         agent.set_status(pacode_types::AgentStatus::Stopped, None);
         let info = agent.info();
         let _ = self
@@ -565,6 +622,8 @@ impl Session {
 
             // 1. Swap ID atomically
             main.set_id(new_id.clone());
+            // The detached turn keeps what it read; the fresh main (same history) too.
+            self.ledger.copy_agent(&AgentId::main(), &new_id);
 
             // 2. Restrict tools to subagent subset (exclude `agent` tool)
             {
@@ -599,7 +658,11 @@ impl Session {
             agents_guard.insert(new_id.clone(), main.clone());
 
             // 6. Create FRESH main agent
-            let main_tools = self.tools.read().unwrap_or_else(|p| p.into_inner()).clone();
+            let main_tools = self
+                .tools
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .without(pacode_tools::builtin::ask_parent::NAME);
             let now = pacode_types::now_ms();
             let fresh_main_info = pacode_types::AgentInfo {
                 id: AgentId::main(),

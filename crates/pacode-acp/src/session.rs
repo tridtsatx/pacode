@@ -21,8 +21,9 @@ use pacode_types::state::Mode;
 use crate::error::AcpError;
 use crate::mapping::{
     MappingState, event_to_session_updates, modes_state, permission_request_to_acp,
-    permission_response_to_decision, plan_to_acp, prompt_content_to_text, session_id_from_acp,
-    session_id_to_acp, transcript_item_to_session_updates, turn_stop_to_stop_reason,
+    permission_response_to_decision, plan_to_acp, prompt_content_to_attachments,
+    prompt_content_to_text, session_id_from_acp, session_id_to_acp,
+    transcript_item_to_session_updates, turn_stop_to_stop_reason,
 };
 
 #[cfg(test)]
@@ -83,12 +84,15 @@ impl SessionState {
         cx: &ConnectionTo<AcpClient>,
     ) -> Result<AcpStopReason, AcpError> {
         let text = prompt_content_to_text(&prompt.prompt);
+        let attachments = prompt_content_to_attachments(&prompt.prompt);
         let acp_session_id = prompt.session_id.clone();
 
         let mut events = self.events.lock().await;
 
         // Submit the user message to the pacode daemon
-        self.client.ok(Request::UserMessage { text }).await?;
+        self.client
+            .ok(Request::UserMessage { text, attachments })
+            .await?;
 
         let mut mapping_state = MappingState::new();
 

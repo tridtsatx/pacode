@@ -1,23 +1,29 @@
-//! Model providers. v1 ships one adapter, [`OpenAiCompat`], for any OpenAI-compatible
-//! `/chat/completions` endpoint (Gemini via its OpenAI endpoint, Ollama, OpenRouter,
-//! vLLM, LM Studio, ...). [`ProviderRegistry`] resolves `provider/model` routes from
-//! the config.
+//! Model providers. [`OpenAiCompat`] serves every OpenAI-compatible `/chat/completions`
+//! endpoint (OpenRouter, Kimi, Z.AI, OpenCode, Gemini via its OpenAI endpoint, OpenAI,
+//! Ollama, LM Studio, custom gateways); `codex` speaks the OpenAI Responses API for the
+//! ChatGPT login; `devin` is its own transport. [`ProviderRegistry`] resolves
+//! `provider/model` routes from the config and the builtin table.
 //!
-//! Submodules (to implement):
+//! Submodules:
+//! - `builtin`: the builtin provider table (ids, URLs, env vars, default models)
+//! - `compat`: per-endpoint wire quirks applied by `openai_compat`
 //! - `openai_compat`: request building, SSE parsing, retries, `/models` catalog
 //! - `registry`: `ProviderRegistry` built from `Config`
 //! - `mock`: `MockProvider` with scripted responses (behind `cfg(any(test, feature = "mock"))`
 //!   and always compiled for downstream tests via the `mock` feature)
 
-pub mod anthropic;
+pub mod builtin;
 pub mod catalog_cache;
 pub mod codex;
+pub mod compat;
 pub mod devin;
 pub mod mock;
+pub mod model_meta;
 pub mod openai_compat;
 pub mod registry;
 mod retry;
 pub mod sse;
+pub mod vision;
 
 use std::pin::Pin;
 
@@ -25,9 +31,11 @@ use async_trait::async_trait;
 use futures::Stream;
 use pacode_types::{Effort, Message, ModelInfo, StreamEvent, ToolDefinition};
 
+pub use builtin::{BuiltinModel, BuiltinProvider, builtin_providers, find_builtin};
 pub use catalog_cache::{
     CATALOG_CACHE_VERSION, CatalogCache, DEFAULT_CATALOG_TTL_SECS, DEFAULT_MAX_MODELS_PER_PROVIDER,
 };
+pub use compat::{Compat, MaxTokensField, ReasoningWire, ToolIdRule};
 pub use mock::MockProvider;
 pub use openai_compat::{OpenAiCompat, redact};
 pub use registry::ProviderRegistry;

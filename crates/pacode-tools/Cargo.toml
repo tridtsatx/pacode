@@ -12,12 +12,16 @@ description = "Tool trait, ToolHost, and the built-in tool set (read/write/edit/
 
 [dependencies]
 pacode-types = { workspace = true }
+pacode-image = { workspace = true }
 pacode-skills = { workspace = true }
 pacode-exec = { workspace = true }
 pacode-risk = { workspace = true }
 pacode-render = { workspace = true }
 pacode-mcp = { workspace = true }
 pacode-plugin = { workspace = true }
+pacode-coreutils = { workspace = true }
+pacode-outline = { workspace = true }
+pacode-memory = { workspace = true }
 tokio = { workspace = true, features = ["rt", "fs", "io-util", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
@@ -41,5 +45,6 @@ futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+image = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 pretty_assertions = { workspace = true }

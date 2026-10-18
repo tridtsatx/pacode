@@ -281,7 +281,10 @@ async fn test_read_offset_limit_and_binary() {
 
     let tool = ReadTool;
     let out = tool
-        .call(json!({"path": "test.txt", "offset": 3, "limit": 4}), &ctx)
+        .call(
+            json!({"path": "test.txt", "offset": 3, "limit": 4, "anchors": false}),
+            &ctx,
+        )
         .await
         .unwrap();
 
@@ -670,10 +673,53 @@ async fn test_agent_spawn_and_list() {
     assert!(spawn_out.content.contains("Spawned agent"));
     assert!(spawn_out.content.contains("worker"));
 
+    // LLM-sent model/effort are ignored: no kind, so the session inherits.
+    let spec = host.spawned_specs.lock().unwrap().last().unwrap().clone();
+    assert_eq!(spec.model, None);
+    assert_eq!(spec.effort, None);
+
     let list_out = tool.call(json!({"action": "list"}), &ctx).await.unwrap();
     assert!(list_out.content.contains("worker"));
     assert!(list_out.content.contains("thinking"));
     assert!(list_out.content.contains("↓42"));
+}
+
+#[test]
+fn test_agent_schema_hides_model_and_effort() {
+    let schema = AgentTool.schema();
+    let props = schema["properties"].as_object().unwrap();
+    assert!(!props.contains_key("model"));
+    assert!(!props.contains_key("effort"));
+    assert!(props.contains_key("kind"));
+    assert!(props.contains_key("context"));
+    let desc = AgentTool.description();
+    assert!(!desc.contains("model"), "description leaks model: {desc}");
+    assert!(!desc.contains("effort"), "description leaks effort: {desc}");
+}
+
+#[tokio::test]
+async fn test_agent_spawn_ignores_llm_model_without_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+
+    // Even an unresolvable model from the LLM is silently ignored.
+    AgentTool
+        .call(
+            json!({
+                "action": "spawn",
+                "prompt": "do work",
+                "model": "nosuchmodel",
+                "effort": "max"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let spec = host.spawned_specs.lock().unwrap().last().unwrap().clone();
+    assert_eq!(spec.model, None, "session should inherit the parent model");
+    assert_eq!(spec.effort, None);
 }
 
 fn reviewer_kind(tmp: &std::path::Path) -> AgentKindDef {
@@ -722,7 +768,8 @@ async fn test_agent_spawn_with_named_kind() {
     );
     assert_eq!(spec.model, Some(ModelRoute::new("mock", "review-model")));
 
-    // Explicit params beat the kind file.
+    // Explicit name/tools still beat the kind file; an LLM model is ignored and
+    // the kind file's model stays in force.
     tool.call(
         json!({
             "action": "spawn",
@@ -738,7 +785,7 @@ async fn test_agent_spawn_with_named_kind() {
     .unwrap();
     let spec = host.spawned_specs.lock().unwrap().last().unwrap().clone();
     assert_eq!(spec.name.as_deref(), Some("second-look"));
-    assert_eq!(spec.model, Some(ModelRoute::new("other", "x")));
+    assert_eq!(spec.model, Some(ModelRoute::new("mock", "review-model")));
     assert_eq!(spec.tools, Some(vec!["ls".to_string()]));
 }
 

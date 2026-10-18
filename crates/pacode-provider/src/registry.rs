@@ -89,7 +89,7 @@ pub fn resolve_provider_credential(
         if let Some(acc) = store.get(id) {
             return ResolvedCredential::StoreOAuth(acc.clone());
         }
-        // Catalog lookup for aliases (e.g. claude -> anthropic)
+        // Catalog lookup for aliases (e.g. chatgpt -> openai)
         if let Some(desc) = pacode_auth::catalog::find(id)
             && let Some(acc) = store.get(desc.id)
         {
@@ -100,38 +100,24 @@ pub fn resolve_provider_credential(
     ResolvedCredential::None
 }
 
-/// Synthesize built-in provider entries so `/login claude` etc. work with an empty config.toml.
+/// Synthesize built-in provider entries so `/login moonshot` or `OPENROUTER_API_KEY` work
+/// with an empty config.toml.
 ///
-/// Rules:
-/// - claude -> kind anthropic, base_url `https://api.anthropic.com/v1`
-/// - openai -> kind codex, base_url `https://api.openai.com/v1`
-/// - devin  -> kind devin, base_url from account's `extra["api_server_url"]`
+/// A builtin (see [`crate::builtin`]) is added when the config has no entry of that id and
+/// the store holds a login for it or its API-key environment variable is set. Local
+/// servers (Ollama, LM Studio) are added only once logged in. `devin` takes its base URL
+/// from the account's `extra["api_server_url"]`.
 pub fn synthesize_builtin_providers(
     providers: &mut BTreeMap<String, ProviderConfig>,
     store: &AuthStore,
 ) {
-    if !providers.contains_key("claude") && store.get("claude").is_some() {
-        providers.insert(
-            "claude".to_string(),
-            ProviderConfig {
-                kind: ProviderKind::Anthropic,
-                base_url: "https://api.anthropic.com/v1".to_string(),
-                catalog: true,
-                ..ProviderConfig::default()
-            },
-        );
-    }
-
-    if !providers.contains_key("openai") && store.get("openai").is_some() {
-        providers.insert(
-            "openai".to_string(),
-            ProviderConfig {
-                kind: ProviderKind::Codex,
-                base_url: "https://api.openai.com/v1".to_string(),
-                catalog: true,
-                ..ProviderConfig::default()
-            },
-        );
+    for builtin in crate::builtin::builtin_providers() {
+        if providers.contains_key(builtin.id) {
+            continue;
+        }
+        if store.get(builtin.id).is_some() || builtin.env_key().is_some() {
+            providers.insert(builtin.id.to_string(), builtin.to_config());
+        }
     }
 
     if !providers.contains_key("devin")
@@ -174,29 +160,9 @@ fn build_transport(
             )?;
             Ok(Arc::new(provider))
         }
-        ProviderKind::Anthropic => match credential {
-            ResolvedCredential::StoreOAuth(acc) => {
-                let provider = crate::anthropic::Anthropic::from_oauth(
-                    id.to_string(),
-                    pcfg.clone(),
-                    defaults.clone(),
-                    acc.access.clone(),
-                    pricing.clone(),
-                )?;
-                Ok(Arc::new(provider))
-            }
-            _ => {
-                let api_key = credential.api_key().map(String::from);
-                let provider = crate::anthropic::Anthropic::from_api_key(
-                    id.to_string(),
-                    pcfg.clone(),
-                    defaults.clone(),
-                    api_key,
-                    pricing.clone(),
-                )?;
-                Ok(Arc::new(provider))
-            }
-        },
+        ProviderKind::Anthropic => Err(ProviderError::Config(format!(
+            "provider '{id}': the anthropic provider kind is no longer supported"
+        ))),
         ProviderKind::Codex => match credential {
             ResolvedCredential::StoreOAuth(acc) => {
                 let tokens = crate::codex::CodexOAuthTokens {
@@ -593,7 +559,14 @@ impl ProviderRegistry {
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(id);
-            if matches!(id, "claude" | "openai" | "devin") && store.accounts(id).is_empty() {
+            // A synthesized builtin whose login is gone (and with no env key) disappears;
+            // a config-defined entry stays even if it is merely unauthenticated.
+            let synthesized = id == "devin"
+                || crate::builtin::find_builtin(id).is_some_and(|b| b.to_config() == pcfg);
+            if synthesized
+                && store.accounts(id).is_empty()
+                && matches!(credential, ResolvedCredential::None)
+            {
                 configs.remove(id);
                 self.providers
                     .write()

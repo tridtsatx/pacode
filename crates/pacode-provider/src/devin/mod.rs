@@ -189,6 +189,16 @@ impl Devin {
         }
     }
 
+    /// Reasoning levels the catalog offers for family `model`; empty for anything
+    /// that is not a known family.
+    fn family_efforts(&self, model: &str) -> Vec<Effort> {
+        self.families
+            .lock()
+            .ok()
+            .and_then(|g| g.iter().find(|f| f.id == model).map(Family::efforts))
+            .unwrap_or_default()
+    }
+
     /// Turn a family id into the catalog id serving `effort`. Ids that are not a
     /// known family — a concrete catalog id, a configured model, `adaptive` — are
     /// left alone.
@@ -299,6 +309,7 @@ impl Devin {
                 .map(|(_, id)| id.as_str())
                 .unwrap_or(family.id.as_str());
             let mut info = self.model_info(&family.id);
+            info.efforts = family.efforts();
             if let Some(dn) = display_names.get(representative) {
                 info.display_name = catalog::family_display_name(dn);
             }
@@ -342,6 +353,12 @@ impl Provider for Devin {
                 effort.as_str()
             );
             req.model = resolved;
+        }
+
+        if req.messages.iter().any(pacode_types::Message::has_images) {
+            let vision = self.model_info(&req.model).vision;
+            req.messages =
+                crate::vision::gate_images(&req.messages, &req.model, vision)?.into_owned();
         }
 
         let assignment_jwt = if req.model.eq_ignore_ascii_case("adaptive") {
@@ -431,7 +448,12 @@ impl Provider for Devin {
             display_name,
             context_window,
             supports_reasoning,
+            // `adaptive` routes to a vision-capable model server side.
+            vision: model.eq_ignore_ascii_case("adaptive")
+                || crate::vision::heuristic_vision(model),
             pricing,
+            efforts: self.family_efforts(model),
+            ..ModelInfo::default()
         }
     }
 }

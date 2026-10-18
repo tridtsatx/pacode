@@ -3,13 +3,14 @@
 //! [`ToolCtx`].
 
 pub mod builtin;
+pub mod hashline;
 pub mod host;
 pub mod output;
 pub mod registry;
 pub mod test_support;
 
 pub use builtin::{builtin_tools, subagent_tool_names};
-pub use host::{AgentSpec, ToolCtx, ToolHost, WaitOutcome};
+pub use host::{AgentSpec, LedgerPass, ToolCtx, ToolHost, WaitOutcome, WriteIntent, WriteLock};
 pub use output::{ToolError, ToolOutput};
 pub use registry::ToolRegistry;
 

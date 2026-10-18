@@ -64,8 +64,42 @@ pacode run --json "..."     # headless, one turn, events on stdout
 ```
 
 Configuration lives in `~/.config/pacode/config.toml`; `/config` edits it from
-inside the TUI. `/login` signs in to a provider that uses OAuth, and
+inside the TUI. `/login` signs in to a provider (OAuth or API key), and
 `pacode login --list` shows what is configured.
+
+### Providers
+
+Every provider below works with no `config.toml` entry: export its key, or run
+`/login <id>` and paste one. A `[providers.<id>]` table with the same id replaces the
+builtin.
+
+| id | Provider | Base URL | Key |
+|---|---|---|---|
+| `openai` | OpenAI, ChatGPT subscription (Codex OAuth) | `https://chatgpt.com/backend-api/codex` | `/login openai` |
+| `openai-api` | OpenAI API | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `openrouter` | OpenRouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `moonshot` | Kimi (Moonshot) | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` |
+| `kimi-code` | Kimi Code coding plan | `https://api.kimi.com/coding/v1` | `KIMI_API_KEY` |
+| `zai` | Z.AI (GLM) | `https://api.z.ai/api/paas/v4` | `ZAI_API_KEY` |
+| `zai-coding` | Z.AI coding plan | `https://api.z.ai/api/coding/paas/v4` | `ZAI_API_KEY` |
+| `opencode-zen` | OpenCode Zen | `https://opencode.ai/zen/v1` | `OPENCODE_API_KEY` |
+| `opencode-go` | OpenCode Go | `https://opencode.ai/zen/go/v1` | `OPENCODE_API_KEY` |
+| `gemini` | Google Gemini (OpenAI-compatible endpoint) | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |
+| `ollama`, `lmstudio` | local servers | `http://localhost:11434/v1`, `http://localhost:1234/v1` | none |
+
+Any other OpenAI-compatible server is a custom provider:
+
+```toml
+[providers.vllm]
+base_url = "http://gpu-box:8000/v1"
+api_key_env = "VLLM_API_KEY"
+catalog = true                       # list models from GET /models
+```
+
+Endpoint differences (`max_completion_tokens` on OpenAI, `reasoning` object on
+OpenRouter, binary `thinking` on Z.AI and Kimi K2, tool-id limits, Gemini schema
+limits) are applied by host, so a custom entry pointing at one of these hosts gets
+them too. Devin keeps its own login.
 
 A provider can be sent through a proxy:
 
@@ -148,6 +182,33 @@ editors that speak it.
 `/plugins`, `/keys`, `/editor`, `/import`, `/compact`, `/export`, `/help`.
 
 Every binding is rebindable from `/keys`.
+
+## Resource limits
+
+Agents run arbitrary commands, so pacode keeps the machine usable. By default 20% of
+memory stays free (of the cgroup limit when one is lower than the host's RAM). Below
+that reserve, new commands and subagents are refused with `low resources: ...` until
+running ones finish. Stopping is soft: only a shortfall of more than `overshoot_mb`
+beyond the reserve that lasts `grace_secs` counts, and then only the largest process
+tree (never the daemon, the TUI or MCP servers, never one younger than 2 s) gets
+SIGTERM, and SIGKILL after `term_wait_secs`. The task reports why it was stopped so
+the agent can retry with less memory. Sampling runs only while a command is running.
+Spawned commands run at lower CPU priority and output spooling stops when the spool
+disk is nearly full. Linux is fully supported; macOS is best effort.
+
+```toml
+[resources]
+enabled = true
+min_free_percent = 20      # of total memory (or cgroup limit)
+overshoot_mb = 512         # tolerated beyond the reserve before it is a breach
+grace_secs = 10            # a breach must last this long
+term_wait_secs = 5         # SIGTERM, wait, then SIGKILL
+max_process_percent = 0    # optional cap for one process tree, 0 = off
+nice = 10                  # CPU niceness of spawned commands, 0 = off
+min_free_disk_mb = 512     # spool disk reserve
+sample_ms_idle_headroom = 1000
+sample_ms_pressure = 200
+```
 
 ## Layout
 

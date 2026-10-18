@@ -63,6 +63,10 @@ pub enum Request {
     /// Starts a turn when idle; queued as a steer injection while a turn runs.
     UserMessage {
         text: String,
+        /// Images sent with the message (at most [`crate::MAX_IMAGES_PER_MESSAGE`]).
+        /// Old clients omit the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
     },
     /// Cancel the running turn (history is kept).
     Interrupt,
@@ -533,7 +537,10 @@ mod tests {
     fn envelope_flattens_request() {
         let env = Envelope {
             id: 7,
-            req: Request::UserMessage { text: "hi".into() },
+            req: Request::UserMessage {
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
         };
         let json = serde_json::to_value(&env).unwrap();
         assert_eq!(json["id"], 7);

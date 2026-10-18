@@ -30,6 +30,7 @@ pub(crate) fn agent_status_to_str(status: AgentStatus) -> &'static str {
         AgentStatus::Thinking => "thinking",
         AgentStatus::RunningTool => "running_tool",
         AgentStatus::WaitingApproval => "waiting_approval",
+        AgentStatus::WaitingOrchestrator => "waiting_orchestrator",
         AgentStatus::Finished => "finished",
         AgentStatus::Failed => "failed",
         AgentStatus::Stopped => "stopped",
@@ -42,6 +43,7 @@ pub(crate) fn agent_status_from_str(s: &str) -> AgentStatus {
         "thinking" => AgentStatus::Thinking,
         "running_tool" => AgentStatus::RunningTool,
         "waiting_approval" => AgentStatus::WaitingApproval,
+        "waiting_orchestrator" => AgentStatus::WaitingOrchestrator,
         "finished" => AgentStatus::Finished,
         "failed" => AgentStatus::Failed,
         "stopped" => AgentStatus::Stopped,
@@ -436,13 +438,82 @@ pub fn save_compaction(
     Ok(())
 }
 
+/// One compaction run. `summary: None` means a shake-only run: stats are recorded but
+/// any stored summary and `upto_seq` are left untouched (a row created this way holds
+/// an empty summary, which `load_compaction` ignores).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionRecord {
+    pub summary: Option<String>,
+    pub upto_seq: u64,
+    /// `"shake"` or `"summary"`.
+    pub method: String,
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+}
+
+pub fn record_compaction(
+    conn: &mut Connection,
+    session: &SessionId,
+    agent: &AgentId,
+    rec: &CompactionRecord,
+) -> Result<(), StoreError> {
+    match &rec.summary {
+        Some(summary) => {
+            conn.execute(
+                r#"
+                INSERT INTO compaction
+                    (session_id, agent_id, summary, upto_seq, method, tokens_before, tokens_after)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(session_id, agent_id) DO UPDATE SET
+                    summary = excluded.summary,
+                    upto_seq = excluded.upto_seq,
+                    method = excluded.method,
+                    tokens_before = excluded.tokens_before,
+                    tokens_after = excluded.tokens_after;
+                "#,
+                params![
+                    session.as_str(),
+                    agent.as_str(),
+                    summary,
+                    rec.upto_seq as i64,
+                    rec.method,
+                    rec.tokens_before as i64,
+                    rec.tokens_after as i64
+                ],
+            )?;
+        }
+        None => {
+            conn.execute(
+                r#"
+                INSERT INTO compaction
+                    (session_id, agent_id, summary, upto_seq, method, tokens_before, tokens_after)
+                VALUES (?1, ?2, '', 0, ?3, ?4, ?5)
+                ON CONFLICT(session_id, agent_id) DO UPDATE SET
+                    method = excluded.method,
+                    tokens_before = excluded.tokens_before,
+                    tokens_after = excluded.tokens_after;
+                "#,
+                params![
+                    session.as_str(),
+                    agent.as_str(),
+                    rec.method,
+                    rec.tokens_before as i64,
+                    rec.tokens_after as i64
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub fn load_compaction(
     conn: &Connection,
     session: &SessionId,
     agent: &AgentId,
 ) -> Result<Option<(String, u64)>, StoreError> {
     let mut stmt = conn.prepare_cached(
-        "SELECT summary, upto_seq FROM compaction WHERE session_id = ?1 AND agent_id = ?2;",
+        "SELECT summary, upto_seq FROM compaction \
+         WHERE session_id = ?1 AND agent_id = ?2 AND summary != '';",
     )?;
     let mut rows = stmt.query(params![session.as_str(), agent.as_str()])?;
     if let Some(row) = rows.next()? {

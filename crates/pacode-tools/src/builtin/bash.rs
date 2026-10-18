@@ -39,7 +39,10 @@ impl Tool for BashTool {
          servers) should use `background: true`, or they are moved to the background \
          automatically after a few seconds: you then get a task id, keep working, and \
          a notification arrives when the task finishes. Use `bg` to check, wait for, \
-         or kill tasks. Output above the cap is cut head+tail."
+         or kill tasks. Output above the cap is cut head+tail. For counting, filtering, \
+         sorting, slicing, JSON extraction, diffs and listings (wc head tail sort uniq cut \
+         tr sed jq diff tree ...) prefer the `util` tool over shell or python scripts; \
+         plain pipelines of those utilities run in-process anyway."
     }
 
     fn schema(&self) -> Value {
@@ -94,6 +97,24 @@ impl Tool for BashTool {
         };
         ctx.require_permission(perm_title, detail, Some(assessment.level))
             .await?;
+
+        // A pure pipeline of supported text utilities (`wc -l f | sort -n`) runs in-process:
+        // no fork, same output shape. Anything else, or any failure, takes the normal path.
+        if !args.background
+            && let Some(out) = super::utils::try_in_process(&args.command, &ctx.cwd).await
+        {
+            let (content, preview) =
+                super::utils::render_for_bash(&out, accept_large_output, ctx.output_cap_chars);
+            let label = args
+                .label
+                .clone()
+                .unwrap_or_else(|| pacode_types::task_label_from_command(&args.command));
+            let mut result = ToolOutput::text(content)
+                .with_title(format!("Bash {label} [in-process]"))
+                .with_preview(preview);
+            result.is_error = out.code != 0;
+            return Ok(result);
+        }
 
         ssh_multiplex::check_and_warn(&args.command, ctx.host.as_ref()).await;
 

@@ -1,6 +1,6 @@
 //! Tool results and errors.
 
-use pacode_types::{DiffStat, TaskId};
+use pacode_types::{DiffStat, ImageRef, TaskId};
 
 /// What a tool returns. `content` goes to the model; `title`/`preview`/`diff` go to
 /// the transcript row.
@@ -17,6 +17,10 @@ pub struct ToolOutput {
     /// Set when the call handed work to a background task.
     pub task: Option<TaskId>,
     pub is_error: bool,
+    /// Images the call produced (already stored in the image store). They follow the
+    /// result in history and render below the call row; they are sent to the model
+    /// only when it accepts images.
+    pub images: Vec<ImageRef>,
 }
 
 impl ToolOutput {
@@ -39,6 +43,11 @@ impl ToolOutput {
 
     pub fn with_diff(mut self, diff: DiffStat) -> Self {
         self.diff = Some(diff);
+        self
+    }
+
+    pub fn with_images(mut self, images: Vec<ImageRef>) -> Self {
+        self.images = images;
         self
     }
 

@@ -204,6 +204,16 @@ fn get_or_render_cell(
         })
     );
 
+    // Inline images need the decoded-cell cache, which only the transcript owns.
+    if let CellKind::Item(TranscriptKind::Images { images }) = args.cell_kind {
+        if let Some(cached) = transcript.cache.get(key) {
+            return cached.to_vec();
+        }
+        let rendered =
+            crate::ui::images::render_images(images, args.width, opts, &mut transcript.images);
+        return transcript.cache.insert(key, rendered).to_vec();
+    }
+
     if !args.is_live && !is_running_tool {
         if let Some(cached) = transcript.cache.get(key) {
             return cached.to_vec();
@@ -667,6 +677,8 @@ fn render_item_inner(
             lines.push(Line::default());
             lines
         }
+        // Cache-free fallback; the transcript draws images through `ui::images`.
+        TranscriptKind::Images { images } => crate::ui::images::stub_lines(images, width, opts),
         TranscriptKind::BashCommand {
             command,
             output,

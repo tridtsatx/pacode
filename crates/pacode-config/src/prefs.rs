@@ -20,6 +20,9 @@ pub struct Prefs {
     /// Marketplace last pointed at with `/plugins <source>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marketplace: Option<String>,
+    /// Models picked in `/model`, newest first (capped by the picker).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_models: Vec<String>,
 }
 
 pub fn prefs_file(paths: &Paths) -> PathBuf {

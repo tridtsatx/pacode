@@ -33,13 +33,20 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
         return;
     }
 
-    let w = ((dialog_area.width as u32 * 78) / 100).max(20) as u16;
-    let max_h = dialog_area.height.saturating_sub(4).max(6);
-    // Cap at the content: an empty picker should not draw a tall bordered void.
-    let h = wanted_height(state).min(max_h);
-    let x = dialog_area.x + (dialog_area.width.saturating_sub(w)) / 2;
-    let y = dialog_area.y + 2;
-    let area = Rect::new(x, y, w, h);
+    // The model picker needs the room for its sidebar and columns: it takes the
+    // whole dialog area.
+    let full_screen = matches!(state.focus, Focus::Overlay(Overlay::ModelPicker { .. }));
+    let area = if full_screen {
+        dialog_area
+    } else {
+        let w = ((dialog_area.width as u32 * 78) / 100).max(20) as u16;
+        let max_h = dialog_area.height.saturating_sub(4).max(6);
+        // Cap at the content: an empty picker should not draw a tall bordered void.
+        let h = wanted_height(state).min(max_h);
+        let x = dialog_area.x + (dialog_area.width.saturating_sub(w)) / 2;
+        let y = dialog_area.y + 2;
+        Rect::new(x, y, w, h)
+    };
 
     frame.render_widget(Clear, area);
 
@@ -97,9 +104,11 @@ pub fn draw(frame: &mut Frame, dialog_area: Rect, state: &mut AppState, opts: &R
             Overlay::ConfigPicker => {
                 crate::ui::config_view::draw(frame, area, state, opts);
             }
+            Overlay::ModelPicker { .. } => {
+                crate::ui::model_picker::draw(frame, area, state, opts);
+            }
             // Drawn as a bottom picker, not as a centred overlay.
             Overlay::QuestionPicker { .. }
-            | Overlay::ModelPicker { .. }
             | Overlay::LoginPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
@@ -169,9 +178,11 @@ fn wanted_height(state: &AppState) -> u16 {
                 (lines.min(15) as u16) + 2
             }
             // Settings, the rail and help fill the space they are given.
-            Overlay::ConfigPicker | Overlay::RailOverlay | Overlay::Help => u16::MAX,
+            Overlay::ConfigPicker
+            | Overlay::RailOverlay
+            | Overlay::Help
+            | Overlay::ModelPicker { .. } => u16::MAX,
             Overlay::QuestionPicker { .. }
-            | Overlay::ModelPicker { .. }
             | Overlay::LoginPicker { .. }
             | Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
@@ -511,7 +522,7 @@ fn draw_help(frame: &mut Frame, area: Rect, opts: &RenderOptions) {
         Line::from("  alt+f             Show touched files"),
         Line::from("  alt+r             Show plan and agents"),
         Line::from("  .                 Show background tasks (empty prompt)"),
-        Line::from("  shift+tab         Cycle permission mode"),
+        Line::from("  shift+tab / alt+m Cycle permission mode"),
         Line::from("  ctrl+p            Pick / resume session"),
         Line::from("  ctrl+c            Interrupt turn (twice: exit)"),
         Line::from("  r                 Restart MCP server (in /mcp)"),

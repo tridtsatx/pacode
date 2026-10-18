@@ -11,11 +11,14 @@
 
 pub mod buffer;
 pub mod manager;
+mod manager_resources;
 pub mod progress;
+pub mod resources;
 pub mod spec;
 mod state;
 mod supervisor;
 
 pub use buffer::HeadTailBuffer;
 pub use manager::{ExecError, TaskEvent, TaskManager, WaitResult};
+pub use resources::{NoticeLevel, ResourceGuard, ResourceNotice};
 pub use spec::TaskSpec;

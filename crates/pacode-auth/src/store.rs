@@ -9,7 +9,7 @@ use crate::error::{AuthError, Result};
 /// Stored credential for a single account.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Account {
-    /// Account label or identifier (e.g. `"claude-1"`).
+    /// Account label or identifier (e.g. `"openai-1"`).
     pub label: String,
     /// Credential kind (e.g. `"oauth"`, `"api_key"`).
     pub kind: String,

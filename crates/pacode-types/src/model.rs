@@ -30,6 +30,40 @@ impl Effort {
         Effort::Max,
     ];
 
+    /// Position on the low..max scale (0..=4).
+    pub fn rank(self) -> u8 {
+        match self {
+            Effort::Low => 0,
+            Effort::Medium => 1,
+            Effort::High => 2,
+            Effort::XHigh => 3,
+            Effort::Max => 4,
+        }
+    }
+
+    /// The level of `supported` closest to `self`, preferring the next lower one.
+    /// `None` when `supported` is empty (the model has no reasoning control).
+    pub fn clamp_to(self, supported: &[Effort]) -> Option<Effort> {
+        if supported.is_empty() {
+            return None;
+        }
+        if supported.contains(&self) {
+            return Some(self);
+        }
+        let lower = supported
+            .iter()
+            .copied()
+            .filter(|e| e.rank() < self.rank())
+            .max_by_key(|e| e.rank());
+        lower.or_else(|| {
+            supported
+                .iter()
+                .copied()
+                .filter(|e| e.rank() > self.rank())
+                .min_by_key(|e| e.rank())
+        })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Effort::Low => "low",
@@ -69,7 +103,7 @@ impl fmt::Display for Effort {
 }
 
 /// `provider/model`. The provider is a key in `[providers.<key>]` of the config.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelRoute {
     pub provider: String,
     pub model: String,
@@ -170,7 +204,31 @@ impl Pricing {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// What a catalog entry is for. The model picker filters on it.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    #[default]
+    Chat,
+    Image,
+    Embedding,
+    Other,
+}
+
+impl ModelKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelKind::Chat => "chat",
+            ModelKind::Image => "image",
+            ModelKind::Embedding => "embedding",
+            ModelKind::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub route: ModelRoute,
     pub display_name: String,
@@ -178,8 +236,27 @@ pub struct ModelInfo {
     pub context_window: Option<u32>,
     #[serde(default)]
     pub supports_reasoning: bool,
+    /// The model accepts image input. Unknown models default to `false`.
+    #[serde(default)]
+    pub vision: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<Pricing>,
+    /// Reasoning levels the model accepts, weakest first. Empty = no reasoning control.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<Effort>,
+    /// Output-token limit when the catalog states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output: Option<u32>,
+    #[serde(default)]
+    pub kind: ModelKind,
+}
+
+impl ModelInfo {
+    /// `effort` moved onto a level this model supports; `None` when the model has
+    /// no reasoning control.
+    pub fn clamp_effort(&self, effort: Effort) -> Option<Effort> {
+        effort.clamp_to(&self.efforts)
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +280,28 @@ mod tests {
         assert_eq!(prettify_model_name("gemini-3.8-flash"), "Gemini 3.8 Flash");
         assert_eq!(prettify_model_name("z-ai/glm-4.6"), "Glm 4.6");
         assert_eq!(prettify_model_name("qwen3.5:397b"), "Qwen3.5 397b");
+    }
+
+    #[test]
+    fn effort_clamp_prefers_lower() {
+        use Effort::*;
+        let kimi = [Low, High, Max];
+        assert_eq!(Medium.clamp_to(&kimi), Some(Low));
+        assert_eq!(XHigh.clamp_to(&kimi), Some(High));
+        assert_eq!(High.clamp_to(&kimi), Some(High));
+        let basic = [Low, Medium, High];
+        assert_eq!(Max.clamp_to(&basic), Some(High));
+        assert_eq!(Low.clamp_to(&[Medium, High]), Some(Medium));
+        assert_eq!(Medium.clamp_to(&[]), None);
+    }
+
+    #[test]
+    fn old_model_info_loads_with_defaults() {
+        let json = r#"{"route":{"provider":"a","model":"b"},"display_name":"B"}"#;
+        let info: ModelInfo = serde_json::from_str(json).unwrap();
+        assert!(info.efforts.is_empty());
+        assert_eq!(info.kind, ModelKind::Chat);
+        assert_eq!(info.max_output, None);
     }
 
     #[test]

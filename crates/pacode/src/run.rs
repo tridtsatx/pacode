@@ -75,6 +75,7 @@ async fn run_headless(opts: RunOptions) {
 
     let user_msg = Request::UserMessage {
         text: opts.prompt.clone(),
+        attachments: Vec::new(),
     };
 
     if let Err(err) = client.request(user_msg).await {

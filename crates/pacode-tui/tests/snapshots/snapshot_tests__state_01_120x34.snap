@@ -34,5 +34,5 @@ expression: view
 "────────────────────────────────────────────────────────────────────────────────────── │BACKGROUND                  1 ◍ "
 "❯                                                                                      │◍ cargo test --all 214/380      "
 "────────────────────────────────────────────────────────────────────────────────────── │       ~/zed/pacode:master      "
-"Build · Claude 3 7 Sonnet | high /effort                                        /model │                                "
+"Build · Claude 3 7 Sonnet · high                                                /model │                                "
 "» ask before edits and commands · ← 4 agents · 1 bg       [1]········ · 10.7K · ctrl+p │                                "

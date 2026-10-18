@@ -260,40 +260,43 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
         "model" => {
             if arg.is_empty() {
                 log::debug!("open overlay: ModelPicker");
-                state.focus = Focus::Overlay(Overlay::ModelPicker {
-                    query: String::new(),
-                    index: 0,
-                });
-                state.dirty = true;
-                vec![Action::Send(Request::ListModels)]
+                crate::ui::model_picker_keys::open(state)
             } else {
                 let route = if let Some((p, m)) = arg.split_once('/') {
                     ModelRoute::new(p, m)
                 } else {
                     ModelRoute::new("default", &arg)
                 };
-                state.save_pref_model(&route.to_string());
-                vec![Action::Send(Request::SetModel(route))]
+                let info = state.models.iter().find(|m| m.route == route).cloned();
+                crate::ui::model_picker_keys::set_main_model(state, route, info.as_ref())
             }
         }
         "effort" => {
-            if arg.is_empty() {
+            if !state.effort_visible() {
+                push_notice(
+                    state,
+                    ToastLevel::Info,
+                    "This model has no reasoning effort control".to_string(),
+                );
+                vec![]
+            } else if arg.is_empty() {
                 log::debug!("open overlay: EffortPicker");
-                let cur_idx = Effort::ALL
-                    .iter()
-                    .position(|e| *e == state.effort())
-                    .unwrap_or(1);
+                let levels = state.effort_levels();
+                let cur_idx = state
+                    .effort()
+                    .clamp_to(&levels)
+                    .and_then(|e| levels.iter().position(|l| *l == e))
+                    .unwrap_or(0);
                 state.focus = Focus::Overlay(Overlay::EffortPicker { index: cur_idx });
                 state.dirty = true;
                 vec![]
             } else if let Some(eff) = Effort::parse(&arg) {
-                state.save_pref_effort(eff);
-                vec![Action::Send(Request::SetEffort(eff))]
+                crate::ui::model_picker_keys::set_effort(state, eff)
             } else {
                 push_notice(
                     state,
                     ToastLevel::Warn,
-                    format!("Invalid effort '{arg}'. Valid: low, medium, high, max"),
+                    format!("Invalid effort '{arg}'. Valid: low, medium, high, xhigh, max"),
                 );
                 vec![]
             }
@@ -462,6 +465,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
         "clear" => {
             state.transcript.cells.clear();
             state.transcript.cache.clear();
+            state.transcript.images.clear();
             state.dirty = true;
             vec![]
         }

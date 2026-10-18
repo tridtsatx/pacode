@@ -770,3 +770,104 @@ fn restored_transcript_items_do_not_collide_with_new_ones() {
         "a new item must not reuse a restored seq"
     );
 }
+
+fn model_with_efforts(model: &str, efforts: &[Effort]) -> pacode_types::ModelInfo {
+    pacode_types::ModelInfo {
+        route: ModelRoute::new("mock", model),
+        display_name: model.to_string(),
+        supports_reasoning: !efforts.is_empty(),
+        efforts: efforts.to_vec(),
+        ..Default::default()
+    }
+}
+
+/// An effort the model does not list is moved to the nearest one it does,
+/// preferring the next lower; a model with no levels leaves the effort alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_set_effort_clamps_to_supported_levels() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+
+    session.set_effort(Effort::Max).await;
+    assert_eq!(
+        session.meta().effort,
+        Effort::Max,
+        "unknown levels: no clamp"
+    );
+
+    mock.set_models(vec![model_with_efforts(
+        "mock-model",
+        &[Effort::Low, Effort::High, Effort::Max],
+    )]);
+    session.set_effort(Effort::Medium).await;
+    assert_eq!(session.meta().effort, Effort::Low);
+    session.set_effort(Effort::XHigh).await;
+    assert_eq!(session.meta().effort, Effort::High);
+    session.set_effort(Effort::Max).await;
+    assert_eq!(session.meta().effort, Effort::Max);
+}
+
+/// Switching to a model that lacks the current effort clamps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_set_model_clamps_effort() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    session.set_effort(Effort::Max).await;
+
+    mock.set_models(vec![
+        model_with_efforts(
+            "mock-model",
+            &[Effort::Low, Effort::Medium, Effort::High, Effort::Max],
+        ),
+        model_with_efforts("small", &[Effort::Low, Effort::Medium, Effort::High]),
+        model_with_efforts("plain", &[]),
+    ]);
+    session
+        .set_model(ModelRoute::new("mock", "small"))
+        .await
+        .unwrap();
+    assert_eq!(session.meta().effort, Effort::High);
+    assert_eq!(session.main_agent().unwrap().info().effort, Effort::High);
+
+    session
+        .set_model(ModelRoute::new("mock", "plain"))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.meta().effort,
+        Effort::High,
+        "no levels: effort untouched"
+    );
+}
+
+/// A subagent that inherits the session effort gets it clamped to its own model.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_spawn_agent_clamps_inherited_effort() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    session.set_effort(Effort::Max).await;
+
+    mock.set_models(vec![
+        model_with_efforts(
+            "mock-model",
+            &[Effort::Low, Effort::Medium, Effort::High, Effort::Max],
+        ),
+        model_with_efforts("narrow", &[Effort::Low, Effort::High]),
+    ]);
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "working".into(),
+    });
+    let id = session
+        .spawn_agent(pacode_tools::AgentSpec {
+            name: Some("narrow".into()),
+            prompt: "work".into(),
+            tools: None,
+            fork: false,
+            model: Some(ModelRoute::new("mock", "narrow")),
+            effort: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(session.agent(&id).unwrap().info().effort, Effort::High);
+}

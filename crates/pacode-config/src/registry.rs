@@ -89,12 +89,18 @@ pub const SKIP_LIST: &[&str] = &[
     "hooks.session_start",
     "hooks.session_end",
     "hooks.notification",
+    // `[rules]` is edited in config.toml / .pacode/rules (not yet in /config).
+    "rules.enabled",
+    "rules.builtin",
+    "rules.disable",
+    "rules.stream",
 ];
 
 pub const SECTIONS: &[&str] = &[
     "provider",
     "ui",
     "exec",
+    "resources",
     "agents",
     "daemon",
     "context",
@@ -107,6 +113,8 @@ pub const SECTIONS: &[&str] = &[
     "font",
     "keys",
     "web",
+    "memory",
+    "read",
 ];
 
 const EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -120,7 +128,7 @@ const FONT_WEIGHT_OPTIONS: &[&str] = &["", "normal", "bold"];
 #[rustfmt::skip]
 pub static SETTINGS: &[SettingEntry] = &[
     // provider
-    SettingEntry { dotted_key: "provider.default", label: "Default Route", description: "Default provider/model route (e.g. anthropic/claude-3-5-sonnet)", section: "provider", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "provider.default", label: "Default Route", description: "Default provider/model route (e.g. openrouter/openai/gpt-5.5)", section: "provider", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.effort", label: "Reasoning Effort", description: "Base reasoning effort level", section: "provider", default_value: "medium", kind: SettingKind::Enum { options: EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.stream_idle_secs", label: "Stream Idle Timeout", description: "Base idle timeout in seconds for streaming responses", section: "provider", default_value: "180", kind: SettingKind::Integer { min: 1, max: 3600 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.max_retries", label: "Max Retries", description: "Maximum retries for failed provider requests", section: "provider", default_value: "5", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
@@ -150,11 +158,27 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "exec.max_tasks", label: "Max Tasks", description: "Maximum concurrent background tasks", section: "exec", default_value: "64", kind: SettingKind::Integer { min: 1, max: 1024 }, apply: ApplyMode::Restart },
     SettingEntry { dotted_key: "exec.default_timeout_secs", label: "Default Timeout Seconds", description: "Hard timeout in seconds for foreground command", section: "exec", default_value: "3600", kind: SettingKind::Integer { min: 1, max: 604800 }, apply: ApplyMode::Restart },
 
+    // resources
+    SettingEntry { dotted_key: "resources.enabled", label: "Resource Guard", description: "Refuse and softly stop processes when machine memory or disk runs low", section: "resources", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.min_free_percent", label: "Min Free Memory Percent", description: "Percent of total memory (or cgroup limit) that must stay free", section: "resources", default_value: "20", kind: SettingKind::Integer { min: 1, max: 90 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.overshoot_mb", label: "Overshoot MB", description: "Extra MB below the reserve tolerated before it counts as a breach", section: "resources", default_value: "512", kind: SettingKind::Integer { min: 0, max: 65536 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.grace_secs", label: "Breach Grace Seconds", description: "A breach must persist this long before a process tree is stopped", section: "resources", default_value: "10", kind: SettingKind::Integer { min: 1, max: 3600 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.term_wait_secs", label: "Term Wait Seconds", description: "Seconds between SIGTERM and SIGKILL when the guard stops a process", section: "resources", default_value: "5", kind: SettingKind::Integer { min: 0, max: 300 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.max_process_percent", label: "Max Process Percent", description: "Hard cap for one process tree as percent of total memory (0 = off)", section: "resources", default_value: "0", kind: SettingKind::Integer { min: 0, max: 95 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.nice", label: "Process Niceness", description: "Niceness for spawned processes (0 = off)", section: "resources", default_value: "10", kind: SettingKind::Integer { min: 0, max: 19 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.min_free_disk_mb", label: "Min Free Disk MB", description: "Free MB required on the output spool directory", section: "resources", default_value: "512", kind: SettingKind::Integer { min: 0, max: 10485760 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.sample_ms_idle_headroom", label: "Sample Interval (headroom) ms", description: "Sampling interval in ms while memory is comfortably free", section: "resources", default_value: "1000", kind: SettingKind::Integer { min: 100, max: 60000 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "resources.sample_ms_pressure", label: "Sample Interval (pressure) ms", description: "Sampling interval in ms near or below the reserve", section: "resources", default_value: "200", kind: SettingKind::Integer { min: 50, max: 10000 }, apply: ApplyMode::Restart },
+
     // agents
     SettingEntry { dotted_key: "agents.max_live", label: "Max Live Agents", description: "Maximum concurrent live subagents", section: "agents", default_value: "8", kind: SettingKind::Integer { min: 1, max: 64 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "agents.default_model", label: "Subagent Model", description: "provider/model for subagents when unspecified", section: "agents", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "agents.default_effort", label: "Subagent Effort", description: "Reasoning effort for subagents: low, medium, high, xhigh, max", section: "agents", default_value: "", kind: SettingKind::Enum { options: SUBAGENT_EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "agents.max_turns", label: "Max Turns", description: "Maximum tool-calling turns for a subagent before stopping", section: "agents", default_value: "200", kind: SettingKind::Integer { min: 1, max: 10000 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "agents.todo_guard", label: "Todo Guard", description: "Remind the agent to finish or close open plan items before it stops", section: "agents", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "agents.todo_guard_max_reminders", label: "Todo Guard Reminders", description: "Maximum todo-guard reminders per user turn", section: "agents", default_value: "2", kind: SettingKind::Integer { min: 0, max: 10 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "agents.ask_parent_timeout_secs", label: "Ask Parent Timeout", description: "Seconds a subagent waits for the orchestrator to answer a blocking question", section: "agents", default_value: "600", kind: SettingKind::Integer { min: 5, max: 86400 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "agents.ask_parent_max", label: "Ask Parent Limit", description: "Maximum questions one subagent may ask the orchestrator", section: "agents", default_value: "5", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
 
     // daemon
     SettingEntry { dotted_key: "daemon.idle_timeout_secs", label: "Idle Timeout Seconds", description: "Seconds of inactivity before daemon shuts down (0 to disable)", section: "daemon", default_value: "600", kind: SettingKind::Integer { min: 0, max: 2592000 }, apply: ApplyMode::Restart },
@@ -168,6 +192,8 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "context.memory_cap_chars", label: "Memory Cap Chars", description: "Maximum characters for session memory", section: "context", default_value: "8000", kind: SettingKind::Integer { min: 100, max: 10000000 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.compaction_model", label: "Compaction Model", description: "Model to perform context compaction (default: session model)", section: "context", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.keep_recent_messages", label: "Keep Recent Messages", description: "Recent messages kept verbatim after compaction", section: "context", default_value: "6", kind: SettingKind::Integer { min: 1, max: 100 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "context.compaction_target_ratio", label: "Compaction Target Ratio", description: "Fraction of the context window compaction aims to reach", section: "context", default_value: "0.40", kind: SettingKind::Float { min: 0.05, max: 0.9 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "context.keep_recent_turns", label: "Keep Recent Turns", description: "Last N user turns whose tool results are never shaken", section: "context", default_value: "6", kind: SettingKind::Integer { min: 1, max: 100 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.default_context_window", label: "Default Context Window", description: "Fallback context window tokens when unknown", section: "context", default_value: "128000", kind: SettingKind::Integer { min: 1000, max: 10000000 }, apply: ApplyMode::NextTurn },
 
     // permissions
@@ -210,6 +236,13 @@ pub static SETTINGS: &[SettingEntry] = &[
     // web
     SettingEntry { dotted_key: "web.default_num_results", label: "Default Search Results", description: "Default number of search results to return", section: "web", default_value: "8", kind: SettingKind::Integer { min: 1, max: 50 }, apply: ApplyMode::Restart },
     SettingEntry { dotted_key: "web.request_timeout_secs", label: "Web Request Timeout", description: "Request timeout in seconds for web tools", section: "web", default_value: "15", kind: SettingKind::Integer { min: 1, max: 300 }, apply: ApplyMode::Restart },
+
+    // memory
+    SettingEntry { dotted_key: "memory.enabled", label: "Memory Injection", description: "Inject pinned memories and a recent-memory index into the system prompt", section: "memory", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "memory.embeddings", label: "Memory Embeddings", description: "Hybrid semantic recall (requires an embedder; none ships yet)", section: "memory", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Restart },
+
+    // read
+    SettingEntry { dotted_key: "read.outline_threshold", label: "Outline Threshold", description: "Files with more lines are read as an outline (0 = never automatically)", section: "read", default_value: "400", kind: SettingKind::Integer { min: 0, max: 10000000 }, apply: ApplyMode::Restart },
 ];
 
 pub fn all_settings() -> &'static [SettingEntry] {
@@ -251,6 +284,18 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "exec.kill_grace_secs" => Some(config.exec.kill_grace_secs.to_string()),
         "exec.max_tasks" => Some(config.exec.max_tasks.to_string()),
         "exec.default_timeout_secs" => Some(config.exec.default_timeout_secs.to_string()),
+        "resources.enabled" => Some(config.resources.enabled.to_string()),
+        "resources.min_free_percent" => Some(config.resources.min_free_percent.to_string()),
+        "resources.overshoot_mb" => Some(config.resources.overshoot_mb.to_string()),
+        "resources.grace_secs" => Some(config.resources.grace_secs.to_string()),
+        "resources.term_wait_secs" => Some(config.resources.term_wait_secs.to_string()),
+        "resources.max_process_percent" => Some(config.resources.max_process_percent.to_string()),
+        "resources.nice" => Some(config.resources.nice.to_string()),
+        "resources.min_free_disk_mb" => Some(config.resources.min_free_disk_mb.to_string()),
+        "resources.sample_ms_idle_headroom" => {
+            Some(config.resources.sample_ms_idle_headroom.to_string())
+        }
+        "resources.sample_ms_pressure" => Some(config.resources.sample_ms_pressure.to_string()),
         "agents.max_live" => Some(config.agents.max_live.to_string()),
         "agents.default_model" => Some(config.agents.default_model.clone().unwrap_or_default()),
         "agents.default_effort" => Some(
@@ -261,6 +306,12 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
                 .unwrap_or_default(),
         ),
         "agents.max_turns" => Some(config.agents.max_turns.to_string()),
+        "agents.todo_guard" => Some(config.agents.todo_guard.to_string()),
+        "agents.todo_guard_max_reminders" => {
+            Some(config.agents.todo_guard_max_reminders.to_string())
+        }
+        "agents.ask_parent_timeout_secs" => Some(config.agents.ask_parent_timeout_secs.to_string()),
+        "agents.ask_parent_max" => Some(config.agents.ask_parent_max.to_string()),
         "daemon.idle_timeout_secs" => Some(config.daemon.idle_timeout_secs.to_string()),
         "daemon.socket" => Some(
             config
@@ -281,6 +332,10 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             Some(config.context.compaction_model.clone().unwrap_or_default())
         }
         "context.keep_recent_messages" => Some(config.context.keep_recent_messages.to_string()),
+        "context.compaction_target_ratio" => {
+            Some(format!("{:.2}", config.context.compaction_target_ratio))
+        }
+        "context.keep_recent_turns" => Some(config.context.keep_recent_turns.to_string()),
         "context.default_context_window" => Some(config.context.default_context_window.to_string()),
         "permissions.default_mode" => Some(config.permissions.default_mode.as_str().to_string()),
         "permissions.allow_catastrophic" => Some(config.permissions.allow_catastrophic.to_string()),
@@ -311,6 +366,9 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         )),
         "web.default_num_results" => Some(config.web.default_num_results.to_string()),
         "web.request_timeout_secs" => Some(config.web.request_timeout_secs.to_string()),
+        "memory.enabled" => Some(config.memory.enabled.to_string()),
+        "memory.embeddings" => Some(config.memory.embeddings.to_string()),
+        "read.outline_threshold" => Some(config.read.outline_threshold.to_string()),
         _ => None,
     }
 }
@@ -553,6 +611,56 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 config.exec.default_timeout_secs = *n as u64;
             }
         }
+        "resources.enabled" => {
+            if let toml::Value::Boolean(b) = value {
+                config.resources.enabled = *b;
+            }
+        }
+        "resources.min_free_percent" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.min_free_percent = *n as u8;
+            }
+        }
+        "resources.overshoot_mb" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.overshoot_mb = *n as u64;
+            }
+        }
+        "resources.grace_secs" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.grace_secs = *n as u64;
+            }
+        }
+        "resources.term_wait_secs" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.term_wait_secs = *n as u64;
+            }
+        }
+        "resources.max_process_percent" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.max_process_percent = *n as u8;
+            }
+        }
+        "resources.nice" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.nice = *n as i32;
+            }
+        }
+        "resources.min_free_disk_mb" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.min_free_disk_mb = *n as u64;
+            }
+        }
+        "resources.sample_ms_idle_headroom" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.sample_ms_idle_headroom = *n as u64;
+            }
+        }
+        "resources.sample_ms_pressure" => {
+            if let toml::Value::Integer(n) = value {
+                config.resources.sample_ms_pressure = *n as u64;
+            }
+        }
         "agents.max_live" => {
             if let toml::Value::Integer(n) = value {
                 config.agents.max_live = *n as usize;
@@ -571,6 +679,26 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "agents.max_turns" => {
             if let toml::Value::Integer(n) = value {
                 config.agents.max_turns = *n as u32;
+            }
+        }
+        "agents.todo_guard" => {
+            if let toml::Value::Boolean(b) = value {
+                config.agents.todo_guard = *b;
+            }
+        }
+        "agents.todo_guard_max_reminders" => {
+            if let toml::Value::Integer(n) = value {
+                config.agents.todo_guard_max_reminders = *n as u32;
+            }
+        }
+        "agents.ask_parent_timeout_secs" => {
+            if let toml::Value::Integer(n) = value {
+                config.agents.ask_parent_timeout_secs = *n as u64;
+            }
+        }
+        "agents.ask_parent_max" => {
+            if let toml::Value::Integer(n) = value {
+                config.agents.ask_parent_max = *n as u32;
             }
         }
         "daemon.idle_timeout_secs" => {
@@ -620,6 +748,16 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "context.keep_recent_messages" => {
             if let toml::Value::Integer(n) = value {
                 config.context.keep_recent_messages = *n as usize;
+            }
+        }
+        "context.compaction_target_ratio" => {
+            if let toml::Value::Float(f) = value {
+                config.context.compaction_target_ratio = *f as f32;
+            }
+        }
+        "context.keep_recent_turns" => {
+            if let toml::Value::Integer(n) = value {
+                config.context.keep_recent_turns = *n as usize;
             }
         }
         "context.default_context_window" => {
@@ -727,6 +865,21 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "web.request_timeout_secs" => {
             if let toml::Value::Integer(n) = value {
                 config.web.request_timeout_secs = *n as u64;
+            }
+        }
+        "read.outline_threshold" => {
+            if let toml::Value::Integer(n) = value {
+                config.read.outline_threshold = *n as usize;
+            }
+        }
+        "memory.enabled" => {
+            if let toml::Value::Boolean(b) = value {
+                config.memory.enabled = *b;
+            }
+        }
+        "memory.embeddings" => {
+            if let toml::Value::Boolean(b) = value {
+                config.memory.embeddings = *b;
             }
         }
         _ => {}

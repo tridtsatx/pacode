@@ -12,6 +12,9 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::Agent;
 use crate::session::Session;
 
+mod cancel;
+use cancel::{CancelledCall, record_cancelled};
+
 struct ToolCallInfo {
     call_id: CallId,
     name: String,
@@ -71,38 +74,18 @@ async fn run_single_tool(
     session.events.emit(Event::AgentUpdated(agent.info()));
 
     if cancel.is_cancelled() {
-        let stub = Message::tool_result(call.call_id.clone(), "cancelled", true);
-        let (seq, arc_stub) = agent
-            .history
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(stub);
-        let _ = session
-            .store
-            .append_message(&session.id, &agent.id(), seq, &arc_stub)
-            .await;
-        let item = TranscriptItem {
-            seq: call.item_seq,
-            agent: agent.id(),
-            ts_ms: pacode_types::now_ms(),
-            kind: TranscriptKind::ToolCall {
+        record_cancelled(
+            &session,
+            &agent,
+            CancelledCall {
                 call_id: call.call_id,
                 name: call.name,
                 title: call.title,
                 intent: call.intent,
-                status: ToolStatus::Error,
-                preview: "cancelled".to_string(),
-                diff: None,
-                duration_ms: None,
-                task: None,
+                item_seq: call.item_seq,
             },
-        };
-        agent
-            .transcript
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .upsert(item.clone());
-        session.events.emit(Event::ItemUpdated(item));
+        )
+        .await;
         return ToolExecutionStatus::Cancelled;
     }
 
@@ -166,127 +149,145 @@ async fn run_single_tool(
         tool_kind: tool_opt.as_ref().map(|t| t.kind()),
     };
 
+    // Style guard: remember the file as it was, so the lines this call adds can be
+    // checked once it succeeded (see `crate::style_guard`).
+    let guard_snapshot =
+        if hook_denied.is_none() && user_hook_block.is_none() && call.parse_err.is_none() {
+            crate::style_guard::snapshot(&session, &call.name, &call.input).await
+        } else {
+            None
+        };
+
     let start = Instant::now();
-    let (content, is_error, preview, diff, task, status) = if let Some(reason) = hook_denied {
-        (
-            format!("Permission denied: {reason}"),
-            true,
-            "Denied".to_string(),
-            None,
-            None,
-            ToolStatus::Denied,
-        )
-    } else if let Some(reason) = user_hook_block {
-        (
-            reason,
-            true,
-            "Blocked by hook".to_string(),
-            None,
-            None,
-            ToolStatus::Denied,
-        )
-    } else if let Some(err) = call.parse_err {
-        (
-            format!("Invalid JSON arguments: {err}"),
-            true,
-            "Invalid JSON".to_string(),
-            None,
-            None,
-            ToolStatus::Error,
-        )
-    } else {
-        match tool_opt {
-            Some(tool) => {
-                let call_fut = tool.call(call.input.clone(), &ctx);
-                let tool_res = tokio::select! {
-                    _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
-                    res = call_fut => res,
-                };
-                match tool_res {
-                    Ok(output) => {
-                        let status = if let Some(task_id) = output.task.as_ref() {
-                            session.tasks.mark_backgrounded(task_id);
-                            if let Some(tinfo) = session.tasks.info(task_id) {
-                                session.events.emit(Event::TaskUpdated(tinfo));
-                            }
-                            ToolStatus::Backgrounded
-                        } else if output.is_error {
-                            ToolStatus::Error
-                        } else {
-                            ToolStatus::Ok
-                        };
-                        (
-                            output.content,
-                            output.is_error,
-                            output.preview,
-                            output.diff,
-                            output.task,
-                            status,
-                        )
-                    }
-                    Err(pacode_tools::ToolError::Cancelled) => {
-                        let stub = Message::tool_result(call.call_id.clone(), "cancelled", true);
-                        let (seq, arc_stub) = agent
-                            .history
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push(stub);
-                        let _ = session
-                            .store
-                            .append_message(&session.id, &agent.id(), seq, &arc_stub)
-                            .await;
-                        let item = TranscriptItem {
-                            seq: call.item_seq,
-                            agent: agent.id(),
-                            ts_ms: pacode_types::now_ms(),
-                            kind: TranscriptKind::ToolCall {
-                                call_id: call.call_id,
-                                name: call.name,
-                                title: call.title,
-                                intent: call.intent,
-                                status: ToolStatus::Error,
-                                preview: "cancelled".to_string(),
-                                diff: None,
-                                duration_ms: None,
-                                task: None,
-                            },
-                        };
-                        agent
-                            .transcript
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .upsert(item.clone());
-                        session.events.emit(Event::ItemUpdated(item));
-                        return ToolExecutionStatus::Cancelled;
-                    }
-                    Err(pacode_tools::ToolError::Denied(reason)) => (
-                        format!("Permission denied: {reason}"),
-                        true,
-                        "Denied".to_string(),
-                        None,
-                        None,
-                        ToolStatus::Denied,
-                    ),
-                    Err(err) => (
-                        err.to_string(),
-                        true,
-                        err.to_string(),
-                        None,
-                        None,
-                        ToolStatus::Error,
-                    ),
-                }
-            }
-            None => (
-                format!("unknown tool: {}", call.name),
+    // Images the tool returned (e.g. `read` on a picture); shown in the transcript and
+    // sent to the model only when it accepts images.
+    let mut tool_images: Vec<pacode_types::ImageRef> = Vec::new();
+    let (mut content, mut is_error, preview, diff, task, mut status) =
+        if let Some(reason) = hook_denied {
+            (
+                format!("Permission denied: {reason}"),
                 true,
-                "unknown tool".to_string(),
+                "Denied".to_string(),
                 None,
                 None,
-                ToolStatus::Error,
-            ),
+                ToolStatus::Denied,
+            )
+        } else if let Some(reason) = user_hook_block {
+            (
+                reason,
+                true,
+                "Blocked by hook".to_string(),
+                None,
+                None,
+                ToolStatus::Denied,
+            )
+        } else if let Some(err) = call.parse_err {
+            if err.starts_with(pacode_rules::STREAM_STOP_PREFIX) {
+                // The stream was cut short by a style-guard rule: the text is already
+                // the model-facing explanation.
+                (
+                    err,
+                    true,
+                    "Stopped by style guard".to_string(),
+                    None,
+                    None,
+                    ToolStatus::Error,
+                )
+            } else {
+                (
+                    format!("Invalid JSON arguments: {err}"),
+                    true,
+                    "Invalid JSON".to_string(),
+                    None,
+                    None,
+                    ToolStatus::Error,
+                )
+            }
+        } else {
+            match tool_opt {
+                Some(tool) => {
+                    let call_fut = tool.call(call.input.clone(), &ctx);
+                    let tool_res = tokio::select! {
+                        _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
+                        res = call_fut => res,
+                    };
+                    match tool_res {
+                        Ok(output) => {
+                            tool_images = output.images.clone();
+                            let status = if let Some(task_id) = output.task.as_ref() {
+                                session.tasks.mark_backgrounded(task_id);
+                                if let Some(tinfo) = session.tasks.info(task_id) {
+                                    session.events.emit(Event::TaskUpdated(tinfo));
+                                }
+                                ToolStatus::Backgrounded
+                            } else if output.is_error {
+                                ToolStatus::Error
+                            } else {
+                                ToolStatus::Ok
+                            };
+                            (
+                                output.content,
+                                output.is_error,
+                                output.preview,
+                                output.diff,
+                                output.task,
+                                status,
+                            )
+                        }
+                        Err(pacode_tools::ToolError::Cancelled) => {
+                            record_cancelled(
+                                &session,
+                                &agent,
+                                CancelledCall {
+                                    call_id: call.call_id,
+                                    name: call.name,
+                                    title: call.title,
+                                    intent: call.intent,
+                                    item_seq: call.item_seq,
+                                },
+                            )
+                            .await;
+                            return ToolExecutionStatus::Cancelled;
+                        }
+                        Err(pacode_tools::ToolError::Denied(reason)) => (
+                            format!("Permission denied: {reason}"),
+                            true,
+                            "Denied".to_string(),
+                            None,
+                            None,
+                            ToolStatus::Denied,
+                        ),
+                        Err(err) => (
+                            err.to_string(),
+                            true,
+                            err.to_string(),
+                            None,
+                            None,
+                            ToolStatus::Error,
+                        ),
+                    }
+                }
+                None => (
+                    format!("unknown tool: {}", call.name),
+                    true,
+                    "unknown tool".to_string(),
+                    None,
+                    None,
+                    ToolStatus::Error,
+                ),
+            }
+        };
+
+    if !is_error
+        && let Some(snap) = guard_snapshot
+        && let Some(found) = crate::style_guard::check_after_write(&session, &agent, snap).await
+    {
+        content.push_str(&found.block);
+        if found.is_error {
+            is_error = true;
+            status = ToolStatus::Error;
         }
-    };
+    }
 
     let duration_ms = start.elapsed().as_millis() as u64;
     log::debug!(
@@ -339,7 +340,23 @@ async fn run_single_tool(
         .upsert(item.clone());
     session.events.emit(Event::ItemUpdated(item));
 
-    let res_msg = Message::tool_result(call.call_id, content, is_error);
+    if !tool_images.is_empty() {
+        let route = agent.info().model;
+        let accepts = match session.providers.resolve(&route).await {
+            Ok(provider) => provider.model_info(&route.model).vision,
+            Err(_) => false,
+        };
+        if !accepts {
+            content.push_str(&format!(
+                "\n[{} image(s) not shown: model {} does not accept images]",
+                tool_images.len(),
+                route.model
+            ));
+            tool_images.clear();
+        }
+    }
+
+    let res_msg = Message::tool_result_with_images(call.call_id, content, is_error, &tool_images);
     let (seq, arc_msg) = agent
         .history
         .lock()
@@ -349,6 +366,28 @@ async fn run_single_tool(
         .store
         .append_message(&session.id, &agent.id(), seq, &arc_msg)
         .await;
+
+    if !tool_images.is_empty() {
+        let images_seq = agent
+            .transcript
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .next_seq();
+        let images_item = TranscriptItem {
+            seq: images_seq,
+            agent: agent.id(),
+            ts_ms: pacode_types::now_ms(),
+            kind: TranscriptKind::Images {
+                images: tool_images,
+            },
+        };
+        agent
+            .transcript
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .upsert(images_item.clone());
+        session.events.emit(Event::ItemAdded(images_item));
+    }
 
     ToolExecutionStatus::Ok
 }
@@ -462,38 +501,18 @@ pub async fn execute_tool_calls(
 
     if interrupted {
         for call in remaining_calls_to_cancel {
-            let stub = Message::tool_result(call.call_id.clone(), "cancelled", true);
-            let (seq, arc_stub) = agent
-                .history
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(stub);
-            let _ = session
-                .store
-                .append_message(&session.id, &agent.id(), seq, &arc_stub)
-                .await;
-            let item = TranscriptItem {
-                seq: call.item_seq,
-                agent: agent.id(),
-                ts_ms: pacode_types::now_ms(),
-                kind: TranscriptKind::ToolCall {
+            record_cancelled(
+                session,
+                agent,
+                CancelledCall {
                     call_id: call.call_id,
                     name: call.name,
                     title: call.title,
                     intent: call.intent,
-                    status: ToolStatus::Error,
-                    preview: "cancelled".to_string(),
-                    diff: None,
-                    duration_ms: None,
-                    task: None,
+                    item_seq: call.item_seq,
                 },
-            };
-            agent
-                .transcript
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .upsert(item.clone());
-            session.events.emit(Event::ItemUpdated(item));
+            )
+            .await;
         }
     }
 

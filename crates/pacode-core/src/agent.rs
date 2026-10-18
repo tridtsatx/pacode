@@ -71,6 +71,8 @@ pub struct Agent {
     pub history_before_turn: Mutex<Option<History>>,
     /// Turn-scoped prompt cache (invalidation point: turn start).
     pub prompt_cache: Mutex<Option<crate::prompt::TurnPromptCache>>,
+    /// Pending `ask_parent` question and question count (subagents).
+    pub comm: crate::agent_comm::AgentComm,
 }
 
 impl Agent {
@@ -95,6 +97,7 @@ impl Agent {
             turns: Mutex::new(0),
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
+            comm: crate::agent_comm::AgentComm::default(),
         }
     }
 
@@ -119,6 +122,7 @@ impl Agent {
             turns: Mutex::new(0),
             history_before_turn: Mutex::new(None),
             prompt_cache: Mutex::new(None),
+            comm: crate::agent_comm::AgentComm::default(),
         }
     }
 
@@ -185,6 +189,23 @@ impl Agent {
                 info.finished_at_ms = Some(pacode_types::now_ms());
             }
         }
+    }
+
+    /// Set `status`/`activity` only if the agent is still in status `from` (a stop
+    /// that landed meanwhile wins). Returns whether it changed.
+    pub fn restore_status(
+        &self,
+        from: AgentStatus,
+        status: AgentStatus,
+        activity: Option<String>,
+    ) -> bool {
+        let mut info = self.info.write().unwrap_or_else(|p| p.into_inner());
+        if info.status != from {
+            return false;
+        }
+        info.status = status;
+        info.activity = activity;
+        true
     }
 
     /// Last `limit` transcript items before `before_seq` from the in-memory tail;

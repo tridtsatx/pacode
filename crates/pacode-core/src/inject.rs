@@ -33,6 +33,23 @@ pub enum Injection {
         agent: AgentInfo,
         text: String,
     },
+    /// The orchestrator sent a running subagent an instruction or correction.
+    ParentMessage {
+        from: String,
+        text: String,
+    },
+    /// A subagent asked the orchestrator a question (`ask_parent`).
+    AgentQuestion {
+        agent: AgentInfo,
+        question_id: String,
+        question: String,
+        options: Vec<String>,
+    },
+    /// The orchestrator's late answer to a non-blocking `ask_parent`.
+    ParentAnswer {
+        question_id: String,
+        text: String,
+    },
 }
 
 #[derive(Default)]
@@ -47,6 +64,34 @@ impl InjectionQueue {
             q.push_back(injection);
         }
         self.notify.notify_one();
+    }
+
+    /// Push unless `limit` queued items already satisfy `counts`; `false` = refused.
+    pub fn push_limited(
+        &self,
+        injection: Injection,
+        limit: usize,
+        counts: impl Fn(&Injection) -> bool,
+    ) -> bool {
+        {
+            let Ok(mut q) = self.queue.lock() else {
+                return false;
+            };
+            if q.iter().filter(|i| counts(i)).count() >= limit {
+                return false;
+            }
+            q.push_back(injection);
+        }
+        self.notify.notify_one();
+        true
+    }
+
+    /// How many queued items satisfy `counts`.
+    pub fn count_matching(&self, counts: impl Fn(&Injection) -> bool) -> usize {
+        self.queue
+            .lock()
+            .map(|q| q.iter().filter(|i| counts(i)).count())
+            .unwrap_or(0)
     }
 
     pub fn drain(&self) -> Vec<Injection> {
@@ -149,6 +194,30 @@ pub fn render_injections(items: &[Injection], cap_chars: usize) -> Message {
                 parts.push(format!(
                     "<agent_status id=\"{}\" name=\"{}\">\n{capped}\n</agent_status>",
                     agent.id, agent.name
+                ));
+            }
+            Injection::ParentMessage { from: _, text } => {
+                parts.push(crate::agent_comm::render_parent_message(text, cap_chars));
+            }
+            Injection::AgentQuestion {
+                agent,
+                question_id,
+                question,
+                options,
+            } => {
+                parts.push(crate::agent_comm::render_agent_question(
+                    agent,
+                    question_id,
+                    question,
+                    options,
+                    cap_chars,
+                ));
+            }
+            Injection::ParentAnswer { question_id, text } => {
+                parts.push(crate::agent_comm::render_parent_answer(
+                    question_id,
+                    text,
+                    cap_chars,
                 ));
             }
             Injection::SystemNotice(text) => {

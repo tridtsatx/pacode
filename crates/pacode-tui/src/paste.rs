@@ -85,8 +85,11 @@ pub fn handle_paste_with_runner(
     }
 
     match &mut state.focus {
-        Focus::Overlay(Overlay::ModelPicker { query, index })
-        | Focus::Overlay(Overlay::LoginPicker { query, index }) => {
+        Focus::Overlay(Overlay::ModelPicker { .. }) => {
+            crate::ui::model_picker_keys::paste(state, &text);
+            vec![]
+        }
+        Focus::Overlay(Overlay::LoginPicker { query, index }) => {
             paste_into_filter(query, index, &text);
             state.dirty = true;
             vec![]
@@ -153,6 +156,32 @@ fn flatten_single_line(text: &str) -> String {
 
 /// Pastes text into `state.input`, enforcing size caps and respecting vim mode.
 fn paste_into_prompt(state: &mut AppState, text: String, now: Instant) {
+    // Drag-and-drop of an image file arrives as a bracketed paste of its path.
+    if let Some(path) = crate::attachments::image_path_from_paste(&text) {
+        state.prune_attachments();
+        match state.attachments.add_file(&path) {
+            Ok(chip) => {
+                insert_chip(state, &chip);
+                state.push_toast(
+                    ToastLevel::Info,
+                    "Image attached".to_string(),
+                    Some(path.display().to_string()),
+                    now,
+                );
+                return;
+            }
+            Err(err) => {
+                log::warn!("dropped image {} not attached: {err}", path.display());
+                state.push_toast(
+                    ToastLevel::Warn,
+                    "Cannot attach dropped image".to_string(),
+                    Some(err.to_string()),
+                    now,
+                );
+                // Fall through: paste the path as text.
+            }
+        }
+    }
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let total_chars = normalized.chars().count();
 
@@ -267,30 +296,22 @@ pub fn handle_paste_image_with_runner(
     let result = read_image_data(runner, platform);
 
     match result {
-        ClipboardImageResult::Image(bytes) => match state.pasted_images.create_image_file(&bytes) {
-            Ok(path) => {
-                let token = format!("@{} ", path.display());
-                if state.config.ui.vim && state.focus == Focus::Normal {
-                    apply_vim_paste(&mut state.vim, &mut state.input, &token);
-                } else {
-                    state.input.insert_str(&token);
-                }
+        ClipboardImageResult::Image(bytes) => match state.attach_bytes(&bytes, None) {
+            Ok(chip) => {
+                insert_chip(state, &chip);
                 state.push_toast(
-                        ToastLevel::Info,
-                        "Image pasted".to_string(),
-                        Some(
-                            "Preview shown inline. Daemon attaches image as metadata (name & size), not pixels (v1 spec §18.5)."
-                                .to_string(),
-                        ),
-                        now,
-                    );
+                    ToastLevel::Info,
+                    "Image attached".to_string(),
+                    Some("Sent with your message. Backspace on the chip removes it.".to_string()),
+                    now,
+                );
                 state.dirty = true;
             }
             Err(err) => {
-                log::warn!("clipboard image paste failed to save file: {err}");
+                log::warn!("clipboard image paste failed: {err}");
                 state.push_toast(
                     ToastLevel::Error,
-                    "Failed to save pasted image".to_string(),
+                    "Cannot attach pasted image".to_string(),
                     Some(err.to_string()),
                     now,
                 );
@@ -321,6 +342,16 @@ pub fn handle_paste_image_with_runner(
     }
 
     vec![]
+}
+
+/// Inserts an image chip (plus a trailing space) at the prompt cursor, vim-aware.
+fn insert_chip(state: &mut AppState, chip: &str) {
+    let token = format!("{chip} ");
+    if state.config.ui.vim && state.focus == Focus::Normal {
+        apply_vim_paste(&mut state.vim, &mut state.input, &token);
+    } else {
+        state.input.insert_str(&token);
+    }
 }
 
 /// Cleans up any unreferenced pasted images from disk.

@@ -35,5 +35,5 @@ expression: view
 "────────────────────────────────────────────────────────────────────────────────────── │✓ tsc --noEmit 12s              "
 "❯                                                                                      │◍ cargo test --all 214/380      "
 "────────────────────────────────────────────────────────────────────────────────────── │       ~/zed/pacode:master      "
-"Build · Claude 3 7 Sonnet | high /effort                                        /model │                                "
+"Build · Claude 3 7 Sonnet · high                                                /model │                                "
 "» 1 bg running · 1 failed · enter output · k kill · esc                                │                                "

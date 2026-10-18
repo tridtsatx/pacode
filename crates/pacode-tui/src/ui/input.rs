@@ -104,13 +104,21 @@ pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts
                         line_spans.push(Span::styled(token.clone(), opts.theme.cyan));
                         line_spans.push(Span::styled(wl[token.len()..].to_string(), opts.theme.fg));
                     } else {
-                        line_spans.push(Span::styled(wl.clone(), opts.theme.fg));
+                        line_spans.extend(crate::ui::images::style_chips(
+                            wl,
+                            opts.theme.fg,
+                            opts.theme.accent,
+                        ));
                     }
                     if let Some(ref hint) = inline_hint {
                         line_spans.push(Span::styled(hint.clone(), opts.theme.dim));
                     }
                 } else {
-                    line_spans.push(Span::styled(wl.clone(), opts.theme.fg));
+                    line_spans.extend(crate::ui::images::style_chips(
+                        wl,
+                        opts.theme.fg,
+                        opts.theme.accent,
+                    ));
                 }
 
                 rendered.push(Line::from(line_spans));

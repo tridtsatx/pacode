@@ -130,18 +130,31 @@ pub fn encode_pending() -> proto::Writer {
 }
 
 /// Encode messages from the conversation history into protobuf messages.
-// Field 10 { 1 base64_data, 2 mime_type } exists for image attachments in live traffic; unused because ContentBlock has no image variant.
+///
+/// Images (observed in live traffic of the official CLI): a user message carries one
+/// nested field `10 { 1 base64_data, 2 mime_type }` per image and keeps a text
+/// placeholder `[Image N: <path>]` for each. Tool messages cannot carry images, so
+/// images returned by tools go into one user message after the run of tool messages.
 pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
     let mut encoded = Vec::new();
+    let mut pending_tool_images: Vec<&ContentBlock> = Vec::new();
 
     for msg in messages {
+        if msg.role != Role::Tool && !pending_tool_images.is_empty() {
+            let images = std::mem::take(&mut pending_tool_images);
+            encoded.push(user_message(
+                "Images returned by the tool call(s) above:",
+                &images,
+            ));
+        }
         match msg.role {
             Role::User | Role::System => {
-                let mut w = proto::Writer::new();
-                w.write_string(1, &random_uuid());
-                w.write_varint(2, 1);
-                w.write_string(3, &msg.text());
-                encoded.push(w);
+                let images: Vec<&ContentBlock> = msg
+                    .content
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                    .collect();
+                encoded.push(user_message(&msg.text(), &images));
             }
             Role::Assistant => {
                 let mut w = proto::Writer::new();
@@ -175,23 +188,72 @@ pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
             }
             Role::Tool => {
                 for block in &msg.content {
-                    if let ContentBlock::ToolResult {
-                        call_id, content, ..
-                    } = block
-                    {
-                        let mut w = proto::Writer::new();
-                        w.write_string(1, &random_uuid());
-                        w.write_varint(2, 4);
-                        w.write_string(3, content);
-                        w.write_string(7, call_id.as_str());
-                        encoded.push(w);
+                    match block {
+                        ContentBlock::ToolResult {
+                            call_id, content, ..
+                        } => {
+                            let mut w = proto::Writer::new();
+                            w.write_string(1, &random_uuid());
+                            w.write_varint(2, 4);
+                            w.write_string(3, content);
+                            w.write_string(7, call_id.as_str());
+                            encoded.push(w);
+                        }
+                        ContentBlock::Image { .. } => pending_tool_images.push(block),
+                        ContentBlock::Text { .. }
+                        | ContentBlock::Reasoning { .. }
+                        | ContentBlock::ToolUse { .. } => {}
                     }
                 }
             }
         }
     }
+    if !pending_tool_images.is_empty() {
+        encoded.push(user_message(
+            "Images returned by the tool call(s) above:",
+            &pending_tool_images,
+        ));
+    }
 
     encoded
+}
+
+/// A user message: `text`, then a `[Image N: path]` placeholder per image, with the
+/// pixels in nested field 10. An image whose bytes are gone keeps only its placeholder.
+fn user_message(text: &str, images: &[&ContentBlock]) -> proto::Writer {
+    let mut full = text.to_string();
+    for (i, block) in images.iter().enumerate() {
+        if let ContentBlock::Image {
+            hash, source_path, ..
+        } = block
+        {
+            if !full.is_empty() {
+                full.push('\n');
+            }
+            let path = source_path
+                .clone()
+                .unwrap_or_else(|| format!("image-{}", hash.chars().take(12).collect::<String>()));
+            full.push_str(&format!("[Image {}: {path}]", i + 1));
+        }
+    }
+    let mut w = proto::Writer::new();
+    w.write_string(1, &random_uuid());
+    w.write_varint(2, 1);
+    w.write_string(3, &full);
+    for block in images {
+        if let ContentBlock::Image { mime, hash, .. } = block {
+            match crate::vision::base64_payload(hash) {
+                Ok(data) => {
+                    let mut img = proto::Writer::new();
+                    img.write_string(1, &data);
+                    img.write_string(2, mime);
+                    w.write_message(10, &img);
+                }
+                Err(err) => log::warn!("image {hash} left out of the request: {err}"),
+            }
+        }
+    }
+    w
 }
 
 /// Encode `GetChatMessageRequest` into protobuf bytes.

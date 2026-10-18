@@ -130,6 +130,21 @@ pub struct Family {
 }
 
 impl Family {
+    /// The reasoning levels this family's ids encode, weakest first. `none` and
+    /// `minimal` have no [`Effort`] and an effort-less member adds nothing.
+    pub fn efforts(&self) -> Vec<Effort> {
+        let mut out: Vec<Effort> = Effort::ALL
+            .into_iter()
+            .filter(|e| {
+                self.members
+                    .iter()
+                    .any(|(rank, _)| *rank == Some(effort_rank(*e)))
+            })
+            .collect();
+        out.sort_by_key(|e| e.rank());
+        out
+    }
+
     /// The concrete id to request at `effort`: the member with that exact rank,
     /// else the nearest one, preferring the stronger side on a tie. A family with
     /// a single effort-less member always resolves to that member.

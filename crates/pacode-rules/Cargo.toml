@@ -1,0 +1,20 @@
+[package]
+name = "pacode-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Code-style guard rules: rule files, built-in Rust/TypeScript packs, added-line scanning"
+
+[dependencies]
+regex = { workspace = true }
+similar = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

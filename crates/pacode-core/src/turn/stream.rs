@@ -40,6 +40,11 @@ pub async fn consume_stream(
     let mut reasoning_signature: Option<String> = None;
     let mut tool_calls_building: BTreeMap<u32, (CallId, String, String)> = BTreeMap::new();
     let mut turn_usage = Usage::default();
+    // Style guard: `mode: stream` rules scan write/edit arguments as they arrive. On a
+    // hit the stream is dropped and the offending call comes back as a tool error that
+    // carries the rule (index of the call, error text).
+    let mut style_guard = crate::style_guard::StreamGuard::new(session).await;
+    let mut style_stop: Option<(u32, String)> = None;
 
     let stream_interrupted = loop {
         tokio::select! {
@@ -151,10 +156,18 @@ pub async fn consume_stream(
                                 tool_calls_building.insert(index, (id, name, String::new()));
                             }
                             Ok(StreamEvent::ToolCallArgsDelta { index, delta }) => {
-                                if let Some((_, _, args)) =
+                                if let Some((_, name, args)) =
                                     tool_calls_building.get_mut(&index)
                                 {
                                     args.push_str(&delta);
+                                    if let Some(guard) = style_guard.as_mut()
+                                        && let Some(hit) = guard
+                                            .check(session, agent, index, name.as_str(), args.as_str())
+                                            .await
+                                    {
+                                        style_stop = Some((index, hit.message));
+                                        break false;
+                                    }
                                 }
                             }
                             Ok(StreamEvent::MessageStart { .. }) => {}
@@ -266,7 +279,13 @@ pub async fn consume_stream(
     }
 
     let mut tool_calls = Vec::new();
-    for (_, (call_id, name, raw_args)) in tool_calls_building {
+    for (index, (call_id, name, raw_args)) in tool_calls_building {
+        if let Some((stop_index, message)) = &style_stop
+            && *stop_index == index
+        {
+            tool_calls.push((call_id, name, serde_json::json!({}), Some(message.clone())));
+            continue;
+        }
         let (parse_err, input_val) = match serde_json::from_str::<serde_json::Value>(&raw_args) {
             Ok(v) => (None, v),
             Err(e) => (Some(e.to_string()), serde_json::json!({})),

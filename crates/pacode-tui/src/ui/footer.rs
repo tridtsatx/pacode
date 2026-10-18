@@ -82,7 +82,6 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
     let effort_str = state.effort().to_string();
 
     let show_model_hint = state.config.ui.hints.model;
-    let show_effort_hint = state.config.ui.hints.effort;
 
     let right_hint = if show_model_hint { "/model" } else { "" };
     let right_len = display_width(right_hint);
@@ -109,15 +108,18 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         left_spans.push(Span::styled(format!(" · {text}"), opts.theme.dim));
     }
 
+    // Plain `<Mode> · <model> · <effort>`: foreground colour only, no
+    // background segments or decorative glyphs.
     left_spans.extend([
         Span::styled(" · ", opts.theme.faint),
         Span::styled(model_name, opts.theme.dim),
-        Span::styled(" | ", opts.theme.faint),
-        Span::styled(effort_str, opts.theme.accent),
     ]);
-
-    if show_effort_hint {
-        left_spans.push(Span::styled(" /effort", opts.theme.cyan));
+    // A model with no reasoning control shows no effort at all.
+    if state.effort_visible() {
+        left_spans.extend([
+            Span::styled(" · ", opts.theme.faint),
+            Span::styled(effort_str, opts.theme.accent),
+        ]);
     }
 
     let left_len: usize = left_spans.iter().map(|s| display_width(&s.content)).sum();
@@ -141,11 +143,15 @@ fn render_row1(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
         };
         let mode_label = mode.label();
         let display_name = state.model().map(|m| m.display_name()).unwrap_or_default();
-        let effort = state.effort();
-        let plain = if let Some((_, text)) = &state.plugin_status {
-            format!("{mode_label}{vim_part} · {text} · {display_name} | {effort}")
+        let effort = if state.effort_visible() {
+            format!(" · {}", state.effort())
         } else {
-            format!("{mode_label}{vim_part} · {display_name} | {effort}")
+            String::new()
+        };
+        let plain = if let Some((_, text)) = &state.plugin_status {
+            format!("{mode_label}{vim_part} · {text} · {display_name}{effort}")
+        } else {
+            format!("{mode_label}{vim_part} · {display_name}{effort}")
         };
         let trunc = truncate_to_width(&plain, width, true);
         Line::from(Span::styled(trunc, opts.theme.dim))
@@ -337,7 +343,7 @@ fn render_row2(width: usize, state: &AppState, opts: &RenderOptions) -> Line<'st
                             .as_ref()
                             .map(|(_, t)| format!(" · {t}"))
                             .unwrap_or_default();
-                        let hint = " (shift+tab to cycle)";
+                        let hint = " (shift+tab / alt+m)";
                         let counts_or_idle =
                             if state.rail.show_session_stats && state.rail.usage.turns > 0 {
                                 let done_count = state

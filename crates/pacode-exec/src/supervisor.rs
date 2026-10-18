@@ -152,6 +152,19 @@ pub(crate) async fn run_supervisor(
         child_status = child.wait().await.ok();
     }
 
+    let guard_reason = {
+        let tasks = state.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get(&id).and_then(|e| e.guard_reason.clone())
+    };
+    if let Some(reason) = guard_reason {
+        let line = format!("\n{reason}\n");
+        let _ = spool_file.write_all(line.as_bytes()).await;
+        let mut tasks = state.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = tasks.get_mut(&id) {
+            entry.buffer.push(line.as_bytes());
+        }
+    }
+
     let _ = spool_file.flush().await;
 
     let remaining_lines: Vec<String> = {
@@ -207,6 +220,7 @@ pub(crate) async fn run_supervisor(
         }
     };
 
+    state.guard.process_ended();
     if let Some(info) = ended_info {
         let _ = state.events.send(TaskEvent::Ended(info));
     }
@@ -223,6 +237,13 @@ async fn handle_chunk(
     line_acc: &mut Vec<u8>,
     state: &Arc<SharedState>,
 ) {
+    if !*spool_truncated && !state.guard.spool_allowed() {
+        let _ = spool_file
+            .write_all(b"\n[spool stopped: low disk space]\n")
+            .await;
+        let _ = spool_file.flush().await;
+        *spool_truncated = true;
+    }
     if !*spool_truncated {
         if *spool_written + chunk.len() as u64 <= max_spool_bytes {
             let _ = spool_file.write_all(chunk).await;

@@ -74,7 +74,7 @@ fn test_registry_from_config_and_routes() {
     let cfg = Config {
         providers,
         provider: pacode_types::ProviderDefaults {
-            default: Some("openrouter/anthropic/claude-3.5-sonnet".to_string()),
+            default: Some("openrouter/openai/gpt-5.5".to_string()),
             ..pacode_types::ProviderDefaults::default()
         },
         ..Config::default()
@@ -86,10 +86,7 @@ fn test_registry_from_config_and_routes() {
     let reg = ProviderRegistry::from_config(&cfg, &api_keys).expect("valid registry");
     assert_eq!(
         reg.default_route(),
-        Some(&ModelRoute::new(
-            "openrouter",
-            "anthropic/claude-3.5-sonnet"
-        ))
+        Some(&ModelRoute::new("openrouter", "openai/gpt-5.5"))
     );
 
     let prov = reg.get("openrouter");
@@ -180,11 +177,11 @@ fn test_transport_selection_per_kind() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut store = AuthStore::new_empty(temp_dir.path().join("auth.json"));
     store.upsert(
-        "claude",
+        "moonshot",
         Account {
-            label: "claude-oauth".to_string(),
-            kind: "oauth".to_string(),
-            access: "claude-token".to_string(),
+            label: "moonshot-key".to_string(),
+            kind: "api_key".to_string(),
+            access: "moonshot-token".to_string(),
             refresh: None,
             expires_at: None,
             email: None,
@@ -199,15 +196,6 @@ fn test_transport_selection_per_kind() {
             kind: ProviderKind::OpenAi,
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: Some("sk-openai".to_string()),
-            ..ProviderConfig::default()
-        },
-    );
-    providers.insert(
-        "my-anthropic".to_string(),
-        ProviderConfig {
-            kind: ProviderKind::Anthropic,
-            base_url: "https://api.anthropic.com/v1".to_string(),
-            api_key: Some("sk-ant-api".to_string()),
             ..ProviderConfig::default()
         },
     );
@@ -230,7 +218,7 @@ fn test_transport_selection_per_kind() {
         .expect("builds transports");
 
     assert!(reg.get("my-openai").is_some());
-    assert!(reg.get("my-anthropic").is_some());
+    assert!(reg.get("moonshot").is_some());
     assert!(reg.get("my-codex").is_some());
 
     // Devin builds like any other transport now that the protocol is implemented.
@@ -261,11 +249,11 @@ fn test_synthesized_builtin_providers() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut store = AuthStore::new_empty(temp_dir.path().join("auth.json"));
     store.upsert(
-        "claude",
+        "openrouter",
         Account {
-            label: "claude-1".to_string(),
-            kind: "oauth".to_string(),
-            access: "claude-oauth-token".to_string(),
+            label: "openrouter-1".to_string(),
+            kind: "api_key".to_string(),
+            access: "sk-or-test".to_string(),
             refresh: None,
             expires_at: None,
             email: None,
@@ -306,11 +294,16 @@ fn test_synthesized_builtin_providers() {
     let mut providers = BTreeMap::new();
     synthesize_builtin_providers(&mut providers, &store);
 
-    // claude synthesized
-    assert!(providers.contains_key("claude"));
-    let claude_cfg = &providers["claude"];
-    assert_eq!(claude_cfg.kind, ProviderKind::Anthropic);
-    assert_eq!(claude_cfg.base_url, "https://api.anthropic.com/v1");
+    // openrouter synthesized from its stored key
+    let openrouter_cfg = &providers["openrouter"];
+    assert_eq!(openrouter_cfg.kind, ProviderKind::OpenAi);
+    assert_eq!(openrouter_cfg.base_url, "https://openrouter.ai/api/v1");
+    assert_eq!(
+        openrouter_cfg.api_key_env.as_deref(),
+        Some("OPENROUTER_API_KEY")
+    );
+    assert!(!providers.contains_key("anthropic"));
+    assert!(!providers.contains_key("claude"));
 
     // openai synthesized
     assert!(providers.contains_key("openai"));
@@ -329,7 +322,7 @@ fn test_synthesized_builtin_providers() {
     let reg = ProviderRegistry::from_config_with_store(&empty_cfg, &BTreeMap::new(), Some(&store))
         .expect("builds synthesized registry");
 
-    assert!(reg.get("claude").is_some());
+    assert!(reg.get("openrouter").is_some());
     assert!(reg.get("openai").is_some());
 }
 
@@ -368,9 +361,9 @@ async fn test_resolve_refreshes_token_when_changed() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut store = AuthStore::new_empty(temp_dir.path().join("auth.json"));
     store.upsert(
-        "claude",
+        "moonshot",
         Account {
-            label: "claude-1".to_string(),
+            label: "moonshot-1".to_string(),
             kind: "oauth".to_string(),
             access: "initial-token".to_string(),
             refresh: None,
@@ -389,9 +382,9 @@ async fn test_resolve_refreshes_token_when_changed() {
         ProviderRegistry::from_config_with_store(&empty_cfg, &BTreeMap::new(), Some(&store))
             .expect("registry");
 
-    let route = ModelRoute::new("claude", "claude-3-5-sonnet");
+    let route = ModelRoute::new("moonshot", "kimi-k3");
     let initial_prov = reg.resolve(&route).await.expect("resolve initial");
-    assert_eq!(initial_prov.id(), "claude");
+    assert_eq!(initial_prov.id(), "moonshot");
 
     // Register token refresher that produces a new token
     let refreshed_token = Arc::new(std::sync::Mutex::new("refreshed-token-xyz".to_string()));
@@ -402,10 +395,10 @@ async fn test_resolve_refreshes_token_when_changed() {
     }));
 
     let refreshed_prov = reg.resolve(&route).await.expect("resolve refreshed");
-    assert_eq!(refreshed_prov.id(), "claude");
+    assert_eq!(refreshed_prov.id(), "moonshot");
 
     // Provider in registry was rebuilt with the fresh token
-    let current_token = reg.store_providers.read().unwrap().get("claude").cloned();
+    let current_token = reg.store_providers.read().unwrap().get("moonshot").cloned();
     assert_eq!(current_token.as_deref(), Some("refreshed-token-xyz"));
 }
 
@@ -430,7 +423,9 @@ impl Provider for FailingProvider {
             display_name: model.to_string(),
             context_window: None,
             supports_reasoning: false,
+            vision: false,
             pricing: None,
+            ..Default::default()
         }
     }
 }
@@ -454,7 +449,9 @@ impl Provider for SuccessProvider {
             display_name: "Good Model".to_string(),
             context_window: Some(64_000),
             supports_reasoning: true,
+            vision: false,
             pricing: None,
+            ..Default::default()
         }
     }
 }
@@ -468,4 +465,71 @@ async fn test_list_all_models_skips_errors() {
     let all = reg.list_all_models().await;
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].route.model, "good-model");
+}
+
+#[test]
+fn test_anthropic_kind_is_rejected() {
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "legacy".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            base_url: "https://example.test/v1".to_string(),
+            api_key: Some("sk-legacy".to_string()),
+            ..ProviderConfig::default()
+        },
+    );
+    let cfg = Config {
+        providers,
+        ..Config::default()
+    };
+    let res = ProviderRegistry::from_config_with_store(&cfg, &BTreeMap::new(), None);
+    match res {
+        Err(ProviderError::Config(msg)) => assert!(msg.contains("no longer supported")),
+        Err(other) => panic!("expected Config error, got {other:?}"),
+        Ok(_) => panic!("anthropic kind must not build"),
+    }
+}
+
+#[test]
+fn test_config_entry_overrides_builtin_and_api_key_login_synthesizes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut store = AuthStore::new_empty(temp_dir.path().join("auth.json"));
+    for id in ["zai", "zai-coding", "kimi-code", "opencode-go", "gemini"] {
+        store.upsert(
+            id,
+            Account {
+                label: format!("{id}-1"),
+                kind: "api_key".to_string(),
+                access: "key".to_string(),
+                refresh: None,
+                expires_at: None,
+                email: None,
+                extra: serde_json::Map::new(),
+            },
+        );
+    }
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "zai".to_string(),
+        ProviderConfig {
+            base_url: "https://proxy.example.test/zai".to_string(),
+            ..ProviderConfig::default()
+        },
+    );
+    synthesize_builtin_providers(&mut providers, &store);
+    assert_eq!(providers["zai"].base_url, "https://proxy.example.test/zai");
+    assert_eq!(
+        providers["zai-coding"].base_url,
+        "https://api.z.ai/api/coding/paas/v4"
+    );
+    assert_eq!(
+        providers["kimi-code"].base_url,
+        "https://api.kimi.com/coding/v1"
+    );
+    assert_eq!(
+        providers["opencode-go"].base_url,
+        "https://opencode.ai/zen/go/v1"
+    );
+    assert!(providers.contains_key("gemini"));
 }

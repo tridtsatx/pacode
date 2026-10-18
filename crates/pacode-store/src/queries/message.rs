@@ -21,7 +21,9 @@ pub(crate) fn message_plain_text(msg: &Message) -> String {
         match block {
             ContentBlock::Text { text } => parts.push(text.as_str()),
             ContentBlock::ToolResult { content, .. } => parts.push(content.as_str()),
-            ContentBlock::Reasoning { .. } | ContentBlock::ToolUse { .. } => {}
+            ContentBlock::Reasoning { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::Image { .. } => {}
         }
     }
     parts.join("\n")

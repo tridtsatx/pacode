@@ -10,6 +10,7 @@ members = [
     "crates/pacode-mcp",
     "crates/pacode-store",
     "crates/pacode-tools",
+    "crates/pacode-coreutils",
     "crates/pacode-core",
     "crates/pacode-daemon",
     "crates/pacode-client",
@@ -22,6 +23,9 @@ members = [
     "crates/pacode-acp",
     "crates/pacode-auth",
     "crates/pacode-net",
+    "crates/pacode-rules",
+    "crates/pacode-memory",
+    "crates/pacode-outline",
 ]
 
 [workspace.package]
@@ -45,6 +49,7 @@ pacode-provider = { path = "crates/pacode-provider", version = "1.0.0" }
 pacode-mcp = { path = "crates/pacode-mcp", version = "1.0.0" }
 pacode-store = { path = "crates/pacode-store", version = "1.0.0" }
 pacode-tools = { path = "crates/pacode-tools", version = "1.0.0" }
+pacode-coreutils = { path = "crates/pacode-coreutils", version = "1.0.0" }
 pacode-core = { path = "crates/pacode-core", version = "1.0.0" }
 pacode-daemon = { path = "crates/pacode-daemon", version = "1.0.0" }
 pacode-client = { path = "crates/pacode-client", version = "1.0.0" }
@@ -56,6 +61,9 @@ pacode-skills = { path = "crates/pacode-skills", version = "1.0.0" }
 pacode-acp = { path = "crates/pacode-acp", version = "1.0.0" }
 pacode-auth = { path = "crates/pacode-auth", version = "1.0.0" }
 pacode-net = { path = "crates/pacode-net", version = "1.0.0" }
+pacode-rules = { path = "crates/pacode-rules", version = "1.0.0" }
+pacode-memory = { path = "crates/pacode-memory", version = "1.0.0" }
+pacode-outline = { path = "crates/pacode-outline", version = "1.0.0" }
 
 # async
 tokio = { version = "1", default-features = false }

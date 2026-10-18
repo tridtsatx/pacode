@@ -20,12 +20,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pacode_types::{
-    ExecConfig, ProgressSource, SessionId, TaskId, TaskInfo, TaskProgress, TaskStatus,
+    ExecConfig, ProgressSource, ResourcesConfig, SessionId, TaskId, TaskInfo, TaskProgress,
+    TaskStatus,
 };
 use tokio::sync::broadcast;
 
 use crate::buffer::HeadTailBuffer;
 use crate::progress::ProgressParser;
+use crate::resources::ResourceNotice;
 use crate::spec::TaskSpec;
 use crate::state::{SharedState, TaskEntry};
 
@@ -36,6 +38,8 @@ pub enum TaskEvent {
     Ended(TaskInfo),
     /// No output and no progress for `exec.stall_secs`; the task is still running.
     Stalled(TaskInfo),
+    /// The resource guard entered a warning/breach level or recovered.
+    Resource(ResourceNotice),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,28 +60,29 @@ pub enum ExecError {
     Spawn(std::io::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Machine memory or spool disk is low; carries the full user-facing text.
+    #[error("{0}")]
+    LowResources(String),
 }
 
 pub struct TaskManager {
-    state: Arc<SharedState>,
+    pub(crate) state: Arc<SharedState>,
 }
 
 impl TaskManager {
+    /// Without the resource guard (tests); the daemon uses `with_resources`.
     pub fn new(spool_dir: PathBuf, config: ExecConfig) -> Arc<Self> {
-        let (events, _) = broadcast::channel(256);
-        Arc::new(Self {
-            state: Arc::new(SharedState {
-                spool_dir,
-                config,
-                tasks: Mutex::new(HashMap::new()),
-                events,
-            }),
-        })
+        let resources = ResourcesConfig {
+            enabled: false,
+            nice: 0,
+            ..ResourcesConfig::default()
+        };
+        Self::with_resources(spool_dir, config, resources)
     }
 
     /// Start the process. Returns immediately with the initial `TaskInfo`.
     pub async fn spawn(&self, spec: TaskSpec) -> Result<TaskInfo, ExecError> {
-        // Enforce max_tasks on currently running tasks
+        self.state.guard.admit()?;
         {
             let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
             let running = tasks
@@ -119,6 +124,19 @@ impl TaskManager {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(false);
+        #[cfg(unix)]
+        {
+            if self.state.nice > 0 {
+                let nice = self.state.nice.clamp(0, 19);
+                // SAFETY: only async-signal-safe setpriority(2) runs between fork and exec.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                        Ok(())
+                    });
+                }
+            }
+        }
 
         let child = cmd.spawn().map_err(ExecError::Spawn)?;
         let child_pid = child.id();
@@ -162,6 +180,9 @@ impl TaskManager {
             kill_requested: false,
             child_pid,
             supervisor: None,
+            started: std::time::Instant::now(),
+            protected: false,
+            guard_reason: None,
         };
 
         {
@@ -170,6 +191,8 @@ impl TaskManager {
         }
 
         let _ = self.state.events.send(TaskEvent::Started(info.clone()));
+        // Before the supervisor can finish: starts sampling on 0 -> 1.
+        self.state.guard.process_started();
 
         let supervisor = tokio::spawn(crate::supervisor::run_supervisor(
             id.clone(),

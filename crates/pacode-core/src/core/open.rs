@@ -90,7 +90,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 pacode_types::AgentId::main(),
                 main_info,
                 crate::agent::History::default(),
-                session_tools.clone(),
+                session_tools.without(pacode_tools::builtin::ask_parent::NAME),
                 core.deps.config.session.history_page,
                 None,
             ));
@@ -117,6 +117,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 app_version: core.deps.app_version.clone(),
                 skills: core.deps.skills.clone(),
                 scheduler: crate::schedule::Scheduler::new(),
+                ledger: crate::ledger::FileLedger::new(),
             });
 
             start_scheduler(&session).await;
@@ -273,7 +274,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 pacode_types::AgentId::main(),
                 main_info,
                 main_history,
-                session_tools.clone(),
+                session_tools.without(pacode_tools::builtin::ask_parent::NAME),
                 transcript_state,
                 None,
             ));
@@ -321,6 +322,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 app_version: core.deps.app_version.clone(),
                 skills: core.deps.skills.clone(),
                 scheduler: crate::schedule::Scheduler::new(),
+                ledger: crate::ledger::FileLedger::new(),
             });
 
             start_scheduler(&session).await;

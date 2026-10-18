@@ -1,6 +1,5 @@
 //! Provider OAuth login flows and access token coordinator.
 
-pub mod claude;
 pub mod devin;
 pub mod openai;
 
@@ -81,7 +80,7 @@ pub(crate) fn urlencode(input: &str) -> String {
     encoded
 }
 
-/// Runs the whole browser login for `provider` (`claude` | `openai` | `devin`).
+/// Runs the whole browser login for `provider` (`openai` | `devin`).
 /// Reports each stage through `on_progress`. Does NOT touch the store.
 pub async fn login(
     provider: &str,
@@ -89,7 +88,6 @@ pub async fn login(
 ) -> Result<LoginOutcome> {
     let canonical = provider.trim().to_ascii_lowercase();
     match canonical.as_str() {
-        "claude" | "anthropic" => claude::login(on_progress).await,
         "openai" | "chatgpt" => openai::login(on_progress).await,
         "devin" | "cognition" => devin::login(on_progress).await,
         _ => Err(AuthError::UnknownProvider(format!(
@@ -167,9 +165,6 @@ pub(crate) async fn access_token_in_with_endpoint(
             let provider_name = provider_name.clone();
             async move {
                 let res = match provider_name.as_str() {
-                    "claude" | "anthropic" => {
-                        claude::refresh_tokens(&refresh_token, endpoint_override.as_deref()).await
-                    }
                     "openai" | "chatgpt" => {
                         openai::refresh_tokens(&refresh_token, endpoint_override.as_deref()).await
                     }

@@ -315,12 +315,15 @@ pub fn matches_key(binding: &Binding, key: KeyEvent) -> bool {
     let b_mods = binding.mods & mask;
     let k_mods = key.modifiers & mask;
 
-    // Shift+Tab and BackTab compatibility across terminals
+    // Shift+Tab and BackTab compatibility across terminals: the same key arrives
+    // as BackTab (any modifiers) or as Tab+SHIFT, so both forms are one family.
     let b_is_backtab = binding.code == KeyCode::BackTab
         || (binding.code == KeyCode::Tab && b_mods.contains(KeyModifiers::SHIFT));
     let k_is_backtab = key.code == KeyCode::BackTab
         || (key.code == KeyCode::Tab && k_mods.contains(KeyModifiers::SHIFT));
     if b_is_backtab && k_is_backtab {
+        // SHIFT is not compared: terminals report BackTab with or without it.
+        // CONTROL/ALT/SUPER still must match the binding exactly.
         let no_shift = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER;
         return (b_mods & no_shift) == (k_mods & no_shift);
     }
@@ -547,6 +550,8 @@ impl Keymap {
                 mods: KeyModifiers::NONE,
             }],
         );
+        // shift+tab is the primary key; alt+m is the fallback for terminals that
+        // never deliver a shifted Tab (kitty keyboard flags, multiplexers).
         bindings.insert(
             Action::CycleMode,
             vec![
@@ -557,6 +562,10 @@ impl Keymap {
                 Binding {
                     code: KeyCode::BackTab,
                     mods: KeyModifiers::NONE,
+                },
+                Binding {
+                    code: KeyCode::Char('m'),
+                    mods: KeyModifiers::ALT,
                 },
             ],
         );

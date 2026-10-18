@@ -58,6 +58,17 @@ impl UiSink for DaemonUiSink {
 pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> {
     opts.paths.ensure_dirs().map_err(DaemonError::Io)?;
 
+    // Image store: shared with the TUI; LRU-evicted once here (no timer).
+    if pacode_image::store::init(opts.paths.images_dir())
+        && let Some(images) = pacode_image::store::global()
+        && let Err(err) = images.evict(
+            pacode_image::store::MAX_STORE_BYTES,
+            pacode_image::store::MAX_STORE_FILES,
+        )
+    {
+        log::warn!("image store eviction failed: {err}");
+    }
+
     let mut api_keys = BTreeMap::new();
     for (id, pcfg) in &opts.config.providers {
         let key = pacode_config::resolve_api_key(pcfg);
@@ -118,6 +129,10 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
     };
 
     let mut tools = builtin_tools(&opts.config.web);
+    // `read` with the `[read]` settings (outline threshold) replaces the default one.
+    tools.register(Arc::new(
+        pacode_tools::builtin::read_outline::ConfiguredRead::new(opts.config.read.clone()),
+    ));
     for tool in pacode_tools::builtin::plugin::plugin_tools(plugin_host.clone()) {
         tools.register(tool);
     }
@@ -128,7 +143,11 @@ pub async fn build_core(opts: &DaemonOptions) -> Result<Arc<Core>, DaemonError> 
         )));
     }
 
-    let tasks = TaskManager::new(opts.paths.spool_dir(), opts.config.exec.clone());
+    let tasks = TaskManager::with_resources(
+        opts.paths.spool_dir(),
+        opts.config.exec.clone(),
+        opts.config.resources.clone(),
+    );
     // MCP servers declared by installed plugins join the configured ones under a
     // `<plugin>/<server>` name, so two plugins cannot collide on `github`.
     let mut mcp_servers = opts.config.mcp.servers.clone();

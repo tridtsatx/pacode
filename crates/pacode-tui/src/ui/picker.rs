@@ -24,9 +24,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         Focus::Overlay(Overlay::ModePicker { index }) => {
             draw_mode(frame, area, state, *index, opts);
         }
-        Focus::Overlay(Overlay::ModelPicker { query, index }) => {
-            draw_model(frame, area, state, query, *index, opts);
-        }
         Focus::Overlay(Overlay::LoginPicker { query, index }) => {
             crate::ui::login_picker::draw(frame, area, state, query, *index, opts);
         }
@@ -70,6 +67,17 @@ pub fn option_label_center(label_start: usize, label_len: usize) -> usize {
     label_start + label_len / 2
 }
 
+fn effort_description(effort: pacode_types::Effort) -> &'static str {
+    use pacode_types::Effort;
+    match effort {
+        Effort::Low => "low: fastest, minimal reasoning",
+        Effort::Medium => "medium: balanced",
+        Effort::High => "high: deep reasoning for hard tasks",
+        Effort::XHigh => "xhigh: extra reasoning; sent as `high` unless the provider maps it",
+        Effort::Max => "max: maximum reasoning, slow and expensive",
+    }
+}
+
 fn draw_effort(
     frame: &mut Frame,
     area: Rect,
@@ -77,14 +85,10 @@ fn draw_effort(
     selected: usize,
     opts: &RenderOptions,
 ) {
-    let levels = ["low", "medium", "high", "xhigh", "max"];
-    let descriptions = [
-        "low: fastest, minimal reasoning",
-        "medium: balanced",
-        "high: deep reasoning for hard tasks",
-        "xhigh: extra reasoning; sent as `high` unless the provider maps it",
-        "max: maximum reasoning, slow and expensive",
-    ];
+    // Only the levels the current model supports.
+    let efforts = state.effort_levels();
+    let levels: Vec<&str> = efforts.iter().map(|e| e.as_str()).collect();
+    let descriptions: Vec<&str> = efforts.iter().map(|e| effort_description(*e)).collect();
 
     let mut lines = Vec::new();
 
@@ -249,109 +253,6 @@ fn draw_mode(
     lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
 
     frame.render_widget(Paragraph::new(lines), area);
-}
-
-fn draw_model(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    query: &str,
-    selected: usize,
-    opts: &RenderOptions,
-) {
-    let mut lines = Vec::new();
-
-    // 0: Title
-    lines.push(Line::from(Span::styled(
-        "Switch Model",
-        opts.theme.bold.patch(opts.theme.accent),
-    )));
-
-    // 1: Query input
-    lines.push(Line::from(vec![
-        Span::styled("> ", opts.theme.accent),
-        Span::styled(query.to_string(), opts.theme.fg),
-    ]));
-
-    let query_lower = query.to_lowercase();
-    let filtered: Vec<_> = state
-        .models
-        .iter()
-        .filter(|m| {
-            query_lower.is_empty()
-                || m.route.to_string().to_lowercase().contains(&query_lower)
-                || m.display_name.to_lowercase().contains(&query_lower)
-        })
-        .collect();
-
-    let list_height = (area.height as usize).saturating_sub(3).min(8);
-
-    if state.models.is_empty() {
-        lines.push(Line::from(Span::styled("  loading…", opts.theme.faint)));
-    } else if filtered.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no matching models",
-            opts.theme.dim,
-        )));
-        lines.push(Line::from(Span::styled(
-            "  backspace to clear the filter",
-            opts.theme.faint,
-        )));
-    } else {
-        let sel_idx = if filtered.is_empty() {
-            0
-        } else {
-            selected % filtered.len()
-        };
-        let start = if sel_idx >= list_height {
-            sel_idx + 1 - list_height
-        } else {
-            0
-        };
-
-        for (i, m) in filtered.iter().enumerate().skip(start).take(list_height) {
-            let is_sel = i == sel_idx;
-            let route_str = m.route.to_string();
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{} ", if is_sel { opts.glyphs.pointer } else { " " }),
-                    opts.theme.accent,
-                ),
-                Span::styled(
-                    route_str,
-                    if is_sel {
-                        opts.theme.bold
-                    } else {
-                        opts.theme.fg
-                    },
-                ),
-                Span::raw("  "),
-                Span::styled(m.display_name.clone(), opts.theme.dim),
-            ]);
-            if is_sel {
-                lines.push(selected_row(line, area.width, opts));
-            } else {
-                lines.push(line);
-            }
-        }
-    }
-
-    while lines.len() < (area.height as usize).saturating_sub(1) {
-        lines.push(Line::default());
-    }
-
-    let hint = if state.config.ui.ascii_only {
-        "^/v select . enter confirm . esc cancel"
-    } else {
-        "↑/↓ select · enter confirm · esc cancel"
-    };
-    lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
-
-    frame.render_widget(Paragraph::new(lines), area);
-
-    // Set cursor on query input
-    let cursor_x = area.x + 2 + (query.len() as u16).min(area.width.saturating_sub(3));
-    frame.set_cursor_position((cursor_x, area.y + 1));
 }
 
 /// The question the model asked, as a bottom picker: the header chip, the

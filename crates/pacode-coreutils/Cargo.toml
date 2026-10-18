@@ -1,0 +1,25 @@
+[package]
+name = "pacode-coreutils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "In-process, no-fork implementations of common text utilities (wc, sort, sed, jq, tree, diff, ...)"
+
+[dependencies]
+thiserror = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

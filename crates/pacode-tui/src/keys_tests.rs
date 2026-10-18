@@ -239,14 +239,18 @@ fn test_overlay_model_picker_navigation_and_esc() {
             display_name: "Model 1".into(),
             context_window: Some(1000),
             supports_reasoning: true,
+            vision: false,
             pricing: None,
+            ..Default::default()
         },
         pacode_types::ModelInfo {
             route: ModelRoute::new("p", "m2"),
             display_name: "Model 2".into(),
             context_window: Some(1000),
             supports_reasoning: true,
+            vision: false,
             pricing: None,
+            ..Default::default()
         },
     ];
 
@@ -254,24 +258,23 @@ fn test_overlay_model_picker_navigation_and_esc() {
     state.input.insert_str("/model");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     handle_key(&mut state, enter, now);
-    assert_eq!(
+    assert!(matches!(
         state.focus,
-        Focus::Overlay(Overlay::ModelPicker {
-            query: String::new(),
-            index: 0,
-        })
+        Focus::Overlay(Overlay::ModelPicker { .. })
+    ));
+    assert_eq!(
+        state.model_picker.side,
+        crate::state::model_picker::SIDE_ALL
     );
 
-    // Down key changes index to 1 and keeps focus on overlay
+    // Down moves to the first provider and keeps focus on the overlay
     let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
     handle_key(&mut state, down, now);
-    assert_eq!(
+    assert!(matches!(
         state.focus,
-        Focus::Overlay(Overlay::ModelPicker {
-            query: String::new(),
-            index: 1,
-        })
-    );
+        Focus::Overlay(Overlay::ModelPicker { .. })
+    ));
+    assert_eq!(state.model_picker.side, 2);
 
     // Esc closes it
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -979,7 +982,8 @@ fn test_vim_disabled_behavior_is_identical() {
     assert_eq!(
         actions,
         vec![Action::Send(Request::UserMessage {
-            text: "wbdx".into()
+            text: "wbdx".into(),
+            attachments: Vec::new(),
         })]
     );
     assert!(state.input.is_empty());
@@ -1050,7 +1054,8 @@ fn test_vim_enabled_keys_routing() {
     assert_eq!(
         actions,
         vec![Action::Send(Request::UserMessage {
-            text: "hello !world".into()
+            text: "hello !world".into(),
+            attachments: Vec::new(),
         })]
     );
     assert!(state.input.is_empty());
@@ -1104,6 +1109,73 @@ fn test_default_binding_cycle_mode() {
     let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
     let actions = handle_key(&mut state, backtab, now);
     assert_eq!(actions, vec![Action::Send(Request::SetMode(expected_next))]);
+}
+
+#[test]
+fn test_cycle_mode_variants_and_alt_m() {
+    let now = Instant::now();
+    let expected = |s: &AppState| Action::Send(Request::SetMode(s.mode().next()));
+
+    // BackTab carrying SHIFT (what many terminals send for shift+tab)
+    let mut state = make_test_state();
+    let e = expected(&state);
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        now,
+    );
+    assert_eq!(actions, vec![e]);
+
+    // Tab+SHIFT (kitty keyboard protocol form)
+    let mut state = make_test_state();
+    let e = expected(&state);
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        now,
+    );
+    assert_eq!(actions, vec![e]);
+
+    // alt+m fallback
+    let mut state = make_test_state();
+    let e = expected(&state);
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+        now,
+    );
+    assert_eq!(actions, vec![e]);
+
+    // Plain Tab and plain 'm' do not cycle
+    let mut state = make_test_state();
+    let plain_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+    let actions = handle_key(&mut state, plain_m, now);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Send(Request::SetMode(_))))
+    );
+}
+
+#[test]
+fn test_cycle_mode_not_swallowed_by_overlay() {
+    let now = Instant::now();
+    let mut state = make_test_state();
+    state.focus = Focus::Overlay(Overlay::EffortPicker { index: 0 });
+    let e = Action::Send(Request::SetMode(state.mode().next()));
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        now,
+    );
+    assert_eq!(actions, vec![e.clone()]);
+
+    let actions = handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+        now,
+    );
+    assert_eq!(actions, vec![e]);
 }
 
 #[test]
@@ -1643,7 +1715,8 @@ fn test_enter_queues_when_turn_running_and_sends_when_idle() {
     assert_eq!(
         actions,
         vec![Action::Send(Request::UserMessage {
-            text: "idle prompt".into()
+            text: "idle prompt".into(),
+            attachments: Vec::new(),
         })]
     );
     assert!(state.input.is_empty());
@@ -1695,7 +1768,8 @@ fn test_queue_drains_in_order_on_turn_finished() {
     assert_eq!(
         req1,
         Some(Request::UserMessage {
-            text: "first".into()
+            text: "first".into(),
+            attachments: Vec::new(),
         })
     );
     assert_eq!(state.input.prompt_queue.len(), 1);
@@ -1720,7 +1794,8 @@ fn test_queue_drains_in_order_on_turn_finished() {
     assert_eq!(
         req2,
         Some(Request::UserMessage {
-            text: "second".into()
+            text: "second".into(),
+            attachments: Vec::new(),
         })
     );
     assert_eq!(state.input.prompt_queue.len(), 0);
@@ -1835,7 +1910,8 @@ fn test_ctrl_enter_submit_now_behavior() {
     assert_eq!(
         actions,
         vec![Action::Send(Request::UserMessage {
-            text: "send now when idle".into()
+            text: "send now when idle".into(),
+            attachments: Vec::new(),
         })]
     );
     assert!(state.input.is_empty());
@@ -1851,7 +1927,8 @@ fn test_ctrl_enter_submit_now_behavior() {
         vec![
             Action::Send(Request::DetachTurn),
             Action::Send(Request::UserMessage {
-                text: "send now while busy".into()
+                text: "send now while busy".into(),
+                attachments: Vec::new(),
             })
         ]
     );

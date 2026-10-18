@@ -2,8 +2,10 @@
 
 use std::collections::HashSet;
 
+use base64::Engine as _;
+
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, ContentChunk, EmbeddedResourceResource, PermissionOption,
+    Content, ContentBlock, ContentChunk, EmbeddedResourceResource, ImageContent, PermissionOption,
     PermissionOptionKind, Plan as AcpPlan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionId as AcpSessionId, SessionMode, SessionModeId,
@@ -11,6 +13,7 @@ use agent_client_protocol::schema::v1::{
     ToolCall as AcpToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
     ToolCallUpdate as AcpToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
+use pacode_types::Attachment;
 use pacode_types::ids::SessionId as PacodeSessionId;
 use pacode_types::protocol::{Event, TurnStop};
 use pacode_types::state::{Mode, PermissionDecision, PermissionRequest, Plan, PlanStatus};
@@ -273,6 +276,7 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
                 )]
             }
             TranscriptKind::User { .. }
+            | TranscriptKind::Images { .. }
             | TranscriptKind::Notice { .. }
             | TranscriptKind::Permission(_)
             | TranscriptKind::Question { .. } => vec![],
@@ -324,6 +328,7 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
             }
             TranscriptKind::BashCommand { .. }
             | TranscriptKind::User { .. }
+            | TranscriptKind::Images { .. }
             | TranscriptKind::Notice { .. }
             | TranscriptKind::Permission(_)
             | TranscriptKind::Question { .. } => vec![],
@@ -456,8 +461,37 @@ pub fn transcript_item_to_session_updates(item: &TranscriptItem) -> Vec<SessionU
                 ContentBlock::Text(TextContent::new(format!("[{level:?}] {text}\n"))),
             ))]
         }
+        TranscriptKind::Images { images } => images
+            .iter()
+            .filter_map(|image| {
+                // Bytes live in the shared image store; an evicted image is skipped.
+                let bytes = pacode_image::store::load(&image.hash).ok()?;
+                Some(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                    ContentBlock::Image(ImageContent::new(
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                        image.mime.clone(),
+                    )),
+                )))
+            })
+            .collect(),
         TranscriptKind::Permission(_) | TranscriptKind::Question { .. } => vec![],
     }
+}
+
+/// Image blocks of an ACP prompt as daemon attachments, in order. The daemon
+/// prepares (downscales, re-encodes) and stores them.
+pub fn prompt_content_to_attachments(prompt: &[ContentBlock]) -> Vec<Attachment> {
+    prompt
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(img) => Some(Attachment {
+                mime: img.mime_type.clone(),
+                data: img.data.clone(),
+                name: None,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Extracts plain prompt text from ACP prompt content blocks.
@@ -468,6 +502,7 @@ pub fn prompt_content_to_text(prompt: &[ContentBlock]) -> String {
             ContentBlock::Text(t) => {
                 text_parts.push(t.text.clone());
             }
+            // Images travel as attachments, see `prompt_content_to_attachments`.
             ContentBlock::Image(_) => {}
             ContentBlock::Audio(_) => {}
             ContentBlock::Resource(r) => match &r.resource {

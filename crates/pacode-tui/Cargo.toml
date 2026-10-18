@@ -17,6 +17,7 @@ pacode-client = { workspace = true }
 pacode-render = { workspace = true }
 pacode-import = { workspace = true }
 pacode-image = { workspace = true }
+base64 = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "process"] }
@@ -33,5 +34,6 @@ arboard = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+image = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }

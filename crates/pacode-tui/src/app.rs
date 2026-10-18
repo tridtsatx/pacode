@@ -51,6 +51,8 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     let mut term_guard = TerminalGuard::enter(opts.config.ui.mouse)?;
 
     let client_paths = opts.client.paths.clone();
+    // Inline images are read from the daemon's content-addressed store.
+    pacode_image::store::init(client_paths.images_dir());
     let (client, mut events) = Client::connect(opts.client).await?;
     let snapshot = client.attach(opts.attach.clone()).await?;
     let session_id = snapshot.meta.id.clone();
@@ -91,7 +93,12 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     }
 
     if let Some(prompt) = opts.initial_prompt {
-        let _ = client.ok(Request::UserMessage { text: prompt }).await;
+        let _ = client
+            .ok(Request::UserMessage {
+                text: prompt,
+                attachments: Vec::new(),
+            })
+            .await;
     }
 
     let mut term_events = EventStream::new();
@@ -103,6 +110,16 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         let tx = bg_tx.clone();
         tokio::spawn(async move {
             let res = cl.request(Request::ListPlugins).await;
+            let _ = tx.send(BgResponse::Reply(res));
+        });
+    }
+
+    // The footer and `/effort` need the current model's reasoning levels.
+    {
+        let cl = Arc::clone(&client);
+        let tx = bg_tx.clone();
+        tokio::spawn(async move {
+            let res = cl.request(Request::ListModels).await;
             let _ = tx.send(BgResponse::Reply(res));
         });
     }
@@ -284,6 +301,8 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                         Event::Resize(w, h) => {
                             state.cols = w;
                             state.rows = h;
+                            state.transcript.images.clear();
+                            state.panel.agent_transcript.images.clear();
                             state.dirty = true;
                             vec![]
                         }
@@ -496,11 +515,13 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
         }
         BgResponse::Reply(Ok(Reply::Models { models })) => {
             state.models = models;
+            state.refresh_model_picker();
             state.dirty = true;
             vec![]
         }
         BgResponse::Reply(Ok(Reply::AuthStatus { providers })) => {
             state.auth_providers = providers;
+            state.refresh_model_picker();
             state.dirty = true;
             vec![]
         }
@@ -568,7 +589,10 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                 vec![]
             }
             PluginCommandOutcome::SendPrompt { text } => {
-                vec![Action::Send(Request::UserMessage { text })]
+                vec![Action::Send(Request::UserMessage {
+                    text,
+                    attachments: Vec::new(),
+                })]
             }
             PluginCommandOutcome::Nothing => vec![],
         },

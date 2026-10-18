@@ -11,7 +11,7 @@ async fn test_access_token_fresh_token_untouched() {
         .as_secs() as i64;
 
     let account = Account {
-        label: "claude-1".to_string(),
+        label: "openai-1".to_string(),
         kind: "oauth".to_string(),
         access: "fresh_access_token".to_string(),
         refresh: Some("my_refresh_token".to_string()),
@@ -20,9 +20,9 @@ async fn test_access_token_fresh_token_untouched() {
         extra: serde_json::Map::new(),
     };
 
-    store.upsert("claude", account);
+    store.upsert("openai", account);
 
-    let token = access_token_in(&mut store, "claude")
+    let token = access_token_in(&mut store, "openai")
         .await
         .expect("get fresh token");
 
@@ -40,7 +40,7 @@ async fn test_access_token_expired_token_refreshed_once() {
         .as_secs() as i64;
 
     let account = Account {
-        label: "claude-1".to_string(),
+        label: "openai-1".to_string(),
         kind: "oauth".to_string(),
         access: "stale_access_token".to_string(),
         refresh: Some("active_refresh_token".to_string()),
@@ -48,7 +48,7 @@ async fn test_access_token_expired_token_refreshed_once() {
         email: Some("user@test.com".to_string()),
         extra: serde_json::Map::new(),
     };
-    store.upsert("claude", account);
+    store.upsert("openai", account);
 
     let refresh_response = serde_json::json!({
         "access_token": "brand_new_access_token",
@@ -60,7 +60,7 @@ async fn test_access_token_expired_token_refreshed_once() {
     let (port, handle) = crate::flows::test_support::mock_server(200, &refresh_response).await;
     let mock_url = format!("http://127.0.0.1:{port}/oauth/token");
 
-    let token = access_token_in_with_endpoint(&mut store, "claude", Some(&mock_url))
+    let token = access_token_in_with_endpoint(&mut store, "openai", Some(&mock_url))
         .await
         .expect("refresh expired token");
 
@@ -70,7 +70,7 @@ async fn test_access_token_expired_token_refreshed_once() {
     assert_eq!(recorded.method, "POST");
 
     // Verify store was mutated with new token and new expiry
-    let updated = store.get("claude").expect("updated account");
+    let updated = store.get("openai").expect("updated account");
     assert_eq!(updated.access, "brand_new_access_token");
     assert_eq!(updated.refresh.as_deref(), Some("next_refresh_token"));
     assert!(updated.expires_at.unwrap() >= now_secs + 3500);
@@ -87,7 +87,7 @@ async fn test_access_token_expiring_within_60s_refreshes() {
         .as_secs() as i64;
 
     let account = Account {
-        label: "claude-soon".to_string(),
+        label: "openai-soon".to_string(),
         kind: "oauth".to_string(),
         access: "about_to_expire".to_string(),
         refresh: Some("active_refresh_token".to_string()),
@@ -95,7 +95,7 @@ async fn test_access_token_expiring_within_60s_refreshes() {
         email: None,
         extra: serde_json::Map::new(),
     };
-    store.upsert("claude", account);
+    store.upsert("openai", account);
 
     let refresh_response = serde_json::json!({
         "access_token": "renewed_access_token",
@@ -106,7 +106,7 @@ async fn test_access_token_expiring_within_60s_refreshes() {
     let (port, _handle) = crate::flows::test_support::mock_server(200, &refresh_response).await;
     let mock_url = format!("http://127.0.0.1:{port}/oauth/token");
 
-    let token = access_token_in_with_endpoint(&mut store, "claude", Some(&mock_url))
+    let token = access_token_in_with_endpoint(&mut store, "openai", Some(&mock_url))
         .await
         .expect("refresh token expiring within 60s");
 
@@ -124,7 +124,7 @@ async fn test_access_token_refresh_failure_surfaced_and_terminal() {
         .as_secs() as i64;
 
     let account = Account {
-        label: "claude-term".to_string(),
+        label: "openai-term".to_string(),
         kind: "oauth".to_string(),
         access: "old_token".to_string(),
         refresh: Some("revoked_refresh_token".to_string()),
@@ -132,9 +132,9 @@ async fn test_access_token_refresh_failure_surfaced_and_terminal() {
         email: None,
         extra: serde_json::Map::new(),
     };
-    store.upsert("claude", account);
+    store.upsert("openai", account);
 
-    clear_refresh_state_for_test("claude:claude-term");
+    clear_refresh_state_for_test("openai:openai-term");
 
     let error_body = serde_json::json!({
         "error": "invalid_grant",
@@ -146,13 +146,13 @@ async fn test_access_token_refresh_failure_surfaced_and_terminal() {
     let mock_url = format!("http://127.0.0.1:{port}/oauth/token");
 
     // First call: hits mock server, fails, records terminal error
-    let err1 = access_token_in_with_endpoint(&mut store, "claude", Some(&mock_url))
+    let err1 = access_token_in_with_endpoint(&mut store, "openai", Some(&mock_url))
         .await
         .expect_err("should fail with invalid_grant");
     assert!(format!("{err1}").contains("invalid_grant"));
 
     // Second call: does NOT hit network, immediately blocked by terminal failure in RefreshState
-    let err2 = access_token_in_with_endpoint(&mut store, "claude", Some(&mock_url))
+    let err2 = access_token_in_with_endpoint(&mut store, "openai", Some(&mock_url))
         .await
         .expect_err("should immediately fail due to terminal state");
     assert!(format!("{err2}").contains("terminal failure"));
@@ -205,11 +205,11 @@ fn test_auth_client_proxy_resolution_and_validation() {
     let cfg: pacode_types::Config = serde_json::from_value(serde_json::json!({
         "provider": { "proxy": "http://global:8080" },
         "providers": {
-            "claude": { "proxy": "http://prov:8080", "base_url": "https://api.anthropic.com" }
+            "openai": { "proxy": "http://prov:8080", "base_url": "https://api.openai.com" }
         }
     }))
     .unwrap();
-    let client = auth_client_from_config(&cfg, "claude");
+    let client = auth_client_from_config(&cfg, "openai");
     assert!(client.is_ok());
 
     // 2. Global applies when provider has none
@@ -237,15 +237,15 @@ fn test_auth_client_proxy_resolution_and_validation() {
     // 4. Malformed proxy produces AuthError::Config naming provider and offending value
     let cfg_bad: pacode_types::Config = serde_json::from_value(serde_json::json!({
         "providers": {
-            "claude": { "proxy": "unsupported-scheme://host:9090", "base_url": "https://api.anthropic.com" }
+            "openai": { "proxy": "unsupported-scheme://host:9090", "base_url": "https://api.openai.com" }
         }
     }))
     .unwrap();
-    let res = auth_client_from_config(&cfg_bad, "claude");
+    let res = auth_client_from_config(&cfg_bad, "openai");
     assert!(res.is_err());
     match res {
         Err(AuthError::Config(msg)) => {
-            assert!(msg.contains("claude"), "error must name provider: {msg}");
+            assert!(msg.contains("openai"), "error must name provider: {msg}");
             assert!(
                 msg.contains("unsupported-scheme://host:9090"),
                 "error must name offending value: {msg}"
@@ -277,21 +277,18 @@ async fn test_auth_client_routes_through_proxy() {
 
     let cfg: pacode_types::Config = serde_json::from_value(serde_json::json!({
         "providers": {
-            "claude": { "proxy": format!("http://{proxy_addr}"), "base_url": "https://api.anthropic.com" }
+            "openai": { "proxy": format!("http://{proxy_addr}"), "base_url": "https://api.openai.com" }
         }
     }))
     .unwrap();
 
-    let client = auth_client_from_config(&cfg, "claude").expect("client builds");
-    let resp = client
-        .post("http://anthropic.auth.test:80/token")
-        .send()
-        .await;
+    let client = auth_client_from_config(&cfg, "openai").expect("client builds");
+    let resp = client.post("http://openai.auth.test:80/token").send().await;
     assert!(resp.is_ok());
 
     let received = proxy_handle.await.unwrap();
     assert!(
-        received.starts_with("POST http://anthropic.auth.test/token HTTP/1.1"),
+        received.starts_with("POST http://openai.auth.test/token HTTP/1.1"),
         "expected auth request to reach proxy with absolute URI, got: {received}"
     );
 }

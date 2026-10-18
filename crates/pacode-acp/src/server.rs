@@ -17,6 +17,8 @@ use crate::session::SessionManager;
 
 /// Runs the ACP agent server over stdio until EOF or disconnect.
 pub async fn run_server(client_opts: ClientOptions, _config: Config) -> Result<(), AcpError> {
+    // Image bytes live in the daemon's shared store; replayed images are read from it.
+    pacode_image::store::init(client_opts.paths.images_dir());
     let session_mgr = Arc::new(SessionManager::new(client_opts));
 
     let mgr_new = Arc::clone(&session_mgr);

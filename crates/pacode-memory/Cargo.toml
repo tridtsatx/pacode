@@ -1,0 +1,19 @@
+[package]
+name = "pacode-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Shared (global) and per-project agent memory: SQLite + FTS5 store, dedupe, ranked recall, prompt index"
+
+[dependencies]
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

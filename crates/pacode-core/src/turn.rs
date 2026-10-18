@@ -26,7 +26,9 @@
 
 pub(crate) mod lifecycle;
 pub(crate) mod stream;
+pub(crate) mod todo_guard;
 pub(crate) mod tools;
+pub(crate) mod wake;
 
 pub(crate) use lifecycle::emit_failure_notice;
 pub use lifecycle::start_turn;
@@ -99,6 +101,7 @@ pub async fn run_turn(
     *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(prompt_cache.clone());
 
     let mut turn_usage = Usage::default();
+    let mut todo_guard = todo_guard::TodoGuard::default();
 
     loop {
         if cancel.is_cancelled() {
@@ -112,6 +115,9 @@ pub async fn run_turn(
             )
             .await;
         }
+
+        // A turn that begins on an idle agent must see what woke it.
+        wake::absorb_pending(&session, &agent).await;
 
         let system_dynamic = {
             let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
@@ -336,6 +342,13 @@ pub async fn run_turn(
         if outcome.tool_calls.is_empty() {
             let drained = agent.injections.drain();
             if drained.is_empty() {
+                // Unfinished-todo guard: remind instead of ending with open plan items.
+                if todo_guard
+                    .remind(&session, &agent, cancel.is_cancelled(), &outcome.text)
+                    .await
+                {
+                    continue;
+                }
                 break;
             } else {
                 let injection_msg = crate::inject::render_injections(
@@ -355,6 +368,7 @@ pub async fn run_turn(
             }
         }
 
+        todo_guard.note_calls(&outcome.tool_calls);
         let tool_interrupted =
             tools::execute_tool_calls(&session, &agent, &cancel, outcome.tool_calls).await;
         if tool_interrupted || cancel.is_cancelled() {
@@ -405,7 +419,7 @@ pub async fn run_turn(
         );
         let threshold = session.config.context.compaction_threshold;
         if crate::compaction::needs_compaction(last_input_tokens, context_window, threshold) {
-            let _ = crate::compaction::compact(&session, &agent).await;
+            let _ = crate::compaction::compact_auto(&session, &agent, last_input_tokens).await;
         }
 
         if !agent.id().is_main() {

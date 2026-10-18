@@ -16,17 +16,22 @@ pacode-config = { workspace = true }
 pacode-auth = { workspace = true }
 pacode-skills = { workspace = true }
 pacode-provider = { workspace = true }
+pacode-image = { workspace = true }
 pacode-tools = { workspace = true }
 pacode-exec = { workspace = true }
 pacode-mcp = { workspace = true }
 pacode-plugin = { workspace = true }
 pacode-store = { workspace = true }
+pacode-rules = { workspace = true }
+pacode-memory = { workspace = true }
+pacode-import = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "fs", "process", "io-util"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
+similar = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
@@ -34,5 +39,7 @@ croner = { version = "4", default-features = false, features = ["chrono"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 pretty_assertions = { workspace = true }

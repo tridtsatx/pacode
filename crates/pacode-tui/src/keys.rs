@@ -100,6 +100,12 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
+    // Permission-mode cycle is resolved before the chord, overlay and vim handlers
+    // below, which all return early and could otherwise swallow shift+tab / alt+m.
+    if state.keymap.action_for(key) == Some(KeyAction::CycleMode) {
+        return vec![Action::Send(Request::SetMode(state.mode().next()))];
+    }
+
     // 1.5 While an overlay is open, ALL keys go to it (fixes focus leak to input).
     if matches!(state.focus, Focus::Overlay(Overlay::Import(_))) {
         // The handler needs `&mut AppState` too, so take the overlay out and put
@@ -152,11 +158,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![Action::Send(Request::ListSessions { limit: 50 })];
     }
 
-    // 3. Shift+Tab: cycle permission mode; plain Tab: autocomplete slash command / @ / bash
-    if action == Some(KeyAction::CycleMode) {
-        let next_mode = state.mode().next();
-        return vec![Action::Send(Request::SetMode(next_mode))];
-    }
+    // 3. Plain Tab: autocomplete slash command / @ / bash (shift+tab cycles mode above)
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
         // First check @ completion
         let byte_cursor =
@@ -169,6 +171,12 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             if !candidates.is_empty() {
                 let sel = state.input.at_index % candidates.len();
                 let cand = candidates[sel].clone();
+                if !cand.is_dir
+                    && crate::attachments::is_image_path(&cand.path)
+                    && state.attach_at_candidate(q.at_byte_index, byte_cursor, &cand.path)
+                {
+                    return vec![];
+                }
                 let prefix = state.input.text[..q.at_byte_index].to_string();
                 let suffix = state.input.text[byte_cursor..].to_string();
                 let insert = format!("@{}", cand.path);
@@ -404,10 +412,8 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         // agent that takes its place. Nothing in flight is discarded.
         let text = state.input.take();
         state.pasted_images.mark_submitted(&text);
-        return vec![
-            Action::Send(Request::DetachTurn),
-            Action::Send(Request::UserMessage { text }),
-        ];
+        let message = state.build_user_message(text);
+        return vec![Action::Send(Request::DetachTurn), Action::Send(message)];
     }
 
     // 10. Enter key
@@ -427,6 +433,12 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
             if !candidates.is_empty() {
                 let sel = state.input.at_index % candidates.len();
                 let cand = candidates[sel].clone();
+                if !cand.is_dir
+                    && crate::attachments::is_image_path(&cand.path)
+                    && state.attach_at_candidate(q.at_byte_index, byte_cursor, &cand.path)
+                {
+                    return vec![];
+                }
                 let prefix = state.input.text[..q.at_byte_index].to_string();
                 let suffix = state.input.text[byte_cursor..].to_string();
                 let insert = format!("@{}", cand.path);
@@ -729,7 +741,7 @@ fn submit_prompt(state: &mut AppState) -> Vec<Action> {
                 return vec![Action::RunBashCaptured { command: cmd }];
             }
         }
-        return vec![Action::Send(Request::UserMessage { text })];
+        return vec![Action::Send(state.build_user_message(text))];
     }
     vec![]
 }

@@ -15,8 +15,12 @@
 //! - `host`: `ToolHost` implementation handed to tools
 //! - `hooks`: user `[hooks]` shell commands on tool/lifecycle events
 //! - `naming`: session title generation after the first reply
+//! - `ledger`: file ownership between agents sharing one working tree
 
 pub mod agent;
+pub mod agent_comm;
+mod agent_comm_flow;
+mod attach;
 pub mod auth;
 pub mod compaction;
 pub mod core;
@@ -24,6 +28,7 @@ pub mod expand;
 pub mod hooks;
 pub mod host;
 pub mod inject;
+pub mod ledger;
 pub mod naming;
 pub mod permissions;
 pub mod prompt;
@@ -31,6 +36,8 @@ pub mod questions;
 pub mod sampling;
 pub mod schedule;
 pub mod session;
+mod session_efforts;
+pub mod style_guard;
 pub mod transcript;
 pub mod turn;
 

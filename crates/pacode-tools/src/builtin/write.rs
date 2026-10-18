@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{is_outside_workspace, parse_input};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use super::helpers::{is_outside_workspace, parse_input, write_atomic};
+use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WriteIntent};
 
 pub const NAME: &str = "write";
 
@@ -27,8 +27,17 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create or overwrite a file with the given content. Parent directories are \
-         created. Prefer `edit` for changes to existing files."
+        // Formatted once from constant text (not a cache: nothing to invalidate).
+        static DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "Create or overwrite a file with the given content. Parent directories are \
+                 created. Prefer `edit` for changes to existing files: a full overwrite is \
+                 rejected when it would revert lines another agent changed after your read. \
+                 New files need no prior read. {}",
+                super::edit::CONCURRENCY_NOTE
+            )
+        });
+        DESCRIPTION.as_str()
     }
 
     fn schema(&self) -> Value {
@@ -59,6 +68,8 @@ impl Tool for WriteTool {
             return Err(ToolError::invalid("content contains NUL byte"));
         }
         let full_path = ctx.resolve(Path::new(&args.path));
+        // Read, ledger check and write all happen under the path's write lock.
+        let _lock = ctx.host.ledger_lock(std::slice::from_ref(&full_path)).await;
 
         let old_content = match tokio::fs::read(&full_path).await {
             Ok(bytes) => {
@@ -76,6 +87,16 @@ impl Tool for WriteTool {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(ToolError::Io(e)),
         };
+        let pass = ctx
+            .host
+            .ledger_check(
+                &ctx.agent,
+                &full_path,
+                WriteIntent::Write,
+                old_content.as_deref(),
+                Some(args.content.as_str()),
+            )
+            .await?;
 
         let rel_path = full_path
             .strip_prefix(&ctx.cwd)
@@ -110,12 +131,17 @@ impl Tool for WriteTool {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let tmp_path = format!("{}.pacode-tmp", full_path.to_string_lossy());
-        tokio::fs::write(&tmp_path, args.content.as_bytes()).await?;
-        tokio::fs::rename(&tmp_path, &full_path).await?;
+        write_atomic(&full_path, &args.content).await?;
+        ctx.host
+            .ledger_record_write(&ctx.agent, &full_path, &args.content)
+            .await;
 
         let line_count = args.content.lines().count();
-        let content_msg = format!("Wrote {} bytes to {rel_path}", args.content.len());
+        let mut content_msg = format!("Wrote {} bytes to {rel_path}", args.content.len());
+        if let Some(note) = pass.note {
+            content_msg.push_str("\n\n");
+            content_msg.push_str(&note);
+        }
         let preview = format!("{line_count} lines");
         let title = format!("Write {rel_path}");
 
@@ -128,3 +154,7 @@ impl Tool for WriteTool {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+#[path = "write_tests.rs"]
+mod write_tests;

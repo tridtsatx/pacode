@@ -378,3 +378,58 @@ fn test_cancel_notification_maps_to_interrupt() {
         | Request::SetAuthAccount { .. } => panic!("expected Request::Interrupt"),
     }
 }
+
+#[test]
+fn test_prompt_images_become_attachments() {
+    let prompt = vec![
+        ContentBlock::Text(TextContent::new("look at this")),
+        ContentBlock::Image(ImageContent::new("AAAA", "image/png")),
+        ContentBlock::Image(ImageContent::new("BBBB", "image/jpeg")),
+    ];
+    assert_eq!(prompt_content_to_text(&prompt), "look at this");
+    let attachments = prompt_content_to_attachments(&prompt);
+    assert_eq!(attachments.len(), 2);
+    assert_eq!(attachments[0].mime, "image/png");
+    assert_eq!(attachments[0].data, "AAAA");
+    assert_eq!(attachments[1].mime, "image/jpeg");
+}
+
+#[test]
+fn test_images_item_replays_as_image_chunks() {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!("pacode-acp-images-{}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("mkdir");
+        path
+    });
+    pacode_image::store::init(dir.clone());
+    let hash = pacode_image::store::put(b"png-bytes", "image/png").expect("put");
+
+    let item = TranscriptItem {
+        seq: 1,
+        agent: AgentId::new("main"),
+        ts_ms: 0,
+        kind: TranscriptKind::Images {
+            images: vec![
+                pacode_types::ImageRef {
+                    hash,
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    name: None,
+                },
+                pacode_types::ImageRef {
+                    hash: "f".repeat(64),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    name: None,
+                },
+            ],
+        },
+    };
+    // The second image is not in the store and is skipped.
+    let updates = transcript_item_to_session_updates(&item);
+    assert_eq!(updates.len(), 1);
+    assert!(matches!(updates[0], SessionUpdate::UserMessageChunk(_)));
+}

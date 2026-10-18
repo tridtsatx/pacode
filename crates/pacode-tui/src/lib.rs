@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod at_complete;
+pub mod attachments;
 pub mod bash;
 pub mod binding;
 pub mod clipboard;

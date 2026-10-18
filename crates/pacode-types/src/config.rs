@@ -21,6 +21,7 @@ pub struct Config {
     pub pricing: BTreeMap<String, Pricing>,
     pub ui: UiConfig,
     pub exec: ExecConfig,
+    pub resources: ResourcesConfig,
     pub agents: AgentsConfig,
     pub daemon: DaemonConfig,
     pub context: ContextConfig,
@@ -33,7 +34,10 @@ pub struct Config {
     pub font: FontConfig,
     pub keys: KeysConfig,
     pub web: WebConfig,
+    pub read: ReadConfig,
     pub hooks: HooksConfig,
+    pub rules: RulesConfig,
+    pub memory: MemoryConfig,
 }
 
 impl Config {
@@ -332,6 +336,50 @@ impl Default for ExecConfig {
     }
 }
 
+/// `[resources]`: machine-resource guard for supervised processes. Soft limits:
+/// a breach must persist for `grace_secs` before anything is stopped, and a stop is
+/// SIGTERM first, SIGKILL only after `term_wait_secs`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourcesConfig {
+    pub enabled: bool,
+    /// Share of total memory (or of the cgroup limit when lower) that must stay free.
+    pub min_free_percent: u8,
+    /// Extra MB below the reserve tolerated before it counts as a breach.
+    pub overshoot_mb: u64,
+    /// A breach must persist this long before a process tree is stopped.
+    pub grace_secs: u64,
+    /// SIGTERM, wait this long, then SIGKILL.
+    pub term_wait_secs: u64,
+    /// Hard cap for one process tree as % of total memory; 0 = off.
+    pub max_process_percent: u8,
+    /// Niceness for spawned processes; 0 = off.
+    pub nice: i32,
+    /// Free MB required on the output spool directory.
+    pub min_free_disk_mb: u64,
+    /// Sampling interval in ms while memory is comfortably above the reserve.
+    pub sample_ms_idle_headroom: u64,
+    /// Sampling interval in ms near or below the reserve.
+    pub sample_ms_pressure: u64,
+}
+
+impl Default for ResourcesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_free_percent: 20,
+            overshoot_mb: 512,
+            grace_secs: 10,
+            term_wait_secs: 5,
+            max_process_percent: 0,
+            nice: 10,
+            min_free_disk_mb: 512,
+            sample_ms_idle_headroom: 1000,
+            sample_ms_pressure: 200,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsConfig {
@@ -341,6 +389,14 @@ pub struct AgentsConfig {
     pub default_effort: Option<Effort>,
     /// Max tool-calling turns for one subagent before it is stopped.
     pub max_turns: u32,
+    /// Remind the model when it ends its turn with open plan items.
+    pub todo_guard: bool,
+    /// Max todo-guard reminders per user turn.
+    pub todo_guard_max_reminders: u32,
+    /// Seconds a subagent's blocking `ask_parent` waits for the orchestrator.
+    pub ask_parent_timeout_secs: u64,
+    /// Most questions one subagent may put to the orchestrator in its lifetime.
+    pub ask_parent_max: u32,
 }
 
 impl Default for AgentsConfig {
@@ -350,6 +406,10 @@ impl Default for AgentsConfig {
             default_model: None,
             default_effort: None,
             max_turns: 200,
+            todo_guard: true,
+            todo_guard_max_reminders: 2,
+            ask_parent_timeout_secs: 600,
+            ask_parent_max: 5,
         }
     }
 }
@@ -381,8 +441,13 @@ pub struct ContextConfig {
     pub instructions_cap_chars: usize,
     pub memory_cap_chars: usize,
     pub compaction_model: Option<String>,
-    /// Recent messages kept verbatim after compaction.
+    /// Recent messages kept verbatim after a summary compaction.
     pub keep_recent_messages: usize,
+    /// Compaction aims to end at or below this fraction of the context window
+    /// (default 0.40). Stages stop as soon as the target is met.
+    pub compaction_target_ratio: f32,
+    /// Tool results of the last N user turns are never shaken into stubs (default 6).
+    pub keep_recent_turns: usize,
     /// Used when neither the provider nor the config knows the window.
     pub default_context_window: u32,
 }
@@ -397,6 +462,8 @@ impl Default for ContextConfig {
             memory_cap_chars: 8_000,
             compaction_model: None,
             keep_recent_messages: 6,
+            compaction_target_ratio: 0.40,
+            keep_recent_turns: 6,
             default_context_window: 128_000,
         }
     }
@@ -548,6 +615,71 @@ impl Default for WebConfig {
         Self {
             default_num_results: 8,
             request_timeout_secs: 15,
+        }
+    }
+}
+
+/// `[read]`: the `read` tool.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadConfig {
+    /// Files with more lines than this are returned as an outline (signatures kept,
+    /// bodies elided) when their language is supported and the outline is clearly
+    /// shorter. `0` turns automatic outlines off (`mode:"outline"` still works).
+    pub outline_threshold: usize,
+}
+
+impl Default for ReadConfig {
+    fn default() -> Self {
+        Self {
+            outline_threshold: 400,
+        }
+    }
+}
+
+/// `[rules]`: code-style guard rules (`pacode-rules`). Rule files live in
+/// `<project>/.pacode/rules/*.md` and `<config dir>/rules/*.md`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RulesConfig {
+    /// Master switch; `false` disables scanning entirely.
+    pub enabled: bool,
+    /// Load the built-in Rust/TypeScript packs.
+    pub builtin: bool,
+    /// Rule names removed from every layer (built-in, global, project).
+    pub disable: Vec<String>,
+    /// Allow `mode: stream` rules to cut a write/edit call short while its
+    /// arguments are still streaming. `false` = after-write checks only.
+    pub stream: bool,
+}
+
+impl Default for RulesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            builtin: true,
+            disable: Vec::new(),
+            stream: true,
+        }
+    }
+}
+
+/// `[memory]`: shared (global) and per-project agent memory (`pacode-memory`). The prompt
+/// injection size reuses `[context].memory_cap_chars`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Inject pinned entries + a recent index into the system prompt.
+    pub enabled: bool,
+    /// Hybrid semantic recall (needs an embedder; none ships yet, so this is a no-op).
+    pub embeddings: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            embeddings: false,
         }
     }
 }

@@ -17,7 +17,7 @@ fn make_provider(
 ) -> OpenAiCompat {
     let cfg = ProviderConfig {
         kind: Default::default(),
-        base_url: "https://api.openai.com/v1".to_string(),
+        base_url: "https://llm.example.test/v1".to_string(),
         api_key: None,
         api_key_env: None,
         models,
@@ -339,7 +339,7 @@ fn test_model_info() {
 
     let cfg = ProviderConfig {
         kind: Default::default(),
-        base_url: "https://api.openai.com/v1".to_string(),
+        base_url: "https://llm.example.test/v1".to_string(),
         api_key: None,
         api_key_env: None,
         models: vec![ModelConfig {
@@ -385,7 +385,7 @@ fn test_model_info() {
 async fn test_list_models_catalog_false() {
     let cfg = ProviderConfig {
         kind: Default::default(),
-        base_url: "https://api.openai.com/v1".to_string(),
+        base_url: "https://llm.example.test/v1".to_string(),
         api_key: None,
         api_key_env: None,
         models: vec![
@@ -687,7 +687,7 @@ async fn test_provider_with_proxy_routes_through_proxy_rather_than_base_url() {
 #[test]
 fn test_provider_malformed_proxy_names_provider_and_offending_value() {
     let cfg = ProviderConfig {
-        base_url: "https://api.openai.com/v1".to_string(),
+        base_url: "https://llm.example.test/v1".to_string(),
         proxy: Some("invalid-proxy-scheme://host:1234".to_string()),
         ..Default::default()
     };

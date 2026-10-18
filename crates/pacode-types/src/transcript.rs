@@ -65,6 +65,12 @@ pub enum TranscriptKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answer: Option<crate::question::QuestionAnswer>,
     },
+    /// Images shown right below the preceding item: the user message or the tool
+    /// call that carried them. Bytes are not on the wire; clients load them from the
+    /// image store by hash.
+    Images {
+        images: Vec<crate::ImageRef>,
+    },
     BashCommand {
         command: String,
         output: String,

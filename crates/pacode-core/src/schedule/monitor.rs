@@ -35,8 +35,10 @@ pub async fn check_condition(condition: &MonitorCondition, cwd: &Path) -> Result
             run_shell(command, cwd).await.map(|code| code == 0)
         }
         MonitorCondition::ProcessGone { pattern } => {
-            // `pgrep` exits 1 when nothing matches, which is exactly "gone".
-            let command = format!("pgrep -f -- {}", shell_quote(pattern));
+            // `pgrep` exits 1 when nothing matches, which is exactly "gone". `exec`
+            // replaces the wrapping `sh -c`, whose own command line carries the
+            // pattern and would otherwise always match (dash does not exec by itself).
+            let command = format!("exec pgrep -f -- {}", shell_quote(pattern));
             run_shell(&command, cwd).await.map(|code| code != 0)
         }
         MonitorCondition::FileExists { path } => {

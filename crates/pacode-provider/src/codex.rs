@@ -308,6 +308,8 @@ impl Provider for Codex {
     async fn complete(&self, req: CompletionRequest) -> Result<EventStream, ProviderError> {
         let url = self.endpoint();
         let headers = self.build_headers();
+        let info = self.model_info(&req.model);
+        let req = gate_images(req, &info)?;
         let body = self.build_body(&req);
         let max_retries = self.defaults.max_retries;
 
@@ -320,7 +322,7 @@ impl Provider for Codex {
         log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
 
         let serialized_body = serde_json::to_string(&body).unwrap_or_default();
-        let body_redacted = redact(&serialized_body);
+        let body_redacted = redact(&crate::vision::redact_data_urls(&serialized_body));
         log::trace!("request body: {body_redacted}");
 
         let effort = req.effort.unwrap_or(self.defaults.effort);
@@ -372,12 +374,30 @@ impl Provider for Codex {
 
         let pricing = self.pricing.get(model).copied();
 
-        ModelInfo {
+        let mut info = ModelInfo {
             route: ModelRoute::new(self.id.clone(), model),
             display_name,
             context_window,
             supports_reasoning,
+            vision: crate::vision::heuristic_vision(model),
             pricing,
-        }
+            kind: crate::model_meta::kind_from_id(model),
+            ..ModelInfo::default()
+        };
+        // The Responses API takes low / medium / high.
+        crate::model_meta::finish(&mut info, crate::ReasoningWire::ReasoningEffort);
+        info
     }
+}
+
+/// Reject images for text-only models; strip stale ones from old history.
+fn gate_images(
+    mut req: CompletionRequest,
+    info: &ModelInfo,
+) -> Result<CompletionRequest, ProviderError> {
+    if !req.messages.iter().any(pacode_types::Message::has_images) {
+        return Ok(req);
+    }
+    req.messages = crate::vision::gate_images(&req.messages, &req.model, info.vision)?.into_owned();
+    Ok(req)
 }

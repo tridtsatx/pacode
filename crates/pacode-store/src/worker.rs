@@ -311,6 +311,19 @@ impl Store {
             .await
     }
 
+    /// Persist a compaction run (summary and/or stats) in the `compaction` table.
+    pub async fn record_compaction(
+        &self,
+        session: &SessionId,
+        agent: &AgentId,
+        record: queries::CompactionRecord,
+    ) -> Result<(), StoreError> {
+        let session = session.clone();
+        let agent = agent.clone();
+        self.call(move |conn| queries::record_compaction(conn, &session, &agent, &record))
+            .await
+    }
+
     pub async fn load_compaction(
         &self,
         session: &SessionId,

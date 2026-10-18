@@ -49,71 +49,67 @@ fn test_load_memory_skipping_missing_files() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&proj).unwrap();
 
-    // 1. Neither exists -> None
+    // 1. Neither exists -> None, and nothing is created on disk
     assert!(load_memory(&proj, Some(&home), 8000).is_none());
+    assert!(!home.join("memory.db").exists());
+    assert!(!proj.join(".pacode").exists());
 
-    // 2. Only global exists
+    // 2. Only global exists (legacy memory.md is imported as pinned entries)
     std::fs::write(home.join("memory.md"), "- global note 1\n- global note 2\n").unwrap();
     let loaded_global = load_memory(&proj, Some(&home), 8000).unwrap();
     assert!(loaded_global.starts_with("# Memory (global)"));
     assert!(loaded_global.contains("- global note 1"));
     assert!(loaded_global.contains("- global note 2"));
+    assert!(loaded_global.contains("memory_recall"));
     assert!(!loaded_global.contains("# Memory (project)"));
+    assert!(home.join("memory.md.migrated").exists());
 
     // 3. Only project exists
-    std::fs::remove_file(home.join("memory.md")).unwrap();
-    let proj_pacode = proj.join(".pacode");
-    std::fs::create_dir_all(&proj_pacode).unwrap();
-    std::fs::write(proj_pacode.join("memory.md"), "- proj note 1\n").unwrap();
-    let loaded_proj = load_memory(&proj, Some(&home), 8000).unwrap();
+    let home2 = tmp.path().join("home_config2");
+    let proj2 = tmp.path().join("proj2");
+    std::fs::create_dir_all(&home2).unwrap();
+    std::fs::create_dir_all(proj2.join(".pacode")).unwrap();
+    std::fs::write(proj2.join(".pacode").join("memory.md"), "- proj note 1\n").unwrap();
+    let loaded_proj = load_memory(&proj2, Some(&home2), 8000).unwrap();
     assert!(!loaded_proj.contains("# Memory (global)"));
     assert!(loaded_proj.starts_with("# Memory (project)"));
     assert!(loaded_proj.contains("- proj note 1"));
 }
 
 #[test]
-fn test_load_memory_capping_keeps_tail() {
+fn test_load_memory_cap_drops_index_lines_first() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home_config");
     let proj = tmp.path().join("proj");
-    let proj_pacode = proj.join(".pacode");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&proj_pacode).unwrap();
+    std::fs::create_dir_all(proj.join(".pacode")).unwrap();
 
-    // Global has older notes; project has newer notes
-    std::fs::write(
-        home.join("memory.md"),
-        "- global line 1 (oldest)\n- global line 2\n- global line 3\n",
-    )
-    .unwrap();
-    std::fs::write(
-        proj_pacode.join("memory.md"),
-        "- proj line 1\n- proj line 2 (newest)\n",
-    )
-    .unwrap();
+    // 25 bullets: the first 20 are pinned, the last 5 become index lines.
+    let md: String = (0..25).map(|i| format!("- global line {i}\n")).collect();
+    std::fs::write(home.join("memory.md"), md).unwrap();
 
     let full = load_memory(&proj, Some(&home), 8000).unwrap();
-    assert!(full.contains("global line 1"));
-    assert!(full.contains("proj line 2"));
+    assert!(full.contains("global line 0 ("));
+    assert!(full.contains("Recent (index only)"));
+    assert!(full.contains("global line 24"));
+    assert!(!full.contains("more memories omitted"));
 
-    // Cap to length that drops oldest global line(s) and includes visible marker
-    let capped = load_memory(&proj, Some(&home), 90).unwrap();
-    assert!(capped.chars().count() <= 90);
-    // Newest line must be kept
-    assert!(capped.contains("proj line 2 (newest)"));
-    // Oldest global line must be dropped
-    assert!(!capped.contains("global line 1 (oldest)"));
-    assert!(capped.contains("characters truncated"));
+    // Same store, same text: byte-identical (prompt-cache friendly).
+    assert_eq!(full, load_memory(&proj, Some(&home), 8000).unwrap());
 
-    // Even tighter cap drops all global lines and keeps only project tail
+    let capped = load_memory(&proj, Some(&home), 700).unwrap();
+    assert!(capped.chars().count() <= 700);
+    assert!(capped.contains("more memories omitted"));
+    assert!(!capped.contains("Recent (index only)"));
+    assert!(capped.contains("global line 0 ("));
+
     let tight = load_memory(&proj, Some(&home), 50).unwrap();
     assert!(tight.chars().count() <= 50);
-    assert!(!tight.contains("# Memory (global)"));
-    assert!(tight.contains("proj line 2 (newest)"));
+    assert!(load_memory(&proj, Some(&home), 0).is_none());
 }
 
 #[test]
-fn test_configured_memory_cap_truncates_with_marker_on_char_boundary() {
+fn test_configured_memory_cap_is_char_boundary_safe() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home_config");
     let proj = tmp.path().join("proj");
@@ -124,40 +120,22 @@ fn test_configured_memory_cap_truncates_with_marker_on_char_boundary() {
     // Multi-byte characters (Cyrillic, emoji, accents) to verify character boundary safety
     let global_text = "- Привет мир: старая глобальная запись ✨ 🦀 12345\n".repeat(10);
     let proj_text = "- Проектная заметка: свежие данные важные для работы 🎯\n";
-
     std::fs::write(home.join("memory.md"), &global_text).unwrap();
     std::fs::write(proj_pacode.join("memory.md"), proj_text).unwrap();
 
-    // With large cap (8000), no truncation occurs
     let untruncated = load_memory(&proj, Some(&home), 8000).unwrap();
-    assert!(!untruncated.contains("characters truncated"));
+    assert!(!untruncated.contains("more memories omitted"));
+    assert!(untruncated.contains("🎯"));
 
-    // With tight configured cap (120 chars), truncation must happen
-    let cap = 120;
-    let truncated = load_memory(&proj, Some(&home), cap).unwrap();
-
-    // 1. Output length is strictly within configured cap
-    assert!(
-        truncated.chars().count() <= cap,
-        "length {} must be <= cap {}",
-        truncated.chars().count(),
-        cap
-    );
-
-    // 2. Visible marker is present and consistent with truncate_head_tail
-    assert!(
-        truncated.contains("[... ") && truncated.contains("characters truncated ...]"),
-        "expected visible marker in: {truncated}"
-    );
-
-    // 3. Newest project notes are kept
-    assert!(
-        truncated.contains("🎯"),
-        "expected newest project content to be preserved"
-    );
-
-    // 4. Multi-byte string slicing didn't panic and produced valid UTF-8
-    assert!(!truncated.is_empty());
+    for cap in [30usize, 120, 400] {
+        let truncated = load_memory(&proj, Some(&home), cap).unwrap();
+        assert!(
+            truncated.chars().count() <= cap,
+            "length {} must be <= cap {cap}",
+            truncated.chars().count()
+        );
+        assert!(!truncated.is_empty());
+    }
 }
 
 #[test]

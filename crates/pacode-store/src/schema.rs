@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Create or upgrade the schema. Idempotent.
 pub fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -143,6 +143,21 @@ pub fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             CREATE INDEX IF NOT EXISTS idx_cron_jobs_session ON cron_jobs(session_id);
 
             PRAGMA user_version = 2;
+            "#,
+        )?;
+        tx.commit()?;
+    }
+
+    if current_version < 3 {
+        // Compaction audit columns: which stage produced the row and token counts.
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            r#"
+            ALTER TABLE compaction ADD COLUMN method TEXT NOT NULL DEFAULT 'summary';
+            ALTER TABLE compaction ADD COLUMN tokens_before INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE compaction ADD COLUMN tokens_after INTEGER NOT NULL DEFAULT 0;
+
+            PRAGMA user_version = 3;
             "#,
         )?;
         tx.commit()?;

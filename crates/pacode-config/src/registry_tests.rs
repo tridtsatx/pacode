@@ -424,3 +424,23 @@ fn test_live_restart_classification_spot_checks() {
         ApplyMode::NextTurn
     );
 }
+
+#[test]
+fn test_read_outline_threshold_setting() {
+    let mut cfg = Config::default();
+    assert_eq!(
+        read_value(&cfg, "read.outline_threshold"),
+        Some("400".to_string())
+    );
+    let entry = find_entry("read.outline_threshold").unwrap();
+    assert_eq!(validate_candidate(entry, "0"), Ok(toml::Value::Integer(0)));
+    assert!(validate_candidate(entry, "-1").is_err());
+    apply_to_config(
+        &mut cfg,
+        "read.outline_threshold",
+        &toml::Value::Integer(900),
+    );
+    assert_eq!(cfg.read.outline_threshold, 900);
+    reset_in_config(&mut cfg, "read.outline_threshold");
+    assert_eq!(cfg.read.outline_threshold, 400);
+}

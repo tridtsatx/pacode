@@ -4,7 +4,9 @@
 pub mod activity;
 pub mod events;
 pub mod files;
+pub mod image_cache;
 pub mod input;
+pub mod model_picker;
 pub mod rail;
 pub mod selection;
 pub mod slots;
@@ -232,6 +234,8 @@ pub struct AppState {
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
+    /// State of the `/model` picker (index, filters, cursor).
+    pub model_picker: model_picker::ModelPickerState,
     /// Providers with auth status for the login picker (filled by `ListAuth` or `AuthUpdated`).
     pub auth_providers: Vec<pacode_types::ProviderAuthInfo>,
     pub sessions: Vec<SessionMeta>,
@@ -269,6 +273,8 @@ pub struct AppState {
     pub running_bash: Option<tokio::sync::oneshot::Sender<()>>,
     /// Temporary files created for pasted images.
     pub pasted_images: crate::clipboard_read::PastedImages,
+    /// Prepared images of the prompt being edited (chips in `input.text`).
+    pub attachments: crate::attachments::PendingAttachments,
     /// Current activity phase and when it started. The activity line ages from
     /// this instant, so the thinking wording and its colour reset after every
     /// tool call instead of drifting with the whole turn.
@@ -318,6 +324,7 @@ impl AppState {
 
     pub fn new(config: Config, app_version: String, cols: u16, rows: u16) -> Self {
         let cells = config.ui.transcript_cells;
+        let images_on = config.ui.images_enabled();
         let paths = pacode_config::Paths::discover();
         let truecolor = match config.ui.color.as_str() {
             "ansi" => false,
@@ -338,10 +345,10 @@ impl AppState {
             meta: None,
             connection: Connection::Connected,
             turn_active: false,
-            transcript: Transcript::new(cells),
+            transcript: Transcript::new(cells).with_images(images_on, truecolor),
             panel: PanelState {
                 target: None,
-                agent_transcript: Transcript::new(300),
+                agent_transcript: Transcript::new(300).with_images(images_on, truecolor),
                 task_lines: Vec::new(),
                 task_total_lines: 0,
                 scroll: 0,
@@ -357,6 +364,7 @@ impl AppState {
             auth_providers: Vec::new(),
             sessions: Vec::new(),
             plugins: Vec::new(),
+            model_picker: model_picker::ModelPickerState::default(),
             dirty: true,
             cols,
             rows,
@@ -374,6 +382,7 @@ impl AppState {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             running_bash: None,
             pasted_images: crate::clipboard_read::PastedImages::new(),
+            attachments: crate::attachments::PendingAttachments::default(),
             phase: None,
             phase_elapsed_ms: 0,
             started_at: Instant::now(),
@@ -698,7 +707,7 @@ impl AppState {
             let text = self.input.prompt_queue.pop_front()?;
             self.turn_active = true;
             self.dirty = true;
-            Some(pacode_types::Request::UserMessage { text })
+            Some(self.build_user_message(text))
         } else {
             None
         }
@@ -769,7 +778,8 @@ impl AppState {
                     pacode_types::AgentStatus::Idle
                     | pacode_types::AgentStatus::Thinking
                     | pacode_types::AgentStatus::RunningTool
-                    | pacode_types::AgentStatus::WaitingApproval => return,
+                    | pacode_types::AgentStatus::WaitingApproval
+                    | pacode_types::AgentStatus::WaitingOrchestrator => return,
                 };
                 let duration_ms = info.duration_ms(now_ms());
                 if !background_worth_reporting(outcome, duration_ms) {
@@ -838,7 +848,6 @@ impl AppState {
             &self.focus,
             Focus::Overlay(Overlay::EffortPicker { .. })
                 | Focus::Overlay(Overlay::ModePicker { .. })
-                | Focus::Overlay(Overlay::ModelPicker { .. })
                 | Focus::Overlay(Overlay::LoginPicker { .. })
                 | Focus::Overlay(Overlay::QuestionPicker { .. })
                 | Focus::Overlay(Overlay::ThemePicker { .. })
@@ -849,8 +858,7 @@ impl AppState {
         match &self.focus {
             Focus::Overlay(Overlay::EffortPicker { .. })
             | Focus::Overlay(Overlay::ModePicker { .. }) => 7,
-            Focus::Overlay(Overlay::ModelPicker { .. })
-            | Focus::Overlay(Overlay::ThemePicker { .. }) => 12,
+            Focus::Overlay(Overlay::ThemePicker { .. }) => 12,
             Focus::Overlay(Overlay::LoginPicker { .. }) => 13,
             // Header, question, one row per option, and the hint line.
             Focus::Overlay(Overlay::QuestionPicker { question, .. }) => {
@@ -966,6 +974,7 @@ impl AppState {
         }
         self.transcript.cells.clear();
         self.transcript.cache.clear();
+        self.transcript.images.clear();
         self.transcript.stream = None;
         self.transcript.live_cell = None;
         self.transcript.pending_final = None;

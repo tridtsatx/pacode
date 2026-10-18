@@ -286,7 +286,9 @@ impl Provider for MockProvider {
             display_name: model.to_string(),
             context_window: Some(32_000),
             supports_reasoning: true,
+            vision: true,
             pricing: None,
+            ..Default::default()
         }
     }
 }

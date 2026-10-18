@@ -90,7 +90,7 @@ async fn test_single_flight_different_keys_run_independently() {
 #[test]
 fn test_refresh_state_tracks_terminal_failures() {
     let state = RefreshState::new();
-    let key = "claude:active";
+    let key = "openai:active";
 
     // Initially allowed
     assert!(state.ensure_allowed(key).is_ok());

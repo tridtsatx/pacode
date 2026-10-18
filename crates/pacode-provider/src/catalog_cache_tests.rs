@@ -12,7 +12,9 @@ fn make_model_info(provider: &str, model: &str) -> ModelInfo {
         display_name: format!("Model {model}"),
         context_window: Some(32000),
         supports_reasoning: false,
+        vision: false,
         pricing: None,
+        ..Default::default()
     }
 }
 

@@ -47,6 +47,13 @@ impl ToolRegistry {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
+    /// A copy without the tool `name`.
+    pub fn without(&self, name: &str) -> ToolRegistry {
+        let mut out = self.clone();
+        out.tools.remove(name);
+        out
+    }
+
     /// A registry restricted to `names` (unknown names ignored).
     pub fn subset<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> ToolRegistry {
         let mut out = ToolRegistry::new();

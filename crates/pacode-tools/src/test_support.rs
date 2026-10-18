@@ -5,6 +5,8 @@
 //! jobs and monitors are actually stored and listed back — without each test
 //! rebuilding the same bookkeeping.
 
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,7 +19,10 @@ use pacode_types::{
 use tokio_util::sync::CancellationToken;
 
 use crate::ToolError;
-use crate::host::{AgentKindDef, AgentSpec, PermissionDraft, ToolCtx, ToolHost, WaitOutcome};
+use crate::host::{
+    AgentKindDef, AgentSpec, LedgerPass, PermissionDraft, ToolCtx, ToolHost, WaitOutcome,
+    WriteIntent, WriteLock,
+};
 
 #[derive(Default)]
 pub struct ScheduleStub {
@@ -111,11 +116,50 @@ impl ScheduleStub {
     }
 }
 
+/// Records the file-ledger calls a tool makes, in order; set `reject_with` to make
+/// `ledger_check` refuse every write with that message.
+#[derive(Default)]
+pub struct LedgerStub {
+    calls: Mutex<Vec<String>>,
+    pub reject_with: Mutex<Option<String>>,
+}
+
+impl LedgerStub {
+    pub fn calls(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+
+    fn push(&self, call: String) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(call);
+    }
+
+    fn rejection(&self) -> Option<String> {
+        self.reject_with
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// A host that only has to answer the scheduling calls; everything else a tool
-/// might reach for is refused loudly rather than pretending to work.
+/// might reach for is refused loudly rather than pretending to work. Ledger calls
+/// are recorded (see [`LedgerStub`]) and allowed unless told otherwise.
 #[derive(Default)]
 pub struct StubToolHost {
     pub schedule: ScheduleStub,
+    pub ledger: LedgerStub,
 }
 
 #[async_trait]
@@ -271,6 +315,50 @@ impl ToolHost for StubToolHost {
     fn emit_preview(&self, _call_id: &CallId, _preview: String) {}
 
     fn emit_notice(&self, _level: pacode_types::ToastLevel, _text: String) {}
+
+    async fn ledger_lock(&self, paths: &[PathBuf]) -> WriteLock {
+        self.ledger.push(format!("lock {}", paths.len()));
+        WriteLock::unlocked()
+    }
+
+    async fn ledger_check(
+        &self,
+        _agent: &AgentId,
+        path: &Path,
+        intent: WriteIntent,
+        current: Option<&str>,
+        proposed: Option<&str>,
+    ) -> Result<LedgerPass, ToolError> {
+        self.ledger.push(format!(
+            "check {intent:?} {} existing={} applied={}",
+            file_name(path),
+            current.is_some(),
+            proposed.is_some()
+        ));
+        match self.ledger.rejection() {
+            Some(message) => Err(ToolError::Failed(message)),
+            None => Ok(LedgerPass::default()),
+        }
+    }
+
+    async fn ledger_record_read(
+        &self,
+        _agent: &AgentId,
+        path: &Path,
+        _content: &str,
+        lines: Range<usize>,
+    ) {
+        self.ledger.push(format!(
+            "read {} {}..{}",
+            file_name(path),
+            lines.start,
+            lines.end
+        ));
+    }
+
+    async fn ledger_record_write(&self, _agent: &AgentId, path: &Path, _content: &str) {
+        self.ledger.push(format!("write {}", file_name(path)));
+    }
 }
 
 pub fn stub_ctx(host: Arc<StubToolHost>) -> ToolCtx {

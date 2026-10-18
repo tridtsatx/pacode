@@ -40,6 +40,12 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
 }
 
 fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
+    // The effort picker offers only what the model supports.
+    let effort_levels = if matches!(state.focus, Focus::Overlay(Overlay::EffortPicker { .. })) {
+        state.effort_levels()
+    } else {
+        Vec::new()
+    };
     match &mut state.focus {
         Focus::Overlay(Overlay::QuestionPicker {
             question,
@@ -136,13 +142,14 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                     *index = index.saturating_sub(1);
                 }
                 KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
-                    *index = (*index + 1).min(pacode_types::Effort::ALL.len() - 1);
+                    *index = (*index + 1).min(effort_levels.len().saturating_sub(1));
                 }
                 KeyCode::Enter => {
-                    let effort = pacode_types::Effort::ALL[*index];
+                    let picked = effort_levels.get(*index).copied();
                     state.focus = Focus::Normal;
-                    state.save_pref_effort(effort);
-                    return vec![Action::Send(Request::SetEffort(effort))];
+                    if let Some(effort) = picked {
+                        return crate::ui::model_picker_keys::set_effort(state, effort);
+                    }
                 }
                 _ => {}
             }
@@ -167,61 +174,8 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
-        Focus::Overlay(Overlay::ModelPicker { query, index }) => {
-            let q_lower = query.to_lowercase();
-            let filtered_count = state
-                .models
-                .iter()
-                .filter(|m| {
-                    q_lower.is_empty()
-                        || m.route.to_string().to_lowercase().contains(&q_lower)
-                        || m.display_name.to_lowercase().contains(&q_lower)
-                })
-                .count();
-
-            if is_prev(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
-            }
-            if is_next(&key) && filtered_count > 0 && *index + 1 < filtered_count {
-                *index += 1;
-                return vec![];
-            }
-
-            match key.code {
-                KeyCode::Esc => state.focus = Focus::Normal,
-                KeyCode::Enter => {
-                    let filtered: Vec<_> = state
-                        .models
-                        .iter()
-                        .filter(|m| {
-                            q_lower.is_empty()
-                                || m.route.to_string().to_lowercase().contains(&q_lower)
-                                || m.display_name.to_lowercase().contains(&q_lower)
-                        })
-                        .collect();
-                    if let Some(m) = filtered.get(*index) {
-                        let route = m.route.clone();
-                        state.focus = Focus::Normal;
-                        state.save_pref_model(&route.to_string());
-                        return vec![Action::Send(Request::SetModel(route))];
-                    }
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                    *index = 0;
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    query.push(c);
-                    *index = 0;
-                }
-                _ => {}
-            }
-            vec![]
+        Focus::Overlay(Overlay::ModelPicker { .. }) => {
+            crate::ui::model_picker_keys::handle_key(state, key)
         }
         Focus::Overlay(Overlay::LoginPicker { query, index }) => {
             let q_lower = query.to_lowercase();

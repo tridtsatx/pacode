@@ -128,6 +128,12 @@ impl Paths {
         self.cache_dir.join("mcp")
     }
 
+    /// Content-addressed image store (`pacode_image::store`), shared by the daemon and
+    /// the TUI. Capped and evicted by the daemon at start.
+    pub fn images_dir(&self) -> PathBuf {
+        self.data_dir.join("images")
+    }
+
     pub fn catalog_cache_file(&self) -> PathBuf {
         self.cache_dir.join("catalog.json")
     }

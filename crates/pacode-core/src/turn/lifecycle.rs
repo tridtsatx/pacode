@@ -102,15 +102,15 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
 
         // An injection that landed between the last drain and the end of the turn
         // would otherwise wait for the next user message: run another turn for it.
-        if agent.id().is_main()
-            && matches!(stop, TurnStop::Completed)
-            && !agent.injections.is_empty()
-        {
+        // A subagent is covered too, so a late orchestrator message is not lost.
+        if matches!(stop, TurnStop::Completed) && !agent.injections.is_empty() {
             start_turn(session.clone(), agent.clone());
             return;
         }
 
         if !agent.id().is_main() {
+            // A question still open when the agent ends will never be answered.
+            session.drop_agent_questions(&agent.id());
             let last_assistant_text = {
                 let hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
                 hist.messages

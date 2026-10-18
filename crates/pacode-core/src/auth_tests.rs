@@ -25,11 +25,11 @@ fn test_list_auth_shapes_reply_from_fixture_store() {
 
     // Active, valid account
     store.upsert(
-        "claude",
+        "openai",
         Account {
-            label: "claude-main".to_string(),
+            label: "openai-main".to_string(),
             kind: "oauth".to_string(),
-            access: "claude-access-token".to_string(),
+            access: "openai-access-token".to_string(),
             refresh: Some("refresh-tok".to_string()),
             expires_at: Some((pacode_types::now_ms() / 1000) as i64 + 3600),
             email: Some("user@example.com".to_string()),
@@ -39,11 +39,11 @@ fn test_list_auth_shapes_reply_from_fixture_store() {
 
     // Account needing attention (expired and no refresh token)
     store.upsert(
-        "openai",
+        "kimi-code",
         Account {
-            label: "openai-expired".to_string(),
+            label: "kimi-expired".to_string(),
             kind: "oauth".to_string(),
-            access: "openai-access-token".to_string(),
+            access: "kimi-access-token".to_string(),
             refresh: None,
             expires_at: Some(1000), // Far in the past
             email: None,
@@ -78,19 +78,7 @@ fn test_list_auth_shapes_reply_from_fixture_store() {
 
     let auth_infos = build_auth_status(&store, &config_providers);
 
-    // 1. Check claude: Configured, OAuth, accounts list, active set
-    let claude = auth_infos
-        .iter()
-        .find(|i| i.id == "claude")
-        .expect("claude exists");
-    assert_eq!(claude.display_name, "Claude");
-    assert_eq!(claude.auth_kind, "oauth");
-    assert!(claude.recommended);
-    assert_eq!(claude.state, AuthState::Configured);
-    assert_eq!(claude.accounts, vec!["claude-main"]);
-    assert_eq!(claude.active.as_deref(), Some("claude-main"));
-
-    // 2. Check openai: NeedsAttention due to expired token
+    // 1. Check openai: Configured, OAuth, accounts list, active set
     let openai = auth_infos
         .iter()
         .find(|i| i.id == "openai")
@@ -98,7 +86,16 @@ fn test_list_auth_shapes_reply_from_fixture_store() {
     assert_eq!(openai.display_name, "OpenAI");
     assert_eq!(openai.auth_kind, "oauth");
     assert!(openai.recommended);
-    match &openai.state {
+    assert_eq!(openai.state, AuthState::Configured);
+    assert_eq!(openai.accounts, vec!["openai-main"]);
+    assert_eq!(openai.active.as_deref(), Some("openai-main"));
+
+    // 2. Check kimi-code: NeedsAttention due to expired token
+    let kimi = auth_infos
+        .iter()
+        .find(|i| i.id == "kimi-code")
+        .expect("kimi-code exists");
+    match &kimi.state {
         AuthState::NeedsAttention { reason } => {
             assert!(reason.contains("expired"));
         }
@@ -140,9 +137,9 @@ fn test_list_auth_shapes_reply_from_fixture_store() {
     assert_eq!(custom.state, AuthState::NotConfigured);
 
     // 7. Single lookup helper
-    let single = get_provider_auth_info(&store, &config_providers, "claude");
+    let single = get_provider_auth_info(&store, &config_providers, "openai");
     assert!(single.is_some());
-    assert_eq!(single.unwrap().id, "claude");
+    assert_eq!(single.unwrap().id, "openai");
 }
 
 struct FakeAuthDriver {
@@ -280,7 +277,7 @@ async fn test_login_emits_progress_events_in_order_and_persists_on_success() {
     });
 
     // Request login
-    let reply = core.handle_login("claude".to_string());
+    let reply = core.handle_login("openai".to_string());
     assert_eq!(reply, Reply::Ok);
 
     // Wait for the login flow task to finish
@@ -295,12 +292,12 @@ async fn test_login_emits_progress_events_in_order_and_persists_on_success() {
     for ev in events {
         match ev {
             Event::LoginProgress { provider, stage } => {
-                assert_eq!(provider, "claude");
+                assert_eq!(provider, "openai");
                 stages.push(stage);
             }
             Event::AuthUpdated(info) => {
-                assert_eq!(info.id, "claude");
-                assert_eq!(info.active.as_deref(), Some("claude-new"));
+                assert_eq!(info.id, "openai");
+                assert_eq!(info.active.as_deref(), Some("openai-new"));
                 got_auth_updated = true;
             }
             _ => {}
@@ -310,7 +307,7 @@ async fn test_login_emits_progress_events_in_order_and_persists_on_success() {
     assert_eq!(stages.len(), 4);
     match &stages[0] {
         LoginStage::OpenUrl { url, opened } => {
-            assert!(url.contains("claude.example.com"));
+            assert!(url.contains("openai.example.com"));
             assert!(*opened);
         }
         other => panic!("expected OpenUrl, got {other:?}"),
@@ -320,20 +317,20 @@ async fn test_login_emits_progress_events_in_order_and_persists_on_success() {
     assert_eq!(
         stages[3],
         LoginStage::Done {
-            label: "claude-new".to_string()
+            label: "openai-new".to_string()
         }
     );
     assert!(got_auth_updated);
 
     // Verify account was persisted in the store
     let store = core.load_auth_store();
-    let acc = store.get("claude").expect("claude persisted in store");
-    assert_eq!(acc.label, "claude-new");
+    let acc = store.get("openai").expect("openai persisted in store");
+    assert_eq!(acc.label, "openai-new");
     assert_eq!(acc.access, "token-new-12345");
 
     // Verify provider was rebuilt in registry
     let reg = core.providers();
-    assert!(reg.get("claude").is_some());
+    assert!(reg.get("openai").is_some());
 }
 
 #[tokio::test]
@@ -375,7 +372,7 @@ async fn test_login_failure_emits_failed_stage() {
         }
     });
 
-    let reply = core.handle_login("claude".to_string());
+    let reply = core.handle_login("openai".to_string());
     assert_eq!(reply, Reply::Ok);
 
     let _ = tokio::time::timeout(Duration::from_secs(3), listen_handle).await;
@@ -408,9 +405,9 @@ async fn test_logout_and_set_auth_account() {
     // Seed store with two accounts
     let mut store = core.load_auth_store();
     store.upsert(
-        "claude",
+        "openai",
         Account {
-            label: "claude-1".to_string(),
+            label: "openai-1".to_string(),
             kind: "oauth".to_string(),
             access: "tok-1".to_string(),
             refresh: None,
@@ -420,9 +417,9 @@ async fn test_logout_and_set_auth_account() {
         },
     );
     store.upsert(
-        "claude",
+        "openai",
         Account {
-            label: "claude-2".to_string(),
+            label: "openai-2".to_string(),
             kind: "oauth".to_string(),
             access: "tok-2".to_string(),
             refresh: None,
@@ -433,35 +430,35 @@ async fn test_logout_and_set_auth_account() {
     );
     store.save().unwrap();
 
-    // 1. Set active account to claude-2
-    let reply = core.handle_set_auth_account("claude".to_string(), "claude-2".to_string());
+    // 1. Set active account to openai-2
+    let reply = core.handle_set_auth_account("openai".to_string(), "openai-2".to_string());
     match reply {
         Reply::AuthStatus { providers } => {
-            let claude = providers.iter().find(|p| p.id == "claude").unwrap();
-            assert_eq!(claude.active.as_deref(), Some("claude-2"));
+            let openai = providers.iter().find(|p| p.id == "openai").unwrap();
+            assert_eq!(openai.active.as_deref(), Some("openai-2"));
         }
         other => panic!("expected AuthStatus, got {other:?}"),
     }
 
-    // 2. Logout one account (claude-1)
-    let reply = core.handle_logout("claude".to_string(), Some("claude-1".to_string()));
+    // 2. Logout one account (openai-1)
+    let reply = core.handle_logout("openai".to_string(), Some("openai-1".to_string()));
     match reply {
         Reply::AuthStatus { providers } => {
-            let claude = providers.iter().find(|p| p.id == "claude").unwrap();
-            assert_eq!(claude.accounts, vec!["claude-2"]);
-            assert_eq!(claude.active.as_deref(), Some("claude-2"));
+            let openai = providers.iter().find(|p| p.id == "openai").unwrap();
+            assert_eq!(openai.accounts, vec!["openai-2"]);
+            assert_eq!(openai.active.as_deref(), Some("openai-2"));
         }
         other => panic!("expected AuthStatus, got {other:?}"),
     }
 
-    // 3. Logout all accounts for claude
-    let reply = core.handle_logout("claude".to_string(), None);
+    // 3. Logout all accounts for openai
+    let reply = core.handle_logout("openai".to_string(), None);
     match reply {
         Reply::AuthStatus { providers } => {
-            let claude = providers.iter().find(|p| p.id == "claude").unwrap();
-            assert!(claude.accounts.is_empty());
-            assert_eq!(claude.active, None);
-            assert_eq!(claude.state, AuthState::NotConfigured);
+            let openai = providers.iter().find(|p| p.id == "openai").unwrap();
+            assert!(openai.accounts.is_empty());
+            assert_eq!(openai.active, None);
+            assert_eq!(openai.state, AuthState::NotConfigured);
         }
         other => panic!("expected AuthStatus, got {other:?}"),
     }

@@ -2,6 +2,7 @@
 //! tasks, subagents, plan, UI previews). The core implements it; tests use a stub.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,6 +134,47 @@ pub struct AgentSpec {
     pub fork: bool,
     /// Tool names allowed for the subagent; `None` = the default subagent set.
     pub tools: Option<Vec<String>>,
+}
+
+/// What kind of change a tool is about to make, passed to [`ToolHost::ledger_check`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteIntent {
+    /// `write`: the whole file is replaced.
+    Write,
+    /// `edit`/`multi_edit` exact-string replacement.
+    Edit,
+    /// `edit`/`multi_edit` hashline ops (anchors already verified by the applier).
+    Hashline,
+}
+
+/// A write the file ledger let through. `note` (when set) tells the model what other
+/// agents changed since its read on lines this write did not touch; tools append it
+/// to their output.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LedgerPass {
+    pub note: Option<String>,
+}
+
+/// Held while a tool reads, checks and writes paths ([`ToolHost::ledger_lock`]):
+/// other writers of the same paths wait until it is dropped. Opaque so hosts can put
+/// any guard inside.
+#[must_use = "the paths are unlocked as soon as this is dropped"]
+pub struct WriteLock {
+    _held: Option<Box<dyn Send>>,
+}
+
+impl WriteLock {
+    /// A lock that holds nothing (hosts without a ledger).
+    pub fn unlocked() -> Self {
+        Self { _held: None }
+    }
+
+    /// Keep `guard` alive until this lock is dropped.
+    pub fn holding(guard: impl Send + 'static) -> Self {
+        Self {
+            _held: Some(Box::new(guard)),
+        }
+    }
 }
 
 /// Result of waiting on tasks.
@@ -503,6 +545,37 @@ pub trait ToolHost: Send + Sync {
     /// Subagent → parent: a short status line, delivered as `<agent_status>` at the
     /// parent's next step.
     fn report_status(&self, text: String) -> Result<(), ToolError>;
+    /// Orchestrator → running subagent: queue an instruction or correction
+    /// (`<message_from_orchestrator>` at the subagent's next step). Also resolves
+    /// the subagent's pending question, if any. Errors when the agent is gone.
+    fn message_agent(&self, _agent: &AgentId, _text: String) -> Result<(), ToolError> {
+        Err(ToolError::failed(
+            "messaging agents is not supported by this host",
+        ))
+    }
+    /// Orchestrator → subagent: answer its pending `ask_parent` question.
+    fn answer_agent(
+        &self,
+        _agent: &AgentId,
+        _question_id: &str,
+        _text: String,
+    ) -> Result<(), ToolError> {
+        Err(ToolError::failed(
+            "answering agents is not supported by this host",
+        ))
+    }
+    /// Subagent → orchestrator: put a question; with `wait` block until answered,
+    /// timed out or cancelled.
+    async fn ask_parent(
+        &self,
+        _question: String,
+        _options: Vec<String>,
+        _wait: bool,
+    ) -> Result<crate::builtin::ask_parent::ParentReply, ToolError> {
+        Err(ToolError::failed(
+            "ask_parent is not supported by this host",
+        ))
+    }
 
     // --- plan ---
     fn plan(&self) -> Plan;
@@ -513,6 +586,43 @@ pub trait ToolHost: Send + Sync {
     fn emit_preview(&self, call_id: &CallId, preview: String);
     /// Emit a user-visible notice in the session transcript.
     fn emit_notice(&self, level: ToastLevel, text: String);
+
+    // --- file ledger (owner = session): agents share one working tree ---
+    // Defaults do nothing, so hosts without a ledger (tests) behave as before.
+
+    /// Serialize writers: lock `paths` (deduplicated, in a fixed order) until the
+    /// returned lock drops. `read`, `write`, `edit` and `multi_edit` take it before
+    /// reading the file, so check + write happen under it.
+    async fn ledger_lock(&self, _paths: &[PathBuf]) -> WriteLock {
+        WriteLock::unlocked()
+    }
+
+    /// Decide whether `agent` may replace `current` (`None` = the file does not exist)
+    /// with `proposed` (`None` = the edit could not be applied; the host only explains
+    /// what changed since the agent's read). `Err` carries the model-facing rejection.
+    async fn ledger_check(
+        &self,
+        _agent: &AgentId,
+        _path: &Path,
+        _intent: WriteIntent,
+        _current: Option<&str>,
+        _proposed: Option<&str>,
+    ) -> Result<LedgerPass, ToolError> {
+        Ok(LedgerPass::default())
+    }
+
+    /// `agent` read `content` of `path` and was shown the 0-based lines `lines`.
+    async fn ledger_record_read(
+        &self,
+        _agent: &AgentId,
+        _path: &Path,
+        _content: &str,
+        _lines: Range<usize>,
+    ) {
+    }
+
+    /// `agent` wrote `content` to `path` (after a passing [`Self::ledger_check`]).
+    async fn ledger_record_write(&self, _agent: &AgentId, _path: &Path, _content: &str) {}
 }
 
 #[cfg(test)]

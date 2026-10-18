@@ -3,6 +3,7 @@
 
 pub mod apply;
 pub mod error;
+pub mod instructions;
 pub mod mcp;
 pub mod skills;
 

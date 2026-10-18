@@ -295,6 +295,7 @@ async fn test_attach_snapshot_and_events_order() {
     client
         .ok(Request::UserMessage {
             text: "hello".into(),
+            attachments: Vec::new(),
         })
         .await
         .unwrap();
@@ -786,7 +787,9 @@ async fn test_mcp_and_plugin_helpers() {
                             display_name: "Dummy Model".into(),
                             context_window: Some(32000),
                             supports_reasoning: false,
+                            vision: false,
                             pricing: None,
+                            ..Default::default()
                         }],
                     },
                     _ => Reply::Ok,

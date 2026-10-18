@@ -176,12 +176,14 @@ impl Core {
         };
 
         match req {
-            Request::UserMessage { text } => match session.submit_user_message(text).await {
-                Ok(()) => Reply::Ok,
-                Err(e) => Reply::Error {
-                    message: e.to_string(),
-                },
-            },
+            Request::UserMessage { text, attachments } => {
+                match session.submit_user_message_with(text, attachments).await {
+                    Ok(()) => Reply::Ok,
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
             Request::Interrupt => {
                 session.interrupt();
                 Reply::Ok

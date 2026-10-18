@@ -95,6 +95,8 @@ pub struct Transcript {
     /// finds the cell under it.
     pub cell_lines: Vec<(u64, usize, usize)>,
     pub cache: LineCache,
+    /// Decoded inline images (32 entries / 4 MB, LRU); see `state::image_cache`.
+    pub images: crate::state::image_cache::ImageCellCache,
     /// Streaming reveal buffer for the live assistant cell (`live_cell`).
     pub stream: Option<StreamBuffer>,
     pub live_cell: Option<u64>,
@@ -121,6 +123,7 @@ impl Transcript {
             expanded: std::collections::HashSet::new(),
             cell_lines: Vec::new(),
             cache: LineCache::new(20_000),
+            images: crate::state::image_cache::ImageCellCache::default(),
             stream: None,
             live_cell: None,
             pending_final: None,
@@ -129,10 +132,18 @@ impl Transcript {
         }
     }
 
+    /// Set `[ui] images` and the colour depth used for inline images.
+    pub fn with_images(mut self, enabled: bool, truecolor: bool) -> Self {
+        self.images.enabled = enabled;
+        self.images.truecolor = truecolor;
+        self
+    }
+
     /// Replace everything (snapshot).
     pub fn reset(&mut self, items: Vec<TranscriptItem>, has_more: bool) {
         self.cells.clear();
         self.cache.clear();
+        self.images.clear();
         self.stream = None;
         self.live_cell = None;
         self.pending_final = None;

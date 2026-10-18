@@ -125,6 +125,7 @@ impl TranscriptState {
             | pacode_types::TranscriptKind::Notice { .. }
             | pacode_types::TranscriptKind::Permission(_)
             | pacode_types::TranscriptKind::Question { .. }
+            | pacode_types::TranscriptKind::Images { .. }
             | pacode_types::TranscriptKind::BashCommand { .. } => {}
         }
     }
@@ -175,6 +176,16 @@ pub fn history_to_items(
                     kind: TranscriptKind::User { text },
                 });
                 cur_seq += 1;
+                let images = msg.image_refs();
+                if !images.is_empty() {
+                    items.push(TranscriptItem {
+                        seq: cur_seq,
+                        agent: agent.clone(),
+                        ts_ms: msg.meta.timestamp_ms,
+                        kind: TranscriptKind::Images { images },
+                    });
+                    cur_seq += 1;
+                }
             }
             Role::Assistant => {
                 for block in &msg.content {
@@ -230,7 +241,7 @@ pub fn history_to_items(
                             tool_indices.insert(id.clone(), item_idx);
                             cur_seq += 1;
                         }
-                        ContentBlock::ToolResult { .. } => {}
+                        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
                     }
                 }
             }
@@ -255,6 +266,17 @@ pub fn history_to_items(
                         };
                         *preview = pacode_types::truncate_head_tail(content, 256);
                     }
+                }
+                // Images a tool returned render right below its call row.
+                let images = msg.image_refs();
+                if !images.is_empty() {
+                    items.push(TranscriptItem {
+                        seq: cur_seq,
+                        agent: agent.clone(),
+                        ts_ms: msg.meta.timestamp_ms,
+                        kind: TranscriptKind::Images { images },
+                    });
+                    cur_seq += 1;
                 }
             }
             Role::System => {}
@@ -386,5 +408,58 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {:?}", other),
         }
+    }
+    #[test]
+    fn test_history_to_items_emits_images_after_user_and_tool_rows() {
+        let agent = AgentId::main();
+        let call_id = CallId::generate();
+        let image = pacode_types::ImageRef {
+            hash: "a".repeat(64),
+            mime: "image/png".into(),
+            width: Some(4),
+            height: Some(4),
+            name: Some("a.png".into()),
+        };
+        let msgs = vec![
+            (
+                0,
+                Arc::new(Message::user_with_images(
+                    "look",
+                    std::slice::from_ref(&image),
+                )),
+            ),
+            (
+                1,
+                Arc::new(Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolUse {
+                        id: call_id.clone(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": "b.png"}),
+                    }],
+                )),
+            ),
+            (
+                2,
+                Arc::new(Message::tool_result_with_images(
+                    call_id,
+                    "image file",
+                    false,
+                    std::slice::from_ref(&image),
+                )),
+            ),
+        ];
+        let items = history_to_items(&agent, &msgs, 0);
+        assert_eq!(items.len(), 4);
+        assert!(matches!(&items[0].kind, TranscriptKind::User { text } if text == "look"));
+        assert!(
+            matches!(&items[1].kind, TranscriptKind::Images { images } if images == &vec![image.clone()])
+        );
+        assert!(matches!(&items[2].kind, TranscriptKind::ToolCall { .. }));
+        assert!(matches!(&items[3].kind, TranscriptKind::Images { .. }));
+        assert_eq!(
+            items.iter().map(|i| i.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 }

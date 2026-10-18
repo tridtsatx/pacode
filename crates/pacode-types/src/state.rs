@@ -127,6 +127,8 @@ pub enum AgentStatus {
     Thinking,
     RunningTool,
     WaitingApproval,
+    /// A subagent blocked in `ask_parent` until the orchestrator answers.
+    WaitingOrchestrator,
     Finished,
     Failed,
     Stopped,
@@ -140,6 +142,7 @@ impl AgentStatus {
                 | AgentStatus::Thinking
                 | AgentStatus::RunningTool
                 | AgentStatus::WaitingApproval
+                | AgentStatus::WaitingOrchestrator
         )
     }
 
@@ -147,7 +150,10 @@ impl AgentStatus {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            AgentStatus::Thinking | AgentStatus::RunningTool | AgentStatus::WaitingApproval
+            AgentStatus::Thinking
+                | AgentStatus::RunningTool
+                | AgentStatus::WaitingApproval
+                | AgentStatus::WaitingOrchestrator
         )
     }
 }

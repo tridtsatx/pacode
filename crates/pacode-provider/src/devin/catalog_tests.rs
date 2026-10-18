@@ -137,3 +137,16 @@ fn a_family_with_one_unranked_member_always_resolves_to_it() {
     assert_eq!(family.resolve(Effort::Low), Some("claude-opus-4-6"));
     assert_eq!(family.resolve(Effort::Max), Some("claude-opus-4-6"));
 }
+
+#[test]
+fn family_efforts_come_from_member_suffixes() {
+    let family =
+        fold_families([("swe-2-low", ""), ("swe-2-high", ""), ("swe-2-max", "")]).remove(0);
+    assert_eq!(
+        family.efforts(),
+        vec![Effort::Low, Effort::High, Effort::Max]
+    );
+
+    let plain = fold_families([("claude-opus-4-6", "Claude Opus 4.6")]).remove(0);
+    assert!(plain.efforts().is_empty());
+}

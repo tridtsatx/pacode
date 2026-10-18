@@ -48,9 +48,9 @@ fn test_permissions_after_save() {
 
     let mut store = AuthStore::new_empty(&file_path);
     store.upsert(
-        "claude",
+        "openai",
         Account {
-            label: "claude-1".to_string(),
+            label: "openai-1".to_string(),
             kind: "oauth".to_string(),
             access: "tok".to_string(),
             refresh: None,
@@ -165,8 +165,8 @@ fn test_missing_file_returns_empty_store() {
     let missing = tmp.path().join("does_not_exist.json");
 
     let store = AuthStore::load_from(&missing).expect("missing file should not fail");
-    assert_eq!(store.accounts("claude").len(), 0);
-    assert_eq!(store.get("claude"), None);
+    assert_eq!(store.accounts("openai").len(), 0);
+    assert_eq!(store.get("openai"), None);
 }
 
 #[test]

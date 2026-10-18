@@ -10,6 +10,7 @@
 //!   `ctx.cwd` require permission even in Auto mode (spec §6.3 "запись только внутри cwd").
 
 pub mod agent;
+pub mod ask_parent;
 pub mod ask_question;
 pub mod bash;
 pub mod bg;
@@ -24,9 +25,12 @@ pub mod multi_edit;
 pub mod plan;
 pub mod plugin;
 pub mod read;
+mod read_image;
+pub mod read_outline;
 pub mod report_status;
 pub mod schedule;
 pub mod skill;
+pub mod utils;
 pub mod webfetch;
 pub mod websearch;
 pub mod write;
@@ -48,6 +52,7 @@ pub fn builtin_tools(web: &WebConfig) -> ToolRegistry {
         .with(Arc::new(edit::EditTool))
         .with(Arc::new(multi_edit::MultiEditTool))
         .with(Arc::new(bash::BashTool))
+        .with(Arc::new(utils::UtilTool))
         .with(Arc::new(ask_question::AskQuestionTool))
         .with(Arc::new(bg::BgTool))
         .with(Arc::new(schedule::CronTool))
@@ -60,8 +65,12 @@ pub fn builtin_tools(web: &WebConfig) -> ToolRegistry {
         .with(Arc::new(webfetch::WebFetchTool))
         .with(Arc::new(websearch::WebSearchTool::with_config(web.clone())))
         .with(Arc::new(report_status::ReportStatusTool))
+        .with(Arc::new(ask_parent::AskParentTool))
         .with(Arc::new(memory::MemoryWriteTool))
         .with(Arc::new(memory::MemoryReadTool))
+        .with(Arc::new(memory::MemoryRecallTool))
+        .with(Arc::new(memory::MemoryForgetTool))
+        .with(Arc::new(memory::MemoryListTool))
 }
 
 /// Tool names a subagent gets by default: everything except `agent` (depth 1).
