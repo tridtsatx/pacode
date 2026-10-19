@@ -132,7 +132,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "provider.effort", label: "Reasoning Effort", description: "Base reasoning effort level", section: "provider", default_value: "medium", kind: SettingKind::Enum { options: EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.stream_idle_secs", label: "Stream Idle Timeout", description: "Base idle timeout in seconds for streaming responses", section: "provider", default_value: "180", kind: SettingKind::Integer { min: 1, max: 3600 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.max_retries", label: "Max Retries", description: "Maximum retries for failed provider requests", section: "provider", default_value: "5", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "provider.max_concurrent", label: "Max Concurrent Requests", description: "Maximum in-flight requests per provider across all agents (0 = unlimited)", section: "provider", default_value: "16", kind: SettingKind::Integer { min: 0, max: 4096 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "provider.max_concurrent", label: "Max Concurrent Requests", description: "Maximum in-flight requests per provider across all agents (0 = unlimited)", section: "provider", default_value: "64", kind: SettingKind::Integer { min: 0, max: 4096 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.catalog_ttl_secs", label: "Catalog TTL Seconds", description: "Seconds before cached model catalog is considered stale", section: "provider", default_value: "86400", kind: SettingKind::Integer { min: 1, max: 2592000 }, apply: ApplyMode::NextTurn },
 
     // ui

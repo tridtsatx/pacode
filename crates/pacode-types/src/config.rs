@@ -77,7 +77,7 @@ impl Default for ProviderDefaults {
             effort: Effort::Medium,
             stream_idle_secs: 180,
             max_retries: 5,
-            max_concurrent: 16,
+            max_concurrent: 64,
             catalog_ttl_secs: 86400,
             proxy: None,
         }

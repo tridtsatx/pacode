@@ -762,7 +762,7 @@ fn a_quiet_setting_also_silences_dependencies() {
 fn capacity_keys_default_and_round_trip() {
     let defaults = parse("").expect("empty toml should parse");
     assert_eq!(defaults.agents.max_live, 16);
-    assert_eq!(defaults.provider.max_concurrent, 16);
+    assert_eq!(defaults.provider.max_concurrent, 64);
     assert_eq!(defaults.context.injection_budget_chars, 24_000);
 
     let explicit = parse(
