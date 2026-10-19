@@ -2838,6 +2838,7 @@ dependencies = [
  "pacode-config",
  "pacode-daemon",
  "pacode-import",
+ "pacode-outline",
  "pacode-plugin",
  "pacode-tui",
  "pacode-types",

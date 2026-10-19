@@ -14,9 +14,10 @@ description = "Structural outlines of source files (signatures kept, bodies elid
 #   csharp 5.1 MiB, swift 3.9, cpp 3.3, kotlin 3.3, ruby 2.0, tsx 1.4, typescript 1.4,
 #   bash 1.3, rust 1.1, php 1.1, c 0.6, python 0.5, javascript 0.4, java 0.4,
 #   markdown 0.35, go 0.2, yaml 0.2, toml 0.04, json 0.02 (+ tree-sitter runtime ~0.2).
-# All: ~26.5 MiB. `lang-core` alone: ~7.8 MiB. `typescript` covers TypeScript and TSX.
+# All: ~26.5 MiB. `lang-core` (the default) alone: ~7.8 MiB. `typescript` covers TypeScript and TSX.
+# The `pacode` binary exposes `lang-extra` as its `outline-extra` feature.
 [features]
-default = ["all-languages"]
+default = ["lang-core"]
 all-languages = ["lang-core", "lang-extra"]
 lang-core = ["rust", "typescript", "javascript", "python", "go", "java", "c", "bash", "json", "toml", "yaml", "markdown"]
 lang-extra = ["cpp", "csharp", "kotlin", "ruby", "php", "swift"]
