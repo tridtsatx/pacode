@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use pacode_provider::EventStream;
 use pacode_types::{
     CallId, ContentBlock, Event, Message, Role, StreamEvent, TranscriptItem, TranscriptKind,
@@ -23,6 +23,25 @@ pub struct StreamOutcome {
     pub tool_calls: Vec<(CallId, String, serde_json::Value, Option<String>)>,
     pub usage: Usage,
     pub interrupted: bool,
+}
+
+/// The flush timer fired while the stream was quiet.
+struct FlushDue;
+
+/// Next stream item, or `Err(FlushDue)` once `deadline` passes. With no deadline (nothing
+/// buffered in either coalescer) no timer exists, so a silent stream causes no wakeups.
+/// Cancel-safe: dropping it between polls loses no item.
+async fn next_or_flush<S: Stream + Unpin>(
+    stream: &mut S,
+    deadline: Option<Instant>,
+) -> Result<Option<S::Item>, FlushDue> {
+    match deadline {
+        None => Ok(stream.next().await),
+        Some(at) => tokio::select! {
+            item = stream.next() => Ok(item),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => Err(FlushDue),
+        },
+    }
 }
 
 pub async fn consume_stream(
@@ -51,10 +70,16 @@ pub async fn consume_stream(
             _ = cancel.cancelled() => {
                 break true;
             }
-            res = tokio::time::timeout(Duration::from_millis(25), stream.next()) => {
+            res = next_or_flush(
+                &mut stream,
+                [text_coalescer.deadline(), reasoning_coalescer.deadline()]
+                    .into_iter()
+                    .flatten()
+                    .min(),
+            ) => {
                 let now = Instant::now();
                 match res {
-                    Err(_timeout) => {
+                    Err(FlushDue) => {
                         if let Some(flush) = text_coalescer.take_if_due(now)
                             && let Some(seq) = assistant_item_seq
                         {
@@ -302,3 +327,7 @@ pub async fn consume_stream(
         interrupted: false,
     })
 }
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod stream_tests;

@@ -48,13 +48,7 @@ impl Core {
                                 resources,
                                 prompts,
                             } => {
-                                let prompt_names = self
-                                    .deps
-                                    .mcp
-                                    .list_prompts(&name)
-                                    .await
-                                    .map(|ps| ps.into_iter().map(|p| p.name).collect())
-                                    .unwrap_or_default();
+                                let prompt_names = self.deps.mcp.cached_prompt_names(&name);
                                 (
                                     "ready".to_string(),
                                     None,

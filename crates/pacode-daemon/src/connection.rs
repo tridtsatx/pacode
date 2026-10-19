@@ -5,7 +5,7 @@ use std::sync::Arc;
 use pacode_core::Core;
 use pacode_types::SessionId;
 use pacode_types::protocol::{Envelope, PROTOCOL_VERSION, Reply, Request, ServerMessage};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
@@ -51,6 +51,14 @@ async fn send_reply(tx: &mpsc::Sender<String>, id: u64, reply: Reply) -> bool {
     }
 }
 
+/// Best-effort `id` of an envelope that failed to parse (0 when absent).
+fn request_id(line: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0)
+}
+
 /// Serve one connection until EOF or shutdown.
 pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: ServerControl) {
     control
@@ -63,19 +71,9 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
 
     let (reader, writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
-    let (tx, mut rx) = mpsc::channel::<String>(1024);
+    let (tx, rx) = mpsc::channel::<String>(1024);
 
-    let writer_handle = tokio::spawn(async move {
-        let mut writer = writer;
-        while let Some(line) = rx.recv().await {
-            if writer.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-            if writer.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    let writer_handle = tokio::spawn(crate::writer::write_batched(rx, writer));
 
     let first_line = match lines.next_line().await {
         Ok(Some(line)) => line,
@@ -166,6 +164,8 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
     );
 
     let mut attached_session: Option<SessionId> = None;
+    // Which agents' high-volume events this connection wants; everything until `Subscribe`.
+    let interest = crate::interest::new_shared();
     let mut forwarder_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // Daemon-wide events (login progress, credential changes) reach this client whether
@@ -185,10 +185,13 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
         let env = match serde_json::from_str::<Envelope>(trimmed) {
             Ok(env) => env,
             Err(err) => {
+                // A request type this daemon does not know (newer client): answer it by
+                // id so the caller does not wait forever; the connection stays usable.
+                let id = request_id(trimmed);
                 log::warn!("protocol error: invalid JSON envelope: {err}");
                 if !send_reply(
                     &tx,
-                    0,
+                    id,
                     Reply::Error {
                         message: format!("invalid JSON envelope: {err}"),
                     },
@@ -238,10 +241,11 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                         );
                         attached_session = Some(session_id.clone());
                         if let Some(broadcast_rx) = core.subscribe(&session_id) {
-                            let handle = tokio::spawn(crate::fanout::run_forwarder(
+                            let handle = tokio::spawn(crate::fanout::run_filtered_forwarder(
                                 broadcast_rx,
                                 tx.clone(),
                                 "session",
+                                Arc::clone(&interest),
                             ));
                             forwarder_handle = Some(handle);
                         }
@@ -267,6 +271,11 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                 attached_session = None;
                 Reply::Ok
             }
+            Request::Subscribe { agents, all } => {
+                crate::interest::apply(&interest, agents, all);
+                Reply::Ok
+            }
+            Request::DebugStats => Reply::DebugStats(core.debug_stats()),
             Request::Ping => {
                 let _ = core.handle_global(&Request::ListMcpServers).await;
                 Reply::Pong

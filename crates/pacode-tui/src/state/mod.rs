@@ -223,6 +223,12 @@ pub struct AppState {
     pub connection: Connection,
     /// Event-stream continuity (gap detection, snapshot debounce); see [`resync`].
     pub resync: resync::ResyncState,
+    /// Which agents' events the daemon streams to us (`Request::Subscribe`).
+    pub subscription: resync::SubscriptionState,
+    /// Permission requests in the transcript not yet resolved. Owner: `events.rs`
+    /// (+1 on request, -1 on resolve), reset from each snapshot. Replaces a per-loop
+    /// scan of the transcript in `needs_anim_tick`.
+    pub pending_permissions: usize,
     pub turn_active: bool,
     /// Main agent transcript.
     pub transcript: Transcript,
@@ -348,6 +354,8 @@ impl AppState {
             meta: None,
             connection: Connection::Connected,
             resync: resync::ResyncState::default(),
+            subscription: resync::SubscriptionState::default(),
+            pending_permissions: 0,
             turn_active: false,
             transcript: Transcript::new(cells).with_images(images_on, truecolor),
             panel: PanelState {
@@ -503,12 +511,14 @@ impl AppState {
             }
             ClientEvent::Disconnected { reason } => {
                 self.resync.reset();
+                self.subscription.reset();
                 self.connection = Connection::Disconnected { reason };
                 self.dirty = true;
                 true
             }
             ClientEvent::Reconnecting { attempt } => {
                 self.resync.reset();
+                self.subscription.reset();
                 self.connection = Connection::Reconnecting { attempt };
                 self.dirty = true;
                 true
@@ -568,6 +578,7 @@ impl AppState {
                 self.rail.tasks.sort_by_key(|t| t.started_at_ms);
                 self.rail.usage = snapshot.usage;
                 self.rail.update_idle(self.turn_active, now);
+                self.pending_permissions = snapshot.pending_permissions.len();
                 for (i, perm) in snapshot.pending_permissions.into_iter().enumerate() {
                     let ts_ms = perm.created_at_ms;
                     self.transcript.cells.push_back(Cell {
@@ -586,9 +597,13 @@ impl AppState {
                     return false;
                 }
                 self.observe_background_completion(&event);
-                self.apply_event(seq, event, now);
-                self.dirty = true;
-                true
+                // Redraw only when something on screen changed (a delta for an agent
+                // nobody is looking at must not wake the renderer).
+                let visible = self.apply_event(seq, event, now);
+                if visible {
+                    self.dirty = true;
+                }
+                visible
             }
             ClientEvent::Desynced => {
                 self.resync.note_desynced();
@@ -598,8 +613,9 @@ impl AppState {
     }
 
     /// Fold a daemon event (`ClientEvent::Event`) into transcript/rail/panel/toasts.
-    pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) {
-        events::apply_event(self, seq, event, now);
+    /// Returns whether the event changed anything visible.
+    pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) -> bool {
+        events::apply_event(self, seq, event, now)
     }
 
     pub fn push_toast(
@@ -719,6 +735,30 @@ impl AppState {
     /// A `GetSnapshot` to send when events were lost; at most one is in flight.
     pub fn take_resync_request(&mut self) -> Option<pacode_types::Request> {
         self.resync.take_request()
+    }
+
+    /// A `Subscribe` to send when the agent we want streamed changed (panel opened,
+    /// switched or closed) or the connection was re-established.
+    pub fn take_subscribe_request(&mut self) -> Option<pacode_types::Request> {
+        // A request sent while reconnecting would fail and never be retried.
+        if !matches!(self.connection, Connection::Connected) {
+            return None;
+        }
+        let panel_agent: Option<&AgentId> = match &self.focus {
+            Focus::Panel {
+                target: PanelTarget::Agent(id),
+                ..
+            } => Some(id),
+            _ => match &self.panel.target {
+                Some(PanelTarget::Agent(id)) => Some(id),
+                _ => None,
+            },
+        };
+        let request = self.subscription.take_request(panel_agent);
+        if request.is_some() {
+            self.resync.note_sparse();
+        }
+        request
     }
 
     pub fn drain_prompt_queue(&mut self) -> Option<pacode_types::Request> {
@@ -904,12 +944,7 @@ impl AppState {
         }
         // A permission request pulses until it is answered; waiting on the
         // reader is activity, so the tick is allowed.
-        let permission_pending = self
-            .transcript
-            .cells
-            .iter()
-            .any(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Permission(_))));
-        if permission_pending {
+        if self.pending_permissions > 0 {
             return true;
         }
         if matches!(self.connection, Connection::Reconnecting { .. }) {

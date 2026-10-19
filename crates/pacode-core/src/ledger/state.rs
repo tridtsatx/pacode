@@ -1,193 +1,59 @@
 //! The pure ledger: per path, the current version, who wrote it, and what each agent
 //! has seen. No I/O and no locking; [`super::FileLedger`] wraps it in a mutex and
 //! feeds it file contents read under the path's write lock.
+//!
+//! Diffs are looked up in a shared [`DiffMemo`]: [`super::FileLedger`] computes the
+//! diff a call will need before it takes the state lock (the `peek_*` methods hand it
+//! the snapshots to diff), so under the lock a diff is normally a hit. A miss computes
+//! inline, which is correct, only slower.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pacode_types::AgentId;
 
-use super::ranges::{LineRanges, overlaps, visible};
-use super::snapshot::{Change, Snapshot, Stat, diff};
+use super::diff_memo::DiffMemo;
+use super::entry::{PathEntry, Seen, unacked_changes};
+use super::partial::{Partial, Resolution, same_stat};
+use super::ranges::{LineRanges, overlaps};
+use super::snapshot::{Snapshot, Stat};
+
+pub use super::types::{DigestRow, Drift, Verdict, Writer};
 
 /// Tracked paths per session; past it the least recently used path is forgotten
 /// (with every agent's seen state for it, so "read first" applies to it again).
 pub const MAX_PATHS: usize = 2048;
 
-/// Versions remembered per path to attribute changes to their writers.
-const MAX_LOG: usize = 32;
-
-/// Who produced a version of a file.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Writer {
-    Agent {
-        id: AgentId,
-        name: String,
-    },
-    /// Not written through pacode's tools (user editor, another program).
-    External,
-}
-
-impl Writer {
-    pub fn agent(id: &AgentId, name: &str) -> Self {
-        Self::Agent {
-            id: id.clone(),
-            name: name.to_string(),
-        }
-    }
-
-    /// `agent reviewer`, `agent main (you)` or `external (...)`.
-    pub fn describe(&self, viewer: &AgentId) -> String {
-        match self {
-            Self::Agent { id, name } if id == viewer => format!("agent {name} (you)"),
-            Self::Agent { name, .. } => format!("agent {name}"),
-            Self::External => "external (an editor or a process outside pacode)".to_string(),
-        }
-    }
-}
-
-/// What changed since an agent's read that it has not re-read: the writers since its
-/// version and the changed regions (`new` side = current line numbers).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Drift {
-    pub writers: Vec<Writer>,
-    pub changes: Vec<Change>,
-    /// Lines in the current version.
-    pub line_count: usize,
-}
-
-/// Outcome of [`LedgerState::check`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// The file is new, or nothing changed since the agent's read.
-    Clean,
-    /// The file changed since the agent's read, but not on lines this write touches.
-    Disjoint(Drift),
-    /// The file exists and the agent has no seen state for it.
-    NotRead,
-    /// Changes the agent has not seen overlap the write (or the edit failed).
-    Conflict(Drift),
-}
-
-/// One row of an agent's digest (compaction pin).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DigestRow {
-    pub path: PathBuf,
-    pub version: String,
-    pub wrote: bool,
-    pub read: LineRanges,
-    pub drift: Option<Drift>,
-}
-
-struct LogEntry {
-    to_hash: u64,
-    writer: Writer,
-}
-
-/// One agent's view of one path.
-#[derive(Clone)]
-struct Seen {
-    /// The version the agent is in sync with: changes after it are drift.
-    base: Arc<Snapshot>,
-    /// Lines read (or shown in a rejection) at version `fresh_hash`.
-    fresh: LineRanges,
-    fresh_hash: u64,
-    /// Its last action on the path was a write.
+/// What a digest row needs from the state, cloned under the lock so the diff behind
+/// its drift can run after the lock is released ([`Self::resolve`]).
+pub struct DigestInput {
+    path: PathBuf,
     wrote: bool,
-    /// Ledger tick of its last action on the path (digest order).
-    at: u64,
-}
-
-impl Seen {
-    fn at_version(snap: Arc<Snapshot>, tick: u64) -> Self {
-        Self {
-            fresh_hash: snap.hash,
-            base: snap,
-            fresh: LineRanges::default(),
-            wrote: false,
-            at: tick,
-        }
-    }
-}
-
-struct PathEntry {
+    read: LineRanges,
+    fresh_now: bool,
+    base: Arc<Snapshot>,
     current: Arc<Snapshot>,
-    stat: Stat,
-    last_writer: Option<Writer>,
-    log: VecDeque<LogEntry>,
-    seen: HashMap<AgentId, Seen>,
-    last_used: u64,
+    writers: Vec<Writer>,
 }
 
-impl PathEntry {
-    fn new(current: Arc<Snapshot>, stat: Stat, tick: u64) -> Self {
-        Self {
-            current,
-            stat,
-            last_writer: None,
-            log: VecDeque::new(),
-            seen: HashMap::new(),
-            last_used: tick,
-        }
-    }
-
-    /// Move to `next` written by `writer`; only the stat changes when the content is
-    /// the same.
-    fn advance(&mut self, next: Arc<Snapshot>, stat: Stat, writer: Writer) {
-        self.stat = stat;
-        if next.hash == self.current.hash {
-            return;
-        }
-        self.current = next;
-        self.log.push_back(LogEntry {
-            to_hash: self.current.hash,
-            writer: writer.clone(),
-        });
-        while self.log.len() > MAX_LOG {
-            self.log.pop_front();
-        }
-        self.last_writer = Some(writer);
-    }
-
-    /// Distinct writers of the versions after `base_hash`, oldest first.
-    fn writers_since(&self, base_hash: u64) -> Vec<Writer> {
-        let start = self
-            .log
-            .iter()
-            .rposition(|e| e.to_hash == base_hash)
-            .map_or(0, |i| i + 1);
-        let mut out: Vec<Writer> = Vec::new();
-        for e in self.log.iter().skip(start) {
-            if !out.contains(&e.writer) {
-                out.push(e.writer.clone());
-            }
-        }
-        if out.is_empty() {
-            out.push(self.last_writer.clone().unwrap_or(Writer::External));
-        }
-        out
-    }
-
-    /// Changes since `seen.base` that the agent has not re-read at the current version.
-    fn unacked(&self, seen: &Seen) -> Vec<Change> {
-        if seen.base.hash == self.current.hash {
-            return Vec::new();
-        }
-        let n = self.current.lines.len();
-        let fresh_now = seen.fresh_hash == self.current.hash;
-        diff(&seen.base.lines, &self.current.lines)
-            .into_iter()
-            .filter(|c| !(fresh_now && seen.fresh.covers(&visible(&c.new, n))))
-            .collect()
-    }
-
-    fn drift(&self, seen: &Seen, changes: Vec<Change>) -> Drift {
-        Drift {
-            writers: self.writers_since(seen.base.hash),
+impl DigestInput {
+    /// The finished row; diffs `base` against `current` (memoized).
+    pub fn resolve(self, memo: &DiffMemo) -> DigestRow {
+        let changes = unacked_changes(&self.base, &self.current, &self.read, self.fresh_now, memo);
+        let drift = (!changes.is_empty()).then(|| Drift {
+            writers: self.writers,
             changes,
-            line_count: self.current.lines.len(),
+            line_count: self.current.line_count(),
+            coarse: self.base.whole_only || self.current.whole_only,
+        });
+        DigestRow {
+            path: self.path,
+            version: self.current.short(),
+            wrote: self.wrote,
+            read: self.read,
+            drift,
         }
     }
 }
@@ -199,6 +65,7 @@ pub struct LedgerState {
     entries: HashMap<PathBuf, PathEntry>,
     tick: u64,
     cap: usize,
+    memo: Arc<DiffMemo>,
 }
 
 impl Default for LedgerState {
@@ -213,7 +80,13 @@ impl LedgerState {
             entries: HashMap::new(),
             tick: 0,
             cap: cap.max(1),
+            memo: Arc::new(DiffMemo::default()),
         }
+    }
+
+    /// The diff memo this state reads (shared with the owning `FileLedger`).
+    pub fn memo(&self) -> Arc<DiffMemo> {
+        self.memo.clone()
     }
 
     pub fn tracked_count(&self) -> usize {
@@ -222,6 +95,22 @@ impl LedgerState {
 
     pub fn is_tracked(&self, path: &Path) -> bool {
         self.entries.contains_key(path)
+    }
+
+    /// `agent`'s base version of `path`: the older side of the diff its next
+    /// check/read/ack will need.
+    pub fn peek_base(&self, agent: &AgentId, path: &Path) -> Option<Arc<Snapshot>> {
+        Some(self.entries.get(path)?.seen.get(agent)?.base.clone())
+    }
+
+    /// The path's current version: the older side of the diff a write will need.
+    pub fn peek_current(&self, path: &Path) -> Option<Arc<Snapshot>> {
+        Some(self.entries.get(path)?.current.clone())
+    }
+
+    /// `agent`'s deferred ranged read of `path`, if any.
+    pub fn peek_partial(&self, agent: &AgentId, path: &Path) -> Option<Arc<Partial>> {
+        self.entries.get(path)?.seen.get(agent)?.partial.clone()
     }
 
     fn bump(&mut self) -> u64 {
@@ -278,9 +167,10 @@ impl LedgerState {
         stat: Stat,
         lines: Range<usize>,
     ) {
+        let memo = self.memo.clone();
         let (entry, tick) = self.sync(path, snap, stat, Writer::External);
         let current = entry.current.clone();
-        let whole = lines.start == 0 && lines.end >= current.lines.len();
+        let whole = lines.start == 0 && lines.end >= current.line_count();
         let mut seen = entry
             .seen
             .remove(agent)
@@ -292,10 +182,92 @@ impl LedgerState {
         seen.fresh.insert(lines);
         seen.wrote = false;
         seen.at = tick;
-        if whole || entry.unacked(&seen).is_empty() {
+        seen.partial = None;
+        if whole || entry.unacked(&seen, &memo).is_empty() {
             seen.base = current;
         }
         entry.seen.insert(agent.clone(), seen);
+    }
+
+    /// `agent` was shown lines `first..first + hashes.len()` of a file too large to
+    /// snapshot (a streamed range), at file stat `stat`; `hashes` are
+    /// [`super::snapshot::hash_line`] of each. No whole-file hash exists: when the
+    /// path's last known version has the same len/mtime the read is an ordinary
+    /// ranged read of it, otherwise it is kept as a [`Partial`] that the next write
+    /// check resolves against the full text.
+    pub fn record_read_range(
+        &mut self,
+        agent: &AgentId,
+        path: &Path,
+        stat: Stat,
+        first: usize,
+        hashes: Vec<u64>,
+    ) {
+        let memo = self.memo.clone();
+        let tick = self.bump();
+        if !self.entries.contains_key(path) {
+            self.evict_for_insert();
+        }
+        let entry = self
+            .entries
+            .entry(path.to_path_buf())
+            .or_insert_with(|| PathEntry::pending(stat, tick));
+        entry.last_used = tick;
+        let current = entry.current.clone();
+        let mut seen = entry
+            .seen
+            .remove(agent)
+            .unwrap_or_else(|| Seen::at_version(current.clone(), tick));
+        seen.wrote = false;
+        seen.at = tick;
+        if !entry.pending && same_stat(&entry.stat, &stat) {
+            // The known version is the file as it is now.
+            if seen.fresh_hash != current.hash {
+                seen.fresh.clear();
+                seen.fresh_hash = current.hash;
+            }
+            seen.fresh.insert(first..first + hashes.len());
+            seen.partial = None;
+            if entry.unacked(&seen, &memo).is_empty() {
+                seen.base = current;
+            }
+        } else {
+            let merged = Partial::merged(seen.partial.as_deref(), stat, first, hashes);
+            seen.partial = Some(Arc::new(merged));
+        }
+        entry.seen.insert(agent.clone(), seen);
+    }
+
+    /// Settle `agent`'s deferred ranged read of `path` against the file as it is now
+    /// (`snap`/`stat`, full text hashed by the caller). The entry moves to `snap`.
+    /// `Unchanged` brings the agent in sync (its seen lines become its fresh
+    /// ranges); returns whether the caller may pass the write without a verdict
+    /// (`Covers`: the write touches only lines the agent saw).
+    pub fn apply_partial(
+        &mut self,
+        agent: &AgentId,
+        path: &Path,
+        snap: Arc<Snapshot>,
+        stat: Stat,
+        resolution: Resolution,
+    ) -> bool {
+        let (entry, tick) = self.sync(path, snap, stat, Writer::External);
+        match resolution {
+            Resolution::Covers => true,
+            Resolution::Stale => false,
+            Resolution::Unchanged => {
+                let current = entry.current.clone();
+                if let Some(seen) = entry.seen.get_mut(agent)
+                    && let Some(partial) = seen.partial.take()
+                {
+                    seen.base = current;
+                    seen.fresh_hash = seen.base.hash;
+                    seen.fresh = partial.ranges();
+                    seen.at = tick;
+                }
+                false
+            }
+        }
     }
 
     /// May `agent` write over `current` (`None` = the file does not exist)? `touched`
@@ -311,12 +283,13 @@ impl LedgerState {
         let Some((snap, stat)) = current else {
             return Verdict::Clean;
         };
+        let memo = self.memo.clone();
         // A content mismatch with the last known version is an external change.
         let (entry, _) = self.sync(path, snap, stat, Writer::External);
         let Some(seen) = entry.seen.get(agent).cloned() else {
             return Verdict::NotRead;
         };
-        let changes = entry.unacked(&seen);
+        let changes = entry.unacked(&seen, &memo);
         if changes.is_empty() {
             let cur = entry.current.clone();
             if let Some(s) = entry.seen.get_mut(agent) {
@@ -341,6 +314,7 @@ impl LedgerState {
     /// `agent` was shown the current `lines` of `path` (e.g. in a rejection): they
     /// count as re-read.
     pub fn ack(&mut self, agent: &AgentId, path: &Path, lines: &[Range<usize>]) {
+        let memo = self.memo.clone();
         let tick = self.bump();
         let Some(entry) = self.entries.get_mut(path) else {
             return;
@@ -356,7 +330,7 @@ impl LedgerState {
             seen.fresh.insert(r.clone());
         }
         seen.at = tick;
-        if entry.unacked(&seen).is_empty() {
+        if entry.unacked(&seen, &memo).is_empty() {
             seen.base = entry.current.clone();
         }
         entry.seen.insert(agent.clone(), seen);
@@ -372,6 +346,7 @@ impl LedgerState {
         snap: Arc<Snapshot>,
         stat: Stat,
     ) {
+        let memo = self.memo.clone();
         let writer = Writer::agent(agent, name);
         let created = !self.entries.contains_key(path);
         let before = self.entries.get(path).map(|e| e.current.clone());
@@ -379,11 +354,11 @@ impl LedgerState {
         let mut fresh = LineRanges::default();
         match before {
             Some(prev) => {
-                for c in diff(&prev.lines, &snap.lines) {
-                    fresh.insert(c.new);
+                for c in memo.diff(&prev, &snap).iter() {
+                    fresh.insert(c.new.clone());
                 }
             }
-            None => fresh.insert(0..snap.lines.len()),
+            None => fresh.insert(0..snap.line_count()),
         }
         if created {
             entry.last_writer = Some(writer);
@@ -396,6 +371,7 @@ impl LedgerState {
                 fresh,
                 wrote: true,
                 at: tick,
+                partial: None,
             },
         );
     }
@@ -459,35 +435,42 @@ impl LedgerState {
         }
     }
 
-    /// The paths `agent` has seen, most recent first, at most `limit`, plus the
-    /// number left out.
-    pub fn digest(&self, agent: &AgentId, limit: usize) -> (Vec<DigestRow>, usize) {
-        let mut rows: Vec<(u64, DigestRow)> = Vec::new();
-        for (path, entry) in &self.entries {
-            let Some(seen) = entry.seen.get(agent) else {
-                continue;
-            };
-            let changes = entry.unacked(seen);
-            let drift = (!changes.is_empty()).then(|| entry.drift(seen, changes));
-            let read = if seen.fresh_hash == entry.current.hash {
-                seen.fresh.clone()
-            } else {
-                LineRanges::default()
-            };
-            rows.push((
-                seen.at,
-                DigestRow {
-                    path: path.clone(),
-                    version: entry.current.short(),
-                    wrote: seen.wrote,
-                    read,
-                    drift,
-                },
-            ));
-        }
+    /// The paths `agent` has seen, most recent first, at most `limit` (only those get
+    /// their drift computed), plus the number left out. The rows still need
+    /// [`DigestInput::resolve`], which runs the diffs: call it after unlocking.
+    pub fn digest_inputs(&self, agent: &AgentId, limit: usize) -> (Vec<DigestInput>, usize) {
+        let mut rows: Vec<(u64, &PathBuf, &PathEntry, &Seen)> = self
+            .entries
+            .iter()
+            .filter_map(|(p, e)| e.seen.get(agent).map(|s| (s.at, p, e, s)))
+            .collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.0));
         let omitted = rows.len().saturating_sub(limit);
-        let rows = rows.into_iter().take(limit).map(|(_, r)| r).collect();
-        (rows, omitted)
+        let inputs = rows
+            .into_iter()
+            .take(limit)
+            .map(|(_, path, entry, seen)| {
+                let fresh_now = seen.fresh_hash == entry.current.hash;
+                let writers = if seen.base.hash == entry.current.hash {
+                    Vec::new()
+                } else {
+                    entry.writers_since(seen.base.hash)
+                };
+                DigestInput {
+                    path: path.clone(),
+                    wrote: seen.wrote,
+                    read: if fresh_now {
+                        seen.fresh.clone()
+                    } else {
+                        LineRanges::default()
+                    },
+                    fresh_now,
+                    base: seen.base.clone(),
+                    current: entry.current.clone(),
+                    writers,
+                }
+            })
+            .collect();
+        (inputs, omitted)
     }
 }

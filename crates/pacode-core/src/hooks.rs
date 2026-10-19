@@ -16,7 +16,7 @@
 //! Hook failures never abort a turn: everything degrades to a transcript
 //! notice or a log line.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -82,20 +82,44 @@ fn matching<'a>(rules: &'a [HookRule], tool: Option<&str>) -> Vec<&'a HookRule> 
         .collect()
 }
 
+/// Compiled matcher cache (G2): pattern text -> its regex, `None` for a pattern
+/// that failed to compile (so the warning fires once per pattern, not per
+/// evaluation). Cap: [`MATCHER_CACHE_CAP`] patterns, cleared when full. Owner:
+/// this module. Invalidation: never needed, the key is the pattern text itself.
+static COMPILED: LazyLock<Mutex<HashMap<String, Option<regex::Regex>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Patterns kept in [`COMPILED`].
+const MATCHER_CACHE_CAP: usize = 256;
+
+/// The compiled form of `pattern` (trimmed, non-catch-all), compiled at most once.
+fn compiled_matcher(pattern: &str) -> Option<regex::Regex> {
+    let mut cache = COMPILED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(hit) = cache.get(pattern) {
+        return hit.clone();
+    }
+    let compiled = match regex::Regex::new(pattern) {
+        Ok(re) => Some(re),
+        Err(e) => {
+            log::warn!("invalid [hooks] matcher {pattern:?}: {e}");
+            None
+        }
+    };
+    if cache.len() >= MATCHER_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(pattern.to_string(), compiled.clone());
+    compiled
+}
+
 /// Empty or `.*` matchers catch everything; anything else is a regex. An
-/// invalid regex matches nothing (fail-open) and warns once per evaluation.
+/// invalid regex matches nothing (fail-open) and warns once (see [`COMPILED`]).
 fn matcher_matches(matcher: &str, subject: &str) -> bool {
     let m = matcher.trim();
     if m.is_empty() || m == ".*" {
         return true;
     }
-    match regex::Regex::new(m) {
-        Ok(re) => re.is_match(subject),
-        Err(e) => {
-            log::warn!("invalid [hooks] matcher {m:?}: {e}");
-            false
-        }
-    }
+    compiled_matcher(m).is_some_and(|re| re.is_match(subject))
 }
 
 /// The JSON document piped to the hook's stdin.

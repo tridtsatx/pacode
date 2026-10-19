@@ -621,6 +621,21 @@ pub trait ToolHost: Send + Sync {
     ) {
     }
 
+    /// `agent` was shown `lines` (consecutive line texts without terminators) of
+    /// `path`, starting at the 0-based line `first_line`, streamed from a file too
+    /// large to read whole (`read` above its size limit). Unlike
+    /// [`Self::ledger_record_read`] no full content is available: the host records
+    /// just these lines and the file's len/mtime, so they stay editable. Call it under
+    /// [`Self::ledger_lock`] like `ledger_record_read`.
+    async fn ledger_record_read_range(
+        &self,
+        _agent: &AgentId,
+        _path: &Path,
+        _first_line: usize,
+        _lines: &[&str],
+    ) {
+    }
+
     /// `agent` wrote `content` to `path` (after a passing [`Self::ledger_check`]).
     async fn ledger_record_write(&self, _agent: &AgentId, _path: &Path, _content: &str) {}
 }

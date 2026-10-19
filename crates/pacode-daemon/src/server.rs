@@ -11,6 +11,10 @@ use crate::{DaemonError, DaemonOptions};
 /// With a client attached it waits for the disconnect instead of polling.
 const IDLE_POLL_SECS: u64 = 30;
 
+/// A session untouched this long (no running work, no subscriber) is dropped from memory
+/// by [`Core::evict_idle_sessions`]; it reloads from the store on the next `Resume`.
+const SESSION_MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// Serve until shutdown. Returns after cleanup.
 pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError> {
     let listener = bind_socket(&opts.socket).await?;
@@ -139,6 +143,12 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
             }
             _ = idle_timer => {
                 let current_conns = control.connections.load(std::sync::atomic::Ordering::Relaxed);
+                // Housekeeping rides on this existing wake-up (a closed connection, or the
+                // idle-shutdown poll when nobody is attached); it adds no timer of its own.
+                let evicted = core.evict_idle_sessions(SESSION_MAX_IDLE);
+                if evicted > 0 {
+                    log::info!("evicted {evicted} idle session(s) from memory");
+                }
                 if current_conns == 0 && core.is_idle() {
                     let idle_start = idle_since.get_or_insert_with(std::time::Instant::now);
                     if opts.config.daemon.idle_timeout_secs > 0

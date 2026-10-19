@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+pub mod shared;
+pub use shared::{PromptOpts, shared};
+
 use pacode_types::{Mode, Plan};
 
 /// Inputs of the dynamic part.
@@ -49,7 +52,11 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
         out.push_str(&format!("- Git branch: {branch}\n"));
     }
     out.push_str(&format!("- Current date: {}\n", ctx.date));
-    out.push_str(&format!("- Mode: {}\n", ctx.mode.as_str()));
+    // Subagents do not own the plan or the mode; omitting both keeps their system
+    // prefix byte-stable while the orchestrator changes them (provider prefix cache).
+    if !ctx.is_subagent {
+        out.push_str(&format!("- Mode: {}\n", ctx.mode.as_str()));
+    }
 
     if ctx.is_subagent {
         out.push_str("\n## Subagent Role\n");
@@ -57,7 +64,7 @@ pub fn system_dynamic(ctx: &DynamicContext<'_>) -> String {
         out.push_str("The orchestrator may send you `<message_from_orchestrator>` (new instructions, todo items or corrections): take it into account and continue. Use `report_status` for progress. If you are truly blocked, `ask_parent` puts a short question (with options) to the orchestrator; prefer making a reasonable assumption and stating it, because questions are limited and an unanswered one times out. Never ask for something you can find in the code.\n");
     }
 
-    if !ctx.plan.is_empty() {
+    if !ctx.is_subagent && !ctx.plan.is_empty() {
         out.push_str("\n## Plan Summary\n");
         out.push_str(&format!("Overall progress: {}%\n", ctx.plan.percent()));
         for item in &ctx.plan.items {
@@ -287,8 +294,9 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
 }
 
 /// Turn-scoped prompt cache for expensive or filesystem-backed prompt components.
-/// Initialized at turn start (the explicit invalidation point) and reused across
-/// all steps of a single turn to preserve provider prefix caching and avoid syscalls.
+/// Obtained at turn start through [`shared`] (one `Arc` per cwd, shared by all agents; see
+/// `prompt/shared.rs` for cap, TTL and invalidation) and reused across all steps of a
+/// single turn to preserve provider prefix caching and avoid syscalls.
 #[derive(Clone, Debug)]
 pub struct TurnPromptCache {
     pub git_branch: Option<String>,
@@ -297,6 +305,15 @@ pub struct TurnPromptCache {
 }
 
 impl TurnPromptCache {
+    /// Last-resort value (a failed blocking build): no branch, no instructions.
+    pub fn empty() -> Self {
+        Self {
+            git_branch: None,
+            instructions: None,
+            date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+        }
+    }
+
     /// Invalidation point: compute fresh values at turn start.
     pub fn new(
         cwd: &Path,

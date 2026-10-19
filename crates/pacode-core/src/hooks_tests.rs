@@ -118,6 +118,21 @@ fn matcher_catch_all_and_regex() {
 }
 
 #[test]
+fn matchers_compile_once_and_invalid_ones_are_cached_as_failures() {
+    let good = "^g2-cache-(a|b)$";
+    let bad = "g2-cache-[invalid";
+    for _ in 0..3 {
+        assert!(matcher_matches(good, "g2-cache-a"));
+        assert!(!matcher_matches(bad, "g2-cache-a"));
+    }
+    let cache = COMPILED.lock().unwrap();
+    assert!(matches!(cache.get(good), Some(Some(_))));
+    // The failure is remembered (compiled and warned once), not retried.
+    assert!(matches!(cache.get(bad), Some(None)));
+    assert!(cache.len() <= MATCHER_CACHE_CAP);
+}
+
+#[test]
 fn matching_filters_and_toolless_events() {
     let rules = vec![rule("bash", "a", 1), rule("", "b", 1)];
     assert_eq!(matching(&rules, Some("bash")).len(), 2);

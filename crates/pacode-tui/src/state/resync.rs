@@ -5,9 +5,13 @@
 //! events were dropped. The fix is one `GetSnapshot`, debounced to a single request in
 //! flight. Events with `seq <= snapshot.seq` that arrive after a snapshot are stale.
 //!
-//! Owner: `AppState`. Four scalars, nothing grows, reset on disconnect.
+//! `Subscribe` (interest) also lives here: once the daemon is told which agents to stream,
+//! it skips the others' events, which leaves holes in `seq`. Gap detection is then off
+//! (`sparse`); loss is still reported by `Event::Resync` and `ClientEvent::Desynced`.
+//!
+//! Owner: `AppState`. A few scalars and one `AgentId`, nothing grows, reset on disconnect.
 
-use pacode_types::{Event, Request};
+use pacode_types::{AgentId, Event, Request};
 
 /// What to do with an incoming session event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +34,8 @@ pub struct ResyncState {
     in_flight: bool,
     /// A resync is needed and has not been sent yet.
     wanted: bool,
+    /// The daemon filters this stream by interest, so `seq` has expected holes.
+    sparse: bool,
 }
 
 /// Events whose `seq` does not come from the attached session's counter.
@@ -50,12 +56,17 @@ impl ResyncState {
             return Verdict::Stale;
         }
         if let Some(max) = self.max_seen {
-            if seq > max.saturating_add(1) {
+            if !self.sparse && seq > max.saturating_add(1) {
                 self.wanted = true;
             }
             self.max_seen = Some(max.max(seq));
         }
         Verdict::Apply
+    }
+
+    /// A `Subscribe` was sent: from now on `seq` holes are expected.
+    pub fn note_sparse(&mut self) {
+        self.sparse = true;
     }
 
     /// The client reported that it dropped events.
@@ -91,6 +102,35 @@ impl ResyncState {
     }
 
     /// Connection lost: sequences restart with the next attach.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// What this client last told the daemon it wants (`Request::Subscribe`).
+///
+/// The main agent is always wanted; the only other interest is the agent shown in the
+/// panel. The daemon forgets the subscription with the connection, so `reset` runs on
+/// disconnect and the next call re-sends it.
+#[derive(Debug, Default)]
+pub struct SubscriptionState {
+    sent: bool,
+    panel_agent: Option<AgentId>,
+}
+
+impl SubscriptionState {
+    /// A `Subscribe` to send when `panel_agent` differs from what the daemon knows.
+    pub fn take_request(&mut self, panel_agent: Option<&AgentId>) -> Option<Request> {
+        if self.sent && self.panel_agent.as_ref() == panel_agent {
+            return None;
+        }
+        self.sent = true;
+        self.panel_agent = panel_agent.cloned();
+        let mut agents = vec![AgentId::main()];
+        agents.extend(panel_agent.cloned());
+        Some(Request::Subscribe { agents, all: false })
+    }
+
     pub fn reset(&mut self) {
         *self = Self::default();
     }

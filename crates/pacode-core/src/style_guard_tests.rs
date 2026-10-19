@@ -153,3 +153,30 @@ fn registry_pins_forgets_and_evicts_lru() {
         forget_session(&SessionId::new(id.clone()));
     }
 }
+
+fn rules_fingerprint() -> Fingerprint {
+    LoadOptions {
+        builtin: false,
+        disable: Vec::new(),
+        project_dir: None,
+        global_dir: None,
+    }
+    .fingerprint()
+}
+
+#[test]
+fn ruleset_is_trusted_for_the_ttl_then_rechecked() {
+    let mut guard = SessionGuard::default();
+    let t0 = Instant::now();
+    assert!(guard.fresh_ruleset(t0).is_none(), "nothing cached yet");
+    guard.ruleset = Some((rules_fingerprint(), Arc::new(RuleSet::default())));
+    assert!(guard.fresh_ruleset(t0).is_none(), "never checked");
+    guard.ruleset_checked = Some(t0);
+    // 100 lookups inside the TTL never ask for a fingerprint.
+    for i in 0..100u64 {
+        let now = t0 + Duration::from_millis(i * 10);
+        assert!(guard.fresh_ruleset(now).is_some());
+    }
+    // Past the TTL the caller must fingerprint again (picks up edited rule files).
+    assert!(guard.fresh_ruleset(t0 + RULESET_TTL).is_none());
+}

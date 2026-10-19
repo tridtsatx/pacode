@@ -5,8 +5,22 @@
 //! connection (WAL, `synchronous=NORMAL`, `cache_size=-2000`, `foreign_keys=ON`),
 //! runs `schema::migrate`, then loops. `Store` is `Clone` (cheap); dropping the last
 //! clone stops the thread.
+//!
+//! Group commit: the thread takes one command, then drains up to [`MAX_BATCH`] - 1 more
+//! that are already queued (`try_recv`, never waits) and runs them all inside one
+//! `BEGIN IMMEDIATE .. COMMIT`. Query functions that need atomicity use
+//! `conn.savepoint()` (nest-safe), so a failing command rolls back only itself.
+//! Replies are sent only after the COMMIT returns, so a caller is never acknowledged
+//! for a write that is not yet committed. What a crash can lose: commands still in the
+//! channel or in the open batch, none of which has been acknowledged (at most
+//! `MAX_BATCH` commands plus whatever the queue holds). Acknowledged writes keep the
+//! old guarantee: WAL + `synchronous=NORMAL` survive a process crash, while an OS crash
+//! or power loss may lose the most recent commits (including acknowledged ones) back
+//! to the last WAL checkpoint, exactly as before batching. Cost: an ack can wait for
+//! up to `MAX_BATCH` commands ahead of it in the same batch.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -18,7 +32,14 @@ use rusqlite::Connection;
 use crate::queries::{MessageRow, SearchHit, SessionFilter};
 use crate::{StoreError, queries, schema};
 
-type Task = Box<dyn FnOnce(&mut Connection) + Send>;
+/// Max commands per transaction (1 blocking recv + 63 `try_recv`).
+const MAX_BATCH: usize = 64;
+
+/// Sends the caller's reply. Called after the batch COMMIT with `Some(message)` when the
+/// COMMIT failed (a successful result then becomes an error), `None` otherwise.
+type Reply = Box<dyn FnOnce(Option<&str>) + Send>;
+/// Runs the command on the writer thread and returns its deferred reply.
+type Task = Box<dyn FnOnce(&mut Connection) -> Reply + Send>;
 
 enum Command {
     Execute(Task),
@@ -29,6 +50,10 @@ enum Command {
 pub struct Store {
     sender: mpsc::Sender<Command>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Commands sent but not yet taken by the writer thread. Owner: `call` increments
+    /// (before the send), the worker decrements when it dequeues. Bounded by the number
+    /// of in-flight callers; read via [`Store::queue_depth`].
+    depth: Arc<AtomicUsize>,
 }
 
 impl Store {
@@ -49,6 +74,8 @@ impl Store {
     fn start_worker(path: PathBuf, is_memory: bool) -> Result<Store, StoreError> {
         let (init_tx, init_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel::<Command>();
+        let depth = Arc::new(AtomicUsize::new(0));
+        let worker_depth = Arc::clone(&depth);
 
         let builder = std::thread::Builder::new().name("pacode-store".to_string());
         let handle = builder
@@ -76,12 +103,7 @@ impl Store {
                     return;
                 }
 
-                while let Ok(cmd) = rx.recv() {
-                    match cmd {
-                        Command::Execute(f) => f(&mut conn),
-                        Command::Stop => break,
-                    }
-                }
+                run_loop(&mut conn, &rx, &worker_depth);
             })
             .map_err(StoreError::Io)?;
 
@@ -90,7 +112,14 @@ impl Store {
         Ok(Store {
             sender: tx,
             handle: Arc::new(Mutex::new(Some(handle))),
+            depth,
         })
+    }
+
+    /// Number of commands queued for the writer thread and not yet picked up (a gauge,
+    /// 0 when idle). Commands in the batch currently executing are not counted.
+    pub fn queue_depth(&self) -> usize {
+        self.depth.load(Ordering::Relaxed)
     }
 
     fn init_db(conn: &mut Connection, is_memory: bool) -> Result<(), StoreError> {
@@ -116,10 +145,22 @@ impl Store {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = Command::Execute(Box::new(move |conn| {
             let res = f(conn);
-            let _ = tx.send(res);
+            let reply: Reply = Box::new(move |commit_err: Option<&str>| {
+                let res = match (res, commit_err) {
+                    (Ok(_), Some(msg)) => Err(commit_failure(msg)),
+                    (other, _) => other,
+                };
+                let _ = tx.send(res);
+            });
+            reply
         }));
 
+        // Increment before the send so the worker's decrement can never underflow.
+        self.depth.fetch_add(1, Ordering::Relaxed);
         let send_res = self.sender.send(cmd);
+        if send_res.is_err() {
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+        }
 
         async move {
             if send_res.is_err() {
@@ -169,6 +210,20 @@ impl Store {
         let session = session.clone();
         let agent = agent.clone();
         let msg = msg.clone();
+        self.call(move |conn| queries::append_message(conn, &session, &agent, seq, &msg))
+            .await
+    }
+
+    /// Same as [`Store::append_message`] but takes a shared message: no deep clone.
+    pub async fn append_message_arc(
+        &self,
+        session: &SessionId,
+        agent: &AgentId,
+        seq: u64,
+        msg: Arc<Message>,
+    ) -> Result<(), StoreError> {
+        let session = session.clone();
+        let agent = agent.clone();
         self.call(move |conn| queries::append_message(conn, &session, &agent, seq, &msg))
             .await
     }
@@ -352,5 +407,62 @@ impl Store {
         if let Some(h) = handle {
             let _ = h.join();
         }
+    }
+}
+
+fn commit_failure(msg: &str) -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(msg.to_string()),
+    ))
+}
+
+/// Writer-thread main loop: block for one command, drain what is already queued (up to
+/// `MAX_BATCH`), run the batch in one transaction.
+fn run_loop(conn: &mut Connection, rx: &mpsc::Receiver<Command>, depth: &AtomicUsize) {
+    let mut stop = false;
+    while !stop {
+        let Ok(first) = rx.recv() else { break };
+        let mut batch: Vec<Task> = Vec::with_capacity(MAX_BATCH);
+        let mut next = Some(first);
+        while let Some(cmd) = next.take() {
+            match cmd {
+                Command::Execute(task) => {
+                    depth.fetch_sub(1, Ordering::Relaxed);
+                    batch.push(task);
+                }
+                Command::Stop => {
+                    stop = true;
+                    break;
+                }
+            }
+            if batch.len() >= MAX_BATCH {
+                break;
+            }
+            next = rx.try_recv().ok();
+        }
+        run_batch(conn, batch);
+    }
+}
+
+/// Run `batch` inside `BEGIN IMMEDIATE .. COMMIT`, then send every reply. If BEGIN fails
+/// the tasks still run, each atomic through its own savepoint (the pre-batching
+/// behaviour). If COMMIT fails the batch is rolled back and every reply that would have
+/// been `Ok` becomes an error.
+fn run_batch(conn: &mut Connection, batch: Vec<Task>) {
+    if batch.is_empty() {
+        return;
+    }
+    let in_tx = conn.execute_batch("BEGIN IMMEDIATE;").is_ok();
+    let replies: Vec<Reply> = batch.into_iter().map(|task| task(conn)).collect();
+    let mut commit_err: Option<String> = None;
+    if in_tx && let Err(e) = conn.execute_batch("COMMIT;") {
+        commit_err = Some(format!("batch commit failed: {e}"));
+        if let Err(rb) = conn.execute_batch("ROLLBACK;") {
+            log::warn!("pacode-store: rollback after failed commit: {rb}");
+        }
+    }
+    for reply in replies {
+        reply(commit_err.as_deref());
     }
 }

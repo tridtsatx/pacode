@@ -60,7 +60,7 @@ impl Tool for WriteTool {
     /// same dir); output `Wrote <bytes> bytes to <path>`; diff stat from
     /// `pacode_render::diff_stat`.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let (args, _accept_large_output) = parse_input::<WriteInput>(input)?;
+        let (mut args, _accept_large_output) = parse_input::<WriteInput>(input)?;
         if args.path.is_empty() {
             return Err(ToolError::invalid("path cannot be empty"));
         }
@@ -104,18 +104,28 @@ impl Tool for WriteTool {
             .to_string_lossy()
             .to_string();
 
-        let (detail, diff_stat) = match &old_content {
-            Some(old) => {
-                let diff = pacode_render::unified_diff(old, &args.content, &rel_path, 3);
-                let stat = pacode_render::diff_stat(old, &args.content);
-                (diff, Some(stat))
-            }
-            None => {
-                let line_count = args.content.lines().count();
-                let detail = format!("new file, {line_count} lines");
-                let stat = pacode_render::diff_stat("", &args.content);
-                (detail, Some(stat))
-            }
+        // Diff and stat are CPU work proportional to the file: compute both in one
+        // `spawn_blocking`; the new content moves in and back out (no copy).
+        let (detail, diff_stat) = {
+            let new_content = std::mem::take(&mut args.content);
+            let rel = rel_path.clone();
+            let (detail, stat, new_content) = tokio::task::spawn_blocking(move || {
+                let (detail, stat) = match &old_content {
+                    Some(old) => (
+                        pacode_render::unified_diff(old, &new_content, &rel, 3),
+                        pacode_render::diff_stat(old, &new_content),
+                    ),
+                    None => (
+                        format!("new file, {} lines", new_content.lines().count()),
+                        pacode_render::diff_stat("", &new_content),
+                    ),
+                };
+                (detail, stat, new_content)
+            })
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))?;
+            args.content = new_content;
+            (detail, Some(stat))
         };
 
         let outside = is_outside_workspace(&full_path, &ctx.cwd);

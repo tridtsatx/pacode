@@ -6,6 +6,9 @@ use std::time::Instant;
 use pacode_render::{LineCache, StreamBuffer, StreamKind, StreamOp};
 use pacode_types::{TranscriptItem, TranscriptKind};
 
+#[path = "cell_extent.rs"]
+pub mod cell_extent;
+
 #[cfg(test)]
 #[path = "transcript_tests.rs"]
 mod transcript_tests;
@@ -95,6 +98,13 @@ pub struct Transcript {
     /// finds the cell under it.
     pub cell_lines: Vec<(u64, usize, usize)>,
     pub cache: LineCache,
+    /// Rendered line count per cell, so a frame renders only the cells in view; see
+    /// `cell_extent` for cap and invalidation.
+    pub extents: cell_extent::CellExtents,
+    /// Cells whose lines the most recent draw rendered or fetched (the viewport's
+    /// cells, plus any cell measured for the first time or whose lines are not
+    /// cacheable). Bounded by the viewport once every cell has been measured.
+    pub cells_laid_out: usize,
     /// Decoded inline images (32 entries / 4 MB, LRU); see `state::image_cache`.
     pub images: crate::state::image_cache::ImageCellCache,
     /// Streaming reveal buffer for the live assistant cell (`live_cell`).
@@ -123,6 +133,8 @@ impl Transcript {
             expanded: std::collections::HashSet::new(),
             cell_lines: Vec::new(),
             cache: LineCache::new(20_000),
+            extents: cell_extent::CellExtents::default(),
+            cells_laid_out: 0,
             images: crate::state::image_cache::ImageCellCache::default(),
             stream: None,
             live_cell: None,
@@ -143,6 +155,7 @@ impl Transcript {
     pub fn reset(&mut self, items: Vec<TranscriptItem>, has_more: bool) {
         self.cells.clear();
         self.cache.clear();
+        self.extents.clear();
         self.images.clear();
         self.stream = None;
         self.live_cell = None;
@@ -559,6 +572,7 @@ impl Transcript {
                     // with it rather than leaving an id behind forever.
                     self.expanded.remove(&evicted.id);
                     self.cache.invalidate_cell(evicted.id);
+                    self.extents.remove(evicted.id);
                 } else {
                     break;
                 }

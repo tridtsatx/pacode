@@ -19,22 +19,33 @@
 //!   changed are rehashed and attributed to the agent that ran it.
 //! - Writers of one path are serialized by a per-path async lock held across read,
 //!   check and write.
+//! - Diffs never run under the state mutex: the call computes the diff it will need
+//!   first (on a blocking thread when big) into a content-addressed memo
+//!   ([`diff_memo`]), and the locked section only looks it up.
+//! - Files above [`snapshot::MAX_LINE_SNAPSHOT_BYTES`] are snapshotted by whole-file
+//!   hash only; a changed one is reported as "the file changed". A streamed range of
+//!   such a file is recorded without hashing it ([`FileLedger::record_read_range`],
+//!   [`partial`]), so those lines can still be edited.
 //!
 //! State lives in memory per session (lost on daemon restart, so "read first"
 //! applies again); nothing is persisted and nothing runs while idle. Caps: see
 //! [`state::MAX_PATHS`], [`ranges::MAX_INTERVALS`] and [`locks::LOCK_MAP_CAP`].
 
+mod diff_memo;
+mod entry;
 mod locks;
+mod partial;
 mod ranges;
 mod refresh;
 mod render;
 mod snapshot;
 mod state;
+mod types;
 
 use std::ffi::OsStr;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use pacode_tools::WriteIntent;
 use pacode_types::AgentId;
@@ -46,11 +57,18 @@ pub use snapshot::{Snapshot, Stat};
 pub use state::{Drift, LedgerState, MAX_PATHS, Verdict, Writer};
 
 /// The session's file ledger. Owner: `Session::ledger`.
-#[derive(Default)]
 pub struct FileLedger {
     state: Mutex<LedgerState>,
+    /// The state's diff memo, kept here so diffs can be primed without its lock.
+    memo: Arc<diff_memo::DiffMemo>,
     locks: locks::PathLocks,
     refresh: refresh::RefreshGate,
+}
+
+impl Default for FileLedger {
+    fn default() -> Self {
+        Self::from_state(LedgerState::default())
+    }
 }
 
 impl FileLedger {
@@ -60,11 +78,38 @@ impl FileLedger {
 
     /// A ledger tracking at most `cap` paths (tests).
     pub fn with_cap(cap: usize) -> Self {
+        Self::from_state(LedgerState::with_cap(cap))
+    }
+
+    fn from_state(state: LedgerState) -> Self {
         Self {
-            state: Mutex::new(LedgerState::with_cap(cap)),
+            memo: state.memo(),
+            state: Mutex::new(state),
             locks: locks::PathLocks::default(),
             refresh: refresh::RefreshGate::default(),
         }
+    }
+
+    /// Compute (and memoize) the diff `old` -> `new` that a locked section is about to
+    /// ask for, on a blocking thread when it is big. Never called with the state lock
+    /// held. Skipped when `old` is unknown, equal to `new` or already memoized.
+    async fn prefetch(&self, old: Option<Arc<Snapshot>>, new: &Arc<Snapshot>) {
+        let Some(old) = old else {
+            return;
+        };
+        if old.hash == new.hash || self.memo.get(&old, new).is_some() {
+            return;
+        }
+        if !diff_memo::DiffMemo::is_heavy(&old, new) {
+            self.memo.diff(&old, new);
+            return;
+        }
+        let (memo, new) = (self.memo.clone(), new.clone());
+        // A join error only means the diff is computed inline under the lock instead.
+        let _ = tokio::task::spawn_blocking(move || {
+            memo.diff(&old, &new);
+        })
+        .await;
     }
 
     fn state(&self) -> MutexGuard<'_, LedgerState> {
@@ -112,7 +157,34 @@ impl FileLedger {
         let key = canonical_key(path).await;
         let stat = stat_of(&key, content.len()).await;
         let snap = Snapshot::of(content);
+        if !(lines.start == 0 && lines.end >= snap.line_count()) {
+            let base = self.state().peek_base(agent, &key);
+            self.prefetch(base, &snap).await;
+        }
         self.state().record_read(agent, &key, snap, stat, lines);
+    }
+
+    /// `agent` was shown `lines` (the text of consecutive lines starting at the
+    /// 0-based line `first_line`) of a file too large to read whole (streamed range).
+    /// Records the hashes of just those lines plus the file's len/mtime, taken now
+    /// (call it under the path's [`Self::lock`], like [`Self::record_read`]); the
+    /// whole-file hash is deferred to the agent's next write check. Cap: see
+    /// [`partial::MAX_SEGMENTS`] / [`partial::MAX_PARTIAL_LINES`].
+    pub async fn record_read_range(
+        &self,
+        agent: &AgentId,
+        path: &Path,
+        first_line: usize,
+        lines: &[&str],
+    ) {
+        if lines.is_empty() {
+            return;
+        }
+        let key = canonical_key(path).await;
+        let stat = stat_of(&key, 0).await;
+        let hashes: Vec<u64> = lines.iter().map(|l| snapshot::hash_line(l)).collect();
+        self.state()
+            .record_read_range(agent, &key, stat, first_line, hashes);
     }
 
     /// Decide a write (see `ToolHost::ledger_check`). `shown` is the path as the
@@ -136,6 +208,26 @@ impl FileLedger {
             (Some(c), Some(p)) => Some(snapshot::touched(c, p)),
             _ => None,
         };
+        if let Some((snap, stat)) = &now {
+            // A ranged read of a large file left the whole-file hash for now.
+            let partial = if snap.whole_only {
+                self.state().peek_partial(agent, &key)
+            } else {
+                None
+            };
+            if let Some(partial) = partial {
+                let text = current.unwrap_or_default();
+                let resolution = partial.resolve(stat, text, snap.line_count(), touched.as_deref());
+                let pass = self
+                    .state()
+                    .apply_partial(agent, &key, snap.clone(), *stat, resolution);
+                if pass {
+                    return Ok(Some(render::partial_note(shown)));
+                }
+            }
+            let base = self.state().peek_base(agent, &key);
+            self.prefetch(base, snap).await;
+        }
         let verdict = self.state().check(agent, &key, now, touched.as_deref());
         match verdict {
             Verdict::Clean => Ok(None),
@@ -157,6 +249,8 @@ impl FileLedger {
         let key = canonical_key(path).await;
         let stat = stat_of(&key, content.len()).await;
         let snap = Snapshot::of(content);
+        let prev = self.state().peek_current(&key);
+        self.prefetch(prev, &snap).await;
         self.state().record_write(agent, name, &key, snap, stat);
     }
 
@@ -203,10 +297,12 @@ impl FileLedger {
     /// versions and outstanding "modified by another agent" warnings (at most
     /// [`render::DIGEST_MAX_LINES`] lines). `None` when it has seen no files.
     pub fn digest(&self, agent: &AgentId, cwd: &Path) -> Option<String> {
-        let (rows, omitted) = self.state().digest(agent, render::DIGEST_MAX_ROWS);
+        let (inputs, omitted) = self.state().digest_inputs(agent, render::DIGEST_MAX_ROWS);
         let base = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let rows: Vec<(String, state::DigestRow)> = rows
+        // The diffs behind the drift lines run here, after the state lock is released.
+        let rows: Vec<(String, state::DigestRow)> = inputs
             .into_iter()
+            .map(|input| input.resolve(&self.memo))
             .map(|row| (shown_path(&row.path, &base), row))
             .collect();
         render::digest(&rows, omitted, agent)
@@ -257,6 +353,9 @@ async fn stat_of(key: &Path, fallback_len: usize) -> Stat {
     }
 }
 
+#[cfg(test)]
+#[path = "ledger/large_tests.rs"]
+mod large_tests;
 #[cfg(test)]
 #[path = "ledger_tests.rs"]
 mod ledger_tests;

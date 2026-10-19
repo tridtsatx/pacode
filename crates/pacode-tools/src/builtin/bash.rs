@@ -17,6 +17,9 @@ mod ssh_multiplex_tests;
 
 pub const NAME: &str = "bash";
 
+/// How long a spawn may stay pending before the row shows "waiting for a process slot".
+const SLOT_WAIT_NOTICE: Duration = Duration::from_millis(1500);
+
 pub struct BashTool;
 
 #[derive(Deserialize, Default)]
@@ -141,8 +144,25 @@ impl Tool for BashTool {
         spec.label = args.label.clone();
         spec.background = args.background;
         spec.timeout = timeout;
+        // Cancelling the call also abandons a wait in the exec admission queue.
+        spec.cancel = Some(ctx.cancel.clone());
 
-        let id = ctx.host.spawn_task(spec).await?;
+        // When all process slots are busy `spawn_task` queues (FIFO). A spawn that is still
+        // pending after `SLOT_WAIT_NOTICE` is most likely queued: say so in the live row.
+        let spawn = ctx.host.spawn_task(spec);
+        tokio::pin!(spawn);
+        let spawned = tokio::select! {
+            r = &mut spawn => r,
+            () = tokio::time::sleep(SLOT_WAIT_NOTICE) => {
+                ctx.host.emit_preview(&ctx.call_id, "waiting for a process slot...".to_string());
+                spawn.await
+            }
+        };
+        let id = match spawned {
+            Ok(id) => id,
+            Err(_) if ctx.cancel.is_cancelled() => return Err(ToolError::Cancelled),
+            Err(e) => return Err(e),
+        };
 
         if args.background {
             let content = format!("task_id: {id}\nstatus: running\nTask started in background.");

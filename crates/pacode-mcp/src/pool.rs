@@ -44,6 +44,13 @@ pub struct McpPool {
     cache_dir: CacheDir,
     cwd: Option<PathBuf>,
     clients: tokio::sync::Mutex<HashMap<String, Arc<PooledClient>>>,
+    /// Per-server start gates: serialises concurrent starts of the SAME server while
+    /// the `clients` map lock is held only briefly. Cap: one entry per configured
+    /// server; never invalidated (entries are tiny); owner: the pool.
+    start_gates: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Hash of the last schema content written to disk per server, so an unchanged
+    /// schema is not rewritten. Cap: one u64 per server; owner: the pool.
+    disk_hashes: std::sync::Mutex<HashMap<String, u64>>,
     schema_cache: std::sync::Mutex<HashMap<String, ServerSchemaCache>>,
     sampling_handler: Arc<std::sync::RwLock<Option<Arc<dyn SamplingHandler>>>>,
     sampling_enabled: Arc<AtomicBool>,
@@ -63,6 +70,8 @@ impl McpPool {
             cache_dir,
             cwd,
             clients: tokio::sync::Mutex::new(HashMap::new()),
+            start_gates: std::sync::Mutex::new(HashMap::new()),
+            disk_hashes: std::sync::Mutex::new(HashMap::new()),
             schema_cache: std::sync::Mutex::new(HashMap::new()),
             sampling_handler: Arc::new(std::sync::RwLock::new(None)),
             sampling_enabled: Arc::new(AtomicBool::new(true)),
@@ -361,8 +370,24 @@ impl McpPool {
         }
 
         if let Some(cache_dir) = &self.cache_dir {
+            let hash = schema_hash(cfg, tools, resources, prompts);
+            {
+                let mut hashes = self.disk_hashes.lock().unwrap_or_else(|p| p.into_inner());
+                if hashes.get(server) == Some(&hash) {
+                    return;
+                }
+                hashes.insert(server.to_string(), hash);
+            }
             save_disk_cache(cache_dir, server, cfg, tools, resources, prompts);
         }
+    }
+
+    /// Prompt names from the in-memory schema cache; no RPC. Empty when unknown.
+    pub fn cached_prompt_names(&self, server: &str) -> Vec<String> {
+        let mem = self.schema_cache.lock().unwrap_or_else(|p| p.into_inner());
+        mem.get(server)
+            .map(|s| s.prompts.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default()
     }
 
     fn get_cached_schema(&self, server: &str, cfg: &McpServerConfig) -> Option<ServerSchemaCache> {
@@ -446,12 +471,18 @@ impl McpPool {
         server: &str,
     ) -> Result<Arc<PooledClient>, McpError> {
         let cfg = self.server_config(server)?;
-        let mut clients = self.clients.lock().await;
-        if let Some(pooled) = clients.get(server) {
-            if pooled.client.is_alive() {
-                return Ok(Arc::clone(pooled));
-            }
-            clients.remove(server);
+        if let Some(pooled) = self.live_pooled(server).await {
+            return Ok(pooled);
+        }
+        let gate = {
+            let mut gates = self.start_gates.lock().unwrap_or_else(|p| p.into_inner());
+            Arc::clone(gates.entry(server.to_string()).or_default())
+        };
+        // Held across the start so concurrent callers for this server wait here, not
+        // on the `clients` map lock (which other servers' calls need).
+        let _start = gate.lock().await;
+        if let Some(pooled) = self.live_pooled(server).await {
+            return Ok(pooled);
         }
 
         {
@@ -466,7 +497,10 @@ impl McpPool {
                     last_used: std::sync::Mutex::new(std::time::Instant::now()),
                     in_flight: AtomicUsize::new(0),
                 });
-                clients.insert(server.to_string(), Arc::clone(&pooled));
+                self.clients
+                    .lock()
+                    .await
+                    .insert(server.to_string(), Arc::clone(&pooled));
                 Ok(pooled)
             }
             Err(err) => {
@@ -475,6 +509,19 @@ impl McpPool {
                 Err(err)
             }
         }
+    }
+
+    /// The pooled client for `server` when alive; a dead one is removed. Holds the
+    /// map lock only for the lookup.
+    async fn live_pooled(&self, server: &str) -> Option<Arc<PooledClient>> {
+        let mut clients = self.clients.lock().await;
+        if let Some(pooled) = clients.get(server) {
+            if pooled.client.is_alive() {
+                return Some(Arc::clone(pooled));
+            }
+            clients.remove(server);
+        }
+        None
     }
 
     fn update_status_ready(&self, server: &str) {
@@ -706,4 +753,24 @@ impl McpPool {
             client.shutdown().await;
         }
     }
+}
+
+/// Content hash of a server's schema plus its launch fingerprint (disk-write dedup).
+fn schema_hash(
+    cfg: &McpServerConfig,
+    tools: &[McpToolInfo],
+    resources: &[McpResource],
+    prompts: &[McpPrompt],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    crate::cache::fingerprint(cfg).hash(&mut hasher);
+    for json in [
+        serde_json::to_string(tools),
+        serde_json::to_string(resources),
+        serde_json::to_string(prompts),
+    ] {
+        json.unwrap_or_default().hash(&mut hasher);
+    }
+    hasher.finish()
 }

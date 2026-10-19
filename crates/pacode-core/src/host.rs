@@ -640,6 +640,19 @@ impl ToolHost for SessionHost {
             .await;
     }
 
+    async fn ledger_record_read_range(
+        &self,
+        agent: &AgentId,
+        path: &Path,
+        first_line: usize,
+        lines: &[&str],
+    ) {
+        self.session
+            .ledger
+            .record_read_range(agent, path, first_line, lines)
+            .await;
+    }
+
     async fn ledger_record_write(&self, agent: &AgentId, path: &Path, content: &str) {
         // Rejections name the writer by its display name.
         let name = self

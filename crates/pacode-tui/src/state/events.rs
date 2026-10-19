@@ -8,7 +8,11 @@ use crate::state::stats;
 use crate::state::transcript::{Cell, CellKind, Transcript};
 use crate::state::{AppState, Focus, PanelTarget};
 
-pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
+/// Fold one event into the state. Returns whether anything visible changed (main
+/// transcript, the focused panel, a rail row, a toast, an overlay, the footer), so the
+/// caller redraws only then. Deltas for an agent nobody is looking at return false.
+pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) -> bool {
+    let mut visible = true;
     match event {
         Event::SessionUpdated(meta) => {
             let mut prefs = pacode_config::load_prefs(&state.paths);
@@ -32,6 +36,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                 state.turn_active = true;
                 state.turn_started_at = Some(now);
                 state.rail.update_idle(true, now);
+            } else {
+                visible = false;
             }
         }
         Event::TurnEnded {
@@ -40,6 +46,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             usage,
             stop,
         } => {
+            let failed = matches!(stop, pacode_types::TurnStop::Failed { .. });
             if let pacode_types::TurnStop::Failed { message } = &stop {
                 state.push_toast(
                     ToastLevel::Error,
@@ -87,6 +94,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                     PanelTarget::Agent(id) => *id == agent,
                     _ => false,
                 });
+                visible = failed || is_panel_target;
                 if is_panel_target {
                     state.panel.agent_transcript.flush_stream();
                     if let Some(ref u) = usage
@@ -118,6 +126,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             }
         }
         Event::ItemAdded(item) => {
+            let is_tool_call = matches!(item.kind, TranscriptKind::ToolCall { .. });
             if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
                 let arg = title
                     .strip_prefix(name.as_str())
@@ -140,6 +149,9 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                 && *id == item.agent
             {
                 state.panel.agent_transcript.upsert(item, now);
+            } else {
+                // Tool calls feed the files list, everything else is off screen.
+                visible = is_tool_call;
             }
         }
         Event::ItemUpdated(item) => {
@@ -152,6 +164,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                 && *id == item.agent
             {
                 state.panel.agent_transcript.upsert(item, now);
+            } else {
+                visible = false;
             }
         }
         Event::TextDelta {
@@ -171,6 +185,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                     .panel
                     .agent_transcript
                     .push_delta(item_seq, &text, false, now);
+            } else {
+                visible = false;
             }
         }
         Event::ReasoningDelta {
@@ -190,10 +206,13 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
                     .panel
                     .agent_transcript
                     .push_delta(item_seq, &text, true, now);
+            } else {
+                visible = false;
             }
         }
         Event::PermissionRequested(req) => {
             let ts_ms = req.created_at_ms;
+            state.pending_permissions += 1;
             state.transcript.cells.push_back(Cell {
                 id: seq,
                 kind: CellKind::Item(TranscriptKind::Permission(req)),
@@ -206,6 +225,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             permission,
             decision,
         } => {
+            // Counted down even when the cell is gone, so the pulse cannot get stuck.
+            state.pending_permissions = state.pending_permissions.saturating_sub(1);
             for cell in &mut state.transcript.cells {
                 if let CellKind::Item(TranscriptKind::Permission(ref req)) = cell.kind
                     && req.id == permission
@@ -248,6 +269,8 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             {
                 *follow = false;
             }
+            // Only a changed row redraws; an identical update is a no-op for the eye.
+            visible = state.rail.agent(&info.id) != Some(&info);
             state.rail.upsert_agent(info);
         }
         Event::TaskAdded(info) => {
@@ -388,9 +411,10 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
         }
         // Handled in `AppState::apply_client_event` (it asks for a snapshot) and never
         // forwarded here; the arm keeps the match exhaustive.
-        Event::Resync { .. } => {}
+        Event::Resync { .. } => visible = false,
     }
-    state.rail.update_idle(state.turn_active, now);
+    let idle_changed = state.rail.update_idle(state.turn_active, now);
+    visible || idle_changed
 }
 
 fn compute_turn_stats(duration_ms: u64, usage: &pacode_types::stream::Usage) -> Option<String> {
@@ -411,3 +435,7 @@ fn attach_turn_stats(transcript: &mut Transcript, stats_str: String) {
         cell.version = cell.version.wrapping_add(1);
     }
 }
+
+#[cfg(test)]
+#[path = "events_tests.rs"]
+mod events_tests;

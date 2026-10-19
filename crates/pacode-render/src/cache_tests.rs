@@ -92,3 +92,72 @@ fn clear_resets_everything() {
     assert_eq!(cache.total_lines(), 0);
     assert!(cache.get(CacheKey { cell: 1, width: 80 }).is_none());
 }
+
+#[test]
+fn clear_bumps_generation_and_eviction_keeps_order_in_sync() {
+    let mut cache = LineCache::new(100);
+    let g = cache.generation();
+    cache.insert(CacheKey { cell: 1, width: 80 }, vec![Line::from("1")]);
+    assert_eq!(cache.generation(), g);
+    cache.clear();
+    assert_ne!(cache.generation(), g);
+    assert!(cache.order.is_empty());
+}
+
+/// The stamp-based LRU evicts exactly what a naive list-based LRU would.
+#[test]
+fn matches_a_naive_lru_model_over_a_random_workload() {
+    use std::collections::VecDeque;
+    let max = 12usize;
+    let mut cache = LineCache::new(max);
+    let mut model: VecDeque<(CacheKey, usize)> = VecDeque::new();
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..2000 {
+        let key = CacheKey {
+            cell: next() % 9,
+            width: 80,
+        };
+        match next() % 3 {
+            0 => {
+                let hit = cache.get(key).is_some();
+                let pos = model.iter().position(|(k, _)| *k == key);
+                assert_eq!(hit, pos.is_some());
+                if let Some(p) = pos
+                    && let Some(e) = model.remove(p)
+                {
+                    model.push_back(e);
+                }
+            }
+            1 => {
+                let n = (next() % 5) as usize + 1;
+                cache.insert(key, vec![Line::from("x"); n]);
+                if let Some(p) = model.iter().position(|(k, _)| *k == key) {
+                    model.remove(p);
+                }
+                model.push_back((key, n));
+                while model.iter().map(|(_, n)| n).sum::<usize>() > max && model.len() > 1 {
+                    model.pop_front();
+                }
+            }
+            _ => {
+                let cell = key.cell;
+                cache.invalidate_cell(cell);
+                model.retain(|(k, _)| k.cell != cell);
+            }
+        }
+        assert_eq!(
+            cache.total_lines(),
+            model.iter().map(|(_, n)| n).sum::<usize>()
+        );
+        assert_eq!(cache.order.len(), cache.entries.len());
+        for (k, _) in &model {
+            assert!(cache.contains(*k));
+        }
+    }
+}

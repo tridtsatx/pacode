@@ -1,8 +1,10 @@
 //! Schema and migrations (spec §12). `user_version` pragma tracks the version.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
-pub const SCHEMA_VERSION: i32 = 3;
+use crate::queries::message::extract_message_plain_text;
+
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Create or upgrade the schema. Idempotent.
 pub fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -162,7 +164,42 @@ pub fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         )?;
         tx.commit()?;
     }
+
+    if current_version < 4 {
+        // FTS now indexes only the head of tool results; re-index so that the contentless
+        // table's 'delete' (which replays the indexed text) stays consistent.
+        rebuild_fts(conn)?;
+    }
     Ok(())
+}
+
+/// Drop and recreate `messages_fts`, re-indexing every message with the current
+/// `message_plain_text`, and set `user_version = 4`. One transaction; runs once on
+/// open for databases older than v4 (cost: one pass over `messages.content_json`).
+pub(crate) fn rebuild_fts(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS messages_fts;
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            text,
+            content='',
+            tokenize='unicode61'
+        );
+        "#,
+    )?;
+    {
+        let mut select = tx.prepare("SELECT id, content_json FROM messages;")?;
+        let mut insert = tx.prepare("INSERT INTO messages_fts(rowid, text) VALUES(?1, ?2);")?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let json: String = row.get(1)?;
+            insert.execute(params![id, extract_message_plain_text(&json)])?;
+        }
+    }
+    tx.execute_batch("PRAGMA user_version = 4;")?;
+    tx.commit()
 }
 
 #[cfg(test)]

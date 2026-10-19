@@ -104,6 +104,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
     let mut term_events = EventStream::new();
     let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgResponse>();
 
+    // Tell the daemon to stream only the main agent (and the panel target later).
+    dispatch_subscribe(&mut state, &client);
+
     // On start (after attach), send ListPlugins and register commands
     {
         let cl = Arc::clone(&client);
@@ -287,6 +290,7 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                         if let Some(req) = state.take_resync_request() {
                             dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
                         }
+                        dispatch_subscribe(&mut state, &client);
                     }
                     None => {
                         break;
@@ -311,6 +315,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                         }
                         _ => vec![],
                     };
+                    // Before the actions, so a panel's history load starts after its
+                    // deltas are already subscribed.
+                    dispatch_subscribe(&mut state, &client);
                     for act in actions {
                         dispatch_action(act, &mut state, &client, &bg_tx);
                     }
@@ -325,6 +332,7 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                     if let Some(req) = state.take_resync_request() {
                         dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
                     }
+                    dispatch_subscribe(&mut state, &client);
                 }
             }
             _ = stream_sleep => {
@@ -376,6 +384,19 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         c.close().await;
     }
     Ok(attached_session)
+}
+
+/// Send `Subscribe` when the wanted agent set changed. Fire and forget: an older daemon
+/// answers with an error and keeps streaming everything, which is still correct.
+fn dispatch_subscribe(state: &mut AppState, client: &Arc<Client>) {
+    if let Some(req) = state.take_subscribe_request() {
+        let cl = Arc::clone(client);
+        tokio::spawn(async move {
+            if let Err(err) = cl.request(req).await {
+                log::debug!("subscribe request failed: {err}");
+            }
+        });
+    }
 }
 
 fn dispatch_action(

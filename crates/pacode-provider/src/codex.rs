@@ -53,6 +53,8 @@ pub struct Codex {
     pricing: BTreeMap<String, Pricing>,
     client: reqwest::Client,
     catalog_cache: Mutex<Option<Vec<ModelInfo>>>,
+    /// Single-flight for `list_models`: concurrent misses share one catalogue GET.
+    catalog_fetch: tokio::sync::Mutex<()>,
     backoff_base: Duration,
     /// Concurrency permits and cooldown; the registry swaps in the shared per-provider gate.
     gate: Arc<crate::gate::ProviderGate>,
@@ -91,6 +93,7 @@ impl Codex {
             pricing,
             client,
             catalog_cache: Mutex::new(None),
+            catalog_fetch: tokio::sync::Mutex::new(()),
             backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
             gate,
         })
@@ -320,23 +323,19 @@ impl Provider for Codex {
         let url = self.endpoint();
         let headers = self.build_headers();
         let info = self.model_info(&req.model);
-        let req = gate_images(req, &info)?;
+        let mut req = gate_images(req, &info)?;
         let body = self.build_body(&req);
         let max_retries = self.defaults.max_retries;
 
-        let body_keys: Vec<&str> = body
-            .as_object()
-            .map(|obj| obj.keys().map(String::as_str).collect())
-            .unwrap_or_default();
+        let body_keys = crate::request_body::body_keys(&body);
         let url_redacted = redact(&url);
         let model = &req.model;
         log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
 
-        if log::log_enabled!(log::Level::Trace) {
-            let serialized_body = serde_json::to_string(&body).unwrap_or_default();
-            let body_redacted = redact(&crate::vision::redact_data_urls(&serialized_body));
-            log::trace!("request body: {body_redacted}");
-        }
+        // Serialise once; the Value tree and the history copy are dropped right away.
+        let body = crate::request_body::encode(body)?;
+        req.messages = Vec::new();
+        crate::request_body::trace_body(&body);
 
         let effort = req.effort.unwrap_or(self.defaults.effort);
         let opener = CodexStreamOpener {
@@ -363,6 +362,13 @@ impl Provider for Codex {
             return Ok(cached.clone());
         }
 
+        // Single-flight: waiters re-check the cache the first caller just filled.
+        let _flight = self.catalog_fetch.lock().await;
+        if let Ok(guard) = self.catalog_cache.lock()
+            && let Some(cached) = guard.as_ref()
+        {
+            return Ok(cached.clone());
+        }
         self.fetch_models().await
     }
 

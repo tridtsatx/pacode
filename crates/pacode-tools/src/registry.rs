@@ -1,7 +1,7 @@
 //! Named tool registry with per-agent subsets.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use pacode_types::ToolDefinition;
 
@@ -10,6 +10,9 @@ use crate::{Tool, ToolKind};
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Cached definitions. Cap: one slice per registry (tool count). Invalidation: reset by
+    /// `register`. Owner: this registry (clones start with the same cached `Arc`).
+    defs: OnceLock<Arc<[ToolDefinition]>>,
 }
 
 impl ToolRegistry {
@@ -19,6 +22,7 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
+        self.defs = OnceLock::new();
     }
 
     pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
@@ -44,13 +48,21 @@ impl ToolRegistry {
 
     /// Definitions for the model, in name order (stable for prompt caching).
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        self.definitions_arc().to_vec()
+    }
+
+    /// The same definitions as a shared slice, built once per registry state (see `defs`).
+    pub fn definitions_arc(&self) -> Arc<[ToolDefinition]> {
+        self.defs
+            .get_or_init(|| self.tools.values().map(|tool| tool.definition()).collect())
+            .clone()
     }
 
     /// A copy without the tool `name`.
     pub fn without(&self, name: &str) -> ToolRegistry {
         let mut out = self.clone();
         out.tools.remove(name);
+        out.defs = OnceLock::new();
         out
     }
 
@@ -76,3 +88,7 @@ impl ToolRegistry {
         out
     }
 }
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod registry_tests;

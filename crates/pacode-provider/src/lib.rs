@@ -14,18 +14,23 @@
 
 pub mod builtin;
 pub mod catalog_cache;
+#[cfg(test)]
+mod catalog_flight_tests;
 pub mod codex;
 pub mod compat;
 pub mod devin;
 pub mod gate;
+mod image_cache;
 pub mod mock;
 pub mod model_meta;
 pub mod openai_compat;
 pub mod registry;
 mod registry_cache;
+mod request_body;
 mod retry;
 mod retry_after;
 pub mod sse;
+mod sse_typed;
 pub mod vision;
 
 use std::pin::Pin;

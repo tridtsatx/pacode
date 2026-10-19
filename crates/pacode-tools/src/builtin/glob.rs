@@ -1,6 +1,9 @@
 //! `glob`: find files by pattern, newest first.
 
-use std::path::Path;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -81,7 +84,11 @@ impl Tool for GlobTool {
                     .require_git(false)
                     .build();
 
-                let mut entries = Vec::new();
+                // Bounded top-N by mtime (cap: `max_results` entries; owner: this call). Ties keep
+                // walk order via `seq`, as the previous stable sort did.
+                let mut heap: BinaryHeap<Reverse<(SystemTime, Reverse<usize>, PathBuf)>> =
+                    BinaryHeap::with_capacity(max_results.min(4096) + 1);
+                let mut seq = 0usize;
 
                 for entry in walker {
                     if cancel.is_cancelled() {
@@ -102,16 +109,19 @@ impl Tool for GlobTool {
                             .ok()
                             .and_then(|m| m.modified().ok())
                             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        entries.push((mtime, rel.to_path_buf()));
+                        heap.push(Reverse((mtime, Reverse(seq), rel.to_path_buf())));
+                        seq += 1;
+                        if heap.len() > max_results {
+                            heap.pop();
+                        }
                     }
                 }
 
-                entries.sort_by_key(|b| std::cmp::Reverse(b.0));
-                entries.truncate(max_results);
-
-                let lines = entries
+                // Ascending order of `Reverse(key)` is newest first.
+                let lines = heap
+                    .into_sorted_vec()
                     .into_iter()
-                    .map(|(_, p)| p.to_string_lossy().to_string())
+                    .map(|Reverse((_, _, p))| p.to_string_lossy().to_string())
                     .collect();
                 Ok(lines)
             })
@@ -129,3 +139,7 @@ impl Tool for GlobTool {
             .with_preview(preview))
     }
 }
+
+#[cfg(test)]
+#[path = "glob_tests.rs"]
+mod glob_tests;

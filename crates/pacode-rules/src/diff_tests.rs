@@ -29,3 +29,13 @@ fn set_based_ignores_blank_and_indentation() {
     let old = OldLines::new("  keep\n");
     assert_eq!(added_by_set(&old, "keep\n\nnew\n    keep\n"), vec![2]);
 }
+
+#[test]
+fn pathological_full_rewrite_is_fast_and_marks_all_added() {
+    let old: String = (0..20_000).map(|i| format!("old line {i}\n")).collect();
+    let new: String = (0..20_000).map(|i| format!("new line {i}\n")).collect();
+    let start = std::time::Instant::now();
+    let idx = added_line_indices(Some(&old), &new);
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    assert_eq!(idx.len(), 20_000);
+}

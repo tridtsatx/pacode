@@ -161,7 +161,7 @@ pub fn render_injections(items: &[Injection], cap_chars: usize, budget_chars: us
     }
     if truncated > 0 {
         parts.push(format!(
-            "<notice>{truncated} reports truncated; use `agent list` to see each agent's status</notice>"
+            "<notice>{truncated} reports truncated; use `agent list` to see each agent's status, `agent result <id>` for an answer</notice>"
         ));
     }
 

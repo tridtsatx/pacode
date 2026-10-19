@@ -241,9 +241,30 @@ impl Tool for EditTool {
             .await?;
 
         let rel = rel_path(&full_path, &ctx.cwd);
-        let diff = pacode_render::unified_diff(&content, &new_content, &rel, 3);
-        let stat = pacode_render::diff_stat(&content, &new_content);
         let outside = is_outside_workspace(&full_path, &ctx.cwd);
+
+        // Diff, stat and the hashline report are CPU work proportional to the file:
+        // compute them together off the async worker. The contents move in and back out.
+        let (diff, stat, report, new_content) = {
+            let rel = rel.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut new_content = new_content;
+                let diff = pacode_render::unified_diff(&content, &new_content, &rel, 3);
+                let stat = pacode_render::diff_stat(&content, &new_content);
+                let report = match outcome {
+                    Outcome::Legacy(count) => format!("Edited {rel}: {count} replacement(s)"),
+                    Outcome::Hashline(mut applied) => {
+                        applied.content = std::mem::take(&mut new_content);
+                        let report = hashline_report(&rel, &applied);
+                        new_content = std::mem::take(&mut applied.content);
+                        report
+                    }
+                };
+                (diff, stat, report, new_content)
+            })
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))?
+        };
 
         ctx.require_permission(permission_title("Edit", &rel, outside), diff.clone(), None)
             .await?;
@@ -252,13 +273,7 @@ impl Tool for EditTool {
             .ledger_record_write(&ctx.agent, &full_path, &new_content)
             .await;
 
-        let mut text = match outcome {
-            Outcome::Legacy(count) => format!("Edited {rel}: {count} replacement(s)"),
-            Outcome::Hashline(mut applied) => {
-                applied.content = new_content;
-                hashline_report(&rel, &applied)
-            }
-        };
+        let mut text = report;
         if let Some(note) = pass.note {
             text.push_str("\n\n");
             text.push_str(&note);

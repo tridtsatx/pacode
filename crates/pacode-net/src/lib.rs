@@ -172,12 +172,32 @@ impl ProxySetting {
     }
 }
 
-/// Build a `reqwest::ClientBuilder` with the proxy setting applied.
-/// The caller adds its own timeouts and custom settings.
+/// Idle pooled connections are closed after this long (reqwest default: 90 s).
+pub const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// HTTP/2 PING interval while a request is in flight (detects dead peers behind NATs).
+pub const HTTP2_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Set to `1` to force HTTP/1.1 for gateways that misbehave on HTTP/2.
+pub const HTTP1_ONLY_ENV: &str = "PACODE_HTTP1_ONLY";
+
+/// Pool and HTTP/2 tuning shared by every client: HTTP/2 is negotiated via ALPN (falls
+/// back to HTTP/1.1 on servers without it), idle sockets are dropped after 30 s, and PINGs
+/// are only sent while a request is active (economy: nothing runs on an idle connection).
+fn tuned(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let builder = builder.pool_idle_timeout(POOL_IDLE_TIMEOUT);
+    if std::env::var(HTTP1_ONLY_ENV).is_ok_and(|v| v == "1") {
+        return builder.http1_only();
+    }
+    builder
+        .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .http2_keep_alive_while_idle(false)
+}
+
+/// Build a `reqwest::ClientBuilder` with the proxy setting applied and the shared pool /
+/// HTTP/2 tuning (see [`tuned`]). The caller adds its own timeouts and custom settings.
 pub fn client_builder(setting: &ProxySetting) -> Result<reqwest::ClientBuilder, ProxyError> {
     match setting {
-        ProxySetting::Inherit => Ok(reqwest::Client::builder()),
-        ProxySetting::Disabled => Ok(reqwest::Client::builder().no_proxy()),
+        ProxySetting::Inherit => Ok(tuned(reqwest::Client::builder())),
+        ProxySetting::Disabled => Ok(tuned(reqwest::Client::builder().no_proxy())),
         ProxySetting::Explicit(proxy_url) => {
             let proxy = reqwest::Proxy::all(proxy_url.as_str()).map_err(|source| {
                 ProxyError::ClientBuilder {
@@ -185,7 +205,7 @@ pub fn client_builder(setting: &ProxySetting) -> Result<reqwest::ClientBuilder, 
                     source,
                 }
             })?;
-            Ok(reqwest::Client::builder().proxy(proxy))
+            Ok(tuned(reqwest::Client::builder().proxy(proxy)))
         }
     }
 }

@@ -11,10 +11,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use pacode_types::{Effort, StreamEvent};
 use rand::Rng;
-use serde_json::Value;
 
 use crate::gate::{GatePermit, GatedStream, MAX_QUEUE_WAIT, ProviderGate};
 use crate::{EventStream, ProviderError};
@@ -53,7 +53,9 @@ pub(crate) struct StreamOpener {
     pub(crate) url: String,
     pub(crate) api_key: Option<String>,
     pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Value,
+    /// Serialised once (see `request_body`); each attempt sends a refcounted clone.
+    /// Replaced by an empty `Bytes` once the stream has committed (no retry possible).
+    pub(crate) body: Bytes,
     pub(crate) model: String,
     pub(crate) stream_idle_secs: u64,
     pub(crate) effort: Effort,
@@ -88,7 +90,7 @@ impl StreamOpener {
                 .client
                 .post(&self.url)
                 .header("Content-Type", "application/json")
-                .json(&self.body);
+                .body(self.body.clone());
 
             if let Some(key) = &self.api_key
                 && !key.is_empty()
@@ -228,6 +230,10 @@ pub(crate) fn retrying_stream(opener: StreamOpener, initial: EventStream) -> Eve
                 Some(Ok(event)) => {
                     if is_committing(&event) {
                         state.committed = true;
+                        // No reopen is possible any more: free the request payload.
+                        if !state.opener.body.is_empty() {
+                            state.opener.body = Bytes::new();
+                        }
                     }
                     return Some((Ok(event), state));
                 }

@@ -50,6 +50,8 @@ impl Tool for AgentTool {
          ask you a question: it arrives as `<question_from_agent id=\"q1\">`; reply \
          with `answer {agent_id, question_id, text}`. Prefer a reasonable assumption \
          over asking, ask only when blocked, and keep questions and answers short. \
+         `result {agent_id}` returns a finished agent's final answer (use it when the \
+         delivered report was cut short). \
          Subagents cannot spawn agents."
     }
 
@@ -58,7 +60,7 @@ impl Tool for AgentTool {
             "type": "object",
             "required": ["action"],
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "stop", "list", "ask_status", "message", "answer"]},
+                "action": {"type": "string", "enum": ["spawn", "stop", "list", "ask_status", "message", "answer", "result"]},
                 "prompt": {"type": "string", "description": "Full task description for the subagent (spawn)."},
                 "kind": {"type": "string", "description": "Named subagent type from `agents/*.md` files; `list` shows what is available."},
                 "name": {"type": "string", "description": "Short name shown in the UI, e.g. `tests`."},
@@ -191,6 +193,29 @@ impl Tool for AgentTool {
                         .with_preview("delivered"),
                 )
             }
+            "result" => {
+                let id = AgentId::new(
+                    args.agent_id
+                        .ok_or_else(|| ToolError::invalid("agent_id is required for result"))?,
+                );
+                let info = ctx
+                    .host
+                    .agent_info(&id)
+                    .ok_or_else(|| ToolError::invalid(format!("unknown agent: {id}")))?;
+                let content = match (&info.summary, &info.error) {
+                    _ if info.status.is_live() => {
+                        format!("Agent {id} is still running; its report arrives when it finishes.")
+                    }
+                    (Some(summary), _) if !summary.trim().is_empty() => {
+                        cap_output(summary, accept_large_output, ctx.output_cap_chars)
+                    }
+                    (_, Some(error)) => format!("Agent {id} failed: {error}"),
+                    _ => format!("Agent {id} produced no final answer."),
+                };
+                Ok(ToolOutput::text(content)
+                    .with_title(format!("Agent result {id}"))
+                    .with_preview(format!("{:?}", info.status).to_lowercase()))
+            }
             "stop" => {
                 let agent_id_str = args
                     .agent_id
@@ -275,3 +300,7 @@ fn resolve_kind(ctx: &ToolCtx, name: &str) -> Result<AgentKindDef, ToolError> {
         "unknown agent kind '{name}', available kinds: {available}"
     )))
 }
+
+#[cfg(test)]
+#[path = "agent_tests.rs"]
+mod agent_tests;

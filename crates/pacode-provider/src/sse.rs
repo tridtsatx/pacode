@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use futures::StreamExt;
-use pacode_types::{CallId, Effort, StopReason, StreamEvent, Usage};
+use pacode_types::{CallId, Effort, StopReason, StreamEvent};
 use serde_json::Value;
 
 use crate::{EventStream, ProviderError};
@@ -20,11 +20,17 @@ pub(crate) const MAX_BUFFERED_ARGS_BYTES: usize = 1024 * 1024;
 /// Incremental SSE parser: feed raw bytes, get complete `data:` payloads.
 pub struct SseParser {
     buffer: Vec<u8>,
+    /// Bytes of `buffer` already searched without finding a delimiter, so a large event
+    /// arriving in many small chunks is scanned once, not once per chunk.
+    scan_from: usize,
 }
 
 impl SseParser {
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self {
+            buffer: Vec::new(),
+            scan_from: 0,
+        }
     }
 
     /// Append bytes; returns the `data:` payloads of every complete event.
@@ -32,15 +38,18 @@ impl SseParser {
         self.buffer.extend_from_slice(bytes);
         if self.buffer.len() > MAX_SSE_BUFFER_BYTES {
             self.buffer.clear();
+            self.scan_from = 0;
             return Vec::new();
         }
 
         let mut events = Vec::new();
         let mut cursor = 0;
+        // A delimiter is at most 4 bytes, so resume 3 bytes before the previous end.
+        let mut resume = self.scan_from.saturating_sub(3);
 
         while cursor < self.buffer.len() {
             let remaining = &self.buffer[cursor..];
-            match find_event_delimiter(remaining) {
+            match find_event_delimiter(remaining, resume) {
                 Some((offset, delim_len)) => {
                     let event_bytes = &remaining[..offset];
                     let event_str = String::from_utf8_lossy(event_bytes);
@@ -48,12 +57,14 @@ impl SseParser {
                         events.push(payload);
                     }
                     cursor += offset + delim_len;
+                    resume = 0;
                 }
                 None => break,
             }
         }
 
         self.buffer.drain(..cursor);
+        self.scan_from = self.buffer.len();
         events
     }
 }
@@ -64,8 +75,9 @@ impl Default for SseParser {
     }
 }
 
-fn find_event_delimiter(slice: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0;
+/// First event delimiter in `slice` at or after `from`.
+fn find_event_delimiter(slice: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
     while i < slice.len() {
         if slice[i..].starts_with(b"\r\n\r\n") {
             return Some((i, 4));
@@ -214,76 +226,22 @@ pub fn chunk_to_events(
                         .and_then(|v| v.as_u64())
                         .map(|i| i as u32)
                         .unwrap_or(pos as u32);
-
-                    let id_opt = tc.get("id").and_then(|v| v.as_str()).map(CallId::new);
                     let func = tc.get("function");
-                    let name_opt = func
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
-                    let args_opt = func
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty());
-
-                    if state.started_indices.contains(&index) {
-                        if let Some(args) = args_opt {
-                            events.push(StreamEvent::ToolCallArgsDelta {
-                                index,
-                                delta: args.to_string(),
-                            });
-                        }
-                    } else if state.pending_calls.len() < MAX_PENDING_TOOL_CALLS {
-                        let pending = state.pending_calls.entry(index).or_default();
-                        if let Some(id) = id_opt {
-                            pending.id = Some(id);
-                        }
-                        if let Some(name) = name_opt {
-                            pending.name = Some(name);
-                        }
-                        if let Some(name) = &pending.name {
-                            let call_id = pending.id.clone().unwrap_or_else(CallId::generate);
-                            let tool_name = name.clone();
-                            let buffered = std::mem::take(&mut pending.buffered_args);
-                            state.started_indices.insert(index);
-                            state.any_tool_call = true;
-
-                            events.push(StreamEvent::ToolCallStart {
-                                index,
-                                id: call_id,
-                                name: tool_name,
-                            });
-                            if !buffered.is_empty() {
-                                events.push(StreamEvent::ToolCallArgsDelta {
-                                    index,
-                                    delta: buffered,
-                                });
-                            }
-                            if let Some(args) = args_opt {
-                                events.push(StreamEvent::ToolCallArgsDelta {
-                                    index,
-                                    delta: args.to_string(),
-                                });
-                            }
-                        } else if let Some(args) = args_opt
-                            && pending.buffered_args.len() + args.len() <= MAX_BUFFERED_ARGS_BYTES
-                        {
-                            pending.buffered_args.push_str(args);
-                        }
-                    }
+                    crate::sse_typed::push_tool_call(
+                        state,
+                        index,
+                        tc.get("id").and_then(|v| v.as_str()),
+                        func.and_then(|f| f.get("name")).and_then(|v| v.as_str()),
+                        func.and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str()),
+                        &mut events,
+                    );
                 }
             }
         }
 
         if let Some(finish_reason) = first_choice.get("finish_reason").and_then(|v| v.as_str()) {
-            let stop = match finish_reason {
-                "stop" => StopReason::EndTurn,
-                "tool_calls" => StopReason::ToolUse,
-                "length" => StopReason::MaxTokens,
-                "content_filter" => StopReason::ContentFilter,
-                other => StopReason::Other(other.to_string()),
-            };
+            let stop = crate::sse_typed::stop_reason(finish_reason);
             events.push(StreamEvent::MessageEnd { stop });
             state.message_end_emitted = true;
         }
@@ -309,13 +267,12 @@ pub fn chunk_to_events(
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        events.push(StreamEvent::Usage(Usage {
+        events.push(crate::sse_typed::usage_event(
             input_tokens,
             output_tokens,
             reasoning_tokens,
             cache_read_tokens,
-            cache_write_tokens: 0,
-        }));
+        ));
     }
 
     Ok(events)
@@ -438,46 +395,33 @@ pub(crate) fn create_event_stream(
                             break;
                         }
 
-                        match serde_json::from_str::<Value>(&payload) {
-                            Err(e) => {
+                        match crate::sse_typed::payload_to_events(
+                            &payload,
+                            &mut state.chunk_state,
+                            &mut state.model,
+                        ) {
+                            Err(err) => {
                                 state.stream_ended = true;
-                                state.pending_error = Some(ProviderError::Malformed(format!(
-                                    "invalid SSE JSON: {e}"
-                                )));
+                                state.pending_error = Some(err);
                                 break;
                             }
-                            Ok(json) => {
-                                if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
-                                    state.model = Some(m.to_string());
-                                }
-
-                                match chunk_to_events(&json, &mut state.chunk_state) {
-                                    Err(err) => {
-                                        state.stream_ended = true;
-                                        state.pending_error = Some(err);
-                                        break;
+                            Ok(events) => {
+                                for event in events {
+                                    if !state.message_start_emitted
+                                        && matches!(
+                                            event,
+                                            StreamEvent::TextDelta { .. }
+                                                | StreamEvent::ReasoningDelta { .. }
+                                                | StreamEvent::ToolCallStart { .. }
+                                                | StreamEvent::ToolCallArgsDelta { .. }
+                                        )
+                                    {
+                                        state.pending_events.push_back(StreamEvent::MessageStart {
+                                            model: state.model.clone(),
+                                        });
+                                        state.message_start_emitted = true;
                                     }
-                                    Ok(events) => {
-                                        for event in events {
-                                            if !state.message_start_emitted
-                                                && matches!(
-                                                    event,
-                                                    StreamEvent::TextDelta { .. }
-                                                        | StreamEvent::ReasoningDelta { .. }
-                                                        | StreamEvent::ToolCallStart { .. }
-                                                        | StreamEvent::ToolCallArgsDelta { .. }
-                                                )
-                                            {
-                                                state.pending_events.push_back(
-                                                    StreamEvent::MessageStart {
-                                                        model: state.model.clone(),
-                                                    },
-                                                );
-                                                state.message_start_emitted = true;
-                                            }
-                                            state.pending_events.push_back(event);
-                                        }
-                                    }
+                                    state.pending_events.push_back(event);
                                 }
                             }
                         }

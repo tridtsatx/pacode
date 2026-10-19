@@ -1,12 +1,17 @@
 //! Which lines of a new text were ADDED relative to an old one.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use similar::{ChangeTag, TextDiff};
 
 /// Above this many (old lines x new lines) the exact diff is replaced by the
 /// set-based approximation to bound CPU.
-const EXACT_DIFF_BUDGET: usize = 40_000_000;
+const EXACT_DIFF_BUDGET: usize = 4_000_000;
+
+/// Wall-clock cap on the exact diff; past it `similar` returns a valid but
+/// approximate (less minimal) script.
+const EXACT_DIFF_DEADLINE: Duration = Duration::from_millis(20);
 
 /// 0-based indexes of the lines of `new` that are inserted relative to `old`
 /// (changed lines count as added). `old = None` means a new file: every line.
@@ -18,7 +23,9 @@ pub fn added_line_indices(old: Option<&str>, new: &str) -> Vec<usize> {
     if old.lines().count().saturating_mul(line_count) > EXACT_DIFF_BUDGET {
         return added_by_set(&OldLines::new(old), new);
     }
-    let diff = TextDiff::from_lines(old, new);
+    let diff = TextDiff::configure()
+        .deadline(Instant::now() + EXACT_DIFF_DEADLINE)
+        .diff_lines(old, new);
     let mut added = Vec::new();
     for change in diff.iter_all_changes() {
         if change.tag() == ChangeTag::Insert

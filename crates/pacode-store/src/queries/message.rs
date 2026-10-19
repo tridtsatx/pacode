@@ -15,12 +15,33 @@ pub(crate) fn role_to_str(role: Role) -> &'static str {
     }
 }
 
+/// Max bytes of one tool result that are indexed in FTS (head only, cut on a char
+/// boundary). Text blocks are indexed in full. The FTS table is contentless, so a
+/// 'delete' must replay exactly the text that was indexed: insert and delete both go
+/// through [`message_plain_text`]. Changing this cap (or that function) requires a
+/// schema migration that rebuilds `messages_fts` (see `schema::rebuild_fts`).
+pub(crate) const FTS_TOOL_RESULT_CAP: usize = 2048;
+
+fn head(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The text indexed in FTS for `msg` (see [`FTS_TOOL_RESULT_CAP`]).
 pub(crate) fn message_plain_text(msg: &Message) -> String {
     let mut parts = Vec::new();
     for block in &msg.content {
         match block {
             ContentBlock::Text { text } => parts.push(text.as_str()),
-            ContentBlock::ToolResult { content, .. } => parts.push(content.as_str()),
+            ContentBlock::ToolResult { content, .. } => {
+                parts.push(head(content.as_str(), FTS_TOOL_RESULT_CAP))
+            }
             ContentBlock::Reasoning { .. }
             | ContentBlock::ToolUse { .. }
             | ContentBlock::Image { .. } => {}
@@ -36,6 +57,9 @@ pub(crate) fn extract_message_plain_text(content_json: &str) -> String {
     }
 }
 
+/// Insert or replace one message and its FTS row. Atomic through a savepoint, so it is
+/// safe both standalone and inside the worker's group-commit transaction. All four
+/// statements go through the connection's prepared-statement cache.
 pub fn append_message(
     conn: &mut Connection,
     session: &SessionId,
@@ -43,11 +67,13 @@ pub fn append_message(
     seq: u64,
     msg: &Message,
 ) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     {
         let existing: Option<(i64, String)> = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT id, content_json FROM messages WHERE session_id = ?1 AND agent_id = ?2 AND seq = ?3;",
+            )?
+            .query_row(
                 params![session.as_str(), agent.as_str(), seq as i64],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -55,18 +81,19 @@ pub fn append_message(
 
         if let Some((old_id, old_json)) = existing {
             let old_text = extract_message_plain_text(&old_json);
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', ?1, ?2);",
-                params![old_id, old_text],
-            )?;
+            )?
+            .execute(params![old_id, old_text])?;
         }
 
         let content_json = serde_json::to_string(msg)?;
         let hidden = if msg.meta.hidden { 1 } else { 0 };
         let role = role_to_str(msg.role);
 
-        let rowid: i64 = tx.query_row(
-            r#"
+        let rowid: i64 = tx
+            .prepare_cached(
+                r#"
             INSERT INTO messages (session_id, agent_id, seq, role, content_json, hidden, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(session_id, agent_id, seq) DO UPDATE SET
@@ -76,23 +103,23 @@ pub fn append_message(
                 created_at = excluded.created_at
             RETURNING id;
             "#,
-            params![
-                session.as_str(),
-                agent.as_str(),
-                seq as i64,
-                role,
-                content_json,
-                hidden,
-                msg.meta.timestamp_ms as i64,
-            ],
-            |r| r.get(0),
-        )?;
+            )?
+            .query_row(
+                params![
+                    session.as_str(),
+                    agent.as_str(),
+                    seq as i64,
+                    role,
+                    content_json,
+                    hidden,
+                    msg.meta.timestamp_ms as i64,
+                ],
+                |r| r.get(0),
+            )?;
 
         let plain_text = message_plain_text(msg);
-        tx.execute(
-            "INSERT INTO messages_fts(rowid, text) VALUES(?1, ?2);",
-            params![rowid, plain_text],
-        )?;
+        tx.prepare_cached("INSERT INTO messages_fts(rowid, text) VALUES(?1, ?2);")?
+            .execute(params![rowid, plain_text])?;
     }
     tx.commit()?;
     Ok(())

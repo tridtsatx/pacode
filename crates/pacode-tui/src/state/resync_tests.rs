@@ -130,3 +130,46 @@ fn app_state_gap_yields_one_get_snapshot_action() {
     ));
     assert!(!state.dirty);
 }
+
+#[test]
+fn sparse_stream_ignores_seq_holes_but_not_resync() {
+    let mut r = ResyncState::default();
+    r.on_snapshot(10);
+    r.note_sparse();
+    assert_eq!(r.classify(40, &toast()), Verdict::Apply);
+    assert!(r.take_request().is_none());
+    assert_eq!(
+        r.classify(0, &Event::Resync { reason: "x".into() }),
+        Verdict::Consumed
+    );
+    assert_eq!(r.take_request(), Some(Request::GetSnapshot));
+    r.reset();
+    r.on_snapshot(10);
+    assert_eq!(r.classify(40, &toast()), Verdict::Apply);
+    assert_eq!(r.take_request(), Some(Request::GetSnapshot));
+}
+
+#[test]
+fn subscription_is_sent_once_and_on_panel_change() {
+    let mut s = SubscriptionState::default();
+    let first = s.take_request(None);
+    assert_eq!(
+        first,
+        Some(Request::Subscribe {
+            agents: vec![AgentId::main()],
+            all: false
+        })
+    );
+    assert!(s.take_request(None).is_none());
+    let a = AgentId::new("sub-1");
+    assert_eq!(
+        s.take_request(Some(&a)),
+        Some(Request::Subscribe {
+            agents: vec![AgentId::main(), a.clone()],
+            all: false
+        })
+    );
+    assert!(s.take_request(Some(&a)).is_none());
+    s.reset();
+    assert!(s.take_request(Some(&a)).is_some());
+}

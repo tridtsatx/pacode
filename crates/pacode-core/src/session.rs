@@ -390,6 +390,9 @@ impl Session {
             .read()
             .map(|a| a.values().cloned().collect())
             .unwrap_or_default();
+        // Collect first (no lock is held across an await), then pipeline the upserts:
+        // the store thread queues them, so N rows cost one round of latency, not N.
+        let mut updated: Vec<(AgentInfo, Option<String>)> = Vec::new();
         for agent in agents {
             let updated_info = {
                 let mut info = agent.info.write().unwrap_or_else(|p| p.into_inner());
@@ -399,20 +402,24 @@ impl Session {
                     None
                 }
             };
-            let Some(info) = updated_info else {
-                continue;
-            };
-            if let Err(e) = self
-                .store
-                .upsert_agent(&self.id, &info, agent.prompt().as_deref())
-                .await
-            {
+            if let Some(info) = updated_info {
+                updated.push((info, agent.prompt()));
+            }
+        }
+        let upserts = updated
+            .iter()
+            .map(|(info, prompt)| self.store.upsert_agent(&self.id, info, prompt.as_deref()));
+        let results = futures::future::join_all(upserts).await;
+        for ((info, _), result) in updated.iter().zip(results) {
+            if let Err(e) = result {
                 log::warn!(
                     "failed to persist agent {} in session {}: {e}",
                     info.id,
                     self.id
                 );
             }
+        }
+        for (info, _) in updated {
             self.events.emit(pacode_types::Event::AgentUpdated(info));
         }
     }

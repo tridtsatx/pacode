@@ -251,9 +251,12 @@ async fn read_large_text(
     let selected = tokio::task::spawn_blocking(move || read_line_range(&path, offset, limit))
         .await
         .map_err(|e| ToolError::failed(format!("read task failed: {e}")))??;
-    // The ledger hashes whole contents, which this path never holds, so a streamed range
-    // is not recorded: edits of these lines stay refused (safe) until a full read.
+    // The ledger cannot hash a whole file this large, so it records only the seen lines
+    // (and the file's len/mtime); the path lock taken in `execute` is still held here.
     let refs: Vec<&str> = selected.iter().map(String::as_str).collect();
+    ctx.host
+        .ledger_record_read_range(&ctx.agent, full_path, offset - 1, &refs)
+        .await;
     Ok(render_lines(
         &refs,
         offset,

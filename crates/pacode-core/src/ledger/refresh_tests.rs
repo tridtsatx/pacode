@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use pacode_types::AgentId;
 
+use super::state::DigestRow;
 use super::*;
 
 fn main_id() -> AgentId {
@@ -66,13 +67,13 @@ async fn one_changed_file_is_rehashed_and_attributed_to_the_caller() {
 
     assert_eq!(ledger.refresh.rehashes(), 1);
     let key = canonical_key(&paths[7]).await;
-    let (rows, _) = ledger.state().digest(&sub_id(), 100);
+    let rows = digest_rows(&ledger, &sub_id());
     let drifted: Vec<_> = rows.iter().filter(|r| r.drift.is_some()).collect();
     assert_eq!(drifted.len(), 1);
     assert_eq!(drifted[0].path, key);
     let drift = drifted[0].drift.clone().unwrap();
     assert_eq!(drift.writers, vec![Writer::agent(&main_id(), "main")]);
-    let (mine, _) = ledger.state().digest(&main_id(), 100);
+    let mine = digest_rows(&ledger, &main_id());
     assert!(mine.iter().all(|r| r.drift.is_none()));
 }
 
@@ -122,4 +123,13 @@ async fn concurrent_refreshes_of_one_agent_coalesce() {
     // The first sweep may predate some requests; one more covers all the rest.
     assert!(ledger.refresh.sweeps() <= 2, "{}", ledger.refresh.sweeps());
     assert_eq!(ledger.refresh.rehashes(), 0);
+}
+
+/// The digest rows (drift resolved) of one agent, for inspection.
+fn digest_rows(ledger: &FileLedger, agent: &AgentId) -> Vec<DigestRow> {
+    let (inputs, _) = ledger.state().digest_inputs(agent, 100);
+    inputs
+        .into_iter()
+        .map(|input| input.resolve(&ledger.memo))
+        .collect()
 }

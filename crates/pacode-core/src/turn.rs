@@ -26,8 +26,10 @@
 
 pub(crate) mod lifecycle;
 pub(crate) mod stream;
+pub(crate) mod system;
 pub(crate) mod todo_guard;
 pub(crate) mod tools;
+pub(crate) mod usage;
 pub(crate) mod wake;
 
 pub(crate) use lifecycle::emit_failure_notice;
@@ -42,7 +44,6 @@ use pacode_types::{
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
-use crate::prompt::DynamicContext;
 use crate::session::Session;
 
 pub async fn run_turn(
@@ -88,30 +89,14 @@ pub async fn run_turn(
 
     // Turn start is the explicit invalidation point for prompt caching
     let meta = session.meta();
-    let home_config = pacode_config::Paths::discover()
-        .config_file
-        .parent()
-        .map(|d| d.to_path_buf());
-    let memory_cap_chars = if session.config.memory.enabled {
-        session.config.context.memory_cap_chars
-    } else {
-        0
-    };
-    let prompt_cache = crate::prompt::TurnPromptCache::with_options(
-        &meta.cwd,
-        home_config.as_deref(),
-        session.config.context.instructions_cap_chars,
-        memory_cap_chars,
-        session.config.context.discover_foreign_instructions,
-    );
-    *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(prompt_cache.clone());
+    let prompt_cache = system::turn_prompt_cache(&session, &agent, &meta.cwd).await;
+    let mut system_slot: system::SystemSlot = None;
 
     let mut turn_usage = Usage::default();
     let mut todo_guard = todo_guard::TodoGuard::default();
 
     loop {
         if cancel.is_cancelled() {
-            *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
             return lifecycle::handle_interrupted(
                 &session,
                 &agent,
@@ -125,22 +110,8 @@ pub async fn run_turn(
         // A turn that begins on an idle agent must see what woke it.
         wake::absorb_pending(&session, &agent).await;
 
-        let system_dynamic = {
-            let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
-            let dyn_ctx = DynamicContext {
-                cwd: &meta.cwd,
-                git_branch: prompt_cache.git_branch.as_deref(),
-                date: &prompt_cache.date,
-                mode: meta.mode,
-                plan: &plan_guard,
-                instructions: prompt_cache.instructions.as_deref(),
-                is_subagent: !agent.id().is_main(),
-                skills: session.skills.skills(),
-                skills_enabled: session.config.skills.enabled,
-                max_listed_skills: session.config.skills.max_listed,
-            };
-            crate::prompt::system_dynamic(&dyn_ctx)
-        };
+        let system_dynamic =
+            system::dynamic(&mut system_slot, &session, &agent, &meta, &prompt_cache).to_string();
         let system_static = crate::prompt::system_static().to_string();
 
         let agent_info = agent.info();
@@ -259,7 +230,6 @@ pub async fn run_turn(
         turn_usage = outcome.usage;
 
         if outcome.interrupted {
-            *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
             return lifecycle::handle_interrupted(
                 &session,
                 &agent,
@@ -381,7 +351,6 @@ pub async fn run_turn(
         let tool_interrupted =
             tools::execute_tool_calls(&session, &agent, &cancel, outcome.tool_calls).await;
         if tool_interrupted || cancel.is_cancelled() {
-            *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
             return lifecycle::handle_interrupted(
                 &session,
                 &agent,
@@ -477,6 +446,7 @@ pub async fn run_turn(
         .unwrap_or_else(|p| p.into_inner())
         .estimated_tokens;
     session.record_usage(&agent.id(), turn_usage, context_tokens);
+    usage::persist(&session, &agent, turn_usage);
 
     let duration_ms = turn_start_instant.elapsed().as_millis() as u64;
     let output_tokens = turn_usage.output_tokens;
@@ -501,8 +471,6 @@ pub async fn run_turn(
         usage: Some(turn_usage),
         stop: TurnStop::Completed,
     });
-
-    *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     TurnStop::Completed
 }

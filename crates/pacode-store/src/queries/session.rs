@@ -134,7 +134,7 @@ pub fn list_sessions(
 }
 
 pub fn delete_session(conn: &mut Connection, id: &SessionId) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
+    let tx = conn.savepoint()?;
     {
         let mut stmt =
             tx.prepare_cached("SELECT id, content_json FROM messages WHERE session_id = ?1;")?;

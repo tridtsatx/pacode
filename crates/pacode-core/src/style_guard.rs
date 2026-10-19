@@ -24,6 +24,7 @@ mod stream;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use pacode_rules::{Finding, Fingerprint, LoadOptions, RuleSet, TurnLimiter, pinned_line};
 use pacode_types::{
@@ -40,6 +41,10 @@ pub(crate) use stream::StreamGuard;
 pub const MAX_PINNED: usize = 32;
 /// Sessions tracked at once.
 pub const MAX_SESSIONS: usize = 64;
+/// How long a rule-set check stays valid (G3b): within it, [`ruleset_for`] returns the
+/// cached set without fingerprinting the rule files. An edited rule file is therefore
+/// picked up at most this long after the edit.
+pub const RULESET_TTL: Duration = Duration::from_secs(2);
 /// Agents (main + subagents) tracked per session. Past this, the least recently used
 /// agent's limiter is evicted; the others keep their budgets.
 pub const MAX_AGENTS_PER_SESSION: usize = 512;
@@ -56,6 +61,8 @@ struct AgentTurn {
 #[derive(Default)]
 pub(crate) struct SessionGuard {
     ruleset: Option<(Fingerprint, Arc<RuleSet>)>,
+    /// When `ruleset` was last confirmed current (loaded, or fingerprint unchanged).
+    ruleset_checked: Option<Instant>,
     pinned: Vec<String>,
     agents: BTreeMap<String, AgentTurn>,
     /// Monotonic counter stamped into `AgentTurn::last_used` (LRU order).
@@ -64,6 +71,13 @@ pub(crate) struct SessionGuard {
 }
 
 impl SessionGuard {
+    /// The cached rule set when it was checked less than [`RULESET_TTL`] before `now`.
+    fn fresh_ruleset(&self, now: Instant) -> Option<Arc<RuleSet>> {
+        let (_, set) = self.ruleset.as_ref()?;
+        let at = self.ruleset_checked?;
+        (now.saturating_duration_since(at) < RULESET_TTL).then(|| set.clone())
+    }
+
     /// The limiter of `agent_key`, reset when `marker` shows a new turn started.
     fn limiter_for(&mut self, agent_key: &str, marker: usize) -> &mut TurnLimiter {
         self.agent_tick += 1;
@@ -171,6 +185,8 @@ fn load_options(session: &Session) -> LoadOptions {
 }
 
 /// The session's rule set, reloaded only when the rule files or `[rules]` changed.
+/// The fingerprint (a directory listing on a blocking thread) runs at most once per
+/// [`RULESET_TTL`] per session.
 /// `None` when the guard is disabled or the set is empty.
 pub(crate) async fn ruleset_for(session: &Session) -> Option<Arc<RuleSet>> {
     if !session.config.rules.enabled {
@@ -178,7 +194,12 @@ pub(crate) async fn ruleset_for(session: &Session) -> Option<Arc<RuleSet>> {
     }
     let sid = session.id.to_string();
     let opts = load_options(session);
-    let cached = with_session(&sid, |g| g.ruleset.clone());
+    let (cached, fresh) = with_session(&sid, |g| {
+        (g.ruleset.clone(), g.fresh_ruleset(Instant::now()))
+    });
+    if let Some(set) = fresh {
+        return (!set.is_empty()).then_some(set);
+    }
     let cached_fp = cached.as_ref().map(|(fp, _)| fp.clone());
     let reloaded = tokio::task::spawn_blocking(move || {
         let fp = opts.fingerprint();
@@ -191,13 +212,20 @@ pub(crate) async fn ruleset_for(session: &Session) -> Option<Arc<RuleSet>> {
     .await
     .ok()?;
     let set = match reloaded {
-        None => cached.map(|(_, set)| set)?,
+        None => {
+            let set = cached.map(|(_, set)| set)?;
+            with_session(&sid, |g| g.ruleset_checked = Some(Instant::now()));
+            set
+        }
         Some((fp, loaded)) => {
             for err in &loaded.errors {
                 log::warn!("style-guard rule skipped: {err}");
             }
             let set = Arc::new(loaded.set);
-            with_session(&sid, |g| g.ruleset = Some((fp, set.clone())));
+            with_session(&sid, |g| {
+                g.ruleset = Some((fp, set.clone()));
+                g.ruleset_checked = Some(Instant::now());
+            });
             set
         }
     };

@@ -10,8 +10,6 @@
 
 use std::borrow::Cow;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use pacode_types::{ContentBlock, Message, Role};
 use serde_json::Value;
 
@@ -81,20 +79,15 @@ pub fn catalog_vision(item: &Value) -> Option<bool> {
     Some(input.contains("image"))
 }
 
-/// `data:<mime>;base64,<payload>` for a stored image, loaded lazily from disk.
+/// `data:<mime>;base64,<payload>` for a stored image (payload cached, see `image_cache`).
 pub(crate) fn data_url(mime: &str, hash: &str) -> Result<String, ProviderError> {
-    let bytes = load(hash)?;
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+    let payload = crate::image_cache::payload(hash)?;
+    Ok(format!("data:{mime};base64,{payload}"))
 }
 
-/// Base64 payload (no prefix) for a stored image.
+/// Base64 payload (no prefix) for a stored image (cached, see `image_cache`).
 pub(crate) fn base64_payload(hash: &str) -> Result<String, ProviderError> {
-    Ok(STANDARD.encode(load(hash)?))
-}
-
-fn load(hash: &str) -> Result<Vec<u8>, ProviderError> {
-    pacode_image::store::load(hash)
-        .map_err(|e| ProviderError::Config(format!("image {hash} unavailable: {e}")))
+    Ok(crate::image_cache::payload(hash)?.to_string())
 }
 
 /// Text standing in for an image the model cannot see.

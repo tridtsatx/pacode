@@ -74,6 +74,16 @@ pub fn conflict(
     content: &str,
     intent: WriteIntent,
 ) -> (String, Vec<Range<usize>>) {
+    if drift.coarse {
+        // A side too large to diff line by line: "the file changed", nothing to show.
+        let msg = format!(
+            "{shown} was modified by {} after you read it (it is too large to say which \
+             lines changed). Read the lines you want to change again with `read` \
+             (offset/limit) before writing.",
+            who(drift, viewer)
+        );
+        return (msg, Vec::new());
+    }
     let (n, at, plain) = summary(drift);
     let mut msg = format!(
         "{shown} was modified by {} ({n} lines changed at {at}) after you read it. Read \
@@ -107,6 +117,15 @@ pub fn conflict(
         snippet(content, &regions, CONTEXT, MAX_CONTEXT_LINES, true)
     );
     (msg, windows.spans().to_vec())
+}
+
+/// Appended to a successful write over a large file that changed since a ranged read,
+/// when the write touches only lines that still read as the agent saw them.
+pub fn partial_note(shown: &str) -> String {
+    format!(
+        "Note: {shown} changed since your ranged read, but the lines your change touches \
+         are as you saw them; your change was applied."
+    )
 }
 
 /// Appended to a successful write when the file changed elsewhere since the read.

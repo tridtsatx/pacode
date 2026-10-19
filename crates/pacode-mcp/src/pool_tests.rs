@@ -130,3 +130,30 @@ async fn test_zero_threshold_disables_reaping() {
     assert!(reaped.is_empty());
     assert!(pool.is_running_async("test-srv").await);
 }
+
+#[test]
+fn cached_prompt_names_reads_memory_only() {
+    let pool = McpPool::new(BTreeMap::new(), None, None);
+    assert!(pool.cached_prompt_names("none").is_empty());
+    let cfg = fake_mcp_config();
+    let prompt = McpPrompt {
+        name: "p1".to_string(),
+        description: None,
+        arguments: Vec::new(),
+    };
+    pool.save_cache("s", &cfg, &[], &[], &[prompt]);
+    assert_eq!(pool.cached_prompt_names("s"), vec!["p1".to_string()]);
+}
+
+#[test]
+fn schema_hash_changes_with_content() {
+    let cfg = fake_mcp_config();
+    let a = schema_hash(&cfg, &[], &[], &[]);
+    assert_eq!(a, schema_hash(&cfg, &[], &[], &[]));
+    let prompt = McpPrompt {
+        name: "p".to_string(),
+        description: None,
+        arguments: Vec::new(),
+    };
+    assert_ne!(a, schema_hash(&cfg, &[], &[], &[prompt]));
+}

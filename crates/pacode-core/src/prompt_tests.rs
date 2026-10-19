@@ -1,5 +1,6 @@
 use super::*;
 use pacode_types::Mode;
+use std::sync::Arc;
 
 #[test]
 fn test_load_instructions_order() {
@@ -327,4 +328,103 @@ fn test_system_dynamic_skills_section() {
     };
     let out_empty = system_dynamic(&ctx_empty);
     assert!(!out_empty.contains("## Skills"));
+}
+
+fn shared_opts(home: &Path) -> PromptOpts {
+    PromptOpts {
+        home_config: Some(home.to_path_buf()),
+        instructions_cap_chars: 32_000,
+        memory_cap_chars: 0,
+        discover_foreign: false,
+    }
+}
+
+#[tokio::test]
+async fn shared_cache_is_one_arc_until_main_turn_or_ttl() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("AGENTS.md"), "v1").unwrap();
+    let opts = shared_opts(&tmp.path().join("home"));
+    let cache = shared::SharedPromptCache::new();
+    let t0 = Instant::now();
+
+    let a = cache.resolve(&proj, opts.clone(), false, t0).await;
+    let b = cache.resolve(&proj, opts.clone(), false, t0).await;
+    assert!(Arc::ptr_eq(&a, &b), "two subagents share one cache");
+
+    // Edits stay invisible until a main turn start...
+    std::fs::write(proj.join("AGENTS.md"), "v2").unwrap();
+    let c = cache.resolve(&proj, opts.clone(), false, t0).await;
+    assert!(Arc::ptr_eq(&a, &c));
+    // ...which invalidates and rebuilds.
+    let m = cache.resolve(&proj, opts.clone(), true, t0).await;
+    assert!(!Arc::ptr_eq(&a, &m));
+    assert!(m.instructions.as_deref().unwrap_or("").contains("v2"));
+    let d = cache.resolve(&proj, opts.clone(), false, t0).await;
+    assert!(Arc::ptr_eq(&m, &d));
+
+    // TTL: refreshed after 5 s.
+    std::fs::write(proj.join("AGENTS.md"), "v3").unwrap();
+    let late = t0 + shared::TTL + Duration::from_millis(1);
+    let e = cache.resolve(&proj, opts, false, late).await;
+    assert!(!Arc::ptr_eq(&d, &e));
+    assert!(e.instructions.as_deref().unwrap_or("").contains("v3"));
+}
+
+#[tokio::test]
+async fn shared_cache_is_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = shared_opts(&tmp.path().join("home"));
+    let cache = shared::SharedPromptCache::new();
+    let now = std::time::Instant::now();
+    let mut first = None;
+    for i in 0..(shared::MAX_CWDS + 4) {
+        let dir = tmp.path().join(format!("p{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = cache.resolve(&dir, opts.clone(), false, now).await;
+        if i == 0 {
+            first = Some((dir, v));
+        }
+    }
+    let (dir, v) = first.unwrap();
+    let again = cache.resolve(&dir, opts, false, now).await;
+    assert!(!Arc::ptr_eq(&v, &again), "oldest entry was evicted");
+}
+
+#[test]
+fn subagent_dynamic_prompt_ignores_plan_and_mode() {
+    use pacode_types::{Plan, PlanItem, PlanStatus};
+    let cwd = std::path::PathBuf::from("/tmp/x");
+    let empty = Plan::default();
+    let mut planned = Plan {
+        version: 2,
+        ..Plan::default()
+    };
+    planned.items.push(PlanItem {
+        id: "p1".into(),
+        content: "do the thing".into(),
+        status: PlanStatus::Active,
+        progress: None,
+    });
+    let build = |plan: &Plan, mode: Mode, sub: bool| {
+        system_dynamic(&DynamicContext {
+            cwd: &cwd,
+            git_branch: None,
+            date: "2026-01-01",
+            mode,
+            plan,
+            instructions: None,
+            is_subagent: sub,
+            skills: &[],
+            skills_enabled: false,
+            max_listed_skills: 0,
+        })
+    };
+    assert_eq!(
+        build(&empty, Mode::Build, true),
+        build(&planned, Mode::Plan, true)
+    );
+    assert!(build(&planned, Mode::Build, false).contains("do the thing"));
 }

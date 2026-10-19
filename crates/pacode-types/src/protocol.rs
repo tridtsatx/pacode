@@ -188,6 +188,20 @@ pub enum Request {
         provider: String,
         label: String,
     },
+    /// Narrow which agents' high-volume events (`TextDelta`, `ReasoningDelta`,
+    /// `ItemAdded`, `ItemUpdated`, `AgentUpdated`) this connection receives; replaces the
+    /// previous subscription (`Reply::Ok`). `AgentUpdated` of other agents is coalesced to
+    /// at most 2 per second per agent. Session-level events always pass. A connection that
+    /// never sends this gets everything (`all = true`). The daemon keeps at most 64 ids.
+    Subscribe {
+        #[serde(default)]
+        agents: Vec<AgentId>,
+        #[serde(default)]
+        all: bool,
+    },
+    /// Daemon counters for benchmarks and diagnostics (`Reply::DebugStats`). Computed on
+    /// request only.
+    DebugStats,
 }
 
 /// One provider row in the `/login` picker.
@@ -434,6 +448,8 @@ pub enum Reply {
     AuthStatus {
         providers: Vec<ProviderAuthInfo>,
     },
+    /// Answer to `DebugStats`: a JSON object, see `pacode_core::Core::debug_stats`.
+    DebugStats(serde_json::Value),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

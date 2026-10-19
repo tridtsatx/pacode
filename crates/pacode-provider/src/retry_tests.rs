@@ -196,3 +196,63 @@ async fn test_error_after_content_is_not_retried() {
     );
     server.abort();
 }
+
+/// Like `read_request` but returns the request body.
+async fn read_request_body(socket: &mut TcpStream) -> Vec<u8> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match socket.read(&mut buf).await {
+            Ok(0) | Err(_) => return Vec::new(),
+            Ok(n) => n,
+        };
+        raw.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        let Some(head_end) = text.find("\r\n\r\n") else {
+            continue;
+        };
+        let content_length = text[..head_end]
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if raw.len() >= head_end + 4 + content_length {
+            return raw[head_end + 4..head_end + 4 + content_length].to_vec();
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_retry_resends_byte_identical_body() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = tokio::spawn(async move {
+        let mut bodies = Vec::new();
+        while bodies.len() < 2 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            bodies.push(read_request_body(&mut socket).await);
+            if bodies.len() == 1 {
+                write_sse(&mut socket, MID_STREAM_429).await;
+            } else {
+                write_sse(&mut socket, TEXT_THEN_DONE).await;
+            }
+        }
+        bodies
+    });
+
+    let provider = provider_for(port, 3);
+    let mut stream = provider.complete(request()).await.expect("stream opens");
+    while let Some(item) = stream.next().await {
+        item.expect("no error should reach the caller");
+    }
+
+    let bodies = server.await.expect("server task");
+    assert_eq!(bodies.len(), 2);
+    assert!(!bodies[0].is_empty());
+    assert_eq!(bodies[0], bodies[1], "retry must send identical bytes");
+    let parsed: serde_json::Value = serde_json::from_slice(&bodies[0]).expect("json body");
+    assert_eq!(parsed["model"], "test-model");
+}

@@ -11,7 +11,9 @@ categories.workspace = true
 description = "Networking and proxy configuration for pacode"
 
 [dependencies]
-reqwest = { workspace = true }
+# `http2` is enabled here (not in the workspace default) because the keep-alive tuning below
+# needs it; cargo unifies the feature for every crate that shares this reqwest.
+reqwest = { workspace = true, features = ["http2"] }
 thiserror = { workspace = true }
 url = { workspace = true }
 

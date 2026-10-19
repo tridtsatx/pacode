@@ -73,13 +73,13 @@ pub(crate) async fn check_after_write(
 ) -> Option<Found> {
     let set = ruleset_for(session).await?;
     let new = read_capped(&snap.path).await??;
-    let report = scan_added(
-        &set,
-        &snap.rel,
-        snap.old.as_deref(),
-        &new,
-        ModeFilter::AfterWrite,
-    );
+    // The exact diff + regex scan of up to 2 MiB is CPU work: off the async workers.
+    let Snapshot { rel, old, .. } = snap;
+    let report = tokio::task::spawn_blocking(move || {
+        scan_added(&set, &rel, old.as_deref(), &new, ModeFilter::AfterWrite)
+    })
+    .await
+    .ok()?;
     if report.is_empty() {
         return None;
     }

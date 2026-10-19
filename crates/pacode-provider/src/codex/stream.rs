@@ -173,7 +173,8 @@ pub struct CodexStreamOpener {
     pub client: reqwest::Client,
     pub url: String,
     pub headers: Vec<(String, String)>,
-    pub body: Value,
+    /// Serialised once (see `request_body`); released after the first committing event.
+    pub body: bytes::Bytes,
     pub model: String,
     pub stream_idle_secs: u64,
     pub effort: Effort,
@@ -203,7 +204,7 @@ impl CodexStreamOpener {
         loop {
             // Waits out any provider-wide cooldown and for a free slot (cancel-safe).
             let permit = self.gate.acquire().await;
-            let mut req_builder = self.client.post(&self.url).json(&self.body);
+            let mut req_builder = self.client.post(&self.url).body(self.body.clone());
 
             for (k, v) in &self.headers {
                 req_builder = req_builder.header(k, v);
@@ -330,6 +331,10 @@ pub fn retrying_responses_stream(opener: CodexStreamOpener, initial: EventStream
                 Some(Ok(event)) => {
                     if is_committing(&event) {
                         state.committed = true;
+                        // No reopen is possible any more: free the request payload.
+                        if !state.opener.body.is_empty() {
+                            state.opener.body = bytes::Bytes::new();
+                        }
                     }
                     return Some((Ok(event), state));
                 }

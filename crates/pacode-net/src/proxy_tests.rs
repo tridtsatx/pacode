@@ -409,3 +409,36 @@ async fn test_inherit_uses_env_proxy() {
         "expected request to reach proxy via HTTP_PROXY with Inherit setting"
     );
 }
+
+#[tokio::test]
+async fn tuned_client_still_talks_to_a_plain_http1_server() {
+    // ALPN/h2 tuning must not break a plain-text HTTP/1.1 peer.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = [0u8; 2048];
+        let _ = socket.read(&mut buf).await;
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await;
+        let _ = socket.shutdown().await;
+    });
+
+    let client = client_builder(&ProxySetting::Disabled)
+        .expect("builder")
+        .build()
+        .expect("client");
+    let text = client
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .await
+        .expect("send")
+        .text()
+        .await
+        .expect("text");
+    assert_eq!(text, "ok");
+    server.abort();
+}

@@ -37,6 +37,11 @@ impl EventSink {
     pub fn subscribe(&self) -> broadcast::Receiver<(u64, Event)> {
         self.tx.subscribe()
     }
+
+    /// Live subscribers; `0` means `emit` has nobody to deliver to.
+    pub fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
 }
 
 impl Default for EventSink {
@@ -51,6 +56,8 @@ pub struct TranscriptState {
     pub next_item_seq: u64,
     pub live_assistant: Option<u64>,
     pub live_reasoning: Option<u64>,
+    /// Only `Running` tool calls; removed on any terminal status (cap = calls in flight,
+    /// owner = `upsert`).
     pub tool_items: HashMap<CallId, TranscriptItem>,
     /// Bounded (`session.history_page × 2`) tail of items for snapshots/history.
     pub tail: VecDeque<TranscriptItem>,
@@ -118,9 +125,19 @@ impl TranscriptState {
                     self.live_reasoning = None;
                 }
             }
-            pacode_types::TranscriptKind::ToolCall { call_id, .. } => {
-                self.tool_items.insert(call_id.clone(), item);
-            }
+            pacode_types::TranscriptKind::ToolCall {
+                call_id, status, ..
+            } => match status {
+                pacode_types::ToolStatus::Running => {
+                    self.tool_items.insert(call_id.clone(), item);
+                }
+                pacode_types::ToolStatus::Ok
+                | pacode_types::ToolStatus::Error
+                | pacode_types::ToolStatus::Backgrounded
+                | pacode_types::ToolStatus::Denied => {
+                    self.tool_items.remove(call_id);
+                }
+            },
             pacode_types::TranscriptKind::User { .. }
             | pacode_types::TranscriptKind::Notice { .. }
             | pacode_types::TranscriptKind::Permission(_)
@@ -288,7 +305,7 @@ pub fn history_to_items(
 
 /// Coalesces text deltas: flush when ≥ `max_bytes` or `max_age` since the first
 /// buffered byte. The turn loop calls `push` on each delta and `take_if_due`/`take`
-/// around its stream polling (`tokio::time::timeout(max_age, next)`).
+/// around its stream polling, arming a timer for `deadline()` only while data is buffered.
 pub struct DeltaCoalescer {
     buf: String,
     since: Option<Instant>,
@@ -315,6 +332,11 @@ impl DeltaCoalescer {
             return self.take();
         }
         None
+    }
+
+    /// When the buffered data becomes due; `None` while nothing is buffered.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.since.map(|since| since + self.max_age)
     }
 
     pub fn take_if_due(&mut self, now: Instant) -> Option<String> {
@@ -463,3 +485,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "transcript_tests.rs"]
+mod transcript_tests;

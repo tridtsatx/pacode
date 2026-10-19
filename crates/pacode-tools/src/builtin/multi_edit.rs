@@ -204,8 +204,17 @@ impl Tool for MultiEditTool {
 
         let rel_path = rel_path(&full_path, &ctx.cwd);
 
-        let diff = pacode_render::unified_diff(&original, &current, &rel_path, 3);
-        let stat = pacode_render::diff_stat(&original, &current);
+        // Diff and stat in one `spawn_blocking`; `current` moves in and back out.
+        let (diff, stat, current) = {
+            let rel = rel_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let diff = pacode_render::unified_diff(&original, &current, &rel, 3);
+                let stat = pacode_render::diff_stat(&original, &current);
+                (diff, stat, current)
+            })
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))?
+        };
 
         let outside = is_outside_workspace(&full_path, &ctx.cwd);
         let perm_title = permission_title("Edit", &rel_path, outside);
@@ -322,20 +331,26 @@ async fn call_hashline(files: Vec<FileOps>, ctx: &ToolCtx) -> Result<ToolOutput,
         )));
     }
 
-    let mut detail = String::new();
-    let (mut any_outside, mut added, mut removed) = (false, 0u32, 0u32);
-    for p in &planned {
-        detail.push_str(&pacode_render::unified_diff(
-            &p.original,
-            &p.applied.content,
-            &p.rel,
-            3,
-        ));
-        let stat = pacode_render::diff_stat(&p.original, &p.applied.content);
-        added = added.saturating_add(stat.added);
-        removed = removed.saturating_add(stat.removed);
-        any_outside |= p.outside;
-    }
+    // All files' diffs and stats in one `spawn_blocking`; `planned` moves in and back out.
+    let (planned, detail, added, removed) = tokio::task::spawn_blocking(move || {
+        let mut detail = String::new();
+        let (mut added, mut removed) = (0u32, 0u32);
+        for p in &planned {
+            detail.push_str(&pacode_render::unified_diff(
+                &p.original,
+                &p.applied.content,
+                &p.rel,
+                3,
+            ));
+            let stat = pacode_render::diff_stat(&p.original, &p.applied.content);
+            added = added.saturating_add(stat.added);
+            removed = removed.saturating_add(stat.removed);
+        }
+        (planned, detail, added, removed)
+    })
+    .await
+    .map_err(|e| ToolError::failed(e.to_string()))?;
+    let any_outside = planned.iter().any(|p| p.outside);
     let names: Vec<&str> = planned.iter().map(|p| p.rel.as_str()).collect();
     let subject = match names.as_slice() {
         [one] => (*one).to_string(),

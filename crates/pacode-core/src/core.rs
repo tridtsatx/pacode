@@ -1,8 +1,10 @@
 //! `Core`: the daemon-facing API.
 
+pub(crate) mod evict;
 pub(crate) mod global;
 pub(crate) mod open;
 pub(crate) mod router;
+pub(crate) mod stats;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -51,6 +53,9 @@ pub struct Core {
     /// Events that belong to the daemon rather than to a session (login progress,
     /// credential changes). A client sees them without attaching to a session.
     pub(crate) global_events: crate::transcript::EventSink,
+    /// When `evict_idle_sessions` first saw each session idle (cap = live sessions,
+    /// pruned on every call; owner = `core/evict.rs`).
+    pub(crate) idle_since: std::sync::Mutex<BTreeMap<SessionId, std::time::Instant>>,
 }
 
 impl Core {
@@ -71,6 +76,7 @@ impl Core {
             task_router: std::sync::Mutex::new(None),
             cached_mcp_tools: std::sync::Mutex::new(None),
             global_events: crate::transcript::EventSink::new(),
+            idle_since: std::sync::Mutex::new(BTreeMap::new()),
         });
 
         let core_weak = Arc::downgrade(&core);
@@ -439,6 +445,8 @@ impl Core {
             | Request::Attach(_)
             | Request::Detach
             | Request::Shutdown { .. }
+            | Request::Subscribe { .. }
+            | Request::DebugStats
             | Request::Ping => Reply::Error {
                 message: "connection-level request handled by daemon".to_string(),
             },
