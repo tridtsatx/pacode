@@ -38,7 +38,7 @@ use pacode_render::ColorMode;
 use pacode_types::time::now_ms;
 use pacode_types::{
     Config, Effort, MarketplacePluginInfo, McpServerInfo, Mode, ModelFlags, ModelInfo, ModelRoute,
-    PluginInfo, SessionMeta, TranscriptKind,
+    PluginInfo, SessionMeta,
 };
 
 pub use barriers::RequestBarrier;
@@ -186,6 +186,9 @@ pub struct AppState {
     /// Escape sequences stashed by `ui::images::draw` and flushed to the
     /// terminal post-draw: (terminal area, escape payload).
     pub pending_image_escapes: Vec<(ratatui::layout::Rect, String)>,
+    /// Inline transcript images being decoded on blocking threads, for every
+    /// transcript at once (`state::image_cache`).
+    pub inline_image_jobs: crate::state::image_cache::InlineImageJobs,
     /// The `-p`/`--prompt` argv text, carried until the startup attach lands
     /// — `BgResponse::AttachFinished` sends it then.
     pub initial_prompt: Option<String>,
@@ -296,6 +299,7 @@ impl AppState {
             active_slot: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             pending_image_escapes: Vec::new(),
+            inline_image_jobs: Default::default(),
             initial_prompt: None,
             attach_error: None,
             pending_attach: None,
@@ -409,12 +413,10 @@ impl AppState {
     }
 
     /// A pending permission cell still sitting in the transcript — the same
-    /// predicate the footer prompt and the anim tick use.
+    /// predicate the footer prompt and the anim tick use. A counter the
+    /// transcript keeps, not a scan: this runs on every loop pass.
     pub fn has_pending_permission(&self) -> bool {
-        self.transcript
-            .cells
-            .iter()
-            .any(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Permission(_))))
+        self.transcript.pending_permissions() > 0
     }
 
     /// Drop a cache file (§8.2 invalidation points: plugin install/remove,

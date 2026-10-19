@@ -81,6 +81,11 @@ pub struct RailState {
     /// draw time from the available height; this remembers the first visible index in
     /// select mode so the highlighted agent stays on screen.
     pub agents_scroll: usize,
+    /// The subagent rows the last frame drew, as indices among the subagents in
+    /// rail order (`ui::rail::drawn_agents`); `None` before the first frame,
+    /// when every row counts as on screen. An update to a row outside it
+    /// changes nothing on screen, so it does not ask for a frame.
+    pub drawn_agents: Option<std::ops::Range<usize>>,
     /// The Background level's deferred output-tail read (§5.9): the selected
     /// task's key recorded by the draw path (`overlays`), the key of the read
     /// currently on a blocking thread, and the landed tail — the only copy,
@@ -122,6 +127,21 @@ impl RailState {
             return Some(index);
         }
         self.agents.iter().position(|agent| &agent.id == id)
+    }
+
+    /// Whether `id`'s row was on the rail last frame (see `drawn_agents`).
+    pub fn agent_row_drawn(&self, id: &AgentId) -> bool {
+        let Some(drawn) = self.drawn_agents.as_ref() else {
+            return true;
+        };
+        let Some(row) = self.agent_row(id) else {
+            return false;
+        };
+        let mains_before = self.agents[..row]
+            .iter()
+            .filter(|agent| agent.id.is_main())
+            .count();
+        drawn.contains(&(row - mains_before))
     }
 
     fn task_row(&self, id: &TaskId) -> Option<usize> {

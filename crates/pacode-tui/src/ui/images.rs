@@ -30,7 +30,7 @@ use pacode_render::{RenderOptions, display_width, rgb_to_ansi16, truncate_to_wid
 use pacode_types::ImageRef;
 
 use crate::state::AppState;
-use crate::state::image_cache::ImageCellCache;
+use crate::state::image_cache::{ImageCellCache, Lookup};
 use crate::state::images::THUMB_SLOT_W;
 
 #[cfg(test)]
@@ -371,7 +371,9 @@ pub fn cells_to_lines(image: &InlineImage, truecolor: bool) -> Vec<Line<'static>
 }
 
 /// The transcript rows of an `Images` item: each picture below the text, then a blank
-/// line. Decoded cells come from (and go to) `cache`, keyed by hash and size.
+/// line. Decoded cells come from `cache`, keyed by hash and size; an image not decoded
+/// yet draws its one-line stub and leaves a want for the event loop, which decodes
+/// off the frame path and drops these lines when the cells land.
 pub fn render_images(
     images: &[ImageRef],
     width: u16,
@@ -384,14 +386,10 @@ pub fn render_images(
     let max_cols = width.saturating_sub(INDENT.len() as u16).max(1);
     let mut out = Vec::new();
     for image in images {
-        let rendered = cache.get_or_render(&image.hash, max_cols, INLINE_MAX_ROWS, || {
-            let bytes = pacode_image::store::load(&image.hash).map_err(|e| e.to_string())?;
-            pacode_image::render_inline(&bytes, max_cols, INLINE_MAX_ROWS)
-                .map_err(|e| e.to_string())
-        });
-        match rendered {
-            Ok(cells) => out.extend(cells_to_lines(&cells, cache.truecolor)),
-            Err(err) => {
+        match cache.lookup(&image.hash, max_cols, INLINE_MAX_ROWS) {
+            Lookup::Ready(cells) => out.extend(cells_to_lines(&cells, cache.truecolor)),
+            Lookup::Pending => out.push(stub_line(image, None, width, opts)),
+            Lookup::Failed(err) => {
                 log::debug!("inline image {} not drawn: {err}", image.hash);
                 out.push(stub_line(image, Some("unavailable"), width, opts));
             }
@@ -401,9 +399,8 @@ pub fn render_images(
     out
 }
 
-/// Split one input line into spans, drawing image tokens in `chip` style and the
-/// rest in `base`: the paste tokens (`[Image 1]`) and the sized attachment chips
-/// (`[Image 1 \u{b7} 1.2 MB]`).
+/// Split one input line into spans, drawing the `[Image N]` paste tokens in `chip`
+/// style and the rest in `base`.
 pub fn style_chips(line: &str, base: Style, chip: Style) -> Vec<Span<'static>> {
     let chips = image_token_ranges(line);
     if chips.is_empty() {
@@ -431,14 +428,11 @@ pub fn style_chips(line: &str, base: Style, chip: Style) -> Vec<Span<'static>> {
     spans
 }
 
-/// Char ranges (`end` exclusive, in order, non-overlapping) of the image tokens in
-/// `line`: attachment chips first, then `[Image N]` paste tokens outside them.
+/// Char ranges (`end` exclusive, in order, non-overlapping) of the `[Image N]` paste
+/// tokens in `line`.
 fn image_token_ranges(line: &str) -> Vec<(usize, usize)> {
-    let mut ranges: Vec<(usize, usize)> = crate::attachments::find_chips(line)
-        .into_iter()
-        .map(|c| (c.start, c.end))
-        .collect();
     const HEAD: &str = "[Image ";
+    let mut ranges = Vec::new();
     let chars: Vec<char> = line.chars().collect();
     let head: Vec<char> = HEAD.chars().collect();
     let mut i = 0;
@@ -451,15 +445,12 @@ fn image_token_ranges(line: &str) -> Vec<(usize, usize)> {
             let close = i + head.len() + digits;
             if digits > 0 && chars.get(close) == Some(&']') {
                 let end = close + 1;
-                if !ranges.iter().any(|(s, e)| i < *e && *s < end) {
-                    ranges.push((i, end));
-                }
+                ranges.push((i, end));
                 i = end;
                 continue;
             }
         }
         i += 1;
     }
-    ranges.sort_unstable();
     ranges
 }

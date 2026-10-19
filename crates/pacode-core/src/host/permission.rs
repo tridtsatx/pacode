@@ -208,7 +208,10 @@ impl SessionHost {
                     .unwrap_or((pacode_types::AgentStatus::Idle, None));
 
                 if let Some(agent) = &agent_opt {
-                    agent.set_status(
+                    // From the status read above, in one step: a stop that
+                    // landed since keeps `Stopped`.
+                    agent.restore_status(
+                        prev_status,
                         pacode_types::AgentStatus::WaitingApproval,
                         Some(draft.title.clone()),
                     );
@@ -307,10 +310,14 @@ impl SessionHost {
 
                 if let Some(agent) = &agent_opt {
                     // A stop that landed during the permission wait wins over
-                    // restoring the pre-permission status.
-                    if !agent.stop_requested() {
-                        agent.set_status(prev_status, prev_activity);
-                    }
+                    // restoring the pre-permission status: only a status still
+                    // `WaitingApproval` is put back, checked and set under one
+                    // lock.
+                    agent.restore_status(
+                        pacode_types::AgentStatus::WaitingApproval,
+                        prev_status,
+                        prev_activity,
+                    );
                     self.session
                         .events
                         .emit(pacode_types::Event::AgentUpdated(agent.info()));

@@ -252,7 +252,9 @@ pub fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
 
     // v3 and v4 also run for v3/v4 databases: a pre-merge branch build used
     // those two numbers for other steps (compaction audit columns, now v11; an
-    // FTS rebuild, superseded by v9). Both steps are idempotent.
+    // FTS rebuild, superseded by v9). Both steps are idempotent, so rerunning
+    // v3-v5 for every database below v5 treats such a database as v2 without
+    // having to tell the two lineages apart; v6-v11 then run as usual.
     if current_version < 5 {
         let tx = conn.transaction()?;
         add_column_if_missing(&tx, "sessions", "zdr", "INTEGER NOT NULL DEFAULT 0")?;

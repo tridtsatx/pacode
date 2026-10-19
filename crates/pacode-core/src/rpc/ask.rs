@@ -136,7 +136,10 @@ impl<'a> Waiting<'a> {
             post(session, me, item.clone()),
         ];
         let prev = (info.status, info.activity.clone());
-        me.set_status(
+        // From the status read above, in one step: a stop that landed since
+        // keeps `Stopped`, and `finish` then has no `WaitingParent` to undo.
+        me.restore_status(
+            info.status,
             AgentStatus::WaitingParent,
             Some("asking the orchestrator".to_string()),
         );
@@ -177,11 +180,15 @@ impl<'a> Waiting<'a> {
             self.item.clone(),
         );
         update(self.session, self.me, self.seqs[1], self.item.clone());
-        // A stop that landed during the wait wins over the restore.
-        if !self.me.stop_requested() {
-            let (status, activity) = self.prev.clone();
-            self.me.set_status(status, activity);
-        }
+        #[cfg(test)]
+        super::hooks::run(&self.me.id(), super::hooks::Point::WaitRestoring);
+        // A stop that landed during the wait wins over the restore: only a
+        // status still `WaitingParent` is put back, checked and set under one
+        // lock (a flag check before a plain set would let a stop in between
+        // be overwritten).
+        let (status, activity) = self.prev.clone();
+        self.me
+            .restore_status(AgentStatus::WaitingParent, status, activity);
         self.session
             .events
             .emit(Event::AgentUpdated(self.me.info()));

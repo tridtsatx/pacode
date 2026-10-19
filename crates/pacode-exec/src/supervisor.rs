@@ -64,6 +64,95 @@ impl ProgressThrottle {
         self.last_emit = Some(now);
         true
     }
+
+    /// Record an emit made outside the gate (a forced or final one).
+    fn mark_emitted(&mut self, now: Instant) {
+        self.pending = false;
+        self.last_emit = Some(now);
+    }
+}
+
+/// Minimum spacing between two `Output` broadcasts for one task (F6). One event per
+/// read chunk (8 KiB at most) lags the event channel at a hundred concurrent builds;
+/// the text in between is held and sent together, never dropped.
+pub(crate) const OUTPUT_EMIT_INTERVAL: Duration = Duration::from_millis(200);
+/// Held live text at or beyond this size is sent at once, whatever the interval, so a
+/// fast producer holds about this much per task in RAM.
+pub(crate) const OUTPUT_EMIT_MAX_BYTES: usize = 64 * 1024;
+
+/// Per-task coalescing of `TaskEvent::Output` text: the first batch goes out at once,
+/// later ones at most every [`OUTPUT_EMIT_INTERVAL`], with a trailing flush when output
+/// stops inside the window and a final one before `Ended`.
+#[derive(Debug)]
+pub(crate) struct OutputCoalescer {
+    gate: ProgressThrottle,
+    held: String,
+    max_bytes: usize,
+}
+
+impl OutputCoalescer {
+    pub(crate) fn new(interval: Duration, max_bytes: usize) -> Self {
+        Self {
+            gate: ProgressThrottle::new(interval),
+            held: String::new(),
+            max_bytes,
+        }
+    }
+
+    /// Add completed lines; returns the text to broadcast now, if any.
+    pub(crate) fn push(&mut self, text: &str, now: Instant) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+        self.held.push_str(text);
+        if self.gate.on_progress(now) {
+            return Some(std::mem::take(&mut self.held));
+        }
+        if self.held.len() >= self.max_bytes {
+            self.gate.mark_emitted(now);
+            return Some(std::mem::take(&mut self.held));
+        }
+        None
+    }
+
+    /// When held text is owed a trailing emit, the instant it becomes due.
+    pub(crate) fn flush_deadline(&self) -> Option<Instant> {
+        if self.held.is_empty() {
+            None
+        } else {
+            self.gate.flush_deadline()
+        }
+    }
+
+    /// Called when the trailing deadline fires; returns the held text when it is due.
+    pub(crate) fn on_flush(&mut self, now: Instant) -> Option<String> {
+        if self.gate.on_flush(now) && !self.held.is_empty() {
+            return Some(std::mem::take(&mut self.held));
+        }
+        None
+    }
+
+    /// Everything still held (the task is ending).
+    pub(crate) fn take_rest(&mut self) -> Option<String> {
+        if self.held.is_empty() {
+            return None;
+        }
+        self.gate.mark_emitted(Instant::now());
+        Some(std::mem::take(&mut self.held))
+    }
+}
+
+/// Broadcast live output text of a task, if it still exists.
+fn emit_output(id: &TaskId, state: &Arc<SharedState>, text: String) {
+    let entry = state
+        .tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .map(|entry| (entry.info.clone(), entry.call.clone()));
+    if let Some((info, call)) = entry {
+        let _ = state.events.send(TaskEvent::Output { info, call, text });
+    }
 }
 
 /// Broadcast the current progress snapshot of a task, if it still exists.
@@ -155,15 +244,18 @@ pub(crate) async fn run_supervisor(
     let mut wait_failed = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     let mut progress_throttle = ProgressThrottle::new(PROGRESS_EMIT_INTERVAL);
+    let mut output = OutputCoalescer::new(OUTPUT_EMIT_INTERVAL, OUTPUT_EMIT_MAX_BYTES);
 
     loop {
         if stdout_done && stderr_done && child_waited {
             break;
         }
 
-        let flush_at = progress_throttle
-            .flush_deadline()
-            .map(tokio::time::Instant::from_std);
+        let flush_at = match (progress_throttle.flush_deadline(), output.flush_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+        .map(tokio::time::Instant::from_std);
         tokio::select! {
             _ = async {
                 match flush_at {
@@ -171,8 +263,16 @@ pub(crate) async fn run_supervisor(
                     None => std::future::pending().await,
                 }
             }, if flush_at.is_some() => {
-                if progress_throttle.on_flush(Instant::now()) {
+                let now = Instant::now();
+                if progress_throttle.flush_deadline().is_some_and(|at| at <= now)
+                    && progress_throttle.on_flush(now)
+                {
                     emit_progress_snapshot(&id, &state);
+                }
+                if output.flush_deadline().is_some_and(|at| at <= now)
+                    && let Some(text) = output.on_flush(now)
+                {
+                    emit_output(&id, &state, text);
                 }
             }
 
@@ -198,6 +298,7 @@ pub(crate) async fn run_supervisor(
                             &mut stdout_line_acc,
                             &state,
                             &mut progress_throttle,
+                            &mut output,
                         ).await;
                     }
                 }
@@ -225,6 +326,7 @@ pub(crate) async fn run_supervisor(
                             &mut stderr_line_acc,
                             &state,
                             &mut progress_throttle,
+                            &mut output,
                         ).await;
                     }
                 }
@@ -325,6 +427,11 @@ pub(crate) async fn run_supervisor(
         lines
     };
 
+    // Held live output goes out before `Ended`, never dropped.
+    if let Some(text) = output.take_rest() {
+        emit_output(&id, &state, text);
+    }
+
     let exit_code = child_status.and_then(|s| s.code());
     let now_timestamp = now_ms();
 
@@ -375,10 +482,9 @@ pub(crate) async fn run_supervisor(
         state.prune_terminal_overflow(&mut tasks)
     };
     drop(evicted);
-    // F1: forget the oldest finished tasks beyond the stub retention; F5: occasional
-    // spool GC.
+    // F5: an occasional sweep of spools no task holds any more.
     if ended {
-        crate::retention::on_ended(&state, &id);
+        crate::spool::on_ended(&state);
     }
 }
 
@@ -393,6 +499,7 @@ async fn handle_chunk(
     line_acc: &mut Vec<u8>,
     state: &Arc<SharedState>,
     progress_throttle: &mut ProgressThrottle,
+    output: &mut OutputCoalescer,
 ) {
     if !*spool_truncated && !state.guard.spool_allowed() {
         let _ = spool_file
@@ -445,6 +552,7 @@ async fn handle_chunk(
 
     let now_timestamp = now_ms();
     let mut progress_to_emit = None;
+    let mut output_to_emit = None;
 
     {
         let mut tasks = state.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -473,26 +581,17 @@ async fn handle_chunk(
                     progress_to_emit = Some(entry.info.clone());
                 }
             }
+            if let Some(text) = output.push(&live_text, Instant::now()) {
+                output_to_emit = Some((entry.info.clone(), entry.call.clone(), text));
+            }
         }
     }
 
     if let Some(info) = progress_to_emit {
         let _ = state.events.send(TaskEvent::Progress(info));
     }
-    if !live_text.is_empty() {
-        let entry = state
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(id)
-            .map(|entry| (entry.info.clone(), entry.call.clone()));
-        if let Some((info, call)) = entry {
-            let _ = state.events.send(TaskEvent::Output {
-                info,
-                call,
-                text: live_text,
-            });
-        }
+    if let Some((info, call, text)) = output_to_emit {
+        let _ = state.events.send(TaskEvent::Output { info, call, text });
     }
 }
 

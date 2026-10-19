@@ -92,11 +92,33 @@ fn retire_keeps_the_newest_tail_and_drops_tool_items() {
         ));
     }
     assert!(!t.tool_items.is_empty());
-    t.retire(16);
+    t.retire(16, usize::MAX);
     assert_eq!(t.tail.len(), 16);
     assert_eq!(t.tail.front().map(|i| i.seq), Some(24));
     assert!(t.tool_items.is_empty());
     assert_eq!(t.tail_cap, 16);
+    t.reopen(1000);
+    assert_eq!(t.tail_cap, 1000, "a resumed agent's tail grows back");
+}
+
+#[test]
+fn retire_bounds_the_tail_bytes_but_keeps_the_newest_item() {
+    let mut t = TranscriptState::new(1000);
+    for seq in 0..8u64 {
+        t.upsert(TranscriptItem {
+            seq,
+            agent: AgentId::main(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: "x".repeat(100_000),
+                complete: true,
+            },
+        });
+    }
+    t.retire(16, 64 * 1024);
+    assert_eq!(t.tail.len(), 1, "one 100 KB item is already past 64 KiB");
+    assert_eq!(t.tail.back().map(|i| i.seq), Some(7), "the newest stays");
+    assert!(t.tail_bytes() < 128 * 1024);
 }
 
 #[test]

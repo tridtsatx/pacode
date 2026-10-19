@@ -15,7 +15,7 @@ use crate::{Provider, ProviderError};
 #[path = "catalog_cache_tests.rs"]
 mod catalog_cache_tests;
 
-pub const CATALOG_CACHE_VERSION: u32 = 2;
+pub const CATALOG_CACHE_VERSION: u32 = 3;
 pub const DEFAULT_MAX_MODELS_PER_PROVIDER: usize = 500;
 pub const DEFAULT_CATALOG_TTL_SECS: u64 = 86400;
 /// Provider HTTP clients bound connect only — without this a server that

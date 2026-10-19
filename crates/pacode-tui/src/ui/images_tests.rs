@@ -258,6 +258,26 @@ fn opts() -> RenderOptions {
     RenderOptions::new(80, false)
 }
 
+/// What the event loop does between two draws: decode every image the last
+/// draw asked for (off the frame path in the app) and hand the cells back.
+fn decode_wants(cache: &mut ImageCellCache) {
+    for key in cache.take_wants() {
+        let decoded = crate::state::image_cache::decode(&key);
+        cache.insert(key, decoded);
+    }
+}
+
+/// `render_images` once the decodes it asked for have landed.
+fn render_decoded(
+    images: &[ImageRef],
+    width: u16,
+    cache: &mut ImageCellCache,
+) -> Vec<Line<'static>> {
+    render_images(images, width, &opts(), cache);
+    decode_wants(cache);
+    render_images(images, width, &opts(), cache)
+}
+
 fn width_of(line: &Line<'_>) -> usize {
     line.spans
         .iter()
@@ -269,7 +289,7 @@ fn width_of(line: &Line<'_>) -> usize {
 fn square_image_is_14_rows_and_fits_the_width() {
     let image = stored_png(100, 100);
     let mut cache = ImageCellCache::default();
-    let lines = render_images(&[image], 80, &opts(), &mut cache);
+    let lines = render_decoded(&[image], 80, &mut cache);
     // 14 image rows + the blank line after the picture.
     assert_eq!(lines.len(), 15);
     assert!(lines.last().unwrap().spans.is_empty());
@@ -286,7 +306,7 @@ fn square_image_is_14_rows_and_fits_the_width() {
 fn wide_image_is_bounded_by_the_cell_width() {
     let image = stored_png(1000, 100);
     let mut cache = ImageCellCache::default();
-    let lines = render_images(&[image], 40, &opts(), &mut cache);
+    let lines = render_decoded(&[image], 40, &mut cache);
     assert!(lines.iter().all(|l| width_of(l) <= 40));
     // 38 columns -> 38 px wide, 3.8 px tall -> 4 px -> 2 cell rows (+ blank).
     assert_eq!(lines.len(), 3);
@@ -296,7 +316,7 @@ fn wide_image_is_bounded_by_the_cell_width() {
 fn rows_are_painted_with_half_blocks_in_the_pixel_colours() {
     let image = stored_png(10, 10);
     let mut cache = ImageCellCache::default();
-    let lines = render_images(&[image], 80, &opts(), &mut cache);
+    let lines = render_decoded(&[image], 80, &mut cache);
     let span = &lines[0].spans[1];
     assert!(span.content.starts_with('\u{2580}'));
     assert_eq!(span.style.fg, Some(Color::Rgb(200, 50, 50)));
@@ -310,7 +330,7 @@ fn ansi_terminals_get_indexed_colours() {
     let image = stored_png(10, 10);
     let mut cache = ImageCellCache::default();
     cache.truecolor = false;
-    let lines = render_images(&[image], 80, &opts(), &mut cache);
+    let lines = render_decoded(&[image], 80, &mut cache);
     assert!(!matches!(lines[0].spans[1].style.fg, Some(Color::Rgb(..))));
 }
 
@@ -324,6 +344,7 @@ fn off_draws_a_one_line_stub() {
     let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(text.trim(), "[image: shot.png 800\u{d7}600]");
     assert!(cache.is_empty());
+    assert!(cache.take_wants().is_empty(), "off decodes nothing");
 }
 
 #[test]
@@ -337,9 +358,23 @@ fn missing_bytes_degrade_to_a_stub() {
         name: None,
     };
     let mut cache = ImageCellCache::default();
-    let lines = render_images(&[image], 80, &opts(), &mut cache);
+    let lines = render_decoded(&[image], 80, &mut cache);
     let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(text.contains("unavailable"), "{text}");
+}
+
+#[test]
+fn an_image_not_decoded_yet_draws_its_stub_and_asks_for_a_decode() {
+    let image = stored_png(100, 100);
+    let mut cache = ImageCellCache::default();
+    let lines = render_images(std::slice::from_ref(&image), 80, &opts(), &mut cache);
+    assert_eq!(lines.len(), 2, "stub + blank: nothing decoded in draw");
+    let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text.trim(), "[image: shot.png 100\u{d7}100]");
+    assert!(cache.is_empty());
+    let wants = cache.take_wants();
+    assert_eq!(wants.len(), 1);
+    assert_eq!(wants[0].hash, image.hash);
 }
 
 #[test]
@@ -373,6 +408,21 @@ fn transcript_cell_draws_the_image_below_the_text_at_width_80() {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let render_opts = opts();
+    // The first frame draws the stub and asks for the decode; the event loop
+    // decodes off the frame path and hands the cells back.
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            let prepared = crate::ui::dialog::prepare(area, &mut transcript, &render_opts, 0, 0);
+            crate::ui::dialog::draw(frame, area, &prepared);
+        })
+        .expect("draw");
+    let wants = transcript.images.take_wants();
+    assert_eq!(wants.len(), 1);
+    for key in wants {
+        let decoded = crate::state::image_cache::decode(&key);
+        transcript.image_ready(key, decoded);
+    }
     terminal
         .draw(|frame| {
             let area = frame.area();
@@ -401,17 +451,6 @@ fn transcript_cell_draws_the_image_below_the_text_at_width_80() {
     assert_eq!(buffer[(3, picture[0])].fg, Color::Rgb(200, 50, 50));
     // Cached lines: a second draw reuses the decoded cells.
     assert_eq!(transcript.images.len(), 1);
-}
-
-#[test]
-fn chips_in_input_lines_are_styled_separately() {
-    let base = Style::default();
-    let chip = Style::default().fg(Color::Cyan);
-    let spans = style_chips("see [Image 1 \u{b7} 3 B] now", base, chip);
-    assert_eq!(spans.len(), 3);
-    assert_eq!(spans[1].content, "[Image 1 \u{b7} 3 B]");
-    assert_eq!(spans[1].style, chip);
-    assert_eq!(style_chips("plain", base, chip).len(), 1);
 }
 
 #[test]

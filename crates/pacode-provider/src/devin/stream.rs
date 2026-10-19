@@ -15,7 +15,7 @@ use super::tool_parser::InlineToolCallParser;
 use super::wire::{decode_get_chat_message_response, encode_get_chat_message_request};
 use crate::governor::{ProviderGovernor, governor_for, hold_permit};
 use crate::retry::{
-    MIN_429_COOLDOWN, OpenedStream, RetryAfterSignal, RetryBudget, StreamTransport, retry_delay,
+    OpenedStream, RetryAfterSignal, RetryBudget, StreamTransport, note_failure, retry_delay,
     sleep_delay,
 };
 use crate::{CompletionRequest, EventStream, ProviderError};
@@ -351,11 +351,7 @@ impl StreamTransport for DevinStreamOpener {
                 }
                 Err(failure) => {
                     let delay = retry_delay(self.backoff_base, budget.used, failure.retry_after);
-                    if failure.retry_after.is_some()
-                        || matches!(&failure.error, ProviderError::RateLimited(_))
-                    {
-                        governor.start_cooldown(delay.max(MIN_429_COOLDOWN));
-                    }
+                    note_failure(governor, &failure.error, failure.retry_after, delay);
                     drop(permit);
                     if failure.error.is_retryable() && budget.reserve() {
                         sleep_delay(delay).await;

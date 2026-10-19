@@ -11,7 +11,7 @@ use crate::ProviderError;
 use crate::error_body::MAX_ERROR_BODY_BYTES;
 use crate::governor::{GovernorPermit, ProviderGovernor};
 use crate::retry::{
-    MIN_429_COOLDOWN, RetryBudget, error_body_read_timeout, retry_after_from_response, retry_delay,
+    RetryBudget, error_body_read_timeout, note_failure, retry_after_from_response, retry_delay,
     sleep_delay,
 };
 
@@ -70,11 +70,9 @@ pub(crate) async fn post_with_retries(
             Ok(response) => return Ok((response, permit)),
             Err(failure) => {
                 let delay = retry_delay(post.backoff_base, budget.used, failure.retry_after);
-                if failure.retry_after.is_some()
-                    || matches!(failure.error, ProviderError::RateLimited(_))
-                {
-                    governor.start_cooldown(delay.max(MIN_429_COOLDOWN));
-                }
+                // Before the slot is released: the waiter it goes to then sees the
+                // cooldown (and the shrunk limit) instead of firing into the same 429.
+                note_failure(governor, &failure.error, failure.retry_after, delay);
                 drop(permit);
                 if failure.error.is_retryable() && budget.reserve() {
                     sleep_delay(delay).await;

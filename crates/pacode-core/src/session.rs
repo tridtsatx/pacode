@@ -137,6 +137,21 @@ impl Session {
             .unwrap_or(0)
     }
 
+    /// Refuse to make one more subagent live past `agents.max_live`: every live
+    /// agent holds its history, transcript and tools, and runs model calls of
+    /// its own. Checked under `submit_lock` by spawn, detach, `continue` and
+    /// `rpc::resume`, so two of them cannot both take the last slot.
+    pub(crate) fn check_live_cap(&self) -> Result<(), CoreError> {
+        let max = self.config.agents.max_live;
+        if self.live_subagents() >= max {
+            return Err(CoreError::Invalid(format!(
+                "maximum live subagents ({max}) reached: wait for one to finish or stop one \
+                 (`agents.max_live`)"
+            )));
+        }
+        Ok(())
+    }
+
     /// Record the answer on the question's transcript item, so the conversation
     /// shows what was asked and what was chosen rather than only the tool result.
     pub fn record_question_answer(
@@ -557,6 +572,25 @@ impl Session {
             .iter()
             .map(pacode_types::ImageSource::stored)
             .collect())
+    }
+
+    /// Store prompt images given as a path or raw bytes (see `attach::store_sources`)
+    /// so the persisted message holds `ImageSource::Stored` blocks. A model without
+    /// vision never fails the message over an image: it gets the text placeholder
+    /// the providers render for any image it cannot take.
+    pub async fn prepare_images(
+        &self,
+        images: Vec<pacode_types::ImageSource>,
+    ) -> Result<Vec<pacode_types::ImageSource>, CoreError> {
+        if images.iter().all(|source| source.image_ref().is_some()) {
+            return Ok(images);
+        }
+        let route = self.meta().model;
+        let vision = match self.providers.resolve(&route).await {
+            Ok(provider) => provider.model_info(&route.model).supports_vision,
+            Err(_) => false,
+        };
+        crate::attach::store_sources(images, vision).await
     }
 
     /// [`submit_user_message`](Self::submit_user_message) plus image attachments:
@@ -1466,7 +1500,7 @@ impl Session {
         self.events.emit(pacode_types::Event::AgentUpdated(info));
     }
 
-    /// Spawn a subagent (depth 1, no concurrency cap) and start its turn.
+    /// Spawn a subagent (depth 1, `agents.max_live` cap) and start its turn.
     pub async fn spawn_agent(self: &Arc<Self>, spec: AgentSpec) -> Result<AgentId, CoreError> {
         let _submit_guard = self.submit_lock.lock().await;
         if self.closed.load(Ordering::SeqCst) {
@@ -1478,8 +1512,10 @@ impl Session {
         if parent.stop_requested() {
             return Err(CoreError::Invalid("session is closed".into()));
         }
-        // Process-wide resource guard (memory/fds): refuse before anything is created.
+        // Process-wide resource guard (memory/fds) and the per-session live cap:
+        // refuse before anything is created.
         self.tasks.admit_agent()?;
+        self.check_live_cap()?;
         let parent_info = parent.info();
         let id = AgentId::generate();
         let name = spec.name.unwrap_or_else(|| {
@@ -1743,6 +1779,8 @@ impl Session {
         if agent.mailbox.held_by_user(consent) {
             return Err(CoreError::Invalid(crate::rpc::kept_stopped(id, consent)));
         }
+        // A stopped agent is not live; continuing it makes it live again.
+        self.check_live_cap()?;
 
         let message_guard = agent.message_write_lock.clone().lock_owned().await;
         let current = self
@@ -1815,6 +1853,7 @@ impl Session {
             .unwrap_or_else(|p| p.into_inner())
             .upsert(item.clone());
         self.events.emit(pacode_types::Event::ItemAdded(item));
+        agent.reset_steps();
         agent.set_status(pacode_types::AgentStatus::Idle, None);
         self.events
             .emit(pacode_types::Event::AgentUpdated(agent.info()));
@@ -2118,6 +2157,11 @@ impl Session {
             return Err(CoreError::Invalid(
                 "no turn is running on the main agent".to_string(),
             ));
+        }
+        // The detached turn becomes one more live subagent.
+        if let Err(error) = self.check_live_cap() {
+            log::warn!("failed to detach main turn: {error}");
+            return Err(error);
         }
 
         let plan = self.prepare_detach(&main);

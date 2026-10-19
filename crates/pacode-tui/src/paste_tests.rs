@@ -469,3 +469,34 @@ fn test_ctrl_v_on_an_empty_clipboard_reports_and_inserts_nothing() {
     assert_eq!(state.toasts.len(), 1);
     assert_eq!(state.toasts[0].level, ToastLevel::Info);
 }
+
+#[test]
+fn image_extension_detection() {
+    assert!(is_image_path("a/b/c.PNG"));
+    assert!(is_image_path("x.jpeg"));
+    assert!(!is_image_path("x.rs"));
+    assert!(!is_image_path("png"));
+}
+
+#[test]
+fn drag_and_drop_path_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("my shot.png");
+    std::fs::write(&file, b"x").unwrap();
+    let plain = file.display().to_string();
+    assert_eq!(image_path_from_paste(&plain), Some(file.clone()));
+    assert_eq!(
+        image_path_from_paste(&format!("'{plain}'\n")),
+        Some(file.clone())
+    );
+    assert_eq!(
+        image_path_from_paste(&plain.replace(' ', "\\ ")),
+        Some(file.clone())
+    );
+    assert_eq!(
+        image_path_from_paste(&format!("file://{}", plain.replace(' ', "%20"))),
+        Some(file)
+    );
+    assert_eq!(image_path_from_paste("two\nlines.png"), None);
+    assert_eq!(image_path_from_paste("/definitely/missing.png"), None);
+}

@@ -8,7 +8,7 @@
 //! - `builtin`: the builtin provider table (ids, URLs, env vars, default models)
 //! - `compat`: per-endpoint wire quirks applied by `openai_compat`
 //! - `dialect`: the wire-protocol table that turns a config entry into a transport
-//! - `gate` / `governor`: adaptive per-provider limit and per-account admission control
+//! - `governor`: per-account admission control (adaptive AIMD limit, FIFO queue, cooldown)
 //! - `openai_compat`: request building, SSE parsing, retries, `/models` catalog
 //! - `registry`: `ProviderRegistry` built from `Config`
 //! - `mock`: `MockProvider` with scripted responses (behind `cfg(any(test, feature = "mock"))`
@@ -27,7 +27,6 @@ pub mod compat;
 pub mod devin;
 pub mod dialect;
 pub mod error_body;
-pub mod gate;
 mod governor;
 pub mod image;
 mod image_cache;
@@ -40,7 +39,6 @@ pub mod registry;
 mod registry_cache;
 mod request_body;
 mod retry;
-mod retry_after;
 pub mod sse;
 mod sse_typed;
 pub mod vision;
@@ -60,7 +58,6 @@ pub use catalog_cache::{
 };
 pub use compat::{Compat, MaxTokensField, ReasoningWire, ToolIdRule};
 pub use error_body::error_body_message;
-pub use gate::ProviderGate;
 pub use mock::MockProvider;
 pub use openai_compat::{OpenAiCompat, redact};
 pub use registry::{ProviderRegistry, ReloadReport};
@@ -77,8 +74,9 @@ static PROVIDER_CONCURRENCY: AtomicUsize = AtomicUsize::new(DEFAULT_PROVIDER_CON
 static PROVIDER_QUEUE_ITEMS: AtomicUsize = AtomicUsize::new(PROVIDER_QUEUE_ITEM_LIMIT);
 static PROVIDER_QUEUE_BYTES: AtomicU64 = AtomicU64::new(PROVIDER_QUEUE_BYTE_LIMIT);
 
-/// Admission control applied to every provider account: `max_concurrency`
-/// requests in flight, the rest parked in a queue bounded by items and bytes.
+/// Admission control applied to every provider account: at most `max_concurrency`
+/// requests in flight (the ceiling of the adaptive limit, see `governor`), the rest
+/// parked in a FIFO queue bounded by items and bytes.
 /// A zero queue cap never waits — it rejects instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderLimits {
@@ -193,20 +191,6 @@ pub fn provider_stats() -> pacode_types::ProviderStats {
     governor::provider_stats()
 }
 
-/// The adaptive per-provider gate (see [`gate`]) shared by every instance of the
-/// provider `id` at `base_url`: clones, token-refresh rebuilds and hot reloads of the
-/// same entry draw from one permit pool and one cooldown. It sits in front of the
-/// per-account governor: the governor bounds an account's in-flight requests and queue,
-/// the gate adapts the provider's limit (AIMD) to its 429/503 answers.
-///
-/// Process-wide map keyed by `(id, base_url)`, bounded by the number of distinct
-/// provider entries ever built; a gate whose `max_concurrent` changed is replaced
-/// (in-flight requests release into the old one).
-pub(crate) fn provider_gate(id: &str, base_url: &str, max_concurrent: u32) -> Arc<ProviderGate> {
-    static GATES: std::sync::LazyLock<gate::GateMap> = std::sync::LazyLock::new(Default::default);
-    GATES.gate_for(&format!("{id}\u{0}{base_url}"), max_concurrent)
-}
-
 pub fn provider_concurrency_ceiling() -> usize {
     PROVIDER_CONCURRENCY.load(Ordering::Acquire)
 }
@@ -252,7 +236,8 @@ pub trait Provider: Send + Sync {
     }
     /// Static knowledge about a model (context window, reasoning) without a network call.
     fn model_info(&self, model: &str) -> ModelInfo;
-    /// Requests currently queued behind this provider's concurrency gate or cooldown.
+    /// Superseded by [`provider_stats`]: admission is per account, not per provider,
+    /// so no provider reports a depth any more. Kept until its last caller moves.
     fn queue_depth(&self) -> usize {
         0
     }

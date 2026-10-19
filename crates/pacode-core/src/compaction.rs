@@ -425,6 +425,18 @@ impl Summarizer for ProviderSummarizer<'_> {
     }
 }
 
+/// Stands in for the summary model when no route may take the conversation (ZDR):
+/// every call fails without leaving the process, so the pipeline still shakes and
+/// folds the older span into its deterministic digest.
+struct RefusedSummarizer(String);
+
+#[async_trait]
+impl Summarizer for RefusedSummarizer {
+    async fn summarize(&self, _request: Vec<Message>) -> Result<String, CoreError> {
+        Err(CoreError::Invalid(self.0.clone()))
+    }
+}
+
 /// Manual compaction (`/compact`): runs the pipeline without the threshold gates.
 /// Returns false when there was nothing to do.
 pub async fn compact(session: &Arc<Session>, agent: &Arc<Agent>) -> Result<bool, CoreError> {
@@ -482,8 +494,15 @@ async fn run_compaction(
         session.zdr_active(),
         &|key| session.model_flags(key).zdr_capable,
     );
-    if let Some(reason) = refusal {
-        return Err(CoreError::Invalid(reason));
+    // No route may see the conversation: the summary stage is refused, but the
+    // stages that never leave the process (shake, the digest fallback, the
+    // pinned blocks) still run.
+    if let Some(reason) = &refusal {
+        log::warn!(
+            "compaction without a summary model: session={} agent={}: {reason}",
+            session.id,
+            agent.id()
+        );
     }
     // The pipeline folds exactly the prefix `split_for_compaction` picks (shake never
     // changes the length), so the request it would fold away is known up front.
@@ -510,12 +529,17 @@ async fn run_compaction(
         previous_summary: prev_summary,
         pinned: collect_pinned(session, &agent.id()),
     };
-    let summarizer = ProviderSummarizer {
+    let provider_summarizer = ProviderSummarizer {
         session: session.as_ref(),
         route,
         active_request,
     };
-    let out = pipeline::run(input, &cfg, &summarizer).await;
+    let refused_summarizer = refusal.clone().map(RefusedSummarizer);
+    let summarizer: &dyn Summarizer = match &refused_summarizer {
+        Some(refused) => refused,
+        None => &provider_summarizer,
+    };
+    let out = pipeline::run(input, &cfg, summarizer).await;
     let Some(method) = out.method else {
         return Ok(false);
     };
@@ -593,7 +617,9 @@ async fn run_compaction(
         out.tokens_before,
         out.tokens_after
     );
-    if out.summary_failed {
+    if out.summary_failed && refusal.is_some() {
+        text.push_str("; no zdr_capable summary route, used a deterministic digest");
+    } else if out.summary_failed {
         text.push_str("; summary model failed, used a deterministic digest");
     }
     session.emit_notice(agent, pacode_types::ToastLevel::Info, text);

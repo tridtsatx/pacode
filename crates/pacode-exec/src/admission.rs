@@ -9,12 +9,14 @@
 //! - Invalidation: a [`SlotPermit`] frees its slot on drop (the supervisor owns it for the
 //!   task's whole life; a failed spawn drops it at once); a waiter's ticket leaves the
 //!   queue when its future is dropped, cancelled or admitted.
-//! - Fairness: a ticket number per waiter; only the head of the queue may take a slot and
-//!   new callers never overtake waiters.
-//! - Nothing ticks while idle: waiters sleep on a `Notify`, woken only by a release or a
-//!   leaving ticket.
+//! - Fairness: a freed slot is handed straight to the head of the queue (it never becomes
+//!   free while someone waits), so new callers never overtake waiters and a release wakes
+//!   exactly one waiter, through that waiter's own `Notify`.
+//! - A waiter that leaves after its slot was handed to it (cancelled or dropped at the
+//!   same moment) passes the slot on to the next waiter: nothing leaks, nothing starts.
+//! - Nothing ticks while idle: waiters sleep on their `Notify`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
@@ -25,17 +27,43 @@ use crate::manager::ExecError;
 /// Maximum number of spawn calls waiting for a slot.
 pub(crate) const MAX_QUEUED: usize = 1024;
 
+#[derive(Debug)]
+struct Waiter {
+    ticket: u64,
+    wake: Arc<Notify>,
+}
+
 #[derive(Debug, Default)]
 struct AdmissionState {
+    /// Slots held, including slots handed to a waiter that has not picked them up yet.
     active: usize,
     next_ticket: u64,
-    waiters: VecDeque<u64>,
+    waiters: VecDeque<Waiter>,
+    /// Tickets a slot was handed to, not yet picked up.
+    granted: HashSet<u64>,
+}
+
+impl AdmissionState {
+    /// Give one slot back: to the head waiter when there is one (the slot stays counted
+    /// in `active`), otherwise to the pool. Returns the waiter to wake, to be notified
+    /// after the lock is released.
+    fn release_slot(&mut self) -> Option<Arc<Notify>> {
+        match self.waiters.pop_front() {
+            Some(waiter) => {
+                self.granted.insert(waiter.ticket);
+                Some(waiter.wake)
+            }
+            None => {
+                self.active = self.active.saturating_sub(1);
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct Admission {
     state: Mutex<AdmissionState>,
-    notify: Notify,
     max_active: usize,
     max_queued: usize,
 }
@@ -48,15 +76,15 @@ pub(crate) struct SlotPermit {
 
 impl Drop for SlotPermit {
     fn drop(&mut self) {
-        {
-            let mut st = self.admission.lock();
-            st.active = st.active.saturating_sub(1);
+        let wake = self.admission.lock().release_slot();
+        if let Some(wake) = wake {
+            wake.notify_one();
         }
-        self.admission.notify.notify_waiters();
     }
 }
 
-/// Removes a waiter's ticket when its future ends without being admitted.
+/// Removes a waiter's ticket when its future ends without being admitted, and passes on
+/// a slot that was handed to it in the meantime.
 struct TicketGuard<'a> {
     admission: &'a Admission,
     ticket: u64,
@@ -68,11 +96,18 @@ impl Drop for TicketGuard<'_> {
         if !self.armed {
             return;
         }
-        {
+        let wake = {
             let mut st = self.admission.lock();
-            st.waiters.retain(|t| *t != self.ticket);
+            if st.granted.remove(&self.ticket) {
+                st.release_slot()
+            } else {
+                st.waiters.retain(|w| w.ticket != self.ticket);
+                None
+            }
+        };
+        if let Some(wake) = wake {
+            wake.notify_one();
         }
-        self.admission.notify.notify_waiters();
     }
 }
 
@@ -84,7 +119,6 @@ impl Admission {
     pub(crate) fn with_queue_cap(max_active: usize, max_queued: usize) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
-            notify: Notify::new(),
             max_active: max_active.max(1),
             max_queued,
         }
@@ -100,6 +134,25 @@ impl Admission {
         self.lock().waiters.len()
     }
 
+    /// Number of slots held (including slots handed to a waiter not yet resumed).
+    #[cfg(test)]
+    pub(crate) fn active(&self) -> usize {
+        self.lock().active
+    }
+
+    /// A free slot right now, without queueing; `None` when every slot is taken or
+    /// someone already waits (a caller that does not wait never overtakes one that does).
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<SlotPermit> {
+        let mut st = self.lock();
+        if st.waiters.is_empty() && st.active < self.max_active {
+            st.active += 1;
+            return Some(SlotPermit {
+                admission: Arc::clone(self),
+            });
+        }
+        None
+    }
+
     /// Wait for a free slot. `Err(Cancelled)` when `cancel` fires first; nothing is held
     /// then. `Err(TooManyTasks)` when the queue itself is full.
     pub(crate) async fn acquire(
@@ -109,7 +162,7 @@ impl Admission {
         if cancel.is_some_and(|c| c.is_cancelled()) {
             return Err(ExecError::Cancelled);
         }
-        let ticket = {
+        let (ticket, wake) = {
             let mut st = self.lock();
             if st.waiters.is_empty() && st.active < self.max_active {
                 st.active += 1;
@@ -122,8 +175,12 @@ impl Admission {
             }
             let ticket = st.next_ticket;
             st.next_ticket += 1;
-            st.waiters.push_back(ticket);
-            ticket
+            let wake = Arc::new(Notify::new());
+            st.waiters.push_back(Waiter {
+                ticket,
+                wake: Arc::clone(&wake),
+            });
+            (ticket, wake)
         };
         let mut guard = TicketGuard {
             admission: self,
@@ -132,26 +189,21 @@ impl Admission {
         };
 
         loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            // Register before checking the state so a release in between is not lost.
-            notified.as_mut().enable();
-            {
-                let mut st = self.lock();
-                if st.waiters.front() == Some(&ticket) && st.active < self.max_active {
-                    st.waiters.pop_front();
-                    st.active += 1;
-                    guard.armed = false;
-                    drop(st);
-                    // The next waiter may be admissible too (several slots freed).
-                    self.notify.notify_waiters();
-                    return Ok(SlotPermit {
-                        admission: Arc::clone(self),
-                    });
-                }
+            // A cancel wins over a slot handed over at the same moment: the guard passes
+            // that slot on, and nothing starts.
+            if cancel.is_some_and(|c| c.is_cancelled()) {
+                return Err(ExecError::Cancelled);
             }
+            if self.lock().granted.remove(&ticket) {
+                guard.armed = false;
+                return Ok(SlotPermit {
+                    admission: Arc::clone(self),
+                });
+            }
+            // `notify_one` stores a permit when nobody is parked yet, so a hand-over
+            // between the check above and this await is not lost.
             tokio::select! {
-                _ = &mut notified => {}
+                _ = wake.notified() => {}
                 _ = async {
                     match cancel {
                         Some(c) => c.cancelled().await,

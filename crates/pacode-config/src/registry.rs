@@ -91,7 +91,6 @@ pub struct ConfigValidationError {
 pub const SKIP_LIST: &[&str] = &[
     "providers",
     "pricing",
-    "agents",
     "plugins.dirs",
     "skills.dirs",
     "hooks.pre_tool_use",
@@ -111,6 +110,7 @@ pub const SECTIONS: &[&str] = &[
     "ui",
     "exec",
     "resources",
+    "agents",
     "limits",
     "daemon",
     "context",
@@ -186,7 +186,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "provider.effort", label: "Reasoning Effort", description: "Base reasoning effort level", section: "provider", default_value: "medium", kind: SettingKind::Enum { options: EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.stream_idle_secs", label: "Stream Idle Timeout", description: "Base idle timeout in seconds for streaming responses", section: "provider", default_value: "180", kind: SettingKind::Integer { min: 1, max: 3600 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.max_retries", label: "Max Retries", description: "Maximum retries for failed provider requests", section: "provider", default_value: "5", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "provider.max_concurrent", label: "Max Concurrent Requests", description: "Maximum in-flight requests per provider across all agents (0 = unlimited)", section: "provider", default_value: "64", kind: SettingKind::Integer { min: 0, max: 4096 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "provider.max_concurrent", label: "Max Concurrent Requests", description: "Deprecated: use limits.max_provider_concurrency. Per-provider ceiling of the adaptive limit (0 = unlimited); a file setting only this one also seeds the limits key", section: "provider", default_value: "64", kind: SettingKind::Integer { min: 0, max: 4096 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.catalog_ttl_secs", label: "Catalog TTL Seconds", description: "Seconds before cached model catalog is considered stale", section: "provider", default_value: "86400", kind: SettingKind::Integer { min: 1, max: 2592000 }, apply: ApplyMode::NextTurn },
 
     // ui
@@ -233,6 +233,8 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "resources.sample_ms_pressure", label: "Sample Interval (pressure) ms", description: "Sampling interval in ms near or below the reserve", section: "resources", default_value: "200", kind: SettingKind::Integer { min: 50, max: 10000 }, apply: ApplyMode::Restart },
 
     // agents
+    SettingEntry { dotted_key: "agents.max_live", label: "Max Live Agents", description: "Maximum subagents alive at once in one session; a spawn past it is refused", section: "agents", default_value: "16", kind: SettingKind::Integer { min: 1, max: 1024 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "agents.max_turns", label: "Max Turns", description: "Maximum tool-calling turns for a subagent before it is stopped", section: "agents", default_value: "200", kind: SettingKind::Integer { min: 1, max: 10000 }, apply: ApplyMode::NextTurn },
 
     // limits
     SettingEntry { dotted_key: "limits.max_provider_concurrency", label: "Provider Concurrency", description: "Ceiling on in-flight provider requests per provider+credential; the runtime rejects anything outside 1..=1024", section: "limits", default_value: "128", kind: SettingKind::Integer { min: 1, max: 1024 }, apply: ApplyMode::Restart },
@@ -427,6 +429,8 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             Some(config.resources.sample_ms_idle_headroom.to_string())
         }
         "resources.sample_ms_pressure" => Some(config.resources.sample_ms_pressure.to_string()),
+        "agents.max_live" => Some(config.agents.max_live.to_string()),
+        "agents.max_turns" => Some(config.agents.max_turns.to_string()),
         "limits.max_provider_concurrency" => {
             Some(config.limits.max_provider_concurrency.to_string())
         }
@@ -1062,6 +1066,16 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "resources.sample_ms_pressure" => {
             if let toml::Value::Integer(n) = value {
                 config.resources.sample_ms_pressure = *n as u64;
+            }
+        }
+        "agents.max_live" => {
+            if let toml::Value::Integer(n) = value {
+                config.agents.max_live = *n as usize;
+            }
+        }
+        "agents.max_turns" => {
+            if let toml::Value::Integer(n) = value {
+                config.agents.max_turns = *n as u32;
             }
         }
         "limits.max_provider_concurrency" => {

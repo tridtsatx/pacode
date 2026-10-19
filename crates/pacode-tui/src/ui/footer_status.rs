@@ -14,7 +14,8 @@
 //! With no session attached nothing is known, and the row says so rather
 //! than showing defaults (B10).
 //! Narrow widths drop, in order: the `/effort` hint, the `/model` hint, the
-//! plugin status, the context fill — then cut the model name.
+//! plugin status, the context fill — then cut the model name. The effort
+//! itself is left out for a model the catalog says has no reasoning control.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -151,11 +152,14 @@ fn pieces(
     if !model.is_empty() {
         left.push(text(vec![Span::styled(model, theme.bold)]));
     }
-    let mut effort = vec![Span::styled(meta.effort.to_string(), theme.accent)];
-    if keep.effort_hint && state.config.ui.hints.effort {
-        effort.push(Span::styled(" /effort", theme.cyan));
+    // A model without reasoning control has no effort to show or change.
+    if state.has_effort_control() {
+        let mut effort = vec![Span::styled(meta.effort.to_string(), theme.accent)];
+        if keep.effort_hint && state.config.ui.hints.effort {
+            effort.push(Span::styled(" /effort", theme.cyan));
+        }
+        left.push(text(effort));
     }
-    left.push(text(effort));
     if keep.plugin
         && let Some((_, status)) = &state.plugin_status
     {

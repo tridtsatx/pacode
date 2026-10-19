@@ -92,8 +92,9 @@ pub(super) async fn drain_injections(
         });
     }
 
-    let injection_msg =
-        crate::inject::render_injections(&renderable, session.config.context.injection_cap_chars);
+    // One batch is bounded as a whole: 200 subagents finishing together become
+    // a budget's worth of reports plus one-line stubs, never ~800k chars.
+    let injection_msg = crate::inject::render_for(&session.config.context, &renderable);
     if let Err(error) = persist_history_message(session, agent, injection_msg).await {
         agent.restore_due(Taken::new(deferred, prev_due));
         crate::rpc::resolve_undeliverable(session, &renderable);

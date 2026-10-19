@@ -80,6 +80,12 @@ pub enum Action {
     ModelPickerAccount,
     /// Sign the highlighted provider's active account out.
     ModelPickerLogout,
+    /// Show embedding, image and other non-chat models in the model palette
+    /// too (it lists chat models only by default).
+    ModelPickerTypes,
+    /// Make the highlighted model the one that summarizes the context
+    /// (`context.compaction_model`); again on the same model clears it.
+    ModelPickerCompaction,
     /// Expand or collapse the newest tool-call cell with hidden output (§6);
     /// a click on a cell does the same for that specific cell.
     ExpandOutput,
@@ -214,6 +220,8 @@ impl Action {
             Self::ModelPickerKind => "model_picker_kind",
             Self::ModelPickerAccount => "model_picker_account",
             Self::ModelPickerLogout => "model_picker_logout",
+            Self::ModelPickerTypes => "model_picker_types",
+            Self::ModelPickerCompaction => "model_picker_compaction",
             Self::ExpandOutput => "expand_output",
             Self::MoveWordLeft => "move_word_left",
             Self::MoveWordRight => "move_word_right",
@@ -280,6 +288,8 @@ impl Action {
             Self::ModelPickerKind => "Model picker: cycle the capability filter",
             Self::ModelPickerAccount => "Model picker: switch the provider's account",
             Self::ModelPickerLogout => "Model picker: sign the provider out",
+            Self::ModelPickerTypes => "Model picker: show non-chat models too",
+            Self::ModelPickerCompaction => "Model picker: use the model for compaction",
             Self::ExpandOutput => "Expand/collapse the latest tool output",
             Self::MoveWordLeft => "Move cursor one word left",
             Self::MoveWordRight => "Move cursor one word right",
@@ -352,7 +362,9 @@ impl Action {
             | Self::ModelPickerRefresh
             | Self::ModelPickerKind
             | Self::ModelPickerAccount
-            | Self::ModelPickerLogout => Scope::Picker,
+            | Self::ModelPickerLogout
+            | Self::ModelPickerTypes
+            | Self::ModelPickerCompaction => Scope::Picker,
         }
     }
 
@@ -613,6 +625,8 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("model_picker_kind", Action::ModelPickerKind),
     ("model_picker_account", Action::ModelPickerAccount),
     ("model_picker_logout", Action::ModelPickerLogout),
+    ("model_picker_types", Action::ModelPickerTypes),
+    ("model_picker_compaction", Action::ModelPickerCompaction),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -1064,6 +1078,36 @@ impl Keymap {
                 },
                 Binding {
                     code: KeyCode::Char('x'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        // Chat models only until asked: an aggregator's embedding and image
+        // models are no answer to "which model talks to me".
+        bindings.insert(
+            Action::ModelPickerTypes,
+            vec![
+                Binding {
+                    code: KeyCode::Char('t'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('t'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        // Never `ctrl+c`: that chord interrupts and quits before any overlay
+        // sees it. `ctrl+e` is the fallback for terminals that eat alt.
+        bindings.insert(
+            Action::ModelPickerCompaction,
+            vec![
+                Binding {
+                    code: KeyCode::Char('c'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('e'),
                     mods: KeyModifiers::CONTROL,
                 },
             ],

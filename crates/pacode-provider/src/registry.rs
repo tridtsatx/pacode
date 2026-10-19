@@ -285,7 +285,7 @@ pub struct ProviderRegistry {
     token_refresher: Option<TokenRefresher>,
     /// Resolved store credentials with their expiry; see `registry_cache` for the cap,
     /// invalidation and ownership rules. Seeded when providers are built from a store.
-    /// (Per-provider concurrency gates are process-wide, see [`crate::provider_gate`].)
+    /// (Per-account admission control is process-wide, see `governor::governor_for`.)
     token_cache: Arc<TokenCache>,
     /// Ids registered by the host rather than by config (`insert`), which a
     /// [`ProviderRegistry::reload`] must not drop: they exist in no config file,

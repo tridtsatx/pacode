@@ -87,7 +87,11 @@ pub fn commit(
 /// Write `key = value` into the owning config file and apply it to the live
 /// `state.config`. A failed write toasts; the in-memory apply runs regardless,
 /// matching what the file will hold the next time it saves.
-fn apply_value(state: &mut AppState, key: &str, value: pacode_config::toml::Value) -> Vec<Action> {
+pub(crate) fn apply_value(
+    state: &mut AppState,
+    key: &str,
+    value: pacode_config::toml::Value,
+) -> Vec<Action> {
     if let Err(e) = pacode_config::update_config_value(&state.paths, key, value.clone()) {
         log::warn!("failed to write config key '{key}': {e}");
         state.push_toast(
@@ -117,7 +121,7 @@ fn apply_value(state: &mut AppState, key: &str, value: pacode_config::toml::Valu
 
 /// Back to the registry default: the key leaves the owning config file, the
 /// in-memory value follows it, and the runtime is told.
-fn reset_value(state: &mut AppState, key: &str) -> Vec<Action> {
+pub(crate) fn reset_value(state: &mut AppState, key: &str) -> Vec<Action> {
     if let Err(e) = pacode_config::remove_config_value(&state.paths, key) {
         log::warn!("failed to remove config key '{key}': {e}");
         state.push_toast(

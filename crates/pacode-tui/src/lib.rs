@@ -17,7 +17,6 @@
 
 pub mod app;
 pub mod at_complete;
-pub mod attachments;
 pub mod backpressure;
 pub mod bash;
 pub mod binding;

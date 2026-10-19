@@ -9,16 +9,22 @@
 //! | esc | close, nothing sent |
 //! | alt+f / alt+z | mark favourite / ZDR-capable |
 //! | alt+k | capability filter (all / reasoning / vision) |
+//! | alt+t | also list non-chat models (embedding, image, …); chat only by default |
+//! | alt+c | make the highlighted model the compaction model (`context.compaction_model`); again clears it |
 //! | ctrl+r | force-refresh the catalog |
 //! | alt+a | next stored account of the highlighted provider |
 //! | alt+x, twice | sign the highlighted provider out (the first press asks on its header) |
 //!
 //! The chords come from the keymap (`model_picker_*` actions), so `/keys` can
 //! rebind them and the palette's hints spell whatever is bound.
+//!
+//! A model the catalog classifies as anything but chat (`ModelInfo::kind`)
+//! can be listed but never picked — neither as the session's model nor for
+//! compaction: an embedding or image model cannot hold a conversation.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use pacode_types::{Effort, ModelRoute, Request, ToastLevel};
+use pacode_types::{Effort, ModelKind, ModelRoute, Request, ToastLevel};
 
 use crate::binding::Action as KeyAction;
 use crate::keys::Action;
@@ -86,6 +92,8 @@ enum Chord {
     Kind,
     Account,
     Logout,
+    Types,
+    Compaction,
 }
 
 fn chord_of(state: &AppState, key: KeyEvent) -> Option<Chord> {
@@ -96,6 +104,8 @@ fn chord_of(state: &AppState, key: KeyEvent) -> Option<Chord> {
         (KeyAction::ModelPickerKind, Chord::Kind),
         (KeyAction::ModelPickerAccount, Chord::Account),
         (KeyAction::ModelPickerLogout, Chord::Logout),
+        (KeyAction::ModelPickerTypes, Chord::Types),
+        (KeyAction::ModelPickerCompaction, Chord::Compaction),
     ]
     .into_iter()
     .find(|(action, _)| {
@@ -114,6 +124,7 @@ enum Picked {
         route: ModelRoute,
         effort: Option<Effort>,
         signed_in: bool,
+        kind: ModelKind,
     },
     SignIn(String),
     Nothing,
@@ -129,6 +140,7 @@ fn picked(state: &AppState, palette: &ModelPalette) -> Picked {
             route: model.route.clone(),
             effort: palette.effort_for(model),
             signed_in: *signed_in,
+            kind: model.kind,
         },
         Some(Row::Header {
             provider: Some(provider),
@@ -161,6 +173,14 @@ fn handle(state: &mut AppState, palette: &mut ModelPalette, key: KeyEvent) -> (V
                 vec![]
             }
             Chord::Account => switch_account(state, palette),
+            Chord::Types => {
+                palette.toggle_types();
+                vec![]
+            }
+            Chord::Compaction => {
+                set_compaction_model(state, palette);
+                vec![]
+            }
             Chord::Logout => {
                 palette.confirm_logout = highlighted_auth(state, palette)
                     .filter(|info| !info.accounts.is_empty())
@@ -221,12 +241,51 @@ fn commit(state: &mut AppState, palette: &mut ModelPalette) -> (Vec<Action>, boo
             ..
         } => (sign_in(palette, route.provider), false),
         Picked::SignIn(provider) => (sign_in(palette, provider), false),
+        Picked::Model { route, kind, .. } if kind != ModelKind::Chat => {
+            refuse_non_chat(state, &route, kind);
+            (vec![], false)
+        }
         Picked::Model { route, effort, .. } => (
             state.model_switch_actions(route, effort, palette.for_zdr),
             true,
         ),
         Picked::Nothing => (vec![], false),
     }
+}
+
+/// An embedding or image model cannot hold a conversation: say so, and keep
+/// the palette open on it.
+fn refuse_non_chat(state: &mut AppState, route: &ModelRoute, kind: ModelKind) {
+    state.push_notice_with_level(
+        ToastLevel::Warn,
+        format!("{route} is not a chat model ({})", kind.as_str()),
+    );
+}
+
+/// The compaction chord: the highlighted chat model summarizes the context
+/// from the next compaction on (`context.compaction_model`, written to the
+/// config file like the settings page does). On the model already set, the
+/// chord clears it, back to the session's model.
+fn set_compaction_model(state: &mut AppState, palette: &ModelPalette) {
+    let Picked::Model { route, kind, .. } = picked(state, palette) else {
+        return;
+    };
+    if kind != ModelKind::Chat {
+        refuse_non_chat(state, &route, kind);
+        return;
+    }
+    const KEY: &str = "context.compaction_model";
+    let value = route.to_string();
+    if state.config.context.compaction_model.as_deref() == Some(value.as_str()) {
+        crate::ui::settings_ui::reset_value(state, KEY);
+        state.push_notice_with_level(
+            ToastLevel::Info,
+            "compaction uses the session model again".to_string(),
+        );
+        return;
+    }
+    crate::ui::settings_ui::apply_value(state, KEY, pacode_config::toml::Value::String(value));
+    state.push_notice_with_level(ToastLevel::Info, format!("compaction model: {route}"));
 }
 
 fn sign_in(palette: &mut ModelPalette, provider: String) -> Vec<Action> {

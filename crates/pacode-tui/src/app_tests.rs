@@ -2465,3 +2465,35 @@ fn quitting_writes_the_pending_prefs_delta() {
         Some("p/b")
     );
 }
+
+/// A pasted image whose path went out in a `UserMessage` belongs to the
+/// session: the daemon may read it after this client exits, so dropping the
+/// paste store (exit, or a store replaced) must leave it on disk.
+#[test]
+fn a_sent_prompt_hands_its_pasted_images_to_the_session() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut state = AppState::new(Config::default(), "test".into(), 100, 30);
+    state.pasted_images = crate::clipboard_read::PastedImages::new_in(tmp.path().to_path_buf());
+    let record = state
+        .pasted_images
+        .create_image_file(b"png")
+        .expect("paste");
+    let request = Request::UserMessage {
+        text: format!("look at {}", record.token_label()),
+        images: Vec::new(),
+        message_id: None,
+        attachments: Vec::new(),
+    };
+
+    let Request::UserMessage { images, .. } = prompt::resolve_request(&mut state, request) else {
+        panic!("a user message stays one");
+    };
+    assert_eq!(
+        images,
+        vec![pacode_types::ImageSource::Path(record.path.clone())]
+    );
+    assert!(state.pasted_images.records()[0].sent);
+
+    state.pasted_images = crate::clipboard_read::PastedImages::new_in(tmp.path().to_path_buf());
+    assert!(record.path.exists(), "the sent file outlives the store");
+}

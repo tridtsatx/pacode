@@ -224,6 +224,25 @@ impl InjectionQueue {
 /// takes the budget from `[context] injection_budget_chars` (this is its default).
 pub const DEFAULT_INJECTION_BUDGET: usize = 24_000;
 
+/// The batch budget `[context] injection_budget_chars` sets; `0` falls back to
+/// [`DEFAULT_INJECTION_BUDGET`] rather than stubbing every report.
+pub fn injection_budget(context: &pacode_types::ContextConfig) -> usize {
+    match context.injection_budget_chars {
+        0 => DEFAULT_INJECTION_BUDGET,
+        budget => budget,
+    }
+}
+
+/// [`render_injections_budgeted`] with both caps from `[context]`: what every drain
+/// site renders with.
+pub fn render_for(context: &pacode_types::ContextConfig, items: &[Injection]) -> Message {
+    render_injections_budgeted(
+        items,
+        context.injection_cap_chars,
+        injection_budget(context),
+    )
+}
+
 /// Render a batch of injections into ONE user message of kind `Injected`, each item
 /// wrapped in a marker tag and capped to `cap_chars` (spec §6.4), the whole batch
 /// held to roughly `budget_chars`:
@@ -631,5 +650,56 @@ mod tests {
         assert!(text.contains("characters truncated"));
         assert!(!text.contains("truncated=\"true\""));
         assert!(text.len() < 3_000, "len {}", text.len());
+    }
+
+    #[test]
+    fn exchange_items_past_the_budget_are_never_stubbed() {
+        let mut items: Vec<Injection> = (0..50).map(|i| finished(i, 4000)).collect();
+        items.push(Injection::ParentMessage {
+            text: "M".repeat(900),
+        });
+        items.push(Injection::AgentQuestion {
+            agent: AgentId::new("agt_q"),
+            name: "asker".into(),
+            call_id: CallId::new("call_q"),
+            question: "Q".repeat(900),
+        });
+        items.push(Injection::PlanReminder {
+            open: vec![PlanItem {
+                id: "1".into(),
+                content: "finish the port".into(),
+                status: pacode_types::PlanStatus::Pending,
+                progress: None,
+            }],
+            attempt: 1,
+            max: 2,
+        });
+        items.push(Injection::SystemNotice("notice past the budget".into()));
+        let text = render_injections_budgeted(&items, 4000, 8_000).text();
+        assert!(
+            text.contains("truncated=\"true\""),
+            "reports past it are stubbed"
+        );
+        assert!(text.contains(&"M".repeat(900)));
+        assert!(text.contains(&"Q".repeat(900)));
+        assert!(text.contains("finish the port"));
+        assert!(text.contains("<notice>notice past the budget</notice>"));
+        // 50 reports at 4k each would be 200k chars; the batch stays near the budget.
+        assert!(text.len() < 8_000 + 50 * 120 + 4_000, "len {}", text.len());
+    }
+
+    #[test]
+    fn an_unset_budget_falls_back_to_the_default() {
+        let mut context = pacode_types::ContextConfig::default();
+        assert_eq!(injection_budget(&context), context.injection_budget_chars);
+        context.injection_budget_chars = 0;
+        assert_eq!(injection_budget(&context), DEFAULT_INJECTION_BUDGET);
+        context.injection_budget_chars = 1_000;
+        let items: Vec<Injection> = (0..5).map(|i| finished(i, 900)).collect();
+        let text = render_for(&context, &items).text();
+        assert!(
+            text.contains("truncated=\"true\""),
+            "the configured budget applies"
+        );
     }
 }

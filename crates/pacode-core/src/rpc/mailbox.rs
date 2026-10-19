@@ -17,6 +17,11 @@ use crate::inject::{Injection, InjectionQueue};
 /// for one more.
 pub(crate) const MAX_UNANSWERED_IN_ROW: u8 = 3;
 
+/// Orchestrator messages one subagent may have queued and unread at once. A
+/// `send` past it is refused: the agent reads its queue at its next step, and
+/// an orchestrator that keeps sending meanwhile is flooding, not steering.
+pub(crate) const MAX_QUEUED_PARENT_MESSAGES: usize = 16;
+
 /// Who stopped an agent. The orchestrator may resume an agent it stopped
 /// itself; one the user stopped is the user's to resume. Stored with the
 /// agent (`rpc::persist_stop_origin`), so a daemon restart keeps it.
@@ -134,6 +139,8 @@ pub(super) enum Offer {
         taken: oneshot::Receiver<()>,
     },
     Queued,
+    /// [`MAX_QUEUED_PARENT_MESSAGES`] messages are already waiting unread.
+    QueueFull,
     /// The user stopped the agent: resuming it is the user's call.
     StoppedByUser,
     Ended,
@@ -359,9 +366,16 @@ impl Mailbox {
             }
         }
         if agent.is_running() && !state.sealed && !agent.stop_requested() {
-            agent.injections.push(Injection::ParentMessage {
-                text: text.to_string(),
-            });
+            let queued = agent.injections.push_limited(
+                Injection::ParentMessage {
+                    text: text.to_string(),
+                },
+                MAX_QUEUED_PARENT_MESSAGES,
+                |item| matches!(item, Injection::ParentMessage { .. }),
+            );
+            if !queued {
+                return Offer::QueueFull;
+            }
             state.unanswered_in_row = 0;
             return Offer::Queued;
         }

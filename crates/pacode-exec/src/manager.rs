@@ -30,8 +30,8 @@ use crate::memcap::MemoryPolicy;
 use crate::memlimit::{MemoryLimiter, SpawnSetup};
 use crate::progress::ProgressParser;
 use crate::resources::{GuardHost, ResourceGuard, ResourceNotice};
-use crate::retention::Retention;
 use crate::spec::TaskSpec;
+use crate::spool::SpoolGc;
 use crate::state::{ManagedSpool, SharedState, TaskEntry};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,10 +50,12 @@ pub enum TaskEvent {
     /// Output the process produced, on whole lines, while it is still running.
     ///
     /// One event per batch of completed lines, not per line and not per read:
-    /// a build that flushes 8 KiB at a time would otherwise put a hundred
-    /// events on the wire to say one thing. A partial trailing line waits for
-    /// its newline — a client that drew half a line would repaint it a moment
-    /// later anyway.
+    /// the lines of every read inside a 200 ms window (or up to 64 KiB) go out
+    /// together, so a build that flushes 8 KiB at a time does not put a hundred
+    /// events on the wire to say one thing. Nothing is dropped: held text is sent
+    /// when the window closes, and at the latest just before `Ended`. A partial
+    /// trailing line waits for its newline — a client that drew half a line
+    /// would repaint it a moment later anyway.
     Output {
         info: TaskInfo,
         /// The foreground call the output belongs to ([`TaskSpec::call`]).
@@ -113,17 +115,6 @@ fn disabled_resources() -> ResourcesConfig {
     }
 }
 
-/// Polls `fut` once and returns its output if it is ready right away. Dropping
-/// a pending admission future leaves the queue as it was.
-fn ready_now<F: std::future::Future>(fut: F) -> Option<F::Output> {
-    let mut fut = std::pin::pin!(fut);
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    match fut.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(output) => Some(output),
-        std::task::Poll::Pending => None,
-    }
-}
-
 impl TaskManager {
     /// Build a manager with no tool memory cap and no resource guard.
     ///
@@ -177,12 +168,12 @@ impl TaskManager {
             guard,
             nice: resources.nice,
             admission,
-            retention: Retention::default(),
+            spool_gc: SpoolGc::default(),
         });
         let host: Arc<dyn GuardHost> = state.clone();
         state.guard.bind(Arc::downgrade(&host));
-        // F5: trim spools left by earlier runs.
-        crate::retention::gc_at_start(&state);
+        // F5: sweep spools left by earlier runs.
+        crate::spool::gc_at_start(&state);
         Arc::new(Self { state, memory })
     }
 
@@ -214,8 +205,8 @@ impl TaskManager {
     async fn admit(&self, spec: &TaskSpec) -> Result<SlotPermit, ExecError> {
         let permit = match spec.cancel.as_ref() {
             Some(cancel) => self.state.admission.acquire(Some(cancel)).await?,
-            None => match ready_now(self.state.admission.acquire(None)) {
-                Some(permit) => permit?,
+            None => match self.state.admission.try_acquire() {
+                Some(permit) => permit,
                 None => return Err(ExecError::TooManyTasks(self.state.config.max_tasks)),
             },
         };
@@ -383,11 +374,7 @@ impl TaskManager {
 
     pub fn info(&self, id: &TaskId) -> Option<TaskInfo> {
         let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        match tasks.get(id) {
-            Some(e) => Some(e.info.clone()),
-            // Evicted terminal task (F1): the stub is inserted before the entry leaves.
-            None => self.state.retention.get(id),
-        }
+        tasks.get(id).map(|e| e.info.clone())
     }
 
     fn managed_spool_path(&self, id: &TaskId) -> Option<PathBuf> {
@@ -487,8 +474,8 @@ impl TaskManager {
             .collect()
     }
 
-    /// Running tasks, the newest 256 finished ones, and the stubs of older finished
-    /// ones (see `retention.rs`), optionally for one session, ordered by start time.
+    /// Running tasks and the newest finished ones (`MAX_TERMINAL_TASKS` in
+    /// `state.rs`), optionally for one session, ordered by start time.
     pub fn list(&self, session: Option<&SessionId>) -> Vec<TaskInfo> {
         let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let mut result: Vec<TaskInfo> = tasks
@@ -499,7 +486,6 @@ impl TaskManager {
             })
             .map(|e| e.info.clone())
             .collect();
-        result.extend(self.state.retention.stubs(session));
         result.sort_by_key(|e| e.started_at_ms);
         result
     }
@@ -525,12 +511,7 @@ impl TaskManager {
                         entry.info.progress.clone(),
                     )
                 }
-                None => {
-                    return match self.state.retention.get(id) {
-                        Some(stub) => WaitResult::Ended(stub),
-                        None => WaitResult::NotFound,
-                    };
-                }
+                None => return WaitResult::NotFound,
             }
         };
 
@@ -598,11 +579,8 @@ impl TaskManager {
     /// Clear the failed-unacked flag.
     pub fn ack(&self, id: &TaskId) {
         let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        match tasks.get_mut(id) {
-            Some(entry) => entry.info.acked = true,
-            None => {
-                self.state.retention.ack(id);
-            }
+        if let Some(entry) = tasks.get_mut(id) {
+            entry.info.acked = true;
         }
     }
 
@@ -623,7 +601,6 @@ impl TaskManager {
                 None
             }
         };
-        self.state.retention.forget(id);
         if let Some(entry) = removed {
             entry.spool.request_cleanup();
             drop(entry);

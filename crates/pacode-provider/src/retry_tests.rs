@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use pacode_types::{ProviderConfig, ProviderDefaults, StreamEvent};
@@ -10,8 +10,8 @@ use tokio::net::TcpStream;
 
 use crate::governor::{ProviderGovernor, governor_for};
 use crate::retry::{
-    OpenedStream, RetryAfterSignal, RetryBudget, StreamTransport, backoff_delay, parse_retry_after,
-    retrying_transport_stream,
+    OpenedStream, RetryAfterSignal, RetryBudget, StreamTransport, backoff_delay,
+    delay_from_headers, parse_reset_duration, parse_retry_after, retrying_transport_stream,
 };
 use crate::{CompletionRequest, OpenAiCompat, Provider, ProviderError};
 
@@ -562,4 +562,127 @@ fn test_retry_budget_cannot_be_over_reserved() {
     assert!(budget.reserve());
     assert!(!budget.reserve());
     assert_eq!(budget.used, 1);
+}
+
+/// Two concurrent requests both get `429 Retry-After: 1`: the hint parks the
+/// whole account, so both wait it out before their single retry instead of
+/// hammering the server on their own schedules.
+#[tokio::test]
+async fn test_retry_after_parks_every_request_of_the_account() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = tokio::spawn(async move {
+        let mut served = 0usize;
+        loop {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            read_request(&mut socket).await;
+            if served < 2 {
+                write_http(
+                    &mut socket,
+                    "429 Too Many Requests",
+                    &[("Retry-After", "1")],
+                    "{}",
+                )
+                .await;
+            } else {
+                write_sse(&mut socket, TEXT_THEN_DONE).await;
+            }
+            served += 1;
+        }
+    });
+
+    let provider = Arc::new(provider_for(port, 1));
+    let started = tokio::time::Instant::now();
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let provider = Arc::clone(&provider);
+        tasks.push(tokio::spawn(async move {
+            let mut stream = provider.complete(request()).await.expect("opens");
+            let mut text = String::new();
+            while let Some(item) = stream.next().await {
+                if let StreamEvent::TextDelta { text: delta } = item.expect("no error") {
+                    text.push_str(&delta);
+                }
+            }
+            (text, started.elapsed())
+        }));
+    }
+    for task in tasks {
+        let (text, elapsed) = task.await.expect("joins");
+        assert_eq!(text, "hello");
+        assert!(elapsed >= Duration::from_millis(950), "elapsed {elapsed:?}");
+    }
+    server.abort();
+}
+
+fn at(secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+#[test]
+fn test_retry_after_garbage_is_no_hint() {
+    assert_eq!(
+        parse_retry_after(" 7 ", at(0)),
+        Some(Duration::from_secs(7))
+    );
+    assert_eq!(parse_retry_after("soon", at(0)), None);
+    assert_eq!(parse_retry_after("", at(0)), None);
+    assert_eq!(
+        parse_retry_after("Sun, 99 Foo 1994 08:49:37 GMT", at(0)),
+        None
+    );
+}
+
+#[test]
+fn test_reset_duration_forms() {
+    assert_eq!(parse_reset_duration("1s"), Some(Duration::from_secs(1)));
+    assert_eq!(
+        parse_reset_duration("250ms"),
+        Some(Duration::from_millis(250))
+    );
+    assert_eq!(parse_reset_duration("2m3s"), Some(Duration::from_secs(123)));
+    assert_eq!(
+        parse_reset_duration("1h2m"),
+        Some(Duration::from_secs(3720))
+    );
+    assert_eq!(
+        parse_reset_duration("1.5s"),
+        Some(Duration::from_millis(1500))
+    );
+    assert_eq!(parse_reset_duration("20"), Some(Duration::from_secs(20)));
+    assert_eq!(parse_reset_duration("abc"), None);
+    assert_eq!(parse_reset_duration("5x"), None);
+}
+
+#[test]
+fn test_headers_prefer_retry_after_then_the_largest_reset() {
+    use reqwest::header::{HeaderMap, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ratelimit-reset-requests", HeaderValue::from_static("2s"));
+    headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("1m"));
+    assert_eq!(
+        delay_from_headers(&headers, at(0)),
+        Some(Duration::from_secs(60))
+    );
+    headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("2h"));
+    assert_eq!(
+        delay_from_headers(&headers, at(0)),
+        Some(Duration::from_secs(5 * 60)),
+        "a reset hint is clamped like Retry-After"
+    );
+    headers.insert("retry-after", HeaderValue::from_static("3"));
+    assert_eq!(
+        delay_from_headers(&headers, at(0)),
+        Some(Duration::from_secs(3))
+    );
+    assert_eq!(delay_from_headers(&HeaderMap::new(), at(0)), None);
+    let mut zero = HeaderMap::new();
+    zero.insert("x-ratelimit-reset-requests", HeaderValue::from_static("0s"));
+    assert_eq!(
+        delay_from_headers(&zero, at(0)),
+        None,
+        "a zero reset is no hint"
+    );
 }

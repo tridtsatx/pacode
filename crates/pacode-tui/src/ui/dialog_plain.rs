@@ -10,7 +10,8 @@ use ratatui::text::Line;
 use pacode_render::{LineCache, RenderOptions};
 
 use super::toolgroup::{self, Segment};
-use super::{Block, CellRenderState, CellsSource, group_block, plan_group, render_cell_block};
+use super::{CellsSource, RenderParts, extent_key, is_fresh, segment_block};
+use crate::state::image_cache::ImageCellCache;
 use crate::state::selection::{MAX_SELECTION_BYTES, MAX_SELECTION_LINES};
 use crate::state::transcript::{Cell, RenderProfile, ToolStreams, Transcript};
 use crate::ui::cells::decoration_width;
@@ -95,46 +96,6 @@ impl PlainSink {
     }
 }
 
-/// One segment's block outside the frame pass: the same plan-then-borrow the
-/// frame does, one segment at a time. Segment indices come from `src.cells`
-/// itself, so they are in bounds.
-fn segment_block<'a>(
-    src: &CellsSource<'_>,
-    segment: &Segment,
-    opts: &RenderOptions,
-    cache: &'a mut LineCache,
-) -> Block<'a> {
-    let cells = src.cells;
-    match segment {
-        Segment::Cell(index) => {
-            let cell = &cells[*index];
-            let state = CellRenderState {
-                live: src.live_id == Some(cell.id),
-                expanded: src.expanded.contains(&cell.id),
-                stable_revision: src
-                    .stable_revisions
-                    .get(&cell.id)
-                    .copied()
-                    .unwrap_or((0, 0)),
-            };
-            render_cell_block(
-                cell,
-                state,
-                opts,
-                cache,
-                src.tool_streams,
-                src.width,
-                src.anim_frame,
-            )
-        }
-        Segment::Group(range) => {
-            let plan = plan_group(cells, range.clone(), opts, cache, src.width, src.anim_frame);
-            let cache: &'a LineCache = cache;
-            group_block(cells, range.clone(), &plan, opts, cache, src.anim_frame)
-        }
-    }
-}
-
 /// How far the cells from `prefix` on moved down when the first `prefix`
 /// cells were put in front of them: the lines the view now draws up to the
 /// end of the block the first of them sits in, minus what those same cells
@@ -145,6 +106,7 @@ pub(crate) fn measure_cell_lines(
     prefix: usize,
     expanded: &HashSet<u64>,
     cache: &mut LineCache,
+    images: &mut ImageCellCache,
     tool_streams: &ToolStreams,
     profile: &RenderProfile,
 ) -> usize {
@@ -153,13 +115,12 @@ pub(crate) fn measure_cell_lines(
         cells,
         expanded,
         stable_revisions: &no_revisions,
-        header: None,
         live_id: None,
         tool_streams,
         width: profile.width,
         anim_frame: profile.anim_frame,
-        welcome_ms: 0,
     };
+    let mut parts = RenderParts { cache, images };
     let opts = &profile.options;
     let mut now = 0usize;
     let mut through = prefix;
@@ -172,7 +133,7 @@ pub(crate) fn measure_cell_lines(
             break;
         }
         through = through.max(end);
-        let block = segment_block(&src, &segment, opts, cache);
+        let block = segment_block(&src, &segment, opts, &mut parts);
         now = now.saturating_add(block.lines().len());
     }
     // The cells of a straddling group that were already there, segmented as
@@ -188,7 +149,7 @@ pub(crate) fn measure_cell_lines(
             Segment::Cell(index) => Segment::Cell(prefix + index),
             Segment::Group(range) => Segment::Group(prefix + range.start..prefix + range.end),
         };
-        let block = segment_block(&src, &segment, opts, cache);
+        let block = segment_block(&src, &segment, opts, &mut parts);
         before = before.saturating_add(block.lines().len());
     }
     now.saturating_sub(before)
@@ -207,10 +168,12 @@ pub(crate) fn plain_lines(
         cells,
         expanded,
         cache,
+        extents,
         stable_revisions,
         header,
         live_cell,
         tool_streams,
+        images,
         ..
     } = &mut *transcript;
     let mut sink = PlainSink::new(window);
@@ -230,16 +193,27 @@ pub(crate) fn plain_lines(
         cells,
         expanded,
         stable_revisions,
-        header: None,
         live_id: *live_cell,
         tool_streams,
         width,
         anim_frame,
-        welcome_ms,
     };
+    extents.sync(cache.generation());
+    let mut parts = RenderParts { cache, images };
     for segment in toolgroup::segments(cells.iter(), expanded, opts.thinking) {
         if line > sink.end || sink.full() {
             break;
+        }
+        // A block wholly above the window is only counted: the height the
+        // frame measured answers for it without drawing it again.
+        if !is_fresh(&src, &segment) {
+            let (id, key) = extent_key(&src, &segment, opts);
+            if let Some(count) = extents.get(id, &key)
+                && line + count <= sink.start
+            {
+                line += count;
+                continue;
+            }
         }
         // A group's rows are tool rows: its first cell's kind names their
         // decoration (the body gutter).
@@ -250,7 +224,7 @@ pub(crate) fn plain_lines(
         let Some(kind) = cells.get(first).map(|cell| &cell.kind) else {
             break;
         };
-        let block = segment_block(&src, &segment, opts, cache);
+        let block = segment_block(&src, &segment, opts, &mut parts);
         let rendered: Vec<(String, usize)> = block
             .lines()
             .iter()

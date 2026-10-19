@@ -17,7 +17,6 @@ pacode-client = { workspace = true }
 pacode-render = { workspace = true }
 pacode-import = { workspace = true }
 pacode-image = { workspace = true }
-base64 = { workspace = true }
 # Local `git status`/`git diff` probes for the Files menu level (§5.5) — the
 # crate carries no ratatui and its calls run on spawned tasks, never in draw.
 pacode-vcs = { workspace = true }

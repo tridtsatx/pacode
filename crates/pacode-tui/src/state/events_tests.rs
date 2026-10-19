@@ -1811,3 +1811,142 @@ fn agent_update_is_visible_only_when_the_row_changed() {
     assert!(!apply(&mut s, "reading"));
     assert!(apply(&mut s, "writing"));
 }
+
+fn update(s: &mut AppState, info: AgentInfo) -> bool {
+    crate::state::events::apply_event(s, 0, Event::AgentUpdated(info), Instant::now())
+}
+
+/// Three subagents, the rail drew only the first last frame.
+fn rail_with_one_drawn_row() -> AppState {
+    let mut s = plain_state();
+    for id in ["sub-1", "sub-2", "sub-3"] {
+        s.rail.upsert_agent(sub_agent(id, AgentStatus::Thinking));
+    }
+    s.rail.drawn_agents = Some(0..1);
+    s
+}
+
+fn with_activity(id: &str, activity: &str) -> AgentInfo {
+    let mut info = sub_agent(id, AgentStatus::Thinking);
+    info.activity = Some(activity.into());
+    info
+}
+
+#[test]
+fn an_update_to_a_row_off_the_rail_is_not_visible() {
+    let mut s = rail_with_one_drawn_row();
+    assert!(!update(&mut s, with_activity("sub-3", "reading")));
+    // The state still took it: the row is right once it scrolls into view.
+    assert_eq!(
+        s.rail
+            .agent(&AgentId::new("sub-3"))
+            .and_then(|a| a.activity.as_deref()),
+        Some("reading")
+    );
+    assert!(
+        update(&mut s, with_activity("sub-1", "reading")),
+        "drawn row"
+    );
+}
+
+#[test]
+fn a_status_change_off_the_rail_is_still_visible() {
+    let mut s = rail_with_one_drawn_row();
+    assert!(update(&mut s, sub_agent("sub-3", AgentStatus::Finished)));
+}
+
+#[test]
+fn an_update_to_the_followed_agent_is_visible_off_the_rail() {
+    let mut s = rail_with_one_drawn_row();
+    s.panel.target = Some(PanelTarget::Agent(AgentId::new("sub-3")));
+    assert!(update(&mut s, with_activity("sub-3", "reading")));
+}
+
+#[test]
+fn an_update_under_an_open_overlay_is_visible() {
+    let mut s = rail_with_one_drawn_row();
+    s.focus = Focus::Overlay(crate::state::Overlay::RailOverlay {
+        selected: AgentId::new("sub-3"),
+    });
+    assert!(update(&mut s, with_activity("sub-3", "reading")));
+}
+
+#[test]
+fn an_unfollowed_subagents_tool_call_shows_only_in_the_files_menus() {
+    let mut s = plain_state();
+    let call = |seq: u64| {
+        Event::ItemAdded(TranscriptItem {
+            seq,
+            agent: AgentId::new("sub-1"),
+            ts_ms: 1,
+            kind: TranscriptKind::ToolCall {
+                call_id: pacode_types::CallId::new(format!("call_{seq}")),
+                name: "read".into(),
+                title: "read src/lib.rs".into(),
+                intent: None,
+                status: pacode_types::transcript::ToolStatus::Ok,
+                preview: String::new(),
+                diff: None,
+                duration_ms: Some(1),
+                task: None,
+            },
+        })
+    };
+    let now = Instant::now();
+    assert!(!crate::state::events::apply_event(&mut s, 0, call(1), now));
+    crate::keys_menu::open(&mut s, crate::ui::menu::MenuId::Files);
+    assert!(crate::state::events::apply_event(&mut s, 0, call(2), now));
+}
+
+#[test]
+fn an_unchanged_usage_total_is_not_visible() {
+    let mut s = plain_state();
+    let usage = UsageTotals {
+        turns: 1,
+        ..UsageTotals::default()
+    };
+    let now = Instant::now();
+    assert!(crate::state::events::apply_event(
+        &mut s,
+        0,
+        Event::UsageUpdated(usage.clone()),
+        now
+    ));
+    assert!(!crate::state::events::apply_event(
+        &mut s,
+        0,
+        Event::UsageUpdated(usage),
+        now
+    ));
+}
+
+#[test]
+fn the_permission_count_follows_requests_resolutions_and_resets() {
+    let mut state = attached_state();
+    let now = Instant::now();
+    let req = perm_request("perm_1");
+    // The daemon emits the request twice (event, then transcript item): one prompt.
+    state.apply_event(1, Event::PermissionRequested(req.clone()), now);
+    state.apply_event(2, Event::ItemAdded(perm_item(7, &req)), now);
+    assert_eq!(state.transcript.pending_permissions(), 1);
+    assert!(state.has_pending_permission());
+    state.apply_event(
+        3,
+        Event::PermissionResolved {
+            permission: req.id.clone(),
+            decision: pacode_types::PermissionDecision::Deny,
+            reason: None,
+        },
+        now,
+    );
+    assert_eq!(state.transcript.pending_permissions(), 0);
+    assert!(!state.has_pending_permission());
+
+    // A snapshot carries one; `/clear` drops it with the transcript.
+    state
+        .transcript
+        .reset(vec![perm_item(9, &perm_request("perm_2"))], false);
+    assert!(state.has_pending_permission());
+    state.apply_event(4, Event::ContextCleared, now);
+    assert!(!state.has_pending_permission());
+}

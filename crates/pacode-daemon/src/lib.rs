@@ -12,17 +12,15 @@
 //!   channel; an `Attach` to another session replaces the subscription), `Detach`,
 //!   `Ping`, `Shutdown`; everything else → `core.handle(session, req)`.
 //!   Replies and events share one ordered writer channel (capacity 1024; a client
-//!   that lags gets `Event::Resync` and must `GetSnapshot`, see [`fanout`]).
+//!   that lags gets `ServerMessage::Resync` and must `GetSnapshot`). The writer
+//!   joins whatever is already queued into one write.
 //! - Text deltas are already coalesced by the core. `Subscribe` narrows which agents'
-//!   deltas/items/updates a connection receives ([`interest`]); socket writes are batched
-//!   ([`writer`]).
+//!   deltas/items/updates a connection receives ([`interest`]).
 
 pub mod connection;
-pub mod fanout;
 pub mod interest;
 pub mod server;
 pub mod wiring;
-pub mod writer;
 
 use std::path::PathBuf;
 use std::sync::Arc;

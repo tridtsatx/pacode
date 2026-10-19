@@ -280,3 +280,21 @@ fn test_command_notice_scrolls_into_view() {
     commands::execute(&mut state, "/no-such-command");
     assert_eq!(state.transcript.scroll_from_bottom, 0);
 }
+
+/// `/model <route>` refuses what the palette would not offer: a route the
+/// catalog classifies as embedding or image never becomes the chat model.
+#[test]
+fn test_model_command_refuses_a_non_chat_route() {
+    let mut state = make_test_state();
+    state.models = vec![pacode_types::ModelInfo {
+        route: pacode_types::ModelRoute::new("p", "text-embedding-3"),
+        display_name: "text-embedding-3".into(),
+        kind: pacode_types::ModelKind::Embedding,
+        ..Default::default()
+    }];
+    let actions = commands::execute(&mut state, "/model p/text-embedding-3");
+    assert!(actions.is_empty(), "{actions:?}");
+    let (level, text) = last_notice(&state);
+    assert_eq!(level, pacode_types::ToastLevel::Warn);
+    assert!(text.contains("not a chat model"), "{text}");
+}

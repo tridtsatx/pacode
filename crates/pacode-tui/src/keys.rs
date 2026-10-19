@@ -174,20 +174,6 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return vec![];
     }
 
-    // Permission-mode cycle is resolved before the chord, overlay and vim handlers
-    // below, which all return early and could otherwise swallow shift+tab / alt+m.
-    // The model palette and the settings page step with tab/shift+tab themselves,
-    // so there only the non-tab chord (alt+m) cycles the mode.
-    if state.keymap.action_for(key) == Some(KeyAction::CycleMode) {
-        let overlay_owns_tab = matches!(
-            state.focus,
-            Focus::Overlay(Overlay::ModelPalette { .. } | Overlay::Settings { .. })
-        ) && matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
-        if !overlay_owns_tab {
-            return vec![Action::Send(Request::SetMode(state.mode().next()))];
-        }
-    }
-
     // 1.5 While an overlay is open, ALL keys go to it (fixes focus leak to input).
     if let Focus::Overlay(_) = state.focus {
         return crate::keys_picker::handle_picker_key(state, key);
@@ -229,8 +215,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent, now: Instant) -> Vec<Acti
         return crate::keys_menu::open(state, crate::ui::menu::MenuId::Sessions);
     }
 
-    // 3. Shift+Tab cycles the permission mode above, before the overlays;
-    //    plain Tab: autocomplete slash command / @ / bash.
+    // 3. Shift+Tab (or alt+m, for terminals that never deliver a shifted Tab):
+    //    cycle permission mode; plain Tab: autocomplete slash command / @ / bash.
+    //    Overlays (the palette steps effort with shift+tab) own the keys above.
+    if action == Some(KeyAction::CycleMode) {
+        let next_mode = state.mode().next();
+        return vec![Action::Send(Request::SetMode(next_mode))];
+    }
 
     // Alt+Z: session ZDR toggle (no-op unless `zdr = "session"`).
     if action == Some(KeyAction::ToggleZdr) {

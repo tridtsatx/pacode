@@ -483,7 +483,52 @@ fn repair_config_clamps_out_of_range_values_instead_of_failing() {
 fn deprecated_agent_keys_are_not_active_registry_settings() {
     assert!(find_entry("agents.default_model").is_none());
     assert!(find_entry("agents.default_effort").is_none());
-    assert!(!SECTIONS.contains(&"agents"));
+}
+
+#[test]
+fn agent_caps_are_registry_settings() {
+    // The section exists so /config lists the two caps.
+    assert!(SECTIONS.contains(&"agents"));
+    assert!(!SKIP_LIST.contains(&"agents"));
+
+    let mut cfg = Config::default();
+    assert!(validate_config(&cfg).is_ok());
+    for (key, default) in [("agents.max_live", "16"), ("agents.max_turns", "200")] {
+        let entry = find_entry(key).unwrap();
+        assert_eq!(entry.section, "agents");
+        assert_eq!(entry.default_value, default);
+        assert_eq!(read_value(&cfg, key), Some(default.to_string()));
+        assert!(validate(key, "0").is_err(), "{key}: 0 would disable agents");
+    }
+
+    let v = validate("agents.max_live", "64").unwrap();
+    apply_to_config(&mut cfg, "agents.max_live", &v);
+    assert_eq!(cfg.agents.max_live, 64);
+    let v = validate("agents.max_turns", "50").unwrap();
+    apply_to_config(&mut cfg, "agents.max_turns", &v);
+    assert_eq!(cfg.agents.max_turns, 50);
+    assert!(validate_config(&cfg).is_ok());
+
+    reset_in_config(&mut cfg, "agents.max_live");
+    reset_in_config(&mut cfg, "agents.max_turns");
+    assert_eq!(cfg.agents.max_live, 16);
+    assert_eq!(cfg.agents.max_turns, 200);
+
+    cfg.agents.max_live = 0;
+    let repairs = repair_config(&mut cfg);
+    assert!(repairs.iter().any(|r| r.key == "agents.max_live"));
+    assert_eq!(cfg.agents.max_live, 1);
+}
+
+#[test]
+fn provider_max_concurrent_is_marked_deprecated() {
+    let entry = find_entry("provider.max_concurrent").unwrap();
+    assert!(entry.description.starts_with("Deprecated"));
+    assert!(
+        entry
+            .description
+            .contains("limits.max_provider_concurrency")
+    );
 }
 
 #[test]

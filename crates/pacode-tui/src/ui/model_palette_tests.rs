@@ -588,3 +588,24 @@ fn a_selected_header_stays_selected_when_its_models_arrive() {
         Some(Row::Header { title, .. }) if title == "OPENROUTER"
     ));
 }
+
+#[test]
+fn non_chat_models_are_left_out_until_all_types_is_on() {
+    let mut fx = Fixture::new();
+    fx.models.push(ModelInfo {
+        kind: pacode_types::ModelKind::Image,
+        ..model("claude", "painter", "Claude Painter")
+    });
+    let listed = |palette: &ModelPalette, fx: &Fixture| {
+        palette
+            .rows(&fx.src())
+            .iter()
+            .any(|row| matches!(row, Row::Model { model, .. } if model.route.model == "painter"))
+    };
+    let mut palette = ModelPalette::default();
+    assert!(!listed(&palette, &fx), "chat models only by default");
+    palette.toggle_types();
+    assert!(listed(&palette, &fx));
+    palette.toggle_types();
+    assert!(!listed(&palette, &fx));
+}

@@ -15,7 +15,9 @@ mod events_tests;
 
 /// Fold one event into the state. Returns whether anything visible changed (main
 /// transcript, the focused panel, a rail row, a toast, an overlay, the footer), so a
-/// caller can redraw only then. Deltas for an agent nobody is looking at return false.
+/// caller can redraw only then. Deltas for an agent nobody is looking at return false,
+/// and so do updates to an agent row off the rail (see [`agent_update_visible`]).
+/// When in doubt an event is visible: a missed `true` leaves the screen stale.
 pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) -> bool {
     let mut visible = true;
     match event {
@@ -150,8 +152,9 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) -
             if let Some(transcript) = transcript_for_agent(state, &agent) {
                 transcript.upsert(item, now);
             } else {
-                // Tool calls feed the files list, everything else is off screen.
-                visible = is_tool_call;
+                // Tool calls feed the files list (the Files level and the hub's
+                // totals, both menus); everything else is off screen.
+                visible = is_tool_call && menu_open(state);
             }
         }
         Event::ToolOutput {
@@ -194,7 +197,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) -
                 transcript.upsert(item, now);
             } else {
                 // A diff stat moves the files list; anything else is off screen.
-                visible = is_diff;
+                visible = is_diff && menu_open(state);
             }
         }
         Event::TextDelta {
@@ -230,35 +233,29 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) -
             decision,
             reason,
         } => {
-            for cell in &mut state.transcript.cells {
-                if let CellKind::Item(TranscriptKind::Permission(ref req)) = cell.kind
-                    && req.id == permission
-                {
-                    let (level, text) = match decision {
-                        PermissionDecision::AllowOnce => {
-                            (ToastLevel::Success, format!("Allowed: {}", req.title))
-                        }
-                        PermissionDecision::AllowSession => (
-                            ToastLevel::Success,
-                            format!("Allowed for session: {}", req.title),
-                        ),
-                        PermissionDecision::Deny => (
-                            ToastLevel::Warn,
-                            // The title stays so the row still says what was
-                            // denied; the reason explains who/what denied it
-                            // ("interrupted", a client note, …).
-                            match &reason {
-                                Some(reason) => format!("Denied: {} — {reason}", req.title),
-                                None => format!("Denied: {}", req.title),
-                            },
-                        ),
-                    };
-                    cell.kind = CellKind::Item(TranscriptKind::Notice { level, text });
-                    cell.perm_explain = None;
-                    cell.version = cell.version.wrapping_add(1);
-                    break;
-                }
-            }
+            // Through the transcript, which keeps its count of waiting
+            // prompts in step.
+            state
+                .transcript
+                .resolve_permission(&permission, |req| match decision {
+                    PermissionDecision::AllowOnce => {
+                        (ToastLevel::Success, format!("Allowed: {}", req.title))
+                    }
+                    PermissionDecision::AllowSession => (
+                        ToastLevel::Success,
+                        format!("Allowed for session: {}", req.title),
+                    ),
+                    PermissionDecision::Deny => (
+                        ToastLevel::Warn,
+                        // The title stays so the row still says what was
+                        // denied; the reason explains who/what denied it
+                        // ("interrupted", a client note, …).
+                        match &reason {
+                            Some(reason) => format!("Denied: {} — {reason}", req.title),
+                            None => format!("Denied: {}", req.title),
+                        },
+                    ),
+                });
         }
         Event::PermissionExplained {
             permission,
@@ -305,8 +302,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) -
             state.rail.upsert_agent(info);
         }
         Event::AgentUpdated(info) => {
-            // Only a changed row redraws; an identical update is a no-op for the eye.
-            visible = state.rail.agent(&info.id) != Some(&info);
+            visible = agent_update_visible(state, &info);
             // Following a subagent stops when that subagent stops. No toast here:
             // `observe_background_completion` already puts the finished agent in
             // the transcript, and saying it twice was noise.
@@ -372,6 +368,7 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) -
             state.dirty = true;
         }
         Event::UsageUpdated(usage) => {
+            visible = state.rail.usage != usage;
             state.rail.usage = usage;
         }
         Event::Toast {
@@ -434,6 +431,41 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) -
     let turn_active = state.turn_active;
     let idle_changed = state.rail.update_idle(turn_active, now);
     visible || idle_changed
+}
+
+/// Whether a menu is open: the Files level and the hub's file totals are where
+/// a subagent's tool calls show while nobody follows it.
+fn menu_open(state: &AppState) -> bool {
+    matches!(
+        state.focus,
+        Focus::Overlay(crate::state::Overlay::Menu { .. })
+    )
+}
+
+/// Whether an `AgentUpdated` changes anything on screen. An identical row does
+/// not. A changed one does when it is the main agent, when its status moves
+/// (the live counts, the pulse and the slot status read it), when the panel or
+/// the exchange view follows it, while an overlay that may list it is open (the
+/// rail overlay, the Background level) — and otherwise only when its row was
+/// on the rail last frame: a row scrolled off or folded into `and N more`
+/// draws nothing new.
+fn agent_update_visible(state: &AppState, info: &pacode_types::AgentInfo) -> bool {
+    let Some(old) = state.rail.agent(&info.id) else {
+        return true;
+    };
+    if old == info {
+        return false;
+    }
+    if info.id.is_main() || old.status != info.status {
+        return true;
+    }
+    if matches!(state.focus, Focus::Overlay(_)) {
+        return true;
+    }
+    if matches!(state.panel_agent_target(), Some(PanelTarget::Agent(id)) if id == info.id) {
+        return true;
+    }
+    state.rail.agent_row_drawn(&info.id)
 }
 
 /// The daemon reset the conversation (`/clear`, from this client or another):

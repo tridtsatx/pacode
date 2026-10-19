@@ -48,9 +48,11 @@ pub(crate) fn prepare(
     }
     let opts = state.render_options(area.width);
     let anim_frame = state.anim_frame;
+    let (images_on, truecolor) = (state.config.ui.images_enabled(), state.truecolor);
     let transcript = match target.as_ref() {
         Some(PanelTarget::Agent(agent)) if area.height > 3 => {
             let owner = state.panel.agent_transcript_for(agent);
+            owner.set_images(images_on, truecolor);
             Some(crate::ui::dialog::prepare(
                 Rect::new(area.x, area.y + 3, area.width, area.height - 3),
                 owner,

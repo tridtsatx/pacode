@@ -34,7 +34,7 @@
 //! `stream_idle_secs × effort factor` ends with `ProviderError::IdleTimeout`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -103,9 +103,6 @@ pub struct OpenAiCompat {
     catalog_fetch: tokio::sync::Mutex<()>,
     /// First retry backoff step; only tuned down by tests.
     backoff_base: Duration,
-    /// Adaptive concurrency limit and cooldown, shared by every instance of this provider
-    /// entry (see [`crate::provider_gate`]).
-    gate: Arc<crate::gate::ProviderGate>,
 }
 
 impl OpenAiCompat {
@@ -142,7 +139,6 @@ impl OpenAiCompat {
             .map_err(|e| ProviderError::Config(format!("failed to build HTTP client: {e}")))?;
 
         let compat = Compat::for_base_url(&cfg.base_url);
-        let gate = crate::provider_gate(&id, &cfg.base_url, defaults.max_concurrent);
 
         Ok(Self {
             id,
@@ -155,7 +151,6 @@ impl OpenAiCompat {
             catalog_cache: Mutex::new(None),
             catalog_fetch: tokio::sync::Mutex::new(()),
             backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
-            gate,
         })
     }
 
@@ -997,7 +992,6 @@ impl Provider for OpenAiCompat {
                 .stream_idle_secs_or(self.defaults.stream_idle_secs),
             effort,
             backoff_base: self.backoff_base,
-            gate: Arc::clone(&self.gate),
         };
 
         opener.open(RetryBudget::new(max_retries)).await
@@ -1022,10 +1016,6 @@ impl Provider for OpenAiCompat {
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         self.fetch_models().await
-    }
-
-    fn queue_depth(&self) -> usize {
-        self.gate.queued()
     }
 
     fn model_info(&self, model: &str) -> ModelInfo {

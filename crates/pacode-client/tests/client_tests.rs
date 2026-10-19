@@ -5197,3 +5197,112 @@ async fn w128_reconnect_orders_recovery_events() {
     client.close().await;
     server_task.await.unwrap();
 }
+
+/// Records every request per connection; the first connection drops right after it
+/// answered a `Subscribe`, so the client has to reconnect.
+async fn handle_subscribe_replay_conn(
+    stream: tokio::net::UnixStream,
+    connection: usize,
+    requests: mpsc::UnboundedSender<(usize, Request)>,
+) {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let Ok(wire) = serde_json::from_str::<AttachEnvelope>(line.trim()) else {
+            return;
+        };
+        let Envelope { id, req } = wire.envelope;
+        let _ = requests.send((connection, req.clone()));
+        let reply = match req {
+            Request::Hello(_) => Reply::Hello {
+                daemon_version: "t".to_string(),
+                protocol: PROTOCOL_VERSION,
+                pid: 1,
+            },
+            Request::Attach(_) => Reply::Attached(dummy_snapshot()),
+            _ => Reply::Ok,
+        };
+        if !write_server_message(&mut write_half, ServerMessage::Reply { id, reply }).await {
+            return;
+        }
+        if connection == 0 && matches!(req, Request::Subscribe { .. }) {
+            return;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_replays_the_last_subscribe_before_attaching() {
+    let dir = tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    let daemon_task = tokio::spawn(async move {
+        let mut connection = 0;
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(handle_subscribe_replay_conn(
+                stream,
+                connection,
+                request_tx.clone(),
+            ));
+            connection += 1;
+        }
+    });
+
+    let mut opts = ClientOptions::new(Paths::under(dir.path()), "t");
+    opts.socket = Some(socket);
+    opts.spawn_daemon = false;
+    let (client, mut events) = Client::connect(opts).await.unwrap();
+    client
+        .attach(Attach::Resume {
+            session: SessionId::new("ses_test"),
+        })
+        .await
+        .unwrap();
+    let subscribe = Request::Subscribe {
+        agents: vec![AgentId::main(), AgentId::new("sub-1")],
+        all: false,
+    };
+    assert!(matches!(
+        client.request(subscribe.clone()).await,
+        Ok(Reply::Ok)
+    ));
+
+    // The reattach snapshot on the new connection marks the end of the handshake.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Some(ClientEvent::Snapshot { .. }) => break,
+                Some(_) => {}
+                None => panic!("event stream closed before the reconnect snapshot"),
+            }
+        }
+    })
+    .await
+    .expect("the client never reattached");
+
+    let mut second = Vec::new();
+    while let Ok((connection, request)) = request_rx.try_recv() {
+        if connection == 1 {
+            second.push(request);
+        }
+    }
+    assert!(
+        matches!(second.first(), Some(Request::Hello(_))),
+        "{second:?}"
+    );
+    assert_eq!(second.get(1), Some(&subscribe), "{second:?}");
+    assert!(
+        matches!(second.get(2), Some(Request::Attach(_))),
+        "{second:?}"
+    );
+
+    client.close().await;
+    daemon_task.abort();
+}

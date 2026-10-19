@@ -2,13 +2,19 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
+use pacode_types::{StopReason, StreamEvent};
 
-use super::{ProviderGovernor, evict_idle_governor, governor_for_key, governor_key};
-use crate::{
-    DEFAULT_PROVIDER_CONCURRENCY, MAX_PROVIDER_CONCURRENCY, ProviderError, ProviderLimits,
-    provider_concurrency_ceiling, set_provider_concurrency_ceiling,
+use super::{
+    GovernorPermit, MIN_EPISODE, MIN_LIMIT, ProviderGovernor, evict_idle_governor,
+    governor_for_key, governor_key, hold_permit,
 };
+use crate::{
+    DEFAULT_PROVIDER_CONCURRENCY, EventStream, MAX_PROVIDER_CONCURRENCY, ProviderError,
+    ProviderLimits, provider_concurrency_ceiling, set_provider_concurrency_ceiling,
+};
+
+const SHORT: Duration = Duration::from_millis(40);
 
 fn limits(max_concurrency: usize) -> ProviderLimits {
     ProviderLimits {
@@ -38,13 +44,18 @@ async fn test_governor_admits_up_to_the_concurrency_limit() {
     assert!(blocked.as_mut().now_or_never().is_none());
 
     governor.apply_limits(limits(2));
-    let second = governor
-        .acquire(0)
-        .await
+    // The new slot goes to the caller already waiting, not to a newcomer.
+    let second = blocked
+        .as_mut()
+        .now_or_never()
+        .expect("resize admits the waiter")
         .expect("second permit after resize");
+    let mut third = Box::pin(governor.acquire(0));
+    assert!(third.as_mut().now_or_never().is_none());
     drop(first);
+    let third = third.await.expect("third permit after a release");
     drop(second);
-    drop(blocked);
+    drop(third);
 }
 
 #[tokio::test]
@@ -355,4 +366,323 @@ async fn a_128_way_fan_out_is_admitted_exactly_once_each() {
     );
     assert_eq!(stats.in_flight, 0, "every permit was released");
     assert_eq!(stats.queued, 0, "the ceiling was never reached");
+}
+
+async fn hold(governor: &Arc<ProviderGovernor>, n: usize) -> Vec<GovernorPermit> {
+    let mut held = Vec::with_capacity(n);
+    for _ in 0..n {
+        held.push(governor.acquire(0).await.expect("permit"));
+    }
+    held
+}
+
+/// Waiters are served oldest first, one per freed slot, and a newcomer queues
+/// behind them instead of taking the slot a release just freed.
+#[tokio::test]
+async fn test_waiters_are_admitted_in_arrival_order_one_per_release() {
+    let governor = ProviderGovernor::new(limits(1));
+    let held = governor.acquire(0).await.expect("first permit");
+    let mut first = Box::pin(governor.acquire(0));
+    let mut second = Box::pin(governor.acquire(0));
+    assert!(first.as_mut().now_or_never().is_none());
+    assert!(second.as_mut().now_or_never().is_none());
+
+    drop(held);
+    assert!(
+        second.as_mut().now_or_never().is_none(),
+        "one release wakes one waiter, and not the later one"
+    );
+    let first = first
+        .as_mut()
+        .now_or_never()
+        .expect("the oldest waiter holds the slot")
+        .expect("permit");
+
+    let mut late = Box::pin(governor.acquire(0));
+    assert!(late.as_mut().now_or_never().is_none());
+    drop(first);
+    assert!(
+        late.as_mut().now_or_never().is_none(),
+        "a newcomer never overtakes the queue"
+    );
+    let second = second
+        .as_mut()
+        .now_or_never()
+        .expect("next in line")
+        .expect("permit");
+    drop(second);
+    let late = tokio::time::timeout(Duration::from_secs(1), late)
+        .await
+        .expect("last in line")
+        .expect("permit");
+    drop(late);
+    assert_eq!(governor.stats().in_flight, 0);
+}
+
+/// A slot handed to a waiter whose acquire is then cancelled moves on to the
+/// next waiter instead of leaking.
+#[tokio::test]
+async fn test_a_grant_to_a_cancelled_waiter_moves_on() {
+    let governor = ProviderGovernor::new(limits(1));
+    let held = governor.acquire(0).await.expect("first permit");
+    let mut first = Box::pin(governor.acquire(0));
+    let mut second = Box::pin(governor.acquire(0));
+    assert!(first.as_mut().now_or_never().is_none());
+    assert!(second.as_mut().now_or_never().is_none());
+
+    drop(held);
+    drop(first);
+    let second = second
+        .as_mut()
+        .now_or_never()
+        .expect("the cancelled grant reached the next waiter")
+        .expect("permit");
+    assert_eq!(governor.stats().in_flight, 1);
+    assert_eq!(governor.stats().queued, 0);
+    drop(second);
+    assert_eq!(governor.stats().in_flight, 0);
+}
+
+#[tokio::test]
+async fn test_rate_limits_halve_the_limit_once_per_episode() {
+    let governor = ProviderGovernor::new(limits(64));
+    for _ in 0..64 {
+        governor.note_rate_limited(Duration::from_millis(150));
+    }
+    assert_eq!(governor.limit(), 32, "64 simultaneous 429s halve once");
+    assert_eq!(governor.stats().max_concurrency, 64, "the ceiling stays");
+    tokio::time::sleep(MIN_EPISODE + Duration::from_millis(50)).await;
+    governor.note_rate_limited(Duration::from_millis(150));
+    assert_eq!(governor.limit(), 16, "a new episode halves again");
+}
+
+#[tokio::test]
+async fn test_rate_limits_floor_at_the_minimum_and_the_ceiling() {
+    let governor = ProviderGovernor::new(limits(64));
+    for _ in 0..10 {
+        governor.note_rate_limited(Duration::from_millis(1));
+    }
+    assert_eq!(governor.limit(), 32);
+    for _ in 0..5 {
+        tokio::time::sleep(MIN_EPISODE + Duration::from_millis(20)).await;
+        governor.note_rate_limited(Duration::from_millis(1));
+    }
+    assert_eq!(governor.limit(), MIN_LIMIT);
+
+    let tiny = ProviderGovernor::new(limits(1));
+    tiny.note_rate_limited(Duration::from_millis(1));
+    assert_eq!(tiny.limit(), 1, "never below one, never above the ceiling");
+}
+
+#[tokio::test]
+async fn additive_increase_stops_at_ceiling() {
+    let governor = ProviderGovernor::new(limits(8));
+    assert_eq!(governor.limit(), 8);
+    // Streams that started before the decrease and succeed inside the episode
+    // earn no credit. (`acquire` waits out the cooldown, so take them first.)
+    let early = hold(&governor, 4).await;
+    governor.note_rate_limited(Duration::from_millis(30));
+    assert_eq!(governor.limit(), 4);
+    for permit in &early {
+        permit.record_success();
+    }
+    assert_eq!(governor.limit(), 4);
+    drop(early);
+
+    tokio::time::sleep(MIN_EPISODE + Duration::from_millis(50)).await;
+    for _ in 0..3 {
+        governor.acquire(0).await.expect("permit").record_success();
+    }
+    assert_eq!(governor.limit(), 4);
+    governor.acquire(0).await.expect("permit").record_success();
+    assert_eq!(governor.limit(), 5, "+1 after L successes");
+
+    for _ in 0..200 {
+        governor.acquire(0).await.expect("permit").record_success();
+    }
+    assert_eq!(governor.limit(), 8, "never above the ceiling");
+    assert_eq!(governor.stats().in_flight, 0);
+}
+
+/// Shrinking below the permits already out needs no bookkeeping: releases
+/// simply stop handing slots on until `in_flight` is under the new limit.
+#[tokio::test]
+async fn test_shrink_below_the_permits_in_use_takes_effect_as_they_return() {
+    let governor = ProviderGovernor::new(limits(8));
+    let permits = hold(&governor, 8).await;
+    governor.note_rate_limited(Duration::from_millis(20));
+    tokio::time::sleep(MIN_EPISODE + Duration::from_millis(20)).await;
+    governor.note_rate_limited(Duration::from_millis(20));
+    assert_eq!(governor.limit(), 2);
+    assert_eq!(governor.stats().in_flight, 8);
+
+    drop(permits);
+    assert_eq!(governor.stats().in_flight, 0);
+    let _a = governor.acquire(0).await.expect("permit");
+    let _b = governor.acquire(0).await.expect("permit");
+    let third = tokio::time::timeout(SHORT, governor.acquire(0)).await;
+    assert!(third.is_err(), "limit is 2");
+}
+
+#[tokio::test]
+async fn test_cancelled_waiters_during_a_decrease_corrupt_nothing() {
+    let governor = ProviderGovernor::new(limits(8));
+    let permits = hold(&governor, 8).await;
+    let mut waiters = Vec::new();
+    for _ in 0..3 {
+        let governor = Arc::clone(&governor);
+        waiters.push(tokio::spawn(async move { governor.acquire(0).await }));
+    }
+    tokio::time::sleep(SHORT).await;
+    assert_eq!(governor.stats().queued, 3);
+    governor.note_rate_limited(Duration::from_millis(20));
+    for waiter in waiters {
+        waiter.abort();
+        let _ = waiter.await;
+    }
+    assert_eq!(governor.stats().queued, 0);
+    assert_eq!(governor.stats().in_flight, 8);
+    drop(permits);
+    assert_eq!(governor.stats().in_flight, 0);
+    assert_eq!(governor.limit(), 4);
+    let again = tokio::time::timeout(Duration::from_secs(1), hold(&governor, 4))
+        .await
+        .expect("four slots are free again");
+    drop(again);
+}
+
+/// Only the server pacing the account shrinks it: 429/529 (`RateLimited`) and
+/// 503. Any other failure with a `Retry-After` only parks it.
+#[test]
+fn test_only_rate_limits_and_503_shrink_the_limit() {
+    let governor = ProviderGovernor::new(limits(8));
+    let server_error = ProviderError::Http {
+        status: 500,
+        message: "boom".to_string(),
+    };
+    crate::retry::note_failure(
+        &governor,
+        &server_error,
+        Some(Duration::from_secs(5)),
+        Duration::from_secs(5),
+    );
+    assert!(governor.cooldown_remaining() > Duration::from_secs(4));
+    assert_eq!(governor.limit(), 8);
+
+    let unavailable = ProviderError::Http {
+        status: 503,
+        message: "overloaded".to_string(),
+    };
+    crate::retry::note_failure(&governor, &unavailable, None, Duration::from_millis(1));
+    assert_eq!(governor.limit(), 4);
+
+    let fresh = ProviderGovernor::new(limits(8));
+    let rate_limited = ProviderError::RateLimited("slow down".to_string());
+    crate::retry::note_failure(&fresh, &rate_limited, None, Duration::from_millis(1));
+    assert_eq!(fresh.limit(), 4);
+}
+
+fn events(items: Vec<Result<StreamEvent, ProviderError>>) -> EventStream {
+    futures::stream::iter(items)
+        .chain(futures::stream::pending())
+        .boxed()
+}
+
+/// The slot comes back at `MessageEnd` even while the consumer still holds the
+/// stream; error, end and drop release it as well.
+#[tokio::test]
+async fn test_held_stream_frees_its_slot_at_message_end() {
+    let governor = ProviderGovernor::new(limits(1));
+    let permit = governor.acquire(0).await.expect("permit");
+    let mut stream = hold_permit(
+        events(vec![
+            Ok(StreamEvent::TextDelta {
+                text: "hi".to_string(),
+            }),
+            Ok(StreamEvent::MessageEnd {
+                stop: StopReason::EndTurn,
+            }),
+        ]),
+        permit,
+    );
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::TextDelta { .. }))
+    ));
+    assert_eq!(governor.stats().in_flight, 1);
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::MessageEnd { .. }))
+    ));
+    assert_eq!(
+        governor.stats().in_flight,
+        0,
+        "released at MessageEnd, stream alive"
+    );
+
+    let permit = governor.acquire(0).await.expect("permit");
+    let mut failing = hold_permit(
+        events(vec![Err(ProviderError::Transport("reset".to_string()))]),
+        permit,
+    );
+    assert!(matches!(failing.next().await, Some(Err(_))));
+    assert_eq!(governor.stats().in_flight, 0, "released on error");
+
+    let permit = governor.acquire(0).await.expect("permit");
+    let pending = hold_permit(events(vec![]), permit);
+    assert_eq!(governor.stats().in_flight, 1);
+    drop(pending);
+    assert_eq!(governor.stats().in_flight, 0, "released on drop");
+    drop(stream);
+}
+
+/// 64 agents x 4 requests against a provider that serves 32 concurrent streams
+/// and answers 429 above that: the shared limit converges instead of herding.
+#[tokio::test]
+async fn test_limit_converges_to_provider_capacity_without_herd() {
+    const CAPACITY: usize = 32;
+    let governor = ProviderGovernor::new(limits(64));
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rejects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..64 {
+        let (governor, live, rejects) = (
+            Arc::clone(&governor),
+            Arc::clone(&live),
+            Arc::clone(&rejects),
+        );
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..4 {
+                loop {
+                    let permit = governor.acquire(0).await.expect("admitted");
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    if now > CAPACITY {
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        rejects.fetch_add(1, Ordering::SeqCst);
+                        governor.note_rate_limited(Duration::from_millis(30));
+                        drop(permit);
+                        continue;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    permit.record_success();
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
+                    break;
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("agent joins");
+    }
+    let total_429 = rejects.load(Ordering::SeqCst);
+    assert!(total_429 <= 2 * 256, "{total_429} 429s for 256 requests");
+    let limit = governor.limit();
+    assert!(
+        (8..=40).contains(&limit),
+        "limit {limit} should hover near {CAPACITY}"
+    );
+    let stats = governor.stats();
+    assert_eq!(stats.in_flight, 0);
+    assert_eq!(stats.queued, 0);
 }

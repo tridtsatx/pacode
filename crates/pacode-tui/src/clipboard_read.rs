@@ -11,6 +11,9 @@ pub(crate) mod clipboard_read_tests;
 pub const IMAGE_PASTE_MAX_BYTES: usize = 20 * 1024 * 1024; // 20 MiB
 pub const PASTED_IMAGES_MAX_COUNT: usize = 16;
 pub const PASTED_IMAGES_MAX_TOTAL_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
+/// Records of images already handed to the daemon that are kept only so a
+/// queued prompt repeating their `[Image N]` token still resolves.
+pub const PASTED_IMAGES_MAX_SENT_RECORDS: usize = 64;
 
 /// Command execution abstraction for testing clipboard reading without display or external tools.
 pub trait CommandRunner: Send + Sync {
@@ -249,6 +252,11 @@ pub struct PastedImageRecord {
     pub path: PathBuf,
     pub bytes_len: usize,
     pub submitted: bool,
+    /// Its path went out in a `UserMessage`: the file belongs to the session
+    /// from then on (the daemon may read it on a later turn, after this client
+    /// detached or exited), so this client never deletes it and it no longer
+    /// counts toward the caps.
+    pub sent: bool,
 }
 
 impl PastedImageRecord {
@@ -269,11 +277,15 @@ impl PastedImageRecord {
 /// Owns temporary image files created during clipboard paste operations.
 ///
 /// - Storage location: `$TMPDIR/pacode-pastes-<pid>` (or a configured directory).
-/// - Size cap: 20 MiB per image file, 16 files maximum, 50 MiB total disk cap.
-/// - Lifecycle and ownership: `PastedImages` owns the files. An image pasted and then
-///   removed from the prompt is deleted immediately by `cleanup_unreferenced`.
-///   Submitted images remain until the process terminates, at which point `Drop`
-///   cleans up all remaining temporary files and the temporary directory.
+/// - Size cap: 20 MiB per image file, 16 files maximum, 50 MiB total disk cap,
+///   counted over the files this client still owns (never the sent ones).
+/// - Lifecycle and ownership: `PastedImages` owns a file until its path is sent.
+///   An image pasted and then removed from the prompt is deleted immediately by
+///   `cleanup_unreferenced`. A submitted image (in a queued prompt) is kept and
+///   never evicted. Once a `UserMessage` carries the path (`mark_sent`), the file
+///   is handed off: the session outlives this client (detach, resume) and its
+///   history may name the path, so neither eviction nor `Drop` ever deletes it.
+///   `Drop` deletes only the files no message carried.
 #[derive(Debug)]
 pub struct PastedImages {
     temp_dir: PathBuf,
@@ -325,7 +337,7 @@ impl PastedImages {
             ));
         }
 
-        while self.records.len() >= PASTED_IMAGES_MAX_COUNT
+        while self.owned_count() >= PASTED_IMAGES_MAX_COUNT
             || self.total_bytes().saturating_add(bytes.len()) > PASTED_IMAGES_MAX_TOTAL_BYTES
         {
             let Some(pos) = self.records.iter().position(|record| !record.submitted) else {
@@ -333,7 +345,7 @@ impl PastedImages {
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "pasted image storage cap reached ({} files, {} bytes; submitted images are retained)",
-                        self.records.len(),
+                        self.owned_count(),
                         self.total_bytes()
                     ),
                 ));
@@ -354,6 +366,7 @@ impl PastedImages {
             path: file_path,
             bytes_len: bytes.len(),
             submitted: false,
+            sent: false,
         };
         self.records.push(record.clone());
 
@@ -383,16 +396,50 @@ impl PastedImages {
         }
     }
 
+    /// Hand the files at `paths` to the session: a `UserMessage` carries them.
+    /// They are never deleted by this client again and leave the caps; the
+    /// records stay (at most [`PASTED_IMAGES_MAX_SENT_RECORDS`]) only so a token
+    /// repeated in a queued prompt still resolves to the same file.
+    pub fn mark_sent(&mut self, paths: &[PathBuf]) {
+        for record in &mut self.records {
+            if paths.contains(&record.path) {
+                record.submitted = true;
+                record.sent = true;
+            }
+        }
+        let sent = self.records.iter().filter(|record| record.sent).count();
+        let mut excess = sent.saturating_sub(PASTED_IMAGES_MAX_SENT_RECORDS);
+        self.records.retain(|record| {
+            if excess > 0 && record.sent {
+                excess -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Files this client still owns (not handed to the session).
+    fn owned_count(&self) -> usize {
+        self.records.iter().filter(|record| !record.sent).count()
+    }
+
     fn total_bytes(&self) -> usize {
-        self.records.iter().fold(0usize, |total, record| {
-            total.saturating_add(record.bytes_len)
-        })
+        self.records
+            .iter()
+            .filter(|record| !record.sent)
+            .fold(0usize, |total, record| {
+                total.saturating_add(record.bytes_len)
+            })
     }
 }
 
 impl Drop for PastedImages {
+    /// Deletes only what no message carried. A sent file may still be read by
+    /// the daemon for a session that outlives this client; it stays (the
+    /// directory with it — `remove_dir` only removes an empty one).
     fn drop(&mut self) {
-        for record in &self.records {
+        for record in self.records.iter().filter(|record| !record.sent) {
             let _ = std::fs::remove_file(&record.path);
         }
         let _ = std::fs::remove_dir(&self.temp_dir);

@@ -447,15 +447,70 @@ async fn shutdown_requests_all_kills_before_waiting() {
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
+/// A finished task with a managed spool in `dir`, ended at `ended_at_ms`.
+fn finished_info(dir: &Path, ended_at_ms: u64) -> pacode_types::TaskInfo {
+    let id = pacode_types::TaskId::generate();
+    let output_path = dir.join(format!("{}.out", id.as_str()));
+    std::fs::write(&output_path, b"done\n").unwrap();
+    pacode_types::TaskInfo {
+        id,
+        session: SessionId::generate(),
+        owner: AgentId::generate(),
+        label: String::new(),
+        command: "printf done".to_string(),
+        cwd: std::path::PathBuf::new(),
+        status: TaskStatus::Completed,
+        backgrounded: false,
+        exit_code: Some(0),
+        started_at_ms: ended_at_ms,
+        ended_at_ms: Some(ended_at_ms),
+        progress: None,
+        warnings: 0,
+        errors: 0,
+        output_path,
+        output_bytes: 5,
+        acked: false,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn terminal_retention_is_bounded_and_cleans_evicted_spools() {
+    use crate::state::MAX_TERMINAL_TASKS;
+
+    // `max_tasks` (the concurrency cap) no longer bounds what finished tasks keep.
+    let config = ExecConfig {
+        max_tasks: 1,
+        ..Default::default()
+    };
+    let (mgr, tmp) = test_manager(config);
+    let infos: Vec<_> = (0..MAX_TERMINAL_TASKS + 3)
+        .map(|n| finished_info(tmp.path(), 1_000 + n as u64))
+        .collect();
+    mgr.hydrate(infos.clone());
+
+    assert_eq!(mgr.list(None).len(), MAX_TERMINAL_TASKS);
+    for evicted in &infos[..3] {
+        assert!(mgr.info(&evicted.id).is_none());
+        assert!(!evicted.output_path.exists());
+    }
+    for kept in &infos[3..] {
+        assert!(mgr.info(&kept.id).is_some());
+        assert!(kept.output_path.exists());
+    }
+
+    let newest = infos.last().unwrap();
+    mgr.forget(&newest.id);
+    assert!(!newest.output_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_task_survives_more_ends_than_max_tasks() {
     let config = ExecConfig {
         max_tasks: 1,
         ..Default::default()
     };
     let (mgr, _tmp) = test_manager(config);
     let mut infos = Vec::new();
-
     for _ in 0..3 {
         let info = mgr.spawn(test_spec("printf done")).await.unwrap();
         let ended = mgr.wait(&info.id, Duration::from_secs(5), false).await;
@@ -464,16 +519,24 @@ async fn terminal_retention_is_bounded_and_cleans_evicted_spools() {
         );
         infos.push(info);
     }
+    assert_eq!(mgr.list(None).len(), 3);
+    assert_eq!(mgr.tail(&infos[0].id, 1).await.unwrap(), vec!["done"]);
+    assert!(infos[0].output_path.exists());
+}
 
-    let retained = mgr.list(None);
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].id, infos[2].id);
-    assert!(!infos[0].output_path.exists());
-    assert!(!infos[1].output_path.exists());
-    assert!(infos[2].output_path.exists());
+#[tokio::test(flavor = "multi_thread")]
+async fn running_tasks_are_never_evicted() {
+    use crate::state::MAX_TERMINAL_TASKS;
 
-    mgr.forget(&infos[2].id);
-    assert!(!infos[2].output_path.exists());
+    let (mgr, tmp) = test_manager(ExecConfig::default());
+    let long = mgr.spawn(test_spec("sleep 30")).await.unwrap();
+    let infos: Vec<_> = (0..MAX_TERMINAL_TASKS + 5)
+        .map(|n| finished_info(tmp.path(), n as u64))
+        .collect();
+    mgr.hydrate(infos);
+    assert_eq!(mgr.info(&long.id).unwrap().status, TaskStatus::Running);
+    assert!(long.output_path.exists());
+    mgr.kill(&long.id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

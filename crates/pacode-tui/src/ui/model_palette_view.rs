@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use pacode_render::{RenderOptions, display_width, truncate_to_width};
-use pacode_types::ModelInfo;
+use pacode_types::{ModelInfo, ModelKind};
 
 use crate::binding::Action as KeyAction;
 use crate::state::{AppState, Focus, Overlay};
@@ -128,6 +128,11 @@ impl View<'_, '_> {
         let base = match palette.kind {
             Kind::All => base,
             kind => format!("{base}{}{}", opts.glyphs.dot_sep, kind.label()),
+        };
+        let base = if palette.all_types {
+            format!("{base}{}all types", opts.glyphs.dot_sep)
+        } else {
+            base
         };
         let title = title_with_badge(&base, state.lists.badge(crate::cache::ListKind::Models));
         let chords = chord_hint(state, src, highlighted, opts);
@@ -475,6 +480,11 @@ fn chord_hint(
         (KeyAction::ModelPickerKind, "kind"),
         (KeyAction::ModelPickerRefresh, "refresh"),
     ];
+    // Only a catalog that has something besides chat models has anything to
+    // show or hide.
+    if src.models.iter().any(|model| model.kind != ModelKind::Chat) {
+        items.push((KeyAction::ModelPickerTypes, "types"));
+    }
     if auth.is_some_and(|info| info.accounts.len() > 1) {
         items.push((KeyAction::ModelPickerAccount, "account"));
     }

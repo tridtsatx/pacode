@@ -11,7 +11,7 @@ use crate::buffer::HeadTailBuffer;
 use crate::manager::TaskEvent;
 use crate::progress::ProgressParser;
 use crate::resources::{GuardHost, KillSignal, ResourceGuard, ResourceNotice, TreeRoot};
-use crate::retention::Retention;
+use crate::spool::SpoolGc;
 
 pub(crate) struct ManagedSpool {
     path: PathBuf,
@@ -77,8 +77,8 @@ pub(crate) struct SharedState {
     pub(crate) nice: i32,
     /// Admission queue for `exec.max_tasks` process slots (F4).
     pub(crate) admission: Arc<Admission>,
-    /// Stubs of evicted terminal tasks (F1).
-    pub(crate) retention: Retention,
+    /// When the next spool sweep is due (F5, see `spool.rs`).
+    pub(crate) spool_gc: SpoolGc,
 }
 
 impl GuardHost for SharedState {
@@ -135,7 +135,20 @@ impl GuardHost for SharedState {
     }
 }
 
+/// Finished tasks kept (entry, buffer and spool) daemon-wide before the oldest is
+/// evicted with its spool. Well above `exec.max_tasks`: with a fleet of agents a
+/// finished task must outlive the moment its owner gets to read its output.
+pub(crate) const MAX_TERMINAL_TASKS: usize = 256;
+
 impl SharedState {
+    /// Terminal tasks kept: [`MAX_TERMINAL_TASKS`], or `exec.max_tasks` when raised
+    /// above it.
+    pub(crate) fn terminal_keep(&self) -> usize {
+        MAX_TERMINAL_TASKS.max(self.config.max_tasks)
+    }
+
+    /// Evict the oldest terminal tasks beyond [`Self::terminal_keep`]; their spools are
+    /// deleted once the returned entries (and any tail lease) are dropped.
     pub(crate) fn prune_terminal_overflow(
         &self,
         tasks: &mut HashMap<TaskId, TaskEntry>,
@@ -145,7 +158,7 @@ impl SharedState {
             .filter(|(_, entry)| entry.info.status.is_terminal())
             .map(|(id, entry)| (entry.info.ended_at_ms.unwrap_or_default(), id.clone()))
             .collect();
-        let overflow = terminal.len().saturating_sub(self.config.max_tasks);
+        let overflow = terminal.len().saturating_sub(self.terminal_keep());
         if overflow == 0 {
             return Vec::new();
         }

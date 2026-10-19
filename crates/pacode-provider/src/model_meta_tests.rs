@@ -67,15 +67,15 @@ fn reasoning_flag_and_efforts_come_from_supported_parameters() {
     apply_catalog_item(&mut info, &item(0), ReasoningWire::ReasoningObject, true);
     assert!(info.supports_reasoning);
     assert_eq!(
-        info.efforts,
-        vec![Effort::Low, Effort::Medium, Effort::High]
+        info.supported_efforts,
+        Some(vec![Effort::Low, Effort::Medium, Effort::High])
     );
 
     let mut free = base("vendor/free-model:free");
     free.supports_reasoning = true; // the id heuristic guessed wrong
     apply_catalog_item(&mut free, &item(1), ReasoningWire::ReasoningObject, true);
     assert!(!free.supports_reasoning);
-    assert!(free.efforts.is_empty());
+    assert!(free.supported_efforts.is_none());
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn pinned_reasoning_is_not_overridden() {
     free.supports_reasoning = true;
     apply_catalog_item(&mut free, &item(1), ReasoningWire::ReasoningObject, false);
     assert!(free.supports_reasoning);
-    assert_eq!(free.efforts.len(), 3);
+    assert_eq!(free.supported_efforts.as_ref().map(Vec::len), Some(3));
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn modalities_decide_the_kind() {
     apply_catalog_item(&mut img, &item(3), ReasoningWire::ReasoningObject, true);
     assert_eq!(img.kind, ModelKind::Image);
     assert!(!img.supports_reasoning);
-    assert!(img.efforts.is_empty());
+    assert!(img.supported_efforts.is_none());
 }
 
 #[test]

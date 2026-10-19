@@ -1,5 +1,6 @@
 //! Deferred work recorded before paint — completion scans, file previews and
-//! statuses, diffs, task tails, image thumbnails, the clipboard copy, git
+//! statuses, diffs, task tails, image thumbnails and inline transcript image
+//! decodes, the clipboard copy, git
 //! detail/next-page wants — spawned off the frame path (§8.1), plus the
 //! "is this view on screen" predicates that gate it.
 
@@ -211,6 +212,22 @@ pub(super) fn dispatch_deferred(
         });
     }
     state.image_strip.want = pending_wants;
+
+    // Inline transcript images the last draw showed as a stub: one decode
+    // each, at most `image_cache::MAX_IN_FLIGHT` at once. A want that finds
+    // the pool full is dropped; the stub asks again on the next draw.
+    let mut decode_wants = state.transcript.images.take_wants();
+    decode_wants.extend(state.panel.agent_transcript.images.take_wants());
+    for key in decode_wants {
+        if !state.inline_image_jobs.start(&key) {
+            continue;
+        }
+        let tx = bg_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let decoded = crate::state::image_cache::decode(&key);
+            let _ = tx.send(BgResponse::InlineImageReady { key, decoded });
+        });
+    }
 
     // The selection copy prepared before paint — OSC 52 + arboard, off-thread.
     if let Some(mut copy) = state.pending_copy.take() {

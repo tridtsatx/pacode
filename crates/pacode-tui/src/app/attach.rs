@@ -276,7 +276,11 @@ fn apply_snapshot_and_actions(
 }
 
 fn post_attach_actions(state: &mut AppState) -> Vec<Action> {
-    let mut actions = Vec::new();
+    // First, so the turn the startup prompt starts streams only what is drawn. The
+    // client replays it after a reconnect; panel loads update it.
+    let mut actions = vec![Action::Send(super::panel::interest_request(
+        state.panel_agent_target().as_ref(),
+    ))];
     if prompt_gate_open(state)
         && let Some(prompt) = state.initial_prompt.take()
     {

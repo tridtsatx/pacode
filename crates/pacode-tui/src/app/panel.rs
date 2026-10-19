@@ -72,6 +72,19 @@ fn panel_load_reply_is_current(context: &SessionContext, target: &PanelTarget, t
     })
 }
 
+/// The `Subscribe` matching what the TUI draws live: the main agent, plus the agent the
+/// panel shows. Other agents' deltas and items are dropped by the daemon and their rail
+/// rows arrive coalesced; their tool calls still come through for the files list.
+pub(super) fn interest_request(panel: Option<&PanelTarget>) -> Request {
+    let mut agents = vec![AgentId::main()];
+    if let Some(PanelTarget::Agent(id)) = panel
+        && !id.is_main()
+    {
+        agents.push(id.clone());
+    }
+    Request::Subscribe { agents, all: false }
+}
+
 /// `Action::LoadPanel`: the open panel's agent history or task output.
 pub(super) fn load_panel(
     state: &mut AppState,
@@ -109,9 +122,21 @@ pub(super) fn load_panel(
     let Some(token) = begin_panel_load(&context, &target) else {
         return;
     };
+    // An agent's live stream must be on before its history is read: an item added
+    // between the two would otherwise be in neither. One task, Subscribe acknowledged
+    // first, then the page.
+    let subscribe =
+        matches!(target, PanelTarget::Agent(_)).then(|| interest_request(Some(&target)));
     let cl = Arc::clone(client);
     let tx = bg_tx.clone();
     tokio::spawn(async move {
+        if let Some(subscribe) = subscribe
+            && let Err(error) = cl
+                .request_session_for(client_context.clone(), subscribe)
+                .await
+        {
+            log::warn!("panel subscribe failed: {error}");
+        }
         let result = cl
             .request_session_for(client_context.clone(), request)
             .await;

@@ -298,8 +298,71 @@ fn submitted_images_cannot_bypass_the_aggregate_cap() {
         path: tmp.path().join("synthetic.png"),
         bytes_len: PASTED_IMAGES_MAX_TOTAL_BYTES,
         submitted: true,
+        sent: false,
     });
     assert!(manager.create_image_file(b"png").is_err());
+}
+
+#[test]
+fn sent_images_survive_drop_and_unsent_ones_do_not() {
+    let tmp = TempDir::new().unwrap();
+    let mut manager = PastedImages::new_in(tmp.path().to_path_buf());
+    let sent = manager.create_image_file(b"sent").unwrap();
+    let queued = manager.create_image_file(b"queued").unwrap();
+    let draft = manager.create_image_file(b"draft").unwrap();
+    manager.mark_submitted(&format!("{} {}", sent.token_label(), queued.token_label()));
+    manager.mark_sent(std::slice::from_ref(&sent.path));
+
+    // The client exits (or the store is replaced): the daemon may still read
+    // the sent file for a session that outlives it.
+    drop(manager);
+    assert!(sent.path.exists(), "a sent image is the session's");
+    assert!(!queued.path.exists(), "no message carried the queued one");
+    assert!(!draft.path.exists());
+}
+
+#[test]
+fn sent_images_leave_the_caps_and_are_never_evicted() {
+    let tmp = TempDir::new().unwrap();
+    let mut manager = PastedImages::new_in(tmp.path().to_path_buf());
+    let mut sent_paths = Vec::new();
+    for _ in 0..PASTED_IMAGES_MAX_COUNT {
+        let record = manager.create_image_file(b"png").unwrap();
+        manager.mark_submitted(&record.token_label());
+        manager.mark_sent(std::slice::from_ref(&record.path));
+        sent_paths.push(record.path);
+    }
+    // Every slot was sent: pasting goes on, and nothing sent is deleted.
+    for _ in 0..PASTED_IMAGES_MAX_COUNT {
+        manager.create_image_file(b"png").unwrap();
+    }
+    assert!(sent_paths.iter().all(|path| path.exists()));
+
+    // The unsent ones fill the cap again: the oldest unsent is evicted, never
+    // a sent one.
+    manager.create_image_file(b"png").unwrap();
+    assert!(sent_paths.iter().all(|path| path.exists()));
+}
+
+#[test]
+fn sent_records_stay_resolvable_but_bounded() {
+    let tmp = TempDir::new().unwrap();
+    let mut manager = PastedImages::new_in(tmp.path().to_path_buf());
+    let first = manager.create_image_file(b"png").unwrap();
+    manager.mark_sent(std::slice::from_ref(&first.path));
+    // A queued prompt repeating the token still finds the same file.
+    let (_, sources) = crate::state::images::resolve_image_tokens(&manager, &first.token_label());
+    assert_eq!(sources.len(), 1);
+
+    for _ in 0..PASTED_IMAGES_MAX_SENT_RECORDS + 4 {
+        let record = manager.create_image_file(b"png").unwrap();
+        manager.mark_sent(std::slice::from_ref(&record.path));
+    }
+    assert_eq!(manager.records().len(), PASTED_IMAGES_MAX_SENT_RECORDS);
+    assert!(
+        first.path.exists(),
+        "forgetting a record never deletes its file"
+    );
 }
 
 fn wl_runner() -> MockCommandRunner {

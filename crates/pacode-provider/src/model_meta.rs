@@ -189,6 +189,10 @@ pub fn apply_catalog_item(
             .any(|p| p == "reasoning" || p == "include_reasoning");
     }
     finish(info, wire);
+    // A catalogue entry is the one place the levels can be inferred from the wire.
+    if info.supports_reasoning && info.supported_efforts.is_none() {
+        info.supported_efforts = Some(efforts_for(wire, &info.route.model));
+    }
 }
 
 /// Derive the fields that follow from the others: reasoning levels from the wire,
@@ -197,9 +201,6 @@ pub fn finish(info: &mut ModelInfo, wire: ReasoningWire) {
     if info.kind != ModelKind::Chat {
         info.supports_reasoning = false;
     }
-    info.efforts = if info.supports_reasoning {
-        efforts_for(wire, &info.route.model)
-    } else {
-        Vec::new()
-    };
+    // Pinned levels stay, and `None` stays "unknown, every level selectable":
+    // `clamp_effort` ignores the list for a model without reasoning.
 }

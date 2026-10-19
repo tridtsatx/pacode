@@ -1115,14 +1115,32 @@ impl Default for LimitsConfig {
     }
 }
 
+pub const DEFAULT_MAX_LIVE_AGENTS: usize = 16;
+pub const DEFAULT_MAX_AGENT_TURNS: u32 = 200;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct AgentsConfig {
+    /// Most subagents alive at once in one session; a spawn past it is refused.
+    pub max_live: usize,
     #[serde(skip)]
     pub default_model: Option<String>,
     #[serde(skip)]
     pub default_effort: Option<Effort>,
+    /// Max tool-calling turns for one subagent before it is stopped: the stop
+    /// for a subagent caught in a loop.
+    pub max_turns: u32,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            max_live: DEFAULT_MAX_LIVE_AGENTS,
+            default_model: None,
+            default_effort: None,
+            max_turns: DEFAULT_MAX_AGENT_TURNS,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

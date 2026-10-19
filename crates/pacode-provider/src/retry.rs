@@ -12,10 +12,9 @@ use futures::StreamExt;
 use pacode_types::{Effort, StreamEvent};
 use rand::Rng;
 
-use crate::error_body::{ERROR_BODY_READ_TIMEOUT, MAX_ERROR_BODY_BYTES};
-use crate::gate::{GatePermit, GatedStream, MAX_QUEUE_WAIT, ProviderGate};
-use crate::governor::{GovernorPermit, ProviderGovernor, governor_for, hold_permit};
-use crate::post::HttpPost;
+use crate::error_body::ERROR_BODY_READ_TIMEOUT;
+use crate::governor::{ProviderGovernor, governor_for, hold_permit};
+use crate::post::{HttpPost, post_with_retries};
 use crate::{EventStream, ProviderError};
 
 #[cfg(test)]
@@ -27,6 +26,9 @@ const MAX_BACKOFF_STEPS: u32 = 5;
 const MAX_BACKOFF_FACTOR: u32 = 30;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 pub(crate) const MIN_429_COOLDOWN: Duration = Duration::from_millis(1);
+/// OpenAI-style pacing headers consulted when `Retry-After` is absent.
+const RATE_LIMIT_RESET_HEADERS: [&str; 2] =
+    ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"];
 
 pub(crate) fn backoff_delay(attempt: u32, base: Duration) -> Duration {
     let exponent = 1u32
@@ -171,11 +173,87 @@ pub(crate) fn retry_after_value(value: &serde_json::Value) -> Option<Duration> {
 }
 
 pub(crate) fn retry_after_from_response(response: &reqwest::Response) -> Option<Duration> {
-    response
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| parse_retry_after(value, SystemTime::now()))
+    delay_from_headers(response.headers(), SystemTime::now())
+}
+
+/// The pacing hint of a failed response: `Retry-After` wins; otherwise the larger
+/// of the non-zero `x-ratelimit-reset-requests` / `-tokens` hints. Clamped like
+/// every other hint.
+pub(crate) fn delay_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    now: SystemTime,
+) -> Option<Duration> {
+    let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    if let Some(delay) = text("retry-after").and_then(|value| parse_retry_after(value, now)) {
+        return Some(delay);
+    }
+    RATE_LIMIT_RESET_HEADERS
+        .iter()
+        .filter_map(|name| text(name).and_then(parse_reset_duration))
+        .max()
+        .filter(|delay| !delay.is_zero())
+        .map(|delay| delay.min(MAX_RETRY_AFTER))
+}
+
+/// `x-ratelimit-reset-*` values: `1s`, `250ms`, `2m3s`, `1h2m`, `1.5s`; a bare
+/// number is seconds.
+pub(crate) fn parse_reset_duration(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut total = 0.0f64;
+    let mut rest = value;
+    while !rest.is_empty() {
+        let number_end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        if number_end == 0 {
+            return None;
+        }
+        let number: f64 = rest[..number_end].parse().ok()?;
+        rest = &rest[number_end..];
+        let unit_end = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        let factor = match &rest[..unit_end] {
+            "" | "s" => 1.0,
+            "ms" => 0.001,
+            "m" => 60.0,
+            "h" => 3600.0,
+            _ => return None,
+        };
+        rest = &rest[unit_end..];
+        total += number * factor;
+    }
+    Duration::try_from_secs_f64(total).ok()
+}
+
+/// The server is pacing the account: 429 and 529 (classified `RateLimited`, also
+/// when reported inside the stream) and 503, which overloaded backends and
+/// gateways answer instead.
+pub(crate) fn is_rate_limit(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::RateLimited(_) | ProviderError::Http { status: 503, .. }
+    )
+}
+
+/// Feed one failed attempt into the account's governor. A rate limit parks the
+/// account for `delay` and shrinks its adaptive limit once per episode; any other
+/// failure that carried a pacing hint only parks it.
+pub(crate) fn note_failure(
+    governor: &ProviderGovernor,
+    error: &ProviderError,
+    retry_after: Option<Duration>,
+    delay: Duration,
+) {
+    let delay = delay.max(MIN_429_COOLDOWN);
+    if is_rate_limit(error) {
+        governor.note_rate_limited(delay);
+    } else if retry_after.is_some() {
+        governor.start_cooldown(delay);
+    }
 }
 
 pub(crate) fn error_body_read_timeout(idle_wait: Option<Duration>) -> Duration {
@@ -231,168 +309,8 @@ pub(crate) trait StreamTransport: Clone + Send + Sync + 'static {
         governor: &Arc<ProviderGovernor>,
         budget: &mut RetryBudget,
     ) -> impl Future<Output = Result<OpenedStream, ProviderError>> + Send;
-    /// A rate limit arrived inside an open stream (gateways report upstream 429s in a
-    /// 200 body): transports with a [`ProviderGate`] shrink its adaptive limit.
-    fn note_stream_rate_limit(&self) {}
     /// The stream committed (no reopen is possible any more): free the request payload.
     fn release_body(&mut self) {}
-}
-
-/// A server-overload status for [`ProviderGate::note_response`] standing in for a rate
-/// limit reported without HTTP headers (inside the stream).
-const STREAM_RATE_LIMIT_STATUS: u16 = 429;
-
-/// One failed HTTP attempt of [`post_gated`]: the classified error plus what the
-/// response said about pacing.
-struct GatedFailure {
-    error: ProviderError,
-    /// Status and headers of an HTTP answer (`None` for a transport failure).
-    response: Option<(u16, reqwest::header::HeaderMap)>,
-}
-
-/// [`crate::post::post_with_retries`] behind a [`ProviderGate`]: the gate's cooldown and
-/// adaptive (AIMD) limit are waited out first, then the per-account governor.
-///
-/// Every 429/503 shrinks the gate's limit. A server pacing hint (`Retry-After`,
-/// `x-ratelimit-reset-*`) becomes a provider-wide cooldown that every queued request
-/// sleeps out instead of retrying on its own schedule; such hinted waits do not spend
-/// the retry budget, bounded in total by [`MAX_QUEUE_WAIT`]. Everything else follows
-/// the shared budget and backoff exactly like `post_with_retries`.
-pub(crate) async fn post_gated(
-    post: &HttpPost<'_>,
-    gate: &ProviderGate,
-    governor: &Arc<ProviderGovernor>,
-    budget: &mut RetryBudget,
-) -> Result<(reqwest::Response, GovernorPermit, GatePermit), ProviderError> {
-    let started = tokio::time::Instant::now();
-    let queued_bytes = post.body.len() as u64;
-    loop {
-        // Cancel-safe: dropping this future while it waits leaves nothing behind.
-        let gate_permit = gate.acquire().await;
-        let permit = governor.acquire(queued_bytes).await?;
-        let failure = match send_once(post).await {
-            Ok(response) => return Ok((response, permit, gate_permit)),
-            Err(failure) => failure,
-        };
-        drop(permit);
-        drop(gate_permit);
-
-        let (hint, header_retry_after) = match &failure.response {
-            Some((status, headers)) => (
-                gate.note_response(*status, headers),
-                headers
-                    .get("retry-after")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| parse_retry_after(value, SystemTime::now())),
-            ),
-            None => (None, None),
-        };
-        let retry_after = header_retry_after.or(hint);
-        let delay = retry_delay(post.backoff_base, budget.used, retry_after);
-        if retry_after.is_some() || matches!(failure.error, ProviderError::RateLimited(_)) {
-            governor.start_cooldown(delay.max(MIN_429_COOLDOWN));
-        }
-        if failure.error.is_retryable() && hint.is_some() && started.elapsed() < MAX_QUEUE_WAIT {
-            // The shared cooldown paces this retry; the next `acquire` waits it out.
-            continue;
-        }
-        if failure.error.is_retryable() && budget.reserve() {
-            sleep_delay(delay).await;
-            continue;
-        }
-        return Err(failure.error);
-    }
-}
-
-/// One POST of `post`, keeping the status and headers of a failed answer for the gate.
-/// Mirrors `post::post_once` (header wait bounded by the idle budget, bounded error-body
-/// read, the same status classification).
-async fn send_once(post: &HttpPost<'_>) -> Result<reqwest::Response, GatedFailure> {
-    let timeout_secs = post
-        .stream_idle_secs
-        .saturating_mul(post.effort.idle_timeout_factor());
-    let header_wait = (post.stream_idle_secs > 0).then(|| Duration::from_secs(timeout_secs.max(1)));
-    let url = crate::redact(post.url);
-
-    let mut request = post.client.post(post.url).body(post.body.clone());
-    if !post
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-    {
-        request = request.header("Content-Type", "application/json");
-    }
-    if let Some(key) = post.api_key
-        && !key.is_empty()
-    {
-        request = request.header("Authorization", format!("Bearer {key}"));
-    }
-    for (name, value) in post.headers {
-        request = request.header(name, value);
-    }
-
-    let sent = match header_wait {
-        Some(wait) => match tokio::time::timeout(wait, request.send()).await {
-            Ok(result) => result,
-            Err(_) => {
-                log::warn!(
-                    "{label} request to {url}: no response headers within {timeout_secs}s",
-                    label = post.label
-                );
-                return Err(GatedFailure {
-                    error: ProviderError::IdleTimeout(timeout_secs),
-                    response: None,
-                });
-            }
-        },
-        None => request.send().await,
-    };
-
-    match sent {
-        Ok(mut response) => {
-            let status = response.status();
-            if status.is_success() {
-                return Ok(response);
-            }
-            let status = status.as_u16();
-            let headers = response.headers().clone();
-            let text = crate::error_body::read_response_body_with_limits(
-                &mut response,
-                MAX_ERROR_BODY_BYTES,
-                error_body_read_timeout(header_wait),
-            )
-            .await;
-            let redacted_body = crate::redact(&text);
-            log::trace!("{label} response body: {redacted_body}", label = post.label);
-            log::warn!(
-                "{label} request to {url} failed ({status}): {redacted_body}",
-                label = post.label
-            );
-            let message = crate::error_body_message(&text);
-            let error = match status {
-                401 | 403 => ProviderError::Auth(format!("{status}: {message}")),
-                429 => ProviderError::RateLimited(message),
-                529 => ProviderError::RateLimited(format!("overloaded: {message}")),
-                _ => ProviderError::Http { status, message },
-            };
-            Err(GatedFailure {
-                error,
-                response: Some((status, headers)),
-            })
-        }
-        Err(error) => {
-            let message = error.to_string();
-            log::warn!(
-                "{label} request transport error: {redacted}",
-                label = post.label,
-                redacted = crate::redact(&message)
-            );
-            Err(GatedFailure {
-                error: ProviderError::Transport(message),
-                response: None,
-            })
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -408,8 +326,6 @@ pub(crate) struct StreamOpener {
     pub(crate) stream_idle_secs: u64,
     pub(crate) effort: Effort,
     pub(crate) backoff_base: Duration,
-    /// Provider-wide concurrency permits and cooldown; shared with every other request.
-    pub(crate) gate: Arc<ProviderGate>,
 }
 
 impl StreamOpener {
@@ -452,8 +368,7 @@ impl StreamTransport for StreamOpener {
             effort: self.effort,
             backoff_base: self.backoff_base,
         };
-        let (response, permit, gate_permit) =
-            post_gated(&post, &self.gate, governor, budget).await?;
+        let (response, permit) = post_with_retries(&post, governor, budget).await?;
         let retry_after = RetryAfterSignal::default();
         let inner = crate::sse::create_event_stream_with_retry_after(
             response,
@@ -462,17 +377,12 @@ impl StreamTransport for StreamOpener {
             self.effort,
             retry_after.clone(),
         );
-        // Both permits live exactly as long as the stream (freed on end, error or drop);
-        // the gate permit also credits the AIMD increase on the first event.
+        // The slot is freed at `MessageEnd`, error or drop, and the first event
+        // credits the account's AIMD increase.
         Ok(OpenedStream {
-            stream: GatedStream::wrap(hold_permit(inner, permit), gate_permit),
+            stream: hold_permit(inner, permit),
             retry_after,
         })
-    }
-
-    fn note_stream_rate_limit(&self) {
-        self.gate
-            .note_response(STREAM_RATE_LIMIT_STATUS, &reqwest::header::HeaderMap::new());
     }
 
     fn release_body(&mut self) {
@@ -562,15 +472,11 @@ pub(crate) fn retrying_transport_stream<T: StreamTransport>(
                         .as_ref()
                         .and_then(|opened| opened.retry_after.take());
                     state.inner = None;
-                    let is_rate_limited = matches!(&error, ProviderError::RateLimited(_));
                     let delay =
                         retry_delay(state.opener.backoff_base(), state.budget.used, retry_after);
-                    if is_rate_limited || retry_after.is_some() {
-                        state.governor.start_cooldown(delay.max(MIN_429_COOLDOWN));
-                    }
-                    if is_rate_limited {
-                        state.opener.note_stream_rate_limit();
-                    }
+                    // A rate limit reported inside the stream (gateways relay upstream
+                    // 429s in a 200 body) parks and shrinks the account like an HTTP one.
+                    note_failure(&state.governor, &error, retry_after, delay);
 
                     if !state.committed && error.is_retryable() && state.budget.reserve() {
                         let attempt = state.budget.used;

@@ -75,6 +75,38 @@ fn a_running_turn_queues_the_message() {
 }
 
 #[test]
+fn queued_messages_are_capped_until_the_agent_reads_them() {
+    let sub = agent("sub");
+    let _turn = sub.turn_lock.try_lock().unwrap();
+    // Other injections do not count against the cap.
+    sub.injections
+        .push(Injection::SystemNotice("not a message".into()));
+    for i in 0..MAX_QUEUED_PARENT_MESSAGES {
+        assert!(
+            matches!(
+                sub.mailbox.offer(&sub, &format!("m{i}"), Consent::Absent),
+                Offer::Queued
+            ),
+            "message {i} fits"
+        );
+    }
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "one too many", Consent::Absent),
+        Offer::QueueFull
+    ));
+    assert_eq!(
+        queued_messages(&sub),
+        MAX_QUEUED_PARENT_MESSAGES,
+        "the refused message was not queued"
+    );
+    // Read (drained): room again.
+    assert!(matches!(
+        sub.mailbox.offer(&sub, "after the read", Consent::Absent),
+        Offer::Queued
+    ));
+}
+
+#[test]
 fn an_idle_sealed_or_stopping_agent_is_resumed_instead() {
     let sub = agent("sub");
     assert!(matches!(

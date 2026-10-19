@@ -48,6 +48,7 @@ impl Transcript {
         self.expanded.remove(&cell_id);
         self.stable_revisions.remove(&cell_id);
         self.cache.invalidate_cell(cell_id);
+        self.extents.remove(cell_id);
         self.tool_streams.remove(cell_id);
         let size = self.forget_bytes(cell_id);
         if !is_client_id(cell_id) {
@@ -160,6 +161,7 @@ impl Transcript {
             };
             let size = cell_bytes(&cell);
             self.set_cell_bytes(cell.id, size);
+            self.count_permission(&cell.kind, true);
             older.push_back(cell);
         }
         if older.is_empty() {
@@ -184,6 +186,7 @@ impl Transcript {
             cells,
             expanded,
             cache,
+            images,
             render_profile,
             tool_streams,
             ..
@@ -194,6 +197,7 @@ impl Transcript {
                 retained_prefix,
                 expanded,
                 cache,
+                images,
                 tool_streams,
                 profile,
             )

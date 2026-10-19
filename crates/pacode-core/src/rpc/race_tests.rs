@@ -435,3 +435,90 @@ async fn an_answer_whose_send_was_dropped_is_reported_to_the_orchestrator() {
     assert!(told.contains("answered"), "{told}");
     h.core.shutdown().await;
 }
+
+/// After `id`'s first `Stopped` card, every later card for it says `Stopped`
+/// too: nothing that was waiting put an old status back over the stop.
+fn stayed_stopped(h: &Harness, id: &pacode_types::AgentId) -> bool {
+    let statuses: Vec<AgentStatus> = h
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            pacode_types::Event::AgentUpdated(info) if &info.id == id => Some(info.status),
+            _ => None,
+        })
+        .collect();
+    let Some(first) = statuses.iter().position(|s| *s == AgentStatus::Stopped) else {
+        return false;
+    };
+    statuses[first..].iter().all(|s| *s == AgentStatus::Stopped)
+}
+
+/// The user stops a subagent blocked in `ask_parent` through a real turn: the
+/// question is cancelled on both transcripts, the asking call ends, and the
+/// agent stays `Stopped` — the waiter does not put `RunningTool` back.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_agent_cancels_its_blocked_question() {
+    let h = Harness::new().await;
+    let gate = spawn_parked(&h, tool("ask_parent", json!({"question": "which db?"}))).await;
+    // The orchestrator turn that is shown the question parks: nobody answers.
+    h.provider.script(false, vec![tool("gate", json!({}))]);
+    gate.add_permits(1);
+    let sub = h.sub();
+    wait_for("the question", || {
+        sub.mailbox.has_open_question() && sub.status() == AgentStatus::WaitingParent
+    })
+    .await;
+    h.gate_entered().await;
+
+    h.session.stop_agent(&sub.id()).await.unwrap();
+    wait_for("the stop", || !sub.is_running()).await;
+
+    assert_eq!(sub.status(), AgentStatus::Stopped);
+    assert!(!sub.mailbox.has_open_question());
+    let replies = h.question_replies();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    for (_, reply) in replies {
+        assert_eq!(reply, Some(AgentReply::Cancelled));
+    }
+    assert!(stayed_stopped(&h, &sub.id()), "{:?}", h.events());
+    h.gate.release.add_permits(1);
+    h.core.shutdown().await;
+}
+
+/// A stop that lands as the answered call is putting its status back keeps
+/// `Stopped`: the restore is a compare-and-set on `WaitingParent`, not a stop
+/// flag check followed by a plain set a stop could slip in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_while_the_answered_call_restores_its_status_wins() {
+    let h = Harness::new().await;
+    let gate = spawn_parked(&h, tool("ask_parent", json!({"question": "which db?"}))).await;
+    h.provider.script(
+        false,
+        vec![send_to("<agent_question", "postgres"), text("ok")],
+    );
+    h.provider.script(true, vec![text("unreachable")]);
+    let sub = h.sub();
+    {
+        let (session, sub) = (h.session.clone(), sub.clone());
+        hooks::install(sub.id(), Point::WaitRestoring, move || {
+            let id = sub.id();
+            race(async move { session.stop_agent(&id).await });
+            block_until("the stop", 10, || sub.status() == AgentStatus::Stopped);
+        });
+    }
+    gate.add_permits(1);
+
+    wait_for("the stop", || {
+        sub.status() == AgentStatus::Stopped && !sub.is_running()
+    })
+    .await;
+    assert!(stayed_stopped(&h, &sub.id()), "{:?}", h.events());
+    assert!(
+        !h.provider
+            .seen(false)
+            .iter()
+            .any(|r| r.contains("<agent_finished")),
+        "a stopped agent does not report as finished"
+    );
+    h.core.shutdown().await;
+}

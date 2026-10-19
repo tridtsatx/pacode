@@ -348,6 +348,22 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 } else {
                     ModelRoute::new("default", &arg)
                 };
+                // The palette never offers an embedding or image model as the
+                // conversation's; neither does the typed route.
+                if let Some(kind) = state
+                    .models
+                    .iter()
+                    .find(|model| model.route == route)
+                    .map(|model| model.kind)
+                    .filter(|kind| *kind != pacode_types::ModelKind::Chat)
+                {
+                    push_notice(
+                        state,
+                        ToastLevel::Warn,
+                        format!("{route} is not a chat model ({})", kind.as_str()),
+                    );
+                    return vec![];
+                }
                 // Downgrade the session effort if the new route can't run it
                 // (spec §6) — after the switch, and only if it succeeded.
                 let effort = state.clamp_effort(&route);

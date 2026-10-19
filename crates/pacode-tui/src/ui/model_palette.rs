@@ -24,7 +24,7 @@
 //! typing, moving, a catalog refresh — can leave it on a level that model
 //! rejects.
 
-use pacode_types::{AuthState, Effort, ModelInfo, ModelRoute, ProviderAuthInfo};
+use pacode_types::{AuthState, Effort, ModelInfo, ModelKind, ModelRoute, ProviderAuthInfo};
 
 use crate::state::AppState;
 use crate::ui::model_catalog::{Flags, Kind, fuzzy_score, next_effort, prev_effort, snap_effort};
@@ -144,6 +144,10 @@ pub struct LoginLine {
 pub struct ModelPalette {
     pub query: String,
     pub kind: Kind,
+    /// List the models the catalog classifies as embedding, image or other
+    /// too. Off by default: the palette picks the model that holds the
+    /// conversation, and those cannot (they stay unpickable when listed).
+    pub all_types: bool,
     /// Index among the *selectable* rows, clamped at use.
     pub cursor: usize,
     /// The first list row on screen, kept between frames so moving inside
@@ -182,12 +186,13 @@ impl ModelPalette {
     /// then one group per provider — signed-in first, then the ones that need
     /// a sign-in; within each, groups with models before the ones whose
     /// catalog is empty. Sign-in headers ignore the ZDR and kind filters:
-    /// they list no models.
+    /// they list no models. Non-chat models are left out unless
+    /// [`all_types`](Self::all_types) is on.
     pub fn rows<'a>(&self, src: &Sources<'a>) -> Vec<Row<'a>> {
         let query = self.query.trim();
         let mut groups: Vec<Group<'a>> = Vec::new();
         for model in src.models {
-            if !self.kind.keeps(model) {
+            if !self.kind.keeps(model) || !(self.all_types || model.kind == ModelKind::Chat) {
                 continue;
             }
             // One key and one flag lookup per model, reused by the filter,
@@ -423,6 +428,12 @@ impl ModelPalette {
 
     pub fn cycle_kind(&mut self) {
         self.kind = self.kind.next();
+        self.reset_selection();
+    }
+
+    /// The types chord: list non-chat models too, or chat models only again.
+    pub fn toggle_types(&mut self) {
+        self.all_types = !self.all_types;
         self.reset_selection();
     }
 

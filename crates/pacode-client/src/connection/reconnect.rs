@@ -849,6 +849,33 @@ async fn do_reconnect_attach(
     }
 }
 
+/// Replay the caller's `Subscribe` on a new connection. The daemon keeps interest per
+/// connection, so without this a reconnected client would silently get every agent's
+/// stream again. It goes out before the attach, so the new session forwarder filters
+/// from its first event. A daemon that refuses it leaves the default (everything),
+/// which costs volume, never correctness.
+async fn do_reconnect_subscribe(
+    write_half: &mut OwnedWriteHalf,
+    reader: &mut BufReader<OwnedReadHalf>,
+    request_id: u64,
+    request: Request,
+    timeout: std::time::Duration,
+    cancel_token: &CancellationToken,
+) -> Result<BufferedEvents, HandshakeFailure> {
+    let envelope = Envelope {
+        id: request_id,
+        req: request,
+    };
+    write_handshake(write_half, &envelope, timeout, cancel_token)
+        .await
+        .map_err(|kind| HandshakeFailure::new(kind, BufferedEvents::default()))?;
+    let (reply, events) = read_reply_handshake(reader, request_id, timeout, cancel_token).await?;
+    if let Reply::Error { message } = reply {
+        log::warn!("daemon refused the replayed subscription: {message}");
+    }
+    Ok(events)
+}
+
 async fn do_reconnect_detach(
     write_half: &mut OwnedWriteHalf,
     reader: &mut BufReader<OwnedReadHalf>,
@@ -898,6 +925,8 @@ pub(crate) struct SupervisorCtx {
     pub writer: Option<WriterGeneration>,
     pub lifecycle: Arc<LifecycleState>,
     pub cancel_token: CancellationToken,
+    /// The last `Subscribe` the caller sent; replayed on every new connection.
+    pub interest: super::DesiredInterest,
 }
 
 async fn stop_transport(ctx: &mut SupervisorCtx) {
@@ -1050,6 +1079,36 @@ async fn run_supervisor_loop(ctx: &mut SupervisorCtx) {
             };
             let (daemon_version, pid, version_mismatch, events) = hello;
             pending_events.merge(events);
+            let subscribe = lock(&ctx.interest)
+                .clone()
+                .map(|(agents, all)| Request::Subscribe { agents, all });
+            if let Some(subscribe) = subscribe {
+                match do_reconnect_subscribe(
+                    &mut write_half,
+                    &mut current_reader,
+                    ctx.next_id.fetch_add(1, Ordering::Relaxed),
+                    subscribe,
+                    ctx.opts.request_timeout,
+                    &ctx.cancel_token,
+                )
+                .await
+                {
+                    Ok(events) => pending_events.merge(events),
+                    Err(failure) => {
+                        if is_terminal_handshake_error(&failure.kind) {
+                            let reason = client_error(failure.kind).to_string();
+                            stop_transport(ctx).await;
+                            ctx.events_tx.terminate(ClientEvent::Disconnected {
+                                context: ctx.lifecycle.context(),
+                                reason,
+                            });
+                            return;
+                        }
+                        pending_events.merge(failure.events);
+                        continue;
+                    }
+                }
+            }
             if pending_events.overflowed {
                 ctx.events_tx.terminate(ClientEvent::Disconnected {
                     context: ctx.lifecycle.context(),

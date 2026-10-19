@@ -768,3 +768,93 @@ fn the_list_holds_still_while_the_selection_moves_inside_it() {
     };
     assert_eq!(names(&before), names(&after));
 }
+
+fn alt(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+}
+
+/// A catalog with an embedding model next to the chat ones.
+fn with_embedding(state: &mut AppState) {
+    state.models.push(ModelInfo {
+        kind: pacode_types::ModelKind::Embedding,
+        ..model("p", "text-embedding-3", None)
+    });
+}
+
+#[test]
+fn embedding_models_are_listed_only_after_the_types_chord() {
+    let (mut state, _dir) = state();
+    with_embedding(&mut state);
+    open(&mut state);
+    for c in "embed".chars() {
+        press(&mut state, key(KeyCode::Char(c)));
+    }
+    let listed = |state: &AppState| {
+        let src = crate::ui::model_palette::Sources::of(state);
+        palette(state).rows(&src).iter().any(|row| {
+            matches!(row, crate::ui::model_palette::Row::Model { model, .. }
+                    if model.route.model == "text-embedding-3")
+        })
+    };
+    assert!(!listed(&state), "chat models only by default");
+    assert!(press(&mut state, alt('t')).is_empty());
+    assert!(palette(&state).all_types);
+    assert!(listed(&state));
+    assert!(press(&mut state, alt('t')).is_empty());
+    assert!(!listed(&state));
+}
+
+#[test]
+fn an_embedding_model_cannot_become_the_chat_model() {
+    let (mut state, _dir) = state();
+    with_embedding(&mut state);
+    open(&mut state);
+    press(&mut state, alt('t'));
+    for c in "embed".chars() {
+        press(&mut state, key(KeyCode::Char(c)));
+    }
+    let actions = press(&mut state, key(KeyCode::Enter));
+    assert!(actions.is_empty(), "nothing sent: {actions:?}");
+    palette(&state);
+    assert!(
+        notices(&state)
+            .iter()
+            .any(|text| text.contains("not a chat model")),
+        "{:?}",
+        notices(&state)
+    );
+}
+
+#[test]
+fn the_compaction_chord_sets_and_clears_the_compaction_model() {
+    let (mut state, _dir) = state();
+    open(&mut state);
+    // Opens on `p/a`; move to `p/b`.
+    press(&mut state, key(KeyCode::Down));
+    assert!(
+        press(&mut state, alt('c')).is_empty(),
+        "nothing for the daemon"
+    );
+    assert_eq!(
+        state.config.context.compaction_model.as_deref(),
+        Some("p/b")
+    );
+    palette(&state);
+
+    // Again on the same model: back to the session model.
+    press(&mut state, alt('c'));
+    assert_eq!(state.config.context.compaction_model, None);
+}
+
+#[test]
+fn an_embedding_model_cannot_compact() {
+    let (mut state, _dir) = state();
+    with_embedding(&mut state);
+    open(&mut state);
+    press(&mut state, alt('t'));
+    for c in "embed".chars() {
+        press(&mut state, key(KeyCode::Char(c)));
+    }
+    press(&mut state, alt('c'));
+    assert_eq!(state.config.context.compaction_model, None);
+}

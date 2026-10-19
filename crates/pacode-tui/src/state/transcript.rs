@@ -15,6 +15,8 @@ use pacode_render::{LineCache, RenderOptions, StreamBuffer, StreamKind};
 use crate::ui::toolgroup::GroupHead;
 use pacode_types::{PermissionId, PermissionRequest, ToolStatus, TranscriptItem, TranscriptKind};
 
+#[path = "cell_extent.rs"]
+pub mod cell_extent;
 #[path = "tool_stream.rs"]
 mod tool_stream;
 #[path = "transcript_cell.rs"]
@@ -80,6 +82,11 @@ pub struct Transcript {
     /// path that adds, replaces or drops a cell.
     cell_bytes: HashMap<u64, usize>,
     bytes: usize,
+    /// Permission prompts among the cells, kept in step by every path that
+    /// adds, replaces or resolves one (`append_indexed`, `prepend`,
+    /// `resolve_permission`); eviction never drops one (they are pinned). Read
+    /// on every loop pass (`needs_anim_tick`), where a scan of the cells was.
+    pending_permissions: usize,
     /// Scroll offset in rendered lines from the bottom; 0 = follow the tail.
     pub scroll_from_bottom: usize,
     /// Total rendered line count recorded by the most recent draw. `None` before first draw.
@@ -100,6 +107,13 @@ pub struct Transcript {
     /// click there opens the whole group rather than one call of it.
     pub(crate) group_heads: Vec<GroupHead>,
     pub cache: LineCache,
+    /// Line count of every block as last measured, so a frame lays the whole
+    /// transcript out but renders only what overlaps the viewport; see
+    /// `cell_extent` for cap and invalidation.
+    pub extents: cell_extent::CellExtents,
+    /// Blocks the most recent draw rendered or fetched (not answered from
+    /// `extents`): what a frame costs beyond the layout pass.
+    pub cells_laid_out: usize,
     pub(crate) stable_revisions: HashMap<u64, StableRevision>,
     pub(crate) cell_line_index: HashMap<u64, usize>,
     /// Monotonic source of client-allocated cell ids; survives `reset` so an id
@@ -135,6 +149,7 @@ impl Transcript {
             max_bytes: MAX_TRANSCRIPT_BYTES,
             cell_bytes: HashMap::new(),
             bytes: 0,
+            pending_permissions: 0,
             scroll_from_bottom: 0,
             rendered_lines: None,
             viewport_height: None,
@@ -143,6 +158,8 @@ impl Transcript {
             cell_lines: Vec::new(),
             group_heads: Vec::new(),
             cache: LineCache::new(20_000),
+            extents: cell_extent::CellExtents::default(),
+            cells_laid_out: 0,
             stable_revisions: HashMap::new(),
             cell_line_index: HashMap::new(),
             next_client_id: 0,
@@ -170,14 +187,36 @@ impl Transcript {
         self.images.truecolor = truecolor;
     }
 
+    /// A decoded inline image came back from the event loop (see
+    /// `state::image_cache`): keep it, and drop the lines and the measured
+    /// height of every cell that drew its stub, so the next frame draws it.
+    pub fn image_ready(
+        &mut self,
+        key: crate::state::image_cache::ImageKey,
+        decoded: Result<pacode_image::InlineImage, String>,
+    ) {
+        let hash = key.hash.clone();
+        self.images.insert(key, decoded);
+        for cell in &self.cells {
+            if let CellKind::Item(TranscriptKind::Images { images }) = &cell.kind
+                && images.iter().any(|image| image.hash == hash)
+            {
+                self.cache.invalidate_cell(cell.id);
+                self.extents.remove(cell.id);
+            }
+        }
+    }
+
     /// Replace everything (snapshot).
     pub fn reset(&mut self, items: Vec<TranscriptItem>, has_more: bool) {
         self.cells.clear();
         self.cache.clear();
+        self.extents.clear();
         self.stable_revisions.clear();
         self.cell_line_index.clear();
         self.cell_bytes.clear();
         self.bytes = 0;
+        self.pending_permissions = 0;
         self.evicted_floor = None;
         self.render_profile = None;
         self.images.clear();
@@ -264,11 +303,54 @@ impl Transcript {
         let size = cell_bytes(&cell);
         if let Some(index) = self.cell_index(cell.id) {
             self.set_cell_bytes(cell.id, size);
-            self.cells[index] = cell;
+            self.count_permission(&cell.kind, true);
+            let old = std::mem::replace(&mut self.cells[index], cell);
+            self.count_permission(&old.kind, false);
             return;
         }
         self.set_cell_bytes(cell.id, size);
+        self.count_permission(&cell.kind, true);
         self.cells.push_back(cell);
+    }
+
+    /// Keep `pending_permissions` in step with a cell of `kind` coming in
+    /// (`added`) or going out.
+    pub(super) fn count_permission(&mut self, kind: &CellKind, added: bool) {
+        if !matches!(kind, CellKind::Item(TranscriptKind::Permission(_))) {
+            return;
+        }
+        self.pending_permissions = if added {
+            self.pending_permissions.saturating_add(1)
+        } else {
+            self.pending_permissions.saturating_sub(1)
+        };
+    }
+
+    /// Permission prompts still waiting for a verdict.
+    pub fn pending_permissions(&self) -> usize {
+        self.pending_permissions
+    }
+
+    /// The verdict on `permission` landed: its prompt turns into the notice
+    /// `notice` makes of the request. False when no prompt carries it.
+    pub fn resolve_permission(
+        &mut self,
+        permission: &PermissionId,
+        notice: impl FnOnce(&PermissionRequest) -> (pacode_types::ToastLevel, String),
+    ) -> bool {
+        let Some(index) = self.permission_cell_index(permission) else {
+            return false;
+        };
+        let cell = &mut self.cells[index];
+        let CellKind::Item(TranscriptKind::Permission(req)) = &cell.kind else {
+            return false;
+        };
+        let (level, text) = notice(req);
+        cell.kind = CellKind::Item(TranscriptKind::Notice { level, text });
+        cell.perm_explain = None;
+        cell.version = cell.version.wrapping_add(1);
+        self.pending_permissions = self.pending_permissions.saturating_sub(1);
+        true
     }
 
     /// Set or update the non-persisted header banner.

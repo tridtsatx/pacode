@@ -16,7 +16,7 @@ mod request;
 mod stream;
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -56,9 +56,6 @@ pub struct Codex {
     /// Single-flight for `list_models`: concurrent misses share one catalogue GET.
     catalog_fetch: tokio::sync::Mutex<()>,
     backoff_base: Duration,
-    /// Adaptive concurrency limit and cooldown, shared by every instance of this provider
-    /// entry (see [`crate::provider_gate`]).
-    gate: Arc<crate::gate::ProviderGate>,
 }
 
 impl Codex {
@@ -84,8 +81,6 @@ impl Codex {
             .build()
             .map_err(|e| ProviderError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        let gate = crate::provider_gate(&id, &cfg.base_url, defaults.max_concurrent);
-
         Ok(Self {
             id,
             cfg,
@@ -96,7 +91,6 @@ impl Codex {
             catalog_cache: Mutex::new(None),
             catalog_fetch: tokio::sync::Mutex::new(()),
             backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
-            gate,
         })
     }
 
@@ -354,7 +348,6 @@ impl Provider for Codex {
             stream_idle_secs: self.defaults.stream_idle_secs,
             effort,
             backoff_base: self.backoff_base,
-            gate: Arc::clone(&self.gate),
         };
 
         opener.open(RetryBudget::new(max_retries)).await
@@ -379,10 +372,6 @@ impl Provider for Codex {
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         self.fetch_models().await
-    }
-
-    fn queue_depth(&self) -> usize {
-        self.gate.queued()
     }
 
     fn model_info(&self, model: &str) -> ModelInfo {

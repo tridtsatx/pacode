@@ -176,6 +176,26 @@ impl AppState {
             .as_deref()
     }
 
+    /// Whether the current route has any reasoning effort to show. Only a
+    /// catalog entry that says so takes it away — `supports_reasoning` off, or
+    /// an enumerated ladder that is empty; a route the catalog does not know,
+    /// or one whose levels are unknown (`None`), keeps it.
+    pub fn has_effort_control(&self) -> bool {
+        let Some(route) = self.meta.as_ref().map(|meta| &meta.model) else {
+            return true;
+        };
+        self.models
+            .iter()
+            .find(|model| &model.route == route)
+            .is_none_or(|model| {
+                model.supports_reasoning
+                    && model
+                        .supported_efforts
+                        .as_ref()
+                        .is_none_or(|levels| !levels.is_empty())
+            })
+    }
+
     /// Whether `effort` may be selected on the current route (spec §6).
     pub fn effort_supported(&self, effort: Effort) -> bool {
         self.supported_efforts().is_none_or(|l| l.contains(&effort))

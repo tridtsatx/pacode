@@ -131,6 +131,13 @@ pub(super) enum BgResponse {
         cell_h: u16,
         preview: Option<pacode_image::Preview>,
     },
+    /// An inline transcript image decoded off the frame path. Not scoped to a
+    /// session: the cells are keyed by content hash, so they are right for any
+    /// transcript that shows that image.
+    InlineImageReady {
+        key: crate::state::image_cache::ImageKey,
+        decoded: Result<pacode_image::InlineImage, String>,
+    },
     CopyDone {
         context: SessionContext,
         client_context: ClientEventContext,
@@ -407,6 +414,19 @@ fn fold_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
                     preview,
                 },
             );
+            state.dirty = true;
+            vec![]
+        }
+        BgResponse::InlineImageReady { key, decoded } => {
+            if !state.inline_image_jobs.finish(&key) {
+                return Vec::new();
+            }
+            // Both transcripts take it: whichever drew the stub redraws it.
+            state
+                .panel
+                .agent_transcript
+                .image_ready(key.clone(), decoded.clone());
+            state.transcript.image_ready(key, decoded);
             state.dirty = true;
             vec![]
         }

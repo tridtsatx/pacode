@@ -224,21 +224,7 @@ impl InputState {
         self.insert_str(c.encode_utf8(&mut buf));
     }
 
-    /// Remove an image chip whole and put the cursor where it started.
-    fn remove_chip(&mut self, chip: crate::attachments::Chip) {
-        let start_byte = char_to_byte_index(&self.text, chip.start);
-        let end_byte = char_to_byte_index(&self.text, chip.end);
-        self.text.replace_range(start_byte..end_byte, "");
-        self.cursor = chip.start;
-        self.at_closed = false;
-        self.bash_complete_closed = false;
-    }
-
     pub fn backspace(&mut self) {
-        if let Some(chip) = crate::attachments::chip_for_backspace(&self.text, self.cursor) {
-            self.remove_chip(chip);
-            return;
-        }
         if self.cursor > 0 {
             let start_byte = char_to_byte_index(&self.text, self.cursor - 1);
             let end_byte = char_to_byte_index(&self.text, self.cursor);
@@ -251,10 +237,6 @@ impl InputState {
     }
 
     pub fn delete(&mut self) {
-        if let Some(chip) = crate::attachments::chip_for_delete(&self.text, self.cursor) {
-            self.remove_chip(chip);
-            return;
-        }
         let len = self.text.chars().count();
         if self.cursor < len {
             let start_byte = char_to_byte_index(&self.text, self.cursor);

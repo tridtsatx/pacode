@@ -128,6 +128,48 @@ pub(crate) fn resolve_from(
     })
 }
 
+/// The subagent rows `prepared` draws, as indices among the subagents in rail
+/// order — the same walk `draw_agents` makes, without drawing. Nothing when
+/// the rail is hidden, shows the session block, or only counts the agents.
+pub(crate) fn drawn_agents(
+    state: &AppState,
+    prepared: Option<&PreparedRail>,
+) -> std::ops::Range<usize> {
+    let Some(prepared) = prepared else {
+        return 0..0;
+    };
+    let height = usize::from(prepared.layout.agents.height);
+    let drawn = prepared.select_mode || (!prepared.show_session && prepared.has_subagents);
+    if !drawn || height < 4 {
+        return 0..0;
+    }
+    let count = state
+        .rail
+        .agents
+        .iter()
+        .filter(|agent| !agent.id.is_main())
+        .count();
+    // The title and the main agent's row come first.
+    let room = height - 2;
+    if let Some(selected) = prepared.selected_subagent {
+        // From the scroll down: the selected row takes three lines, the rest one.
+        let start = prepared.agents_scroll.min(count);
+        let mut lines = 0;
+        let mut end = start;
+        while end < count && lines < room {
+            lines += if end == selected { 3 } else { 1 };
+            end += 1;
+        }
+        return start..end;
+    }
+    if count <= room {
+        0..count
+    } else {
+        // The last line says `and N more`.
+        0..room.saturating_sub(1)
+    }
+}
+
 pub(crate) fn persist(state: &mut AppState, prepared: &PreparedRail) {
     if prepared.selected_subagent.is_some() && prepared.layout.agents.height >= 4 {
         state.rail.agents_scroll = prepared.agents_scroll;

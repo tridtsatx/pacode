@@ -5,7 +5,9 @@
 //! [`Mailbox`] lock in one step:
 //! - **asking** — blocked in `ask_parent`: the message is the answer;
 //! - **accepting** — a turn owns the agent and has not decided to finish: the
-//!   message is queued as `<orchestrator_message>` and read at the next step.
+//!   message is queued as `<orchestrator_message>` and read at the next step
+//!   (at most `mailbox::MAX_QUEUED_PARENT_MESSAGES` unread; past it `send`
+//!   is refused).
 //!   A turn that is about to finish checks the queue under the same lock
 //!   before it seals itself (`seal_unless_message`), so a message that lands
 //!   in its last moments re-drives it instead of being dropped with it;
@@ -119,6 +121,13 @@ pub(crate) async fn send(
                 post(session, &agent, item);
                 return Ok(SendOutcome::Delivered);
             }
+            Offer::QueueFull => {
+                return Err(ToolError::failed(format!(
+                    "agent {target} already has {} unread messages; wait for it to read them \
+                     (it does at its next step) before sending more",
+                    mailbox::MAX_QUEUED_PARENT_MESSAGES
+                )));
+            }
             Offer::StoppedByUser => return Err(ToolError::failed(kept_stopped(target, consent))),
             Offer::Ended => {}
         }
@@ -201,6 +210,13 @@ async fn resume(
         | AgentStatus::Finished
         | AgentStatus::Stopped => {}
     }
+    // An ended agent is not live; the resume makes it live again, under the
+    // same `submit_lock` a spawn checks the cap under.
+    if !info.status.is_live() {
+        session
+            .check_live_cap()
+            .map_err(|e| ToolError::failed(e.to_string()))?;
+    }
     #[cfg(test)]
     hooks::run(&id, hooks::Point::ResumeChecked);
     // Held until the turn is started, as `continue_agent` does. A stop moves
@@ -236,9 +252,9 @@ async fn resume(
         *agent.history.lock().unwrap_or_else(|p| p.into_inner()) = history;
     }
     agent.commit_pending_user_messages();
-    let message = crate::inject::render_injections(
+    let message = crate::inject::render_for(
+        &session.config.context,
         &[Injection::ParentMessage { text }],
-        session.config.context.injection_cap_chars,
     );
     // Straight to the store: `append_agent_message` takes the message lock
     // this function already holds.
@@ -287,6 +303,14 @@ async fn resume(
     // The ended turn's finalization has run (this call holds the lock it ran
     // under), so its report is queued or parked on `from` by now, if unread.
     let previous_report = take_unread_report(&session, &from, &id);
+    // A fresh turn budget (`agents.max_turns`) and the live transcript tail a
+    // finished agent gave up when it was retired.
+    agent.reset_steps();
+    agent
+        .transcript
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .reopen(session.config.session.history_page as usize * 2);
     post(&session, &from, item.clone());
     post(&session, &agent, item);
     agent.set_status(AgentStatus::Idle, None);

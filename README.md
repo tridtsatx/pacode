@@ -225,12 +225,13 @@ and cost about 64 bytes each.
 **Subagents.** Spawn them, watch them in the rail, select one and its conversation
 takes over the column (`ui.agent_view = "panel"` splits instead). They report back
 as an injection between steps, never mid-stream. The orchestrator talks to a
-running one through the `agent` tool: `message` sends an instruction or
-correction, `answer` replies to a question, `result` fetches the final answer if
-the delivered report was cut short. A subagent that is blocked can put a question
-to its orchestrator with `ask_parent`; `agents.ask_parent_timeout_secs` and
-`agents.ask_parent_max` bound the wait and the number of questions. Named subagent
-kinds come from `agents/*.md` files.
+running one through the `agent` tool: `send` delivers an instruction (a running
+agent reads it at its next step, a finished one is resumed with it; at most 16
+unread messages queue per agent), `result` fetches the final answer if the
+delivered report was cut short. A subagent that is blocked can put a question to
+its orchestrator with `ask_parent` and waits for the answer. `agents.max_live`
+bounds live subagents and `agents.max_turns` stops a runaway subagent loop. Named
+subagent kinds come from `agents/*.md` files.
 
 **Agents do not clobber each other.** Main agent and subagents write one working
 tree, with no worktrees. A file ownership ledger (in memory, per session) tracks
@@ -289,16 +290,16 @@ read-only and a flag a utility does not implement is an error, never ignored. A
 expansion) takes the same fast path and falls back to the real shell on any
 failure, so error text comes from the real tools.
 
-**Images.** `ctrl+v` pastes an image as a chip in the prompt; it is removed whole.
-Images in the transcript are drawn inline as half-block cells, so they scroll and
+**Images.** `ctrl+v` pastes an image as an `[Image N]` token in the prompt, with a
+thumbnail strip above it. The daemon copies sent images into its content store, so
+they stay in the conversation after the TUI exits. Images in the transcript are drawn inline as half-block cells, so they scroll and
 redraw like text (`ui.images = "off"` shows a one-line stub instead). Sending an
-image to a model that does not report vision support is refused with a message
-rather than silently dropped.
+image to a model that does not report vision support sends a text placeholder
+instead.
 
-**Todo guard.** If the model ends its turn while the plan still has open items, a
-reminder is injected and it continues. `agents.todo_guard` (default on) and
-`agents.todo_guard_max_reminders` bound it per user turn; only the main agent is
-guarded.
+**Plan reminders.** If the model ends its turn while the plan still has open items,
+a reminder is injected and it continues; it stays quiet while subagents or
+background tasks are running.
 
 **Compaction.** Triggered at `context.compaction_threshold` of the window, aimed at
 `context.compaction_target_ratio`. First a mechanical shake replaces old large tool
@@ -375,13 +376,11 @@ conversation in place), `/new` (a fresh session), `/export`, `/help`.
 
 Every binding is rebindable from `/keys`.
 
-**Model picker.** `/model` lists providers on the left and their models on the
-right, with context window, a detail line for the highlighted model and a search
-box. `alt+←` / `alt+→` filters by kind (chat, image, embedding, other). `r` picks
-which role the next choice applies to: `default` (the session's model), `agents`
-(`agents.default_model` and `agents.default_effort`) or `compaction`
-(`context.compaction_model`). Effort is limited to the levels the chosen model
-actually supports.
+**Model palette.** It lists chat models by default; `alt+t` also shows image,
+embedding and other models, which cannot be chosen as the session model. `alt+c`
+sets the highlighted model as `context.compaction_model` (again to clear it).
+Subagents inherit the session's model and effort. Effort is limited to the levels
+the chosen model actually supports.
 
 ## Resource limits
 

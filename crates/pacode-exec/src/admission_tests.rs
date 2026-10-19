@@ -93,3 +93,116 @@ async fn full_queue_is_refused() {
     let res = adm.acquire(None).await;
     assert!(matches!(res, Err(ExecError::TooManyTasks(1))));
 }
+
+/// Poll a future once with a no-op waker.
+fn poll_once<F: std::future::Future + ?Sized>(
+    fut: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    fut.poll(&mut cx)
+}
+
+#[test]
+fn a_release_hands_the_slot_to_the_head_only() {
+    let adm = Arc::new(Admission::new(1));
+    let held = adm.try_acquire().unwrap();
+    let mut a = Box::pin(adm.acquire(None));
+    let mut b = Box::pin(adm.acquire(None));
+    assert!(poll_once(a.as_mut()).is_pending());
+    assert!(poll_once(b.as_mut()).is_pending());
+    assert_eq!(adm.queued(), 2);
+
+    drop(held);
+    // The slot went to `a`; `b` stays queued and the slot never became free.
+    assert_eq!(adm.queued(), 1);
+    assert_eq!(adm.active(), 1);
+    assert!(adm.try_acquire().is_none());
+    assert!(poll_once(b.as_mut()).is_pending());
+    let std::task::Poll::Ready(Ok(permit_a)) = poll_once(a.as_mut()) else {
+        panic!("head waiter should hold the slot");
+    };
+    drop(permit_a);
+    assert!(matches!(
+        poll_once(b.as_mut()),
+        std::task::Poll::Ready(Ok(_))
+    ));
+}
+
+#[test]
+fn a_waiter_dropped_after_the_hand_over_passes_the_slot_on() {
+    let adm = Arc::new(Admission::new(1));
+    let held = adm.try_acquire().unwrap();
+    let mut a = Box::pin(adm.acquire(None));
+    let mut b = Box::pin(adm.acquire(None));
+    assert!(poll_once(a.as_mut()).is_pending());
+    assert!(poll_once(b.as_mut()).is_pending());
+
+    drop(held);
+    // `a` was handed the slot but never resumed: dropping it must not leak the slot.
+    drop(a);
+    assert_eq!(adm.queued(), 0);
+    let std::task::Poll::Ready(Ok(permit_b)) = poll_once(b.as_mut()) else {
+        panic!("the slot should have moved on to the next waiter");
+    };
+    drop(permit_b);
+    assert_eq!(adm.active(), 0);
+}
+
+#[test]
+fn a_waiter_cancelled_at_the_hand_over_starts_nothing_and_passes_the_slot_on() {
+    let adm = Arc::new(Admission::new(1));
+    let held = adm.try_acquire().unwrap();
+    let token = CancellationToken::new();
+    let mut a = Box::pin(adm.acquire(Some(&token)));
+    let mut b = Box::pin(adm.acquire(None));
+    assert!(poll_once(a.as_mut()).is_pending());
+    assert!(poll_once(b.as_mut()).is_pending());
+
+    drop(held);
+    token.cancel();
+    assert!(matches!(
+        poll_once(a.as_mut()),
+        std::task::Poll::Ready(Err(ExecError::Cancelled))
+    ));
+    drop(a);
+    assert!(matches!(
+        poll_once(b.as_mut()),
+        std::task::Poll::Ready(Ok(_))
+    ));
+    drop(b);
+    assert_eq!(adm.active(), 0);
+    assert_eq!(adm.queued(), 0);
+}
+
+#[test]
+fn a_dropped_waiter_releases_its_queue_position() {
+    let adm = Arc::new(Admission::new(1));
+    let held = adm.try_acquire().unwrap();
+    let mut a = Box::pin(adm.acquire(None));
+    let mut b = Box::pin(adm.acquire(None));
+    assert!(poll_once(a.as_mut()).is_pending());
+    assert!(poll_once(b.as_mut()).is_pending());
+    drop(a);
+    assert_eq!(adm.queued(), 1);
+    drop(held);
+    assert!(matches!(
+        poll_once(b.as_mut()),
+        std::task::Poll::Ready(Ok(_))
+    ));
+}
+
+#[test]
+fn try_acquire_never_overtakes_a_waiter() {
+    let adm = Arc::new(Admission::new(2));
+    let first = adm.try_acquire().unwrap();
+    let _second = adm.try_acquire().unwrap();
+    assert!(adm.try_acquire().is_none());
+    let mut waiter = Box::pin(adm.acquire(None));
+    assert!(poll_once(waiter.as_mut()).is_pending());
+    drop(first);
+    assert!(adm.try_acquire().is_none());
+    assert!(matches!(
+        poll_once(waiter.as_mut()),
+        std::task::Poll::Ready(Ok(_))
+    ));
+}

@@ -589,6 +589,11 @@ pub struct Agent {
     /// Plan reminders sent for the current user message (main agent only;
     /// see `plan_reminder`). A detached agent keeps its copy and never reads it.
     pub(crate) plan_reminders: Mutex<crate::plan_reminder::Budget>,
+    /// Model steps this subagent ran since it was spawned or last re-driven by
+    /// a resume or a `continue` (cap `agents.max_turns`, checked in `run_turn`).
+    steps: std::sync::atomic::AtomicU32,
+    /// The last turn ended at `agents.max_turns`; taken by the report it ends with.
+    step_capped: std::sync::atomic::AtomicBool,
 }
 
 impl Agent {
@@ -633,7 +638,33 @@ impl Agent {
             spawned_at: Mutex::new(None),
             fusion: Mutex::new(None),
             plan_reminders: Mutex::new(crate::plan_reminder::Budget::default()),
+            steps: std::sync::atomic::AtomicU32::new(0),
+            step_capped: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Count one model step; returns the count including it.
+    pub(crate) fn count_step(&self) -> u32 {
+        self.steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// The running turn is ending because it reached `agents.max_turns`.
+    pub(crate) fn mark_step_capped(&self) {
+        self.step_capped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the turn that just ended was cut by `agents.max_turns`; clears it.
+    pub(crate) fn take_step_capped(&self) -> bool {
+        self.step_capped
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// An explicit re-drive (resume, `continue`) starts a fresh step budget.
+    pub(crate) fn reset_steps(&self) {
+        self.steps.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Mark this agent as freshly spawned, which starts the clock the turn loop
@@ -693,6 +724,8 @@ impl Agent {
             spawned_at: Mutex::new(None),
             fusion: Mutex::new(None),
             plan_reminders: Mutex::new(crate::plan_reminder::Budget::default()),
+            steps: std::sync::atomic::AtomicU32::new(0),
+            step_capped: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1249,8 +1282,10 @@ impl Agent {
         }
     }
 
-    /// Set `status`/`activity` only if the agent is still in status `from` (a stop
-    /// that landed meanwhile wins). Returns whether it changed.
+    /// [`set_status`](Self::set_status) only if the agent is still in status
+    /// `from`, checked and set under one write lock: a stop that landed meanwhile
+    /// (`Stopped`) wins over a waiter putting its old status back. Returns whether
+    /// it changed.
     pub fn restore_status(
         &self,
         from: AgentStatus,
@@ -1263,6 +1298,11 @@ impl Agent {
         }
         info.status = status;
         info.activity = activity;
+        if status.is_live() {
+            info.finished_at_ms = None;
+        } else if info.finished_at_ms.is_none() {
+            info.finished_at_ms = Some(pacode_types::now_ms());
+        }
         true
     }
 

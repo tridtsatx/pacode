@@ -273,6 +273,8 @@ pub enum AgentStatus {
     RunningTool,
     WaitingApproval,
     /// A subagent blocked in `ask_parent` until the orchestrator answers.
+    /// `waiting_orchestrator` is the name a pre-merge branch build wrote.
+    #[serde(alias = "waiting_orchestrator")]
     WaitingParent,
     Finished,
     Failed,
@@ -720,6 +722,15 @@ mod tests {
         }
         assert!(AgentStatus::WaitingParent.is_live());
         assert!(AgentStatus::WaitingParent.is_active());
+    }
+
+    /// A pre-merge branch build serialized the same status as
+    /// `waiting_orchestrator`; it still decodes, and re-encodes under the new name.
+    #[test]
+    fn agent_status_accepts_the_old_waiting_orchestrator_name() {
+        let back: AgentStatus = serde_json::from_str("\"waiting_orchestrator\"").unwrap();
+        assert_eq!(back, AgentStatus::WaitingParent);
+        assert_eq!(serde_json::to_string(&back).unwrap(), "\"waiting_parent\"");
     }
 
     fn item(status: PlanStatus, progress: Option<u8>) -> PlanItem {

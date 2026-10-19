@@ -173,21 +173,64 @@ fn deprecated_agent_keys_load_without_overriding_inherited_defaults() {
 
 #[test]
 fn dead_limit_keys_load_as_no_ops() {
-    // pacode caps no agents, no provider queue and no per-turn calls; a config
-    // still carrying those keys must load, and must fall back to the defaults.
+    // pacode caps no provider queue and no per-turn calls; a config still
+    // carrying those keys must load, and must fall back to the defaults.
     let cfg = parse(
         "[limits]\n\
          max_logical_agents = 32\n\
          max_provider_queue_items = 8192\n\
          max_provider_queue_bytes = 134217728\n\
          max_exec_calls_per_turn = 64\n\
-         max_tool_calls_per_turn = 512\n\
-         [agents]\n\
-         max_live = 24\n\
-         max_turns = 10000\n",
+         max_tool_calls_per_turn = 512\n",
     )
     .expect("dead limit keys must remain loadable");
 
+    assert_eq!(cfg.limits.max_provider_concurrency, 128);
+}
+
+#[test]
+fn agent_caps_default_load_and_repair() {
+    // The live-subagent cap and the per-subagent turn cap are enforced, so
+    // they default on and a set value is kept.
+    let defaults = parse("").expect("empty toml should parse");
+    assert_eq!(defaults.agents.max_live, 16);
+    assert_eq!(defaults.agents.max_turns, 200);
+
+    let cfg = parse("[agents]\nmax_live = 24\nmax_turns = 10000\n").expect("agent caps must load");
+    assert_eq!(cfg.agents.max_live, 24);
+    assert_eq!(cfg.agents.max_turns, 10_000);
+
+    // A zero cap would refuse every spawn and stop every subagent at once:
+    // it is repaired to the smallest working value, not refused.
+    let cfg = parse("[agents]\nmax_live = 0\nmax_turns = 0\n")
+        .expect("out-of-range agent caps must be repaired");
+    assert_eq!(cfg.agents.max_live, 1);
+    assert_eq!(cfg.agents.max_turns, 1);
+}
+
+#[test]
+fn deprecated_provider_max_concurrent_seeds_the_limits_ceiling() {
+    // Only the old key set: it becomes the governor's ceiling.
+    let cfg = parse("[provider]\nmax_concurrent = 32\n").expect("old key must load");
+    assert_eq!(cfg.provider.max_concurrent, 32);
+    assert_eq!(cfg.limits.max_provider_concurrency, 32);
+
+    // 0 meant unlimited; the governor's equivalent is its own maximum.
+    let cfg = parse("[provider]\nmax_concurrent = 0\n").expect("old key must load");
+    assert_eq!(cfg.limits.max_provider_concurrency, 1_024);
+
+    // Above the runtime maximum: copied, then repaired like any other value.
+    let cfg = parse("[provider]\nmax_concurrent = 4096\n").expect("old key must load");
+    assert_eq!(cfg.limits.max_provider_concurrency, 1_024);
+
+    // Both set: the new key wins.
+    let cfg = parse("[provider]\nmax_concurrent = 32\n[limits]\nmax_provider_concurrency = 256\n")
+        .expect("both keys must load");
+    assert_eq!(cfg.provider.max_concurrent, 32);
+    assert_eq!(cfg.limits.max_provider_concurrency, 256);
+
+    // Neither set: the limits default stands.
+    let cfg = parse("").expect("empty toml should parse");
     assert_eq!(cfg.limits.max_provider_concurrency, 128);
 }
 
@@ -869,6 +912,8 @@ fn capacity_keys_default_and_round_trip() {
         parse("[provider]\nmax_concurrent = 0\n\n[context]\ninjection_budget_chars = 1000\n")
             .expect("explicit capacity keys should parse");
     assert_eq!(explicit.provider.max_concurrent, 0);
+    // The deprecated key, set alone, seeds the governor ceiling.
+    assert_eq!(explicit.limits.max_provider_concurrency, 1_024);
     assert_eq!(explicit.context.injection_budget_chars, 1000);
 
     let text = toml::to_string(&explicit).expect("config should serialize");

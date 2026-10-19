@@ -48,7 +48,8 @@ pub(crate) fn agent_status_from_str(s: &str) -> AgentStatus {
         "thinking" => AgentStatus::Thinking,
         "running_tool" => AgentStatus::RunningTool,
         "waiting_approval" => AgentStatus::WaitingApproval,
-        "waiting_parent" => AgentStatus::WaitingParent,
+        // `waiting_orchestrator` is what a pre-merge branch build stored.
+        "waiting_parent" | "waiting_orchestrator" => AgentStatus::WaitingParent,
         "finished" => AgentStatus::Finished,
         "failed" => AgentStatus::Failed,
         "stopped" => AgentStatus::Stopped,

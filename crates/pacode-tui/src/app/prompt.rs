@@ -62,9 +62,16 @@ pub(super) fn resolve_request(state: &mut AppState, request: Request) -> Request
         } => {
             let (text, resolved) =
                 crate::state::images::resolve_image_tokens(&state.pasted_images, &text);
-            if !resolved.is_empty() {
-                state.pasted_images.mark_submitted(&text);
-            }
+            // The message carries the paths from here on: the files are the
+            // session's now, and outlive this client (detach, resume, exit).
+            let sent: Vec<std::path::PathBuf> = resolved
+                .iter()
+                .filter_map(|source| match source {
+                    pacode_types::ImageSource::Path(path) => Some(path.clone()),
+                    _ => None,
+                })
+                .collect();
+            state.pasted_images.mark_sent(&sent);
             let mut images = images;
             images.extend(resolved);
             Request::UserMessage {

@@ -649,7 +649,6 @@ fn footer_state(model: &str, efforts: &[Effort]) -> AppState {
 }
 
 #[test]
-#[ignore = "merge follow-up: footer_status.rs still draws the effort for a model without reasoning control"]
 fn footer_hides_the_effort_for_a_model_without_reasoning_control() {
     let opts = RenderOptions::new(120, false);
     let state = footer_state("plain", &[]);
@@ -663,6 +662,26 @@ fn footer_hides_the_effort_for_a_model_without_reasoning_control() {
 fn footer_shows_the_effort_when_the_model_supports_one() {
     let opts = RenderOptions::new(120, false);
     let state = footer_state("thinker", &[Effort::Low, Effort::High]);
+    let row1 = line_text(&render_row1(120, &state, &opts));
+    assert!(row1.contains("high"), "row1 was: {row1}");
+}
+
+#[test]
+fn footer_keeps_the_effort_when_the_levels_are_unknown() {
+    let opts = RenderOptions::new(120, false);
+    let mut state = footer_state("unknown", &[Effort::Low]);
+    // Reasoning, levels unknown: every level is selectable, nothing to hide.
+    state.models[0].supported_efforts = None;
+    let row1 = line_text(&render_row1(120, &state, &opts));
+    assert!(row1.contains("high"), "row1 was: {row1}");
+
+    // Reasoning off: no effort, whatever the levels say.
+    state.models[0].supports_reasoning = false;
+    let row1 = line_text(&render_row1(120, &state, &opts));
+    assert!(!row1.contains("high"), "row1 was: {row1}");
+
+    // A route the catalog does not know keeps it.
+    state.models.clear();
     let row1 = line_text(&render_row1(120, &state, &opts));
     assert!(row1.contains("high"), "row1 was: {row1}");
 }

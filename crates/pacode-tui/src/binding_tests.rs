@@ -748,3 +748,25 @@ fn test_editing_actions_defaults_scope_and_resolution() {
         assert_eq!(act.name(), name);
     }
 }
+
+#[test]
+fn the_palette_types_and_compaction_chords_are_picker_chords() {
+    let keymap = Keymap::defaults();
+    for action in [Action::ModelPickerTypes, Action::ModelPickerCompaction] {
+        assert_eq!(action.scope(), Scope::Picker);
+        let bindings = keymap.bindings_for(action);
+        assert!(!bindings.is_empty(), "{action:?} has a default");
+        for binding in bindings {
+            // Letters in the palette are search text.
+            assert!(!binding.mods.is_empty(), "{action:?}: {binding:?}");
+            assert_eq!(keymap.find_conflict(binding, action), None, "{action:?}");
+        }
+    }
+    // `ctrl+c` interrupts and quits before any overlay sees it.
+    assert!(
+        !keymap
+            .bindings_for(Action::ModelPickerCompaction)
+            .iter()
+            .any(|b| b.code == KeyCode::Char('c') && b.mods.contains(KeyModifiers::CONTROL))
+    );
+}

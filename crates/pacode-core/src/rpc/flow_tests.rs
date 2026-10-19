@@ -342,3 +342,97 @@ async fn only_the_parent_may_message_a_subagent() {
     gate.add_permits(1);
     h.core.shutdown().await;
 }
+
+/// A subagent caught in a tool loop ends at `agents.max_turns` steps: its
+/// turn stops with a notice on its card, it lands `Finished`, and the report
+/// the orchestrator reads says it was cut short.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_in_a_tool_loop_stops_at_max_turns_and_says_so() {
+    let mut config = pacode_types::Config::default();
+    config.agents.max_turns = 2;
+    let h = Harness::with_config(config).await;
+    // Every `gate` call the loop makes passes straight through.
+    h.gate.release.add_permits(16);
+    let gate = spawn_parked(&h, tool("gate", json!({}))).await;
+    h.provider
+        .script(true, (0..5).map(|_| tool("gate", json!({}))).collect());
+    h.provider.script(false, vec![text("noted")]);
+    gate.add_permits(1);
+
+    let sub = h.sub();
+    wait_for("the capped subagent to finish", || {
+        sub.status() == AgentStatus::Finished
+    })
+    .await;
+    assert_eq!(h.provider.seen(true).len(), 2, "two steps, then the cap");
+    wait_for("the report", || {
+        h.provider
+            .seen(false)
+            .iter()
+            .any(|r| r.contains("<agent_finished") && r.contains("`agents.max_turns`"))
+    })
+    .await;
+    assert!(h.events().iter().any(|event| matches!(
+        event,
+        pacode_types::Event::ItemAdded(item)
+            if item.agent == sub.id()
+                && matches!(
+                    &item.kind,
+                    pacode_types::TranscriptKind::Notice { text, .. }
+                        if text.contains("maximum turns limit (2)")
+                )
+    )));
+    h.core.shutdown().await;
+}
+
+/// A resume makes an ended subagent live again, so it takes a slot under
+/// `agents.max_live` like a spawn: refused, with the limit named, while the
+/// only slot is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn resuming_a_finished_subagent_respects_the_live_cap() {
+    let mut config = pacode_types::Config::default();
+    config.agents.max_live = 1;
+    let h = Harness::with_config(config).await;
+    let gate = spawn_parked(&h, text("first done")).await;
+    h.provider.script(false, vec![text("ok")]);
+    gate.add_permits(1);
+    let first = h.sub();
+    wait_for("the first subagent to finish", || {
+        first.status() == AgentStatus::Finished
+    })
+    .await;
+    wait_for("the orchestrator to settle", || h.main_idle()).await;
+
+    let parked = Arc::new(Semaphore::new(0));
+    h.provider
+        .script(true, vec![gated(&parked, text("second done"))]);
+    h.session
+        .spawn_agent(pacode_tools::AgentSpec {
+            name: Some("second".into()),
+            prompt: "work".into(),
+            tools: None,
+            exclude_tools: None,
+            fork: false,
+            model: None,
+            effort: None,
+        })
+        .await
+        .expect("the slot the first one freed");
+
+    let err = super::send(
+        &h.session,
+        &h.main(),
+        &first.id(),
+        "one more thing",
+        super::Consent::Absent,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("maximum live subagents (1)"),
+        "{err}"
+    );
+    assert_eq!(first.status(), AgentStatus::Finished);
+    parked.add_permits(1);
+    h.core.shutdown().await;
+}

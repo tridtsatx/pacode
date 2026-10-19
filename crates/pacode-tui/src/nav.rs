@@ -379,7 +379,9 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ModelPickerRefresh
             | KeyAction::ModelPickerKind
             | KeyAction::ModelPickerAccount
-            | KeyAction::ModelPickerLogout => {}
+            | KeyAction::ModelPickerLogout
+            | KeyAction::ModelPickerTypes
+            | KeyAction::ModelPickerCompaction => {}
         }
     } else {
         match action {
@@ -442,7 +444,9 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ModelPickerRefresh
             | KeyAction::ModelPickerKind
             | KeyAction::ModelPickerAccount
-            | KeyAction::ModelPickerLogout => {}
+            | KeyAction::ModelPickerLogout
+            | KeyAction::ModelPickerTypes
+            | KeyAction::ModelPickerCompaction => {}
         }
         if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
             && state.transcript.is_at_top()

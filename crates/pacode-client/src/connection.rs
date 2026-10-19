@@ -10,7 +10,7 @@ use pacode_types::ids::ClientId;
 use pacode_types::model::ModelInfo;
 use pacode_types::state::SessionMeta;
 use pacode_types::{
-    Attach, AttachEnvelope, ClientHello, Envelope, McpServerInfo, PROTOCOL_VERSION,
+    AgentId, Attach, AttachEnvelope, ClientHello, Envelope, McpServerInfo, PROTOCOL_VERSION,
     PluginCommandOutcome, PluginInfo, Reply, Request, SessionId, SessionSnapshot,
 };
 use tokio::io::BufReader;
@@ -21,6 +21,10 @@ use crate::{
     AttachAttempt, ClientError, ClientEvent, ClientEventContext, ClientExt, ClientOptions,
     EventReceiver, EventSink, LifecycleState, lock,
 };
+
+/// The last `Subscribe` sent on this client (`agents`, `all`), or `None` when it never
+/// narrowed its stream. Shared with the supervisor, which replays it on reconnect.
+pub(crate) type DesiredInterest = Arc<Mutex<Option<(Vec<AgentId>, bool)>>>;
 
 enum RequestScope {
     Unscoped,
@@ -141,6 +145,7 @@ pub struct Client {
     connected: Arc<AtomicBool>,
     lifecycle: Arc<LifecycleState>,
     cancel_token: CancellationToken,
+    interest: DesiredInterest,
     supervisor_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -302,6 +307,7 @@ impl Client {
         let pending_attaches = Arc::new(Mutex::new(HashMap::new()));
         let session_gate = Arc::new(RwLock::new(()));
         let connected = Arc::new(AtomicBool::new(true));
+        let interest: DesiredInterest = Arc::new(Mutex::new(None));
         let supervisor_handle = tokio::spawn(reconnect::run_supervisor(reconnect::SupervisorCtx {
             reader,
             socket_path,
@@ -317,6 +323,7 @@ impl Client {
             connected: connected.clone(),
             lifecycle: lifecycle.clone(),
             cancel_token: cancel_token.clone(),
+            interest: interest.clone(),
         }));
 
         Ok((
@@ -331,6 +338,7 @@ impl Client {
                 connected,
                 lifecycle,
                 cancel_token,
+                interest,
                 supervisor_handle: Some(supervisor_handle),
             },
             events_rx,
@@ -561,6 +569,10 @@ impl Client {
             lock(&self.pending_attaches).insert(id, attempt.clone());
         }
 
+        let subscribed = match &req {
+            Request::Subscribe { agents, all } => Some((agents.clone(), *all)),
+            _ => None,
+        };
         let envelope = Envelope { id, req };
         let serialized = match attach_metadata.as_ref() {
             Some(attempt) => serde_json::to_string(&AttachEnvelope {
@@ -607,6 +619,11 @@ impl Client {
             if !current {
                 drop(permit);
                 return Err(ClientError::StaleSession);
+            }
+            if let Some(subscribed) = subscribed {
+                // Recorded as it is sent: a reconnect racing the reply still replays
+                // the newest interest, not the one the lost connection had.
+                *lock(&self.interest) = Some(subscribed);
             }
             permit.send(line);
         }

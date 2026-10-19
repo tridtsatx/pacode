@@ -1,6 +1,6 @@
 //! One client connection.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -66,6 +66,9 @@ const WIRE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 const WIRE_PERMIT_GRANULARITY: usize = 512;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WIRE_QUEUE_CAP: usize = 1024;
+/// Soft cap on the data lines the writer joins into one write; one longer line is
+/// still written whole. Nothing waits for a batch to fill.
+const WIRE_WRITE_BATCH: usize = 64 * 1024;
 const ATTACH_LEASE_ATTEMPTS: usize = 3;
 
 fn ndjson(line: String) -> String {
@@ -635,6 +638,8 @@ where
     // `stop_wire_writer` cancels on every exit path.
     tokio::spawn(async move {
         let _finished = WriterFinished(finished);
+        let mut batch: Vec<OutboundLine> = Vec::new();
+        let mut joined = String::new();
         let mut data_open = true;
         let mut control_open = true;
         let mut control_streak = 0;
@@ -677,17 +682,37 @@ where
                 }
                 WriterWake::Control(None) => control_open = false,
                 WriterWake::Data(Some(outbound)) => {
-                    let OutboundLine {
-                        text,
-                        written,
-                        permit,
-                    } = outbound;
-                    let delivered = write_wire_line(&mut writer, &text, &lifecycle).await;
-                    if let Some(written_tx) = written {
-                        let _ = written_tx.send(delivered);
+                    // Everything already queued goes out in one write and one flush;
+                    // each line's `written` ack fires only after that flush, and its
+                    // budget permit is released only then.
+                    batch.push(outbound);
+                    let mut bytes = batch[0].text.len();
+                    while bytes < WIRE_WRITE_BATCH {
+                        let Ok(next) = data_rx.try_recv() else {
+                            break;
+                        };
+                        bytes += next.text.len();
+                        batch.push(next);
+                    }
+                    let delivered = if batch.len() == 1 {
+                        write_wire_line(&mut writer, &batch[0].text, &lifecycle).await
+                    } else {
+                        joined.clear();
+                        for line in &batch {
+                            joined.push_str(&line.text);
+                        }
+                        write_wire_line(&mut writer, &joined, &lifecycle).await
+                    };
+                    if joined.capacity() > 4 * WIRE_WRITE_BATCH {
+                        joined = String::new();
+                    }
+                    for line in batch.drain(..) {
+                        drop(line.permit);
+                        if let Some(written_tx) = line.written {
+                            let _ = written_tx.send(delivered);
+                        }
                     }
                     control_streak = 0;
-                    drop(permit);
                     if !delivered {
                         break;
                     }
@@ -822,29 +847,40 @@ enum ForwarderWake {
 /// the connection did not subscribe to (2 Hz).
 const COALESCE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// What the connection's interest (`Request::Subscribe`) decides for one event.
-enum Routed {
-    Send(Event),
-    Skip,
-    /// `AgentUpdated` of an unsubscribed agent: keep the latest, flush later.
-    Hold(pacode_types::AgentInfo),
+/// When the coalesced `AgentUpdated` events go out (see [`crate::interest::Router`]).
+#[derive(Clone, Copy)]
+enum FlushPlan {
+    /// Nothing held.
+    Idle,
+    /// Held updates go out at this instant.
+    At(tokio::time::Instant),
+    /// The timer fired with no filtered seq to carry them: the next one flushes. No
+    /// timer runs meanwhile, so an idle session stays idle.
+    NextHole,
 }
 
-fn route_by_interest(interest: &crate::interest::SharedInterest, event: Event) -> Routed {
-    use crate::interest::wants;
-    let wanted = match &event {
-        Event::TextDelta { agent, .. } | Event::ReasoningDelta { agent, .. } => {
-            Some(wants(interest, agent))
-        }
-        Event::ItemAdded(item) | Event::ItemUpdated(item) => Some(wants(interest, &item.agent)),
-        Event::AgentUpdated(info) => Some(wants(interest, &info.id)),
-        _ => None,
-    };
-    match (wanted, event) {
-        (None, event) | (Some(true), event) => Routed::Send(event),
-        (Some(false), Event::AgentUpdated(info)) => Routed::Hold(info),
-        (Some(false), _) => Routed::Skip,
+async fn flush_deadline(plan: FlushPlan) {
+    match plan {
+        FlushPlan::At(at) => tokio::time::sleep_until(at).await,
+        FlushPlan::Idle | FlushPlan::NextHole => std::future::pending().await,
     }
+}
+
+/// Queue the coalesced updates that fit. Returns false once the sender task is gone.
+fn queue_flushed(
+    event_tx: &mpsc::Sender<(u64, Event)>,
+    control: &ResyncControl,
+    router: &mut crate::interest::Router,
+) -> bool {
+    for (seq, event) in router.flush() {
+        if matches!(
+            queue_event(event_tx, control, seq, event),
+            QueueEventResult::Closed
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 fn spawn_session_forwarder(
@@ -860,55 +896,41 @@ fn spawn_session_forwarder(
     let (event_tx, mut event_rx) = mpsc::channel(SESSION_FORWARD_EVENT_CAP);
     let receiver_task = tokio::spawn(async move {
         let mut deferred_event: Option<(u64, Event)> = None;
-        // Coalesced `AgentUpdated` of unsubscribed agents: latest per agent, flushed at
-        // most every `COALESCE_INTERVAL`; the timer exists only while one is pending.
-        let mut held: HashMap<AgentId, (u64, pacode_types::AgentInfo)> = HashMap::new();
-        let mut flush_at: Option<tokio::time::Instant> = None;
+        // `Subscribe` filtering and 2 Hz coalescing of other agents' `AgentUpdated`;
+        // the flush timer exists only while an update is held.
+        let mut router = crate::interest::Router::new(interest);
+        let mut flush = FlushPlan::Idle;
         'events: loop {
-            if let Some((seq, event)) = deferred_event.take()
-                && matches!(
-                    queue_event(&event_tx, &control, seq, event),
-                    QueueEventResult::Closed
-                )
-            {
-                break;
-            }
-            let flush_deadline = flush_at;
-            let received = tokio::select! {
-                _ = async {
-                    match flush_deadline {
-                        Some(at) => tokio::time::sleep_until(at).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
-                    flush_at = None;
-                    let mut due: Vec<(u64, pacode_types::AgentInfo)> =
-                        held.drain().map(|(_, held)| held).collect();
-                    due.sort_by_key(|(seq, _)| *seq);
-                    for (seq, info) in due {
-                        if matches!(
-                            queue_event(&event_tx, &control, seq, Event::AgentUpdated(info)),
-                            QueueEventResult::Closed
-                        ) {
+            let next = match deferred_event.take() {
+                Some(event) => Ok(event),
+                None => tokio::select! {
+                    () = flush_deadline(flush) => {
+                        if !queue_flushed(&event_tx, &control, &mut router) {
                             break 'events;
                         }
+                        flush = if router.has_held() {
+                            FlushPlan::NextHole
+                        } else {
+                            FlushPlan::Idle
+                        };
+                        continue 'events;
                     }
-                    continue 'events;
-                }
-                received = receiver.recv() => received,
+                    received = receiver.recv() => received,
+                },
             };
-            match received {
+            match next {
                 Ok((seq, event)) => {
-                    let event = match route_by_interest(&interest, event) {
-                        Routed::Send(event) => event,
-                        Routed::Skip => continue,
-                        Routed::Hold(info) => {
-                            held.insert(info.id.clone(), (seq, info));
-                            if flush_at.is_none() {
-                                flush_at = Some(tokio::time::Instant::now() + COALESCE_INTERVAL);
+                    let Some((seq, event)) = router.route(seq, event) else {
+                        if matches!(flush, FlushPlan::NextHole) {
+                            if !queue_flushed(&event_tx, &control, &mut router) {
+                                break;
                             }
-                            continue;
+                            flush = FlushPlan::Idle;
                         }
+                        if router.has_held() && matches!(flush, FlushPlan::Idle) {
+                            flush = FlushPlan::At(tokio::time::Instant::now() + COALESCE_INTERVAL);
+                        }
+                        continue;
                     };
                     if matches!(
                         queue_event(&event_tx, &control, seq, event),
@@ -919,6 +941,8 @@ fn spawn_session_forwarder(
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     log::warn!("session event receiver lagged by {count} events");
+                    router.reset();
+                    flush = FlushPlan::Idle;
                     loop {
                         match receiver.try_recv() {
                             Ok((seq, event)) => {
@@ -1934,6 +1958,157 @@ mod tests {
             .await
             .expect("the writer ignored its lifecycle token")
             .unwrap();
+    }
+
+    /// Counts `poll_write` calls; everything written lands in one buffer.
+    #[derive(Clone, Default)]
+    struct CountingWriter(Arc<Mutex<(Vec<u8>, usize)>>);
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut inner = self.0.lock().unwrap();
+            inner.0.extend_from_slice(buf);
+            inner.1 += 1;
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_lines_share_one_write_and_each_is_acknowledged() {
+        let (wire, data_rx, resync_rx) = wire_channel(16, WIRE_BYTE_BUDGET);
+        let mut acks = Vec::new();
+        let mut expected = String::new();
+        for n in 0..5 {
+            let text = format!("line-{n}\n");
+            expected.push_str(&text);
+            let (written_tx, written_rx) = oneshot::channel();
+            let permit = wire.try_reserve_outbound(text.len()).unwrap();
+            wire.tx
+                .try_send(OutboundLine {
+                    text,
+                    written: Some(written_tx),
+                    permit,
+                })
+                .unwrap_or_else(|_| panic!("queue full"));
+            acks.push(written_rx);
+        }
+        let sink = CountingWriter::default();
+        let writer = spawn_wire_writer(
+            sink.clone(),
+            data_rx,
+            wire.resync.clone(),
+            resync_rx,
+            wire.lifecycle.clone(),
+            CancellationToken::new(),
+        );
+        for ack in acks {
+            let written = tokio::time::timeout(Duration::from_secs(1), ack)
+                .await
+                .expect("a batched line was never acknowledged")
+                .unwrap();
+            assert!(written);
+        }
+        {
+            let inner = sink.0.lock().unwrap();
+            assert_eq!(String::from_utf8(inner.0.clone()).unwrap(), expected);
+            assert_eq!(inner.1, 1, "the queued lines were written one by one");
+        }
+        // Every permit went back to the budget after the flush.
+        assert_eq!(wire.budget.available_permits(), WIRE_BYTE_BUDGET);
+        stop_wire_writer(wire, writer).await;
+    }
+
+    #[tokio::test]
+    async fn forwarder_filters_unsubscribed_agents_and_coalesces_their_updates() {
+        let (event_tx, _) = broadcast::channel(64);
+        let subscription = event_tx.subscribe();
+        let (wire, mut wire_rx, writer) = test_wire(64);
+        let (_snapshot_tx, snapshot_rx) = watch::channel(Some(0));
+        let (_barrier_tx, barrier_rx) = watch::channel(true);
+        let interest = crate::interest::new_shared();
+        crate::interest::apply(&interest, vec![pacode_types::AgentId::main()], false);
+        let forwarder = spawn_session_forwarder(
+            subscription,
+            snapshot_rx,
+            barrier_rx,
+            wire.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            interest,
+        );
+        let sub = pacode_types::AgentId::new("sub-1");
+        let agent = |activity: &str| pacode_types::AgentInfo {
+            id: sub.clone(),
+            name: "sub".into(),
+            kind: pacode_types::AgentKind::Sub,
+            status: pacode_types::AgentStatus::Thinking,
+            activity: Some(activity.into()),
+            started_at_ms: 0,
+            finished_at_ms: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            model: pacode_types::ModelRoute::new("mock", "mock-model"),
+            effort: pacode_types::Effort::Medium,
+            parent: None,
+            summary: None,
+            error: None,
+        };
+        let delta = |agent: &pacode_types::AgentId| Event::TextDelta {
+            agent: agent.clone(),
+            item_seq: 1,
+            text: "x".into(),
+        };
+
+        // The first update announces the agent; after that its stream is filtered and
+        // its updates are held, while main's delta goes straight through.
+        event_tx
+            .send((1, Event::AgentUpdated(agent("start"))))
+            .unwrap();
+        for seq in 2..=20u64 {
+            event_tx
+                .send((seq, Event::AgentUpdated(agent(&format!("step {seq}")))))
+                .unwrap();
+        }
+        event_tx
+            .send((21, delta(&pacode_types::AgentId::main())))
+            .unwrap();
+        event_tx.send((22, delta(&sub))).unwrap();
+
+        let mut received = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+        while let Ok(Some(line)) = tokio::time::timeout_at(deadline, wire_rx.recv()).await {
+            if let ServerMessage::Event { seq, event } = serde_json::from_str(line.trim()).unwrap()
+            {
+                received.push((seq, event));
+            }
+        }
+        // The held update cannot go out as seq 20 after 21 was sent: it rides on the
+        // filtered delta's seq 22, still carrying the latest state.
+        let seqs: Vec<u64> = received.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![1, 21, 22]);
+        assert!(matches!(
+            &received[2].1,
+            Event::AgentUpdated(info) if info.activity.as_deref() == Some("step 20")
+        ));
+        forwarder.stop().await;
+        stop_wire_writer(wire, writer).await;
     }
 
     #[test]

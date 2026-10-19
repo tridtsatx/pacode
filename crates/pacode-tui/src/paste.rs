@@ -219,7 +219,7 @@ fn normalize_paste_prefix(text: &str, cap: usize) -> (String, usize, bool) {
 fn paste_into_prompt(state: &mut AppState, text: String, now: Instant) {
     // Drag-and-drop of an image file arrives as a bracketed paste of its path:
     // it goes through the same `[Image N]` paste-token path as a clipboard image.
-    if let Some(path) = crate::attachments::image_path_from_paste(&text) {
+    if let Some(path) = image_path_from_paste(&text) {
         match std::fs::metadata(&path) {
             Ok(meta) if meta.len() <= IMAGE_PASTE_MAX_BYTES as u64 => match std::fs::read(&path) {
                 Ok(bytes) => {
@@ -424,4 +424,71 @@ fn handle_paste_image_bytes(state: &mut AppState, bytes: Vec<u8>, now: Instant) 
 /// Cleans up any unreferenced pasted images from disk.
 pub fn cleanup_unreferenced_images(state: &mut AppState) {
     state.cleanup_pasted_images();
+}
+
+/// File extensions a dropped path is pasted as an image for, not as text.
+const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+
+/// Whether `path` names an image by its extension.
+fn is_image_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// A bracketed paste that is exactly one existing image file path (what terminals
+/// produce on drag-and-drop): plain, quoted, backslash-escaped or a `file://` URL.
+fn image_path_from_paste(text: &str) -> Option<std::path::PathBuf> {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 4096 || t.contains('\n') || t.contains('\r') {
+        return None;
+    }
+    let t = t.trim_matches(|c| c == '\'' || c == '"');
+    let decoded = match t.strip_prefix("file://") {
+        Some(rest) => percent_decode(rest),
+        None => unescape_spaces(t),
+    };
+    if !is_image_path(&decoded) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(decoded);
+    path.is_file().then_some(path)
+}
+
+fn unescape_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(next) = chars.peek().copied()
+            && (next == ' ' || next == '\\' || next == '(' || next == ')' || next == '\'')
+        {
+            out.push(next);
+            chars.next();
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

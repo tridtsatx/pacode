@@ -709,15 +709,22 @@ impl Core {
             }
             Request::UserMessage {
                 text,
-                mut images,
+                images,
                 message_id,
                 attachments,
             } => {
-                // Base64 attachments are prepared and stored first; a rejected one
-                // leaves the session untouched.
-                match session.prepare_attachments(attachments).await {
-                    Ok(stored) => {
-                        images.extend(stored);
+                // Prompt images (paths, bytes) and base64 attachments are prepared
+                // and stored first: the message keeps only `Stored` refs, so it
+                // outlives the client's files, and a rejected image leaves the
+                // session untouched.
+                let prepared = async {
+                    let mut images = session.prepare_images(images).await?;
+                    images.extend(session.prepare_attachments(attachments).await?);
+                    Ok::<_, crate::CoreError>(images)
+                }
+                .await;
+                match prepared {
+                    Ok(images) => {
                         self.submit_client_user_message(&session, text, images, message_id)
                             .await
                     }

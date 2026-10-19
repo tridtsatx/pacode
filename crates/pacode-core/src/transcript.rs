@@ -375,19 +375,26 @@ impl TranscriptState {
     }
 
     /// Shrink a finished agent's in-memory state: keep the newest `tail_cap`
-    /// items and drop every tool item (older items stay in the store).
-    pub(crate) fn retire(&mut self, tail_cap: usize) {
-        while self.tail.len() > tail_cap {
+    /// items within `tail_bytes` (the newest item always stays), and drop every
+    /// tool item. Older items stay in the store, which `GetHistory` reads.
+    pub(crate) fn retire(&mut self, tail_cap: usize, tail_bytes: usize) {
+        while self.tail.len() > tail_cap || (self.tail_bytes > tail_bytes && self.tail.len() > 1) {
             if let Some(item) = self.tail.pop_front() {
                 self.tail_bytes = self.tail_bytes.saturating_sub(transcript_item_bytes(&item));
             }
         }
+        self.tail.shrink_to_fit();
         self.tail_cap = self.tail_cap.min(tail_cap);
         self.tool_items.clear();
         self.tool_items.shrink_to_fit();
         self.tool_item_order.clear();
         self.tool_item_order.shrink_to_fit();
         self.tool_items_bytes = 0;
+    }
+
+    /// A retired agent runs again (resume): its tail may grow back to `tail_cap`.
+    pub(crate) fn reopen(&mut self, tail_cap: usize) {
+        self.tail_cap = self.tail_cap.max(tail_cap);
     }
 
     fn update_tool_item(&mut self, item: &TranscriptItem, tail_accepted: bool) {

@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::events::{ResponsesChunkState, responses_chunk_to_events};
 use crate::governor::{ProviderGovernor, governor_for, hold_permit};
-use crate::post::HttpPost;
+use crate::post::{HttpPost, post_with_retries};
 use crate::retry::{OpenedStream, RetryAfterSignal, RetryBudget, StreamTransport};
 use crate::sse::SseParser;
 use crate::{EventStream, ProviderError};
@@ -214,9 +214,6 @@ pub struct CodexStreamOpener {
     pub stream_idle_secs: u64,
     pub effort: Effort,
     pub backoff_base: Duration,
-    /// Provider-wide adaptive concurrency limit and cooldown, shared with every other
-    /// request of this provider entry.
-    pub gate: Arc<crate::gate::ProviderGate>,
 }
 
 impl CodexStreamOpener {
@@ -258,8 +255,7 @@ impl StreamTransport for CodexStreamOpener {
             effort: self.effort,
             backoff_base: self.backoff_base,
         };
-        let (response, permit, gate_permit) =
-            crate::retry::post_gated(&post, &self.gate, governor, budget).await?;
+        let (response, permit) = post_with_retries(&post, governor, budget).await?;
         let retry_after = RetryAfterSignal::default();
         let inner = create_responses_event_stream_with_retry_after(
             response,
@@ -268,17 +264,12 @@ impl StreamTransport for CodexStreamOpener {
             self.effort,
             retry_after.clone(),
         );
-        // Both permits live exactly as long as the stream (freed on end, error or drop);
-        // the gate permit also credits the AIMD increase on the first event.
+        // The slot is freed at `MessageEnd`, error or drop, and the first event
+        // credits the account's AIMD increase.
         Ok(OpenedStream {
-            stream: crate::gate::GatedStream::wrap(hold_permit(inner, permit), gate_permit),
+            stream: hold_permit(inner, permit),
             retry_after,
         })
-    }
-
-    fn note_stream_rate_limit(&self) {
-        self.gate
-            .note_response(429, &reqwest::header::HeaderMap::new());
     }
 
     fn release_body(&mut self) {

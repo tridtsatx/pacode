@@ -1354,57 +1354,43 @@ fn test_cycle_mode_variants_and_alt_m() {
     );
 }
 
+/// Open overlays own the keyboard: the palette steps its effort ladder with
+/// shift+tab, and neither shift+tab nor alt+m leaks out as a mode cycle.
 #[test]
-fn test_cycle_mode_not_swallowed_by_overlay() {
+fn test_overlays_keep_shift_tab_and_alt_m() {
     let now = Instant::now();
-    let mut state = make_test_state();
-    state.focus = Focus::Overlay(Overlay::EffortPicker { index: 0 });
-    let e = Action::Send(Request::SetMode(state.mode().next()));
-    let actions = handle_key(
-        &mut state,
+    let keys = [
         KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
-        now,
-    );
-    assert_eq!(actions, vec![e.clone()]);
-
-    let actions = handle_key(
-        &mut state,
-        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
-        now,
-    );
-    assert_eq!(actions, vec![e]);
-}
-
-#[test]
-fn test_shift_tab_stays_with_the_model_palette_but_alt_m_cycles() {
-    let now = Instant::now();
-    let mut state = make_test_state();
-    state.focus = Focus::Overlay(Overlay::ModelPalette {
-        palette: Default::default(),
-    });
-    // The palette steps the effort ladder with tab/shift+tab itself.
-    let actions = handle_key(
-        &mut state,
         KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-        now,
-    );
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::Send(Request::SetMode(_))))
-    );
-    assert!(matches!(
-        state.focus,
-        Focus::Overlay(Overlay::ModelPalette { .. })
-    ));
-
-    let e = Action::Send(Request::SetMode(state.mode().next()));
-    let actions = handle_key(
-        &mut state,
         KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
-        now,
-    );
-    assert_eq!(actions, vec![e]);
+    ];
+    for key in keys {
+        let mut state = make_test_state();
+        state.focus = Focus::Overlay(Overlay::EffortPicker { index: 0 });
+        let actions = handle_key(&mut state, key, now);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Send(Request::SetMode(_)))),
+            "{key:?} in the effort picker"
+        );
+
+        let mut state = make_test_state();
+        state.focus = Focus::Overlay(Overlay::ModelPalette {
+            palette: Default::default(),
+        });
+        let actions = handle_key(&mut state, key, now);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Send(Request::SetMode(_)))),
+            "{key:?} in the model palette"
+        );
+        assert!(matches!(
+            state.focus,
+            Focus::Overlay(Overlay::ModelPalette { .. })
+        ));
+    }
 }
 
 #[test]

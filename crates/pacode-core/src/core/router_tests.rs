@@ -78,23 +78,21 @@ async fn setup() -> (
 use pacode_exec::{TaskEvent, TaskSpec};
 use pacode_types::{AgentId, TaskInfo};
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
-use super::start_task_router_since;
+use super::start_task_router;
 use crate::inject::Injection;
 
-/// Run `true` to completion and return its terminal info.
+/// Run `true` as a background task to completion and return its terminal info.
 async fn finished_task(
     core: &Core,
     sid: &pacode_types::SessionId,
     cwd: &std::path::Path,
 ) -> TaskInfo {
     let session = core.session(sid).unwrap();
-    let info = session
-        .tasks
-        .spawn(TaskSpec::new(sid.clone(), AgentId::main(), "true", cwd))
-        .await
-        .unwrap();
+    let mut spec = TaskSpec::new(sid.clone(), AgentId::main(), "true", cwd);
+    // Only a backgrounded task's end is announced to its owner.
+    spec.background = true;
+    let info = session.tasks.spawn(spec).await.unwrap();
     for _ in 0..200 {
         if let Some(done) = session
             .tasks
@@ -137,8 +135,8 @@ async fn router_survives_lag_and_routes_a_later_ended() {
     stop_core_router(&core);
     let session = core.session(&sid).unwrap();
     let main = session.main_agent().unwrap();
-    // A running turn makes `start_turn` a no-op, so injections stay queued to inspect.
-    *main.cancel.lock().unwrap() = Some(CancellationToken::new());
+    // A held turn lock makes the wake a no-op, so injections stay queued to inspect.
+    let _turn = main.turn_lock.clone().try_lock_owned().unwrap();
 
     let first = finished_task(&core, &sid, tmp.path()).await;
     let (tx, rx) = broadcast::channel::<TaskEvent>(4);
@@ -146,12 +144,12 @@ async fn router_survives_lag_and_routes_a_later_ended() {
         tx.send(TaskEvent::Progress(first.clone())).unwrap();
     }
     // The first recv sees Lagged; the router must carry on.
-    let handle = start_task_router_since(Arc::downgrade(&core), rx, 0);
+    let handle = start_task_router(Arc::downgrade(&core), rx);
     let got = finished_ids(&main, Duration::from_millis(500)).await;
     assert_eq!(
         got,
         vec![first.id.clone()],
-        "reconcile routes the lost Ended once"
+        "the recovery routes the lost Ended once"
     );
     assert!(!handle.is_finished(), "router must survive Lagged");
 
@@ -168,19 +166,39 @@ async fn lost_ended_is_injected_exactly_once_even_if_ended_arrives_later() {
     stop_core_router(&core);
     let session = core.session(&sid).unwrap();
     let main = session.main_agent().unwrap();
-    *main.cancel.lock().unwrap() = Some(CancellationToken::new());
+    let _turn = main.turn_lock.clone().try_lock_owned().unwrap();
 
     let info = finished_task(&core, &sid, tmp.path()).await;
     let (tx, rx) = broadcast::channel::<TaskEvent>(4);
     for _ in 0..10 {
         tx.send(TaskEvent::Progress(info.clone())).unwrap();
     }
-    let handle = start_task_router_since(Arc::downgrade(&core), rx, 0);
+    let handle = start_task_router(Arc::downgrade(&core), rx);
     tokio::time::sleep(Duration::from_millis(300)).await;
     // The same Ended showing up now must not inject a second time.
     tx.send(TaskEvent::Ended(info.clone())).unwrap();
     let got = finished_ids(&main, Duration::from_millis(500)).await;
     assert_eq!(got, vec![info.id.clone()]);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicate_ended_is_routed_once_and_not_tombstoned() {
+    let (core, _mock, tmp, sid) = setup().await;
+    stop_core_router(&core);
+    let session = core.session(&sid).unwrap();
+    let main = session.main_agent().unwrap();
+    let _turn = main.turn_lock.clone().try_lock_owned().unwrap();
+
+    let info = finished_task(&core, &sid, tmp.path()).await;
+    let (tx, rx) = broadcast::channel::<TaskEvent>(16);
+    let handle = start_task_router(Arc::downgrade(&core), rx);
+    tx.send(TaskEvent::Ended(info.clone())).unwrap();
+    tx.send(TaskEvent::Ended(info.clone())).unwrap();
+    let got = finished_ids(&main, Duration::from_millis(500)).await;
+    assert_eq!(got, vec![info.id.clone()]);
+    // The bounded routed set dedups; the core's tombstones do not grow per task.
+    assert!(!core.is_task_tombstoned(&info.id));
     handle.abort();
 }
 
@@ -191,6 +209,21 @@ fn routed_set_is_capped_and_raises_its_floor() {
         assert!(set.mark(&pacode_types::TaskId::new(format!("t{i}")), 1000 + i));
     }
     assert_eq!(set.ids.len(), super::ROUTED_CAP);
+    assert_eq!(set.order.len(), super::ROUTED_CAP);
     assert_eq!(set.floor_ms, 1000 + 9);
     assert!(!set.mark(&pacode_types::TaskId::new("t20"), 1020));
+    // Evicted below the floor: a recovery leaves it alone.
+    assert!(!set.may_route(&pacode_types::TaskId::new("t3"), 1003));
+    assert!(set.may_route(&pacode_types::TaskId::new("new"), 999_999));
+}
+
+#[test]
+fn an_unmarked_task_may_be_routed_again() {
+    let mut set = super::RoutedSet::default();
+    let id = pacode_types::TaskId::new("t");
+    assert!(set.mark(&id, 10));
+    set.unmark(&id);
+    assert!(set.order.is_empty());
+    assert!(set.may_route(&id, 10));
+    assert!(set.mark(&id, 10));
 }

@@ -2,11 +2,16 @@
 //! (scroll position, click map, "N new lines") without rendering every cell.
 //!
 //! Cap: one record per cell currently in the transcript (`max_cells`, 500 by default);
-//! a record is 32 bytes. Invalidation: a record only answers for the exact
-//! (version, width, expanded, thinking, has_stats, live) it was measured with; `enforce_cap`
-//! drops evicted cells, and a reset of the line cache (its `generation` changes) drops
-//! everything. Owner: `Transcript`. Nothing here ticks; it is only read and written
-//! while drawing.
+//! a record is 48 bytes. Invalidation: a record only answers for the exact
+//! (version, width, expanded, thinking, has_stats, live, context, group) it was measured
+//! with; eviction drops evicted cells, and a reset of the line cache (its `generation`
+//! changes) drops everything. Owner: `Transcript`. Nothing here ticks; it is only read
+//! and written while drawing.
+//!
+//! A run of exploration calls drawn as one group is recorded under its first cell's
+//! id with `group` set to the group's fingerprint (`toolgroup::cache_key`), so a cell
+//! that is drawn alone in one frame and heads a group in the next never answers for
+//! the other shape.
 
 use std::collections::HashMap;
 
@@ -20,6 +25,10 @@ pub struct ExtentKey {
     pub has_stats: bool,
     /// The live (streaming) cell renders through a different path.
     pub live: bool,
+    /// The render context (`RenderOptions::cache_epoch`): theme, glyphs, hints.
+    pub context: u64,
+    /// The group fingerprint when the record is a group's block; 0 for one cell.
+    pub group: u64,
 }
 
 #[derive(Debug, Default)]
@@ -52,6 +61,11 @@ impl CellExtents {
 
     pub fn remove(&mut self, id: u64) {
         self.map.remove(&id);
+    }
+
+    /// Keep only the records `keep` answers true for (by cell id).
+    pub fn retain(&mut self, mut keep: impl FnMut(u64) -> bool) {
+        self.map.retain(|id, _| keep(*id));
     }
 
     pub fn clear(&mut self) {

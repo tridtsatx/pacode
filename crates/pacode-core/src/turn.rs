@@ -25,6 +25,7 @@
 //!   // point D
 //!   history.extend(render_injections(agent.take_due(now)))
 //!   if needs_compaction → compaction::compact
+//!   subagent: steps += 1; stop at agents.max_turns with a notice
 //! }
 //! ```
 
@@ -95,6 +96,8 @@ pub(crate) async fn run_turn(
     if let Some(admission) = admission.as_deref() {
         agent.mark_admission_progressed(admission, &turn_id);
     }
+    // Only this turn's own end at `agents.max_turns` may say so in its report.
+    let _ = agent.take_step_capped();
     if cancel.is_cancelled() {
         session.events.emit(Event::TurnStarted {
             agent: agent.id(),
@@ -595,6 +598,25 @@ pub(crate) async fn run_turn(
                 session.id,
                 agent.id()
             );
+        }
+
+        // The only stop a subagent caught in a tool loop has: past
+        // `agents.max_turns` steps its turn ends like a completed one, and the
+        // report it ends with says why (`lifecycle`).
+        let max_turns = session.config.agents.max_turns;
+        if !agent.id().is_main() && agent.count_step() >= max_turns {
+            log::warn!(
+                "subagent reached agents.max_turns ({max_turns}): session={} agent={}",
+                session.id,
+                agent.id()
+            );
+            session.emit_notice(
+                &agent,
+                pacode_types::ToastLevel::Warn,
+                format!("Subagent stopped: reached the maximum turns limit ({max_turns})"),
+            );
+            agent.mark_step_capped();
+            break;
         }
     }
 

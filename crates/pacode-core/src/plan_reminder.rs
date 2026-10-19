@@ -86,9 +86,9 @@ pub(crate) async fn remind(session: &Arc<Session>, agent: &Arc<Agent>) -> bool {
     };
     let max = session.config.session.plan_reminders_max;
     let line = notice_line(open.len(), attempt, max);
-    let message = crate::inject::render_injections(
+    let message = crate::inject::render_for(
+        &session.config.context,
         &[Injection::PlanReminder { open, attempt, max }],
-        session.config.context.injection_cap_chars,
     );
     if let Err(error) = crate::turn::persist_history_message(session, agent, message).await {
         log::warn!(

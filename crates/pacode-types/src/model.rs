@@ -253,15 +253,14 @@ pub struct ModelInfo {
     /// Unknown models default to `false`.
     #[serde(default, alias = "vision")]
     pub supports_vision: bool,
-    /// Effort levels the model supports; `None` means every [`Effort`] is
-    /// selectable (spec §6).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Effort levels the model supports, weakest first; `None` means every
+    /// [`Effort`] is selectable (spec §6). Only meaningful when
+    /// `supports_reasoning` is set. `efforts` is the name a pre-merge branch
+    /// build cached the list under.
+    #[serde(default, alias = "efforts", skip_serializing_if = "Option::is_none")]
     pub supported_efforts: Option<Vec<Effort>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<Pricing>,
-    /// Reasoning levels the model accepts, weakest first. Empty = no reasoning control.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub efforts: Vec<Effort>,
     /// Output-token limit when the catalog states one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output: Option<u32>,
@@ -270,10 +269,18 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
-    /// `effort` moved onto a level this model supports; `None` when the model has
-    /// no reasoning control.
+    /// `effort` moved onto a level this model supports: `None` when the model has
+    /// no reasoning control (no reasoning, or an empty level list), `effort`
+    /// itself when every level is selectable, otherwise the nearest listed level
+    /// (see [`Effort::clamp_to`]).
     pub fn clamp_effort(&self, effort: Effort) -> Option<Effort> {
-        effort.clamp_to(&self.efforts)
+        if !self.supports_reasoning {
+            return None;
+        }
+        match &self.supported_efforts {
+            None => Some(effort),
+            Some(levels) => effort.clamp_to(levels),
+        }
     }
 }
 
@@ -317,9 +324,64 @@ mod tests {
     fn old_model_info_loads_with_defaults() {
         let json = r#"{"route":{"provider":"a","model":"b"},"display_name":"B"}"#;
         let info: ModelInfo = serde_json::from_str(json).unwrap();
-        assert!(info.efforts.is_empty());
+        assert_eq!(info.supported_efforts, None);
         assert_eq!(info.kind, ModelKind::Chat);
         assert_eq!(info.max_output, None);
+    }
+
+    /// A catalog cached by a pre-merge branch build wrote `vision` and
+    /// `efforts`; both still land on the merged fields.
+    #[test]
+    fn pre_merge_cached_model_info_loads() {
+        let info: ModelInfo = serde_json::from_value(serde_json::json!({
+            "route": {"provider": "kimi", "model": "k2"},
+            "display_name": "K2",
+            "supports_reasoning": true,
+            "vision": true,
+            "efforts": ["low", "high", "max"],
+            "max_output": 32000,
+            "kind": "chat",
+        }))
+        .unwrap();
+        assert!(info.supports_vision);
+        assert_eq!(
+            info.supported_efforts,
+            Some(vec![Effort::Low, Effort::High, Effort::Max])
+        );
+        assert_eq!(info.max_output, Some(32_000));
+        assert_eq!(info.clamp_effort(Effort::Medium), Some(Effort::Low));
+
+        // It re-serializes under the merged names only.
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("efforts").is_none(), "{json}");
+        assert!(json.get("supported_efforts").is_some(), "{json}");
+    }
+
+    #[test]
+    fn clamp_effort_follows_reasoning_and_the_level_list() {
+        use Effort::*;
+        let mut info = ModelInfo {
+            supports_reasoning: true,
+            ..ModelInfo::default()
+        };
+        // Every level selectable.
+        for effort in Effort::ALL {
+            assert_eq!(info.clamp_effort(effort), Some(effort));
+        }
+        // A list: clamped into it, preferring the next lower level.
+        info.supported_efforts = Some(vec![Low, High, Max]);
+        assert_eq!(info.clamp_effort(Medium), Some(Low));
+        assert_eq!(info.clamp_effort(XHigh), Some(High));
+        assert_eq!(info.clamp_effort(Max), Some(Max));
+        // An empty list is no reasoning control.
+        info.supported_efforts = Some(Vec::new());
+        assert_eq!(info.clamp_effort(High), None);
+        // No reasoning: nothing to clamp to, whatever the list says.
+        info.supports_reasoning = false;
+        info.supported_efforts = None;
+        assert_eq!(info.clamp_effort(High), None);
+        info.supported_efforts = Some(vec![Low]);
+        assert_eq!(info.clamp_effort(High), None);
     }
 
     #[test]

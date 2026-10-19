@@ -29,7 +29,6 @@ pub mod memsessions;
 pub mod oneshot;
 pub mod progress;
 pub mod resources;
-mod retention;
 pub mod spec;
 mod spool;
 mod state;

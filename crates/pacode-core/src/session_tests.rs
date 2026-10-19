@@ -75,6 +75,15 @@ async fn build_test_core(
     temp_dir: &tempfile::TempDir,
     mock_provider: Arc<MockProvider>,
 ) -> Arc<Core> {
+    build_test_core_with(store, temp_dir, mock_provider, |_| {}).await
+}
+
+async fn build_test_core_with(
+    store: Store,
+    temp_dir: &tempfile::TempDir,
+    mock_provider: Arc<MockProvider>,
+    configure: impl FnOnce(&mut Config),
+) -> Arc<Core> {
     let exec_cfg = pacode_types::ExecConfig {
         yield_after_secs: 1,
         stall_secs: 100,
@@ -96,6 +105,7 @@ async fn build_test_core(
 
     let mut config = Config::default();
     config.provider.default = Some("mock/mock-model".to_string());
+    configure(&mut config);
 
     let paths = Paths::under(temp_dir.path());
     let mut tools = ToolRegistry::new();
@@ -130,10 +140,21 @@ async fn setup_test_session() -> (
     tempfile::TempDir,
     pacode_types::SessionId,
 ) {
+    setup_test_session_with(|_| {}).await
+}
+
+async fn setup_test_session_with(
+    configure: impl FnOnce(&mut Config),
+) -> (
+    Arc<Core>,
+    Arc<MockProvider>,
+    tempfile::TempDir,
+    pacode_types::SessionId,
+) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = Store::open_in_memory().unwrap();
     let mock_provider = Arc::new(MockProvider::new("mock"));
-    let core = build_test_core(store, &temp_dir, mock_provider.clone()).await;
+    let core = build_test_core_with(store, &temp_dir, mock_provider.clone(), configure).await;
     let session_id = core
         .open_session(Attach::New {
             cwd: temp_dir.path().to_path_buf(),
@@ -715,41 +736,100 @@ async fn test_detach_with_live_subagents_succeeds() {
     assert!(!detached_id.is_main());
 }
 
-/// There is no concurrency cap on subagents: spawning more than the old
-/// `agents.max_live` default (8) must succeed for every spawn.
+/// `agents.max_live` bounds live subagents: spawns up to it succeed, the next
+/// one is refused with an error that names the limit, a stopped agent frees
+/// its slot, and `continue` may not take it back past the cap.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_spawn_agent_has_no_live_cap() {
-    let (core, mock, _tmp, session_id) = setup_test_session().await;
+async fn test_spawn_agent_respects_the_live_cap() {
+    let (core, mock, _tmp, session_id) = setup_test_session_with(|c| c.agents.max_live = 3).await;
     let session = core.session(&session_id).unwrap();
 
-    const SPAWNS: usize = 10;
-    for i in 0..SPAWNS {
+    for i in 0..3 {
         mock.push(MockResponse::Slow {
-            delay: Duration::from_millis(300),
+            delay: Duration::from_secs(30),
             text: format!("subagent {i} working..."),
         });
     }
-
     let mut ids = Vec::new();
-    for i in 0..SPAWNS {
-        let id = session
-            .spawn_agent(pacode_tools::AgentSpec {
-                name: Some(format!("sub{i}")),
-                prompt: format!("work {i}"),
-                tools: None,
-                exclude_tools: None,
-                fork: false,
-                model: None,
-                effort: None,
-            })
-            .await;
+    for i in 0..3 {
+        let id = session.spawn_agent(sub_spec(&format!("sub{i}"))).await;
         assert!(id.is_ok(), "spawn {i} failed: {:?}", id.err());
         ids.push(id.unwrap());
     }
+    assert_eq!(session.live_subagents(), 3);
 
-    assert_eq!(ids.len(), SPAWNS);
-    let unique: std::collections::HashSet<_> = ids.iter().collect();
-    assert_eq!(unique.len(), SPAWNS, "spawned agent ids must be unique");
+    let err = session
+        .spawn_agent(sub_spec("one-too-many"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("maximum live subagents (3)"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        session.agents.read().unwrap().len(),
+        4,
+        "a refused spawn creates no agent"
+    );
+
+    // A stopped agent is not live: its slot is free again.
+    session.stop_agent(&ids[0]).await.unwrap();
+    let stopped = session.agent(&ids[0]).unwrap();
+    for _ in 0..400 {
+        if !stopped.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!stopped.is_running(), "the stopped turn unwound");
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_secs(30),
+        text: "the replacement working...".into(),
+    });
+    session
+        .spawn_agent(sub_spec("after-the-stop"))
+        .await
+        .expect("a freed slot takes a new spawn");
+    // `continue` would make the stopped one live again, past the cap.
+    let err = session.continue_agent(&ids[0]).await.unwrap_err();
+    assert!(
+        err.to_string().contains("maximum live subagents"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Detaching the main turn makes one more live subagent: refused at the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_detach_is_refused_at_the_live_cap() {
+    let (core, mock, _tmp, session_id) = setup_test_session_with(|c| c.agents.max_live = 1).await;
+    let session = core.session(&session_id).unwrap();
+
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_secs(30),
+        text: "subagent working...".into(),
+    });
+    session.spawn_agent(sub_spec("sub")).await.unwrap();
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(500),
+        text: "main turn...".into(),
+    });
+    session
+        .submit_user_message("main work".into())
+        .await
+        .unwrap();
+    let main = session.main_agent().unwrap();
+    for _ in 0..200 {
+        if main.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let err = session.detach_main_turn().await.unwrap_err();
+    assert!(
+        err.to_string().contains("maximum live subagents (1)"),
+        "unexpected error: {err}"
+    );
 }
 
 /// The W128 target, as a single session: a hundred and twenty-eight subagents
@@ -769,7 +849,9 @@ async fn test_spawn_agent_has_no_live_cap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_spawns_128_subagents_without_quadratic_slowdown() {
     const SPAWNS: usize = 128;
-    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    // The default live cap is far below the fleet this measures.
+    let (core, mock, _tmp, session_id) =
+        setup_test_session_with(|c| c.agents.max_live = SPAWNS).await;
     let session = core.session(&session_id).unwrap();
 
     // Every agent gets a slow provider so none of them finishes (and frees its
@@ -1919,6 +2001,33 @@ async fn compaction_store_failure_does_not_mutate_history() {
     assert_eq!(after.summary, before.summary);
     assert_eq!(after.summary_upto, before.summary_upto);
     assert_eq!(after.rows(), before.rows());
+}
+
+/// Under ZDR with no `zdr_capable` route the summary model is never called,
+/// but compaction still runs the stages that stay in the process: the older
+/// span is folded into the deterministic digest.
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_under_zdr_without_a_capable_route_digests_locally() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    let main = session.main_agent().unwrap();
+    {
+        let mut history = main.history.lock().unwrap();
+        for index in 0..10 {
+            history.push(Message::user(format!("history {index}")));
+        }
+    }
+    session.meta.write().unwrap().zdr = true;
+    assert!(session.zdr_active());
+
+    assert!(crate::compaction::compact(&session, &main).await.unwrap());
+    assert!(mock.requests().is_empty(), "nothing left the process");
+    let history = main.history.lock().unwrap();
+    assert!(
+        history.summary.is_some(),
+        "the digest stands in for the summary"
+    );
+    assert!(history.messages.len() < 10);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4892,7 +5001,7 @@ fn model_with_efforts(model: &str, efforts: &[Effort]) -> pacode_types::ModelInf
         route: ModelRoute::new("mock", model),
         display_name: model.to_string(),
         supports_reasoning: !efforts.is_empty(),
-        efforts: efforts.to_vec(),
+        supported_efforts: (!efforts.is_empty()).then(|| efforts.to_vec()),
         ..Default::default()
     }
 }
@@ -5084,4 +5193,51 @@ async fn test_background_fetch_fills_effort_cache() {
         }
     }
     assert_eq!(clamped, Effort::Low);
+}
+
+/// A prompt image the client names by path (a TUI paste temp file) is stored
+/// at admission: the message the model is sent carries a `Stored` ref, so it
+/// no longer depends on the file. The mock model has no vision — that never
+/// refuses the message; the provider renders the placeholder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_path_image_is_stored_at_admission() {
+    static STORE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let store_dir = STORE.get_or_init(|| tempfile::tempdir().unwrap());
+    pacode_image::store::init(store_dir.path().to_path_buf());
+
+    let (core, mock, tmp, session_id) = setup_test_session().await;
+    mock.push(MockResponse::Text("seen".into()));
+    let path = tmp.path().join("paste-1.png");
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 4, image::Rgb([1, 2, 3])))
+        .save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    let reply = core
+        .handle(
+            &session_id,
+            Request::UserMessage {
+                text: "look".into(),
+                images: vec![pacode_types::ImageSource::Path(path.clone())],
+                message_id: None,
+                attachments: Vec::new(),
+            },
+        )
+        .await;
+    assert!(matches!(reply, Reply::Ok), "{reply:?}");
+    std::fs::remove_file(&path).unwrap();
+
+    wait_until(|| !mock.requests().is_empty()).await;
+    let request = mock.requests().remove(0);
+    let image = request
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .find_map(|block| match block {
+            ContentBlock::Image { source } => Some(source.clone()),
+            _ => None,
+        })
+        .expect("the image is in the request");
+    let stored = image.image_ref().expect("stored at admission, not a path");
+    assert_eq!((stored.width, stored.height), (Some(8), Some(4)));
+    assert!(pacode_image::store::load(&stored.hash).is_ok());
 }

@@ -1,6 +1,8 @@
 //! Folding the client's event stream into state: connection transitions,
 //! seq-tracked session events (and the buffer that holds them while a
-//! snapshot is awaited), snapshots, and the seq-gap resync barrier.
+//! snapshot is awaited), snapshots, and the seq-gap resync barrier. A gap is
+//! loss only while no subagent is known; past that, `Subscribe` filtering
+//! leaves holes and loss arrives as an explicit resync marker.
 
 use std::time::Instant;
 
@@ -38,6 +40,17 @@ impl AppState {
         })
     }
 
+    /// Whether a forward jump in `seq` can be the daemon's interest filter rather than
+    /// loss. The TUI subscribes to the main agent and its panel agent only, and the
+    /// daemon filters an agent only after its `AgentAdded` or `AgentUpdated` reached
+    /// this client, so holes need a subagent on the rail. With none the stream is complete
+    /// and any jump is loss. Real loss on a filtered stream is never silent: the daemon
+    /// sends `ServerMessage::Resync` for every event it drops and the client queue turns
+    /// its own overflow into `ResyncNeeded`, both of which re-arm the snapshot.
+    fn seq_holes_expected(&self) -> bool {
+        self.rail.agents.iter().any(|agent| !agent.id.is_main())
+    }
+
     fn apply_tracked_session_event(&mut self, seq: u64, event: Event, now: Instant) -> bool {
         if let Some(last) = self.last_event_seq
             && seq <= last
@@ -47,13 +60,13 @@ impl AppState {
         if self
             .last_event_seq
             .is_some_and(|last| seq != last.wrapping_add(1))
+            && !self.seq_holes_expected()
         {
             self.resync_want = true;
         }
         self.last_event_seq = Some(seq);
         self.observe_background_completion(&event);
-        self.apply_event(seq, event, now);
-        self.dirty = true;
+        self.dirty |= self.apply_event(seq, event, now);
         true
     }
 
@@ -77,8 +90,7 @@ impl AppState {
                     None => {
                         self.last_event_seq = Some(buffered.seq);
                         self.observe_background_completion(&event);
-                        self.apply_event(buffered.seq, event, now);
-                        self.dirty = true;
+                        self.dirty |= self.apply_event(buffered.seq, event, now);
                     }
                     Some(last) if buffered.first_seq <= last => {
                         self.last_event_seq = Some(buffered.seq);
@@ -87,8 +99,7 @@ impl AppState {
                     Some(last) if buffered.first_seq == last.wrapping_add(1) => {
                         self.last_event_seq = Some(buffered.seq);
                         self.observe_background_completion(&event);
-                        self.apply_event(buffered.seq, event, now);
-                        self.dirty = true;
+                        self.dirty |= self.apply_event(buffered.seq, event, now);
                     }
                     Some(_) => {
                         self.apply_tracked_session_event(buffered.seq, event, now);
@@ -195,8 +206,7 @@ impl AppState {
                     return false;
                 }
                 if event.is_global() {
-                    self.apply_event(seq, event, now);
-                    self.dirty = true;
+                    self.dirty |= self.apply_event(seq, event, now);
                     return true;
                 }
                 if self.awaiting_snapshot {
@@ -325,15 +335,16 @@ impl AppState {
     }
 
     /// Fold a daemon event (`ClientEvent::Event`) into transcript/rail/panel/toasts.
-    pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) {
+    pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) -> bool {
         let main_status = match &event {
             Event::AgentUpdated(info) if info.id.is_main() => Some(info.status),
             _ => None,
         };
-        events::apply_event(self, seq, event, now);
+        let visible = events::apply_event(self, seq, event, now);
         if let Some(status) = main_status {
             self.session.observe_main_agent_status(status, now);
         }
+        visible
     }
 
     pub fn resync_reply_is_current(
@@ -415,3 +426,7 @@ impl AppState {
         Some(pacode_types::Request::GetSnapshot)
     }
 }
+
+#[cfg(test)]
+#[path = "client_events_tests.rs"]
+mod client_events_tests;

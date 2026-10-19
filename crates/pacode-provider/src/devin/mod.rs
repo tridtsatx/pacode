@@ -309,7 +309,10 @@ impl Devin {
                 .map(|(_, id)| id.as_str())
                 .unwrap_or(family.id.as_str());
             let mut info = self.model_info(&family.id);
-            info.efforts = family.efforts();
+            let family_efforts = family.efforts();
+            if !family_efforts.is_empty() {
+                info.supported_efforts = Some(family_efforts);
+            }
             if let Some(dn) = display_names.get(representative) {
                 info.display_name = catalog::family_display_name(dn);
             }
@@ -461,9 +464,10 @@ impl Provider for Devin {
             context_window,
             supports_reasoning,
             supports_vision: wire::model_supports_vision(model),
-            supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
+            supported_efforts: model_cfg
+                .and_then(|m| m.efforts.clone())
+                .or_else(|| Some(self.family_efforts(model)).filter(|efforts| !efforts.is_empty())),
             pricing,
-            efforts: self.family_efforts(model),
             ..ModelInfo::default()
         }
     }

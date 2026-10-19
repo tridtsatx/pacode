@@ -117,19 +117,16 @@ const DEPRECATED_AGENT_KEYS: &[&str] = &["default_model", "default_effort"];
 /// Keys the runtime never read, grouped by the table they lived in. serde drops
 /// them silently, which is not enough: a user who set one still believes the
 /// cap is in force, so each is worth a line in the log.
-const DEAD_LIMITS: &[(&str, &[&str])] = &[
-    (
-        "limits",
-        &[
-            "max_logical_agents",
-            "max_provider_queue_items",
-            "max_provider_queue_bytes",
-            "max_exec_calls_per_turn",
-            "max_tool_calls_per_turn",
-        ],
-    ),
-    ("agents", &["max_live", "max_turns"]),
-];
+const DEAD_LIMITS: &[(&str, &[&str])] = &[(
+    "limits",
+    &[
+        "max_logical_agents",
+        "max_provider_queue_items",
+        "max_provider_queue_bytes",
+        "max_exec_calls_per_turn",
+        "max_tool_calls_per_turn",
+    ],
+)];
 
 fn migrate_deprecated_agent_keys(table: &mut toml::Table) {
     let Some(agents) = table.get_mut("agents").and_then(toml::Value::as_table_mut) else {
@@ -148,6 +145,47 @@ fn migrate_deprecated_agent_keys(table: &mut toml::Table) {
     }
 }
 
+/// `provider.max_concurrent` predates `[limits] max_provider_concurrency`, the
+/// ceiling the provider governor enforces. A file that sets only the old key
+/// keeps its cap: the value is copied into `[limits]` (0, "unlimited", becomes
+/// the runtime's maximum). The old key itself still parses and still bounds the
+/// adaptive per-provider limit, but it is deprecated, so it is worth a line in
+/// the log either way.
+fn migrate_provider_max_concurrent(table: &mut toml::Table) {
+    let Some(old) = table
+        .get("provider")
+        .and_then(toml::Value::as_table)
+        .and_then(|provider| provider.get("max_concurrent"))
+        .and_then(toml::Value::as_integer)
+    else {
+        return;
+    };
+    let limits = table
+        .entry("limits")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(limits) = limits.as_table_mut() else {
+        return;
+    };
+    if limits.contains_key("max_provider_concurrency") {
+        log::warn!(
+            "provider.max_concurrent is deprecated and does not set the provider ceiling; limits.max_provider_concurrency is in force"
+        );
+        return;
+    }
+    let ceiling = if old <= 0 {
+        i64::from(pacode_types::config::MAX_PROVIDER_CONCURRENCY)
+    } else {
+        old
+    };
+    limits.insert(
+        "max_provider_concurrency".to_string(),
+        toml::Value::Integer(ceiling),
+    );
+    log::warn!(
+        "provider.max_concurrent is deprecated; using it as limits.max_provider_concurrency = {ceiling}"
+    );
+}
+
 fn warn_about_dead_limits(table: &toml::Table) {
     let present = DEAD_LIMITS
         .iter()
@@ -164,7 +202,7 @@ fn warn_about_dead_limits(table: &toml::Table) {
         return;
     }
     log::warn!(
-        "no-op settings ignored: {}; pacode caps no agents, no provider queue and no per-turn calls",
+        "no-op settings ignored: {}; pacode caps no provider queue and no per-turn calls",
         present.join(", ")
     );
 }
@@ -174,6 +212,7 @@ fn warn_about_dead_limits(table: &toml::Table) {
 /// against bounds that have since moved, must still boot.
 fn deserialize_config(mut table: toml::Table) -> Result<Config, String> {
     migrate_deprecated_agent_keys(&mut table);
+    migrate_provider_max_concurrent(&mut table);
     warn_about_dead_limits(&table);
     let mut config =
         Config::deserialize(toml::Value::Table(table)).map_err(|error| error.to_string())?;

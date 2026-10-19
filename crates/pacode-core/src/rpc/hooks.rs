@@ -16,6 +16,8 @@ pub(crate) enum Point {
     AfterSeal,
     /// `ask_parent` found the parent and is about to queue the question.
     AskLookedUp,
+    /// `ask_parent`'s wait ended and is about to put the asker's status back.
+    WaitRestoring,
     /// A resume passed its checks and is about to take the message lock.
     ResumeChecked,
     /// A resume persisted the message and is about to take effect.

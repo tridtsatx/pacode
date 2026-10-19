@@ -612,58 +612,82 @@ pub(crate) fn start_claimed_turn(
                         .unwrap_or_default()
                 }
             };
+            // A turn `agents.max_turns` cut short completes like any other;
+            // the parent is told it did not end on its own terms.
+            let max_turns = session.config.agents.max_turns;
+            let answer = if agent.take_step_capped() && matches!(stop, TurnStop::Completed) {
+                format!(
+                    "(stopped after reaching the limit of {max_turns} turns \
+                     (`agents.max_turns`); its work may be unfinished — send it a message to \
+                     let it go on)\n\n{answer}"
+                )
+            } else {
+                answer
+            };
             let capped_answer = pacode_types::truncate_head_tail(
                 &answer,
                 session.config.context.injection_cap_chars,
             );
 
-            {
+            // Decided again under the info lock `stop_agent` lands `Stopped`
+            // under: a stop between the check above and this write (its
+            // `note_stop` is the first thing it does) keeps its `Stopped`, and
+            // the agent is neither reported nor retired.
+            let finished = {
                 let mut info = agent.info.write().unwrap_or_else(|p| p.into_inner());
-                match &stop {
-                    TurnStop::Failed { message } => {
-                        info.status = AgentStatus::Failed;
-                        info.activity = Some("failed".to_string());
-                        info.error = Some(message.clone());
+                let stopped = agent.stop_requested()
+                    || agent.mailbox.stopped_by().is_some()
+                    || info.status == AgentStatus::Stopped;
+                if !stopped {
+                    match &stop {
+                        TurnStop::Failed { message } => {
+                            info.status = AgentStatus::Failed;
+                            info.activity = Some("failed".to_string());
+                            info.error = Some(message.clone());
+                        }
+                        TurnStop::Completed | TurnStop::Interrupted => {
+                            info.status = AgentStatus::Finished;
+                            info.activity = None;
+                            info.summary = Some(capped_answer.clone());
+                        }
                     }
-                    TurnStop::Completed | TurnStop::Interrupted => {
-                        info.status = AgentStatus::Finished;
-                        info.activity = None;
-                        info.summary = Some(capped_answer.clone());
+                    if info.finished_at_ms.is_none() {
+                        info.finished_at_ms = Some(pacode_types::now_ms());
                     }
                 }
-                if info.finished_at_ms.is_none() {
-                    info.finished_at_ms = Some(pacode_types::now_ms());
-                }
-            }
-            let info = agent.info();
-            let _ = session
-                .store
-                .upsert_agent(&session.id, &info, agent.prompt().as_deref())
-                .await;
-            session.events.emit(Event::AgentUpdated(info.clone()));
+                !stopped
+            };
+            if finished {
+                let info = agent.info();
+                let _ = session
+                    .store
+                    .upsert_agent(&session.id, &info, agent.prompt().as_deref())
+                    .await;
+                session.events.emit(Event::AgentUpdated(info.clone()));
 
-            if let Some(parent_id) = &info.parent
-                && let Some(parent) = session.agent(parent_id)
-            {
-                let injection = crate::inject::Injection::AgentFinished {
-                    agent: info,
-                    answer: capped_answer,
-                };
-                // A parked report starts no turn: the parent would spend a
-                // model round trip reading an empty injection set.
-                if !session.hold_notice(&parent, &injection) {
-                    parent.injections.push(injection);
-                    if parent.id().is_main() {
-                        request_turn(session.clone(), parent);
+                if let Some(parent_id) = &info.parent
+                    && let Some(parent) = session.agent(parent_id)
+                {
+                    let injection = crate::inject::Injection::AgentFinished {
+                        agent: info,
+                        answer: capped_answer,
+                    };
+                    // A parked report starts no turn: the parent would spend a
+                    // model round trip reading an empty injection set.
+                    if !session.hold_notice(&parent, &injection) {
+                        parent.injections.push(injection);
+                        if parent.id().is_main() {
+                            request_turn(session.clone(), parent);
+                        }
                     }
                 }
-            }
 
-            {
-                let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
-                hist.clear();
+                {
+                    let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
+                    hist.clear();
+                }
+                retire_agent(&agent);
             }
-            retire_agent(&agent);
             #[cfg(test)]
             wait_for_lifecycle_gate(&session, &agent).await;
         }
@@ -701,18 +725,23 @@ pub(crate) fn start_claimed_turn(
 
 /// Items a retired (finished) subagent keeps in its in-memory transcript tail.
 const RETIRED_TAIL: usize = 16;
+/// Bytes that retired tail may hold (the newest item always stays): without it 16
+/// items could still be the live 4 MiB tail cap, per finished agent.
+const RETIRED_TAIL_BYTES: usize = 64 * 1024;
 
 /// Free what a finished subagent no longer needs in memory: transcript tail capped at
-/// `RETIRED_TAIL` (16) items and `tool_items` emptied. Older items are served from the
-/// store by `GetHistory`; `AgentInfo` plus its summary are untouched. The tool registry
-/// and the prompt are kept: an `agent send` may resume a finished subagent
-/// (`rpc::resume` reloads its history with that prompt and runs it with those tools).
+/// `RETIRED_TAIL` (16) items and `RETIRED_TAIL_BYTES`, and `tool_items` emptied (its
+/// history was dropped just before). Older items are served from the store by
+/// `GetHistory`; `AgentInfo` plus its summary are untouched. The tool registry and the
+/// prompt are kept: an `agent send` may resume a finished subagent (`rpc::resume`
+/// reloads its history with that prompt, runs it with those tools and lifts the tail
+/// cap again).
 pub(crate) fn retire_agent(agent: &Agent) {
     agent
         .transcript
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retire(RETIRED_TAIL);
+        .retire(RETIRED_TAIL, RETIRED_TAIL_BYTES);
 }
 
 #[cfg(test)]

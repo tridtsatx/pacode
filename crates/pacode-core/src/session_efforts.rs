@@ -63,6 +63,16 @@ impl EffortsCache {
     }
 }
 
+/// The listed levels of `info`; empty when it has no reasoning control or lists none
+/// (every level selectable), so callers leave the effort alone.
+fn levels_of(info: &pacode_types::ModelInfo) -> Vec<Effort> {
+    if info.supports_reasoning {
+        info.supported_efforts.clone().unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Read the provider catalog (no timeout) and cache the efforts of `route`.
 async fn fetch_into(cache: &EffortsCache, provider: &dyn Provider, route: &ModelRoute) {
     let listed = provider
@@ -71,7 +81,7 @@ async fn fetch_into(cache: &EffortsCache, provider: &dyn Provider, route: &Model
         .ok()
         .and_then(|all| all.into_iter().find(|m| m.route.model == route.model));
     if let Some(info) = listed {
-        cache.put(route, info.efforts);
+        cache.put(route, levels_of(&info));
     }
 }
 
@@ -95,7 +105,7 @@ impl Session {
                 cache.end_fetch(&task_route);
             });
         }
-        provider.model_info(&route.model).efforts
+        levels_of(&provider.model_info(&route.model))
     }
 
     /// `effort` moved to the nearest level `route` supports (preferring the next

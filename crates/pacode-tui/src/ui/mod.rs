@@ -143,6 +143,8 @@ pub fn prepare_frame(area: Rect, state: &mut AppState, now: std::time::Instant) 
         model_palette_view::store_scroll(state, palette);
     }
     let rail = rail::resolve(state, layout.rail);
+    let drawn_agents = rail::drawn_agents(state, rail.as_ref());
+    state.rail.drawn_agents = Some(drawn_agents);
     let overlay = overlays::prepare(
         state,
         full_popup.as_ref(),
@@ -161,9 +163,14 @@ pub fn prepare_frame(area: Rect, state: &mut AppState, now: std::time::Instant) 
         dialog::PreparedDialog::default()
     } else {
         let anim_frame = state.anim_frame;
+        // `[ui] images` and the colour depth are read per frame: a transcript
+        // rebuilt for another session starts from the defaults.
+        let (images_on, truecolor) = (state.config.ui.images_enabled(), state.truecolor);
+        let transcript = dialog_transcript(state);
+        transcript.set_images(images_on, truecolor);
         dialog::prepare(
             dialog_area,
-            dialog_transcript(state),
+            transcript,
             &dialog_opts,
             anim_frame,
             welcome_ms,
