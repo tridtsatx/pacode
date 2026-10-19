@@ -51,3 +51,33 @@ fn event_sink_receiver_count_tracks_subscribers() {
     drop(rx);
     assert_eq!(sink.receiver_count(), 0);
 }
+
+#[test]
+fn concurrent_emits_reach_receivers_in_seq_order() {
+    use std::sync::Arc;
+    let sink = Arc::new(EventSink::new());
+    let mut rx = sink.subscribe();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    sink.emit(pacode_types::Event::Resync {
+                        reason: String::new(),
+                    });
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let mut last = 0;
+    let mut n = 0;
+    while let Ok((seq, _)) = rx.try_recv() {
+        assert_eq!(seq, last + 1, "seq must arrive in order and without gaps");
+        last = seq;
+        n += 1;
+    }
+    assert_eq!(n, 800);
+}

@@ -9,8 +9,15 @@ use pacode_types::{AgentId, CallId, Event, Message, TranscriptItem};
 use tokio::sync::broadcast;
 
 /// Per-session event fan-out with a monotonic seq.
+///
+/// `emit` takes the next seq and sends under one lock, so receivers see seqs in
+/// order even when many agents emit at once (a bare `fetch_add` followed by `send`
+/// let seq 244 overtake 243, which a client reads as a gap).
 pub struct EventSink {
     seq: AtomicU64,
+    /// Serialises "take a seq" + "send": held for two cheap operations, never across
+    /// an await. Owner: this sink.
+    emit_lock: std::sync::Mutex<()>,
     tx: broadcast::Sender<(u64, Event)>,
 }
 
@@ -20,11 +27,13 @@ impl EventSink {
         let (tx, _) = broadcast::channel(1024);
         Self {
             seq: AtomicU64::new(0),
+            emit_lock: std::sync::Mutex::new(()),
             tx,
         }
     }
 
     pub fn emit(&self, event: Event) -> u64 {
+        let _order = self.emit_lock.lock().unwrap_or_else(|p| p.into_inner());
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let _ = self.tx.send((seq, event));
         seq
