@@ -71,6 +71,8 @@ async fn usage_rows_are_written_per_turn() {
             &sid,
             Request::UserMessage {
                 text: format!("question {n}"),
+                images: Vec::new(),
+                message_id: None,
                 attachments: Vec::new(),
             },
         )

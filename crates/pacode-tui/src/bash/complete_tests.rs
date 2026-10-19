@@ -35,6 +35,18 @@ fn test_complete_from_history() {
 }
 
 #[test]
+fn test_complete_uses_a_char_cursor_as_a_boundary() {
+    let mut history = VecDeque::new();
+    record_history(&mut history, "echo 世界上");
+    let dir = tempdir().unwrap();
+    let input = "echo 世界";
+
+    let candidates = complete(input, input.chars().count(), &history, dir.path());
+
+    assert_eq!(candidates[0].display, "echo 世界上");
+}
+
+#[test]
 fn test_complete_filesystem_directory_suffix_and_cap() {
     let dir = tempdir().unwrap();
     fs::create_dir(dir.path().join("sub_dir")).unwrap();

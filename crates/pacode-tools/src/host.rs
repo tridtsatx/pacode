@@ -38,6 +38,10 @@ pub struct ToolCtx {
     pub tool_name: Option<String>,
     /// Explicit tool kind when called through the runtime.
     pub tool_kind: Option<crate::ToolKind>,
+    /// Snapshot of the agent's registry for this call — `batch` resolves its
+    /// ops through it, so a disabled or unavailable tool fails inside a batch
+    /// exactly as it would standalone.
+    pub tools: crate::registry::ToolRegistry,
 }
 
 impl ToolCtx {
@@ -64,8 +68,7 @@ impl ToolCtx {
         detail: impl Into<String>,
         risk: Option<RiskLevel>,
     ) -> Result<PermissionDecision, ToolError> {
-        let decision = self
-            .host
+        self.host
             .request_permission(PermissionDraft {
                 agent: self.agent.clone(),
                 agent_name: self.agent_name.clone(),
@@ -76,10 +79,51 @@ impl ToolCtx {
                 tool_name: self.tool_name.clone(),
                 tool_kind: self.tool_kind,
             })
-            .await;
-        match decision {
-            PermissionDecision::AllowOnce | PermissionDecision::AllowSession => Ok(decision),
-            PermissionDecision::Deny => Err(ToolError::Denied("user denied the request".into())),
+            .await
+            .into_result("user denied the request")
+    }
+}
+
+/// The host's answer to a permission request. `reason` explains a `Deny` that
+/// was NOT the user's refusal: the policy gate's reason, `zdr_blocked: …`,
+/// `interrupted`, or a client-supplied note. `None` on `Deny` means the user
+/// pressed deny without a comment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PermissionOutcome {
+    pub decision: PermissionDecision,
+    pub reason: Option<String>,
+}
+
+impl PermissionOutcome {
+    /// `Ok(decision)` for `Allow*`; `Err(ToolError::Denied)` for `Deny`.
+    /// `user_denied` is the model-facing text for a bare user refusal; a
+    /// `Some` reason is quoted back verbatim and marked as an automatic deny
+    /// so the model does not retry the same call expecting a user answer.
+    pub fn into_result(self, user_denied: &str) -> Result<PermissionDecision, ToolError> {
+        match self.decision {
+            PermissionDecision::AllowOnce | PermissionDecision::AllowSession => Ok(self.decision),
+            PermissionDecision::Deny => {
+                let message = match self.reason {
+                    Some(reason) => {
+                        let reason = reason.trim().trim_end_matches('.');
+                        format!(
+                            "{reason}. This call was denied automatically, not refused by the \
+                             user — do not retry it; choose a different approach or ask the user."
+                        )
+                    }
+                    None => user_denied.to_string(),
+                };
+                Err(ToolError::Denied(message))
+            }
+        }
+    }
+}
+
+impl From<PermissionDecision> for PermissionOutcome {
+    fn from(decision: PermissionDecision) -> Self {
+        Self {
+            decision,
+            reason: None,
         }
     }
 }
@@ -132,8 +176,92 @@ pub struct AgentSpec {
     pub effort: Option<Effort>,
     /// `true` = copy of the parent's history at spawn time.
     pub fork: bool,
-    /// Tool names allowed for the subagent; `None` = the default subagent set.
+    /// Tool names allowed for the subagent; `None` = the default subagent set,
+    /// which is the orchestrator's own set. Purely a narrowing: naming a tool
+    /// that does not exist is ignored, never an error.
     pub tools: Option<Vec<String>>,
+    /// Tool names to drop, applied after [`Self::tools`]. This is how an
+    /// orchestrator trims a subagent without restating the tools it wants: a
+    /// subagent that edits files gains nothing from every browser schema in
+    /// the set, and at 128 subagents those schemas are sent on every step.
+    /// Exclude wins where both lists name the same tool.
+    pub exclude_tools: Option<Vec<String>>,
+}
+
+/// What `agent send` did with the message — the tool output names it, so the
+/// orchestrator knows whether the subagent is reading it now or starting over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The subagent is mid-turn and reads the message at its next step.
+    Delivered,
+    /// The subagent was blocked in `ask_parent`: the message is its answer.
+    Answered,
+    /// The subagent had ended (finished or stopped): the message started a
+    /// new turn on its retained context. `previous_report` is the report it
+    /// ended with when the orchestrator had not read it yet — handed back here
+    /// so it cannot arrive after the resume, posing as the reply.
+    Resumed { previous_report: Option<String> },
+}
+
+impl SendOutcome {
+    /// What the message did to agent `id`, as the orchestrator reads it — in
+    /// the call's result, or after the fact when the call was interrupted.
+    pub fn describe(&self, id: &AgentId) -> String {
+        match self {
+            Self::Delivered => {
+                format!("Message delivered to agent {id}; it reads it at its next step.")
+            }
+            Self::Answered => {
+                format!("Agent {id} was waiting on its question; your message answered it.")
+            }
+            Self::Resumed { previous_report } => {
+                let mut text = format!(
+                    "Agent {id} had ended; your message resumed it with its context. \
+                     Its next report arrives as <agent_finished>."
+                );
+                if let Some(report) = previous_report {
+                    text.push_str(&format!(
+                        "\n\nIt had finished with this report, which you had not read \
+                         yet:\n{report}"
+                    ));
+                }
+                text
+            }
+        }
+    }
+
+    /// The short word the call's transcript row shows.
+    pub fn preview(&self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Answered => "answered",
+            Self::Resumed { .. } => "resumed",
+        }
+    }
+}
+
+/// A subagent the user stopped. The orchestrator resumes it only with the
+/// user's say-so: `stop` names this stop, and leave given for it does not
+/// carry over to a stop made after the user was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserStop {
+    pub name: String,
+    pub stop: u64,
+}
+
+/// How an `ask_parent` question ended, when it did not end in a stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParentReply {
+    /// The orchestrator's `agent send`, capped.
+    Answered(String),
+    /// The orchestrator completed a turn that showed it the question without
+    /// answering.
+    Unanswered,
+    /// The orchestrator's turn failed after it was shown the question, or the
+    /// question could not be delivered at all.
+    ParentFailed,
+    /// Too many questions in a row went unanswered: this one was not sent.
+    NotAnswering,
 }
 
 /// What kind of change a tool is about to make, passed to [`ToolHost::ledger_check`].
@@ -186,6 +314,46 @@ pub enum WaitOutcome {
     Cancelled,
 }
 
+/// A task a tool call started.
+#[derive(Debug)]
+pub struct SpawnedTask {
+    pub id: TaskId,
+    /// Set for a foreground task (`!spec.background`): the call reports the
+    /// task's end and holds this until its result is in hand
+    /// ([`pacode_exec::ForegroundGuard::delivered`]); dropping it earlier — an
+    /// interrupted call — hands the task over instead.
+    pub foreground: Option<pacode_exec::ForegroundGuard>,
+}
+
+impl SpawnedTask {
+    /// Start `spec` on `tasks`, with a guard when it runs in the foreground.
+    pub async fn start(
+        tasks: &pacode_exec::TaskManager,
+        spec: TaskSpec,
+    ) -> Result<(TaskInfo, Self), pacode_exec::ExecError> {
+        if spec.background {
+            let info = tasks.spawn(spec).await?;
+            let id = info.id.clone();
+            return Ok((
+                info,
+                Self {
+                    id,
+                    foreground: None,
+                },
+            ));
+        }
+        let (info, guard) = tasks.spawn_foreground(spec).await?;
+        let id = info.id.clone();
+        Ok((
+            info,
+            Self {
+                id,
+                foreground: Some(guard),
+            },
+        ))
+    }
+}
+
 /// A named subagent type discovered from an `agents/*.md` file (Claude Code
 /// `.claude/agents` parity): frontmatter fenced by `---` (YAML-style) or `+++`
 /// (TOML) carries `name` (default: file stem), `description` (required — it is
@@ -226,14 +394,20 @@ pub enum AgentKindWarning {
     Invalid { path: PathBuf, reason: String },
 }
 
-/// Load agent kinds from `*.md` files in `dirs`. On a name clash the file from
-/// the earlier dir wins, so pass the project dir before the global one.
-/// Missing directories are normal; unreadable or invalid files are skipped and
-/// reported as [`AgentKindWarning`]s.
+/// Load agent kinds: the built-in ones first, then `*.md` files from `dirs`. On
+/// a name clash the earlier source wins, so a file replaces a built-in of the
+/// same name outright and the project dir beats the global one. Missing
+/// directories are normal; unreadable or invalid files are skipped and reported
+/// as [`AgentKindWarning`]s.
 pub fn discover_agent_kinds(dirs: &[PathBuf]) -> (Vec<AgentKindDef>, Vec<AgentKindWarning>) {
     let mut kinds = Vec::new();
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
+    // Files are collected first and win every name clash, so a project file
+    // beats a global one and either beats a built-in of the same name. The
+    // built-ins go in afterwards as the fallback for names nothing claimed —
+    // which is the whole point: a fresh install with no `agents/` directory
+    // still has kinds to offer, instead of every spawn being a refusal.
 
     for dir in dirs {
         let entries = match std::fs::read_dir(dir) {
@@ -288,10 +462,68 @@ pub fn discover_agent_kinds(dirs: &[PathBuf]) -> (Vec<AgentKindDef>, Vec<AgentKi
             }
         }
     }
-
+    // Built-ins last, and only for names no file claimed: the file is the more
+    // specific statement of intent and wins the name outright rather than
+    // contributing field by field to a built-in.
+    for (name, description, tools, prompt) in BUILTIN_AGENT_KINDS {
+        if !seen.insert((*name).to_string()) {
+            continue;
+        }
+        kinds.push(AgentKindDef {
+            name: (*name).to_string(),
+            description: (*description).to_string(),
+            tools: Some(tools.iter().map(|t| (*t).to_string()).collect()),
+            model: None,
+            prompt: (*prompt).to_string(),
+            path: PathBuf::from(format!("<builtin>/{name}")),
+        });
+    }
     kinds.sort_by(|a, b| a.name.cmp(&b.name));
     (kinds, warnings)
 }
+
+/// The kinds that ship with pacode, as `(name, description, tools, brief)`.
+///
+/// These exist because the tool schema takes `kind` as a free-form string: a
+/// model asked for a subagent reaches for a plausible name, and with nothing on
+/// offer every such call was either a refusal or a guess. Two names cover
+/// nearly all of it — `explore` for finding things, `implement` for changing
+/// them — and both pin a *narrow* tool list, which is the other half of the
+/// reason to have them: every tool schema is re-sent on every step of every
+/// subagent, so a fleet of readers stops paying for write and browser tools it
+/// has no use for.
+///
+/// An explicit list rather than `None` (which would mean "the orchestrator's
+/// full set") is the point. A user file of the same name replaces a built-in
+/// whole, not field by field — a half-overridden kind is worse than either.
+const BUILTIN_AGENT_KINDS: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "explore",
+        "Read-only search of the codebase. Cannot edit, cannot run commands.",
+        &[
+            "read",
+            "grep",
+            "glob",
+            "ls",
+            "symbols",
+            "webfetch",
+            "websearch",
+        ],
+        "You are exploring a codebase on someone's behalf. Search widely before \
+         concluding, cite file:line for every claim, and report what you found \
+         rather than what you would change. You cannot edit anything.",
+    ),
+    (
+        "implement",
+        "Makes changes: edits files, runs tests, iterates until the task is done.",
+        &[
+            "read", "edit", "write", "grep", "glob", "ls", "symbols", "bash", "plan",
+        ],
+        "You are implementing a change. Read enough to be sure of the shape \
+         before editing, then make the change and verify it. Report what you did \
+         and what you verified, and say so plainly if you could not.",
+    ),
+];
 
 /// Flat frontmatter of an `agents/*.md` file; every field is optional at this
 /// stage and validated in [`parse_agent_kind`].
@@ -471,8 +703,10 @@ fn strip_quotes(s: &str) -> &str {
 #[async_trait]
 pub trait ToolHost: Send + Sync {
     /// Ask the user (or the mode) whether the call may proceed. The host applies the
-    /// permission matrix and the `AllowSession` cache before prompting.
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision;
+    /// permission matrix and the `AllowSession` cache before prompting. The returned
+    /// [`PermissionOutcome`] carries the reason whenever a `Deny` was decided by
+    /// policy or the environment rather than by the user's refusal.
+    async fn request_permission(&self, draft: PermissionDraft) -> PermissionOutcome;
 
     /// Ask the user a question and wait for the answer. The turn blocks exactly
     /// as it does for a permission prompt; a dismissed question comes back as a
@@ -511,11 +745,18 @@ pub trait ToolHost: Send + Sync {
     fn stop_monitor(&self, id: &pacode_types::MonitorId) -> Result<(), ToolError>;
 
     // --- background tasks (owner = session) ---
-    async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError>;
+    /// Start a task (see [`SpawnedTask::start`]). A foreground task comes with
+    /// its guard, created before any await of the host, so a call dropped
+    /// while the host records the task still hands it over.
+    async fn spawn_task(&self, spec: TaskSpec) -> Result<SpawnedTask, ToolError>;
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo>;
     fn list_tasks(&self) -> Vec<TaskInfo>;
-    /// Wait until the task ends, `timeout` elapses, or (when `return_on_progress`) its
-    /// progress changes.
+    /// Wait, as the call that owns the task's foreground, until the task ends,
+    /// `timeout` elapses, or (when `return_on_progress`) its progress changes.
+    /// `Finished` makes the caller the one that reports the output: no
+    /// `<task_finished>` notice follows. Any other outcome leaves the task
+    /// backgrounded, and its end arrives as that notice; a dropped wait is the
+    /// caller's guard's to settle.
     async fn wait_task(
         &self,
         task: &TaskId,
@@ -525,6 +766,10 @@ pub trait ToolHost: Send + Sync {
     async fn kill_task(&self, task: &TaskId) -> Result<(), ToolError>;
     /// Last `lines` lines of the spooled output.
     async fn task_tail(&self, task: &TaskId, lines: usize) -> Result<Vec<String>, ToolError>;
+    /// The task's output as the exec buffer holds it — the first and the last
+    /// bytes with a `[... N bytes omitted ...]` marker between them when the
+    /// middle was dropped — cut head+tail to `max_chars`.
+    async fn task_output(&self, task: &TaskId, max_chars: usize) -> Result<String, ToolError>;
     fn report_task_progress(&self, task: &TaskId, progress: TaskProgress) -> Result<(), ToolError>;
 
     // --- subagents (depth 1) ---
@@ -539,43 +784,43 @@ pub trait ToolHost: Send + Sync {
     /// provider — against the session's provider registry.
     fn parse_model_route(&self, s: &str) -> Option<ModelRoute>;
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError>;
+    /// The caller's subagent `agent`, if the user stopped it: resuming it
+    /// takes the user's say-so ([`Self::ask_question`]), passed as `consent`
+    /// to [`Self::continue_agent`] or [`Self::send_to_agent`].
+    fn user_stop(&self, _agent: &AgentId) -> Option<UserStop> {
+        None
+    }
+    /// Re-drive a `Stopped` agent: appends a resume nudge to its retained
+    /// history and starts a fresh turn. Errors while the agent is still running
+    /// or already in a terminal state, and for one the user stopped unless
+    /// `consent` is the [`UserStop::stop`] the user agreed to lift.
+    async fn continue_agent(&self, agent: &AgentId, consent: Option<u64>) -> Result<(), ToolError>;
     /// Orchestrator → subagent: ask for a brief status. Delivered to the subagent as a
     /// `<status_request>` injection at its next step; it answers with `report_status`.
     fn request_agent_status(&self, agent: &AgentId) -> Result<(), ToolError>;
     /// Subagent → parent: a short status line, delivered as `<agent_status>` at the
     /// parent's next step.
     fn report_status(&self, text: String) -> Result<(), ToolError>;
-    /// Orchestrator → running subagent: queue an instruction or correction
-    /// (`<message_from_orchestrator>` at the subagent's next step). Also resolves
-    /// the subagent's pending question, if any. Errors when the agent is gone.
-    fn message_agent(&self, _agent: &AgentId, _text: String) -> Result<(), ToolError> {
-        Err(ToolError::failed(
-            "messaging agents is not supported by this host",
-        ))
-    }
-    /// Orchestrator → subagent: answer its pending `ask_parent` question.
-    fn answer_agent(
+    /// Orchestrator → its own subagent. A running subagent gets the message as
+    /// an `<orchestrator_message>` at its next step; one blocked in
+    /// `ask_parent` gets it as the answer; one that has ended is resumed with
+    /// it. A failed subagent cannot be resumed and is an error, and so is one
+    /// the user stopped unless `consent` is the [`UserStop::stop`] the user
+    /// agreed to lift.
+    async fn send_to_agent(
         &self,
-        _agent: &AgentId,
-        _question_id: &str,
-        _text: String,
-    ) -> Result<(), ToolError> {
-        Err(ToolError::failed(
-            "answering agents is not supported by this host",
-        ))
-    }
-    /// Subagent → orchestrator: put a question; with `wait` block until answered,
-    /// timed out or cancelled.
+        agent: &AgentId,
+        message: String,
+        consent: Option<u64>,
+    ) -> Result<SendOutcome, ToolError>;
+    /// Subagent → orchestrator: deliver the question as `<agent_question>` and
+    /// wait until the orchestrator answers it with `agent send` or completes a
+    /// turn without doing so. A stop ends the wait as `Cancelled`.
     async fn ask_parent(
         &self,
-        _question: String,
-        _options: Vec<String>,
-        _wait: bool,
-    ) -> Result<crate::builtin::ask_parent::ParentReply, ToolError> {
-        Err(ToolError::failed(
-            "ask_parent is not supported by this host",
-        ))
-    }
+        call_id: &CallId,
+        question: String,
+    ) -> Result<ParentReply, ToolError>;
 
     // --- plan ---
     fn plan(&self) -> Plan;

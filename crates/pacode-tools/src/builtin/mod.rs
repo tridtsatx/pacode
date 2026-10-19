@@ -4,16 +4,19 @@
 //! Shared conventions:
 //! - every schema is an object; `intent`/`accept_large_output` are added centrally;
 //! - model-visible output is capped to `ctx.output_cap_chars` with
-//!   `pacode_types::truncate_head_tail`; when a result is withheld for size the tool
-//!   returns an error result naming the size and the `accept_large_output` flag;
-//! - paths are resolved with `ctx.resolve`; symlinks are followed; writes outside
-//!   `ctx.cwd` require permission even in Auto mode (spec §6.3 "запись только внутри cwd").
+//!   `pacode_types::truncate_head_tail`, whose marker names the dropped size;
+//!   `accept_large_output: true` skips that cut;
+//! - paths are resolved with `ctx.resolve`; the shared walk does not follow
+//!   symlinks; writes outside `ctx.cwd` require permission even in Auto mode
+//!   (spec §6.3 "writes stay inside cwd").
 
 pub mod agent;
 pub mod ask_parent;
 pub mod ask_question;
 pub mod bash;
+pub mod batch;
 pub mod bg;
+pub mod checkpoint;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -30,6 +33,7 @@ pub mod read_outline;
 pub mod report_status;
 pub mod schedule;
 pub mod skill;
+pub mod symbols;
 pub mod utils;
 pub mod webfetch;
 pub mod websearch;
@@ -51,27 +55,33 @@ pub fn builtin_tools(web: &WebConfig) -> ToolRegistry {
         .with(Arc::new(write::WriteTool))
         .with(Arc::new(edit::EditTool))
         .with(Arc::new(multi_edit::MultiEditTool))
-        .with(Arc::new(bash::BashTool))
+        .with(Arc::new(bash::BashTool::default()))
         .with(Arc::new(utils::UtilTool))
-        .with(Arc::new(ask_question::AskQuestionTool))
-        .with(Arc::new(bg::BgTool))
-        .with(Arc::new(schedule::CronTool))
-        .with(Arc::new(schedule::MonitorTool))
-        .with(Arc::new(grep::GrepTool))
-        .with(Arc::new(glob::GlobTool))
-        .with(Arc::new(ls::LsTool))
-        .with(Arc::new(plan::PlanTool))
+        .with(Arc::new(ask_question::AskQuestionTool::default()))
+        .with(Arc::new(bg::BgTool::default()))
+        .with(Arc::new(schedule::CronTool::default()))
+        .with(Arc::new(schedule::MonitorTool::default()))
+        .with(Arc::new(grep::GrepTool::default()))
+        .with(Arc::new(glob::GlobTool::default()))
+        .with(Arc::new(ls::LsTool::default()))
+        .with(Arc::new(symbols::SymbolsTool::default()))
+        .with(Arc::new(plan::PlanTool::default()))
         .with(Arc::new(agent::AgentTool))
-        .with(Arc::new(webfetch::WebFetchTool))
+        .with(Arc::new(webfetch::WebFetchTool::default()))
         .with(Arc::new(websearch::WebSearchTool::with_config(web.clone())))
-        .with(Arc::new(report_status::ReportStatusTool))
-        .with(Arc::new(ask_parent::AskParentTool))
-        .with(Arc::new(memory::MemoryWriteTool))
-        .with(Arc::new(memory::MemoryReadTool))
-        .with(Arc::new(memory::MemoryRecallTool))
-        .with(Arc::new(memory::MemoryForgetTool))
-        .with(Arc::new(memory::MemoryListTool))
+        .with(Arc::new(report_status::ReportStatusTool::default()))
+        .with(Arc::new(ask_parent::AskParentTool::default()))
+        .with(Arc::new(memory::MemoryWriteTool::default()))
+        .with(Arc::new(memory::MemoryReadTool::default()))
+        .with(Arc::new(memory::MemoryRecallTool::default()))
+        .with(Arc::new(memory::MemoryForgetTool::default()))
+        .with(Arc::new(memory::MemoryListTool::default()))
+        .with(Arc::new(batch::BatchTool::default()))
 }
+
+/// The tools that talk to the agent that spawned the caller. A subagent always
+/// gets them (they are its only channel back); the orchestrator never does.
+pub const SUBAGENT_ONLY: &[&str] = &[report_status::NAME, ask_parent::NAME];
 
 /// Tool names a subagent gets by default: everything except `agent` (depth 1).
 pub fn subagent_tool_names(all: &ToolRegistry) -> Vec<String> {
@@ -79,4 +89,9 @@ pub fn subagent_tool_names(all: &ToolRegistry) -> Vec<String> {
         .filter(|name| *name != agent::NAME)
         .map(str::to_string)
         .collect()
+}
+
+/// The orchestrator's set: everything except [`SUBAGENT_ONLY`].
+pub fn orchestrator_tools(all: &ToolRegistry) -> ToolRegistry {
+    all.subset(all.names().filter(|name| !SUBAGENT_ONLY.contains(name)))
 }

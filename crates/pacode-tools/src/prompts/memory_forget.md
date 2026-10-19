@@ -1,0 +1,1 @@
+Forget a memory by id (from memory_recall / memory_list / the prompt index). Use it for wrong or obsolete entries. It is hidden immediately and erased for good after 90 days.

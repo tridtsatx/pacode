@@ -1,8 +1,10 @@
 //! Slash commands typed in the prompt.
 //!
-//! `/model [name]` (picker without argument), `/effort <low|medium|high|xhigh|max>` (picker
-//! without argument), `/mode <build|auto|plan|bypass>`, `/sessions` (picker),
-//! `/mcp`, `/plugins`, `/compact`, `/clear` (transcript view only),
+//! `/model [name]` (the model palette without argument), `/login [provider]`
+//! (the palette on the first provider to sign in to, without argument),
+//! `/effort <low|medium|high|xhigh|max>` (picker without argument), `/mode <build|auto|plan|bypass>`, `/sessions` (picker),
+//! `/mcp`, `/plugins`, `/compact`, `/clear` (reset the conversation in place),
+//! `/new` (start a fresh session with the current settings),
 //! `/export [path]` (write the visible transcript as markdown to `path` or `~/pacode-<session>.md`),
 //! `/help`, `/quit`.
 
@@ -12,12 +14,12 @@ use std::sync::RwLock;
 
 use pacode_types::model::{Effort, ModelRoute};
 use pacode_types::state::{Mode, ToastLevel};
-use pacode_types::time::now_ms;
-use pacode_types::{McpServerInfo, PluginInfo, Request, TranscriptKind};
+use pacode_types::{McpServerInfo, PluginInfo, Request};
 
 use crate::keys::Action;
-use crate::state::transcript::{Cell, CellKind};
 use crate::state::{AppState, Focus, Overlay};
+
+mod export;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommand {
@@ -27,11 +29,46 @@ pub struct SlashCommand {
     pub arg_hint: Cow<'static, str>,
 }
 
+/// The cache file stores owned strings; `Cow<'static>` cannot derive
+/// `Deserialize` for non-`'static` inputs, so a shadow struct does the
+/// translation (every restored field lands as `Cow::Owned`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SlashCommandSerde {
+    name: String,
+    usage: String,
+    help: String,
+    arg_hint: String,
+}
+
+impl serde::Serialize for SlashCommand {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        SlashCommandSerde {
+            name: self.name.to_string(),
+            usage: self.usage.to_string(),
+            help: self.help.to_string(),
+            arg_hint: self.arg_hint.to_string(),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SlashCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let r = SlashCommandSerde::deserialize(d)?;
+        Ok(SlashCommand {
+            name: Cow::Owned(r.name),
+            usage: Cow::Owned(r.usage),
+            help: Cow::Owned(r.help),
+            arg_hint: Cow::Owned(r.arg_hint),
+        })
+    }
+}
+
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: Cow::Borrowed("model"),
         usage: Cow::Borrowed("/model"),
-        help: Cow::Borrowed("switch model"),
+        help: Cow::Borrowed("model palette: model, effort, sign-in"),
         arg_hint: Cow::Borrowed("[provider/model]"),
     },
     SlashCommand {
@@ -53,9 +90,21 @@ pub const COMMANDS: &[SlashCommand] = &[
         arg_hint: Cow::Borrowed("[name]"),
     },
     SlashCommand {
+        name: Cow::Borrowed("menu"),
+        usage: Cow::Borrowed("/menu"),
+        help: Cow::Borrowed("open the menu hub"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
         name: Cow::Borrowed("config"),
         usage: Cow::Borrowed("/config"),
         help: Cow::Borrowed("settings"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
+        name: Cow::Borrowed("settings"),
+        usage: Cow::Borrowed("/settings"),
+        help: Cow::Borrowed("settings — alias of /config"),
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
@@ -101,6 +150,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
+        name: Cow::Borrowed("analyze"),
+        usage: Cow::Borrowed("/analyze"),
+        help: Cow::Borrowed("where the tokens went, and whether the context held up"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
         name: Cow::Borrowed("compact"),
         usage: Cow::Borrowed("/compact"),
         help: Cow::Borrowed("compact the context now"),
@@ -109,7 +164,13 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: Cow::Borrowed("clear"),
         usage: Cow::Borrowed("/clear"),
-        help: Cow::Borrowed("clear the transcript view"),
+        help: Cow::Borrowed("forget the conversation, keep the session"),
+        arg_hint: Cow::Borrowed(""),
+    },
+    SlashCommand {
+        name: Cow::Borrowed("new"),
+        usage: Cow::Borrowed("/new"),
+        help: Cow::Borrowed("start a fresh session; this one stays in /sessions"),
         arg_hint: Cow::Borrowed(""),
     },
     SlashCommand {
@@ -220,6 +281,32 @@ pub fn clear_dynamic_commands() {
     }
 }
 
+/// The current dynamic registry — written to the `commands` cache file so the
+/// next run completes `/x` before the daemon answers (§8.2).
+pub fn dynamic_commands() -> Vec<SlashCommand> {
+    DYNAMIC_COMMANDS
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// Load the registry from the disk snapshot, wholesale — the file is the
+/// registry, not a merge source.
+pub fn restore_dynamic_commands(cmds: Vec<SlashCommand>) {
+    if let Ok(mut guard) = DYNAMIC_COMMANDS.write() {
+        *guard = cmds;
+    }
+}
+
+/// Rebuild the registry from fresh lists. Replacing (not merging) is what
+/// makes a removed plugin's commands disappear (§8.2: fresh data replaces
+/// cached state wholesale).
+pub fn rebuild_dynamic_commands(plugins: &[PluginInfo], servers: &[McpServerInfo]) {
+    clear_dynamic_commands();
+    register_plugins(plugins);
+    register_mcp_servers(servers);
+}
+
 /// Check if a command name is a registered plugin command.
 pub fn is_plugin_command(state: &AppState, name: &str) -> bool {
     state
@@ -246,33 +333,34 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
     match cmd {
         "login" => {
             if arg.is_empty() {
-                log::debug!("open overlay: LoginPicker");
-                state.focus = Focus::Overlay(Overlay::LoginPicker {
-                    query: String::new(),
-                    index: 0,
-                });
-                state.dirty = true;
-                vec![Action::Send(Request::ListAuth)]
+                log::debug!("open overlay: model palette (login)");
+                crate::keys_palette::open(state, crate::keys_palette::Opening::Login)
             } else {
                 vec![Action::Send(Request::Login { provider: arg })]
             }
         }
         "model" => {
             if arg.is_empty() {
-                log::debug!("open overlay: ModelPicker");
-                crate::ui::model_picker_keys::open(state)
+                open_model_picker(state)
             } else {
                 let route = if let Some((p, m)) = arg.split_once('/') {
                     ModelRoute::new(p, m)
                 } else {
                     ModelRoute::new("default", &arg)
                 };
-                let info = state.models.iter().find(|m| m.route == route).cloned();
-                crate::ui::model_picker_keys::set_main_model(state, route, info.as_ref())
+                // Downgrade the session effort if the new route can't run it
+                // (spec §6) — after the switch, and only if it succeeded.
+                let effort = state.clamp_effort(&route);
+                state.model_switch_actions(route, effort, false)
             }
         }
         "effort" => {
-            if !state.effort_visible() {
+            // A model whose catalog entry lists no effort levels has no
+            // reasoning effort control at all.
+            if state
+                .supported_efforts()
+                .is_some_and(|levels| levels.is_empty())
+            {
                 push_notice(
                     state,
                     ToastLevel::Info,
@@ -281,22 +369,32 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 vec![]
             } else if arg.is_empty() {
                 log::debug!("open overlay: EffortPicker");
-                let levels = state.effort_levels();
-                let cur_idx = state
-                    .effort()
-                    .clamp_to(&levels)
-                    .and_then(|e| levels.iter().position(|l| *l == e))
-                    .unwrap_or(0);
+                let cur_idx = Effort::ALL
+                    .iter()
+                    .position(|e| *e == state.effort())
+                    .unwrap_or(1);
                 state.focus = Focus::Overlay(Overlay::EffortPicker { index: cur_idx });
                 state.dirty = true;
                 vec![]
             } else if let Some(eff) = Effort::parse(&arg) {
-                crate::ui::model_picker_keys::set_effort(state, eff)
+                if !state.effort_supported(eff) {
+                    push_notice(
+                        state,
+                        ToastLevel::Warn,
+                        format!("effort {eff} is not supported by the current model"),
+                    );
+                    vec![]
+                } else {
+                    vec![Action::Send(Request::SetEffort(eff))]
+                }
             } else {
                 push_notice(
                     state,
                     ToastLevel::Warn,
-                    format!("Invalid effort '{arg}'. Valid: low, medium, high, xhigh, max"),
+                    format!(
+                        "Invalid effort '{arg}'. Valid: {}",
+                        Effort::ALL.map(|e| e.to_string()).join(", ")
+                    ),
                 );
                 vec![]
             }
@@ -312,7 +410,6 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 state.dirty = true;
                 vec![]
             } else if let Some(m) = Mode::parse(&arg) {
-                state.save_pref_mode(m);
                 vec![Action::Send(Request::SetMode(m))]
             } else {
                 push_notice(
@@ -324,35 +421,21 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
             }
         }
         "theme" => {
-            let truecolor = match state.config.ui.color.as_str() {
-                "ansi" => false,
-                "truecolor" | "24bit" => true,
-                _ => pacode_render::detect_truecolor(),
-            };
+            let truecolor = state.truecolor;
             if arg.is_empty() {
-                log::debug!("open overlay: ThemePicker");
-                let user_themes = pacode_config::user_theme_names(&state.paths);
-                let builtins = pacode_render::builtin_palettes();
-                let current_name = state.config.theme.name.clone();
-                let index = builtins
-                    .iter()
-                    .position(|p| p.name == current_name)
-                    .or_else(|| {
-                        user_themes
-                            .iter()
-                            .position(|u| u == &current_name)
-                            .map(|i| builtins.len() + i)
-                    })
-                    .unwrap_or(0);
-
-                state.focus = Focus::Overlay(Overlay::ThemePicker {
-                    index,
-                    original_theme: Box::new(state.theme.clone()),
-                    original_name: current_name,
-                    step: crate::state::ThemePickerStep::SelectTheme,
-                    user_themes,
-                });
-                state.dirty = true;
+                open_theme_picker(state)
+            } else if !pacode_render::builtin_palettes()
+                .iter()
+                .any(|p| p.name == arg)
+                && !pacode_config::user_theme_names(&state.paths).contains(&arg)
+            {
+                // `load_theme` would quietly fall back to the default, and the
+                // typo would be saved as the configured theme.
+                push_notice(
+                    state,
+                    ToastLevel::Warn,
+                    format!("Unknown theme '{arg}'. Run /theme to pick one."),
+                );
                 vec![]
             } else {
                 let theme_cfg = pacode_types::ThemeConfig {
@@ -362,6 +445,7 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 let (palette, warnings) = pacode_config::load_theme(&state.paths, &theme_cfg);
                 state.theme = pacode_render::Theme::from_palette(&palette, truecolor);
                 state.config.theme.name = arg.clone();
+                state.sync_render_context();
                 if let Err(e) = pacode_config::update_config_value(
                     &state.paths,
                     "theme.name",
@@ -376,34 +460,30 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 vec![]
             }
         }
-        "config" => {
-            log::debug!("open overlay: ConfigPicker");
-            state.config_view = crate::ui::config_view::ConfigViewState::new(&state.config);
-            state.focus = Focus::Overlay(Overlay::ConfigPicker);
+        "menu" => {
+            log::debug!("open overlay: menu hub");
+            crate::keys_menu::open(state, crate::ui::menu::MenuId::Root)
+        }
+        "config" | "settings" => {
+            // The full page, not the hub's level: the hub row is a shortcut into
+            // the same settings, and two settings screens is one too many.
+            log::debug!("open overlay: settings page");
+            state.focus = Focus::Overlay(Overlay::Settings {
+                ui: crate::ui::settings::SettingsState::new(),
+            });
             state.dirty = true;
             vec![]
         }
         "sessions" => {
-            log::debug!("open overlay: SessionPicker");
-            state.focus = Focus::Overlay(Overlay::SessionPicker {
-                query: String::new(),
-                index: 0,
-            });
-            state.dirty = true;
-            vec![Action::Send(Request::ListSessions { limit: 50 })]
+            log::debug!("open menu: sessions");
+            crate::keys_menu::open(state, crate::ui::menu::MenuId::Sessions)
         }
         "mcp" => {
-            log::debug!("open overlay: McpPicker");
-            state.focus = Focus::Overlay(Overlay::McpPicker {
-                index: 0,
-                servers: Vec::new(),
-                loading: true,
-            });
-            state.dirty = true;
-            vec![Action::Send(Request::ListMcpServers)]
+            log::debug!("open menu: mcp");
+            crate::keys_menu::open(state, crate::ui::menu::MenuId::Mcp)
         }
         "plugins" => {
-            log::debug!("open overlay: PluginsPicker");
+            log::debug!("open menu: plugins");
             // `/plugins <source>` points the Discover tab at a marketplace and
             // remembers it; `/plugins` alone uses the configured one.
             let source = arg.trim();
@@ -411,120 +491,46 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
                 state.config.plugins.marketplace = source.to_string();
                 state.save_pref_marketplace(source);
             }
-            let market_source = state.config.plugins.marketplace.clone();
-            let has_market = !market_source.is_empty();
-            state.focus = Focus::Overlay(Overlay::PluginsPicker {
-                index: 0,
-                plugins: state.plugins.clone(),
-                tab: if has_market && !source.is_empty() {
-                    crate::state::PluginsTab::Discover
-                } else {
-                    crate::state::PluginsTab::Installed
-                },
-                market: Vec::new(),
-                query: String::new(),
-                loading: has_market,
-                stale: false,
-            });
-            state.dirty = true;
-            let mut actions = vec![Action::Send(Request::ListPlugins)];
-            if has_market {
-                actions.push(Action::Send(Request::BrowseMarketplace {
-                    source: market_source,
-                    query: String::new(),
-                }));
+            let actions = crate::keys_menu::open(state, crate::ui::menu::MenuId::Plugins);
+            // A non-empty source lands on Discover.
+            if !source.is_empty()
+                && let Focus::Overlay(Overlay::Menu { ui, .. }) = &mut state.focus
+            {
+                ui.tab = crate::ui::menu::plugins::TAB_DISCOVER;
             }
             actions
         }
         "keys" => {
-            log::debug!("open overlay: KeysPicker");
-            state.focus = Focus::Overlay(Overlay::KeysPicker {
-                index: 0,
-                capturing: false,
-            });
-            state.dirty = true;
-            vec![]
+            log::debug!("open menu: keys");
+            crate::keys_menu::open(state, crate::ui::menu::MenuId::Keys)
         }
         "editor" => {
             crate::editor::open_editor(state);
             vec![]
         }
         "import" => {
-            log::debug!("open overlay: Import");
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let overlay_state =
-                crate::ui::import::ImportOverlayState::discover(&home, &cwd, &state.paths);
-            state.focus = Focus::Overlay(Overlay::Import(overlay_state));
-            state.dirty = true;
+            log::debug!("open menu: import");
+            crate::keys_menu::open(state, crate::ui::menu::MenuId::Import)
+        }
+        "analyze" => {
+            // Opens the page and asks for the reading in the same breath: the
+            // overlay is the answer, and an overlay with nothing in it is a
+            // frame of "loading" that never resolves.
+            state.open_analyze();
+            if state.analyze_mode {
+                return vec![Action::Send(Request::Analyze)];
+            }
             vec![]
         }
         "compact" => vec![Action::Send(Request::Compact)],
-        "clear" => {
-            state.transcript.cells.clear();
-            state.transcript.cache.clear();
-            state.transcript.images.clear();
-            state.dirty = true;
-            vec![]
-        }
-        "export" => {
-            let path = if arg.is_empty() {
-                let ses_id = state
-                    .meta
-                    .as_ref()
-                    .map(|m| m.id.to_string())
-                    .unwrap_or_else(|| "current".to_string());
-                format!("pacode-{ses_id}.md")
-            } else {
-                arg
-            };
-
-            let mut md = String::new();
-            for cell in &state.transcript.cells {
-                match &cell.kind {
-                    CellKind::Item(TranscriptKind::User { text }) => {
-                        md.push_str(&format!("### User\n\n{text}\n\n"));
-                    }
-                    CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
-                        md.push_str(&format!("### Assistant\n\n{text}\n\n"));
-                    }
-                    CellKind::Item(TranscriptKind::ToolCall { name, title, .. }) => {
-                        md.push_str(&format!("*Tool: {name} - {title}*\n\n"));
-                    }
-                    CellKind::Item(TranscriptKind::BashCommand {
-                        command,
-                        output,
-                        exit_code,
-                        ..
-                    }) => {
-                        let code = exit_code
-                            .map(|c| format!(" (exit {c})"))
-                            .unwrap_or_default();
-                        md.push_str(&format!(
-                            "### Bash: {command}{code}\n\n```\n{output}\n```\n\n"
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-
-            match std::fs::write(&path, md) {
-                Ok(_) => {
-                    push_notice(state, ToastLevel::Success, format!("Exported to {path}"));
-                }
-                Err(e) => {
-                    push_notice(state, ToastLevel::Error, format!("Export failed: {e}"));
-                }
-            }
-            vec![]
-        }
+        // The view resets on `Event::ContextCleared`, not here: a refused
+        // clear must leave the transcript as it was, next to the error.
+        "clear" => vec![Action::Send(Request::ClearContext)],
+        "new" => new_session(state),
+        "export" => export::run(state, &arg),
         "help" => {
             log::debug!("open overlay: Help");
-            state.focus = Focus::Overlay(Overlay::Help);
-            state.dirty = true;
-            vec![]
+            crate::keys_menu::open(state, crate::ui::menu::MenuId::Help)
         }
         "quit" => vec![Action::Quit],
         other if other.starts_with("mcp:") => {
@@ -569,16 +575,60 @@ pub fn execute(state: &mut AppState, line: &str) -> Vec<Action> {
     }
 }
 
-fn push_notice(state: &mut AppState, level: ToastLevel, text: String) {
-    let now = now_ms();
-    state.transcript.cells.push_back(Cell {
-        id: now,
-        kind: CellKind::Item(TranscriptKind::Notice { level, text }),
-        version: 0,
-        ts_ms: now,
-        stats: None,
+/// `/new` — a fresh session on the current route, effort and mode, attached
+/// in place of this one. The old session is detached, not closed: a turn
+/// running there keeps running, and `/sessions` resumes it.
+fn new_session(state: &mut AppState) -> Vec<Action> {
+    let attach = pacode_types::Attach::New {
+        cwd: state.cwd(),
+        model: state.meta.as_ref().map(|meta| meta.model.clone()),
+        effort: state.meta.as_ref().map(|meta| meta.effort),
+        mode: state.meta.as_ref().map(|meta| meta.mode),
+    };
+    log::debug!("new session from /new");
+    state.leave_active_slot();
+    state.begin_attach(attach.clone());
+    vec![Action::SwitchSession { attach }]
+}
+
+/// `/model` with no argument, and the hub's model row: the central model
+/// palette, landing on the session's route.
+pub fn open_model_picker(state: &mut AppState) -> Vec<Action> {
+    log::debug!("open overlay: model palette");
+    crate::keys_palette::open(state, crate::keys_palette::Opening::Model)
+}
+
+/// `/theme` with no argument — the bottom picker, pre-selected on the active
+/// theme. Also the hub's `Theme` row (`ui/menu/root.rs`).
+pub fn open_theme_picker(state: &mut AppState) -> Vec<Action> {
+    log::debug!("open overlay: ThemePicker");
+    let user_themes = pacode_config::user_theme_names(&state.paths);
+    let builtins = pacode_render::builtin_palettes();
+    let current_name = state.config.theme.name.clone();
+    let index = builtins
+        .iter()
+        .position(|p| p.name == current_name)
+        .or_else(|| {
+            user_themes
+                .iter()
+                .position(|u| u == &current_name)
+                .map(|i| builtins.len() + i)
+        })
+        .unwrap_or(0);
+
+    state.focus = Focus::Overlay(Overlay::ThemePicker {
+        index,
+        original_theme: Box::new(state.theme.clone()),
+        original_name: current_name,
+        step: crate::state::ThemePickerStep::SelectTheme,
+        user_themes,
     });
     state.dirty = true;
+    vec![]
+}
+
+fn push_notice(state: &mut AppState, level: ToastLevel, text: String) {
+    state.push_notice_with_level(level, text);
 }
 
 #[cfg(test)]

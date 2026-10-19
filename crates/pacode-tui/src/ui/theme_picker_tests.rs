@@ -17,6 +17,9 @@ fn setup_state_with_picker() -> (AppState, TempDir) {
     let paths = Paths::under(tmp.path());
     let mut config = Config::default();
     config.theme.name = "pacode-dark".to_string();
+    // Pinned: under ANSI-16 the dark and light palettes resolve to the same
+    // named colours, so a preview could not be told from the original.
+    config.ui.color = "truecolor".to_string();
 
     let mut state = AppState::new(config, "0.1.0-dev".into(), 80, 24);
     state.paths = paths;
@@ -36,17 +39,23 @@ fn setup_state_with_picker() -> (AppState, TempDir) {
     (state, tmp)
 }
 
+/// `AppState::new` resolves truecolor from the ambient terminal and builds the
+/// theme with whatever it decided, so the picker previews that same theme.
+/// Hardcoding `true` made these assertions depend on the terminal the suite
+/// happened to run in: they passed under a colour-capable `TERM` and failed
+/// under `TERM=dumb`, with the product behaving correctly either way.
+fn expected_palette_theme(state: &AppState, index: usize) -> Theme {
+    Theme::from_palette(
+        &pacode_render::builtin_palettes()[index],
+        state.color_mode == pacode_render::ColorMode::Truecolor,
+    )
+}
+
 #[test]
 fn test_theme_picker_move_previews() {
     let (mut state, _tmp) = setup_state_with_picker();
-    let dark_theme = Theme::from_palette(
-        &pacode_render::builtin_palettes()[0], // pacode-dark
-        true,
-    );
-    let light_theme = Theme::from_palette(
-        &pacode_render::builtin_palettes()[1], // pacode-light
-        true,
-    );
+    let dark_theme = expected_palette_theme(&state, 0); // pacode-dark
+    let light_theme = expected_palette_theme(&state, 1); // pacode-light
 
     assert_eq!(state.theme, dark_theme);
 
@@ -66,7 +75,7 @@ fn test_theme_picker_move_previews() {
 #[test]
 fn test_theme_picker_esc_restores() {
     let (mut state, _tmp) = setup_state_with_picker();
-    let dark_theme = Theme::from_palette(&pacode_render::builtin_palettes()[0], true);
+    let dark_theme = expected_palette_theme(&state, 0);
 
     // Move to index 1 (pacode-light)
     handle_picker_key(&mut state, make_key(KeyCode::Down));
@@ -83,7 +92,7 @@ fn test_theme_picker_esc_restores() {
 #[test]
 fn test_theme_picker_enter_normal_row_persists() {
     let (mut state, _tmp) = setup_state_with_picker();
-    let light_theme = Theme::from_palette(&pacode_render::builtin_palettes()[1], true);
+    let light_theme = expected_palette_theme(&state, 1);
 
     // Move to index 1 (pacode-light)
     handle_picker_key(&mut state, make_key(KeyCode::Down));

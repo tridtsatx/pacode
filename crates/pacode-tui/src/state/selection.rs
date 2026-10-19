@@ -10,10 +10,21 @@
 use std::ops::RangeInclusive;
 
 use ratatui::layout::Rect;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(test)]
 #[path = "selection_tests.rs"]
 mod selection_tests;
+
+pub(crate) const MAX_SELECTION_LINES: usize = 16_384;
+const MAX_SELECTED_LINE: usize = MAX_SELECTION_LINES - 1;
+
+/// Ceiling on the transcript text a copy materializes. Lines are bounded by
+/// `MAX_SELECTION_LINES`, which a transcript of wide tool previews reaches
+/// while still costing megabytes: the copy renders the selected rows into
+/// plain strings, and a select-all over a long session must not cost more than
+/// the clipboard write it feeds.
+pub(crate) const MAX_SELECTION_BYTES: usize = 256 * 1024;
 
 /// Pending copy actions triggered by mouse up or keyboard shortcuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -87,7 +98,10 @@ impl Selection {
     /// text under it has, and the selection must follow the text.
     pub fn drag_to_line(&mut self, line: usize, col: u16) {
         if self.dragging {
-            self.head = Point { line, col };
+            self.head = Point {
+                line: line.min(MAX_SELECTED_LINE),
+                col,
+            };
         }
     }
 
@@ -110,6 +124,18 @@ impl Selection {
         }
     }
 
+    pub fn rebase_lines(&mut self, delta: usize) {
+        if delta == 0 || !self.active {
+            return;
+        }
+        self.anchor.line = self
+            .anchor
+            .line
+            .saturating_add(delta)
+            .min(MAX_SELECTED_LINE);
+        self.head.line = self.head.line.saturating_add(delta).min(MAX_SELECTED_LINE);
+    }
+
     /// Both ends in reading order (top-to-bottom, left-to-right).
     pub fn normalized(&self) -> (Point, Point) {
         if self.anchor <= self.head {
@@ -125,7 +151,7 @@ impl Selection {
             return None;
         }
         let (start, end) = self.normalized();
-        Some(start.line..=end.line)
+        (start.line <= MAX_SELECTED_LINE).then_some(start.line..=end.line.min(MAX_SELECTED_LINE))
     }
 
     /// Column range selected on `line`, as offsets from the left edge of the
@@ -165,11 +191,32 @@ impl Selection {
     }
 }
 
+pub fn slice_by_columns(text: &str, start: u16, end: u16) -> &str {
+    let mut column = 0usize;
+    let mut slice_start = None;
+    let mut slice_end = 0usize;
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        let width = pacode_render::display_width(grapheme);
+        let next = column + width;
+        if next > start as usize && column <= end as usize {
+            slice_start.get_or_insert(offset);
+            slice_end = offset + grapheme.len();
+        }
+        column = next;
+    }
+    let Some(start) = slice_start else {
+        return "";
+    };
+    text.get(start..slice_end).unwrap_or("")
+}
+
 /// The content point under a screen position, clamped into the dialog area.
 fn point_at(col: u16, row: u16, dialog_rect: Rect, first_visible_line: usize) -> Point {
     let (c, r) = clamp_to_rect(col, row, dialog_rect);
     Point {
-        line: first_visible_line + (r.saturating_sub(dialog_rect.y)) as usize,
+        line: first_visible_line
+            .saturating_add((r.saturating_sub(dialog_rect.y)) as usize)
+            .min(MAX_SELECTED_LINE),
         col: c.saturating_sub(dialog_rect.x),
     }
 }

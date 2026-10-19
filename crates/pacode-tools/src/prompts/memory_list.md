@@ -1,0 +1,1 @@
+List memory titles (pinned first, then most recently updated) with ids; no text. Use memory_recall to read the content.

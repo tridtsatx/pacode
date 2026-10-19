@@ -11,8 +11,6 @@ fn basic_allowlist_commands_are_read_only() {
         "cat file.txt",
         "head -n 20 src/main.rs",
         "tail -f log.txt",
-        "less README.md",
-        "more README.md",
         "wc -l Cargo.toml",
         "grep -rn 'TODO' src/",
         "egrep 'foo|bar' file.txt",
@@ -25,7 +23,6 @@ fn basic_allowlist_commands_are_read_only() {
         "printf '%s\\n' value",
         "which cargo",
         "type ls",
-        "env",
         "printenv HOME",
         "stat Cargo.toml",
         "file src/main.rs",
@@ -98,12 +95,146 @@ fn git_read_only_subcommands() {
 }
 
 #[test]
-fn cargo_read_only_subcommands() {
-    assert!(is_read_only("cargo check"));
-    assert!(is_read_only("cargo check --workspace"));
-    assert!(is_read_only("cargo metadata --format-version 1"));
-    assert!(is_read_only("cargo tree"));
+fn cargo_reads_only_what_cannot_rewrite_the_lock_file() {
+    assert!(is_read_only("cargo metadata --locked --format-version 1"));
+    assert!(is_read_only("cargo tree --frozen"));
     assert!(is_read_only("cargo --version"));
+    // `check` runs build scripts and proc macros and writes `target/`;
+    // `metadata` / `tree` rewrite a missing or stale `Cargo.lock`.
+    assert!(!is_read_only("cargo check"));
+    assert!(!is_read_only("cargo check --workspace"));
+    assert!(!is_read_only("cargo metadata --format-version 1"));
+    assert!(!is_read_only("cargo tree"));
+    assert!(!is_read_only(
+        "cargo --config build.rustc-wrapper=x tree --locked"
+    ));
+}
+
+#[test]
+fn pagers_are_not_on_the_allowlist() {
+    // Interactive, and `LESSOPEN` runs a preprocessor on every file.
+    assert!(!is_read_only("less README.md"));
+    assert!(!is_read_only("more README.md"));
+}
+
+#[test]
+fn git_global_options_do_not_hide_the_subcommand() {
+    assert!(!is_read_only("git -C log commit -am x"));
+    assert!(!is_read_only("git -c diff.external=x diff"));
+    assert!(!is_read_only("git -c core.pager=less log"));
+    assert!(!is_read_only("git --config-env=core.pager=X log"));
+    assert!(!is_read_only("git list"));
+    assert!(is_read_only("git -C crates/x status"));
+    assert!(is_read_only("git --no-pager log -5"));
+    assert!(!is_read_only("git -C .. status"));
+}
+
+#[test]
+fn git_branch_and_tag_with_a_name_create_a_ref() {
+    assert!(!is_read_only("git branch newbranch"));
+    assert!(!is_read_only("git branch newbranch main"));
+    assert!(!is_read_only("git branch -f main HEAD~1"));
+    assert!(!is_read_only("git tag v2"));
+    assert!(is_read_only("git branch --list 'feat*'"));
+    assert!(is_read_only("git branch --contains HEAD"));
+    assert!(is_read_only("git branch -a -v"));
+    assert!(is_read_only("git tag --points-at HEAD"));
+    assert!(is_read_only("git tag -l 'v*'"));
+}
+
+#[test]
+fn environment_that_runs_code_is_not_a_read() {
+    for command in [
+        "PATH=. ls",
+        "LD_PRELOAD=./x.so cat f",
+        "GIT_EXTERNAL_DIFF=x git diff",
+        "PAGER=x git log",
+        "env PATH=. ls",
+        "env LD_PRELOAD=x cat f",
+    ] {
+        assert!(!is_read_only(command), "{command:?}");
+    }
+    assert!(is_read_only("LC_ALL=C sort f"));
+    assert!(is_read_only("env TZ=UTC date"));
+}
+
+#[test]
+fn brace_patterns_are_expanded_for_the_path_policy() {
+    assert!(!is_read_only("cat {..,x}/secret"));
+    assert!(!is_read_only("cat x/{a,.env}"));
+    assert!(is_read_only("cat src/{a,b}.rs"));
+}
+
+#[test]
+fn readers_that_write_or_execute_through_their_arguments() {
+    for command in [
+        "sort -uo out in",
+        "sort --out=f in",
+        "sort --compress-program=gzip in",
+        "uniq in out",
+        "uniq -f 1 in out",
+        "tree -o out",
+        "tree -R",
+        "date -s now",
+        "date --set=x",
+        "file -C -m magic",
+        "fd -Hx rm",
+        "sed 's/a/b/e' f",
+        "sed 'e ls' f",
+        "sed '1w out' f",
+        "awk 'BEGIN{print \"x\" | \"sh\"}'",
+        "awk '{print > $2}' f",
+        "xargs -a ls rm",
+        "xargs --arg-file=x rm",
+    ] {
+        assert!(!is_read_only(command), "{command:?}");
+    }
+    for command in [
+        "uniq in",
+        "uniq -c in",
+        "uniq -f 1 in",
+        "sort -k1,1 in",
+        "date -d yesterday",
+        "date +%s",
+        "fd -e rs",
+        "rg --pre-glob '*.pdf' x",
+        "awk '/a|b/ {print}' f",
+    ] {
+        assert!(is_read_only(command), "{command:?}");
+    }
+}
+
+#[test]
+fn pure_filters_are_read_only() {
+    for command in [
+        "tr a-z A-Z < f",
+        "rev file",
+        "nl file",
+        "tac file",
+        "fold file",
+        "comm a b",
+        "join a b",
+        "paste a b",
+        "cmp a b",
+        "column -t file",
+        "od -An -tx1 file",
+        "hexdump -C file",
+        "xxd file",
+        "strings binary",
+        "base64 file",
+        "seq 1 100",
+        "fmt -w 72 file",
+        "sha1sum file",
+        "sha512sum file",
+        "b2sum file",
+        "cksum file",
+        "sum file",
+    ] {
+        assert!(is_read_only(command), "{command:?} should be read-only");
+    }
+    // `xxd -r` and a second (output) operand write.
+    assert!(!is_read_only("xxd -r dump"));
+    assert!(!is_read_only("xxd in out"));
 }
 
 #[test]
@@ -120,7 +251,9 @@ fn read_only_pipelines_are_read_only() {
     assert!(is_read_only("cat file.txt | grep pattern | wc -l"));
     assert!(is_read_only("find . -type f | xargs grep TODO"));
     assert!(is_read_only("ls -la | sort | uniq"));
-    assert!(is_read_only("env | sort"));
+    assert!(is_read_only("printenv PATH | sort"));
+    assert!(is_read_only("env FOO=bar ls -la"));
+    assert!(is_read_only("timeout 5 cat file.txt"));
 }
 
 // ---------------------------------------------------------------------------
@@ -228,4 +361,172 @@ fn destructive_commands_are_disallowed() {
 fn empty_command_is_disallowed() {
     assert!(!is_read_only(""));
     assert!(!is_read_only("   "));
+}
+
+// ---------------------------------------------------------------------------
+// 3. Allowlisted commands that write or execute through their own flags
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fd_exec_flags_run_a_command_per_match() {
+    assert!(!is_read_only("fd -x rm"));
+    assert!(!is_read_only("fd -X wc -l"));
+    assert!(!is_read_only("fd --exec touch {}"));
+    assert!(!is_read_only("fd --exec-batch rm"));
+    // Searching for those names is still a read.
+    assert!(is_read_only("fd --extension rs"));
+    assert!(is_read_only("fd pattern src/"));
+}
+
+#[test]
+fn rg_pre_runs_a_command_on_every_file() {
+    assert!(!is_read_only("rg --pre 'rm' TODO"));
+    assert!(!is_read_only("rg --pre=cat TODO"));
+    assert!(is_read_only("rg 'fn main' crates/"));
+    assert!(is_read_only("rg --glob '*.rs' TODO"));
+}
+
+#[test]
+fn sort_output_flag_rewrites_the_input() {
+    assert!(!is_read_only("sort -o Cargo.toml Cargo.toml"));
+    assert!(!is_read_only("sort --output=out.txt list.txt"));
+    assert!(!is_read_only("sort --output out.txt list.txt"));
+    assert!(is_read_only("sort list.txt"));
+    // `-o` on other allowlisted commands is a different flag entirely.
+    assert!(is_read_only("grep -o 'a.' file.txt"));
+}
+
+#[test]
+fn find_file_writing_actions_are_disallowed() {
+    assert!(!is_read_only("find . -name '*.rs' -fprintf out.txt '%p'"));
+    assert!(!is_read_only("find . -fprint out.txt"));
+    assert!(!is_read_only("find . -fprint0 out.txt"));
+    assert!(!is_read_only("find . -fls out.txt"));
+    // `-printf` writes to stdout only.
+    assert!(is_read_only("find . -name '*.rs' -printf '%p\\n'"));
+}
+
+#[test]
+fn sed_write_command_creates_a_file() {
+    assert!(!is_read_only("sed 'w out.txt' file.txt"));
+    assert!(!is_read_only("sed -n 's/foo/bar/w out.txt' file.txt"));
+    assert!(!is_read_only("sed 's/a/b/;w out.txt' file.txt"));
+    assert!(is_read_only("sed 's/foo/bar/g' file.txt"));
+    // A `..` in a substitution is a regex, not a path.
+    assert!(is_read_only("sed 's/../x/g' file.txt"));
+}
+
+#[test]
+fn awk_print_redirection_writes_a_file() {
+    assert!(!is_read_only("awk '{print > \"out.txt\"}' table.txt"));
+    assert!(!is_read_only("awk '{print $1 >> \"out.txt\"}' table.txt"));
+    assert!(!is_read_only("awk 'BEGIN{printf(\"x\") > \"out.txt\"}'"));
+    // Comparisons and plain output still read.
+    assert!(is_read_only("awk '$3 > 100 {print $1}' table.txt"));
+    assert!(is_read_only("awk '{print $1}' table.txt"));
+}
+
+#[test]
+fn git_output_flag_writes_the_result() {
+    assert!(!is_read_only("git diff --output=changes.patch"));
+    assert!(!is_read_only("git diff --output changes.patch"));
+    assert!(!is_read_only("git log --output=log.txt"));
+}
+
+#[test]
+fn git_ref_writing_subcommands_are_disallowed() {
+    assert!(!is_read_only("git tag v1.0"));
+    assert!(!is_read_only("git tag -f v1.0"));
+    assert!(!is_read_only("git tag -s -u key v1.0"));
+    assert!(!is_read_only("git branch --move old new"));
+    assert!(!is_read_only("git branch --copy main release"));
+    assert!(!is_read_only("git branch --edit-description"));
+    assert!(!is_read_only("git branch --set-upstream-to=origin/main"));
+    assert!(!is_read_only("git remote update"));
+    assert!(!is_read_only("git remote prune origin"));
+    assert!(!is_read_only("git remote set-head origin -a"));
+    // Listing forms stay readable.
+    assert!(is_read_only("git tag"));
+    assert!(is_read_only("git tag -l 'v*'"));
+    assert!(is_read_only("git branch -a"));
+    assert!(is_read_only("git remote -v"));
+}
+
+#[test]
+fn whole_environment_dumps_are_disallowed() {
+    assert!(!is_read_only("env"));
+    assert!(!is_read_only("printenv"));
+    assert!(!is_read_only("env FOO=bar"));
+    assert!(!is_read_only("printenv | grep TOKEN"));
+    // Naming the variable keeps it a read.
+    assert!(is_read_only("printenv HOME"));
+    assert!(is_read_only("printenv PATH | sort"));
+}
+
+// ---------------------------------------------------------------------------
+// 4. Read targets: credential stores and workspace escapes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn credential_stores_and_files_are_not_read_only() {
+    let commands = [
+        "cat ~/.ssh/id_rsa",
+        "cat /home/dev/.aws/credentials",
+        "head -n 5 ./.ssh/config",
+        "grep -rn token .gnupg",
+        "cat .kube/config",
+        "cat ~/.docker/config.json",
+        "cat .env",
+        "cat config/.env.production",
+        "cat deploy/server.key",
+        "cat certs/api.pem",
+        "cat id_ed25519",
+        "cat aws-credentials.json",
+        "cat /etc/shadow",
+        "cat /etc/gshadow",
+        // Every segment is checked, not just the first one.
+        "cat Cargo.toml; cat ~/.ssh/id_rsa",
+        "ls | head ~/.aws/credentials",
+    ];
+    for cmd in commands {
+        assert!(!is_read_only(cmd), "{cmd:?} must not be a Plan-mode read");
+    }
+    // Ordinary files next to them stay readable, and the `.env` templates are
+    // not secrets. `/etc/passwd` is world-readable and holds no secret.
+    assert!(is_read_only("cat src/config.rs"));
+    assert!(is_read_only("cut -d: -f1 /etc/passwd"));
+    assert!(is_read_only("cat .env.example"));
+    assert!(is_read_only("cat config/.env.sample"));
+    // New secrets the gate and Plan mode both refuse to read.
+    assert!(!is_read_only("cat /proc/self/environ"));
+    assert!(!is_read_only("cat ~/.netrc"));
+    assert!(!is_read_only("cat ~/.pgpass"));
+}
+
+#[test]
+fn operands_climbing_out_of_the_workspace_are_disallowed() {
+    let commands = [
+        "cat ../secrets.txt",
+        "ls ..",
+        "head -n 20 ../../other-project/.env",
+        "cat src/../../outside.txt",
+        "grep -rn TODO ..",
+        "find .. -name '*.rs'",
+        "diff ../a.rs b.rs",
+    ];
+    for cmd in commands {
+        assert!(!is_read_only(cmd), "{cmd:?} escapes the workspace");
+    }
+    // `..` as regex text or a leading-dot path is not an escape.
+    assert!(is_read_only("grep -rn 'a\\.\\.b' src/"));
+    assert!(is_read_only("ls .config"));
+    assert!(is_read_only("cat ./file.txt"));
+}
+
+#[test]
+fn escapes_are_seen_through_wrappers() {
+    assert!(!is_read_only("timeout 5 cat ~/.ssh/id_rsa"));
+    assert!(!is_read_only(
+        "find . -name '*.txt' | xargs head -n 1 ../secret"
+    ));
 }

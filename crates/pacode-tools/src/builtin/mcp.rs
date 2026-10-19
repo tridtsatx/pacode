@@ -8,8 +8,11 @@ use async_trait::async_trait;
 use pacode_mcp::{McpPool, McpToolInfo};
 use serde_json::Value;
 
-use super::helpers::cap_output;
-use crate::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use super::helpers::{cap_output, preview_body};
+use crate::{
+    ACCEPT_LARGE_OUTPUT_KEY, DefinitionCache, INTENT_KEY, Tool, ToolCtx, ToolError, ToolKind,
+    ToolOutput,
+};
 
 pub struct McpTool {
     pool: Arc<McpPool>,
@@ -18,6 +21,11 @@ pub struct McpTool {
     /// `<server>__<tool>`
     name: String,
     kind: ToolKind,
+    /// A listing is immutable for the life of the proxy, so the memoised
+    /// definition needs no invalidation: a refreshed pool is served by
+    /// [`mcp_tools`], which builds *new* proxies (with new, empty caches) rather
+    /// than mutating the ones a session already holds.
+    definition: DefinitionCache,
 }
 
 impl McpTool {
@@ -38,6 +46,7 @@ impl McpTool {
             info,
             name,
             kind,
+            definition: DefinitionCache::new(),
         }
     }
 }
@@ -47,12 +56,19 @@ pub struct McpResourceTool {
     server: String,
     /// `<server>__resource`
     name: String,
+    /// Fixed by construction, so it has no refresh path.
+    definition: DefinitionCache,
 }
 
 impl McpResourceTool {
     pub fn new(pool: Arc<McpPool>, server: String) -> Self {
         let name = pacode_mcp::tool_name(&server, "resource");
-        Self { pool, server, name }
+        Self {
+            pool,
+            server,
+            name,
+            definition: DefinitionCache::new(),
+        }
     }
 }
 
@@ -79,6 +95,28 @@ pub async fn mcp_tools(pool: Arc<McpPool>) -> Vec<Arc<dyn Tool>> {
     tools
 }
 
+/// [`mcp_tools`] built purely from the schema cache: a hit contributes the
+/// server's tools, a miss contributes nothing, and no MCP server is spawned
+/// on this path. `open_session` uses it so attach never waits on MCP work —
+/// the daemon's post-attach refresh swaps in the full set once it lands.
+pub fn mcp_tools_cached(pool: Arc<McpPool>) -> Vec<Arc<dyn Tool>> {
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+
+    for (server, info) in pool.list_all_tools_cached() {
+        tools.push(Arc::new(McpTool::new(pool.clone(), server, info)));
+    }
+
+    let mut servers_with_resources = BTreeSet::new();
+    for (server, _) in pool.list_all_resources_cached() {
+        servers_with_resources.insert(server);
+    }
+    for server in servers_with_resources {
+        tools.push(Arc::new(McpResourceTool::new(pool.clone(), server)));
+    }
+
+    tools
+}
+
 #[async_trait]
 impl Tool for McpTool {
     fn name(&self) -> &str {
@@ -87,6 +125,9 @@ impl Tool for McpTool {
 
     fn description(&self) -> &str {
         &self.info.description
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
@@ -130,12 +171,7 @@ impl Tool for McpTool {
 
         let capped = cap_output(&result.content, accept_large_output, ctx.output_cap_chars);
 
-        let preview = capped
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or_default()
-            .to_string();
+        let preview = preview_body(&capped);
 
         let mut output = if result.is_error {
             ToolOutput::error(capped)
@@ -170,6 +206,9 @@ impl Tool for McpResourceTool {
             "required": ["uri"]
         })
     }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
+    }
 
     fn kind(&self) -> ToolKind {
         ToolKind::ReadOnly
@@ -194,12 +233,7 @@ impl Tool for McpResourceTool {
 
         let capped = cap_output(&content, accept_large_output, ctx.output_cap_chars);
 
-        let preview = capped
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or_default()
-            .to_string();
+        let preview = preview_body(&capped);
 
         let mut output = ToolOutput::text(capped);
         output = output.with_title(&self.name).with_preview(preview);

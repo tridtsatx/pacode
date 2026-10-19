@@ -97,3 +97,152 @@ fn test_trailing_space_cursor() {
     assert_eq!(state.cursor_position(80), (0, 2 + 7));
     assert_eq!(state.wrapped_lines(80), 1);
 }
+
+#[test]
+fn test_wrap_word_boundary() {
+    // Words wrap whole at the last boundary that fits; the separating space
+    // still occupies cells (non-trimming contract).
+    let lines = wrap_text_non_trimming("aaa bbb ccc", 7);
+    assert_eq!(lines, vec!["aaa bbb", " ccc"]);
+    assert_eq!(lines.concat(), "aaa bbb ccc");
+}
+
+#[test]
+fn test_wrap_long_word_hard_break() {
+    // A word longer than the line is split mid-word on grapheme boundaries.
+    assert_eq!(
+        wrap_text_non_trimming("averylongword", 5),
+        vec!["avery", "longw", "ord"]
+    );
+    // The boundary wrap happens first, then the oversized word is chunked.
+    assert_eq!(
+        wrap_text_non_trimming("hi averylongword bye", 5),
+        vec!["hi ", "avery", "longw", "ord ", "bye"]
+    );
+}
+
+#[test]
+fn test_wrap_cjk_no_spaces() {
+    // No whitespace at all: CJK (2 cells each) falls back to grapheme splits.
+    assert_eq!(
+        wrap_text_non_trimming("你好世界测试", 4),
+        vec!["你好", "世界", "测试"]
+    );
+}
+
+#[test]
+fn test_wrap_trailing_whitespace_preserved() {
+    // Spaces are real characters: they fill the line and overflow forward.
+    assert_eq!(wrap_text_non_trimming("abc  ", 4), vec!["abc ", " "]);
+    assert_eq!(wrap_text_non_trimming("ab   cd", 4), vec!["ab  ", " cd"]);
+}
+
+#[test]
+fn test_wrap_edge_cases() {
+    assert_eq!(wrap_text_non_trimming("", 10), vec![""]);
+    // width 0 is clamped to 1: hard break every grapheme.
+    assert_eq!(wrap_text_non_trimming("ab", 0), vec!["a", "b"]);
+    assert_eq!(wrap_text_non_trimming("ab", 1), vec!["a", "b"]);
+    assert_eq!(wrap_text_non_trimming("a\nb\n", 10), vec!["a", "b", ""]);
+    assert_eq!(wrap_text_non_trimming("ab\r\ncd", 10), vec!["ab", "cd"]);
+}
+
+#[test]
+fn test_wrap_url_hard_break_no_char_loss() {
+    let url = "see https://example.com/some/long/path ok";
+    let lines = wrap_text_non_trimming(url, 20);
+    // Nothing is dropped or reordered, and no line exceeds the width.
+    assert_eq!(lines.concat(), url);
+    assert!(lines.iter().all(|l| display_width(l) <= 20));
+    // The URL is longer than a line, so it must have been split.
+    assert!(lines.len() > 2);
+}
+
+#[test]
+fn test_wrap_cursor_consistency() {
+    let mut state = InputState::default();
+    state.insert_str("foo barbaz");
+    // Outer width 10 -> text width 8: "foo " stays, "barbaz" wraps to line 1.
+    assert_eq!(state.wrap_lines(10), vec!["foo ", "barbaz"]);
+    assert_eq!(state.cursor_position(10), (1, 8));
+
+    // Cursor right after "foo" sits at the end of line 0.
+    state.cursor = 3;
+    assert_eq!(state.cursor_position(10), (0, 5));
+    // After the separating space, still line 0 (the space trails the line).
+    state.cursor = 4;
+    assert_eq!(state.cursor_position(10), (0, 6));
+}
+
+/// B15: the cursor used to be placed by wrapping only the text before it, so
+/// inside a word that wraps it sat on the row above its letters.
+#[test]
+fn the_cursor_inside_a_wrapped_word_sits_on_the_row_with_the_word() {
+    let mut state = InputState::default();
+    state.insert_str("aaaaaaaaaaaaaa wordword");
+    // Outer width 20 -> text width 18: "wordword" wraps to line 1.
+    assert_eq!(state.wrap_lines(20), vec!["aaaaaaaaaaaaaa ", "wordword"]);
+    state.cursor = "aaaaaaaaaaaaaa wo".chars().count();
+    assert_eq!(state.cursor_position(20), (1, 4));
+    // Vertical moves read the same row.
+    assert!(state.move_up(20));
+    assert!(!state.move_up(20));
+}
+
+#[test]
+fn test_wrapped_position_of_byte() {
+    // Single line: the column is the display width of the text before it.
+    let mut state = InputState::default();
+    state.insert_str("see [Image 2] ok");
+    let byte = state.text.find("[Image 2]").unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 80), (0, 4));
+
+    // Outer width 10 → text width 8: "see " fills line 0, "[Image " wraps
+    // to line 1 — the token's byte lands on the line where it STARTS.
+    assert_eq!(state.wrapped_position_of_byte(byte, 10), (1, 0));
+
+    // A token split mid-word: "a b c d e [Image 3]" at text width 6 wraps
+    // into ["a b c ", "d e ", "[Image", " 3]"] — the space after `[Image`
+    // overflows onto line 3 as leading whitespace (non-trimming wrap), so
+    // '[' is line 2 col 0 and '3' is line 3 col 1.
+    let mut state = InputState::default();
+    state.insert_str("a b c d e [Image 3]");
+    let byte = state.text.find("[Image 3]").unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 8), (2, 0));
+    let byte = state.text.find('3').unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 8), (3, 1));
+
+    // Wide chars before the token count display cells, not bytes: "你好 "
+    // is 5 cells, so the token starts at col 0 of wrapped line 1.
+    let mut state = InputState::default();
+    state.insert_str("你好 [Image 1]");
+    let byte = state.text.find("[Image 1]").unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 10), (1, 0));
+
+    // Multi-line text: the '\n' separator is bridged, the token maps to
+    // line 1 at its column there.
+    let mut state = InputState::default();
+    state.insert_str("ab\ncd [Image 1]");
+    let byte = state.text.find("[Image 1]").unwrap();
+    assert_eq!(state.wrapped_position_of_byte(byte, 20), (1, 3));
+
+    // A byte past the end lands on the last line's end.
+    assert_eq!(
+        state.wrapped_position_of_byte(state.text.len() + 100, 20),
+        (1, 12)
+    );
+}
+
+#[test]
+fn scroll_reconciliation_depends_only_on_current_cursor_and_viewport() {
+    let mut state = InputState::default();
+    state.insert_str("0\n1\n2\n3\n4\n5");
+    state.input_scroll = 99;
+
+    state.reconcile_scroll(20, 2);
+    assert_eq!(state.input_scroll, 4);
+
+    state.cursor = 0;
+    state.reconcile_scroll(20, 2);
+    assert_eq!(state.input_scroll, 0);
+}

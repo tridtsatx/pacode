@@ -4,210 +4,95 @@
 pub mod activity;
 pub mod events;
 pub mod files;
+pub mod git;
 pub mod image_cache;
+pub mod images;
 pub mod input;
-pub mod model_picker;
+pub mod questions;
 pub mod rail;
-pub mod resync;
 pub mod selection;
+pub mod session;
 pub mod slots;
 pub mod stats;
 pub mod transcript;
 pub mod vim;
 
-use std::collections::VecDeque;
+mod attach;
+mod barriers;
+mod client_events;
+mod focus;
+mod notices;
+mod pickers;
+mod render;
+mod ticks;
+
+#[cfg(test)]
+mod picker_tests;
+
+use std::collections::{HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use pacode_client::ClientEvent;
+use pacode_render::ColorMode;
 use pacode_types::time::now_ms;
 use pacode_types::{
-    AgentId, Config, Effort, Event, McpServerInfo, Mode, ModelInfo, ModelRoute, PluginInfo,
-    SessionMeta, TaskId, ToastLevel, ToolStatus, TranscriptKind,
+    Config, Effort, MarketplacePluginInfo, McpServerInfo, Mode, ModelFlags, ModelInfo, ModelRoute,
+    PluginInfo, SessionMeta, TranscriptKind,
 };
 
+pub use barriers::RequestBarrier;
+pub use client_events::RESYNC_DEBOUNCE_MS;
 pub use files::FilesState;
+pub use focus::{Focus, Overlay, PanelTarget, ThemePickerStep};
+pub use git::GitState;
 pub use input::InputState;
-pub use rail::RailState;
-pub use selection::Selection;
-pub use slots::{NUM_SLOTS, SessionSlot};
-pub use transcript::{
-    BackgroundKind, BackgroundOutcome, BackgroundResult, Cell, CellKind, Transcript,
+pub use notices::{
+    BACKGROUND_NOTICE_MIN_MS, TOAST_EXIT_MS, TOAST_MAX, TOAST_TTL_SECS, Toast,
+    background_worth_reporting,
 };
-
-/// A background job shorter than this is not reported in the transcript: it is
-/// over before the reader could act on it, and the rail already carried it.
-pub const BACKGROUND_NOTICE_MIN_MS: u64 = 30_000;
-
-/// Whether a finished background job earns a transcript line. Failures always do,
-/// however brief: a command that died immediately is exactly what must be seen.
-pub fn background_worth_reporting(outcome: BackgroundOutcome, duration_ms: u64) -> bool {
-    match outcome {
-        BackgroundOutcome::Completed => duration_ms >= BACKGROUND_NOTICE_MIN_MS,
-        BackgroundOutcome::Failed | BackgroundOutcome::Killed => true,
-    }
-}
+pub use pickers::{PrefsDelta, PrefsOutbox, nearest_supported_effort, zdr_active};
+pub use questions::{PendingQuestions, QuestionFocus};
+pub use rail::RailState;
+pub use render::RenderContext;
+pub use selection::Selection;
+pub use session::{
+    PanelDiff, PanelState, PendingAttach, PromptBatch, SessionContext, SessionUiState, UiContext,
+    UserMessageInFlight,
+};
+pub use slots::{NUM_SLOTS, SessionSlot};
+pub use ticks::{OVERLAY_GROW_MS, PULSE_FRAMES, WELCOME_ANIM_MS};
+pub use transcript::{
+    BackgroundKind, BackgroundOutcome, BackgroundResult, Cell, CellKind, PermExplain, Transcript,
+};
 pub use vim::{VimEffect, VimMode, VimState};
 
-/// Interaction modes (spec §5). Layers are removed one at a time by `esc`.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Focus {
-    Normal,
-    /// `alt+↓` pressed: the rail lists agents, one is highlighted.
-    SelectAgent {
-        index: usize,
-    },
-    /// Panel open on an agent or task.
-    Panel {
-        target: PanelTarget,
-        follow: bool,
-        follow_paused: bool,
-    },
-    /// `.` in an empty prompt: background task list overlay.
-    BgList {
-        index: usize,
-    },
-    /// Slash pickers and other overlays.
-    Overlay(Overlay),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PanelTarget {
-    Agent(AgentId),
-    Task(TaskId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PluginsTab {
-    /// Plugins live in this session or installed from a marketplace.
-    Installed,
-    /// Plugins the configured marketplace offers.
-    Discover,
-}
-
-impl PluginsTab {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Installed => Self::Discover,
-            Self::Discover => Self::Installed,
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Installed => "Installed",
-            Self::Discover => "Discover",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Overlay {
-    ModelPicker {
-        query: String,
-        index: usize,
-    },
-    LoginPicker {
-        query: String,
-        index: usize,
-    },
-    EffortPicker {
-        index: usize,
-    },
-    ModePicker {
-        index: usize,
-    },
-    /// The settings view. Its state lives in `AppState::config_view`; the
-    /// variant only says which overlay is open.
-    ConfigPicker,
-    /// A question the model asked. The turn is waiting on the answer, so this
-    /// overlay owns the keyboard until it is answered or dismissed.
-    QuestionPicker {
-        question: Box<pacode_types::Question>,
-        index: usize,
-        /// Chosen options, in the order they were picked (multi-select only).
-        selected: Vec<usize>,
-        /// Free text typed instead of picking.
-        typed: String,
-        /// Whether the reader is typing rather than choosing.
-        typing: bool,
-    },
-    ThemePicker {
-        index: usize,
-        original_theme: Box<pacode_render::Theme>,
-        original_name: String,
-        step: ThemePickerStep,
-        user_themes: Vec<String>,
-    },
-    SessionPicker {
-        query: String,
-        index: usize,
-    },
-    Files {
-        index: usize,
-    },
-    McpPicker {
-        index: usize,
-        servers: Vec<McpServerInfo>,
-        loading: bool,
-    },
-    PluginsPicker {
-        index: usize,
-        plugins: Vec<PluginInfo>,
-        /// Which list is on screen.
-        tab: PluginsTab,
-        /// What the configured marketplace offers, once it has answered.
-        market: Vec<pacode_types::MarketplacePluginInfo>,
-        /// Filter typed in the Discover tab.
-        query: String,
-        /// A marketplace request is in flight.
-        loading: bool,
-        /// The listing came from a cached copy past its TTL.
-        stale: bool,
-    },
-    KeysPicker {
-        index: usize,
-        capturing: bool,
-    },
-    Import(crate::ui::import::ImportOverlayState),
-    /// Plan + agents on the `Tiny` tier.
-    RailOverlay,
-    Help,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThemePickerStep {
-    SelectTheme,
-    SelectBase,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Toast {
-    pub level: ToastLevel,
-    pub title: String,
-    pub detail: Option<String>,
-    pub shown_at: Instant,
-}
-
-pub const TOAST_TTL_SECS: u64 = 6;
-pub const TOAST_MAX: usize = 2;
-/// Toast enter window: the slide-in lasts this long.
-pub const TOAST_ENTER_MS: u64 = 150;
-/// Toast exit window: the fade starts this long before expiry.
-pub const TOAST_EXIT_MS: u64 = 600;
-/// Overlay/picker unfold duration (the centred grow-in, spec §animation).
-pub const OVERLAY_GROW_MS: u64 = 140;
-/// Welcome cascade window after attach: the header animates only inside it.
-pub const WELCOME_ANIM_MS: u64 = 400;
 /// AGENTS ⇄ SESSION switch debounce (spec §5).
 pub const IDLE_DEBOUNCE_MS: u64 = 2000;
+
+/// A selection copy the pre-draw coordinator prepared for the event loop.
+/// `clipboard::copy` writes OSC 52 to stdout and may touch `arboard` — that IO
+/// must stay outside the frame, so preparation stashes the text here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCopy {
+    pub text: String,
+    /// Auto-copied selections report how to turn the feature off.
+    pub auto: bool,
+}
 
 /// Connection state shown in the footer / as a notice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Connection {
+    /// First frame is already painted; socket connect / daemon spawn / attach
+    /// are still in flight.
+    Connecting,
     Connected,
-    Reconnecting { attempt: u32 },
-    Disconnected { reason: String },
+    Reconnecting {
+        attempt: u32,
+    },
+    Disconnected {
+        reason: String,
+    },
 }
 
 pub struct AppState {
@@ -219,131 +104,149 @@ pub struct AppState {
     pub plugin_status: Option<(String, String)>,
     pub paths: pacode_config::Paths,
     pub app_version: String,
-    pub meta: Option<SessionMeta>,
     pub connection: Connection,
-    /// Event-stream continuity (gap detection, snapshot debounce); see [`resync`].
-    pub resync: resync::ResyncState,
-    /// Which agents' events the daemon streams to us (`Request::Subscribe`).
-    pub subscription: resync::SubscriptionState,
-    /// Permission requests in the transcript not yet resolved. Owner: `events.rs`
-    /// (+1 on request, -1 on resolve), reset from each snapshot. Replaces a per-loop
-    /// scan of the transcript in `needs_anim_tick`.
-    pub pending_permissions: usize,
-    pub turn_active: bool,
-    /// Main agent transcript.
-    pub transcript: Transcript,
-    /// Panel transcript (agent) or task output lines.
-    pub panel: PanelState,
-    pub files: FilesState,
-    pub rail: RailState,
-    pub input: InputState,
-    pub vim: VimState,
-    pub focus: Focus,
-    pub config_view: crate::ui::config_view::ConfigViewState,
+    pub event_connection_epoch: u64,
+    pub event_session_epoch: u64,
+    pub awaiting_snapshot: bool,
+    snapshot_rebase_allowed: bool,
+    reconnect_snapshot_pending: bool,
+    global_refresh_in_flight: bool,
+    global_refresh_remaining: usize,
+    global_refresh_context: Option<UiContext>,
+    pub session: SessionUiState,
+    /// The scan behind the Import submenu (§5.7): what `pacode-import`
+    /// discovered plus each entry's conflict status and the apply target.
+    /// Filled by `menu::import::on_open`, rebuilt on every open, cleared by a
+    /// successful apply; `None` while the menu has never been opened.
+    pub import: Option<crate::ui::menu::import::ImportScan>,
     pub toasts: VecDeque<Toast>,
     /// Models for the picker (filled by `ListModels`).
     pub models: Vec<ModelInfo>,
-    /// State of the `/model` picker (index, filters, cursor).
-    pub model_picker: model_picker::ModelPickerState,
-    /// Providers with auth status for the login picker (filled by `ListAuth` or `AuthUpdated`).
+    /// MCP servers for the picker (filled by `ListMcpServers`, seeded from the
+    /// disk cache at startup).
+    pub mcp_servers: Vec<McpServerInfo>,
+    /// The configured marketplace's listing (filled by `BrowseMarketplace`,
+    /// seeded from the disk cache at startup).
+    pub marketplace: Vec<MarketplacePluginInfo>,
+    /// Per-list cache health — which sections came from disk, which refreshed,
+    /// which are still in flight. Drives `loading…`/`offline copy` (§8.2).
+    pub lists: crate::cache::Lists,
+    /// The on-disk list cache. `run` points it at `paths.cache_dir` before the
+    /// first frame; until then it is a benign no-op directory.
+    pub cache: crate::cache::DiskCache,
+    /// When this client run started — the TTL baseline for session-scoped
+    /// cache entries (anything written before this is `offline copy` material).
+    pub session_start_ms: u64,
+    /// Per-route flags (`zdr_capable`, `favorite`) mirroring `prefs.toml`;
+    /// written through `save_pref_model_flags` and pushed to the daemon via
+    /// `Request::SetModelFlag`.
+    pub model_flags: HashMap<String, ModelFlags>,
+    /// Recently used routes, most recent first (`prefs.toml`
+    /// `recent_models`); the model palette's `RECENT` group.
+    pub recent_models: Vec<String>,
+    /// Providers with auth status for the model palette (filled by `ListAuth`
+    /// or `AuthUpdated`).
     pub auth_providers: Vec<pacode_types::ProviderAuthInfo>,
     pub sessions: Vec<SessionMeta>,
     pub plugins: Vec<PluginInfo>,
     /// Set by any mutation; cleared after a frame is drawn.
     pub dirty: bool,
+    /// Set by the animation tick; cleared after a frame is drawn. Paced by
+    /// the animation clock (`ui.animation`), not the content clock (`ui.ups`).
+    pub dirty_anim: bool,
     /// Terminal size as last seen.
     pub cols: u16,
     pub rows: u16,
-    /// Mouse selection in dialog area.
-    pub selection: Selection,
-    /// Whether the OSC 52 remote clipboard hint popup has already been shown this session.
+    /// Whether the OSC 52 remote clipboard hint toast has already been shown this session.
     pub clipboard_warned: bool,
     /// `ctrl+c` pressed once (exit on second within 2 s).
     pub ctrl_c_at: Option<Instant>,
     pub quit: bool,
-    /// When the main agent turn started (for calculating thinking duration and animations).
-    pub turn_started_at: Option<Instant>,
-    /// Frame counter for activity animations and spinners (8 fps).
-    pub anim_frame: u64,
     /// Mascot shown in the header banner; random per run, fixed for the session.
     pub mascot: crate::ui::mascot::MascotKind,
     /// Whether the terminal takes RGB; decided once from `[ui] color` and the
     /// environment, and reused by the theme and the mascot.
     pub truecolor: bool,
-    /// Pending readline key chord (e.g. `ctrl+x` waiting for `ctrl+e`).
-    pub pending_chord: Option<crossterm::event::KeyEvent>,
+    /// The last notice-lock state the daemon reported for this session. A view,
+    /// not a switch: the lock itself is the daemon's, and this exists so the
+    /// footer can say how much is parked.
+    pub notice_lock: crate::lock::LockView,
+    pub(crate) color_mode: ColorMode,
+    pub(crate) detected_color_mode: ColorMode,
+    pub(crate) render_context: RenderContext,
+    pub(crate) render_epoch: u64,
+    /// Double-Shift detector state for the menu hub (§4.2).
+    pub double_shift: crate::double_shift::DoubleShift,
     /// Session slot table (1..=9).
     pub slots: [Option<SessionSlot>; NUM_SLOTS],
     /// Currently active slot index (0..8).
     pub active_slot: usize,
     /// Working directory for the session.
     pub cwd: PathBuf,
-    /// Cancellation sender for currently running local bash command.
-    pub running_bash: Option<tokio::sync::oneshot::Sender<()>>,
-    /// Temporary files created for pasted images.
-    pub pasted_images: crate::clipboard_read::PastedImages,
-    /// Prepared images of the prompt being edited (chips in `input.text`).
-    pub attachments: crate::attachments::PendingAttachments,
-    /// Current activity phase and when it started. The activity line ages from
-    /// this instant, so the thinking wording and its colour reset after every
-    /// tool call instead of drifting with the whole turn.
-    pub phase: Option<(crate::state::activity::Phase, Instant)>,
-    /// Age of `phase`, refreshed by the event loop before each draw so the draw
-    /// path stays a pure function of state.
-    pub phase_elapsed_ms: u64,
-    /// When this session's UI came up; drives the welcome cascade in the
-    /// header. Re-armed on every snapshot so a re-attach replays the cascade.
-    pub started_at: Instant,
-    /// Toggles once per second tick; the 1 s blink phase for pulses that run
-    /// while only the second tick is armed (idle main, background work alive).
-    pub second_parity: bool,
-    /// Focus layer seen by the last draw, as a small key (`ui::focus_key`), so
-    /// a new overlay can restart its unfold without inspecting the enum again.
-    pub last_focus_key: u8,
-    /// When the current overlay/picker focus layer opened (render-side clock
-    /// for the ~140 ms unfold); `None` while the focus layer is not a popup.
-    pub overlay_since: Option<Instant>,
+    /// Escape sequences stashed by `ui::images::draw` and flushed to the
+    /// terminal post-draw: (terminal area, escape payload).
+    pub pending_image_escapes: Vec<(ratatui::layout::Rect, String)>,
+    /// The `-p`/`--prompt` argv text, carried until the startup attach lands
+    /// — `BgResponse::AttachFinished` sends it then.
+    pub initial_prompt: Option<String>,
+    /// Why the startup attach failed — `run` returns it once the loop exits
+    /// (the error also sets `quit`, so a failed attach still exits fast).
+    pub attach_error: Option<pacode_client::ClientError>,
+    pub pending_attach: Option<PendingAttach>,
+    pub attach_in_flight: bool,
+    /// Whether this client was started with `--analyze-mode`. Per process, so
+    /// it outlives session switches. The page is gated on it: the reading is
+    /// a scorecard, and a scorecard nobody asked for is noise on a screen
+    /// someone is trying to work in.
+    pub analyze_mode: bool,
+    /// Prompts queued behind a running turn of a session the user switched
+    /// away from, keyed by that session; handed back when it is attached
+    /// again. Capped at `NUM_SLOTS` sessions (each queue at
+    /// `PROMPT_QUEUE_CAP`); the oldest stash is dropped with a toast.
+    pub(crate) stashed_queues: VecDeque<(pacode_types::SessionId, VecDeque<String>)>,
+    /// Default changes (`prefs.toml`) waiting for the event loop to write
+    /// them on a blocking thread; coalesced, so it is at most one record.
+    pub(crate) pending_prefs: PrefsDelta,
+    /// Where `pending_prefs` goes for the blocking writer (one merged delta).
+    pub(crate) prefs_outbox: PrefsOutbox,
 }
 
-/// What the panel shows.
-pub struct PanelState {
-    pub target: Option<PanelTarget>,
-    pub agent_transcript: Transcript,
-    pub task_lines: Vec<String>,
-    pub task_total_lines: u64,
-    pub scroll: usize,
+impl Deref for AppState {
+    type Target = SessionUiState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
 }
 
 impl AppState {
-    /// Whether a subagent (or task) takes over the conversation column instead of
-    /// splitting it. Task output always splits: it is read against the chat.
-    pub fn agent_replaces_dialog(&self) -> bool {
-        self.config.ui.agent_view == pacode_types::config::AgentView::Replace
-            && matches!(self.panel_agent_target(), Some(PanelTarget::Agent(_)))
-    }
-
-    /// The panel's current target, whether it came from focus or from a previous
-    /// selection that is still open.
-    pub fn panel_agent_target(&self) -> Option<PanelTarget> {
-        match &self.focus {
-            Focus::Panel { target, .. } => Some(target.clone()),
-            _ => self.panel.target.clone(),
-        }
-    }
-
     pub fn new(config: Config, app_version: String, cols: u16, rows: u16) -> Self {
         let cells = config.ui.transcript_cells;
         let images_on = config.ui.images_enabled();
         let paths = pacode_config::Paths::discover();
-        let truecolor = match config.ui.color.as_str() {
-            "ansi" => false,
-            "truecolor" | "24bit" => true,
-            _ => pacode_render::detect_truecolor(),
-        };
+        let detected_color_mode = ColorMode::detect();
+        let color_mode = ColorMode::from_setting(&config.ui.color, detected_color_mode);
+        let truecolor = color_mode == ColorMode::Truecolor;
         let (palette, _) = pacode_config::theme::load_theme(&paths, &config.theme);
         let theme = pacode_render::Theme::from_palette(&palette, truecolor);
         let (keymap, keymap_warnings) = crate::binding::Keymap::from_config(&config.keys);
-        Self {
+        let render_context = RenderContext {
+            theme: theme.clone(),
+            glyphs: render::glyphs_for(&config),
+            color: color_mode,
+            thinking: config.ui.thinking,
+            expand_hint: render::expand_hint_for(&keymap),
+        };
+        let prefs = pacode_config::load_prefs(&paths);
+        let model_flags = prefs.model_flags;
+        let recent_models = pickers::capped_recents(prefs.recent_models);
+        let mut state = Self {
             config,
             theme,
             keymap,
@@ -351,344 +254,69 @@ impl AppState {
             plugin_status: None,
             paths,
             app_version,
-            meta: None,
             connection: Connection::Connected,
-            resync: resync::ResyncState::default(),
-            subscription: resync::SubscriptionState::default(),
-            pending_permissions: 0,
-            turn_active: false,
-            transcript: Transcript::new(cells).with_images(images_on, truecolor),
-            panel: PanelState {
-                target: None,
-                agent_transcript: Transcript::new(300).with_images(images_on, truecolor),
-                task_lines: Vec::new(),
-                task_total_lines: 0,
-                scroll: 0,
-            },
-            files: FilesState::default(),
-            rail: RailState::default(),
-            input: InputState::default(),
-            vim: VimState::default(),
-            focus: Focus::Normal,
-            config_view: crate::ui::config_view::ConfigViewState::default(),
+            event_connection_epoch: 0,
+            event_session_epoch: 0,
+            awaiting_snapshot: true,
+            snapshot_rebase_allowed: false,
+            reconnect_snapshot_pending: false,
+            global_refresh_in_flight: false,
+            global_refresh_remaining: 0,
+            global_refresh_context: None,
+            session: SessionUiState::new(cells),
+            import: None,
             toasts: VecDeque::new(),
             models: Vec::new(),
+            model_flags,
+            recent_models,
             auth_providers: Vec::new(),
             sessions: Vec::new(),
             plugins: Vec::new(),
-            model_picker: model_picker::ModelPickerState::default(),
+            mcp_servers: Vec::new(),
+            marketplace: Vec::new(),
+            lists: crate::cache::Lists::default(),
+            cache: crate::cache::DiskCache::default(),
+            session_start_ms: now_ms(),
             dirty: true,
+            dirty_anim: false,
             cols,
             rows,
-            selection: Selection::default(),
             clipboard_warned: false,
             ctrl_c_at: None,
             quit: false,
-            turn_started_at: None,
-            anim_frame: 0,
             mascot: crate::ui::mascot::MascotKind::random(),
             truecolor,
-            pending_chord: None,
+            notice_lock: crate::lock::LockView::default(),
+            color_mode,
+            detected_color_mode,
+            render_context,
+            render_epoch: 0,
+            double_shift: crate::double_shift::DoubleShift::default(),
             slots: Default::default(),
             active_slot: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            running_bash: None,
-            pasted_images: crate::clipboard_read::PastedImages::new(),
-            attachments: crate::attachments::PendingAttachments::default(),
-            phase: None,
-            phase_elapsed_ms: 0,
-            started_at: Instant::now(),
-            second_parity: false,
-            last_focus_key: 0,
-            overlay_since: None,
-        }
-    }
-
-    /// The phase the session is in right now, from what the transcript and the rail
-    /// show. Pure: it reads state only, never the clock.
-    pub fn current_phase(&self) -> Option<crate::state::activity::Phase> {
-        use crate::state::activity::Phase;
-
-        if self.turn_active {
-            // A tool that is executing wins: that is what the session is doing,
-            // whatever the model streamed before starting it.
-            if let Some(title) = self
-                .transcript
-                .cells
-                .iter()
-                .rev()
-                .find_map(|c| match &c.kind {
-                    CellKind::Item(TranscriptKind::ToolCall {
-                        status: ToolStatus::Running,
-                        title,
-                        ..
-                    }) => Some(title.clone()),
-                    _ => None,
-                })
-            {
-                return Some(Phase::Tool(title));
-            }
-            // Answer text already arriving (or still draining) is responding, not thinking.
-            let responding = self.transcript.has_backlog()
-                || self
-                    .transcript
-                    .cells
-                    .iter()
-                    .rev()
-                    .find_map(|c| match &c.kind {
-                        CellKind::Item(TranscriptKind::Assistant { complete, .. }) => {
-                            Some(!complete)
-                        }
-                        CellKind::Item(TranscriptKind::Reasoning { .. }) => Some(false),
-                        CellKind::Item(TranscriptKind::ToolCall { .. }) => Some(false),
-                        _ => None,
-                    })
-                    == Some(true);
-            return Some(if responding {
-                Phase::Responding
-            } else {
-                Phase::Thinking
-            });
-        }
-
-        // The main agent is idle: the session may still be waiting on someone else.
-        if let Some(agent) = self.rail.live_agents().next() {
-            return Some(Phase::WaitingAgent(agent.name.clone()));
-        }
-        let running = self.rail.running_task_count();
-        if running > 0 {
-            return Some(Phase::WaitingTask(running));
-        }
-        None
-    }
-
-    /// Recompute the phase and keep its start instant across redraws. Returns the
-    /// phase with the milliseconds it has been running.
-    pub fn tick_phase(&mut self, now: Instant) -> Option<(crate::state::activity::Phase, u64)> {
-        let current = self.current_phase();
-        let out = match (&current, &self.phase) {
-            (Some(new), Some((old, since))) if new == old => {
-                let elapsed = now.saturating_duration_since(*since).as_millis() as u64;
-                Some((old.clone(), elapsed))
-            }
-            (Some(new), _) => {
-                self.phase = Some((new.clone(), now));
-                Some((new.clone(), 0))
-            }
-            (None, _) => {
-                self.phase = None;
-                None
-            }
+            pending_image_escapes: Vec::new(),
+            initial_prompt: None,
+            attach_error: None,
+            pending_attach: None,
+            attach_in_flight: false,
+            analyze_mode: false,
+            stashed_queues: VecDeque::new(),
+            pending_prefs: PrefsDelta::default(),
+            prefs_outbox: PrefsOutbox::default(),
         };
-        let elapsed = out.as_ref().map(|(_, ms)| *ms).unwrap_or(0);
-        // A redraw between ticks must not change the reading, so only whole
-        // seconds are kept; the sub-second remainder only paces the next tick.
-        if crate::state::activity::displayed_secs(elapsed)
-            != crate::state::activity::displayed_secs(self.phase_elapsed_ms)
-        {
-            self.dirty = true;
-        }
-        self.phase_elapsed_ms = elapsed;
-        out
+        // Inline transcript images: `[ui] images` and the colour depth they fold to.
+        state.session.transcript.set_images(images_on, truecolor);
+        state
+            .session
+            .panel
+            .agent_transcript
+            .set_images(images_on, truecolor);
+        state
     }
 
     pub fn is_running_bash(&self) -> bool {
         self.running_bash.is_some()
-    }
-
-    pub fn cleanup_pasted_images(&mut self) {
-        self.pasted_images.cleanup_unreferenced(&self.input.text);
-    }
-
-    /// Fold a client event into the state (spec §5 state table, §7 follow rules).
-    /// Returns true when a redraw is needed (almost always).
-    pub fn apply_client_event(&mut self, event: ClientEvent, now: Instant) -> bool {
-        match event {
-            ClientEvent::Connected { .. } => {
-                self.connection = Connection::Connected;
-                self.dirty = true;
-                true
-            }
-            ClientEvent::Disconnected { reason } => {
-                self.resync.reset();
-                self.subscription.reset();
-                self.connection = Connection::Disconnected { reason };
-                self.dirty = true;
-                true
-            }
-            ClientEvent::Reconnecting { attempt } => {
-                self.resync.reset();
-                self.subscription.reset();
-                self.connection = Connection::Reconnecting { attempt };
-                self.dirty = true;
-                true
-            }
-            ClientEvent::Snapshot(snapshot) => {
-                self.connection = Connection::Connected;
-                self.resync.on_snapshot(snapshot.seq);
-                // The header banner is (re)installed below, so the welcome
-                // cascade re-arms here: a re-attach replays it.
-                self.started_at = now;
-                self.meta = Some(snapshot.meta.clone());
-                self.record_slot(
-                    self.active_slot,
-                    &snapshot.meta,
-                    &snapshot.usage,
-                    snapshot.agents.len(),
-                    snapshot.tasks.len(),
-                );
-                self.transcript
-                    .reset(snapshot.transcript.clone(), snapshot.has_more_history);
-                let header = crate::state::transcript::HeaderInfo {
-                    version: self.app_version.clone(),
-                    day: crate::ui::phrases::day_index(pacode_types::time::now_ms()),
-                    mascot: self.mascot,
-                    truecolor: self.truecolor,
-                };
-                self.transcript.set_header(header);
-                for item in &snapshot.transcript {
-                    if let TranscriptKind::ToolCall { name, title, .. } = &item.kind {
-                        let arg = title
-                            .strip_prefix(name.as_str())
-                            .map(str::trim_start)
-                            .unwrap_or_else(|| {
-                                title
-                                    .split_once(' ')
-                                    .map(|(_, r)| r.trim())
-                                    .unwrap_or(title.as_str())
-                            });
-                        let input = serde_json::json!({ "path": arg });
-                        self.files.observe_tool_item(name, &input, item.ts_ms);
-                    }
-                }
-                self.turn_active = snapshot.turn_active;
-                if snapshot.turn_active {
-                    if self.turn_started_at.is_none() {
-                        self.turn_started_at = Some(now);
-                    }
-                } else {
-                    self.turn_started_at = None;
-                }
-                self.rail.plan = snapshot.plan;
-                self.rail.agents = snapshot.agents;
-                self.rail.agents.sort_by_key(|a| a.started_at_ms);
-                self.rail.tasks = snapshot.tasks;
-                self.rail.cron_jobs = snapshot.cron_jobs;
-                self.rail.monitors = snapshot.monitors;
-                self.rail.tasks.sort_by_key(|t| t.started_at_ms);
-                self.rail.usage = snapshot.usage;
-                self.rail.update_idle(self.turn_active, now);
-                self.pending_permissions = snapshot.pending_permissions.len();
-                for (i, perm) in snapshot.pending_permissions.into_iter().enumerate() {
-                    let ts_ms = perm.created_at_ms;
-                    self.transcript.cells.push_back(Cell {
-                        id: snapshot.seq.wrapping_add(1).wrapping_add(i as u64),
-                        kind: CellKind::Item(TranscriptKind::Permission(perm)),
-                        version: 0,
-                        ts_ms,
-                        stats: None,
-                    });
-                }
-                self.dirty = true;
-                true
-            }
-            ClientEvent::Event { seq, event } => {
-                if self.resync.classify(seq, &event) != resync::Verdict::Apply {
-                    return false;
-                }
-                self.observe_background_completion(&event);
-                // Redraw only when something on screen changed (a delta for an agent
-                // nobody is looking at must not wake the renderer).
-                let visible = self.apply_event(seq, event, now);
-                if visible {
-                    self.dirty = true;
-                }
-                visible
-            }
-            ClientEvent::Desynced => {
-                self.resync.note_desynced();
-                false
-            }
-        }
-    }
-
-    /// Fold a daemon event (`ClientEvent::Event`) into transcript/rail/panel/toasts.
-    /// Returns whether the event changed anything visible.
-    pub fn apply_event(&mut self, seq: u64, event: Event, now: Instant) -> bool {
-        events::apply_event(self, seq, event, now)
-    }
-
-    pub fn push_toast(
-        &mut self,
-        level: ToastLevel,
-        title: String,
-        detail: Option<String>,
-        now: Instant,
-    ) {
-        let toast = Toast {
-            level,
-            title,
-            detail,
-            shown_at: now,
-        };
-        self.toasts.push_back(toast);
-        while self.toasts.len() > TOAST_MAX {
-            self.toasts.pop_front();
-        }
-        self.dirty = true;
-    }
-
-    /// Drop expired toasts; returns true when something changed.
-    pub fn expire_toasts(&mut self, now: Instant) -> bool {
-        let before = self.toasts.len();
-        self.toasts
-            .retain(|t| now.saturating_duration_since(t.shown_at).as_secs() < TOAST_TTL_SECS);
-        let changed = self.toasts.len() != before;
-        if changed {
-            self.dirty = true;
-        }
-        changed
-    }
-
-    /// Whether a toast sits inside its enter or exit window, i.e. the fast
-    /// tick has visible work. Bounded: ~750 ms around each toast's life.
-    pub fn toast_needs_anim(&self, now: Instant) -> bool {
-        let ttl_ms = TOAST_TTL_SECS * 1000;
-        self.toasts.iter().any(|t| {
-            let age = now.saturating_duration_since(t.shown_at).as_millis() as u64;
-            age < TOAST_ENTER_MS || ttl_ms.saturating_sub(age) < TOAST_EXIT_MS
-        })
-    }
-
-    /// Whether the welcome cascade is still playing (bounded: first 400 ms
-    /// after `started_at`).
-    pub fn welcome_playing(&self, now: Instant) -> bool {
-        (now.saturating_duration_since(self.started_at).as_millis() as u64) < WELCOME_ANIM_MS
-    }
-
-    /// Whether the current overlay/picker is inside its unfold window.
-    pub fn overlay_growing(&self, now: Instant) -> bool {
-        self.overlay_since.is_some_and(|t| {
-            (now.saturating_duration_since(t).as_millis() as u64) < OVERLAY_GROW_MS
-        })
-    }
-
-    /// Whether a short-lived animation (toast slide/fade, overlay unfold,
-    /// welcome cascade) wants the fast tick instead of the ambient 125 ms one.
-    pub fn fast_anim_active(&self, now: Instant) -> bool {
-        self.toast_needs_anim(now) || self.welcome_playing(now) || self.overlay_growing(now)
-    }
-
-    /// The shared two-state blink phase for pulsing dots: driven by
-    /// `anim_frame` while the fast anim tick is armed, by `second_parity` when
-    /// only the 1 s tick runs. Either way it is a pure function of counters the
-    /// existing timers already advance — it never arms a timer of its own.
-    pub fn pulse_lit(&self, now: Instant) -> bool {
-        if self.turn_active || self.transcript.has_backlog() || self.needs_anim_tick(now) {
-            self.anim_frame % 4 < 2
-        } else {
-            self.second_parity
-        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -703,284 +331,70 @@ impl AppState {
         self.meta.as_ref().map(|m| &m.model)
     }
 
-    pub fn push_notice(&mut self, text: String) {
-        let now = now_ms();
-        self.transcript.cells.push_back(Cell {
-            id: now,
-            kind: CellKind::Item(TranscriptKind::Notice {
-                level: ToastLevel::Info,
-                text,
-            }),
-            version: 0,
-            ts_ms: now,
-            stats: None,
-        });
-        self.dirty = true;
-    }
-
-    pub fn push_notice_with_level(&mut self, level: ToastLevel, text: String) {
-        let now = now_ms();
-        self.transcript.cells.push_back(Cell {
-            id: now,
-            kind: CellKind::Item(TranscriptKind::Notice { level, text }),
-            version: 0,
-            ts_ms: now,
-            stats: None,
-        });
-        self.transcript.scroll_to_bottom();
-        self.dirty = true;
-    }
-
-    /// Drain the first prompt from the queue if the main agent is idle.
-    /// A `GetSnapshot` to send when events were lost; at most one is in flight.
-    pub fn take_resync_request(&mut self) -> Option<pacode_types::Request> {
-        self.resync.take_request()
-    }
-
-    /// A `Subscribe` to send when the agent we want streamed changed (panel opened,
-    /// switched or closed) or the connection was re-established.
-    pub fn take_subscribe_request(&mut self) -> Option<pacode_types::Request> {
-        // A request sent while reconnecting would fail and never be retried.
-        if !matches!(self.connection, Connection::Connected) {
+    pub fn take_retry_batch(&mut self) -> Option<PromptBatch> {
+        if self.meta.is_none()
+            || !matches!(self.connection, Connection::Connected)
+            || self.awaiting_snapshot
+            || self.resync_want
+            || self.turn_active
+            || self.user_msgs_in_flight > 0
+            || self.turn_boundary_pending
+            || self.prompt_path_held()
+        {
             return None;
         }
-        let panel_agent: Option<&AgentId> = match &self.focus {
-            Focus::Panel {
-                target: PanelTarget::Agent(id),
-                ..
-            } => Some(id),
-            _ => match &self.panel.target {
-                Some(PanelTarget::Agent(id)) => Some(id),
-                _ => None,
-            },
-        };
-        let request = self.subscription.take_request(panel_agent);
-        if request.is_some() {
-            self.resync.note_sparse();
+        self.session.take_retry_batch()
+    }
+
+    pub fn drain_pending_sequence(&mut self) -> Option<PromptBatch> {
+        if self.meta.is_none()
+            || !matches!(self.connection, Connection::Connected)
+            || self.awaiting_snapshot
+            || self.resync_want
+            || self.user_msgs_in_flight > 0
+            || self.turn_boundary_pending
+            || self.initial_prompt.is_some()
+            || self.has_retry_request()
+            || self.prompt_path_held()
+        {
+            return None;
         }
-        request
+        let sequence = self.session.take_pending_sequence()?;
+        self.dirty = true;
+        Some(sequence)
     }
 
     pub fn drain_prompt_queue(&mut self) -> Option<pacode_types::Request> {
-        if !self.turn_active && !self.input.prompt_queue.is_empty() {
-            let text = self.input.prompt_queue.pop_front()?;
-            self.turn_active = true;
+        if self.meta.is_none()
+            || !matches!(self.connection, Connection::Connected)
+            || self.awaiting_snapshot
+            || self.resync_want
+            || self.turn_active
+            || self.user_msgs_in_flight > 0
+            || self.turn_boundary_pending
+            || self.has_retry_request()
+            || self.has_pending_sequence()
+            || self.prompt_path_held()
+        {
+            return None;
+        }
+        if let Some(text) = self.initial_prompt.take() {
             self.dirty = true;
-            Some(self.build_user_message(text))
-        } else {
-            None
+            return Some(pacode_types::Request::UserMessage {
+                text,
+                images: Vec::new(),
+                message_id: None,
+                attachments: Vec::new(),
+            });
         }
-    }
-
-    /// Observe background tasks and subagents ending and record a line in the transcript.
-    ///
-    /// Only jobs that actually ran for a while are worth interrupting the reader
-    /// for: anything shorter than `BACKGROUND_NOTICE_MIN_MS` finished about as
-    /// fast as reading about it would take, and the rail already showed it. The
-    /// line is the only report — the toast that used to accompany it said the
-    /// same thing twice.
-    pub fn observe_background_completion(&mut self, event: &Event) {
-        match event {
-            Event::TaskUpdated(info) if info.status.is_terminal() => {
-                let was_terminal = self
-                    .rail
-                    .tasks
-                    .iter()
-                    .find(|t| t.id == info.id)
-                    .is_some_and(|t| t.status.is_terminal());
-                if was_terminal {
-                    return;
-                }
-                let outcome = match info.status {
-                    pacode_types::TaskStatus::Completed => {
-                        if info.exit_code.unwrap_or(0) == 0 {
-                            BackgroundOutcome::Completed
-                        } else {
-                            BackgroundOutcome::Failed
-                        }
-                    }
-                    pacode_types::TaskStatus::Failed => BackgroundOutcome::Failed,
-                    pacode_types::TaskStatus::Killed => BackgroundOutcome::Killed,
-                    pacode_types::TaskStatus::Running => return,
-                };
-                let duration_ms = info.duration_ms(now_ms());
-                if !background_worth_reporting(outcome, duration_ms) {
-                    return;
-                }
-                let label = if info.command.is_empty() {
-                    info.label.clone()
-                } else {
-                    info.command.clone()
-                };
-                self.push_background_result(BackgroundResult {
-                    kind: BackgroundKind::Task,
-                    label,
-                    outcome,
-                    exit_code: info.exit_code,
-                    duration_ms,
-                });
-            }
-            Event::AgentUpdated(info) if !info.id.is_main() && !info.status.is_live() => {
-                let was_finished = self
-                    .rail
-                    .agents
-                    .iter()
-                    .find(|a| a.id == info.id)
-                    .is_some_and(|a| !a.status.is_live());
-                if was_finished {
-                    return;
-                }
-                let outcome = match info.status {
-                    pacode_types::AgentStatus::Finished => BackgroundOutcome::Completed,
-                    pacode_types::AgentStatus::Stopped => BackgroundOutcome::Killed,
-                    pacode_types::AgentStatus::Failed => BackgroundOutcome::Failed,
-                    pacode_types::AgentStatus::Idle
-                    | pacode_types::AgentStatus::Thinking
-                    | pacode_types::AgentStatus::RunningTool
-                    | pacode_types::AgentStatus::WaitingApproval
-                    | pacode_types::AgentStatus::WaitingOrchestrator => return,
-                };
-                let duration_ms = info.duration_ms(now_ms());
-                if !background_worth_reporting(outcome, duration_ms) {
-                    return;
-                }
-                self.push_background_result(BackgroundResult {
-                    kind: BackgroundKind::Agent,
-                    label: info.name.clone(),
-                    outcome,
-                    exit_code: None,
-                    duration_ms,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    fn push_background_result(&mut self, result: BackgroundResult) {
-        let now = now_ms();
-        self.transcript.cells.push_back(Cell {
-            id: now,
-            kind: CellKind::BackgroundResult(result),
-            version: 0,
-            ts_ms: now,
-            stats: None,
-        });
-        self.transcript.scroll_to_bottom();
+        let text = self.input.prompt_queue.pop_front()?;
         self.dirty = true;
-    }
-
-    /// Remember the marketplace `/plugins <source>` pointed at.
-    pub fn save_pref_marketplace(&self, source: &str) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.marketplace = Some(source.to_string());
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (marketplace): {e}");
-        }
-    }
-
-    pub fn save_pref_model(&self, model: &str) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.model = Some(model.to_string());
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (model): {e}");
-        }
-    }
-
-    pub fn save_pref_effort(&self, effort: Effort) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.effort = Some(effort);
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (effort): {e}");
-        }
-    }
-
-    pub fn save_pref_mode(&self, mode: Mode) {
-        let mut prefs = pacode_config::load_prefs(&self.paths);
-        prefs.mode = Some(mode);
-        if let Err(e) = pacode_config::save_prefs(&self.paths, &prefs) {
-            log::warn!("failed to save prefs (mode): {e}");
-        }
-    }
-
-    pub fn is_bottom_picker(&self) -> bool {
-        matches!(
-            &self.focus,
-            Focus::Overlay(Overlay::EffortPicker { .. })
-                | Focus::Overlay(Overlay::ModePicker { .. })
-                | Focus::Overlay(Overlay::LoginPicker { .. })
-                | Focus::Overlay(Overlay::QuestionPicker { .. })
-                | Focus::Overlay(Overlay::ThemePicker { .. })
-        )
-    }
-
-    pub fn bottom_picker_height(&self) -> u16 {
-        match &self.focus {
-            Focus::Overlay(Overlay::EffortPicker { .. })
-            | Focus::Overlay(Overlay::ModePicker { .. }) => 7,
-            Focus::Overlay(Overlay::ThemePicker { .. }) => 12,
-            Focus::Overlay(Overlay::LoginPicker { .. }) => 13,
-            // Header, question, one row per option, and the hint line.
-            Focus::Overlay(Overlay::QuestionPicker { question, .. }) => {
-                (question.options.len() as u16).saturating_add(5).min(16)
-            }
-            _ => 0,
-        }
-    }
-
-    /// Whether a periodic 1 s tick is needed (live agents or tasks: durations change).
-    pub fn needs_second_tick(&self) -> bool {
-        self.turn_active || self.rail.has_live_agents() || self.rail.has_running_tasks()
-    }
-
-    /// Whether the animation tick is needed: the turn running, an active panel
-    /// agent, a pending permission pulse, a young overlay unfold, the welcome
-    /// cascade, or the reconnect dots. Every arm is a visible animation.
-    pub fn needs_anim_tick(&self, now: Instant) -> bool {
-        if self.turn_active {
-            return true;
-        }
-        if self.welcome_playing(now) || self.overlay_growing(now) {
-            return true;
-        }
-        // A permission request pulses until it is answered; waiting on the
-        // reader is activity, so the tick is allowed.
-        if self.pending_permissions > 0 {
-            return true;
-        }
-        if matches!(self.connection, Connection::Reconnecting { .. }) {
-            return true;
-        }
-        match &self.focus {
-            Focus::Panel {
-                target: PanelTarget::Agent(id),
-                ..
-            } => self.rail.agent(id).is_some_and(|a| a.status.is_active()),
-            _ => self
-                .panel
-                .target
-                .as_ref()
-                .and_then(|t| match t {
-                    PanelTarget::Agent(id) => self.rail.agent(id),
-                    _ => None,
-                })
-                .is_some_and(|a| a.status.is_active()),
-        }
-    }
-
-    /// Whether the paced stream needs its 33 ms tick.
-    pub fn needs_stream_tick(&self) -> bool {
-        self.transcript.has_backlog() || self.panel.agent_transcript.has_backlog()
-    }
-
-    pub fn tick_stream(&mut self, now: Instant) -> bool {
-        let r1 = self.transcript.tick_stream(now);
-        let r2 = self.panel.agent_transcript.tick_stream(now);
-        if r1 || r2 {
-            self.dirty = true;
-            true
-        } else {
-            false
-        }
+        Some(pacode_types::Request::UserMessage {
+            text,
+            images: Vec::new(),
+            message_id: None,
+            attachments: Vec::new(),
+        })
     }
 
     pub fn cwd(&self) -> PathBuf {
@@ -994,59 +408,29 @@ impl AppState {
         self.transcript.has_more_history && !self.transcript.loading_history
     }
 
-    pub fn record_slot(
-        &mut self,
-        index: usize,
-        meta: &SessionMeta,
-        usage: &pacode_types::state::UsageTotals,
-        agents_count: usize,
-        tasks_count: usize,
-    ) {
-        if index < NUM_SLOTS {
-            self.slots[index] = Some(SessionSlot {
-                id: meta.id.clone(),
-                title: meta.title(),
-                turns: usage.turns,
-                context_tokens: usage.context_tokens,
-                agents_count,
-                tasks_count,
-            });
-        }
+    /// A pending permission cell still sitting in the transcript — the same
+    /// predicate the footer prompt and the anim tick use.
+    pub fn has_pending_permission(&self) -> bool {
+        self.transcript
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Permission(_))))
     }
 
-    pub fn leave_active_slot(&mut self) {
-        let current = self.active_slot;
-        if let Some(meta) = &self.meta {
-            self.slots[current] = Some(SessionSlot {
-                id: meta.id.clone(),
-                title: meta.title(),
-                turns: self.rail.usage.turns,
-                context_tokens: self.rail.usage.context_tokens,
-                agents_count: self.rail.agents.len(),
-                tasks_count: self.rail.tasks.len(),
-            });
+    /// Drop a cache file (§8.2 invalidation points: plugin install/remove,
+    /// MCP config change). Best-effort on a blocking thread — the next list
+    /// reply rewrites the file anyway.
+    pub fn invalidate_cache(&self, kind: crate::cache::ListKind) {
+        let cache = self.cache.clone();
+        let stem = kind.stem(&self.cwd()).into_owned();
+        let schema = kind.schema();
+        let invalidate = move || {
+            cache.invalidate(&stem, schema);
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(invalidate);
+        } else {
+            std::thread::spawn(invalidate);
         }
-        self.transcript.cells.clear();
-        self.transcript.cache.clear();
-        self.transcript.images.clear();
-        self.transcript.stream = None;
-        self.transcript.live_cell = None;
-        self.transcript.pending_final = None;
-        self.transcript.scroll_from_bottom = 0;
-        self.transcript.has_more_history = false;
-        self.transcript.loading_history = false;
-
-        self.panel.agent_transcript.cells.clear();
-        self.panel.agent_transcript.cache.clear();
-        self.panel.task_lines.clear();
-        self.panel.task_total_lines = 0;
-        self.panel.target = None;
-
-        self.focus = Focus::Normal;
-        self.meta = None;
-        self.rail.agents.clear();
-        self.rail.tasks.clear();
-        self.rail.plan = pacode_types::state::Plan::default();
-        self.rail.usage = pacode_types::state::UsageTotals::default();
     }
 }

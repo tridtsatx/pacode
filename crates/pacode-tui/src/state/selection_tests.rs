@@ -5,6 +5,14 @@ fn p(line: usize, col: u16) -> Point {
     Point { line, col }
 }
 
+fn plain(lines: Vec<String>) -> crate::ui::dialog::PlainLines {
+    crate::ui::dialog::PlainLines {
+        lines,
+        leads: Vec::new(),
+        first_line: 0,
+    }
+}
+
 fn sel(anchor: Point, head: Point) -> Selection {
     Selection {
         anchor,
@@ -139,6 +147,37 @@ fn dragging_past_the_viewport_keeps_extending_the_selection() {
 }
 
 #[test]
+fn prepending_history_rebases_an_active_selection() {
+    let mut s = sel(p(40, 2), p(42, 8));
+    s.rebase_lines(10);
+    assert_eq!(s.anchor, p(50, 2));
+    assert_eq!(s.head, p(52, 8));
+
+    let mut inactive = Selection::new();
+    inactive.rebase_lines(10);
+    assert_eq!(inactive.anchor, p(0, 0));
+}
+
+#[test]
+fn selection_line_indices_are_hard_capped() {
+    let mut s = sel(p(MAX_SELECTION_LINES - 2, 0), p(usize::MAX, 1));
+    assert_eq!(
+        s.line_range(),
+        Some(MAX_SELECTION_LINES - 2..=MAX_SELECTION_LINES - 1)
+    );
+
+    s.rebase_lines(MAX_SELECTION_LINES);
+    assert_eq!(s.anchor.line, MAX_SELECTION_LINES - 1);
+    assert_eq!(s.head.line, MAX_SELECTION_LINES - 1);
+
+    let dialog = Rect::new(0, 0, 40, 10);
+    let mut dragged = Selection::new();
+    dragged.start(0, 0, dialog, usize::MAX);
+    dragged.drag_to_line(usize::MAX, 1);
+    assert_eq!(dragged.head.line, MAX_SELECTION_LINES - 1);
+}
+
+#[test]
 fn finishing_an_empty_drag_deactivates_and_requests_no_copy() {
     let dialog = Rect::new(0, 0, 40, 10);
     let mut s = Selection::new();
@@ -165,6 +204,7 @@ fn extraction_takes_the_selected_text_from_content_not_the_screen() {
         "second line".to_string(),
         "third line here".to_string(),
     ];
+    let lines = plain(lines);
     let s = sel(p(0, 6), p(2, 4));
     let text = crate::ui::extract_selection_text(&lines, &s, 40);
     assert_eq!(text, "line of the transcript\nsecond line\nthird");
@@ -182,9 +222,27 @@ fn extraction_takes_the_selected_text_from_content_not_the_screen() {
 }
 
 #[test]
+fn extraction_uses_display_columns_without_splitting_graphemes() {
+    let plain = plain(vec!["a界e\u{301}Z".to_string()]);
+    let lines = &plain.lines;
+    let selected = sel(p(0, 1), p(0, 2));
+    assert_eq!(
+        crate::ui::extract_selection_text(&plain, &selected, 8),
+        "界"
+    );
+
+    assert_eq!(slice_by_columns(&lines[0], 3, 3), "e\u{301}");
+    let selected = sel(p(0, 3), p(0, 4));
+    assert_eq!(
+        crate::ui::extract_selection_text(&plain, &selected, 8),
+        "e\u{301}Z"
+    );
+}
+
+#[test]
 fn extraction_is_capped_so_a_huge_selection_cannot_run_away() {
     let long = "x".repeat(1000);
-    let lines: Vec<String> = std::iter::repeat_n(long, 8000).collect();
+    let lines = plain(std::iter::repeat_n(long, 8000).collect());
     let s = sel(p(0, 0), p(7999, 999));
     let text = crate::ui::extract_selection_text(&lines, &s, 1000);
     assert!(text.chars().count() <= crate::ui::COPY_MAX_CHARS + 8000);

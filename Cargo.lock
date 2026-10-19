@@ -344,6 +344,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "bitvec"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddcec3d12c579d40898fe0a9a358a803c23e9c52ca3c425707f81c9436211837"
+dependencies = [
+ "funty",
+ "radium",
+ "tap",
+ "wyz",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -405,6 +417,20 @@ name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc0e56a716f1e132ff6bf4bdac1c944a3fcdc1cae65f70a4a2a1ac3b401d2d1f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
 
 [[package]]
 name = "byteorder-lite"
@@ -1444,6 +1470,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "funty"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2031,6 +2063,16 @@ dependencies = [
  "zerofrom",
  "zerotrie",
  "zerovec",
+]
+
+[[package]]
+name = "icy_sixel"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c917a041c4c1e8438172eb0dc7a4cb0eba2f22975fbf6681c51e78e4f507e996"
+dependencies = [
+ "quantette",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2703,6 +2745,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+ "libm",
 ]
 
 [[package]]
@@ -2833,6 +2876,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ordered-float"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c7c9e0d9b23589f26070720bac724174bfec1083e82f7854cdd0267518343c0"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "os_pipe"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2844,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "pacode"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2870,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-acp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "agent-client-protocol",
  "base64 0.22.1",
@@ -2888,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-auth"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -2910,7 +2962,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-client"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "libc",
  "log",
@@ -2925,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-config"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -2943,7 +2995,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2967,8 +3019,10 @@ dependencies = [
  "pacode-store",
  "pacode-tools",
  "pacode-types",
+ "pacode-vcs",
  "pretty_assertions",
  "regex",
+ "serde",
  "serde_json",
  "similar",
  "tempfile",
@@ -2979,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-coreutils"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
  "globset",
@@ -2995,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-daemon"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "libc",
  "log",
@@ -3020,7 +3074,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-exec"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "libc",
  "log",
@@ -3035,9 +3089,10 @@ dependencies = [
 
 [[package]]
 name = "pacode-image"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
+ "icy_sixel",
  "image",
  "sha2",
  "tempfile",
@@ -3046,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-import"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "pacode-types",
  "serde",
@@ -3058,7 +3113,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-mcp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3074,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-memory"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "log",
  "rusqlite",
@@ -3084,7 +3139,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-net"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "reqwest",
  "thiserror 2.0.20",
@@ -3094,7 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-outline"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "pretty_assertions",
  "thiserror 2.0.20",
@@ -3109,7 +3164,7 @@ dependencies = [
  "tree-sitter-json",
  "tree-sitter-kotlin-ng",
  "tree-sitter-md",
- "tree-sitter-php",
+ "tree-sitter-php 0.25.1",
  "tree-sitter-python",
  "tree-sitter-ruby",
  "tree-sitter-rust",
@@ -3121,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-plugin"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -3143,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-provider"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3164,11 +3219,12 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "toml",
 ]
 
 [[package]]
 name = "pacode-render"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "insta",
  "pacode-types",
@@ -3183,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-risk"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "pacode-types",
  "pretty_assertions",
@@ -3191,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-rules"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "pretty_assertions",
  "regex",
@@ -3202,19 +3258,20 @@ dependencies = [
 
 [[package]]
 name = "pacode-skills"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "pacode-store"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "log",
  "pacode-types",
  "pretty_assertions",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
@@ -3222,8 +3279,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "pacode-symbols"
+version = "1.1.0"
+dependencies = [
+ "insta",
+ "pretty_assertions",
+ "thiserror 2.0.20",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin-sg",
+ "tree-sitter-lua",
+ "tree-sitter-php 0.24.2",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "pacode-tools"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "dom_smoothie",
@@ -3235,6 +3318,7 @@ dependencies = [
  "htmd",
  "ignore",
  "image",
+ "libc",
  "log",
  "pacode-coreutils",
  "pacode-exec",
@@ -3246,6 +3330,7 @@ dependencies = [
  "pacode-render",
  "pacode-risk",
  "pacode-skills",
+ "pacode-symbols",
  "pacode-types",
  "pretty_assertions",
  "regex",
@@ -3263,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "pacode-tui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -3280,9 +3365,11 @@ dependencies = [
  "pacode-import",
  "pacode-render",
  "pacode-types",
+ "pacode-vcs",
  "pretty_assertions",
  "rand 0.9.5",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
@@ -3293,12 +3380,24 @@ dependencies = [
 
 [[package]]
 name = "pacode-types"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "pretty_assertions",
  "rand 0.9.5",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pacode-vcs"
+version = "1.1.0"
+dependencies = [
+ "pacode-exec",
+ "pacode-types",
+ "pretty_assertions",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -3308,6 +3407,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddeed8580d347d2abf3dcf06a5f0b3dc020258338526b277847cd4248a70fc64"
 dependencies = [
  "approx",
+ "bytemuck",
  "libm",
  "palette_derive",
  "palette_math",
@@ -3620,6 +3720,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
+name = "quantette"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba5d37e94c17b8870a5b936001d2845a6782a22ebdb1706c84294eca777f6729"
+dependencies = [
+ "bitvec",
+ "bytemuck",
+ "libm",
+ "num-traits",
+ "ordered-float 5.5.0",
+ "palette",
+ "rand 0.10.2",
+ "rand_xoshiro",
+ "ref-cast",
+ "wide",
+]
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3712,6 +3830,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "radium"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
 name = "rand"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3762,6 +3886,15 @@ name = "rand_pcg"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "662effc7698e08ea324d3acccf8d9d7f7bf79b9785e270a174ea36e56900c91d"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -4092,6 +4225,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "safe_arch"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4220,7 +4362,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
 dependencies = [
- "ordered-float",
+ "ordered-float 2.10.1",
  "serde",
 ]
 
@@ -4600,6 +4742,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "tap"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "tar"
@@ -5036,16 +5184,46 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-language"
-version = "0.1.9"
+name = "tree-sitter-kotlin-sg"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
+checksum = "c06ec43ae3c12165d4ac08afe4e1f5fc6757ffe274fa7bd5af9007ef11ba4319"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-language"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca0d1bf6fdd806e43ae5198f82f527056d359def39e54e67a0f478ac09dac081"
+
+[[package]]
+name = "tree-sitter-lua"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8daaf5f4235188a58603c39760d5fa5d4b920d36a299c934adddae757f32a10c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "tree-sitter-md"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2efd398be546456c814598ee56c0f51769a77241511b4a58077815d120afa882"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-php"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c17c3ab69052c5eeaa7ff5cd972dd1bc25d1b97ee779fec391ad3b5df5592"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -5086,6 +5264,16 @@ name = "tree-sitter-rust"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-scala"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24e0ab4505990bfe30051761d40a7bf4033ce5a81c9eda9e20e987a5cdc84826"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -5812,6 +6000,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wide"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cf05ca94c9fba0c51316899caa1d1e74a064fc310a5efa7375e614343d415be"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
+]
+
+[[package]]
 name = "wiggle"
 version = "48.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6272,6 +6470,15 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "wyz"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
+dependencies = [
+ "tap",
+]
 
 [[package]]
 name = "x11rb"

@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const WRITE_NAME: &str = "memory_write";
 pub const READ_NAME: &str = "memory_read";
@@ -174,7 +174,10 @@ pub(crate) fn run_write(
     Ok(out)
 }
 
-pub struct MemoryWriteTool;
+#[derive(Default)]
+pub struct MemoryWriteTool {
+    definition: DefinitionCache,
+}
 
 #[async_trait]
 impl Tool for MemoryWriteTool {
@@ -183,12 +186,7 @@ impl Tool for MemoryWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Save a durable memory (a fact, user preference, decision, lesson or gotcha) that \
-         should survive across sessions. scope 'global' is shared by all projects, 'project' \
-         is only this repo. Give a short title (<=80 chars) and the text (<=2000 chars). \
-         A near-duplicate of an existing entry updates it in place ('updated <id>') instead \
-         of adding a copy. Use 'supersedes' with an old id to replace a stale entry, and \
-         pinned=true only for the few things every session must see."
+        include_str!("../prompts/memory_write.md").trim()
     }
 
     fn schema(&self) -> Value {
@@ -208,6 +206,14 @@ impl Tool for MemoryWriteTool {
                 "supersedes": {"type": "string", "description": "Id of an older entry this replaces."}
             }
         })
+    }
+
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
+    }
+
+    fn can_exceed_output_cap(&self) -> bool {
+        false
     }
 
     fn kind(&self) -> ToolKind {
@@ -292,10 +298,6 @@ pub(crate) fn run_recall(store: &MemoryStore, args: RecallInput) -> Result<Strin
     Ok(format!("{} memories\n{}", hits.len(), body.join("\n")))
 }
 
-const RECALL_SCHEMA_DESC: &str = "Search saved memories (BM25 full-text, boosted by recency, \
-    pinned and past use). Empty query lists pinned + most recent entries. Searches both \
-    scopes unless 'scope' is given. Returns id, kind, title and text for up to 'limit' (default 5, max 20).";
-
 fn recall_schema() -> Value {
     json!({
         "type": "object",
@@ -319,7 +321,10 @@ async fn call_recall(name: &str, input: Value, ctx: &ToolCtx) -> Result<ToolOutp
         .with_preview(preview))
 }
 
-pub struct MemoryRecallTool;
+#[derive(Default)]
+pub struct MemoryRecallTool {
+    definition: DefinitionCache,
+}
 
 #[async_trait]
 impl Tool for MemoryRecallTool {
@@ -327,10 +332,13 @@ impl Tool for MemoryRecallTool {
         RECALL_NAME
     }
     fn description(&self) -> &str {
-        RECALL_SCHEMA_DESC
+        include_str!("../prompts/memory_recall.md").trim()
     }
     fn schema(&self) -> Value {
         recall_schema()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
     fn kind(&self) -> ToolKind {
         ToolKind::ReadOnly
@@ -341,7 +349,10 @@ impl Tool for MemoryRecallTool {
 }
 
 /// Backward-compatible alias of [`MemoryRecallTool`] (old name `memory_read`).
-pub struct MemoryReadTool;
+#[derive(Default)]
+pub struct MemoryReadTool {
+    definition: DefinitionCache,
+}
 
 #[async_trait]
 impl Tool for MemoryReadTool {
@@ -349,11 +360,13 @@ impl Tool for MemoryReadTool {
         READ_NAME
     }
     fn description(&self) -> &str {
-        "Alias of memory_recall: search saved memories, or list pinned + recent ones when \
-         no query is given. Optional scope 'global' | 'project' | 'both'."
+        include_str!("../prompts/memory_read.md").trim()
     }
     fn schema(&self) -> Value {
         recall_schema()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
     fn kind(&self) -> ToolKind {
         ToolKind::ReadOnly
@@ -390,7 +403,10 @@ pub(crate) fn run_forget(store: &MemoryStore, args: ForgetInput) -> Result<Strin
     }
 }
 
-pub struct MemoryForgetTool;
+#[derive(Default)]
+pub struct MemoryForgetTool {
+    definition: DefinitionCache,
+}
 
 #[async_trait]
 impl Tool for MemoryForgetTool {
@@ -398,8 +414,7 @@ impl Tool for MemoryForgetTool {
         FORGET_NAME
     }
     fn description(&self) -> &str {
-        "Forget a memory by id (from memory_recall / memory_list / the prompt index). Use it \
-         for wrong or obsolete entries. It is hidden immediately and erased for good after 90 days."
+        include_str!("../prompts/memory_forget.md").trim()
     }
     fn schema(&self) -> Value {
         json!({
@@ -407,6 +422,9 @@ impl Tool for MemoryForgetTool {
             "required": ["id"],
             "properties": {"id": {"type": "string", "description": "Memory id."}}
         })
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
     fn kind(&self) -> ToolKind {
         ToolKind::Edit
@@ -455,7 +473,10 @@ pub(crate) fn run_list(store: &MemoryStore, args: ListInput) -> Result<String, T
     Ok(format!("{} memories\n{}", entries.len(), lines.join("\n")))
 }
 
-pub struct MemoryListTool;
+#[derive(Default)]
+pub struct MemoryListTool {
+    definition: DefinitionCache,
+}
 
 #[async_trait]
 impl Tool for MemoryListTool {
@@ -463,8 +484,7 @@ impl Tool for MemoryListTool {
         LIST_NAME
     }
     fn description(&self) -> &str {
-        "List memory titles (pinned first, then most recently updated) with ids; no text. \
-         Use memory_recall to read the content."
+        include_str!("../prompts/memory_list.md").trim()
     }
     fn schema(&self) -> Value {
         json!({
@@ -475,6 +495,9 @@ impl Tool for MemoryListTool {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Default 50."}
             }
         })
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
     fn kind(&self) -> ToolKind {
         ToolKind::ReadOnly

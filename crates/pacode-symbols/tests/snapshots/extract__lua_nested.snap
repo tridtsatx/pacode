@@ -1,0 +1,10 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Lua, src)"
+---
+fn helper 1-1
+fn M.f 3-3
+method M.sub:method 5-5
+fn run 8-8
+fn closure 11-11
+fn M.extra 13-13

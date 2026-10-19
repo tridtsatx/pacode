@@ -3,19 +3,18 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use pacode_render::RenderOptions;
 
 use crate::state::{AppState, Focus, Overlay};
-use crate::ui::overlays::selected_row;
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOptions) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    frame.render_widget(Clear, area);
+    crate::ui::overlays::clear_panel(frame, area, opts);
 
     match &state.focus {
         Focus::Overlay(Overlay::EffortPicker { index }) => {
@@ -24,19 +23,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, opts: &RenderOption
         Focus::Overlay(Overlay::ModePicker { index }) => {
             draw_mode(frame, area, state, *index, opts);
         }
-        Focus::Overlay(Overlay::LoginPicker { query, index }) => {
-            crate::ui::login_picker::draw(frame, area, state, query, *index, opts);
-        }
-        Focus::Overlay(Overlay::QuestionPicker {
-            question,
-            index,
-            selected,
-            typed,
-            typing,
-        }) => {
-            draw_question(
-                frame, area, question, *index, selected, typed, *typing, opts,
-            );
+        Focus::Overlay(Overlay::QuestionPicker) => {
+            if let Some(question) = state.questions.current() {
+                let focus = state.questions.focus().cloned().unwrap_or_default();
+                crate::ui::question_picker::draw(
+                    frame,
+                    area,
+                    question,
+                    &focus,
+                    state.questions.position(),
+                    state.questions.len(),
+                    opts,
+                );
+            }
         }
         Focus::Overlay(Overlay::ThemePicker { .. }) => {
             crate::ui::theme_picker::draw(frame, area, state, opts);
@@ -67,17 +66,6 @@ pub fn option_label_center(label_start: usize, label_len: usize) -> usize {
     label_start + label_len / 2
 }
 
-fn effort_description(effort: pacode_types::Effort) -> &'static str {
-    use pacode_types::Effort;
-    match effort {
-        Effort::Low => "low: fastest, minimal reasoning",
-        Effort::Medium => "medium: balanced",
-        Effort::High => "high: deep reasoning for hard tasks",
-        Effort::XHigh => "xhigh: extra reasoning; sent as `high` unless the provider maps it",
-        Effort::Max => "max: maximum reasoning, slow and expensive",
-    }
-}
-
 fn draw_effort(
     frame: &mut Frame,
     area: Rect,
@@ -85,10 +73,22 @@ fn draw_effort(
     selected: usize,
     opts: &RenderOptions,
 ) {
-    // Only the levels the current model supports.
-    let efforts = state.effort_levels();
-    let levels: Vec<&str> = efforts.iter().map(|e| e.as_str()).collect();
-    let descriptions: Vec<&str> = efforts.iter().map(|e| effort_description(*e)).collect();
+    let levels = ["low", "medium", "high", "xhigh", "max"];
+    let descriptions = [
+        "low: fastest, minimal reasoning",
+        "medium: balanced",
+        "high: deep reasoning for hard tasks",
+        "xhigh: extra reasoning; sent as `high` unless the provider maps it",
+        "max: maximum reasoning, slow and expensive",
+    ];
+    // Greyed levels are unsupported by the current model and unselectable
+    // (spec §6); `None` means no restriction.
+    let supported = state.supported_efforts();
+    let allowed = |i: usize| {
+        pacode_types::Effort::ALL
+            .get(i)
+            .is_some_and(|e| supported.is_none_or(|l| l.contains(e)))
+    };
 
     let mut lines = Vec::new();
 
@@ -134,7 +134,9 @@ fn draw_effort(
             opt_spans.push(Span::raw(" ".repeat(label_start - cur_col)));
         }
         let is_sel = i == selected;
-        let style = if is_sel {
+        let style = if !allowed(i) {
+            opts.theme.faint
+        } else if is_sel {
             opts.theme.accent.patch(opts.theme.bold)
         } else {
             opts.theme.dim
@@ -145,7 +147,11 @@ fn draw_effort(
     lines.push(Line::from(opt_spans));
 
     // 3: Description
-    let desc = descriptions.get(selected).copied().unwrap_or("");
+    let desc = if allowed(selected) {
+        descriptions.get(selected).copied().unwrap_or("")
+    } else {
+        "not supported by the current model"
+    };
     lines.push(Line::from(Span::styled(desc, opts.theme.fg)));
 
     // 4: Blank
@@ -251,93 +257,6 @@ fn draw_mode(
         "←/→ adjust · enter confirm · esc cancel"
     };
     lines.push(Line::from(Span::styled(hint, opts.theme.dim)));
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// The question the model asked, as a bottom picker: the header chip, the
-/// question, one row per option with its description, and the key hints.
-#[allow(clippy::too_many_arguments)]
-fn draw_question(
-    frame: &mut Frame,
-    area: Rect,
-    question: &pacode_types::Question,
-    index: usize,
-    selected: &[usize],
-    typed: &str,
-    typing: bool,
-    opts: &RenderOptions,
-) {
-    let width = area.width as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    if !question.header.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(" {} ", question.header),
-            opts.theme.selected_bg,
-        )));
-    }
-    for line in pacode_render::wrap_text(&question.question, width) {
-        lines.push(Line::from(Span::styled(line, opts.theme.bold)));
-    }
-
-    for (i, option) in question.options.iter().enumerate() {
-        let is_cursor = i == index;
-        let is_selected = selected.contains(&i);
-        let marker = if is_selected {
-            opts.glyphs.ok
-        } else if is_cursor {
-            opts.glyphs.pointer
-        } else {
-            " "
-        };
-        let marker_style = if is_selected {
-            opts.theme.green
-        } else {
-            opts.theme.accent
-        };
-        let mut spans = vec![
-            Span::styled(format!("{marker} "), marker_style),
-            Span::styled(
-                format!("{}. {}", i + 1, option.label),
-                if is_cursor {
-                    opts.theme.bold
-                } else {
-                    opts.theme.fg
-                },
-            ),
-        ];
-        if option.recommended {
-            spans.push(Span::styled(" (recommended)", opts.theme.faint));
-        }
-        let line = Line::from(spans);
-        if is_cursor {
-            lines.push(selected_row(line, width as u16, opts));
-        } else {
-            lines.push(line);
-        }
-        if is_cursor && !option.description.is_empty() {
-            for dl in pacode_render::wrap_text(&option.description, width.saturating_sub(4)) {
-                lines.push(selected_row(
-                    Line::from(Span::styled(format!("    {dl}"), opts.theme.dim)),
-                    width as u16,
-                    opts,
-                ));
-            }
-        }
-    }
-
-    let hint = if typing {
-        format!("type an answer · enter send · esc back    {typed}")
-    } else if question.multi_select {
-        "space toggle · enter send · 1-9 pick one · t type · esc dismiss".to_string()
-    } else {
-        "enter select · 1-9 pick · t type an answer · esc dismiss".to_string()
-    };
-    lines.push(Line::from(Span::styled(
-        pacode_render::truncate_to_width(&hint, width, true),
-        opts.theme.dim,
-    )));
 
     frame.render_widget(Paragraph::new(lines), area);
 }

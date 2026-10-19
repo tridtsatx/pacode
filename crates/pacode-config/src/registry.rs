@@ -17,6 +17,7 @@ pub enum ApplyMode {
     Immediate,
     NextTurn,
     Restart,
+    RestartClient,
 }
 
 impl ApplyMode {
@@ -25,6 +26,7 @@ impl ApplyMode {
             Self::Immediate => "immediate",
             Self::NextTurn => "next turn",
             Self::Restart => "restart",
+            Self::RestartClient => "restart client",
         }
     }
 }
@@ -78,10 +80,18 @@ pub enum ValidationError {
     NotDirectlyEditable { key: String, command: String },
 }
 
+#[derive(Debug, thiserror::Error, PartialEq)]
+#[error("invalid {key}: {message}")]
+pub struct ConfigValidationError {
+    pub key: &'static str,
+    pub message: String,
+}
+
 /// Explicit, named skip list for collection-valued fields that cannot be edited in a simple list UI.
 pub const SKIP_LIST: &[&str] = &[
     "providers",
     "pricing",
+    "agents",
     "plugins.dirs",
     "skills.dirs",
     "hooks.pre_tool_use",
@@ -101,7 +111,7 @@ pub const SECTIONS: &[&str] = &[
     "ui",
     "exec",
     "resources",
-    "agents",
+    "limits",
     "daemon",
     "context",
     "permissions",
@@ -109,6 +119,7 @@ pub const SECTIONS: &[&str] = &[
     "session",
     "plugins",
     "skills",
+    "tools",
     "theme",
     "font",
     "keys",
@@ -117,13 +128,56 @@ pub const SECTIONS: &[&str] = &[
     "read",
 ];
 
+/// `tools.<name>.enabled` rows for the built-in tools; plugin/MCP names like
+/// `tools.github__get_pr.enabled` are handled dynamically in
+/// `read_value`/`apply_to_config`/`validate`.
+macro_rules! tool_toggle {
+    ($name:literal) => {
+        SettingEntry {
+            dotted_key: concat!("tools.", $name, ".enabled"),
+            label: concat!("Tool: ", $name),
+            description: concat!("Enable the `", $name, "` tool"),
+            section: "tools",
+            default_value: "true",
+            kind: SettingKind::Bool,
+            apply: ApplyMode::Restart,
+        }
+    };
+}
+
 const EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const SUBAGENT_EFFORT_OPTIONS: &[&str] = &["", "low", "medium", "high", "xhigh", "max"];
 const COLOR_OPTIONS: &[&str] = &["auto", "truecolor", "ansi"];
 const IMAGE_OPTIONS: &[&str] = &["auto", "off"];
 const AGENT_VIEW_OPTIONS: &[&str] = &["replace", "panel"];
+const ANIMATION_OPTIONS: &[&str] = &["smooth", "balanced", "eco"];
+const SHIMMER_OPTIONS: &[&str] = &["classic", "kitt", "off"];
 const PERM_OPTIONS: &[&str] = &["build", "auto", "plan", "bypass"];
 const FONT_WEIGHT_OPTIONS: &[&str] = &["", "normal", "bold"];
+const ZDR_OPTIONS: &[&str] = &["always", "session", "off"];
+
+/// The numbers `ui.ups` accepts. Validation and repair both read it, so a
+/// clamped frame rate is the same one an edit would have accepted.
+const UPS_RANGE: std::ops::RangeInclusive<i64> = 1..=240;
+
+/// Parse the one-line `ui.fusion` value: `"planner -> implementer"`, both
+/// `provider/model` routes.
+///
+/// A half-written pair is not a pair. A pipeline missing either half would
+/// bill the expensive model for the work it was supposed to delegate, so an
+/// unparseable value turns fusion *off* rather than guessing which half the
+/// user meant.
+fn parse_fusion_pair(value: &str) -> Option<pacode_types::config::FusionConfig> {
+    let (planner, implementer) = value.split_once("->")?;
+    let planner = planner.trim();
+    let implementer = implementer.trim();
+    if planner.is_empty() || implementer.is_empty() {
+        return None;
+    }
+    Some(pacode_types::config::FusionConfig {
+        planner: planner.to_string(),
+        implementer: implementer.to_string(),
+    })
+}
 
 #[rustfmt::skip]
 pub static SETTINGS: &[SettingEntry] = &[
@@ -139,9 +193,16 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "ui.hints.model", label: "Model Hint", description: "Show model route hint in prompt area", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.hints.effort", label: "Effort Hint", description: "Show reasoning effort hint in prompt area", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.ascii_only", label: "ASCII Only", description: "Render plain ASCII box drawing and icons", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
-    SettingEntry { dotted_key: "ui.mouse", label: "Mouse Support", description: "Enable terminal mouse tracking and scrolling", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.powerline", label: "Powerline Glyphs", description: "The terminal font has Powerline/Nerd Font glyphs: draw arrow separators in the status line", section: "ui", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.mouse", label: "Mouse Support", description: "Enable terminal mouse tracking and scrolling; applied to the live terminal", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.auto_copy", label: "Auto Copy", description: "Automatically copy mouse selections to clipboard", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.ups", label: "Updates Per Second", description: "Render update rate: auto, dynamic, or fixed 1..=240", section: "ui", default_value: "10", kind: SettingKind::String, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.animation", label: "Animation Mode", description: "Animation clock preset: smooth, balanced, or eco", section: "ui", default_value: "smooth", kind: SettingKind::Enum { options: ANIMATION_OPTIONS }, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.shimmer", label: "Shimmer Sweep", description: "Light band sweeping across live text: classic, kitt, or off", section: "ui", default_value: "classic", kind: SettingKind::Enum { options: SHIMMER_OPTIONS }, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "ui.tool_memory_percent", label: "Tool Memory Ceiling", description: "RAM ceiling per tool process, percent of the machine; 0 disables it", section: "ui", default_value: "80", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "ui.tool_memory_split_sessions", label: "Split Ceiling Across Sessions", description: "Divide the ceiling between concurrent sessions instead of applying it to each", section: "ui", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "ui.analyze_checkpoint_every", label: "Analyze Checkpoint Interval", description: "Actions between context-quality checkpoints, used with --analyze-mode", section: "ui", default_value: "100", kind: SettingKind::Integer { min: 1, max: 10000 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "ui.fusion", label: "Fusion", description: "planner = \"provider/model\" for the thinking model, implementer = the cheap one that writes the code", section: "ui", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "ui.color", label: "Color Mode", description: "Terminal color fidelity: auto, truecolor, or ansi", section: "ui", default_value: "auto", kind: SettingKind::Enum { options: COLOR_OPTIONS }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.transcript_cells", label: "Transcript Cells", description: "Max transcript cells kept in RAM before evicting", section: "ui", default_value: "500", kind: SettingKind::Integer { min: 10, max: 100000 }, apply: ApplyMode::Immediate },
     SettingEntry { dotted_key: "ui.images", label: "Image Rendering", description: "Terminal image protocol: auto or off", section: "ui", default_value: "auto", kind: SettingKind::Enum { options: IMAGE_OPTIONS }, apply: ApplyMode::Immediate },
@@ -172,14 +233,9 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "resources.sample_ms_pressure", label: "Sample Interval (pressure) ms", description: "Sampling interval in ms near or below the reserve", section: "resources", default_value: "200", kind: SettingKind::Integer { min: 50, max: 10000 }, apply: ApplyMode::Restart },
 
     // agents
-    SettingEntry { dotted_key: "agents.max_live", label: "Max Live Agents", description: "Maximum concurrent live subagents", section: "agents", default_value: "16", kind: SettingKind::Integer { min: 1, max: 512 }, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.default_model", label: "Subagent Model", description: "provider/model for subagents when unspecified", section: "agents", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.default_effort", label: "Subagent Effort", description: "Reasoning effort for subagents: low, medium, high, xhigh, max", section: "agents", default_value: "", kind: SettingKind::Enum { options: SUBAGENT_EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.max_turns", label: "Max Turns", description: "Maximum tool-calling turns for a subagent before stopping", section: "agents", default_value: "200", kind: SettingKind::Integer { min: 1, max: 10000 }, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.todo_guard", label: "Todo Guard", description: "Remind the agent to finish or close open plan items before it stops", section: "agents", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.todo_guard_max_reminders", label: "Todo Guard Reminders", description: "Maximum todo-guard reminders per user turn", section: "agents", default_value: "2", kind: SettingKind::Integer { min: 0, max: 10 }, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.ask_parent_timeout_secs", label: "Ask Parent Timeout", description: "Seconds a subagent waits for the orchestrator to answer a blocking question", section: "agents", default_value: "600", kind: SettingKind::Integer { min: 5, max: 86400 }, apply: ApplyMode::NextTurn },
-    SettingEntry { dotted_key: "agents.ask_parent_max", label: "Ask Parent Limit", description: "Maximum questions one subagent may ask the orchestrator", section: "agents", default_value: "5", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
+
+    // limits
+    SettingEntry { dotted_key: "limits.max_provider_concurrency", label: "Provider Concurrency", description: "Ceiling on in-flight provider requests per provider+credential; the runtime rejects anything outside 1..=1024", section: "limits", default_value: "128", kind: SettingKind::Integer { min: 1, max: 1024 }, apply: ApplyMode::Restart },
 
     // daemon
     SettingEntry { dotted_key: "daemon.idle_timeout_secs", label: "Idle Timeout Seconds", description: "Seconds of inactivity before daemon shuts down (0 to disable)", section: "daemon", default_value: "600", kind: SettingKind::Integer { min: 0, max: 2592000 }, apply: ApplyMode::Restart },
@@ -202,16 +258,22 @@ pub static SETTINGS: &[SettingEntry] = &[
     // permissions
     SettingEntry { dotted_key: "permissions.default_mode", label: "Default Permission Mode", description: "Default mode: build, auto, plan, or bypass", section: "permissions", default_value: "build", kind: SettingKind::Enum { options: PERM_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "permissions.allow_catastrophic", label: "Allow Catastrophic", description: "Allow destructive commands without prompt in bypass mode", section: "permissions", default_value: "false", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "permissions.explain_model", label: "Permission Explain Model", description: "Model for permission explanations (default: session model)", section: "permissions", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
 
     // mcp
     SettingEntry { dotted_key: "mcp.servers", label: "MCP Servers", description: "Configured MCP servers (manage with /mcp or /import)", section: "mcp", default_value: "/mcp", kind: SettingKind::Action { command: "/mcp" }, apply: ApplyMode::Restart },
-    SettingEntry { dotted_key: "mcp.sampling", label: "MCP Sampling", description: "Enable MCP client sampling capabilities", section: "mcp", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
-    SettingEntry { dotted_key: "mcp.sampling_max_tokens", label: "MCP Sampling Max Tokens", description: "Maximum tokens allowed per MCP sampling request", section: "mcp", default_value: "2048", kind: SettingKind::Integer { min: 1, max: 1000000 }, apply: ApplyMode::Immediate },
-    SettingEntry { dotted_key: "mcp.idle_timeout_secs", label: "MCP Idle Timeout Seconds", description: "Seconds of inactivity before an MCP server goes to sleep (0 to disable)", section: "mcp", default_value: "300", kind: SettingKind::Integer { min: 0, max: 86400 }, apply: ApplyMode::Immediate },
+    // The pool is built once from the config at daemon startup; a later edit
+    // reaches the pool only through a daemon restart.
+    SettingEntry { dotted_key: "mcp.sampling", label: "MCP Sampling", description: "Enable MCP client sampling capabilities", section: "mcp", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "mcp.sampling_max_tokens", label: "MCP Sampling Max Tokens", description: "Maximum tokens allowed per MCP sampling request", section: "mcp", default_value: "2048", kind: SettingKind::Integer { min: 1, max: 1000000 }, apply: ApplyMode::Restart },
+    SettingEntry { dotted_key: "mcp.idle_timeout_secs", label: "MCP Idle Timeout Seconds", description: "Seconds of inactivity before an MCP server goes to sleep (0 to disable)", section: "mcp", default_value: "300", kind: SettingKind::Integer { min: 0, max: 86400 }, apply: ApplyMode::Restart },
 
     // session
     SettingEntry { dotted_key: "session.title_model", label: "Session Title Model", description: "Model used to name sessions after first reply", section: "session", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "session.history_page", label: "History Page Size", description: "Transcript items per historical page load", section: "session", default_value: "200", kind: SettingKind::Integer { min: 1, max: 5000 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "session.plan_reminders", label: "Plan Reminders", description: "Remind the agent to continue when it stops with open plan items", section: "session", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "session.plan_reminders_max", label: "Plan Reminders Max", description: "Most plan reminders per user message", section: "session", default_value: "3", kind: SettingKind::Integer { min: 1, max: 10 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "zdr", label: "ZDR Mode", description: "Zero-data-retention routing: always, session (Alt+Z toggle), or off", section: "session", default_value: "session", kind: SettingKind::Enum { options: ZDR_OPTIONS }, apply: ApplyMode::NextTurn },
 
     // plugins
     SettingEntry { dotted_key: "plugins.enabled", label: "Plugins Enabled", description: "Enable plugin subsystem", section: "plugins", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Restart },
@@ -229,12 +291,38 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "theme.overrides", label: "Theme Overrides", description: "Per-role color overrides (customize with /theme)", section: "theme", default_value: "/theme", kind: SettingKind::Action { command: "/theme" }, apply: ApplyMode::Immediate },
 
     // font
-    SettingEntry { dotted_key: "font.family", label: "Font Family", description: "Terminal font family request (best effort)", section: "font", default_value: "", kind: SettingKind::String, apply: ApplyMode::Immediate },
-    SettingEntry { dotted_key: "font.size", label: "Font Size", description: "Terminal font size in points (best effort)", section: "font", default_value: "", kind: SettingKind::Integer { min: 4, max: 72 }, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "font.family", label: "Font Family", description: "Terminal font family request; takes effect after restarting the client", section: "font", default_value: "", kind: SettingKind::String, apply: ApplyMode::RestartClient },
+    SettingEntry { dotted_key: "font.size", label: "Font Size", description: "Terminal font size in points; takes effect after restarting the client", section: "font", default_value: "", kind: SettingKind::Integer { min: 4, max: 72 }, apply: ApplyMode::RestartClient },
     SettingEntry { dotted_key: "font.weight", label: "Font Weight", description: "Terminal font weight: normal or bold", section: "font", default_value: "", kind: SettingKind::Enum { options: FONT_WEIGHT_OPTIONS }, apply: ApplyMode::Immediate },
 
     // keys
     SettingEntry { dotted_key: "keys", label: "Keybindings", description: "Action keybindings (customize with /keys)", section: "keys", default_value: "/keys", kind: SettingKind::Action { command: "/keys" }, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "keys.double_shift", label: "Double-Shift Menu", description: "Double-tap Shift opens the menu hub", section: "keys", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::Immediate },
+    SettingEntry { dotted_key: "keys.double_shift_ms", label: "Double-Shift Interval", description: "Max milliseconds between the two Shift taps", section: "keys", default_value: "400", kind: SettingKind::Integer { min: 50, max: 2000 }, apply: ApplyMode::Immediate },
+
+    // tools — `tools.<name>.enabled = false` removes the tool from the model
+    // schema entirely (registry drops it; dispatch reports "unknown tool").
+    tool_toggle!("read"),
+    tool_toggle!("write"),
+    tool_toggle!("edit"),
+    tool_toggle!("multi_edit"),
+    tool_toggle!("bash"),
+    tool_toggle!("batch"),
+    tool_toggle!("ask_question"),
+    tool_toggle!("bg"),
+    tool_toggle!("cron"),
+    tool_toggle!("monitor"),
+    tool_toggle!("grep"),
+    tool_toggle!("glob"),
+    tool_toggle!("ls"),
+    tool_toggle!("plan"),
+    tool_toggle!("agent"),
+    tool_toggle!("webfetch"),
+    tool_toggle!("websearch"),
+    tool_toggle!("report_status"),
+    tool_toggle!("memory_write"),
+    tool_toggle!("memory_read"),
+    tool_toggle!("skill"),
 
     // web
     SettingEntry { dotted_key: "web.default_num_results", label: "Default Search Results", description: "Default number of search results to return", section: "web", default_value: "8", kind: SettingKind::Integer { min: 1, max: 50 }, apply: ApplyMode::Restart },
@@ -256,7 +344,32 @@ pub fn find_entry(dotted_key: &str) -> Option<&'static SettingEntry> {
     SETTINGS.iter().find(|e| e.dotted_key == dotted_key)
 }
 
+/// `tools.<name>.enabled` → the tool name. Names never contain dots, so a key
+/// like `tools.a.b.enabled` is not a tool toggle.
+fn tool_toggle_key(dotted_key: &str) -> Option<&str> {
+    dotted_key
+        .strip_prefix("tools.")
+        .and_then(|rest| rest.strip_suffix(".enabled"))
+        .filter(|name| !name.is_empty() && !name.contains('.'))
+}
+
+fn validate_bool(candidate: &str) -> Result<toml::Value, ValidationError> {
+    let trimmed = candidate.trim();
+    if trimmed == "true" {
+        Ok(toml::Value::Boolean(true))
+    } else if trimmed == "false" {
+        Ok(toml::Value::Boolean(false))
+    } else {
+        Err(ValidationError::InvalidBool {
+            value: candidate.to_string(),
+        })
+    }
+}
+
 pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
+    if let Some(name) = tool_toggle_key(dotted_key) {
+        return Some(config.tool_enabled(name).to_string());
+    }
     match dotted_key {
         "provider.default" => Some(config.provider.default.clone().unwrap_or_default()),
         "provider.effort" => Some(config.provider.effort.as_str().to_string()),
@@ -267,6 +380,7 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "ui.hints.model" => Some(config.ui.hints.model.to_string()),
         "ui.hints.effort" => Some(config.ui.hints.effort.to_string()),
         "ui.ascii_only" => Some(config.ui.ascii_only.to_string()),
+        "ui.powerline" => Some(config.ui.powerline.to_string()),
         "ui.mouse" => Some(config.ui.mouse.to_string()),
         "ui.auto_copy" => Some(config.ui.auto_copy.to_string()),
         "ui.ups" => Some(match config.ui.ups {
@@ -274,6 +388,19 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             Ups::Dynamic => "dynamic".to_string(),
             Ups::Auto => "auto".to_string(),
         }),
+        "ui.animation" => Some(config.ui.animation.as_str().to_string()),
+        "ui.shimmer" => Some(config.ui.shimmer.as_str().to_string()),
+        "ui.tool_memory_percent" => Some(config.ui.tool_memory_percent.to_string()),
+        "ui.tool_memory_split_sessions" => Some(config.ui.tool_memory_split_sessions.to_string()),
+        "ui.analyze_checkpoint_every" => Some(config.ui.analyze_checkpoint_every.to_string()),
+        "ui.fusion" => Some(
+            config
+                .ui
+                .fusion
+                .as_ref()
+                .map(|f| format!("{} → {}", f.planner, f.implementer))
+                .unwrap_or_default(),
+        ),
         "ui.color" => Some(config.ui.color.clone()),
         "ui.transcript_cells" => Some(config.ui.transcript_cells.to_string()),
         "ui.images" => Some(config.ui.images.clone()),
@@ -300,22 +427,9 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             Some(config.resources.sample_ms_idle_headroom.to_string())
         }
         "resources.sample_ms_pressure" => Some(config.resources.sample_ms_pressure.to_string()),
-        "agents.max_live" => Some(config.agents.max_live.to_string()),
-        "agents.default_model" => Some(config.agents.default_model.clone().unwrap_or_default()),
-        "agents.default_effort" => Some(
-            config
-                .agents
-                .default_effort
-                .map(|e| e.as_str().to_string())
-                .unwrap_or_default(),
-        ),
-        "agents.max_turns" => Some(config.agents.max_turns.to_string()),
-        "agents.todo_guard" => Some(config.agents.todo_guard.to_string()),
-        "agents.todo_guard_max_reminders" => {
-            Some(config.agents.todo_guard_max_reminders.to_string())
+        "limits.max_provider_concurrency" => {
+            Some(config.limits.max_provider_concurrency.to_string())
         }
-        "agents.ask_parent_timeout_secs" => Some(config.agents.ask_parent_timeout_secs.to_string()),
-        "agents.ask_parent_max" => Some(config.agents.ask_parent_max.to_string()),
         "daemon.idle_timeout_secs" => Some(config.daemon.idle_timeout_secs.to_string()),
         "daemon.socket" => Some(
             config
@@ -347,12 +461,18 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "context.default_context_window" => Some(config.context.default_context_window.to_string()),
         "permissions.default_mode" => Some(config.permissions.default_mode.as_str().to_string()),
         "permissions.allow_catastrophic" => Some(config.permissions.allow_catastrophic.to_string()),
+        "permissions.explain_model" => {
+            Some(config.permissions.explain_model.clone().unwrap_or_default())
+        }
         "mcp.servers" => Some(format!("{} servers (/mcp)", config.mcp.servers.len())),
         "mcp.sampling" => Some(config.mcp.sampling.to_string()),
         "mcp.sampling_max_tokens" => Some(config.mcp.sampling_max_tokens.to_string()),
         "mcp.idle_timeout_secs" => Some(config.mcp.idle_timeout_secs.to_string()),
         "session.title_model" => Some(config.session.title_model.clone().unwrap_or_default()),
         "session.history_page" => Some(config.session.history_page.to_string()),
+        "session.plan_reminders" => Some(config.session.plan_reminders.to_string()),
+        "session.plan_reminders_max" => Some(config.session.plan_reminders_max.to_string()),
+        "zdr" => Some(config.zdr.as_str().to_string()),
         "plugins.enabled" => Some(config.plugins.enabled.to_string()),
         "plugins.wasm_memory_mb" => Some(config.plugins.wasm_memory_mb.to_string()),
         "plugins.lua_memory_mb" => Some(config.plugins.lua_memory_mb.to_string()),
@@ -372,6 +492,8 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
             "{} custom bindings (/keys)",
             config.keys.bindings.len()
         )),
+        "keys.double_shift" => Some(config.keys.double_shift_enabled().to_string()),
+        "keys.double_shift_ms" => Some(config.keys.double_shift_threshold_ms().to_string()),
         "web.default_num_results" => Some(config.web.default_num_results.to_string()),
         "web.request_timeout_secs" => Some(config.web.request_timeout_secs.to_string()),
         "memory.enabled" => Some(config.memory.enabled.to_string()),
@@ -385,23 +507,75 @@ pub fn is_modified(config: &Config, entry: &SettingEntry) -> bool {
     read_value(config, entry.dotted_key).as_deref() != Some(entry.default_value)
 }
 
+/// Where a setting's effective value came from — the `origin` line of the
+/// Settings detail card (§5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Nothing overrides it — the registry `default_value` is in effect.
+    Default,
+    /// Set in the user config (`config.toml` or a split sibling).
+    Global,
+    /// Set by a project-level config. Reserved: pacode has no project config
+    /// layer yet, so nothing returns this today.
+    Project,
+    /// Forced by an environment variable (`PACODE_MODEL`, `PACODE_EFFORT`,
+    /// `PACODE_MODE`) — env wins over every file.
+    Env,
+}
+
+impl Origin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Env => "env",
+        }
+    }
+}
+
+/// The env var owning a dotted key, when the key is env-overridable — the same
+/// mapping `apply_env_overrides` applies on load.
+fn env_key(dotted_key: &str) -> Option<&'static str> {
+    match dotted_key {
+        "provider.default" => Some("PACODE_MODEL"),
+        "provider.effort" => Some("PACODE_EFFORT"),
+        "permissions.default_mode" => Some("PACODE_MODE"),
+        _ => None,
+    }
+}
+
+/// Where `entry`'s effective value came from (§5.1). A live env override wins
+/// over files; short of that, a value differing from the registry default must
+/// have come from the user config — the only settings file pacode has today.
+pub fn value_origin(config: &Config, entry: &SettingEntry) -> Origin {
+    value_origin_with(config, entry, |var| std::env::var_os(var).is_some())
+}
+
+/// [`value_origin`] with the environment injected — tests pass a lookup
+/// instead of touching the real process environment.
+fn value_origin_with(
+    config: &Config,
+    entry: &SettingEntry,
+    env_set: impl Fn(&str) -> bool,
+) -> Origin {
+    if env_key(entry.dotted_key).is_some_and(&env_set) {
+        return Origin::Env;
+    }
+    if is_modified(config, entry) {
+        Origin::Global
+    } else {
+        Origin::Default
+    }
+}
+
 pub fn validate_candidate(
     entry: &SettingEntry,
     candidate: &str,
 ) -> Result<toml::Value, ValidationError> {
     let trimmed = candidate.trim();
     match entry.kind {
-        SettingKind::Bool => {
-            if trimmed == "true" {
-                Ok(toml::Value::Boolean(true))
-            } else if trimmed == "false" {
-                Ok(toml::Value::Boolean(false))
-            } else {
-                Err(ValidationError::InvalidBool {
-                    value: candidate.to_string(),
-                })
-            }
-        }
+        SettingKind::Bool => validate_bool(candidate),
         SettingKind::Integer { min, max } => {
             if trimmed.is_empty() && entry.dotted_key == "font.size" {
                 Ok(toml::Value::String(String::new()))
@@ -457,7 +631,7 @@ pub fn validate_candidate(
                 if trimmed == "auto" || trimmed == "dynamic" {
                     Ok(toml::Value::String(trimmed.to_string()))
                 } else if let Ok(n) = trimmed.parse::<i64>() {
-                    if (1..=240).contains(&n) {
+                    if UPS_RANGE.contains(&n) {
                         Ok(toml::Value::Integer(n))
                     } else {
                         Err(ValidationError::InvalidUps {
@@ -481,13 +655,175 @@ pub fn validate_candidate(
 }
 
 pub fn validate(dotted_key: &str, candidate: &str) -> Result<toml::Value, ValidationError> {
+    if tool_toggle_key(dotted_key).is_some() {
+        return validate_bool(candidate);
+    }
     let entry = find_entry(dotted_key).ok_or_else(|| ValidationError::UnknownKey {
         key: dotted_key.to_string(),
     })?;
     validate_candidate(entry, candidate)
 }
 
+/// `(key, ceiling_key)` pairs whose order matters: each value is legal on its
+/// own, yet breaks the one it is measured against. The registry table describes
+/// ranges, these describe agreements between two of them, so they live beside
+/// it rather than in it. Every `ceiling_key` is never a `key` — the repair loop
+/// lowers keys only, so lowering always terminates.
+const CROSS_FIELD_RULES: &[(&str, &str)] = &[
+    // A tool result larger than the whole window can never be sent: the turn
+    // compacts forever without making progress.
+    (
+        "context.tool_output_cap_chars",
+        "context.default_context_window",
+    ),
+    // An MCP sampling completion asking for more tokens than the window holds
+    // fails at the provider every time it is used.
+    ("mcp.sampling_max_tokens", "context.default_context_window"),
+    // The in-RAM tail mirrors the spool file; a tail above the spool cap is
+    // memory nothing can ever fill.
+    ("exec.tail_bytes", "exec.max_spool_bytes"),
+];
+
+/// The number a cross-field key carries, read wide enough to compare a byte
+/// count with a token count.
+fn cross_field_value(config: &Config, key: &str) -> u64 {
+    match key {
+        "context.tool_output_cap_chars" => config.context.tool_output_cap_chars as u64,
+        "context.default_context_window" => config.context.default_context_window as u64,
+        "mcp.sampling_max_tokens" => config.mcp.sampling_max_tokens as u64,
+        "exec.tail_bytes" => config.exec.tail_bytes as u64,
+        "exec.max_spool_bytes" => config.exec.max_spool_bytes,
+        _ => 0,
+    }
+}
+
+pub fn cross_field_violation(config: &Config) -> Option<ConfigValidationError> {
+    CROSS_FIELD_RULES.iter().find_map(|(key, ceiling_key)| {
+        let value = cross_field_value(config, key);
+        let ceiling = cross_field_value(config, ceiling_key);
+        (value > ceiling).then(|| ConfigValidationError {
+            key,
+            message: format!("{value} exceeds {ceiling_key}={ceiling}"),
+        })
+    })
+}
+
+pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
+    for entry in SETTINGS {
+        if matches!(entry.kind, SettingKind::Action { .. }) {
+            continue;
+        }
+        let value = read_value(config, entry.dotted_key).ok_or_else(|| ConfigValidationError {
+            key: entry.dotted_key,
+            message: ValidationError::UnknownKey {
+                key: entry.dotted_key.to_string(),
+            }
+            .to_string(),
+        })?;
+        validate_candidate(entry, &value).map_err(|error| ConfigValidationError {
+            key: entry.dotted_key,
+            message: error.to_string(),
+        })?;
+    }
+
+    cross_field_violation(config).map_or(Ok(()), Err)
+}
+
+/// The nearest in-range value for a setting [`validate_candidate`] rejected: a
+/// number is pulled to the bound it crossed, a value that is not a number at
+/// all (an `ups` written as a word) falls back to the registry default.
+/// `None` for `Action` rows, which hold no value.
+fn repaired_value(entry: &'static SettingEntry, current: &str) -> Option<toml::Value> {
+    let trimmed = current.trim();
+    match entry.kind {
+        SettingKind::Integer { min, max } => Some(match trimmed.parse::<i64>() {
+            Ok(value) => toml::Value::Integer(value.clamp(min, max)),
+            Err(_) => toml::Value::Integer(entry.default_value.parse::<i64>().unwrap_or(min)),
+        }),
+        SettingKind::Float { min, max } => Some(match trimmed.parse::<f64>() {
+            Ok(value) => toml::Value::Float(value.clamp(min, max)),
+            Err(_) => toml::Value::Float(entry.default_value.parse::<f64>().unwrap_or(min)),
+        }),
+        SettingKind::Enum { options } => Some(toml::Value::String(
+            options
+                .iter()
+                .find(|option| **option == trimmed)
+                .copied()
+                .unwrap_or(entry.default_value)
+                .to_string(),
+        )),
+        SettingKind::String => {
+            if entry.dotted_key == "ui.ups" {
+                return Some(match trimmed.parse::<i64>() {
+                    Ok(value) => {
+                        toml::Value::Integer(value.clamp(*UPS_RANGE.start(), *UPS_RANGE.end()))
+                    }
+                    Err(_) => validate_candidate(entry, entry.default_value).ok()?,
+                });
+            }
+            validate_candidate(entry, entry.default_value).ok()
+        }
+        SettingKind::Bool | SettingKind::Action { .. } => None,
+    }
+}
+
+/// Bring every out-of-range or disagreeing value in `config` back into what the
+/// runtime accepts and report what moved. Loading calls this instead of
+/// refusing the file: a stale out-of-range number is a wrong value, not a
+/// reason to leave the user without a working pacode. Nothing is written back
+/// to disk — the file keeps the number the user typed until they next edit it
+/// through `/config`.
+pub fn repair_config(config: &mut Config) -> Vec<ConfigValidationError> {
+    let mut repairs = Vec::new();
+    for entry in SETTINGS {
+        if matches!(entry.kind, SettingKind::Action { .. }) {
+            continue;
+        }
+        let Some(current) = read_value(config, entry.dotted_key) else {
+            continue;
+        };
+        let Err(error) = validate_candidate(entry, &current) else {
+            continue;
+        };
+        let Some(value) = repaired_value(entry, &current) else {
+            continue;
+        };
+        apply_to_config(config, entry.dotted_key, &value);
+        repairs.push(ConfigValidationError {
+            key: entry.dotted_key,
+            message: error.to_string(),
+        });
+    }
+
+    while let Some(violation) = cross_field_violation(config) {
+        let Some((_, ceiling_key)) = CROSS_FIELD_RULES
+            .iter()
+            .find(|(key, _)| *key == violation.key)
+        else {
+            break;
+        };
+        let ceiling = cross_field_value(config, ceiling_key);
+        apply_to_config(
+            config,
+            violation.key,
+            &toml::Value::Integer(i64::try_from(ceiling).unwrap_or(i64::MAX)),
+        );
+        repairs.push(ConfigValidationError {
+            key: violation.key,
+            message: format!("exceeded {ceiling_key}={ceiling}"),
+        });
+    }
+
+    repairs
+}
+
 pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Value) {
+    if let Some(name) = tool_toggle_key(dotted_key) {
+        if let toml::Value::Boolean(enabled) = value {
+            config.tools.entry(name.to_string()).or_default().enabled = *enabled;
+        }
+        return;
+    }
     match dotted_key {
         "provider.default" => {
             if let toml::Value::String(s) = value {
@@ -536,6 +872,11 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 config.ui.ascii_only = *b;
             }
         }
+        "ui.powerline" => {
+            if let toml::Value::Boolean(b) = value {
+                config.ui.powerline = *b;
+            }
+        }
         "ui.mouse" => {
             if let toml::Value::Boolean(b) = value {
                 config.ui.mouse = *b;
@@ -552,6 +893,45 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
             toml::Value::String(s) if s == "auto" => config.ui.ups = Ups::Auto,
             _ => {}
         },
+        "ui.animation" => {
+            if let toml::Value::String(s) = value
+                && let Some(mode) = pacode_types::config::AnimationMode::parse(s)
+            {
+                config.ui.animation = mode;
+            }
+        }
+        "ui.shimmer" => {
+            if let toml::Value::String(s) = value
+                && let Some(mode) = pacode_types::config::ShimmerMode::parse(s)
+            {
+                config.ui.shimmer = mode;
+            }
+        }
+        "ui.tool_memory_percent" => {
+            if let toml::Value::Integer(n) = value {
+                config.ui.tool_memory_percent =
+                    (*n).clamp(0, i64::from(pacode_types::config::TOOL_MEMORY_MAX_PERCENT)) as u8;
+            }
+        }
+        "ui.tool_memory_split_sessions" => {
+            if let toml::Value::Boolean(b) = value {
+                config.ui.tool_memory_split_sessions = *b;
+            }
+        }
+        "ui.analyze_checkpoint_every" => {
+            if let toml::Value::Integer(n) = value {
+                config.ui.analyze_checkpoint_every = (*n).max(1) as u32;
+            }
+        }
+        "ui.fusion" => {
+            // A pair, written as one string so the setting stays a single row:
+            // `"planner/route -> implementer/route"`. A half-written pair is
+            // not a pair, and a half-configured pipeline would silently bill
+            // the expensive model for the work.
+            if let toml::Value::String(s) = value {
+                config.ui.fusion = parse_fusion_pair(s);
+            }
+        }
         "ui.color" => {
             if let toml::Value::String(s) = value {
                 config.ui.color = s.clone();
@@ -580,6 +960,16 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "plugins.marketplace" => {
             if let toml::Value::String(v) = value {
                 config.plugins.marketplace = v.clone();
+            }
+        }
+        "keys.double_shift" => {
+            if let toml::Value::Boolean(b) = value {
+                config.keys.double_shift = Some(*b);
+            }
+        }
+        "keys.double_shift_ms" => {
+            if let toml::Value::Integer(n) = value {
+                config.keys.double_shift_ms = Some(*n as u64);
             }
         }
         "ui.agent_view" => {
@@ -674,44 +1064,9 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 config.resources.sample_ms_pressure = *n as u64;
             }
         }
-        "agents.max_live" => {
-            if let toml::Value::Integer(n) = value {
-                config.agents.max_live = *n as usize;
-            }
-        }
-        "agents.default_model" => {
-            if let toml::Value::String(s) = value {
-                config.agents.default_model = if s.is_empty() { None } else { Some(s.clone()) };
-            }
-        }
-        "agents.default_effort" => {
-            if let toml::Value::String(s) = value {
-                config.agents.default_effort = Effort::parse(s);
-            }
-        }
-        "agents.max_turns" => {
-            if let toml::Value::Integer(n) = value {
-                config.agents.max_turns = *n as u32;
-            }
-        }
-        "agents.todo_guard" => {
-            if let toml::Value::Boolean(b) = value {
-                config.agents.todo_guard = *b;
-            }
-        }
-        "agents.todo_guard_max_reminders" => {
-            if let toml::Value::Integer(n) = value {
-                config.agents.todo_guard_max_reminders = *n as u32;
-            }
-        }
-        "agents.ask_parent_timeout_secs" => {
-            if let toml::Value::Integer(n) = value {
-                config.agents.ask_parent_timeout_secs = *n as u64;
-            }
-        }
-        "agents.ask_parent_max" => {
-            if let toml::Value::Integer(n) = value {
-                config.agents.ask_parent_max = *n as u32;
+        "limits.max_provider_concurrency" => {
+            if let toml::Value::Integer(value) = value {
+                config.limits.max_provider_concurrency = *value as u32;
             }
         }
         "daemon.idle_timeout_secs" => {
@@ -800,6 +1155,12 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 config.permissions.allow_catastrophic = *b;
             }
         }
+        "permissions.explain_model" => {
+            if let toml::Value::String(s) = value {
+                config.permissions.explain_model =
+                    if s.is_empty() { None } else { Some(s.clone()) };
+            }
+        }
         "mcp.sampling" => {
             if let toml::Value::Boolean(b) = value {
                 config.mcp.sampling = *b;
@@ -823,6 +1184,23 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "session.history_page" => {
             if let toml::Value::Integer(n) = value {
                 config.session.history_page = *n as u32;
+            }
+        }
+        "session.plan_reminders" => {
+            if let toml::Value::Boolean(b) = value {
+                config.session.plan_reminders = *b;
+            }
+        }
+        "session.plan_reminders_max" => {
+            if let toml::Value::Integer(n) = value {
+                config.session.plan_reminders_max = *n as u32;
+            }
+        }
+        "zdr" => {
+            if let toml::Value::String(s) = value
+                && let Some(m) = pacode_types::config::ZdrMode::parse(s)
+            {
+                config.zdr = m;
             }
         }
         "plugins.enabled" => {

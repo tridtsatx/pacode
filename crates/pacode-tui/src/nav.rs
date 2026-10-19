@@ -1,7 +1,7 @@
 //! Navigation helpers: agent selection, session slot switching, panel target changes, and rail navigation.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use pacode_types::{AgentId, Request};
+use pacode_types::AgentId;
 
 use crate::binding::Action as KeyAction;
 use crate::keys::Action;
@@ -56,6 +56,7 @@ pub fn switch_to_session_slot(state: &mut AppState, slot_idx: usize) -> Vec<Acti
         return vec![];
     }
 
+    let cwd = state.cwd();
     state.leave_active_slot();
     state.active_slot = slot_idx;
 
@@ -65,7 +66,7 @@ pub fn switch_to_session_slot(state: &mut AppState, slot_idx: usize) -> Vec<Acti
         }
     } else {
         pacode_types::Attach::New {
-            cwd: state.cwd(),
+            cwd,
             model: None,
             effort: None,
             mode: None,
@@ -78,30 +79,23 @@ pub fn switch_to_session_slot(state: &mut AppState, slot_idx: usize) -> Vec<Acti
         pacode_types::Attach::Latest { .. } => "latest",
     };
     log::debug!("switch session slot to {slot_idx} (session: {session_id_str})");
+    state.begin_attach(attach.clone());
 
-    vec![
-        Action::Send(Request::Detach),
-        Action::Send(Request::Attach(attach)),
-    ]
+    vec![Action::SwitchSession { attach }]
 }
 
 pub fn overlay_name(o: &Overlay) -> &'static str {
     match o {
         Overlay::EffortPicker { .. } => "EffortPicker",
         Overlay::ModePicker { .. } => "ModePicker",
-        Overlay::ModelPicker { .. } => "ModelPicker",
-        Overlay::LoginPicker { .. } => "LoginPicker",
-        Overlay::SessionPicker { .. } => "SessionPicker",
-        Overlay::Files { .. } => "Files",
-        Overlay::RailOverlay => "RailOverlay",
-        Overlay::Help => "Help",
-        Overlay::Import(_) => "Import",
-        Overlay::McpPicker { .. } => "McpPicker",
-        Overlay::PluginsPicker { .. } => "PluginsPicker",
-        Overlay::KeysPicker { .. } => "KeysPicker",
+        Overlay::RailOverlay { .. } => "RailOverlay",
         Overlay::ThemePicker { .. } => "ThemePicker",
-        Overlay::ConfigPicker => "ConfigPicker",
-        Overlay::QuestionPicker { .. } => "QuestionPicker",
+        Overlay::QuestionPicker => "QuestionPicker",
+        Overlay::Analyze { .. } => "Analyze",
+        Overlay::Settings { .. } => "Settings",
+        Overlay::ModelPalette { .. } => "ModelPalette",
+        // The level on screen names the menu in the log (§3.1).
+        Overlay::Menu { stack, .. } => stack.current().map_or("Menu", |l| l.id.title()),
     }
 }
 
@@ -122,18 +116,22 @@ pub fn handle_esc(state: &mut AppState) -> Vec<Action> {
         Focus::Panel { .. } => {
             state.focus = Focus::Normal;
             state.panel.target = None;
+            state.panel.diff = None;
         }
         Focus::SelectAgent { .. } => {
-            state.focus = Focus::Normal;
-        }
-        Focus::BgList { .. } => {
             state.focus = Focus::Normal;
         }
         Focus::Overlay(ref overlay) => {
             log::debug!("close overlay: {}", overlay_name(overlay));
             state.focus = Focus::Normal;
         }
-        Focus::Normal => {}
+        // An overlay opened over a panel closes back to `Normal` and leaves
+        // the panel on screen (layout keeps it while `panel.target` is set):
+        // the next esc closes it, as it would from `Focus::Panel`.
+        Focus::Normal => {
+            state.panel.target = None;
+            state.panel.diff = None;
+        }
     }
     vec![]
 }
@@ -181,11 +179,14 @@ pub fn handle_follow(state: &mut AppState) -> Vec<Action> {
             };
         }
         Focus::Panel {
-            target: PanelTarget::Task(_),
+            target:
+                PanelTarget::Task(_)
+                | PanelTarget::McpServer(_)
+                | PanelTarget::FileDiff { .. }
+                | PanelTarget::CommitDiff { .. },
             ..
         }
         | Focus::Normal
-        | Focus::BgList { .. }
         | Focus::Overlay(_) => {}
     }
     vec![]
@@ -199,32 +200,36 @@ pub fn handle_navigate_down(state: &mut AppState) -> Vec<Action> {
                 *index = (*index + 1) % agents.len();
             }
         }
-        Focus::BgList { index } => {
-            let count = state.rail.tasks.len();
-            if count > 0 && *index + 1 < count {
-                *index += 1;
-            }
-        }
-        Focus::Overlay(Overlay::ModelPicker { index, .. })
-        | Focus::Overlay(Overlay::LoginPicker { index, .. })
-        | Focus::Overlay(Overlay::EffortPicker { index })
-        | Focus::Overlay(Overlay::SessionPicker { index, .. }) => {
+        Focus::Overlay(Overlay::EffortPicker { index }) => {
             *index += 1;
         }
+        // The page scrolls, and its length is only known once its rows are
+        // built — so the key asks the page rather than guessing a bound.
+        Focus::Overlay(Overlay::Analyze { .. }) => {
+            // The geometry is read before the mutable borrow, because the view
+            // lives inside the focus this match is holding.
+            let (rows, visible) = state.analyze_geometry();
+            if let Focus::Overlay(Overlay::Analyze { view }) = &mut state.focus {
+                view.scroll_by(1, rows, visible);
+            }
+        }
+
         Focus::Normal
         | Focus::Panel { .. }
         | Focus::Overlay(
-            Overlay::Files { .. }
-            | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker
-            | Overlay::QuestionPicker { .. }
-            | Overlay::McpPicker { .. }
-            | Overlay::PluginsPicker { .. }
-            | Overlay::Import(_)
-            | Overlay::RailOverlay
-            | Overlay::Help
+            Overlay::ModePicker { .. }
+            | Overlay::QuestionPicker
+            | Overlay::RailOverlay { .. }
             | Overlay::ThemePicker { .. }
-            | Overlay::KeysPicker { .. },
+            // The settings page scrolls with its own keys, and a global
+            // navigate must not turn that into "select the first agent".
+            | Overlay::Settings { .. }
+            // The palette moves its own cursor, so a global navigate must not
+            // turn that into "select the first agent".
+            | Overlay::ModelPalette { .. }
+            // Unreachable — an open menu intercepts keys before `nav` — but
+            // the match stays exhaustive.
+            | Overlay::Menu { .. },
         ) => {
             // Anywhere -> select first agent
             if !agents.is_empty() {
@@ -243,37 +248,29 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
                 *index = (*index + agents.len() - 1) % agents.len();
             }
         }
-        Focus::BgList { index } => {
-            if *index > 0 {
-                *index -= 1;
-            }
-        }
-        Focus::Overlay(Overlay::ModelPicker { index, .. })
-        | Focus::Overlay(Overlay::LoginPicker { index, .. })
-        | Focus::Overlay(Overlay::EffortPicker { index })
-        | Focus::Overlay(Overlay::SessionPicker { index, .. })
-            if *index > 0 =>
-        {
+        Focus::Overlay(Overlay::EffortPicker { index }) if *index > 0 => {
             *index -= 1;
         }
+        Focus::Overlay(Overlay::Analyze { .. }) => {
+            let (rows, visible) = state.analyze_geometry();
+            if let Focus::Overlay(Overlay::Analyze { view }) = &mut state.focus {
+                view.scroll_by(-1, rows, visible);
+            }
+        }
+        // The settings page scrolls with its own keys; a global navigate
+        // must not turn that into "select the first agent".
+        Focus::Overlay(Overlay::Settings { .. }) => {}
+        // And the palette owns its cursor, for the same reason.
+        Focus::Overlay(Overlay::ModelPalette { .. }) => {}
         Focus::Normal
         | Focus::Panel { .. }
         | Focus::Overlay(
-            Overlay::ModelPicker { .. }
-            | Overlay::LoginPicker { .. }
-            | Overlay::EffortPicker { .. }
-            | Overlay::SessionPicker { .. }
-            | Overlay::Files { .. }
+            Overlay::EffortPicker { .. }
             | Overlay::ModePicker { .. }
-            | Overlay::ConfigPicker
-            | Overlay::QuestionPicker { .. }
-            | Overlay::McpPicker { .. }
-            | Overlay::PluginsPicker { .. }
-            | Overlay::Import(_)
-            | Overlay::RailOverlay
-            | Overlay::Help
+            | Overlay::QuestionPicker
+            | Overlay::RailOverlay { .. }
             | Overlay::ThemePicker { .. }
-            | Overlay::KeysPicker { .. },
+            | Overlay::Menu { .. },
         ) => {}
     }
     vec![]
@@ -282,6 +279,30 @@ pub fn handle_navigate_up(state: &mut AppState) -> Vec<Action> {
 pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
     let in_panel = matches!(state.focus, Focus::Panel { .. });
     if in_panel {
+        // The MCP log and file-diff panels have no transcript —
+        // `panel.scroll` is the offset from the tail (ui::panel); a diff
+        // opens at `usize::MAX`, pinning its head.
+        if matches!(
+            state.focus,
+            Focus::Panel {
+                target: PanelTarget::McpServer(_)
+                    | PanelTarget::FileDiff { .. }
+                    | PanelTarget::CommitDiff { .. }
+                    | PanelTarget::Task(_),
+                ..
+            }
+        ) {
+            if action == KeyAction::ScrollUp {
+                state.panel.scroll = state.panel.scroll.saturating_add(10);
+            } else if action == KeyAction::ScrollDown {
+                state.panel.scroll = state.panel.scroll.saturating_sub(10);
+            } else if action == KeyAction::ScrollTop {
+                state.panel.scroll = usize::MAX;
+            } else if action == KeyAction::ScrollBottom {
+                state.panel.scroll = 0;
+            }
+            return vec![];
+        }
         if let Focus::Panel {
             ref mut follow_paused,
             follow: true,
@@ -313,6 +334,11 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ClearInput
             | KeyAction::DeleteWordForward
             | KeyAction::DeleteWordBack
+            | KeyAction::MoveWordLeft
+            | KeyAction::MoveWordRight
+            | KeyAction::MoveStart
+            | KeyAction::MoveEnd
+            | KeyAction::DeleteLine
             | KeyAction::StopAgent
             | KeyAction::KillTask
             | KeyAction::CycleMode
@@ -340,7 +366,20 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ClearQueue
             | KeyAction::PasteImage
             | KeyAction::PasteClipboard
-            | KeyAction::RailOverlay => {}
+            | KeyAction::RailOverlay
+            | KeyAction::ToggleZdr
+            | KeyAction::ToggleLock
+            | KeyAction::Menu
+            | KeyAction::Help
+            | KeyAction::ExpandOutput
+            // Picker-scoped (§9.1): never reach the shared ladder — an open
+            // picker overlay swallows its keys before this dispatch.
+            | KeyAction::ModelPickerFavorite
+            | KeyAction::ModelPickerZdr
+            | KeyAction::ModelPickerRefresh
+            | KeyAction::ModelPickerKind
+            | KeyAction::ModelPickerAccount
+            | KeyAction::ModelPickerLogout => {}
         }
     } else {
         match action {
@@ -360,6 +399,11 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ClearInput
             | KeyAction::DeleteWordForward
             | KeyAction::DeleteWordBack
+            | KeyAction::MoveWordLeft
+            | KeyAction::MoveWordRight
+            | KeyAction::MoveStart
+            | KeyAction::MoveEnd
+            | KeyAction::DeleteLine
             | KeyAction::StopAgent
             | KeyAction::KillTask
             | KeyAction::CycleMode
@@ -387,7 +431,18 @@ pub fn handle_scroll(state: &mut AppState, action: KeyAction) -> Vec<Action> {
             | KeyAction::ClearQueue
             | KeyAction::PasteImage
             | KeyAction::PasteClipboard
-            | KeyAction::RailOverlay => {}
+            | KeyAction::RailOverlay
+            | KeyAction::ToggleZdr
+            | KeyAction::ToggleLock
+            | KeyAction::Menu
+            | KeyAction::Help
+            | KeyAction::ExpandOutput
+            | KeyAction::ModelPickerFavorite
+            | KeyAction::ModelPickerZdr
+            | KeyAction::ModelPickerRefresh
+            | KeyAction::ModelPickerKind
+            | KeyAction::ModelPickerAccount
+            | KeyAction::ModelPickerLogout => {}
         }
         if (action == KeyAction::ScrollUp || action == KeyAction::ScrollTop)
             && state.transcript.is_at_top()

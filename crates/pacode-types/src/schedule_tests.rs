@@ -1,7 +1,12 @@
 //! Tests for `crate::schedule`: schedule parsing, monitor normalization, summaries.
 
 use crate::ids::{CronJobId, MonitorId};
-use crate::schedule::{CronJob, CronSchedule, MonitorCondition, MonitorInfo, MonitorStatus};
+use crate::schedule::{
+    CRON_EXPR_MAX_CHARS, CRON_STATUS_MAX_CHARS, CronJob, CronSchedule, MAX_MONITOR_POLL_SECS,
+    MAX_TIMESTAMP_MS, MONITOR_COMMAND_MAX_CHARS, MONITOR_LABEL_MAX_CHARS, MONITOR_PATH_MAX_CHARS,
+    MONITOR_PATTERN_MAX_CHARS, MonitorCondition, MonitorInfo, MonitorStatus,
+};
+use crate::state::{LimitUnit, NAME_MAX_CHARS, TEXT_MAX_CHARS};
 
 #[test]
 fn cron_schedule_parse_interval_forms() {
@@ -331,6 +336,174 @@ fn an_interval_schedule_counts_from_the_previous_run() {
     assert_eq!(s.next_run_ms(1_000_000), Ok(1_090_000));
     // A zero interval is clamped to one second rather than firing forever.
     assert_eq!(CronSchedule::every(0).next_run_ms(0), Ok(1000));
+}
+
+#[test]
+fn an_interval_that_overflows_the_millisecond_range_saturates() {
+    let forever = CronSchedule::Every { secs: u64::MAX };
+    assert_eq!(forever.next_run_ms(0), Ok(u64::MAX));
+    assert_eq!(forever.next_run_ms(10_000), Ok(u64::MAX));
+    assert_eq!(
+        CronSchedule::Every {
+            secs: u64::MAX / 500
+        }
+        .next_run_ms(u64::MAX),
+        Ok(u64::MAX)
+    );
+    let run = forever.next_run_ms(10_000).expect("next run");
+    assert!(run > 10_000, "a wrapped run time would already be due");
+}
+
+#[test]
+fn a_run_time_from_beyond_the_searchable_range_is_clamped() {
+    let nightly = CronSchedule::cron("0 0 * * *");
+    let clamped = nightly.next_run_ms(u64::MAX).expect("next run");
+    let from_the_end = nightly.next_run_ms(MAX_TIMESTAMP_MS).expect("next run");
+    assert_eq!(clamped, from_the_end);
+    let five_years_ms = 366 * 86_400_000;
+    assert!(
+        clamped <= MAX_TIMESTAMP_MS.saturating_add(five_years_ms),
+        "{clamped}"
+    );
+}
+
+#[test]
+fn a_schedule_longer_than_the_parser_needs_is_refused() {
+    let long_expr = format!("0 0 * * * {}", "x".repeat(CRON_EXPR_MAX_CHARS));
+    assert!(long_expr.chars().count() > CRON_EXPR_MAX_CHARS);
+    assert_eq!(CronSchedule::parse(&long_expr), None);
+    assert_eq!(
+        CronSchedule::parse("0 0 * * *"),
+        Some(CronSchedule::cron("0 0 * * *"))
+    );
+    let long_interval = format!("every {}s", "9".repeat(CRON_EXPR_MAX_CHARS));
+    assert_eq!(CronSchedule::parse(&long_interval), None);
+}
+
+#[test]
+fn a_job_reports_every_field_it_holds_to_a_cap() {
+    assert!(job("nightly", CronSchedule::every(60)).validate().is_ok());
+
+    let mut over = job(&"n".repeat(NAME_MAX_CHARS + 1), CronSchedule::every(60));
+    assert_eq!(
+        over.validate().expect_err("overlong name").field,
+        "cron name"
+    );
+
+    over = job(
+        "nightly",
+        CronSchedule::cron("x".repeat(CRON_EXPR_MAX_CHARS + 1)),
+    );
+    assert_eq!(
+        over.validate().expect_err("overlong expression").field,
+        "cron expression"
+    );
+
+    over = job("nightly", CronSchedule::every(60));
+    over.prompt = "p".repeat(TEXT_MAX_CHARS + 1);
+    assert_eq!(
+        over.validate().expect_err("overlong prompt").field,
+        "cron prompt"
+    );
+
+    over = job("nightly", CronSchedule::every(60));
+    over.last_status = Some("s".repeat(CRON_STATUS_MAX_CHARS + 1));
+    assert_eq!(
+        over.validate().expect_err("overlong status").field,
+        "cron last status"
+    );
+}
+
+#[test]
+fn a_monitor_reports_every_field_it_holds_to_a_cap() {
+    let base = monitor(MonitorStatus::Watching, 0, None);
+    assert!(base.validate().is_ok());
+
+    let mut over = base.clone();
+    over.label = "l".repeat(MONITOR_LABEL_MAX_CHARS + 1);
+    assert_eq!(
+        over.validate().expect_err("overlong label").field,
+        "monitor label"
+    );
+
+    over = base.clone();
+    over.condition = MonitorCondition::CommandSucceeds {
+        command: "c".repeat(MONITOR_COMMAND_MAX_CHARS + 1),
+    };
+    assert_eq!(
+        over.validate().expect_err("overlong command").field,
+        "monitor command"
+    );
+
+    over = base.clone();
+    over.condition = MonitorCondition::ProcessGone {
+        pattern: "p".repeat(MONITOR_PATTERN_MAX_CHARS + 1),
+    };
+    assert_eq!(
+        over.validate().expect_err("overlong pattern").field,
+        "monitor pattern"
+    );
+
+    over = base.clone();
+    over.condition = MonitorCondition::FileMatches {
+        path: "p".repeat(MONITOR_PATH_MAX_CHARS + 1),
+        pattern: "DONE".into(),
+    };
+    assert_eq!(
+        over.validate().expect_err("overlong path").field,
+        "monitor path"
+    );
+}
+
+#[test]
+fn a_poll_interval_past_the_ceiling_is_a_mistyped_number() {
+    assert_eq!(
+        MonitorInfo::normalize_poll_interval(Some(MAX_MONITOR_POLL_SECS + 1)),
+        MAX_MONITOR_POLL_SECS
+    );
+    assert_eq!(
+        MonitorInfo::normalize_poll_interval(Some(u64::MAX)),
+        MAX_MONITOR_POLL_SECS
+    );
+
+    let over = MonitorInfo {
+        poll_interval_secs: u64::MAX,
+        ..monitor(MonitorStatus::Watching, 0, None)
+    };
+    let error = over.validate().expect_err("poll interval past the ceiling");
+    assert_eq!(error.field, "monitor poll interval");
+    assert_eq!(error.unit, LimitUnit::Seconds);
+
+    let stopped = MonitorInfo {
+        poll_interval_secs: u64::MAX,
+        ..monitor(MonitorStatus::Stopped, 0, None)
+    };
+    assert!(stopped.validate().is_ok());
+}
+
+#[test]
+fn a_poll_interval_that_overflows_saturates_to_a_time_in_the_future() {
+    let m = MonitorInfo {
+        poll_interval_secs: u64::MAX,
+        last_check_ms: Some(5_000),
+        ..monitor(MonitorStatus::Watching, 0, None)
+    };
+    assert_eq!(m.next_check_at_ms(), Some(u64::MAX));
+    assert_eq!(m.next_check_in_ms(5_000), Some(u64::MAX - 5_000));
+}
+
+fn job(name: &str, schedule: CronSchedule) -> CronJob {
+    CronJob {
+        id: CronJobId::new("cron_1"),
+        name: name.to_string(),
+        schedule,
+        prompt: "run the suite".to_string(),
+        enabled: true,
+        created_at_ms: 0,
+        last_run_ms: None,
+        next_run_ms: None,
+        last_status: None,
+    }
 }
 
 #[test]

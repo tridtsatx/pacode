@@ -1,0 +1,20 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::CSharp, src)"
+---
+module App.Core 3-21
+  const Top 4-4
+  class Widget 6-14
+    const Max 7-7
+    method Widget 9-9
+    method Widget 10-10
+    method Draw 11-11
+    method Calc 12-12
+    method operator 13-13
+  struct S 16-16
+  interface IRepo 17-17
+    method Save 17-17
+  enum Color 18-18
+  type Callback 19-19
+  class Rec 20-20
+class F 23-23

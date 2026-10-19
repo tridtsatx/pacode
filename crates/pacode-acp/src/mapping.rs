@@ -1,8 +1,6 @@
 //! Protocol mapping between pacode and ACP (Agent Client Protocol) v1.
 
-use std::collections::HashSet;
-
-use base64::Engine as _;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use agent_client_protocol::schema::v1::{
     Content, ContentBlock, ContentChunk, EmbeddedResourceResource, ImageContent, PermissionOption,
@@ -13,8 +11,10 @@ use agent_client_protocol::schema::v1::{
     ToolCall as AcpToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
     ToolCallUpdate as AcpToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
+use base64::Engine;
 use pacode_types::Attachment;
 use pacode_types::ids::SessionId as PacodeSessionId;
+use pacode_types::message::ImageSource;
 use pacode_types::protocol::{Event, TurnStop};
 use pacode_types::state::{Mode, PermissionDecision, PermissionRequest, Plan, PlanStatus};
 use pacode_types::transcript::{ToolStatus, TranscriptItem, TranscriptKind};
@@ -87,18 +87,21 @@ pub fn plan_to_acp(plan: &Plan) -> AcpPlan {
     AcpPlan::new(entries)
 }
 
+/// One-line description of a pacode `Mode`, shared by the legacy mode picker
+/// (`mode_to_session_mode`) and the config-option "mode" select so both
+/// surfaces always show identical texts.
+pub fn mode_description(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Build => "ask before edits and non-trivial commands",
+        Mode::Auto => "auto-accept edits and low-risk commands",
+        Mode::Plan => "read-only tools and planning",
+        Mode::Bypass => "bypass permissions except catastrophic deny",
+    }
+}
+
 /// Converts a pacode `Mode` to an ACP `SessionMode`.
 pub fn mode_to_session_mode(mode: Mode) -> SessionMode {
-    match mode {
-        Mode::Build => SessionMode::new("build", "Build")
-            .description("ask before edits and non-trivial commands"),
-        Mode::Auto => {
-            SessionMode::new("auto", "Auto").description("auto-accept edits and low-risk commands")
-        }
-        Mode::Plan => SessionMode::new("plan", "Plan").description("read-only tools and planning"),
-        Mode::Bypass => SessionMode::new("bypass", "Bypass")
-            .description("bypass permissions except catastrophic deny"),
-    }
+    SessionMode::new(mode.as_str(), mode.label()).description(mode_description(mode))
 }
 
 /// Builds the full `SessionModeState` for an ACP session given the current pacode mode.
@@ -113,11 +116,11 @@ pub fn modes_state(current_mode: Mode) -> SessionModeState {
 }
 
 /// Maps pacode `TurnStop` to ACP `StopReason`.
-pub fn turn_stop_to_stop_reason(stop: &TurnStop) -> AcpStopReason {
+pub fn turn_stop_to_stop_reason(stop: &TurnStop) -> Result<AcpStopReason, String> {
     match stop {
-        TurnStop::Completed => AcpStopReason::EndTurn,
-        TurnStop::Interrupted => AcpStopReason::Cancelled,
-        TurnStop::Failed { .. } => AcpStopReason::EndTurn,
+        TurnStop::Completed => Ok(AcpStopReason::EndTurn),
+        TurnStop::Interrupted => Ok(AcpStopReason::Cancelled),
+        TurnStop::Failed { message } => Err(message.clone()),
     }
 }
 
@@ -170,11 +173,50 @@ pub fn permission_response_to_decision(response: &RequestPermissionResponse) -> 
     }
 }
 
+const MAPPING_RETENTION_LIMIT: usize = 1024;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ToolView {
+    name: String,
+    title: String,
+    preview: String,
+}
+
+fn tool_view(kind: &TranscriptKind) -> ToolView {
+    match kind {
+        TranscriptKind::ToolCall {
+            name,
+            title,
+            preview,
+            ..
+        } => ToolView {
+            name: name.clone(),
+            title: title.clone(),
+            preview: preview.clone(),
+        },
+        TranscriptKind::User { .. }
+        | TranscriptKind::Assistant { .. }
+        | TranscriptKind::Reasoning { .. }
+        | TranscriptKind::Notice { .. }
+        | TranscriptKind::Permission(_)
+        | TranscriptKind::Question { .. }
+        | TranscriptKind::BashCommand { .. }
+        | TranscriptKind::Images { .. }
+        | TranscriptKind::AgentMessage { .. } => ToolView::default(),
+    }
+}
+
 /// Tracks streaming state for a prompt turn to avoid duplicate chunks on item updates.
 #[derive(Debug, Default)]
 pub struct MappingState {
-    /// Item sequence numbers that have been streamed via deltas.
-    pub streamed_items: HashSet<u64>,
+    pub streamed_items: HashMap<u64, String>,
+    completed_items: HashSet<u64>,
+    replayed_items: HashSet<u64>,
+    tool_statuses: HashMap<u64, ToolStatus>,
+    tool_views: HashMap<u64, ToolView>,
+    retained_items: HashSet<u64>,
+    retention_order: VecDeque<u64>,
+    replayed_floor: u64,
 }
 
 impl MappingState {
@@ -184,6 +226,318 @@ impl MappingState {
 
     pub fn clear(&mut self) {
         self.streamed_items.clear();
+        self.completed_items.clear();
+        self.replayed_items.clear();
+        self.tool_statuses.clear();
+        self.tool_views.clear();
+        self.retained_items.clear();
+        self.retention_order.clear();
+        self.replayed_floor = 0;
+    }
+
+    pub fn finish_turn(&mut self) {
+        self.streamed_items
+            .retain(|item_seq, _| !self.completed_items.contains(item_seq));
+    }
+
+    fn retired(&self, item_seq: u64) -> bool {
+        item_seq <= self.replayed_floor
+    }
+
+    fn track_item(&mut self, item_seq: u64) {
+        if self.retired(item_seq) {
+            return;
+        }
+        if self.retained_items.insert(item_seq) {
+            self.retention_order.push_back(item_seq);
+        }
+        while self.retention_order.len() > MAPPING_RETENTION_LIMIT {
+            let Some(oldest) = self.retention_order.pop_front() else {
+                break;
+            };
+            self.retained_items.remove(&oldest);
+            self.completed_items.remove(&oldest);
+            self.replayed_items.remove(&oldest);
+            self.tool_statuses.remove(&oldest);
+            self.tool_views.remove(&oldest);
+            self.streamed_items.remove(&oldest);
+            self.replayed_floor = self.replayed_floor.max(oldest);
+        }
+    }
+
+    pub fn seed_transcript(&mut self, floor: u64, items: &[(u64, String, bool)]) {
+        let seen = items.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>();
+        self.seed_transcript_with_seen(floor, items, &seen);
+    }
+
+    pub fn seed_transcript_with_seen(
+        &mut self,
+        _floor: u64,
+        items: &[(u64, String, bool)],
+        seen: &[u64],
+    ) {
+        for (seq, text, complete) in items {
+            if self.retired(*seq) {
+                continue;
+            }
+            self.track_item(*seq);
+            self.streamed_items.insert(*seq, text.clone());
+            if *complete {
+                self.completed_items.insert(*seq);
+                self.streamed_items.remove(seq);
+            } else {
+                self.completed_items.remove(seq);
+            }
+        }
+        for seq in seen {
+            self.mark_item_replayed(*seq);
+        }
+    }
+
+    pub fn seed_tool_statuses(&mut self, statuses: &[(u64, ToolStatus)]) {
+        for (seq, status) in statuses {
+            if self.retired(*seq) {
+                continue;
+            }
+            self.track_item(*seq);
+            self.tool_statuses.insert(*seq, *status);
+        }
+    }
+
+    pub fn replay_transcript(
+        &mut self,
+        items: &[TranscriptItem],
+    ) -> Result<Vec<SessionUpdate>, String> {
+        let mut updates = Vec::new();
+        for item in items {
+            updates.extend(self.replay_transcript_item(item)?);
+        }
+        Ok(updates)
+    }
+
+    pub(crate) fn replay_transcript_item(
+        &mut self,
+        item: &TranscriptItem,
+    ) -> Result<Vec<SessionUpdate>, String> {
+        if !item.agent.is_main() || self.retired(item.seq) {
+            return Ok(Vec::new());
+        }
+        let is_new = !self.replayed_items.contains(&item.seq);
+        let updates = match &item.kind {
+            TranscriptKind::Assistant { text, complete } if *complete => {
+                self.validate_authoritative(item.seq, text)?;
+                final_item_update(self, item.seq, text, true, false)
+            }
+            TranscriptKind::Assistant { text, .. }
+                if is_new || !self.completed_items.contains(&item.seq) =>
+            {
+                self.replay_partial_text(item.seq, text, false)?
+            }
+            TranscriptKind::Reasoning { text, complete } if *complete => {
+                self.validate_authoritative(item.seq, text)?;
+                final_item_update(self, item.seq, text, true, true)
+            }
+            TranscriptKind::Reasoning { text, .. }
+                if is_new || !self.completed_items.contains(&item.seq) =>
+            {
+                self.replay_partial_text(item.seq, text, true)?
+            }
+            TranscriptKind::ToolCall { status, .. } => {
+                self.track_item(item.seq);
+                let status_changed = self.tool_statuses.insert(item.seq, *status) != Some(*status);
+                let view = tool_view(&item.kind);
+                let view_changed = self.tool_views.get(&item.seq) != Some(&view);
+                self.tool_views.insert(item.seq, view);
+                if is_new {
+                    transcript_item_to_session_updates(item)
+                } else if status_changed || view_changed {
+                    tool_call_update(item)
+                } else {
+                    Vec::new()
+                }
+            }
+            _ if is_new => transcript_item_to_session_updates(item),
+            _ => Vec::new(),
+        };
+        self.mark_item_replayed(item.seq);
+        self.remember_item(item);
+        Ok(updates)
+    }
+
+    fn validate_authoritative(&self, item_seq: u64, authoritative: &str) -> Result<(), String> {
+        if self.completed_items.contains(&item_seq) {
+            return Ok(());
+        }
+        if self
+            .streamed_items
+            .get(&item_seq)
+            .is_some_and(|streamed| !authoritative.starts_with(streamed.as_str()))
+        {
+            return Err(format!(
+                "authoritative transcript item {item_seq} diverges from the ACP v1 prefix"
+            ));
+        }
+        Ok(())
+    }
+
+    fn replay_partial_text(
+        &mut self,
+        item_seq: u64,
+        authoritative: &str,
+        reasoning: bool,
+    ) -> Result<Vec<SessionUpdate>, String> {
+        if self.retired(item_seq) || self.completed_items.contains(&item_seq) {
+            return Ok(Vec::new());
+        }
+        self.track_item(item_seq);
+        self.validate_authoritative(item_seq, authoritative)?;
+        let suffix = self
+            .streamed_items
+            .get(&item_seq)
+            .map_or(authoritative, |streamed| &authoritative[streamed.len()..]);
+        self.streamed_items
+            .insert(item_seq, authoritative.to_owned());
+        if suffix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let content = ContentChunk::new(ContentBlock::Text(TextContent::new(suffix.to_owned())));
+        Ok(if reasoning {
+            vec![SessionUpdate::AgentThoughtChunk(content)]
+        } else {
+            vec![SessionUpdate::AgentMessageChunk(content)]
+        })
+    }
+
+    pub fn remember_item(&mut self, item: &TranscriptItem) {
+        if !item.agent.is_main() || self.retired(item.seq) {
+            return;
+        }
+        self.remember_tool_call(item);
+        self.track_item(item.seq);
+        let (text, complete) = match &item.kind {
+            TranscriptKind::Assistant { text, complete }
+            | TranscriptKind::Reasoning { text, complete } => (text, *complete),
+            _ => return,
+        };
+        if complete {
+            self.completed_items.insert(item.seq);
+            return;
+        }
+        self.completed_items.remove(&item.seq);
+        self.streamed_items.insert(item.seq, text.clone());
+    }
+
+    pub(crate) fn remember_tool_call(&mut self, item: &TranscriptItem) {
+        if !item.agent.is_main() || self.retired(item.seq) {
+            return;
+        }
+        let TranscriptKind::ToolCall { status, .. } = &item.kind else {
+            return;
+        };
+        self.track_item(item.seq);
+        self.tool_statuses.insert(item.seq, *status);
+        self.tool_views.insert(item.seq, tool_view(&item.kind));
+    }
+
+    fn mark_item_replayed(&mut self, item_seq: u64) {
+        if self.retired(item_seq) {
+            return;
+        }
+        self.track_item(item_seq);
+        self.replayed_items.insert(item_seq);
+    }
+
+    fn record_delta(&mut self, item_seq: u64, text: &str) -> bool {
+        if self.retired(item_seq) || self.completed_items.contains(&item_seq) {
+            return false;
+        }
+        self.mark_item_replayed(item_seq);
+        self.streamed_items
+            .entry(item_seq)
+            .or_default()
+            .push_str(text);
+        true
+    }
+
+    fn take_final_text(&mut self, item_seq: u64, authoritative: &str) -> Option<String> {
+        if self.retired(item_seq) || self.completed_items.contains(&item_seq) {
+            return None;
+        }
+        self.track_item(item_seq);
+        let (prefix_matches, suffix) = self.streamed_items.get(&item_seq).map_or(
+            (
+                true,
+                (!authoritative.is_empty()).then(|| authoritative.to_owned()),
+            ),
+            |streamed| {
+                let matches = authoritative.starts_with(streamed.as_str());
+                let suffix = if matches && authoritative.len() > streamed.len() {
+                    Some(authoritative[streamed.len()..].to_owned())
+                } else {
+                    None
+                };
+                (matches, suffix)
+            },
+        );
+        self.completed_items.insert(item_seq);
+        if !prefix_matches {
+            self.streamed_items
+                .insert(item_seq, authoritative.to_owned());
+            return None;
+        }
+        self.streamed_items.remove(&item_seq);
+        suffix
+    }
+}
+
+fn tool_call_update(item: &TranscriptItem) -> Vec<SessionUpdate> {
+    let TranscriptKind::ToolCall {
+        call_id,
+        status,
+        preview,
+        name,
+        title,
+        ..
+    } = &item.kind
+    else {
+        return Vec::new();
+    };
+    let tool_status = tool_status_to_acp(*status);
+    let mut content = Vec::new();
+    if !preview.is_empty() {
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(preview.clone()),
+        ))));
+    }
+    let fields = ToolCallUpdateFields::new()
+        .kind(tool_kind_from_name(name))
+        .title(title.clone())
+        .status(tool_status)
+        .content(content);
+    vec![SessionUpdate::ToolCallUpdate(AcpToolCallUpdate::new(
+        ToolCallId::new(call_id.as_str()),
+        fields,
+    ))]
+}
+
+fn final_item_update(
+    state: &mut MappingState,
+    item_seq: u64,
+    text: &str,
+    complete: bool,
+    reasoning: bool,
+) -> Vec<SessionUpdate> {
+    if !complete {
+        return Vec::new();
+    }
+    let Some(text) = state.take_final_text(item_seq, text) else {
+        return Vec::new();
+    };
+    let content = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+    if reasoning {
+        vec![SessionUpdate::AgentThoughtChunk(content)]
+    } else {
+        vec![SessionUpdate::AgentMessageChunk(content)]
     }
 }
 
@@ -191,13 +545,29 @@ impl MappingState {
 ///
 /// Unmapped events (toasts, plugins, agent metadata, etc.) return an empty `Vec` cleanly.
 pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<SessionUpdate> {
+    if let Event::TextDelta { agent, .. } | Event::ReasoningDelta { agent, .. } = event
+        && !agent.is_main()
+    {
+        return Vec::new();
+    }
+    if let Event::ItemAdded(item) | Event::ItemUpdated(item) = event
+        && !item.agent.is_main()
+    {
+        return Vec::new();
+    }
+    if let Event::ItemAdded(item) | Event::ItemUpdated(item) = event {
+        state.mark_item_replayed(item.seq);
+        state.remember_tool_call(item);
+    }
     match event {
         Event::TextDelta {
             item_seq,
             text,
             agent: _,
         } => {
-            state.streamed_items.insert(*item_seq);
+            if !state.record_delta(*item_seq, text) {
+                return Vec::new();
+            }
             vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
                 ContentBlock::Text(TextContent::new(text.clone())),
             ))]
@@ -207,7 +577,9 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
             text,
             agent: _,
         } => {
-            state.streamed_items.insert(*item_seq);
+            if !state.record_delta(*item_seq, text) {
+                return Vec::new();
+            }
             vec![SessionUpdate::AgentThoughtChunk(ContentChunk::new(
                 ContentBlock::Text(TextContent::new(text.clone())),
             ))]
@@ -237,22 +609,10 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
                 )]
             }
             TranscriptKind::Assistant { text, complete } => {
-                if *complete && !text.is_empty() && !state.streamed_items.contains(&item.seq) {
-                    vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                        ContentBlock::Text(TextContent::new(text.clone())),
-                    ))]
-                } else {
-                    vec![]
-                }
+                final_item_update(state, item.seq, text, *complete, false)
             }
             TranscriptKind::Reasoning { text, complete } => {
-                if *complete && !text.is_empty() && !state.streamed_items.contains(&item.seq) {
-                    vec![SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                        ContentBlock::Text(TextContent::new(text.clone())),
-                    ))]
-                } else {
-                    vec![]
-                }
+                final_item_update(state, item.seq, text, *complete, true)
             }
             TranscriptKind::BashCommand {
                 command,
@@ -279,7 +639,8 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
             | TranscriptKind::Images { .. }
             | TranscriptKind::Notice { .. }
             | TranscriptKind::Permission(_)
-            | TranscriptKind::Question { .. } => vec![],
+            | TranscriptKind::Question { .. }
+            | TranscriptKind::AgentMessage { .. } => vec![],
         },
         Event::ItemUpdated(item) => match &item.kind {
             TranscriptKind::ToolCall {
@@ -309,32 +670,26 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
                 ))]
             }
             TranscriptKind::Assistant { text, complete } => {
-                if *complete && !text.is_empty() && !state.streamed_items.contains(&item.seq) {
-                    vec![SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                        ContentBlock::Text(TextContent::new(text.clone())),
-                    ))]
-                } else {
-                    vec![]
-                }
+                final_item_update(state, item.seq, text, *complete, false)
             }
             TranscriptKind::Reasoning { text, complete } => {
-                if *complete && !text.is_empty() && !state.streamed_items.contains(&item.seq) {
-                    vec![SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                        ContentBlock::Text(TextContent::new(text.clone())),
-                    ))]
-                } else {
-                    vec![]
-                }
+                final_item_update(state, item.seq, text, *complete, true)
             }
             TranscriptKind::BashCommand { .. }
             | TranscriptKind::User { .. }
             | TranscriptKind::Images { .. }
             | TranscriptKind::Notice { .. }
             | TranscriptKind::Permission(_)
-            | TranscriptKind::Question { .. } => vec![],
+            | TranscriptKind::Question { .. }
+            | TranscriptKind::AgentMessage { .. } => vec![],
         },
         Event::PlanUpdated(plan) => {
             vec![SessionUpdate::Plan(plan_to_acp(plan))]
+        }
+        // ACP has no way to retract transcript it already streamed; the plan
+        // is the one piece of state a client keeps from us that a clear empties.
+        Event::ContextCleared => {
+            vec![SessionUpdate::Plan(plan_to_acp(&Plan::default()))]
         }
         Event::SessionUpdated(meta) => {
             vec![SessionUpdate::CurrentModeUpdate(
@@ -359,17 +714,27 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
                 vec![]
             }
         }
-        Event::TurnEnded { .. } => {
-            state.clear();
+        Event::TurnEnded { agent, .. } if agent.is_main() => {
+            state.finish_turn();
             vec![]
         }
+        Event::TurnEnded { .. } => vec![],
         Event::TurnStarted { .. }
         | Event::PermissionRequested(_)
         | Event::PermissionResolved { .. }
+        // The explanation is a display hint attached to a pending permission;
+        // ACP has no channel for it and the prompt itself is already a
+        // `session/request_permission` round-trip.
+        | Event::PermissionExplained { .. }
         | Event::AgentAdded(_)
         | Event::AgentUpdated(_)
         | Event::TaskAdded(_)
         | Event::TaskUpdated(_)
+        // A running call's output belongs to the tool cell ACP already got as
+        // an item update when the call started; there is no ACP channel for
+        // "the row is still growing", and sending it as message chunks would
+        // put tool output into the assistant's transcript.
+        | Event::ToolOutput { .. }
         | Event::Toast { .. }
         | Event::DaemonShuttingDown
         | Event::PluginToast { .. }
@@ -387,12 +752,21 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         | Event::LoginProgress { .. }
         | Event::AuthUpdated(_)
         // Connection-level repair signal for stateful clients; ACP keeps no mirror.
-        | Event::Resync { .. } => vec![],
+        | Event::Resync { .. }
+        // The model catalog is ACP `list_models` request data, not a session update.
+        | Event::ModelsUpdated { .. }
+        // The slot badge and the notice-lock badge are pacode client concerns;
+        // ACP sessions are driven one at a time and have no footer chrome.
+        | Event::SessionStatus { .. }
+        | Event::NoticeLockChanged { .. } => vec![],
     }
 }
 
 /// Converts a static `TranscriptItem` into ACP session updates (used during history replay).
 pub fn transcript_item_to_session_updates(item: &TranscriptItem) -> Vec<SessionUpdate> {
+    if !item.agent.is_main() {
+        return Vec::new();
+    }
     match &item.kind {
         TranscriptKind::User { text } => {
             vec![SessionUpdate::UserMessageChunk(ContentChunk::new(
@@ -476,7 +850,9 @@ pub fn transcript_item_to_session_updates(item: &TranscriptItem) -> Vec<SessionU
                 )))
             })
             .collect(),
-        TranscriptKind::Permission(_) | TranscriptKind::Question { .. } => vec![],
+        TranscriptKind::Permission(_)
+        | TranscriptKind::Question { .. }
+        | TranscriptKind::AgentMessage { .. } => vec![],
     }
 }
 
@@ -496,16 +872,46 @@ pub fn prompt_content_to_attachments(prompt: &[ContentBlock]) -> Vec<Attachment>
         .collect()
 }
 
-/// Extracts plain prompt text from ACP prompt content blocks.
+/// Extracts plain prompt text from ACP prompt content blocks (images are left
+/// out; see [`prompt_content_to_parts`]).
 pub fn prompt_content_to_text(prompt: &[ContentBlock]) -> String {
+    prompt_content_to_parts(prompt).0
+}
+
+/// Base64 length cap for one image block, matching the TUI's 20 MiB paste
+/// limit (`IMAGE_PASTE_MAX_BYTES`) after decoding — 4/3 ratio plus padding.
+/// Checked before decoding so an oversized payload never allocates the
+/// decoded buffer.
+const MAX_IMAGE_B64_LEN: usize = 20 * 1024 * 1024 * 4 / 3 + 8;
+
+/// Extracts prompt text and attached images from ACP prompt content blocks.
+///
+/// Text blocks, embedded text resources and resource links fold into one
+/// string; `Image` blocks decode into `ImageSource::Bytes`. An image that
+/// fails base64 decoding or exceeds the size cap degrades to a text
+/// placeholder rather than failing the whole prompt.
+pub fn prompt_content_to_parts(prompt: &[ContentBlock]) -> (String, Vec<ImageSource>) {
     let mut text_parts = Vec::new();
+    let mut images = Vec::new();
     for block in prompt {
         match block {
             ContentBlock::Text(t) => {
                 text_parts.push(t.text.clone());
             }
-            // Images travel as attachments, see `prompt_content_to_attachments`.
-            ContentBlock::Image(_) => {}
+            ContentBlock::Image(img) => {
+                let mime = &img.mime_type;
+                if img.data.len() > MAX_IMAGE_B64_LEN {
+                    text_parts.push(format!("[image: {mime}, too large]"));
+                } else {
+                    match base64::engine::general_purpose::STANDARD.decode(&img.data) {
+                        Ok(data) => images.push(ImageSource::Bytes {
+                            mime: mime.clone(),
+                            data,
+                        }),
+                        Err(_) => text_parts.push(format!("[image: {mime}, undecodable]")),
+                    }
+                }
+            }
             ContentBlock::Audio(_) => {}
             ContentBlock::Resource(r) => match &r.resource {
                 EmbeddedResourceResource::TextResourceContents(t) => {
@@ -526,7 +932,7 @@ pub fn prompt_content_to_text(prompt: &[ContentBlock]) -> String {
             _ => {}
         }
     }
-    text_parts.join("")
+    (text_parts.join(""), images)
 }
 
 #[cfg(test)]

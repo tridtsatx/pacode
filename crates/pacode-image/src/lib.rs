@@ -10,6 +10,7 @@ pub mod iterm2;
 pub mod kitty;
 pub mod prepare;
 pub mod render;
+pub mod sixel;
 pub mod store;
 
 pub use detect::{GraphicsProtocol, detect, detect_from};
@@ -21,3 +22,4 @@ pub use prepare::{MAX_IMAGES, PrepareError, Prepared, prepare};
 pub use render::{
     ImageError, MAX_FILE_SIZE, MAX_IMAGE_HEIGHT, MAX_IMAGE_WIDTH, Preview, PreviewRequest, render,
 };
+pub use sixel::{encode_sixel, encode_sixel_rgba};

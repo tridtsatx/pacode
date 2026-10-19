@@ -23,13 +23,13 @@ fn format_bytes_units() {
 fn image_block_counts_fixed_tokens_not_payload() {
     let msg = Message::new(
         Role::User,
-        vec![ContentBlock::Image {
-            mime: "image/png".into(),
+        vec![ContentBlock::image(&ImageRef {
             hash: "ab".repeat(32),
-            source_path: None,
+            mime: "image/png".into(),
             width: Some(750),
             height: Some(750),
-        }],
+            name: None,
+        })],
     );
     assert_eq!(msg.estimate_tokens(), 750);
 }
@@ -44,13 +44,13 @@ fn old_history_without_image_blocks_deserializes() {
 
 #[test]
 fn image_block_roundtrip_omits_empty_optionals() {
-    let block = ContentBlock::Image {
-        mime: "image/jpeg".into(),
+    let block = ContentBlock::image(&ImageRef {
         hash: "cd".repeat(32),
-        source_path: None,
+        mime: "image/jpeg".into(),
         width: None,
         height: None,
-    };
+        name: None,
+    });
     let json = serde_json::to_value(&block).unwrap();
     assert_eq!(json["type"], "image");
     assert!(json.get("source_path").is_none());
@@ -62,7 +62,9 @@ fn image_block_roundtrip_omits_empty_optionals() {
 fn user_message_without_attachments_still_parses() {
     let req: Request = serde_json::from_str(r#"{"type":"user_message","text":"hello"}"#).unwrap();
     match req {
-        Request::UserMessage { text, attachments } => {
+        Request::UserMessage {
+            text, attachments, ..
+        } => {
             assert_eq!(text, "hello");
             assert!(attachments.is_empty());
         }
@@ -74,6 +76,8 @@ fn user_message_without_attachments_still_parses() {
 fn attachments_roundtrip_through_protocol() {
     let req = Request::UserMessage {
         text: "look".into(),
+        images: Vec::new(),
+        message_id: None,
         attachments: vec![Attachment {
             mime: "image/png".into(),
             data: "AAAA".into(),

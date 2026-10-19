@@ -53,11 +53,11 @@ pub fn complete(
 ) -> Vec<Candidate> {
     let mut results = Vec::new();
     let trimmed = input_after_bang.trim_start();
-    let prefix = if cursor <= input_after_bang.len() {
-        &input_after_bang[..cursor]
-    } else {
-        input_after_bang
-    };
+    let cursor_byte = input_after_bang
+        .char_indices()
+        .nth(cursor)
+        .map_or(input_after_bang.len(), |(offset, _)| offset);
+    let prefix = &input_after_bang[..cursor_byte];
 
     // Source 1: Previously executed bash commands matching prefix
     if !trimmed.is_empty() {

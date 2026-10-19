@@ -500,6 +500,43 @@ fn verb_flag_home_sweep() {
 }
 
 #[test]
+fn closed_bypasses_reach_the_gate() {
+    // Shell reading its program from stdin, writers into protected paths, and
+    // writing redirects to protected targets are all absolute denials.
+    for cmd in [
+        "sh <<EOF\nrm -rf ~\nEOF",
+        "cp evil ~/.ssh/authorized_keys",
+        "echo key >> ~/.ssh/authorized_keys",
+        "echo x &>> ~/.bashrc",
+        "ln -sf /etc/shadow ./leak",
+    ] {
+        assert_eq!(level(cmd), RiskLevel::Catastrophic, "{cmd:?}");
+        assert!(matches!(
+            gate(&assess(cmd), &none()),
+            GateOutcome::Deny { .. }
+        ));
+    }
+    // Env hooks, inline destructive code, and secret reads ask (Build/Auto).
+    for cmd in [
+        "GIT_SSH_COMMAND='touch /tmp/pwned' git fetch",
+        "cat ~/.ssh/id_rsa",
+        "printenv",
+        "python3 -c 'import os; os.system(\"rm x\")'",
+        "bash < /tmp/evil.sh",
+    ] {
+        assert_eq!(level(cmd), RiskLevel::Confirm, "{cmd:?}");
+        assert!(matches!(
+            gate(&assess(cmd), &none()),
+            GateOutcome::Reflect { .. }
+        ));
+    }
+    // Inline interpreter code without a destructive payload is Low — Build
+    // asks, Auto allows, and the gate lets it through on its own.
+    assert_eq!(level("node -e 'console.log(1)'"), RiskLevel::Low);
+    assert_eq!(gate(&assess("node -e 'x'"), &none()), GateOutcome::Allow);
+}
+
+#[test]
 fn garbage_input_is_handled_gracefully() {
     for cmd in ["", "   ", "'", "\\", ";;;", "&&", "rm -rf \"unterminated"] {
         let _ = assess(cmd);

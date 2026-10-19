@@ -21,6 +21,8 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 
 use crate::ProviderError;
+use crate::error_body::MAX_ERROR_BODY_BYTES;
+use crate::retry::{error_body_read_timeout, retry_after_from_response};
 
 /// Flag bit in Connect frame header indicating the trailer/end-of-stream message.
 pub const CONNECT_FLAG_END_STREAM: u8 = 0x02;
@@ -94,7 +96,7 @@ impl ConnectClient {
         let url = self.build_url(method);
         let req_builder = self.prepare_request(&url, "application/proto");
 
-        let response = req_builder
+        let mut response = req_builder
             .body(body.to_vec())
             .send()
             .await
@@ -103,8 +105,9 @@ impl ConnectClient {
         let status = response.status();
         if !status.is_success() {
             let status_u16 = status.as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(parse_connect_error(&text, status_u16));
+            return Err(read_connect_error(&mut response, status_u16, None)
+                .await
+                .error);
         }
 
         let bytes = response
@@ -123,24 +126,93 @@ impl ConnectClient {
         idle_timeout: Option<(Duration, u64)>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>, ProviderError>
     {
+        self.server_stream(method, body, idle_timeout)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn server_stream(
+        &self,
+        method: &str,
+        body: &[u8],
+        idle_timeout: Option<(Duration, u64)>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>, ConnectFailure>
+    {
         let url = self.build_url(method);
         let req_builder = self.prepare_request(&url, "application/connect+proto");
 
         let framed_body = encode_connect_frame(0x00, body);
-        let response = req_builder
-            .body(framed_body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let send = req_builder.body(framed_body).send();
+        // Bound the wait for response headers with the same idle budget the body
+        // phase uses; `None` leaves the wait unbounded (idle timeout disabled).
+        let response = match idle_timeout {
+            Some((wait, secs)) => match tokio::time::timeout(wait, send).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(err)) => {
+                    return Err(ConnectFailure::new(ProviderError::Transport(
+                        err.to_string(),
+                    )));
+                }
+                Err(_) => {
+                    log::warn!("connect request: no response headers within {secs}s");
+                    return Err(ConnectFailure::new(ProviderError::IdleTimeout(secs)));
+                }
+            },
+            None => match send.await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    return Err(ConnectFailure::new(ProviderError::Transport(
+                        err.to_string(),
+                    )));
+                }
+            },
+        };
 
         let status = response.status();
         if !status.is_success() {
             let status_u16 = status.as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(parse_connect_error(&text, status_u16));
+            let mut response = response;
+            let failure =
+                read_connect_error(&mut response, status_u16, idle_timeout.map(|(w, _)| w)).await;
+            return Err(failure);
         }
 
         Ok(decode_response_stream(response, idle_timeout))
+    }
+}
+
+pub(crate) struct ConnectFailure {
+    pub(crate) error: ProviderError,
+    pub(crate) retry_after: Option<Duration>,
+}
+
+impl ConnectFailure {
+    fn new(error: ProviderError) -> Self {
+        Self {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+async fn read_connect_error(
+    response: &mut reqwest::Response,
+    status: u16,
+    idle_wait: Option<Duration>,
+) -> ConnectFailure {
+    let retry_after = retry_after_from_response(response);
+    let body = crate::error_body::read_response_body_with_limits(
+        response,
+        MAX_ERROR_BODY_BYTES,
+        error_body_read_timeout(idle_wait),
+    )
+    .await;
+    let redacted = crate::redact(&body);
+    log::trace!("connect error body: {redacted}");
+    log::warn!("connect request failed ({status}): {redacted}");
+    ConnectFailure {
+        error: parse_connect_error(&body, status),
+        retry_after,
     }
 }
 
@@ -249,7 +321,8 @@ impl ConnectFrameDecoder {
                         }
                         Err(e) => {
                             return Err(ProviderError::Malformed(format!(
-                                "invalid Connect trailer JSON: {e}"
+                                "invalid Connect trailer JSON: {e}: {}",
+                                crate::error_body_message(&String::from_utf8_lossy(&payload))
                             )));
                         }
                     }
@@ -378,17 +451,17 @@ pub fn parse_connect_error(body: &str, status: u16) -> ProviderError {
     if let Ok(err) = serde_json::from_str::<ConnectErrorPayload>(body)
         && let Some(code) = err.code
     {
-        let message = err.message.unwrap_or_else(|| body.to_string());
+        let message = err
+            .message
+            .unwrap_or_else(|| crate::error_body_message(body));
         return map_connect_error_code(&code, message, status);
     }
 
+    let message = crate::error_body_message(body);
     match status {
-        401 | 403 => ProviderError::Auth(format!("{status}: {body}")),
-        429 => ProviderError::RateLimited(body.to_string()),
-        _ => ProviderError::Http {
-            status,
-            message: body.to_string(),
-        },
+        401 | 403 => ProviderError::Auth(format!("{status}: {message}")),
+        429 => ProviderError::RateLimited(message),
+        _ => ProviderError::Http { status, message },
     }
 }
 

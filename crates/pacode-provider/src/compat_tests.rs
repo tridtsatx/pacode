@@ -22,7 +22,7 @@ fn request(model: &str) -> CompletionRequest {
         model: model.to_string(),
         system_static: "sys".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("hi")],
+        messages: vec![std::sync::Arc::new(Message::user("hi"))],
         tools: vec![],
         effort: Some(Effort::Medium),
         max_output_tokens: Some(1000),
@@ -146,7 +146,8 @@ fn kimi_always_sends_max_tokens_and_pads_tool_turns() {
     let p = provider("https://api.kimi.com/coding/v1");
     let mut req = request("kimi-for-coding");
     req.max_output_tokens = None;
-    req.messages.extend(tool_turn("call_1"));
+    req.messages
+        .extend(tool_turn("call_1").into_iter().map(std::sync::Arc::new));
     let body = p.build_body(&req);
     assert_eq!(body["max_tokens"], 32_768);
     let assistant = &body["messages"][2];
@@ -158,7 +159,8 @@ fn kimi_always_sends_max_tokens_and_pads_tool_turns() {
 fn default_endpoint_keeps_plain_openai_shape() {
     let p = provider("http://localhost:11434/v1");
     let mut req = request("llama3");
-    req.messages.extend(tool_turn("call|1"));
+    req.messages
+        .extend(tool_turn("call|1").into_iter().map(std::sync::Arc::new));
     let body = p.build_body(&req);
     assert_eq!(body["max_tokens"], 1000);
     let assistant = &body["messages"][2];
@@ -171,7 +173,11 @@ fn default_endpoint_keeps_plain_openai_shape() {
 fn tool_ids_stay_paired_after_sanitizing() {
     let p = provider("https://openrouter.ai/api/v1");
     let mut req = request("openai/gpt-5.5");
-    req.messages.extend(tool_turn("call|odd.id"));
+    req.messages.extend(
+        tool_turn("call|odd.id")
+            .into_iter()
+            .map(std::sync::Arc::new),
+    );
     req.tools = vec![ToolDefinition {
         name: "ls".to_string(),
         description: "d".to_string(),

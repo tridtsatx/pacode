@@ -21,6 +21,7 @@ fn meta(id: &str) -> SessionMeta {
         effort: Effort::High,
         mode: Mode::Build,
         first_prompt: None,
+        zdr: false,
     }
 }
 

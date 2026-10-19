@@ -7,27 +7,40 @@
 //! - `layout`: rects per width tier (spec §8)
 //! - `ui`: widgets — rail, dialog, panel, input, footer, overlays, toasts
 //! - `keys`: key bindings and the interaction mode machine (spec §5–§7)
+//! - `lock`: the `alt+l` notice lock — hold orchestrator-bound notices, release
+//!   them paced (`offer` / `tick`), and say so in a badge
 //! - `commands`: slash commands
 //! - `terminal`: raw mode / alt screen / mouse capture / panic hook
+//! - `backpressure`: frame scheduler — nominal cadence, measured degradation,
+//!   phase-stable ticker, elapsed-time animation phase
+//! - `render_metrics`: what the frame path pays, reported by `pacode stats`
 
 pub mod app;
 pub mod at_complete;
 pub mod attachments;
+pub mod backpressure;
 pub mod bash;
 pub mod binding;
+pub mod cache;
 pub mod clipboard;
 pub mod clipboard_read;
 pub mod commands;
+pub mod double_shift;
 pub mod editor;
 pub mod font;
 pub mod keys;
+pub mod keys_menu;
+pub mod keys_palette;
 pub mod keys_picker;
 pub mod layout;
+pub mod lock;
 pub mod mouse;
 pub mod nav;
 pub mod paste;
+pub mod render_metrics;
 pub mod state;
 pub mod terminal;
+pub mod timing;
 pub mod ui;
 
 #[cfg(test)]
@@ -52,6 +65,10 @@ pub struct TuiOptions {
     pub initial_prompt: Option<String>,
     pub cwd: PathBuf,
     pub app_version: String,
+    /// Whether `/analyze` is available. A flag rather than a setting: the page is
+    /// a reading of one run, and leaving it on across sessions would keep
+    /// feeding records nobody reads.
+    pub analyze_mode: bool,
 }
 
 #[derive(Debug, thiserror::Error)]

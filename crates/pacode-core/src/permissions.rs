@@ -4,8 +4,49 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use pacode_tools::ToolKind;
-use pacode_types::{Mode, PermissionDecision, PermissionId, PermissionRequest, RiskLevel};
+use pacode_types::{AgentId, Mode, PermissionDecision, PermissionId, PermissionRequest, RiskLevel};
 use tokio::sync::oneshot;
+
+use crate::session::Session;
+
+/// Refusal prefix carried by every ZDR denial. Clients and the transcript
+/// read it as a policy refusal, not as the user's "no".
+pub const ZDR_BLOCKED: &str = "zdr_blocked";
+
+/// ZDR route policy (spec §3: "providers still reachable only for the chosen
+/// ZDR model's chat endpoint"). While retention is active, a route the user has
+/// not flagged `zdr_capable` must not carry conversation content — including
+/// the auxiliary provider calls (compaction summary, permission explain, MCP
+/// sampling) that no client ever sees in a permission prompt.
+///
+/// Checked at the point of the provider call rather than at route selection:
+/// the flag can be toggled between the two, and only the later check is the
+/// one that keeps data inside the boundary. Returns the refusal reason.
+pub fn zdr_route_violation(session: &Session, route: &str) -> Option<String> {
+    if !session.zdr_active() || session.model_flags(route).zdr_capable {
+        return None;
+    }
+    Some(format!(
+        "{ZDR_BLOCKED}: {route} is not flagged zdr_capable; \
+         mark it in the model picker or disable ZDR"
+    ))
+}
+
+/// ZDR tool policy: network tools and MCP tools (`server__tool`, `__resource`)
+/// never run under retention. `run_single_tool` denies them before dispatch;
+/// this is the same rule for the permission path, so a tool cannot route around
+/// it by asking for permission instead of being gated.
+pub fn zdr_tool_violation(session: &Session, tool_name: &str, kind: ToolKind) -> Option<String> {
+    if !session.zdr_active() {
+        return None;
+    }
+    if kind == ToolKind::Network || tool_name.contains("__") {
+        return Some(format!(
+            "{ZDR_BLOCKED}: {tool_name} is disabled while zero-data-retention is active"
+        ));
+    }
+    None
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateDecision {
@@ -26,7 +67,7 @@ pub enum GateDecision {
 /// | Exec Confirm              | ask   | ask  | deny | allow  |
 /// | Exec Catastrophic         | deny  | deny | deny | deny*  |
 ///
-/// `*` allowed only when `allow_catastrophic` is set.
+/// `*` allowed only in Bypass mode when `allow_catastrophic` is set.
 pub fn gate(
     mode: Mode,
     kind: ToolKind,
@@ -47,7 +88,7 @@ pub fn gate(
             let exec_risk = risk.unwrap_or(RiskLevel::Confirm);
             match exec_risk {
                 RiskLevel::Catastrophic => {
-                    if allow_catastrophic {
+                    if mode == Mode::Bypass && allow_catastrophic {
                         GateDecision::Allow
                     } else {
                         GateDecision::Deny(
@@ -173,13 +214,181 @@ mod tests {
             ));
         }
 
-        // Exec Catastrophic with allow_catastrophic
-        for mode in [Mode::Build, Mode::Auto, Mode::Plan, Mode::Bypass] {
-            assert_eq!(
+        for mode in [Mode::Build, Mode::Auto, Mode::Plan] {
+            assert!(matches!(
                 gate(mode, ToolKind::Exec, Some(RiskLevel::Catastrophic), true),
-                GateDecision::Allow
+                GateDecision::Deny(_)
+            ));
+        }
+        assert_eq!(
+            gate(
+                Mode::Bypass,
+                ToolKind::Exec,
+                Some(RiskLevel::Catastrophic),
+                true
+            ),
+            GateDecision::Allow
+        );
+    }
+
+    /// What `bash` hands the matrix for a command is `pacode_risk`'s level: a
+    /// destructive command hidden behind shell grammar must not come out
+    /// `Safe`, which is the one exec level allowed in every mode unasked.
+    #[test]
+    fn hidden_destructive_commands_are_never_allowed_unasked() {
+        let cwd = std::path::Path::new("/home/tester/proj");
+        let home = std::path::Path::new("/home/tester");
+        for command in [
+            "ls & rm -rf ~",
+            "ls |& rm -rf ~",
+            "{ rm -rf ~; }",
+            "! rm -rf ~",
+            "X=1 rm -rf ~",
+            ">/dev/null rm -rf ~",
+            "echo \"$(rm -rf ~)\"",
+            "eval 'rm -rf ~'",
+            "env -u X rm -rf ~",
+            "$CMD -rf ~",
+        ] {
+            let risk = pacode_risk::classify_with_home(command, cwd, home).level;
+            for mode in [Mode::Build, Mode::Auto, Mode::Plan] {
+                assert_ne!(
+                    gate(mode, ToolKind::Exec, Some(risk), false),
+                    GateDecision::Allow,
+                    "{command:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    fn perm_req(agent: &AgentId, tool: &str) -> PermissionRequest {
+        PermissionRequest {
+            id: PermissionId::generate(),
+            agent: agent.clone(),
+            agent_name: agent.to_string(),
+            call_id: pacode_types::CallId::new("call_test"),
+            tool: tool.to_string(),
+            title: format!("{tool} title"),
+            detail: String::new(),
+            risk: None,
+            created_at_ms: pacode_types::now_ms(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_delivers_decision_and_reason() {
+        let state = PermissionState::default();
+        let req = perm_req(&AgentId::main(), "bash");
+        let id = req.id.clone();
+        let rx = state.register(req).expect("permission should register");
+
+        assert!(state.resolve(&id, PermissionDecision::Deny, Some("no".to_string())));
+        let (decision, reason) = rx.await.unwrap();
+        assert_eq!(decision, PermissionDecision::Deny);
+        assert_eq!(reason.as_deref(), Some("no"));
+
+        // A resolved id is gone: a second resolve reports unknown.
+        assert!(!state.resolve(&id, PermissionDecision::AllowOnce, None));
+    }
+
+    #[tokio::test]
+    async fn get_returns_pending_request_until_resolved() {
+        let state = PermissionState::default();
+        let req = perm_req(&AgentId::main(), "write");
+        let id = req.id.clone();
+        let _rx = state.register(req).expect("permission should register");
+
+        let fetched = state.get(&id).expect("pending request must be fetchable");
+        assert_eq!(fetched.id, id);
+        assert_eq!(fetched.tool, "write");
+
+        // Resolved is gone — an explain request against it must fail.
+        assert!(state.resolve(&id, PermissionDecision::AllowOnce, None));
+        assert!(state.get(&id).is_none());
+        assert!(state.get(&PermissionId::new("perm_nope")).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_for_agent_removes_only_that_agents_requests() {
+        let state = PermissionState::default();
+        let main = AgentId::main();
+        let sub = AgentId::new("sub_1");
+
+        let rx_main = state
+            .register(perm_req(&main, "bash"))
+            .expect("permission should register");
+        let rx_main2 = state
+            .register(perm_req(&main, "write"))
+            .expect("permission should register");
+        let _rx_sub = state
+            .register(perm_req(&sub, "bash"))
+            .expect("permission should register");
+
+        let cancelled = state.cancel_for_agent(&main);
+        assert_eq!(cancelled.len(), 2);
+        assert!(state.pending().len() == 1, "subagent's request stays");
+        assert_eq!(state.pending()[0].agent, sub);
+
+        let (decision, reason) = rx_main.await.expect("cancelled permission resolves");
+        assert_eq!(decision, PermissionDecision::Deny);
+        assert_eq!(reason.as_deref(), Some(CANCELLED_BY_AGENT_REASON));
+        let (decision, reason) = rx_main2.await.expect("cancelled permission resolves");
+        assert_eq!(decision, PermissionDecision::Deny);
+        assert_eq!(reason.as_deref(), Some(CANCELLED_BY_AGENT_REASON));
+    }
+
+    #[test]
+    fn the_pending_cap_refuses_rather_than_growing_without_bound() {
+        let state = PermissionState::default();
+        let mut receivers = Vec::new();
+        for index in 0..MAX_PENDING {
+            receivers.push(
+                state
+                    .register(perm_req(&AgentId::main(), &format!("tool_{index}")))
+                    .expect("permission should register"),
             );
         }
+        assert!(
+            state
+                .register(perm_req(&AgentId::main(), "tool_overflow"))
+                .is_none()
+        );
+        assert_eq!(state.pending().len(), MAX_PENDING);
+        drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn a_granted_target_short_circuits_the_queue() {
+        let state = PermissionState::default();
+        assert!(
+            matches!(
+                state.register_or_cached(perm_req(&AgentId::main(), "bash"), "bash:ls"),
+                Registration::Pending(_)
+            ),
+            "an ungranted target is queued"
+        );
+        state.allow_for_session("bash:ls".to_string());
+
+        // Same key: no second prompt, and nothing new lands on the queue.
+        assert!(matches!(
+            state.register_or_cached(perm_req(&AgentId::main(), "bash"), "bash:ls"),
+            Registration::Granted
+        ));
+        assert_eq!(state.pending().len(), 1, "only the first request is queued");
+
+        // The grant is answered from the cache even with the queue at its cap,
+        // so a full queue can never push a granted tool back to a prompt.
+        while state.pending().len() < MAX_PENDING {
+            state.register_or_cached(perm_req(&AgentId::main(), "bash"), "bash:fill");
+        }
+        assert!(matches!(
+            state.register_or_cached(perm_req(&AgentId::main(), "bash"), "bash:fill"),
+            Registration::QueueFull
+        ));
+        assert!(matches!(
+            state.register_or_cached(perm_req(&AgentId::main(), "bash"), "bash:ls"),
+            Registration::Granted
+        ));
     }
 }
 
@@ -189,47 +398,115 @@ pub fn session_key(tool: &str, target: &str) -> String {
     format!("{tool}:{}", target.trim())
 }
 
+/// What a pending request resolves to: the decision plus, for `Deny`, an
+/// optional explanation that was not the user's plain refusal (policy reason,
+/// `interrupted`, `zdr_blocked: …`, a client-supplied note).
+pub type PermissionResolution = (PermissionDecision, Option<String>);
+
+pub(crate) const CANCELLED_BY_AGENT_REASON: &str = "\0pacode-permission-cancelled";
+
+/// Prompts that may wait for the user at once, per session. Deliberately small:
+/// these queue behind a human reading them, so raising it buys no throughput and
+/// only makes the client's prompt list unusable. A subagent whose prompt is
+/// refused is told so — it is not a throttle on how many agents may work.
+pub const MAX_PENDING: usize = 8;
+
+/// Both permission tables live under one mutex: "is this target already granted
+/// for the session?" and "put this request on the queue" are a single
+/// decision. With two locks a pair of concurrent calls for the same target can
+/// both miss the cache and both raise a prompt for one grant.
+#[derive(Default)]
+struct PermissionStore {
+    allowed_for_session: HashSet<String>,
+    pending: HashMap<PermissionId, (PermissionRequest, oneshot::Sender<PermissionResolution>)>,
+}
+
+/// Outcome of the atomic cache-check + queue-registration step.
+pub enum Registration {
+    /// The key is already granted for the session: no prompt.
+    Granted,
+    /// Registered; the receiver resolves to the user's decision.
+    Pending(oneshot::Receiver<PermissionResolution>),
+    /// `MAX_PENDING` requests are already waiting.
+    QueueFull,
+}
+
+/// Queue `req` unless the cap is reached. The caller holds the store lock, so
+/// the cap check and the insert cannot interleave with another registration.
+fn insert_pending(
+    store: &mut PermissionStore,
+    req: PermissionRequest,
+) -> Option<oneshot::Receiver<PermissionResolution>> {
+    if store.pending.len() >= MAX_PENDING {
+        log::warn!(
+            "refusing permission {}: {MAX_PENDING} are already waiting",
+            req.id
+        );
+        return None;
+    }
+    let (tx, rx) = oneshot::channel();
+    log::info!(
+        "permission requested: id={} tool={} title={:?}",
+        req.id,
+        req.tool,
+        req.title
+    );
+    store.pending.insert(req.id.clone(), (req, tx));
+    Some(rx)
+}
+
 #[derive(Default)]
 pub struct PermissionState {
-    allowed_for_session: Mutex<HashSet<String>>,
-    pending: Mutex<HashMap<PermissionId, (PermissionRequest, oneshot::Sender<PermissionDecision>)>>,
+    store: Mutex<PermissionStore>,
 }
 
 impl PermissionState {
-    pub fn is_allowed_for_session(&self, key: &str) -> bool {
-        self.allowed_for_session
+    fn lock(&self) -> std::sync::MutexGuard<'_, PermissionStore> {
+        self.store
             .lock()
-            .map(|s| s.contains(key))
-            .unwrap_or(false)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn is_allowed_for_session(&self, key: &str) -> bool {
+        self.lock().allowed_for_session.contains(key)
     }
 
     pub fn allow_for_session(&self, key: String) {
-        if let Ok(mut s) = self.allowed_for_session.lock() {
-            s.insert(key);
+        self.lock().allowed_for_session.insert(key);
+    }
+
+    /// Check the AllowSession cache and, on a miss, register the pending
+    /// request — one atomic step, see [`PermissionStore`].
+    pub fn register_or_cached(&self, req: PermissionRequest, key: &str) -> Registration {
+        let mut store = self.lock();
+        if store.allowed_for_session.contains(key) {
+            return Registration::Granted;
+        }
+        match insert_pending(&mut store, req) {
+            Some(rx) => Registration::Pending(rx),
+            None => Registration::QueueFull,
         }
     }
 
-    /// Register a pending request; the returned receiver resolves on `resolve`.
-    pub fn register(&self, req: PermissionRequest) -> oneshot::Receiver<PermissionDecision> {
-        log::info!(
-            "permission requested: id={} tool={} title={:?}",
-            req.id,
-            req.tool,
-            req.title
-        );
-        let (tx, rx) = oneshot::channel();
-        if let Ok(mut p) = self.pending.lock() {
-            p.insert(req.id.clone(), (req, tx));
-        }
-        rx
+    /// Register a pending request; `None` is returned when the cap is reached.
+    pub fn register(
+        &self,
+        req: PermissionRequest,
+    ) -> Option<oneshot::Receiver<PermissionResolution>> {
+        insert_pending(&mut self.lock(), req)
     }
 
-    /// Resolve a pending request. Returns false when unknown.
-    pub fn resolve(&self, id: &PermissionId, decision: PermissionDecision) -> bool {
-        log::info!("permission decision: id={id} decision={decision:?}");
-        let entry = self.pending.lock().ok().and_then(|mut p| p.remove(id));
-        match entry {
-            Some((_, tx)) => tx.send(decision).is_ok(),
+    /// Resolve a pending request. Returns false when unknown. `reason` rides
+    /// along to the waiting call, the wire event and the transcript.
+    pub fn resolve(
+        &self,
+        id: &PermissionId,
+        decision: PermissionDecision,
+        reason: Option<String>,
+    ) -> bool {
+        log::info!("permission decision: id={id} decision={decision:?} reason={reason:?}");
+        match self.lock().pending.remove(id) {
+            Some((_, tx)) => tx.send((decision, reason)).is_ok(),
             None => {
                 log::warn!("permission decision for unknown id={id}");
                 false
@@ -238,16 +515,53 @@ impl PermissionState {
     }
 
     pub fn pending(&self) -> Vec<PermissionRequest> {
-        self.pending
-            .lock()
-            .map(|p| p.values().map(|(req, _)| req.clone()).collect())
-            .unwrap_or_default()
+        self.lock()
+            .pending
+            .values()
+            .map(|(req, _)| req.clone())
+            .collect()
+    }
+
+    /// A clone of the pending request for `id` — `None` once resolved or
+    /// cancelled (the entry is removed in both cases).
+    pub fn get(&self, id: &PermissionId) -> Option<PermissionRequest> {
+        self.lock().pending.get(id).map(|(req, _)| req.clone())
     }
 
     /// Drop a request without answering (agent stopped): the waiting tool sees Deny.
-    pub fn cancel(&self, id: &PermissionId) {
-        if let Ok(mut p) = self.pending.lock() {
-            p.remove(id);
+    pub fn cancel(&self, id: &PermissionId) -> bool {
+        self.lock().pending.remove(id).is_some()
+    }
+
+    pub(crate) fn reassign_agent(&self, from: &AgentId, to: &AgentId) {
+        let mut store = self.lock();
+        for (request, _) in store.pending.values_mut() {
+            if &request.agent == from {
+                request.agent = to.clone();
+            }
         }
+    }
+
+    /// Drop every request `agent` is still waiting on (interrupt/stop_agent).
+    /// The requests are returned so the session can emit the resolution event.
+    pub fn cancel_for_agent(&self, agent: &AgentId) -> Vec<PermissionRequest> {
+        let mut store = self.lock();
+        let ids: Vec<PermissionId> = store
+            .pending
+            .iter()
+            .filter(|(_, (req, _))| &req.agent == agent)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut cancelled = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some((req, tx)) = store.pending.remove(&id) {
+                let _ = tx.send((
+                    PermissionDecision::Deny,
+                    Some(CANCELLED_BY_AGENT_REASON.to_string()),
+                ));
+                cancelled.push(req);
+            }
+        }
+        cancelled
     }
 }

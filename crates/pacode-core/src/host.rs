@@ -7,16 +7,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_exec::TaskSpec;
-use pacode_tools::host::{AgentKindDef, PermissionDraft};
+use pacode_tools::host::{AgentKindDef, PermissionDraft, PermissionOutcome};
 use pacode_tools::{
-    AgentSpec, LedgerPass, ToolError, ToolHost, WaitOutcome, WriteIntent, WriteLock,
+    AgentSpec, LedgerPass, ParentReply, SendOutcome, SpawnedTask, ToolError, ToolHost, WaitOutcome,
+    WriteIntent, WriteLock,
 };
 use pacode_types::{
     AgentId, AgentInfo, CallId, ModelRoute, PermissionDecision, Plan, TaskId, TaskInfo,
     TaskProgress, ToastLevel,
 };
 
+use crate::agent::Agent;
 use crate::session::Session;
+
+mod permission;
 
 pub struct SessionHost {
     pub session: Arc<Session>,
@@ -24,208 +28,119 @@ pub struct SessionHost {
     pub agent: AgentId,
 }
 
-#[async_trait]
-impl ToolHost for SessionHost {
-    /// Applies `permissions::gate` with the session mode and the draft's risk; checks
-    /// the AllowSession cache; otherwise registers the request, emits
-    /// `PermissionRequested` + an `ItemAdded(Permission)` item, sets the agent to
-    /// `WaitingApproval`, awaits the decision (cancel → Deny), emits
-    /// `PermissionResolved`, caches `AllowSession`.
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
-        let (tool_name, kind) = {
-            let session_tools = self.session.tools.read().unwrap_or_else(|p| p.into_inner());
+impl SessionHost {
+    fn owner_agent(&self) -> Option<Arc<Agent>> {
+        self.session.agent_for_host(&self.agent)
+    }
 
-            let name = if let Some(ref name) = draft.tool_name {
-                name.clone()
-            } else {
-                let prefix = draft
-                    .title
-                    .split(|c: char| c == ':' || c.is_whitespace())
-                    .next()
-                    .unwrap_or("")
-                    .to_lowercase();
-                if session_tools.get(&prefix).is_some() {
-                    prefix
-                } else if draft.risk.is_some() {
-                    "bash".to_string()
-                } else {
-                    prefix
-                }
-            };
+    fn owner_id(&self) -> AgentId {
+        self.owner_agent()
+            .map(|agent| agent.id())
+            .unwrap_or_else(|| self.agent.clone())
+    }
 
-            let kind = if let Some(k) = draft.tool_kind {
-                k
-            } else if draft.risk.is_some() {
-                pacode_tools::ToolKind::Exec
-            } else if let Some(t) = session_tools.get(&name) {
-                t.kind()
-            } else if name == "bash" {
-                pacode_tools::ToolKind::Exec
-            } else if name == "write" || name == "edit" || name == "multi_edit" {
-                pacode_tools::ToolKind::Edit
-            } else {
-                // Unknown or unclassifiable tool MUST fail closed:
-                // treat as the most restrictive kind so it requires an explicit permission prompt.
-                pacode_tools::ToolKind::Exec
-            };
+    fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {
+        self.session
+            .tasks
+            .info(task)
+            .filter(|info| info.session == self.session.id)
+    }
+}
 
-            (name, kind)
+fn zdr_denied_subagent() -> ToolError {
+    ToolError::Denied(format!(
+        "{}: subagent spawning is disabled while zero-data-retention is active",
+        crate::permissions::ZDR_BLOCKED
+    ))
+}
+
+impl SessionHost {
+    /// The body of [`ToolHost::spawn_agent`], split out so the trait method can
+    /// time the whole call. Takes the spec by value so the route can be resolved
+    /// in place without cloning the prompt.
+    async fn spawn_agent_inner(&self, mut spec: AgentSpec) -> Result<AgentId, ToolError> {
+        if self.session.zdr_active() {
+            return Err(zdr_denied_subagent());
+        }
+        let requested_route = spec.model.take();
+        let owner = self
+            .owner_agent()
+            .ok_or_else(|| ToolError::failed("agent not found"))?;
+        let (owner_id, owner_name, owner_route) = {
+            let info = owner.info.read().unwrap_or_else(|p| p.into_inner());
+            (info.id.clone(), info.name.clone(), info.model.clone())
         };
-
-        let mode = self.session.meta().mode;
-        let allow_catastrophic = self.session.config.permissions.allow_catastrophic;
-        let gate_decision = crate::permissions::gate(mode, kind, draft.risk, allow_catastrophic);
-
-        match gate_decision {
-            crate::permissions::GateDecision::Allow => PermissionDecision::AllowOnce,
-            crate::permissions::GateDecision::Deny(_) => PermissionDecision::Deny,
-            crate::permissions::GateDecision::Ask => {
-                let target = draft.detail.lines().next().unwrap_or("").trim();
-                let cache_key = crate::permissions::session_key(&tool_name, target);
-                if self.session.permissions.is_allowed_for_session(&cache_key) {
-                    return PermissionDecision::AllowSession;
-                }
-
-                let perm_id = pacode_types::PermissionId::generate();
-                let perm_req = pacode_types::PermissionRequest {
-                    id: perm_id.clone(),
-                    agent: draft.agent.clone(),
-                    agent_name: draft.agent_name.clone(),
-                    call_id: draft.call_id.clone(),
-                    tool: tool_name,
-                    title: draft.title.clone(),
-                    detail: draft.detail.clone(),
-                    risk: draft.risk,
-                    created_at_ms: pacode_types::now_ms(),
-                };
-
-                let rx = self.session.permissions.register(perm_req.clone());
-                self.session
-                    .events
-                    .emit(pacode_types::Event::PermissionRequested(perm_req.clone()));
-                crate::hooks::notification(
-                    &self.session,
-                    &draft.agent,
-                    Some(perm_req.tool.clone()),
-                );
-
-                let agent_opt = self.session.agent(&draft.agent);
-                let item_seq = agent_opt
-                    .as_ref()
-                    .map(|a| {
-                        a.transcript
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .next_seq()
-                    })
-                    .unwrap_or(0);
-
-                let perm_item = pacode_types::TranscriptItem {
-                    seq: item_seq,
-                    agent: draft.agent.clone(),
-                    ts_ms: perm_req.created_at_ms,
-                    kind: pacode_types::TranscriptKind::Permission(perm_req),
-                };
-
-                if let Some(agent) = &agent_opt {
-                    agent
-                        .transcript
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .upsert(perm_item.clone());
-                }
-                self.session
-                    .events
-                    .emit(pacode_types::Event::ItemAdded(perm_item.clone()));
-
-                let prev_status = agent_opt
-                    .as_ref()
-                    .map(|a| a.status())
-                    .unwrap_or(pacode_types::AgentStatus::Idle);
-                let prev_activity = agent_opt.as_ref().and_then(|a| a.info().activity);
-
-                if let Some(agent) = &agent_opt {
-                    agent.set_status(
-                        pacode_types::AgentStatus::WaitingApproval,
-                        Some(draft.title.clone()),
-                    );
-                    self.session
-                        .events
-                        .emit(pacode_types::Event::AgentUpdated(agent.info()));
-                }
-
-                let cancel_token = agent_opt
-                    .as_ref()
-                    .and_then(|a| a.cancel.lock().unwrap_or_else(|p| p.into_inner()).clone());
-
-                let decision = match cancel_token {
-                    Some(token) => {
-                        tokio::select! {
-                            _ = token.cancelled() => {
-                                self.session.permissions.cancel(&perm_id);
-                                PermissionDecision::Deny
-                            }
-                            res = rx => res.unwrap_or(PermissionDecision::Deny),
-                        }
-                    }
-                    None => rx.await.unwrap_or(PermissionDecision::Deny),
-                };
-
-                self.session
-                    .events
-                    .emit(pacode_types::Event::PermissionResolved {
-                        permission: perm_id,
-                        decision,
-                    });
-
-                if decision == PermissionDecision::AllowSession {
-                    self.session.permissions.allow_for_session(cache_key);
-                }
-
-                let (level, notice_text) = match decision {
-                    PermissionDecision::AllowOnce => (
-                        pacode_types::ToastLevel::Info,
-                        "Permission allowed".to_string(),
-                    ),
-                    PermissionDecision::AllowSession => (
-                        pacode_types::ToastLevel::Info,
-                        "Permission allowed for session".to_string(),
-                    ),
-                    PermissionDecision::Deny => (
-                        pacode_types::ToastLevel::Warn,
-                        "Permission denied".to_string(),
-                    ),
-                };
-                let notice_item = pacode_types::TranscriptItem {
-                    seq: perm_item.seq,
-                    agent: draft.agent.clone(),
-                    ts_ms: pacode_types::now_ms(),
-                    kind: pacode_types::TranscriptKind::Notice {
-                        level,
-                        text: notice_text,
+        // The pair this spawn will be judged by: the orchestrator route it
+        // departs from, and the route the subagent would actually run on.
+        let authorized_from = owner_route;
+        let asked_route = requested_route
+            .clone()
+            .unwrap_or_else(|| authorized_from.clone());
+        if asked_route != authorized_from {
+            let outcome = self
+                .request_permission_inner(
+                    PermissionDraft {
+                        agent: owner_id.clone(),
+                        agent_name: owner_name,
+                        call_id: CallId::generate(),
+                        title: format!("Authorize subagent route {asked_route}"),
+                        detail: format!(
+                            "Subagent route {asked_route} differs from orchestrator route {authorized_from}"
+                        ),
+                        risk: None,
+                        tool_name: Some("agent.route".to_string()),
+                        tool_kind: Some(pacode_tools::ToolKind::Control),
                     },
-                };
-                if let Some(agent) = &agent_opt {
-                    agent
-                        .transcript
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .upsert(notice_item.clone());
-                }
-                self.session
-                    .events
-                    .emit(pacode_types::Event::ItemUpdated(notice_item));
-
-                if let Some(agent) = &agent_opt {
-                    agent.set_status(prev_status, prev_activity);
-                    self.session
-                        .events
-                        .emit(pacode_types::Event::AgentUpdated(agent.info()));
-                }
-
-                decision
+                    true,
+                )
+                .await;
+            if outcome.decision == PermissionDecision::Deny {
+                return Err(ToolError::Denied(
+                    outcome
+                        .reason
+                        .unwrap_or_else(|| "subagent route change denied".to_string()),
+                ));
             }
         }
+
+        // Commit point. The user answers that prompt in their own time, and both
+        // the session route and the ZDR flag can move while it is open, so the
+        // decision above is re-read here — ZDR and route under one guard, with
+        // nothing awaited in between — and anything it does not cover is
+        // refused instead of spawned. A toggle landing after this point still
+        // fails closed downstream: `set_model` propagates to live subagents
+        // still on the old route, and the turn loop re-checks the ZDR flag
+        // before every provider call.
+        let effective_route = {
+            let meta = self.session.meta.read().unwrap_or_else(|p| p.into_inner());
+            if self.session.zdr_active() {
+                return Err(zdr_denied_subagent());
+            }
+            let current_route = meta.model.clone();
+            let effective = requested_route.unwrap_or_else(|| current_route.clone());
+            let covered = effective == current_route
+                || (current_route == authorized_from && effective == asked_route);
+            if !covered {
+                return Err(ToolError::Denied(format!(
+                    "session route changed from {authorized_from} to {current_route} while the \
+                     subagent route {effective} was being authorized; spawn again to confirm it"
+                )));
+            }
+            effective
+        };
+
+        spec.model = Some(effective_route);
+        self.session
+            .spawn_agent(spec)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl ToolHost for SessionHost {
+    async fn request_permission(&self, draft: PermissionDraft) -> PermissionOutcome {
+        self.request_permission_inner(draft, false).await
     }
 
     async fn ask_question(
@@ -236,11 +151,21 @@ impl ToolHost for SessionHost {
         options: Vec<pacode_types::QuestionOption>,
         multi_select: bool,
     ) -> Result<pacode_types::QuestionAnswer, ToolError> {
-        let agent_id = self.agent.clone();
-        let agent_name = self
-            .session
-            .agent(&agent_id)
-            .map(|a| a.info().name)
+        let owner = self.owner_agent();
+        let agent_id = owner
+            .as_ref()
+            .map(|agent| agent.id())
+            .unwrap_or_else(|| self.agent.clone());
+        let agent_name = owner
+            .as_ref()
+            .map(|agent| {
+                agent
+                    .info
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .name
+                    .clone()
+            })
             .unwrap_or_else(|| "main".to_string());
 
         let question = pacode_types::Question::new(
@@ -259,11 +184,19 @@ impl ToolHost for SessionHost {
                 "too many questions are already waiting for an answer".to_string(),
             ));
         };
+        let cancelled_before_publish = owner
+            .as_ref()
+            .and_then(|agent| agent.cancel.lock().ok().and_then(|token| token.clone()))
+            .is_some_and(|token| token.is_cancelled());
+        if cancelled_before_publish {
+            self.session.cancel_questions_for(&agent_id);
+            return Ok(pacode_types::QuestionAnswer::cancelled());
+        }
 
         // The question goes into the transcript so the conversation shows what was
         // asked even after it is answered, and as an event so the client can put a
         // picker in front of the user.
-        let agent_opt = self.session.agent(&agent_id);
+        let agent_opt = owner;
         let item_seq = agent_opt
             .as_ref()
             .map(|a| {
@@ -295,6 +228,7 @@ impl ToolHost for SessionHost {
         self.session
             .events
             .emit(pacode_types::Event::QuestionAsked(question.clone()));
+        self.session.emit_session_status();
         crate::hooks::notification(&self.session, &question.agent, None);
 
         // A client that goes away, or an agent that is stopped, drops the sender:
@@ -387,18 +321,31 @@ impl ToolHost for SessionHost {
         Ok(())
     }
 
-    async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError> {
-        let info = self
-            .session
-            .tasks
-            .spawn(spec)
+    async fn spawn_task(&self, mut spec: TaskSpec) -> Result<SpawnedTask, ToolError> {
+        if spec.session != self.session.id {
+            return Err(ToolError::Failed(
+                "task does not belong to this session".to_string(),
+            ));
+        }
+        spec.owner = self.owner_id();
+        // The guard exists before the row is written: a call dropped while
+        // the store answers still hands its task over.
+        let (info, spawned) = SpawnedTask::start(&self.session.tasks, spec)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
-        Ok(info.id)
+        if let Err(error) = self.session.store.upsert_task(&info).await {
+            let _ = self.session.tasks.kill(&info.id).await;
+            // This error is the call's report of the task.
+            if let Some(guard) = spawned.foreground {
+                guard.delivered();
+            }
+            return Err(ToolError::Failed(error.to_string()));
+        }
+        Ok(spawned)
     }
 
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {
-        self.session.tasks.info(task)
+        self.task_info(task)
     }
 
     fn list_tasks(&self) -> Vec<TaskInfo> {
@@ -411,10 +358,13 @@ impl ToolHost for SessionHost {
         timeout: Duration,
         return_on_progress: bool,
     ) -> WaitOutcome {
+        if self.task_info(task).is_none() {
+            return WaitOutcome::Finished;
+        }
         let res = self
             .session
             .tasks
-            .wait(task, timeout, return_on_progress)
+            .wait_foreground(task, timeout, return_on_progress)
             .await;
         match res {
             pacode_exec::WaitResult::Ended(_) => WaitOutcome::Finished,
@@ -425,6 +375,9 @@ impl ToolHost for SessionHost {
     }
 
     async fn kill_task(&self, task: &TaskId) -> Result<(), ToolError> {
+        if self.task_info(task).is_none() {
+            return Err(ToolError::Failed("task not found".to_string()));
+        }
         self.session
             .tasks
             .kill(task)
@@ -433,6 +386,9 @@ impl ToolHost for SessionHost {
     }
 
     async fn task_tail(&self, task: &TaskId, lines: usize) -> Result<Vec<String>, ToolError> {
+        if self.task_info(task).is_none() {
+            return Err(ToolError::Failed("task not found".to_string()));
+        }
         self.session
             .tasks
             .tail(task, lines)
@@ -440,7 +396,21 @@ impl ToolHost for SessionHost {
             .map_err(|e| ToolError::Failed(e.to_string()))
     }
 
+    async fn task_output(&self, task: &TaskId, max_chars: usize) -> Result<String, ToolError> {
+        if self.task_info(task).is_none() {
+            return Err(ToolError::Failed("task not found".to_string()));
+        }
+        self.session
+            .tasks
+            .output(task, max_chars)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
+    }
+
     fn report_task_progress(&self, task: &TaskId, progress: TaskProgress) -> Result<(), ToolError> {
+        if self.task_info(task).is_none() {
+            return Err(ToolError::Failed("task not found".to_string()));
+        }
         self.session
             .tasks
             .report_progress(task, progress)
@@ -448,14 +418,17 @@ impl ToolHost for SessionHost {
     }
 
     async fn spawn_agent(&self, spec: AgentSpec) -> Result<AgentId, ToolError> {
-        self.session
-            .spawn_agent(spec)
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))
+        // `ready` is bounded right here: the whole `agent` call, from its first
+        // line to the turn being scheduled. Recorded at the boundary that owns
+        // it, which is the only place the number means what its name says.
+        let spawn_started = std::time::Instant::now();
+        let outcome = self.spawn_agent_inner(spec).await;
+        pacode_types::record_launch_ready(spawn_started.elapsed(), outcome.is_err());
+        outcome
     }
 
     fn agent_info(&self, agent: &AgentId) -> Option<AgentInfo> {
-        self.session.agent(agent).map(|a| a.info())
+        self.session.agent_for_host(agent).map(|a| a.info())
     }
 
     fn list_agents(&self) -> Vec<AgentInfo> {
@@ -484,9 +457,14 @@ impl ToolHost for SessionHost {
     fn request_agent_status(&self, agent: &AgentId) -> Result<(), ToolError> {
         let target = self
             .session
-            .agent(agent)
+            .agent_for_host(agent)
             .ok_or_else(|| ToolError::failed(format!("agent not found: {agent}")))?;
-        if !target.info().status.is_live() {
+        let is_live = target
+            .info
+            .read()
+            .map(|info| info.status.is_live())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().status.is_live());
+        if !is_live {
             return Err(ToolError::failed(format!("agent {agent} is not running")));
         }
         target
@@ -497,8 +475,7 @@ impl ToolHost for SessionHost {
 
     fn report_status(&self, text: String) -> Result<(), ToolError> {
         let me = self
-            .session
-            .agent(&self.agent)
+            .owner_agent()
             .ok_or_else(|| ToolError::failed("agent not found"))?;
         let info = me.info();
         let parent_id = info
@@ -509,43 +486,68 @@ impl ToolHost for SessionHost {
             .session
             .agent(&parent_id)
             .ok_or_else(|| ToolError::failed("parent agent is gone"))?;
-        parent
-            .injections
-            .push(crate::inject::Injection::AgentStatus { agent: info, text });
-        if parent.id().is_main() && !parent.is_running() {
-            crate::turn::start_turn(self.session.clone(), parent);
+        let injection = crate::inject::Injection::AgentStatus { agent: info, text };
+        // A parked report starts no turn: the parent would spend a model round
+        // trip reading an empty injection set.
+        if self.session.hold_notice(&parent, &injection) {
+            return Ok(());
+        }
+        parent.injections.push(injection);
+        if parent.id().is_main() {
+            crate::turn::lifecycle::request_turn(self.session.clone(), parent);
         }
         Ok(())
     }
 
-    fn message_agent(&self, agent: &AgentId, text: String) -> Result<(), ToolError> {
-        Ok(self.session.message_agent(agent, &text)?)
-    }
-
-    fn answer_agent(
+    async fn send_to_agent(
         &self,
         agent: &AgentId,
-        question_id: &str,
-        text: String,
-    ) -> Result<(), ToolError> {
-        Ok(self.session.answer_agent(agent, question_id, &text)?)
+        message: String,
+        consent: Option<u64>,
+    ) -> Result<SendOutcome, ToolError> {
+        let me = self
+            .owner_agent()
+            .ok_or_else(|| ToolError::failed("agent not found"))?;
+        crate::rpc::send(&self.session, &me, agent, &message, consent.into()).await
     }
 
     async fn ask_parent(
         &self,
+        call_id: &CallId,
         question: String,
-        options: Vec<String>,
-        wait: bool,
-    ) -> Result<pacode_tools::builtin::ask_parent::ParentReply, ToolError> {
-        Ok(self
-            .session
-            .ask_parent(&self.agent, question, options, wait)
-            .await?)
+    ) -> Result<ParentReply, ToolError> {
+        let me = self
+            .owner_agent()
+            .ok_or_else(|| ToolError::failed("agent not found"))?;
+        crate::rpc::ask_parent(&self.session, &me, call_id, &question).await
     }
 
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         self.session
-            .stop_agent(agent)
+            .stop_agent_by(agent, crate::rpc::StopOrigin::Orchestrator)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))
+    }
+
+    fn user_stop(&self, agent: &AgentId) -> Option<pacode_tools::UserStop> {
+        let owner = self.owner_id();
+        let agent = self.session.agent(agent)?;
+        let info = agent.info();
+        if info.parent.as_ref() != Some(&owner) {
+            return None;
+        }
+        let stop = agent.mailbox.user_stop()?;
+        Some(pacode_tools::UserStop {
+            name: info.name,
+            stop,
+        })
+    }
+
+    async fn continue_agent(&self, agent: &AgentId, consent: Option<u64>) -> Result<(), ToolError> {
+        // The orchestrator resumes what it stopped; what the user stopped is
+        // the user's to resume (the same rule `agent send` follows).
+        self.session
+            .continue_agent_by(agent, consent.into())
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))
     }
@@ -563,7 +565,7 @@ impl ToolHost for SessionHost {
     }
 
     fn emit_preview(&self, call_id: &CallId, preview: String) {
-        if let Some(agent) = self.session.agent(&self.agent) {
+        if let Some(agent) = self.owner_agent() {
             let mut transcript = agent.transcript.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(item) = transcript.tool_items.get_mut(call_id) {
                 if let pacode_types::TranscriptKind::ToolCall {
@@ -583,26 +585,8 @@ impl ToolHost for SessionHost {
     }
 
     fn emit_notice(&self, level: ToastLevel, text: String) {
-        if let Some(agent) = self.session.agent(&self.agent) {
-            let seq = agent
-                .transcript
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .next_seq();
-            let item = pacode_types::TranscriptItem {
-                seq,
-                agent: self.agent.clone(),
-                ts_ms: pacode_types::now_ms(),
-                kind: pacode_types::TranscriptKind::Notice { level, text },
-            };
-            agent
-                .transcript
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .upsert(item.clone());
-            self.session
-                .events
-                .emit(pacode_types::Event::ItemAdded(item));
+        if let Some(agent) = self.owner_agent() {
+            self.session.emit_notice(&agent, level, text);
         }
     }
 

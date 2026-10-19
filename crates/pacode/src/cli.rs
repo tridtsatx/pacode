@@ -25,6 +25,7 @@ mod run;
 mod serve;
 #[path = "sessions.rs"]
 mod sessions;
+mod stats_cmd;
 
 #[cfg(test)]
 #[path = "cli_tests.rs"]
@@ -86,6 +87,13 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 
+    /// Enable `/analyze`: the per-session reading of where the tokens went and
+    /// whether the model's context held up. Off by default because the records
+    /// behind it are fed on the turn path, and a client that never opens the
+    /// page should not pay to build them.
+    #[arg(long)]
+    pub analyze_mode: bool,
+
     /// Subcommand to execute instead of launching the interactive TUI.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -128,6 +136,15 @@ pub enum Command {
         /// Working directory for execution.
         #[arg(short = 'C', long, value_name = "DIR")]
         dir: Option<PathBuf>,
+    },
+
+    /// Report what the running daemon is holding and what it is paying:
+    /// resident sessions and agents, transcript bytes, store queue and exec
+    /// time, provider admit waits, and session-open cost.
+    Stats {
+        /// Emit the raw reading as JSON instead of a formatted report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List or delete recorded sessions.
@@ -348,6 +365,8 @@ pub fn parse_mode_override(raw: Option<&str>) -> anyhow::Result<Option<Mode>> {
 
 pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let timing = pacode_tui::timing::enabled();
+    let t_start = std::time::Instant::now();
 
     if let Some(ref dir) = cli.dir {
         let dir_display = dir.display();
@@ -355,12 +374,16 @@ pub fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to change directory to {dir_display}"))?;
     }
 
+    let t = std::time::Instant::now();
     let paths = Paths::discover();
     paths
         .ensure_dirs()
         .context("failed to create pacode directories")?;
+    pacode_tui::timing::mark(timing, "paths_discover+dirs", t);
 
+    let t = std::time::Instant::now();
     let config = pacode_config::load(&paths).context("failed to load config")?;
+    pacode_tui::timing::mark(timing, "config_load", t);
 
     let socket = cli
         .socket
@@ -419,6 +442,7 @@ pub fn main() -> anyhow::Result<()> {
             };
             run::run(run_opts)
         }
+        Some(Command::Stats { json }) => stats_cmd::run(Some(socket), paths, json),
         Some(Command::Sessions { action }) => {
             pacode_config::logging::init_file_logger(&paths.client_log(), log_level)
                 .context("failed to initialize client logger")?;
@@ -483,6 +507,7 @@ pub fn main() -> anyhow::Result<()> {
             let cwd = std::env::current_dir().context("failed to get current working directory")?;
             // Remembered choices (/model, /effort, /mode) win over config defaults;
             // explicit flags win over both.
+            let t = std::time::Instant::now();
             let prefs = pacode_config::load_prefs(&paths);
             let model_route = parse_model_override(cli.model.as_deref(), &config)?.or_else(|| {
                 parse_model_override(prefs.model.as_deref(), &config)
@@ -498,6 +523,8 @@ pub fn main() -> anyhow::Result<()> {
                 effort_level,
                 mode_val,
             );
+            pacode_tui::timing::mark(timing, "prefs+attach_opts", t);
+            pacode_tui::timing::mark(timing, "pre_tui_total", t_start);
 
             let mut client_opts = ClientOptions::new(paths.clone(), pacode_config::APP_VERSION);
             client_opts.socket = Some(socket);
@@ -515,6 +542,7 @@ pub fn main() -> anyhow::Result<()> {
                 initial_prompt: cli.prompt,
                 cwd,
                 app_version: pacode_config::APP_VERSION.to_string(),
+                analyze_mode: cli.analyze_mode,
             };
 
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -522,11 +550,16 @@ pub fn main() -> anyhow::Result<()> {
                 .build()
                 .context("failed to create tokio current_thread runtime")?;
 
+            // `None` when the user quit while the background attach was
+            // still in flight — no session was ever attached, so there is
+            // nothing to resume and no banner to print.
             let session_id = rt
                 .block_on(async { pacode_tui::run(tui_opts).await })
                 .context("tui error")?;
 
-            println!("Resume this session with:\n  pacode -s {session_id}");
+            if let Some(session_id) = session_id {
+                println!("Resume this session with:\n  pacode -s {session_id}");
+            }
 
             Ok(())
         }

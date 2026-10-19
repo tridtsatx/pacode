@@ -5,8 +5,8 @@ use std::time::Instant;
 use pacode_types::ToastLevel;
 
 use crate::clipboard_read::{
-    ClipboardImageResult, ClipboardPlatform, CommandRunner, SystemCommandRunner, read_image_data,
-    read_text_data,
+    ClipboardImageResult, ClipboardPlatform, CommandRunner, IMAGE_PASTE_MAX_BYTES,
+    SystemCommandRunner, read_image_data, read_text_data,
 };
 use crate::keys::Action;
 use crate::state::input::char_to_byte_index;
@@ -42,20 +42,32 @@ pub fn handle_paste_clipboard_with_runner(
     platform: ClipboardPlatform,
     now: Instant,
 ) -> Vec<Action> {
-    if let ClipboardImageResult::Image(_) = read_image_data(runner, platform) {
-        return handle_paste_image_with_runner(state, true, runner, platform, now);
-    }
-    match read_text_data(runner, platform) {
-        Some(text) => handle_paste_with_runner(state, text, runner, platform, now),
-        None => {
-            state.push_toast(
-                ToastLevel::Info,
-                "Clipboard is empty".to_string(),
-                None,
-                now,
-            );
-            vec![]
+    match read_image_data(runner, platform) {
+        ClipboardImageResult::Image(bytes) => {
+            if matches!(state.focus, Focus::Overlay(_)) {
+                log::warn!("paste image rejected: overlay active");
+                state.push_toast(
+                    ToastLevel::Warn,
+                    "Cannot paste image".to_string(),
+                    Some("Close the open overlay before pasting images".to_string()),
+                    now,
+                );
+                return vec![];
+            }
+            handle_paste_image_bytes(state, bytes, now)
         }
+        _ => match read_text_data(runner, platform) {
+            Some(text) => handle_paste_with_runner(state, text, runner, platform, now),
+            None => {
+                state.push_toast(
+                    ToastLevel::Info,
+                    "Clipboard is empty".to_string(),
+                    None,
+                    now,
+                );
+                vec![]
+            }
+        },
     }
 }
 
@@ -84,49 +96,67 @@ pub fn handle_paste_with_runner(
         return handle_paste_image_with_runner(state, false, runner, platform, now);
     }
 
+    // A menu accepts pasted text only where text input is live: an Edit-mode
+    // buffer or a filter line (§3.2). It is checked before the match —
+    // `view_for` needs a shared `&state`, which the `&mut` arm borrow blocks.
+    let mut menu_remote_ms = None;
+    let menu_takes_paste = if let Focus::Overlay(Overlay::Menu { stack, ui }) = &state.focus {
+        match &ui.mode {
+            crate::ui::menu::MenuMode::Edit { .. } => true,
+            _ => {
+                stack.current().is_some() && {
+                    let view = crate::ui::menu::view_for(stack, state, ui);
+                    if let Some(crate::ui::menu::FilterMode::Remote { debounce_ms }) = view.filter {
+                        menu_remote_ms = Some(debounce_ms);
+                    }
+                    crate::ui::menu::shows_filter(&view)
+                }
+            }
+        }
+    } else {
+        false
+    };
+
     match &mut state.focus {
-        Focus::Overlay(Overlay::ModelPicker { .. }) => {
-            crate::ui::model_picker_keys::paste(state, &text);
-            vec![]
-        }
-        Focus::Overlay(Overlay::LoginPicker { query, index }) => {
-            paste_into_filter(query, index, &text);
+        Focus::Overlay(Overlay::ModelPalette { palette }) => {
+            palette.push_str(&flatten_single_line(&text, FILTER_MAX_CHARS));
             state.dirty = true;
             vec![]
         }
-        Focus::Overlay(Overlay::SessionPicker { query, index }) => {
-            paste_into_filter(query, index, &text);
-            state.dirty = true;
-            vec![]
-        }
-        Focus::Overlay(Overlay::ConfigPicker) => {
-            if let Some(ref mut edit) = state.config_view.editing {
-                let flattened = flatten_single_line(&text);
-                let count = flattened.chars().count();
-                let byte_idx = char_to_byte_index(&edit.buffer, edit.cursor);
-                edit.buffer.insert_str(byte_idx, &flattened);
-                edit.cursor += count;
-                state.config_view.error = None;
-            } else {
-                let flattened = flatten_single_line(&text);
-                state.config_view.query.push_str(&flattened);
-                state.config_view.selected = 0;
-                state.config_view.scroll_offset = 0;
-                state.config_view.error = None;
+        Focus::Overlay(Overlay::Menu { ui, .. }) if menu_takes_paste => {
+            let flattened = flatten_single_line(&text, PASTE_MAX_CHARS);
+            match &mut ui.mode {
+                crate::ui::menu::MenuMode::Edit { buffer, cursor } => {
+                    let count = flattened.chars().count();
+                    let byte_idx = char_to_byte_index(buffer, *cursor);
+                    buffer.insert_str(byte_idx, &flattened);
+                    *cursor += count;
+                }
+                _ => {
+                    let available = FILTER_MAX_CHARS.saturating_sub(ui.query.chars().count());
+                    let to_insert: String = flattened.chars().take(available).collect();
+                    ui.query.push_str(&to_insert);
+                    ui.cursor = crate::ui::menu::RowId::default();
+                    // A remote filter owes the daemon the pasted query — the
+                    // same debounce keystrokes arm (§3.2).
+                    if !to_insert.is_empty()
+                        && let Some(ms) = menu_remote_ms
+                    {
+                        ui.remote_at = Some(now + std::time::Duration::from_millis(ms));
+                    }
+                }
             }
             state.dirty = true;
             vec![]
         }
         Focus::Overlay(_) => {
-            // Overlays without a text/filter box (EffortPicker, ModePicker, Files, McpPicker, etc.)
-            // ignore pastes so text does not leak into the hidden prompt.
+            // Overlays without a text/filter box (EffortPicker, ModePicker,
+            // RailOverlay, a menu without a live filter) ignore pastes so text
+            // does not leak into the hidden prompt.
             vec![]
         }
-        Focus::Normal | Focus::Panel { .. } | Focus::SelectAgent { .. } | Focus::BgList { .. } => {
-            if matches!(
-                state.focus,
-                Focus::SelectAgent { .. } | Focus::BgList { .. }
-            ) {
+        Focus::Normal | Focus::Panel { .. } | Focus::SelectAgent { .. } => {
+            if matches!(state.focus, Focus::SelectAgent { .. }) {
                 state.focus = Focus::Normal;
             }
             paste_into_prompt(state, text, now);
@@ -136,56 +166,79 @@ pub fn handle_paste_with_runner(
     }
 }
 
-/// Pastes text into an overlay's single-line filter box.
-fn paste_into_filter(query: &mut String, index: &mut usize, text: &str) {
-    let flattened = flatten_single_line(text);
-    let available = FILTER_MAX_CHARS.saturating_sub(query.chars().count());
-    let to_insert: String = flattened.chars().take(available).collect();
-    query.push_str(&to_insert);
-    *index = 0;
+fn flatten_single_line(text: &str, cap: usize) -> String {
+    let mut out = String::new();
+    let mut kept = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            if kept == cap {
+                break;
+            }
+            out.push(' ');
+            kept += 1;
+        }
+        for ch in line.chars() {
+            if kept == cap {
+                break;
+            }
+            out.push(ch);
+            kept += 1;
+        }
+    }
+    out
 }
 
-/// Flattens multi-line text into a single line suitable for filter boxes.
-fn flatten_single_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+fn normalize_paste_prefix(text: &str, cap: usize) -> (String, usize, bool) {
+    let mut out = String::new();
+    let mut kept = 0usize;
+    let mut total = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let ch = if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            '\n'
+        } else {
+            ch
+        };
+        total += 1;
+        if kept < cap {
+            out.push(ch);
+            kept += 1;
+        }
+    }
+    (out, total, total > cap)
 }
 
 /// Pastes text into `state.input`, enforcing size caps and respecting vim mode.
 fn paste_into_prompt(state: &mut AppState, text: String, now: Instant) {
-    // Drag-and-drop of an image file arrives as a bracketed paste of its path.
+    // Drag-and-drop of an image file arrives as a bracketed paste of its path:
+    // it goes through the same `[Image N]` paste-token path as a clipboard image.
     if let Some(path) = crate::attachments::image_path_from_paste(&text) {
-        state.prune_attachments();
-        match state.attachments.add_file(&path) {
-            Ok(chip) => {
-                insert_chip(state, &chip);
-                state.push_toast(
-                    ToastLevel::Info,
-                    "Image attached".to_string(),
-                    Some(path.display().to_string()),
-                    now,
-                );
-                return;
-            }
-            Err(err) => {
-                log::warn!("dropped image {} not attached: {err}", path.display());
-                state.push_toast(
-                    ToastLevel::Warn,
-                    "Cannot attach dropped image".to_string(),
-                    Some(err.to_string()),
-                    now,
-                );
-                // Fall through: paste the path as text.
-            }
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() <= IMAGE_PASTE_MAX_BYTES as u64 => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    handle_paste_image_bytes(state, bytes, now);
+                    return;
+                }
+                Err(err) => log::warn!("dropped image {} not read: {err}", path.display()),
+            },
+            Ok(meta) => log::warn!(
+                "dropped image {} too large ({} bytes); pasting the path as text",
+                path.display(),
+                meta.len()
+            ),
+            Err(err) => log::warn!("dropped image {} not read: {err}", path.display()),
         }
+        // Fall through: paste the path as text.
     }
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let total_chars = normalized.chars().count();
-
-    let paste_content = if total_chars > PASTE_MAX_CHARS {
+    let (paste_content, total_chars, truncated) = normalize_paste_prefix(&text, PASTE_MAX_CHARS);
+    if truncated {
         log::warn!("pasted text truncated from {total_chars} to {PASTE_MAX_CHARS} chars");
         state.push_toast(
             ToastLevel::Warn,
@@ -193,13 +246,14 @@ fn paste_into_prompt(state: &mut AppState, text: String, now: Instant) {
             Some(format!("Original was {total_chars} chars")),
             now,
         );
-        normalized.chars().take(PASTE_MAX_CHARS).collect()
-    } else {
-        normalized
-    };
+    }
 
     if state.config.ui.vim && state.focus == Focus::Normal {
-        apply_vim_paste(&mut state.vim, &mut state.input, &paste_content);
+        apply_vim_paste(
+            &mut state.session.vim,
+            &mut state.session.input,
+            &paste_content,
+        );
     } else {
         state.input.insert_str(&paste_content);
     }
@@ -279,7 +333,6 @@ pub fn handle_paste_image_with_runner(
     platform: ClipboardPlatform,
     now: Instant,
 ) -> Vec<Action> {
-    // If an overlay is active, pasting an image into it is invalid.
     if matches!(state.focus, Focus::Overlay(_)) {
         log::warn!("paste image rejected: overlay active");
         if explicit {
@@ -293,30 +346,8 @@ pub fn handle_paste_image_with_runner(
         return vec![];
     }
 
-    let result = read_image_data(runner, platform);
-
-    match result {
-        ClipboardImageResult::Image(bytes) => match state.attach_bytes(&bytes, None) {
-            Ok(chip) => {
-                insert_chip(state, &chip);
-                state.push_toast(
-                    ToastLevel::Info,
-                    "Image attached".to_string(),
-                    Some("Sent with your message. Backspace on the chip removes it.".to_string()),
-                    now,
-                );
-                state.dirty = true;
-            }
-            Err(err) => {
-                log::warn!("clipboard image paste failed: {err}");
-                state.push_toast(
-                    ToastLevel::Error,
-                    "Cannot attach pasted image".to_string(),
-                    Some(err.to_string()),
-                    now,
-                );
-            }
-        },
+    match read_image_data(runner, platform) {
+        ClipboardImageResult::Image(bytes) => handle_paste_image_bytes(state, bytes, now),
         ClipboardImageResult::NoImage => {
             log::debug!("clipboard image paste: no image found in clipboard");
             if explicit {
@@ -327,6 +358,7 @@ pub fn handle_paste_image_with_runner(
                     now,
                 );
             }
+            vec![]
         }
         ClipboardImageResult::HelperMissing(msg) => {
             log::warn!("clipboard image paste failed: helper missing: {msg}");
@@ -338,20 +370,55 @@ pub fn handle_paste_image_with_runner(
                     now,
                 );
             }
+            vec![]
         }
     }
-
-    vec![]
 }
 
-/// Inserts an image chip (plus a trailing space) at the prompt cursor, vim-aware.
-fn insert_chip(state: &mut AppState, chip: &str) {
-    let token = format!("{chip} ");
-    if state.config.ui.vim && state.focus == Focus::Normal {
-        apply_vim_paste(&mut state.vim, &mut state.input, &token);
-    } else {
-        state.input.insert_str(&token);
+fn handle_paste_image_bytes(state: &mut AppState, bytes: Vec<u8>, now: Instant) -> Vec<Action> {
+    if bytes.len() > IMAGE_PASTE_MAX_BYTES {
+        state.push_toast(
+            ToastLevel::Warn,
+            "Pasted image is too large".to_string(),
+            Some(format!(
+                "Maximum image size is {} bytes",
+                IMAGE_PASTE_MAX_BYTES
+            )),
+            now,
+        );
+        return vec![];
     }
+    match state.pasted_images.create_image_file(&bytes) {
+        Ok(record) => {
+            let token = format!("{} ", record.token_label());
+            if state.config.ui.vim && state.focus == Focus::Normal {
+                apply_vim_paste(&mut state.session.vim, &mut state.session.input, &token);
+            } else {
+                state.input.insert_str(&token);
+            }
+            state.push_toast_linked(
+                ToastLevel::Info,
+                format!("Image pasted as {}", record.token_label()),
+                Some(
+                    "Sent as an image attachment with the prompt; remove the token to discard."
+                        .to_string(),
+                ),
+                now,
+                record.token_label(),
+            );
+            state.dirty = true;
+        }
+        Err(err) => {
+            log::warn!("clipboard image paste failed to save file: {err}");
+            state.push_toast(
+                ToastLevel::Error,
+                "Failed to save pasted image".to_string(),
+                Some(err.to_string()),
+                now,
+            );
+        }
+    }
+    vec![]
 }
 
 /// Cleans up any unreferenced pasted images from disk.

@@ -6,7 +6,11 @@ use std::collections::BTreeMap;
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
+use crate::color::{GREY_ROLES, NAMED_ROLES};
+pub use crate::color::{ansi_grey, ansi_hue, parse_color, rgb_to_ansi16};
+pub use crate::glyphs::Glyphs;
 pub use crate::palettes::builtin_palettes;
+use crate::theme_derive::{derive_border, derive_surface, relative_luminance};
 
 /// Serializable color palette. Role names match `Theme` fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +52,44 @@ pub struct Theme {
     pub bash_operator: Style,
     pub bash_variable: Style,
     pub bash_arg: Style,
+    /// Background of a full-width band (the user-message plaque). Derived from
+    /// `selected_bg` pulled towards `faint`, so a selection painted over a
+    /// band stays visible. Empty under ANSI-16 and mono: there is no band, and
+    /// the bar plus the bold text carry the plaque.
+    pub surface: Style,
+    /// Foreground of frames and borders (the prompt frame at rest, menus,
+    /// overlays). Derived between `faint` and `dim`.
+    pub border: Style,
+    /// Solid background of overlays, popups, menus, pickers and toasts, so a
+    /// translucent terminal background never shows through them. Derived
+    /// from `selected_bg` moved away from the text (darker on a dark
+    /// palette, lighter on a light one), so a selected row stays visible on
+    /// it. Empty under ANSI-16 and mono: overlays keep the terminal's own
+    /// background, as before.
+    pub panel: Style,
+    /// Background of a tool-call block while the call runs: the neutral
+    /// tool card (halfway between `panel` and `selected_bg`) tinted a little
+    /// towards `accent`, the running colour. Empty under ANSI-16 and mono;
+    /// the status glyph and its colour carry the state there.
+    pub tool_pending_bg: Style,
+    /// Background of a finished tool-call block: the tool card tinted a
+    /// little towards `green`. Empty under ANSI-16 and mono.
+    pub tool_success_bg: Style,
+    /// Background of a failed tool-call block: the tool card tinted towards
+    /// `red`, the strongest of the three tints. Empty under ANSI-16 and mono.
+    pub tool_error_bg: Style,
+    /// Background of the odd powerline segments of the status line: `panel`
+    /// moved a quarter of the way towards `faint`. Empty under ANSI-16 and
+    /// mono, where the segments are separated by their glyphs alone.
+    pub status_bg: Style,
+    /// Background of the even status-line segments: a shade further towards
+    /// `faint` than `status_bg`. Empty under ANSI-16 and mono.
+    pub status_bg_alt: Style,
 }
+
+/// Badge foregrounds: not pure black/white, which glare on most palettes.
+const BADGE_DARK: Color = Color::Rgb(0x16, 0x16, 0x16);
+const BADGE_LIGHT: Color = Color::Rgb(0xf6, 0xf6, 0xf4);
 
 /// Detects `COLORTERM` (`truecolor`/`24bit`) or `PACODE_COLOR=ansi|truecolor`.
 pub fn detect_truecolor() -> bool {
@@ -62,6 +103,41 @@ pub fn detect_truecolor() -> bool {
                 v.contains("truecolor") || v.contains("24bit")
             })
             .unwrap_or(false),
+    }
+}
+
+/// How much colour the terminal can show; renderers degrade in steps: RGB +
+/// background bands under `Truecolor` → ANSI-16 foregrounds → glyphs only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorMode {
+    /// `COLORTERM`/`PACODE_COLOR` = `truecolor`/`24bit`.
+    #[default]
+    Truecolor,
+    /// ANSI-16 only (`ui.color = ansi`, `PACODE_COLOR=ansi`, no truecolor).
+    Ansi,
+    /// No colour (`PACODE_COLOR=mono` or a non-empty `NO_COLOR`).
+    Mono,
+}
+
+impl ColorMode {
+    pub fn detect() -> Self {
+        match std::env::var("PACODE_COLOR").ok().as_deref() {
+            Some("mono") => Self::Mono,
+            Some("ansi") => Self::Ansi,
+            Some("truecolor") | Some("24bit") => Self::Truecolor,
+            _ if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) => Self::Mono,
+            _ if detect_truecolor() => Self::Truecolor,
+            _ => Self::Ansi,
+        }
+    }
+
+    pub fn from_setting(setting: &str, detected: Self) -> Self {
+        match setting.trim().to_ascii_lowercase().as_str() {
+            "ansi" => Self::Ansi,
+            "truecolor" | "24bit" => Self::Truecolor,
+            "mono" => Self::Mono,
+            _ => detected,
+        }
     }
 }
 
@@ -86,17 +162,36 @@ impl Theme {
             Self::ansi()
         };
 
+        // Under ANSI-16 a role's meaning picks its colour (see `NAMED_ROLES`,
+        // `GREY_ROLES`): the hexes the fixed roles use, so a syntax role in
+        // the same hex lands on the same colour.
+        let fixed: Vec<((u8, u8, u8), Color)> = NAMED_ROLES
+            .iter()
+            .filter_map(|(role, ansi)| match parse_color(p.colors.get(*role)?)? {
+                Color::Rgb(r, g, b) => Some(((r, g, b), *ansi)),
+                _ => None,
+            })
+            .collect();
         let resolve = |key: &str| -> Option<Color> {
             let raw = p.colors.get(key)?;
             let parsed = parse_color(raw)?;
-            if !truecolor {
-                match parsed {
-                    Color::Rgb(r, g, b) => Some(rgb_to_ansi16(r, g, b)),
-                    other => Some(other),
-                }
-            } else {
-                Some(parsed)
+            if truecolor {
+                return Some(parsed);
             }
+            let Color::Rgb(r, g, b) = parsed else {
+                // A named or indexed colour is already an ANSI choice.
+                return Some(parsed);
+            };
+            if GREY_ROLES.contains(&key) {
+                // `None` keeps `Theme::ansi()`'s grey ladder for the role.
+                return None;
+            }
+            let named = NAMED_ROLES.iter().find(|(role, _)| *role == key);
+            let shared = fixed.iter().find(|(rgb, _)| *rgb == (r, g, b));
+            Some(match (named, shared) {
+                (Some((_, ansi)), _) | (None, Some((_, ansi))) => *ansi,
+                (None, None) => ansi_hue(r, g, b),
+            })
         };
 
         let fg = resolve("fg")
@@ -167,8 +262,14 @@ impl Theme {
             .or_else(|| resolve("argument"))
             .map(|c| Style::default().fg(c))
             .unwrap_or(base.bash_arg);
+        let surface = resolve("surface")
+            .map(|c| Style::default().bg(c))
+            .unwrap_or_else(|| derive_surface(selected_bg, faint));
+        let border = resolve("border")
+            .map(|c| Style::default().fg(c))
+            .unwrap_or_else(|| derive_border(faint, dim));
 
-        Self {
+        let mut theme = Self {
             fg,
             dim,
             faint,
@@ -187,6 +288,27 @@ impl Theme {
             bash_operator,
             bash_variable,
             bash_arg,
+            surface,
+            border,
+            // Only the backgrounds, which `derive_backgrounds` sets next.
+            ..Self::mono()
+        };
+        theme.derive_backgrounds(p.light, resolve);
+        theme
+    }
+
+    /// A badge (plaque) in `tone`: the tone's colour as the background under a
+    /// contrasting bold foreground. The fallback follows the colour itself, so
+    /// a palette mixing RGB and named colours still degrades per badge: RGB →
+    /// background band; a named or indexed colour (ANSI-16) →
+    /// `REVERSED|BOLD`, which lets the terminal pick the contrast; no colour
+    /// (mono) → bold only, the glyph and the text are the marker.
+    pub fn badge(&self, tone: Style) -> Style {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        match tone.fg {
+            Some(Color::Rgb(r, g, b)) => bold.bg(Color::Rgb(r, g, b)).fg(contrast_fg(r, g, b)),
+            None | Some(Color::Reset) => bold,
+            Some(c) => bold.fg(c).add_modifier(Modifier::REVERSED),
         }
     }
 
@@ -206,10 +328,13 @@ impl Theme {
     /// ANSI-16 palette is monochrome still get colour this way.
     pub fn truecolor() -> Self {
         let rgb = |r: u8, g: u8, b: u8| Style::default().fg(Color::Rgb(r, g, b));
-        Self {
+        let selected_bg = Style::default().bg(Color::Rgb(0x1e, 0x24, 0x1c));
+        let dim = rgb(0x75, 0x77, 0x6f);
+        let faint = rgb(0x43, 0x46, 0x3f);
+        let mut theme = Self {
             fg: rgb(0xc9, 0xc7, 0xc0),
-            dim: rgb(0x75, 0x77, 0x6f),
-            faint: rgb(0x43, 0x46, 0x3f),
+            dim,
+            faint,
             accent: rgb(0xd9, 0x9b, 0x4e),
             green: rgb(0x96, 0xb3, 0x5d),
             cyan: rgb(0x6e, 0xa9, 0xbd),
@@ -219,7 +344,7 @@ impl Theme {
             bold: Style::default()
                 .fg(Color::Rgb(0xe7, 0xe5, 0xdd))
                 .add_modifier(Modifier::BOLD),
-            selected_bg: Style::default().bg(Color::Rgb(0x1e, 0x24, 0x1c)),
+            selected_bg,
             user_bar: rgb(0x6e, 0xa9, 0xbd),
             bash_command: rgb(0x6e, 0xa9, 0xbd).add_modifier(Modifier::BOLD),
             bash_flag: rgb(0x9a, 0x8b, 0xc4),
@@ -227,7 +352,13 @@ impl Theme {
             bash_operator: rgb(0xd9, 0x9b, 0x4e),
             bash_variable: rgb(0xf5, 0xc5, 0x42),
             bash_arg: rgb(0xc9, 0xc7, 0xc0),
-        }
+            surface: derive_surface(selected_bg, faint),
+            border: derive_border(faint, dim),
+            // Only the backgrounds, which `derive_backgrounds` sets next.
+            ..Self::mono()
+        };
+        theme.derive_backgrounds(false, |_| None);
+        theme
     }
 
     /// Plain ANSI-16 palette.
@@ -255,211 +386,59 @@ impl Theme {
             bash_operator: Style::default().fg(Color::Yellow),
             bash_variable: Style::default().fg(Color::Yellow),
             bash_arg: Style::default(),
+            surface: Style::default(),
+            border: Style::default().fg(Color::DarkGray),
+            panel: Style::default(),
+            tool_pending_bg: Style::default(),
+            tool_success_bg: Style::default(),
+            tool_error_bg: Style::default(),
+            status_bg: Style::default(),
+            status_bg_alt: Style::default(),
+        }
+    }
+
+    pub fn mono() -> Self {
+        Self {
+            fg: Style::default(),
+            dim: Style::default(),
+            faint: Style::default(),
+            accent: Style::default(),
+            green: Style::default(),
+            cyan: Style::default(),
+            red: Style::default(),
+            violet: Style::default(),
+            yellow: Style::default(),
+            bold: Style::default().add_modifier(Modifier::BOLD),
+            selected_bg: Style::default().add_modifier(Modifier::REVERSED),
+            user_bar: Style::default(),
+            bash_command: Style::default().add_modifier(Modifier::BOLD),
+            bash_flag: Style::default(),
+            bash_string: Style::default(),
+            bash_operator: Style::default(),
+            bash_variable: Style::default(),
+            bash_arg: Style::default(),
+            surface: Style::default(),
+            border: Style::default(),
+            panel: Style::default(),
+            tool_pending_bg: Style::default(),
+            tool_success_bg: Style::default(),
+            tool_error_bg: Style::default(),
+            status_bg: Style::default(),
+            status_bg_alt: Style::default(),
         }
     }
 }
 
-/// Parse a color string: `"#rrggbb"`, `"#rgb"`, a named ANSI colour, or an index `0-255`.
-pub fn parse_color(s: &str) -> Option<Color> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-
-    if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some(Color::Rgb(r, g, b));
-        } else if hex.len() == 3 {
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
-            return Some(Color::Rgb(r * 17, g * 17, b * 17));
-        }
-        return None;
-    }
-
-    if let Ok(idx) = s.parse::<u8>() {
-        return Some(Color::Indexed(idx));
-    }
-
-    let lower = s.to_ascii_lowercase();
-    match lower.as_str() {
-        "black" => Some(Color::Black),
-        "red" => Some(Color::Red),
-        "green" => Some(Color::Green),
-        "yellow" => Some(Color::Yellow),
-        "blue" => Some(Color::Blue),
-        "magenta" | "purple" => Some(Color::Magenta),
-        "cyan" => Some(Color::Cyan),
-        "gray" | "grey" => Some(Color::Gray),
-        "darkgray" | "dark_gray" | "dark-gray" | "darkgrey" => Some(Color::DarkGray),
-        "lightred" | "light_red" | "light-red" => Some(Color::LightRed),
-        "lightgreen" | "light_green" | "light-green" => Some(Color::LightGreen),
-        "lightyellow" | "light_yellow" | "light-yellow" => Some(Color::LightYellow),
-        "lightblue" | "light_blue" | "light-blue" => Some(Color::LightBlue),
-        "lightmagenta" | "light_magenta" | "light-magenta" => Some(Color::LightMagenta),
-        "lightcyan" | "light_cyan" | "light-cyan" => Some(Color::LightCyan),
-        "white" => Some(Color::White),
-        "reset" => Some(Color::Reset),
-        _ => None,
-    }
-}
-
-/// Map an RGB value to the nearest ANSI-16 colour using squared Euclidean distance.
-pub fn rgb_to_ansi16(r: u8, g: u8, b: u8) -> Color {
-    const ANSI_TABLE: [(Color, (u8, u8, u8)); 16] = [
-        (Color::Black, (0, 0, 0)),
-        (Color::Red, (128, 0, 0)),
-        (Color::Green, (0, 128, 0)),
-        (Color::Yellow, (128, 128, 0)),
-        (Color::Blue, (0, 0, 128)),
-        (Color::Magenta, (128, 0, 128)),
-        (Color::Cyan, (0, 128, 128)),
-        (Color::Gray, (192, 192, 192)),
-        (Color::DarkGray, (128, 128, 128)),
-        (Color::LightRed, (255, 0, 0)),
-        (Color::LightGreen, (0, 255, 0)),
-        (Color::LightYellow, (255, 255, 0)),
-        (Color::LightBlue, (0, 0, 255)),
-        (Color::LightMagenta, (255, 0, 255)),
-        (Color::LightCyan, (0, 255, 255)),
-        (Color::White, (255, 255, 255)),
-    ];
-
-    let mut best_color = Color::White;
-    let mut best_dist = u64::MAX;
-
-    for (color, (ar, ag, ab)) in ANSI_TABLE {
-        let dr = (r as i32) - (ar as i32);
-        let dg = (g as i32) - (ag as i32);
-        let db = (b as i32) - (ab as i32);
-        let dist = (dr * dr + dg * dg + db * db) as u64;
-        if dist < best_dist {
-            best_dist = dist;
-            best_color = color;
-        }
-    }
-
-    best_color
-}
-
-/// Glyphs with ASCII fallback (`ui.ascii_only`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Glyphs {
-    pub ascii: bool,
-    pub bar_full: &'static str,
-    pub bar_empty: &'static str,
-    pub running: &'static str,
-    pub pointer: &'static str,
-    pub ok: &'static str,
-    pub fail: &'static str,
-    pub main_dot: &'static str,
-    pub agent_dot: &'static str,
-    pub tool: &'static str,
-    pub prompt: &'static str,
-    pub check_done: &'static str,
-    pub check_active: &'static str,
-    pub check_pending: &'static str,
-    pub arrow_down: &'static str,
-    pub arrow_up: &'static str,
-    pub arrow_right: &'static str,
-    pub dot_sep: &'static str,
-    pub ellipsis: &'static str,
-    pub vline: &'static str,
-    pub hline: &'static str,
-    pub chevrons: &'static str,
-    pub disabled: &'static str,
-    pub stopped: &'static str,
-}
-
-impl Glyphs {
-    pub fn new(ascii_only: bool) -> Self {
-        if ascii_only {
-            Self {
-                ascii: true,
-                bar_full: "#",
-                bar_empty: "-",
-                running: "*",
-                pointer: ">",
-                ok: "+",
-                fail: "x",
-                main_dot: "@",
-                agent_dot: "o",
-                tool: "#",
-                prompt: ">",
-                check_done: "[x]",
-                check_active: "[*]",
-                check_pending: "[ ]",
-                arrow_down: "v",
-                arrow_up: "^",
-                arrow_right: "->",
-                dot_sep: " . ",
-                ellipsis: "...",
-                vline: "|",
-                hline: "-",
-                chevrons: ">>",
-                disabled: "o",
-                stopped: "-",
-            }
-        } else {
-            Self {
-                ascii: false,
-                bar_full: "▰",
-                bar_empty: "▱",
-                running: "◍",
-                pointer: "▸",
-                ok: "✓",
-                fail: "✗",
-                main_dot: "●",
-                agent_dot: "○",
-                tool: "▣",
-                prompt: "❯",
-                check_done: "[✓]",
-                check_active: "[•]",
-                check_pending: "[ ]",
-                arrow_down: "↓",
-                arrow_up: "↑",
-                arrow_right: "→",
-                dot_sep: " · ",
-                ellipsis: "…",
-                vline: "│",
-                hline: "─",
-                chevrons: "»",
-                disabled: "⊘",
-                stopped: "■",
-            }
-        }
-    }
-
-    /// Braille spinner frame for `frame` (`-\|/` under ASCII). A method rather
-    /// than a field because the glyph is a cycle, not a constant.
-    pub fn spinner(&self, frame: u64) -> &'static str {
-        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        const ASCII: [&str; 4] = ["-", "\\", "|", "/"];
-        if self.ascii {
-            ASCII[(frame as usize) % ASCII.len()]
-        } else {
-            FRAMES[(frame as usize) % FRAMES.len()]
-        }
-    }
-
-    /// `▰▰▰▰▰▱▱▱` for `percent` over `width` cells.
-    pub fn progress_bar(&self, percent: u8, width: usize) -> String {
-        let width = width.max(1);
-        let filled = ((percent.min(100) as usize) * width)
-            .div_ceil(100)
-            .min(width);
-        let mut out = String::with_capacity(width * 3);
-        for _ in 0..filled {
-            out.push_str(self.bar_full);
-        }
-        for _ in filled..width {
-            out.push_str(self.bar_empty);
-        }
-        out
+/// Near-black or near-white, whichever has the higher WCAG contrast ratio
+/// against `(r, g, b)`.
+fn contrast_fg(r: u8, g: u8, b: u8) -> Color {
+    let l = relative_luminance(r, g, b);
+    // Against black the ratio is (l + 0.05) / 0.05, against white
+    // 1.05 / (l + 0.05); black wins when the first is larger.
+    if (l + 0.05) * (l + 0.05) > 0.05 * 1.05 {
+        BADGE_DARK
+    } else {
+        BADGE_LIGHT
     }
 }
 

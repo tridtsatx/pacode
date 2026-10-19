@@ -1,0 +1,17 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Java, src)"
+---
+interface Tag 3-5
+  method value 4-4
+enum Level 7-7
+interface Repo 9-13
+  const LIMIT 10-10
+  method save 11-11
+  method flush 12-12
+class Point 15-15
+class Outer 17-23
+  class Inner 18-20
+    method m 19-19
+  method Outer 21-21
+  method count 22-22

@@ -165,14 +165,6 @@ pub(crate) fn gc_at_start(state: &Arc<SharedState>) {
     spawn_gc(state);
 }
 
-/// Last `max_chars` characters of a spool file (fallback for an evicted task).
-pub(crate) async fn spool_tail(path: &std::path::Path, max_chars: usize) -> String {
-    let content = tokio::fs::read(path).await.unwrap_or_default();
-    let text = String::from_utf8_lossy(&content);
-    let count = text.chars().count();
-    text.chars().skip(count.saturating_sub(max_chars)).collect()
-}
-
 #[cfg(test)]
 #[path = "retention_tests.rs"]
 mod retention_tests;

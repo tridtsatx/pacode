@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use pacode_types::{Config, Effort, Mode, ProviderConfig};
+use pacode_types::{Config, Effort, Mode, ModelFlags, ProviderConfig};
 use tempfile::tempdir;
 
 use crate::logging::{FileLogger, default_level, default_level_for, level_from_env};
@@ -37,8 +37,8 @@ effort = true
 yield_after_secs = 10
 stall_secs = 120
 
-[agents]
-max_live = 8
+[limits]
+max_provider_concurrency = 512
 
 [daemon]
 idle_timeout_secs = 600
@@ -93,7 +93,7 @@ fn parse_spec_example() {
     assert_eq!(cfg.exec.yield_after_secs, 10);
     assert_eq!(cfg.exec.stall_secs, 120);
 
-    assert_eq!(cfg.agents.max_live, 8);
+    assert_eq!(cfg.limits.max_provider_concurrency, 512);
 
     assert_eq!(cfg.daemon.idle_timeout_secs, 600);
 
@@ -140,8 +140,7 @@ fn defaults_from_empty_text() {
     assert_eq!(cfg.exec.max_tasks, 64);
     assert_eq!(cfg.exec.default_timeout_secs, 3600);
 
-    assert_eq!(cfg.agents.max_live, 16);
-    assert_eq!(cfg.agents.max_turns, 200);
+    assert_eq!(cfg.limits.max_provider_concurrency, 128);
 
     assert_eq!(cfg.daemon.idle_timeout_secs, 600);
 
@@ -161,6 +160,79 @@ fn defaults_from_empty_text() {
     assert_eq!(cfg.ui.transcript_cells, 500);
     assert!(!cfg.ui.hints.model);
     assert!(cfg.ui.hints.effort);
+}
+
+#[test]
+fn deprecated_agent_keys_load_without_overriding_inherited_defaults() {
+    let cfg = parse("[agents]\ndefault_model = \"legacy/model\"\ndefault_effort = \"max\"\n")
+        .expect("deprecated agent keys must remain loadable");
+
+    assert_eq!(cfg.agents.default_model, None);
+    assert_eq!(cfg.agents.default_effort, None);
+}
+
+#[test]
+fn dead_limit_keys_load_as_no_ops() {
+    // pacode caps no agents, no provider queue and no per-turn calls; a config
+    // still carrying those keys must load, and must fall back to the defaults.
+    let cfg = parse(
+        "[limits]\n\
+         max_logical_agents = 32\n\
+         max_provider_queue_items = 8192\n\
+         max_provider_queue_bytes = 134217728\n\
+         max_exec_calls_per_turn = 64\n\
+         max_tool_calls_per_turn = 512\n\
+         [agents]\n\
+         max_live = 24\n\
+         max_turns = 10000\n",
+    )
+    .expect("dead limit keys must remain loadable");
+
+    assert_eq!(cfg.limits.max_provider_concurrency, 128);
+}
+
+#[test]
+fn load_repairs_out_of_range_values_instead_of_refusing_the_file() {
+    // A config written against older bounds must still boot, with the value
+    // pulled to the nearest one the runtime accepts.
+    let cfg = parse(
+        "[limits]\nmax_provider_concurrency = 4096\n\
+         [provider]\nmax_retries = 101\n\
+         [exec]\nmax_tasks = 0\n\
+         [ui]\nups = 900\n\
+         [context]\ntool_output_cap_chars = 500000\n",
+    )
+    .expect("out-of-range values must be repaired, not rejected");
+
+    assert_eq!(cfg.limits.max_provider_concurrency, 1_024);
+    assert_eq!(cfg.provider.max_retries, 100);
+    assert_eq!(cfg.exec.max_tasks, 1);
+    assert_eq!(cfg.ui.ups, pacode_types::Ups::Fixed(240));
+    assert_eq!(cfg.context.tool_output_cap_chars, 128_000);
+
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+    fs::write(
+        &paths.config_file,
+        "[limits]\nmax_provider_concurrency = 0\n",
+    )
+    .expect("write stale config");
+    let loaded = load(&paths).expect("a stale value must not stop the daemon from booting");
+    assert_eq!(loaded.limits.max_provider_concurrency, 1);
+}
+
+#[test]
+fn load_still_rejects_a_config_it_cannot_read() {
+    // Repairing a number is not the same as accepting a broken file: a value
+    // with the wrong type is a typo, and the user needs to hear about it.
+    for source in [
+        "[provider]\nmax_retries = \"many\"\n",
+        "[exec]\nmax_tasks = \"lots\"\n",
+        "[ui]\nups = 10.5\n",
+        "[ui]\nanimation = \"wobbly\"\n",
+    ] {
+        assert!(parse(source).is_err(), "source must be rejected: {source}");
+    }
 }
 
 #[test]
@@ -558,10 +630,17 @@ fn prefs_round_trip() {
     // Save prefs
     let custom = crate::Prefs {
         marketplace: None,
+        recent_models: vec!["openrouter/openai/gpt-5.5".to_string()],
         model: Some("openrouter/openai/gpt-5.5".to_string()),
         effort: Some(Effort::Max),
         mode: Some(Mode::Bypass),
-        recent_models: vec!["openrouter/openai/gpt-5.5".to_string()],
+        model_flags: std::collections::HashMap::from([(
+            "openrouter/openai/gpt-5.5".to_string(),
+            ModelFlags {
+                zdr_capable: true,
+                favorite: true,
+            },
+        )]),
     };
     crate::save_prefs(&paths, &custom).expect("save_prefs must succeed");
 
@@ -574,6 +653,8 @@ fn prefs_round_trip() {
     assert!(text.contains("model = \"openrouter/openai/gpt-5.5\""));
     assert!(text.contains("effort = \"max\""));
     assert!(text.contains("mode = \"bypass\""));
+    assert!(text.contains("zdr_capable = true"), "prefs.toml: {text}");
+    assert!(text.contains("favorite = true"), "prefs.toml: {text}");
 }
 
 #[test]
@@ -652,6 +733,26 @@ fn test_ups_toml_parsing() {
     // 5. Invalid values must fail
     assert!(parse("[ui]\nups = \"invalid\"\n").is_err());
     assert!(parse("[ui]\nups = -1\n").is_err());
+}
+
+#[test]
+fn test_animation_toml_parsing() {
+    // Default when omitted.
+    let cfg = parse("[ui]\nmouse = false\n").expect("parse without animation");
+    assert_eq!(cfg.ui.animation, pacode_types::AnimationMode::Smooth);
+
+    for (raw, want) in [
+        ("smooth", pacode_types::AnimationMode::Smooth),
+        ("balanced", pacode_types::AnimationMode::Balanced),
+        ("eco", pacode_types::AnimationMode::Eco),
+    ] {
+        let cfg = parse(&format!("[ui]\nanimation = \"{raw}\"\n")).expect("parse animation mode");
+        assert_eq!(cfg.ui.animation, want);
+    }
+
+    // Unknown values must fail.
+    assert!(parse("[ui]\nanimation = \"wobbly\"\n").is_err());
+    assert!(parse("[ui]\nanimation = 3\n").is_err());
 }
 
 #[test]
@@ -761,19 +862,339 @@ fn a_quiet_setting_also_silences_dependencies() {
 #[test]
 fn capacity_keys_default_and_round_trip() {
     let defaults = parse("").expect("empty toml should parse");
-    assert_eq!(defaults.agents.max_live, 16);
     assert_eq!(defaults.provider.max_concurrent, 64);
     assert_eq!(defaults.context.injection_budget_chars, 24_000);
 
-    let explicit = parse(
-        "[provider]\nmax_concurrent = 0\n\n[agents]\nmax_live = 256\n\n[context]\ninjection_budget_chars = 1000\n",
-    )
-    .expect("explicit capacity keys should parse");
+    let explicit =
+        parse("[provider]\nmax_concurrent = 0\n\n[context]\ninjection_budget_chars = 1000\n")
+            .expect("explicit capacity keys should parse");
     assert_eq!(explicit.provider.max_concurrent, 0);
-    assert_eq!(explicit.agents.max_live, 256);
     assert_eq!(explicit.context.injection_budget_chars, 1000);
 
     let text = toml::to_string(&explicit).expect("config should serialize");
     let back = parse(&text).expect("serialized config should re-parse");
     assert_eq!(back, explicit);
+}
+
+// ---------------------------------------------------------------------------
+// Split config files: config.toml + providers.toml + keybindings.toml
+// ---------------------------------------------------------------------------
+
+fn providers_file(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .config_file
+        .parent()
+        .expect("config parent")
+        .join("providers.toml")
+}
+
+fn keybindings_file(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .config_file
+        .parent()
+        .expect("config parent")
+        .join("keybindings.toml")
+}
+
+fn backup_file(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .config_file
+        .parent()
+        .expect("config parent")
+        .join("config.toml.bak")
+}
+
+#[test]
+fn load_merges_three_files() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    fs::write(
+        &paths.config_file,
+        "zdr = \"always\"\n[ui]\nmouse = false\n",
+    )
+    .expect("write config");
+    fs::write(
+        providers_file(&paths),
+        "[providers.acme]\nbase_url = \"https://acme.example/v1\"\n",
+    )
+    .expect("write providers");
+    fs::write(
+        keybindings_file(&paths),
+        "[keys]\nfollow_agent = \"ctrl+a\"\n",
+    )
+    .expect("write keybindings");
+
+    let cfg = load(&paths).expect("merged load must succeed");
+    assert!(!cfg.ui.mouse);
+    assert_eq!(cfg.zdr, pacode_types::ZdrMode::Always);
+    assert_eq!(
+        cfg.providers.get("acme").map(|p| p.base_url.as_str()),
+        Some("https://acme.example/v1")
+    );
+    assert_eq!(
+        cfg.keys.bindings.get("follow_agent").map(|s| s.as_str()),
+        Some("ctrl+a")
+    );
+
+    // Merging must not create backup files.
+    assert!(!backup_file(&paths).exists());
+}
+
+#[test]
+fn load_missing_sibling_files_ok() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+    fs::write(&paths.config_file, "[ui]\nascii_only = true\n").expect("write config");
+
+    let cfg = load(&paths).expect("load with only config.toml must succeed");
+    assert!(cfg.ui.ascii_only);
+    assert!(cfg.providers.is_empty());
+    assert!(cfg.keys.bindings.is_empty());
+}
+
+#[test]
+fn load_migrates_legacy_providers_and_keys() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    let legacy = r#"
+[provider]
+default = "legacy/model-1"
+
+[providers.legacy]
+base_url = "https://legacy.example/v1"
+api_key_env = "LEGACY_KEY"
+
+[keys]
+follow_agent = "alt+f"
+
+[ui]
+mouse = false
+"#;
+    fs::write(&paths.config_file, legacy).expect("write legacy config");
+
+    let cfg = load(&paths).expect("migrating load must succeed");
+    assert_eq!(cfg.provider.default.as_deref(), Some("legacy/model-1"));
+    assert_eq!(
+        cfg.providers.get("legacy").map(|p| p.base_url.as_str()),
+        Some("https://legacy.example/v1")
+    );
+    assert_eq!(
+        cfg.keys.bindings.get("follow_agent").map(|s| s.as_str()),
+        Some("alt+f")
+    );
+    assert!(!cfg.ui.mouse);
+
+    // Three files exist afterwards.
+    let providers_text = fs::read_to_string(providers_file(&paths)).expect("providers.toml");
+    assert!(
+        providers_text.contains("[providers.legacy]"),
+        "{providers_text}"
+    );
+    assert!(providers_text.contains("https://legacy.example/v1"));
+
+    let keys_text = fs::read_to_string(keybindings_file(&paths)).expect("keybindings.toml");
+    assert!(keys_text.contains("[keys]"), "{keys_text}");
+    assert!(keys_text.contains("follow_agent"));
+
+    // config.toml no longer carries the moved sections but keeps the rest.
+    let stripped = fs::read_to_string(&paths.config_file).expect("stripped config.toml");
+    assert!(!stripped.contains("[providers"), "{stripped}");
+    assert!(!stripped.contains("[keys]"), "{stripped}");
+    assert!(stripped.contains("mouse = false"), "{stripped}");
+    assert!(stripped.contains("[provider]"), "{stripped}");
+
+    // Original preserved verbatim as .bak.
+    let bak = fs::read_to_string(backup_file(&paths)).expect("config.toml.bak");
+    assert_eq!(bak, legacy);
+}
+
+#[test]
+fn migration_prefers_split_file_values_on_conflict() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    fs::write(
+        &paths.config_file,
+        "[providers.acme]\nbase_url = \"https://old.example/v1\"\ncatalog = true\n",
+    )
+    .expect("write legacy config");
+    fs::write(
+        providers_file(&paths),
+        "[providers.acme]\nbase_url = \"https://new.example/v1\"\n",
+    )
+    .expect("write existing providers.toml");
+
+    let cfg = load(&paths).expect("load must succeed");
+    let acme = cfg.providers.get("acme").expect("acme provider");
+    // New file wins on conflicting keys…
+    assert_eq!(acme.base_url, "https://new.example/v1");
+    // …while legacy keys not defined there are merged in.
+    assert!(acme.catalog);
+
+    let providers_text = fs::read_to_string(providers_file(&paths)).expect("providers.toml");
+    assert!(providers_text.contains("https://new.example/v1"));
+    assert!(!providers_text.contains("https://old.example"));
+    assert!(
+        providers_text.contains("catalog = true"),
+        "{providers_text}"
+    );
+}
+
+#[test]
+fn migration_is_idempotent() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    fs::write(
+        &paths.config_file,
+        "[providers.p]\nbase_url = \"https://p.example/v1\"\n[keys]\nquit = \"ctrl+q\"\n",
+    )
+    .expect("write legacy config");
+
+    load(&paths).expect("first load migrates");
+
+    let config_after = fs::read_to_string(&paths.config_file).expect("config after");
+    let providers_after = fs::read_to_string(providers_file(&paths)).expect("providers after");
+    let keys_after = fs::read_to_string(keybindings_file(&paths)).expect("keys after");
+    let bak_after = fs::read_to_string(backup_file(&paths)).expect("bak after");
+
+    // Second load must not rewrite anything (no providers/keys left in config.toml).
+    load(&paths).expect("second load is a no-op");
+
+    assert_eq!(
+        fs::read_to_string(&paths.config_file).expect("config"),
+        config_after
+    );
+    assert_eq!(
+        fs::read_to_string(providers_file(&paths)).expect("providers"),
+        providers_after
+    );
+    assert_eq!(
+        fs::read_to_string(keybindings_file(&paths)).expect("keys"),
+        keys_after
+    );
+    assert_eq!(
+        fs::read_to_string(backup_file(&paths)).expect("bak"),
+        bak_after
+    );
+}
+
+#[test]
+fn update_config_value_routes_to_split_files() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    crate::update_config_value(
+        &paths,
+        "providers.acme.base_url",
+        toml::Value::String("https://acme.example/v1".to_string()),
+    )
+    .expect("route providers.* to providers.toml");
+    assert!(
+        providers_file(&paths).exists(),
+        "providers.toml must be created"
+    );
+    let providers_text = fs::read_to_string(providers_file(&paths)).expect("read providers");
+    assert!(providers_text.contains("https://acme.example/v1"));
+    assert!(
+        !paths.config_file.exists()
+            || !fs::read_to_string(&paths.config_file)
+                .expect("config")
+                .contains("acme"),
+        "providers.* must not land in config.toml"
+    );
+
+    crate::update_config_value(
+        &paths,
+        "keys.follow_agent",
+        toml::Value::String("ctrl+a".to_string()),
+    )
+    .expect("route keys.* to keybindings.toml");
+    let keys_text = fs::read_to_string(keybindings_file(&paths)).expect("read keybindings");
+    assert!(keys_text.contains("ctrl+a"));
+
+    crate::update_config_value(&paths, "ui.mouse", toml::Value::Boolean(false))
+        .expect("route ui.* to config.toml");
+    crate::update_config_value(&paths, "zdr", toml::Value::String("always".to_string()))
+        .expect("route zdr to config.toml");
+    let config_text = fs::read_to_string(&paths.config_file).expect("read config");
+    assert!(config_text.contains("mouse = false"), "{config_text}");
+    assert!(config_text.contains("zdr"), "{config_text}");
+
+    let cfg = load(&paths).expect("merged load");
+    assert_eq!(
+        cfg.providers.get("acme").map(|p| p.base_url.as_str()),
+        Some("https://acme.example/v1")
+    );
+    assert_eq!(
+        cfg.keys.bindings.get("follow_agent").map(|s| s.as_str()),
+        Some("ctrl+a")
+    );
+    assert!(!cfg.ui.mouse);
+    assert_eq!(cfg.zdr, pacode_types::ZdrMode::Always);
+}
+
+#[test]
+fn remove_config_value_routes_to_split_files() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    crate::update_config_value(
+        &paths,
+        "keys.follow_agent",
+        toml::Value::String("ctrl+a".to_string()),
+    )
+    .expect("seed keybinding");
+    crate::remove_config_value(&paths, "keys.follow_agent").expect("remove binding");
+
+    let keys_text = fs::read_to_string(keybindings_file(&paths)).expect("read keybindings");
+    assert!(!keys_text.contains("follow_agent"), "{keys_text}");
+
+    let cfg = load(&paths).expect("load after remove");
+    assert_eq!(cfg.keys.bindings.get("follow_agent"), None);
+}
+
+#[test]
+fn migration_notice_is_reported_once() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+
+    // No marker -> no notice.
+    assert_eq!(crate::take_migration_notice(&paths), None);
+
+    // Marker -> the message is delivered exactly once.
+    let marker = paths
+        .config_file
+        .parent()
+        .expect("config dir")
+        .join("config.toml.migrated");
+    fs::write(&marker, "moved [providers]\n").expect("write marker");
+    assert_eq!(
+        crate::take_migration_notice(&paths).as_deref(),
+        Some("moved [providers]")
+    );
+    assert_eq!(crate::take_migration_notice(&paths), None);
+}
+
+#[test]
+fn migration_leaves_notice_marker() {
+    let dir = tempdir().expect("tempdir");
+    let paths = Paths::under(dir.path());
+    fs::write(
+        &paths.config_file,
+        "[providers.acme]\nbase_url = \"https://acme.example/v1\"\n",
+    )
+    .expect("write legacy config");
+
+    load(&paths).expect("migrating load");
+    // The migration drops the marker for the next attach to consume.
+    let notice = crate::take_migration_notice(&paths);
+    assert!(
+        notice
+            .as_deref()
+            .is_some_and(|n| n.contains("providers.toml")),
+        "expected a migration notice, got {notice:?}"
+    );
 }

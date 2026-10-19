@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pacode_types::{AgentId, SessionId};
+use pacode_types::{AgentId, CallId, SessionId};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -20,9 +20,18 @@ pub struct TaskSpec {
     pub background: bool,
     /// Hard timeout; the task is killed and marked failed when it elapses.
     pub timeout: Option<Duration>,
-    /// Cancels the wait for a free process slot (admission queue); `None` waits as long
-    /// as it takes. Only the wait is cancelled: a started task is stopped with `kill`.
+    /// Opts into the admission queue: with a token, a spawn that finds every
+    /// `exec.max_tasks` slot busy waits (FIFO) for one, and the token cancels that
+    /// wait; with `None` such a spawn fails at once with `ExecError::TooManyTasks`.
+    /// Only the wait is cancelled: a started task is stopped with `kill`.
     pub cancel: Option<CancellationToken>,
+    /// The tool call waiting on this task in the foreground, whose transcript
+    /// row its live output belongs to. `None`: nobody draws it live.
+    pub call: Option<CallId>,
+    /// For a foreground task: if the call waiting on it is dropped while it
+    /// runs, kill it instead of moving it to the background — a read whose
+    /// output only that call wanted (see `ForegroundGuard`).
+    pub kill_if_abandoned: bool,
 }
 
 impl TaskSpec {
@@ -42,6 +51,8 @@ impl TaskSpec {
             background: false,
             timeout: None,
             cancel: None,
+            call: None,
+            kill_if_abandoned: false,
         }
     }
 }

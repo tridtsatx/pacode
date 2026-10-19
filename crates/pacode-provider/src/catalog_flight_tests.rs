@@ -52,6 +52,7 @@ async fn fifty_concurrent_list_models_make_one_get() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..ProviderConfig::default()
     };
     let provider = Arc::new(
         OpenAiCompat::new(

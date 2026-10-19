@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
+use base64::Engine;
 use pacode_types::{
-    CallId, ContentBlock, Effort, Message, ModelConfig, ProviderConfig, ProviderDefaults, Role,
-    ToolDefinition,
+    CallId, ContentBlock, Effort, ImageSource, Message, ModelConfig, ProviderConfig,
+    ProviderDefaults, Role, ToolDefinition,
 };
 use serde_json::json;
 
-use crate::{CompletionRequest, OpenAiCompat, Provider, ProviderError, redact};
+use crate::{CompletionRequest, OpenAiCompat, Provider, ProviderError, redact, shared};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn make_provider(
@@ -28,6 +29,7 @@ fn make_provider(
         extra_body,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
     OpenAiCompat::new(
         "openai",
@@ -96,7 +98,7 @@ fn test_build_body_messages_conversion() {
         model: "gpt-4o".to_string(),
         system_static: "System".to_string(),
         system_dynamic: String::new(),
-        messages: vec![
+        messages: shared(vec![
             Message {
                 role: Role::User,
                 content: vec![
@@ -142,7 +144,7 @@ fn test_build_body_messages_conversion() {
                 }],
                 meta: pacode_types::MessageMeta::default(),
             },
-        ],
+        ]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(4096),
@@ -239,6 +241,8 @@ fn test_build_body_reasoning_effort_and_map() {
             display_name: None,
             context_window: None,
             reasoning: Some(true),
+            efforts: None,
+            ..Default::default()
         }],
         None,
         effort_map,
@@ -347,6 +351,8 @@ fn test_model_info() {
             display_name: Some("Custom Display".to_string()),
             context_window: Some(64_000),
             reasoning: Some(true),
+            efforts: None,
+            ..Default::default()
         }],
         catalog: false,
         context_window: Some(128_000),
@@ -355,6 +361,7 @@ fn test_model_info() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = OpenAiCompat::new("my-openai", cfg, ProviderDefaults::default(), None, pricing)
@@ -394,12 +401,16 @@ async fn test_list_models_catalog_false() {
                 display_name: None,
                 context_window: None,
                 reasoning: None,
+                efforts: None,
+                ..Default::default()
             },
             ModelConfig {
                 id: "o3-mini".to_string(),
                 display_name: None,
                 context_window: None,
                 reasoning: None,
+                efforts: None,
+                ..Default::default()
             },
         ],
         catalog: false,
@@ -409,6 +420,7 @@ async fn test_list_models_catalog_false() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = OpenAiCompat::new(
@@ -461,6 +473,8 @@ async fn test_list_models_catalog_fetch_and_merge() {
             display_name: Some("GPT-4o Configured".to_string()),
             context_window: Some(128_000),
             reasoning: Some(false),
+            efforts: None,
+            ..Default::default()
         }],
         catalog: true,
         context_window: None,
@@ -469,6 +483,7 @@ async fn test_list_models_catalog_fetch_and_merge() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = OpenAiCompat::new(
@@ -554,7 +569,7 @@ fn test_redact_no_sensitive_data() {
 }
 
 #[tokio::test]
-async fn test_complete_non_2xx_carries_full_error_body() {
+async fn test_complete_non_2xx_extracts_error_message() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -590,6 +605,7 @@ async fn test_complete_non_2xx_carries_full_error_body() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = OpenAiCompat::new(
@@ -614,11 +630,12 @@ async fn test_complete_non_2xx_carries_full_error_body() {
     let result = provider.complete(req).await;
     server.await.unwrap();
 
-    let expected_body = "{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Invalid model specified: foo\"}}";
+    // The surfaced message is the extracted human-readable text, not raw JSON.
+    let expected_message = "invalid_request_error: Invalid model specified: foo";
     match result {
         Err(ProviderError::Http { status, message }) => {
             assert_eq!(status, 400);
-            assert_eq!(message, expected_body);
+            assert_eq!(message, expected_message);
         }
         Err(other) => panic!("expected ProviderError::Http, got: {other}"),
         Ok(_) => panic!("expected ProviderError::Http, got a successful stream"),
@@ -626,12 +643,12 @@ async fn test_complete_non_2xx_carries_full_error_body() {
 
     let err: ProviderError = ProviderError::Http {
         status: 400,
-        message: expected_body.to_string(),
+        message: expected_message.to_string(),
     };
     let err_str = format!("{err}");
     assert_eq!(
         err_str,
-        "request failed (400): {\"error\":{\"code\":\"invalid_request_error\",\"message\":\"Invalid model specified: foo\"}}"
+        "request failed (400): invalid_request_error: Invalid model specified: foo"
     );
 }
 
@@ -709,4 +726,201 @@ fn test_provider_malformed_proxy_names_provider_and_offending_value() {
         err_msg.contains("invalid-proxy-scheme://host:1234"),
         "error must name offending value: {err_msg}"
     );
+}
+
+fn user_msg(content: Vec<ContentBlock>) -> Message {
+    Message {
+        role: Role::User,
+        content,
+        meta: pacode_types::MessageMeta::default(),
+    }
+}
+
+fn text_req(model: &str, messages: Vec<Message>) -> CompletionRequest {
+    CompletionRequest {
+        model: model.to_string(),
+        system_static: "Sys".to_string(),
+        system_dynamic: String::new(),
+        messages: shared(messages),
+        tools: vec![],
+        effort: None,
+        max_output_tokens: None,
+    }
+}
+
+#[test]
+fn test_build_body_user_image_parts_vision_model() {
+    let provider = make_provider(vec![], None, BTreeMap::new(), None);
+    let dir = tempfile::tempdir().expect("tmp");
+    let img_path = dir.path().join("pic.png");
+    std::fs::write(&img_path, b"\x89PNG fake").expect("write");
+
+    let req = text_req(
+        "gpt-4o",
+        vec![user_msg(vec![
+            ContentBlock::Text {
+                text: "look at these".to_string(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Path(img_path.clone()),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    mime: "image/webp".to_string(),
+                    data: vec![1, 2, 3],
+                },
+            },
+        ])],
+    );
+    let body = provider.build_body(&req);
+    let content = body["messages"][1]["content"]
+        .as_array()
+        .expect("vision user msg -> content parts array");
+    assert_eq!(content[0], json!({"type": "text", "text": "look at these"}));
+    assert_eq!(content[1]["type"], "image_url");
+    let url1 = content[1]["image_url"]["url"].as_str().expect("url");
+    assert!(
+        url1.starts_with("data:image/png;base64,"),
+        "png data url: {url1}"
+    );
+    let expect_b64 = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG fake");
+    assert_eq!(url1, format!("data:image/png;base64,{expect_b64}"));
+    assert_eq!(content[2]["type"], "image_url");
+    let url2 = content[2]["image_url"]["url"].as_str().expect("url");
+    let expect_b64_2 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
+    assert_eq!(url2, format!("data:image/webp;base64,{expect_b64_2}"));
+}
+
+#[test]
+fn test_build_body_user_image_degrades_without_vision() {
+    let provider = make_provider(vec![], None, BTreeMap::new(), None);
+    let req = text_req(
+        "llama-3.1-8b",
+        vec![user_msg(vec![
+            ContentBlock::Text {
+                text: "see".to_string(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    mime: "image/png".to_string(),
+                    data: vec![7, 8, 9],
+                },
+            },
+        ])],
+    );
+    let body = provider.build_body(&req);
+    let content = &body["messages"][1]["content"];
+    assert!(
+        content.is_string(),
+        "non-vision model keeps string content: {content}"
+    );
+    assert_eq!(
+        content.as_str().expect("string"),
+        "see\n[image: image/png, 3 bytes]"
+    );
+}
+
+#[test]
+fn test_build_body_user_image_unreadable_degrades_to_text_part() {
+    let provider = make_provider(vec![], None, BTreeMap::new(), None);
+    let missing = std::path::PathBuf::from("/nonexistent-dir-xyz/pic.png");
+    let req = text_req(
+        "gpt-4o",
+        vec![user_msg(vec![ContentBlock::Image {
+            source: ImageSource::Path(missing.clone()),
+        }])],
+    );
+    let body = provider.build_body(&req);
+    let content = body["messages"][1]["content"]
+        .as_array()
+        .expect("content parts");
+    assert_eq!(
+        content.len(),
+        1,
+        "unreadable image folds into the text part"
+    );
+    let text = content[0]["text"].as_str().expect("text");
+    assert_eq!(
+        text,
+        format!("[image file: {}]", missing.display()),
+        "placeholder emitted"
+    );
+}
+
+#[test]
+fn test_build_body_assistant_image_degrades() {
+    let provider = make_provider(vec![], None, BTreeMap::new(), None);
+    let req = text_req(
+        "gpt-4o",
+        vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "done".to_string(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Bytes {
+                        mime: "image/png".to_string(),
+                        data: vec![0],
+                    },
+                },
+            ],
+            meta: pacode_types::MessageMeta::default(),
+        }],
+    );
+    let body = provider.build_body(&req);
+    assert_eq!(
+        body["messages"][1]["content"],
+        "done\n[image: image/png, 1 bytes]"
+    );
+}
+
+#[test]
+fn test_model_info_vision_and_efforts() {
+    let cfg = ProviderConfig {
+        kind: Default::default(),
+        base_url: "https://api.openai.com/v1".to_string(),
+        api_key: None,
+        api_key_env: None,
+        models: vec![ModelConfig {
+            id: "cfg-vl".to_string(),
+            display_name: None,
+            context_window: None,
+            reasoning: None,
+            efforts: Some(vec![Effort::Low, Effort::High]),
+            ..Default::default()
+        }],
+        catalog: false,
+        context_window: Some(128_000),
+        reasoning: None,
+        effort_map: BTreeMap::new(),
+        extra_body: None,
+        headers: BTreeMap::new(),
+        proxy: None,
+        ..Default::default()
+    };
+    let provider = OpenAiCompat::new(
+        "openai",
+        cfg,
+        ProviderDefaults::default(),
+        None,
+        BTreeMap::new(),
+    )
+    .expect("ok");
+
+    assert!(provider.model_info("gpt-4o").supports_vision);
+    assert!(provider.model_info("meta-llama-4-scout").supports_vision);
+    assert!(!provider.model_info("llama-3.1-8b").supports_vision);
+    assert!(
+        !provider.model_info("o1-mini").supports_vision,
+        "excluded keyword wins"
+    );
+
+    let cfgd = provider.model_info("cfg-vl");
+    assert_eq!(
+        cfgd.supported_efforts,
+        Some(vec![Effort::Low, Effort::High]),
+        "config efforts land on ModelInfo"
+    );
+    assert_eq!(provider.model_info("gpt-4o").supported_efforts, None);
 }

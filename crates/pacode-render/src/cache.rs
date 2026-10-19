@@ -1,9 +1,9 @@
 //! Bounded cache of rendered lines keyed by (cell id, width). Total cached lines are
-//! capped; eviction is LRU by cell. The TUI owns one per transcript.
+//! capped; eviction is LRU by key. The TUI owns one per transcript.
 //!
-//! Recency is a monotonically increasing `stamp` per entry plus a `BTreeMap<stamp, key>`
-//! ordered oldest first, so `get`, `insert` and eviction are O(log n) in the number of
-//! entries (the old `VecDeque` scan was O(n) on every hit).
+//! Recency is a monotonically increasing sequence number per entry plus a
+//! `BTreeMap<seq, key>` ordered oldest first, so `get`, `insert` and eviction are
+//! O(log n) in the number of entries.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -14,16 +14,91 @@ use ratatui::text::Line;
 mod cache_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StablePrefixKey {
+    pub revision: u64,
+    pub len: usize,
+}
+
+/// Which rendering of `CacheKey::cell` an entry holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyPart {
+    /// The whole cell.
+    Whole,
+    /// The stable prefix of a live answer.
+    StablePrefix(StablePrefixKey),
+    /// A run of cells drawn as one block, starting at `cell`: a fingerprint
+    /// of every member's id and version. Invalidating the first cell drops
+    /// the block too.
+    Group(u64),
+    /// The one-row summary of a cell drawn inside a group.
+    Row,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub cell: u64,
+    pub version: u32,
     pub width: u16,
+    pub expanded: bool,
+    pub context: u64,
+    pub part: KeyPart,
+}
+
+impl CacheKey {
+    pub fn cell(cell: u64, version: u32, width: u16, expanded: bool, context: u64) -> Self {
+        Self {
+            cell,
+            version,
+            width,
+            expanded,
+            context,
+            part: KeyPart::Whole,
+        }
+    }
+
+    /// The block of a run of cells starting at `first_cell`; `fingerprint`
+    /// changes whenever a member is added, dropped or updated.
+    pub fn group(first_cell: u64, fingerprint: u64, width: u16, context: u64) -> Self {
+        Self {
+            cell: first_cell,
+            version: 0,
+            width,
+            expanded: false,
+            context,
+            part: KeyPart::Group(fingerprint),
+        }
+    }
+
+    /// The one-row summary of `cell` at `version` inside a group.
+    pub fn row(cell: u64, version: u32, width: u16, context: u64) -> Self {
+        Self {
+            cell,
+            version,
+            width,
+            expanded: false,
+            context,
+            part: KeyPart::Row,
+        }
+    }
+
+    pub fn stable_prefix(cell: u64, revision: u64, len: usize, width: u16, context: u64) -> Self {
+        Self {
+            cell,
+            version: 0,
+            width,
+            expanded: false,
+            context,
+            part: KeyPart::StablePrefix(StablePrefixKey { revision, len }),
+        }
+    }
 }
 
 struct Entry {
     lines: Vec<Line<'static>>,
     len: usize,
-    /// Position in `LineCache::order`; refreshed on every hit.
-    stamp: u64,
+    /// Stamp in `order`: recency is a sequence number, not a list position, so
+    /// a touch is one BTreeMap remove + insert instead of a linear scan.
+    seq: u64,
 }
 
 /// Cap: `max_lines` rendered lines in total (the entry just inserted always stays).
@@ -31,9 +106,11 @@ struct Entry {
 /// `generation`). Owner: the transcript view state.
 pub struct LineCache {
     entries: HashMap<CacheKey, Entry>,
-    /// Oldest first: `stamp -> key`. Holds exactly one item per entry.
+    /// `seq -> key`, oldest at the front; the LRU order of `entries`. Holds
+    /// exactly one item per entry.
     order: BTreeMap<u64, CacheKey>,
-    next_stamp: u64,
+    /// Next recency stamp. Monotone; wrap is unreachable in practice.
+    next_seq: u64,
     /// Bumped by `clear`, so derived data (cached line counts) can tell the cache was reset.
     generation: u64,
     total_lines: usize,
@@ -46,33 +123,34 @@ impl LineCache {
         Self {
             entries: HashMap::new(),
             order: BTreeMap::new(),
-            next_stamp: 0,
+            next_seq: 0,
             generation: 0,
             total_lines: 0,
             max_lines,
         }
     }
 
-    fn fresh_stamp(&mut self) -> u64 {
-        let stamp = self.next_stamp;
-        self.next_stamp = self.next_stamp.wrapping_add(1);
-        stamp
-    }
-
     /// Borrow cached lines, marking the entry recently used.
     pub fn get(&mut self, key: CacheKey) -> Option<&[Line<'static>]> {
-        let old = self.entries.get(&key)?.stamp;
-        let stamp = self.fresh_stamp();
-        self.order.remove(&old);
-        self.order.insert(stamp, key);
         let entry = self.entries.get_mut(&key)?;
-        entry.stamp = stamp;
+        self.order.remove(&entry.seq);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        entry.seq = seq;
+        self.order.insert(seq, key);
         Some(entry.lines.as_slice())
     }
 
     /// True when `key` is cached. Does not touch recency.
     pub fn contains(&self, key: CacheKey) -> bool {
         self.entries.contains_key(&key)
+    }
+
+    /// Borrow cached lines without touching recency — the read-only counterpart
+    /// of `get` for callers that already know the entry is warm (the render
+    /// pass touches recency in its `&mut` phase, then borrows through `&`).
+    pub fn peek(&self, key: CacheKey) -> Option<&[Line<'static>]> {
+        self.entries.get(&key).map(|e| e.lines.as_slice())
     }
 
     /// Insert (replacing any entry for the same key) and evict LRU entries until under
@@ -82,25 +160,24 @@ impl LineCache {
 
         if let Some(old) = self.entries.remove(&key) {
             self.total_lines = self.total_lines.saturating_sub(old.len);
-            self.order.remove(&old.stamp);
+            self.order.remove(&old.seq);
         }
 
-        let stamp = self.fresh_stamp();
         self.total_lines += len;
-        self.entries.insert(key, Entry { lines, len, stamp });
-        self.order.insert(stamp, key);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.entries.insert(key, Entry { lines, len, seq });
+        self.order.insert(seq, key);
 
         while self.total_lines > self.max_lines && self.order.len() > 1 {
-            let Some((oldest_stamp, oldest_key)) = self.order.pop_first() else {
-                break;
-            };
-            if oldest_key == key {
-                // Only reachable if the new entry is the oldest; keep it.
-                self.order.insert(oldest_stamp, oldest_key);
-                break;
-            }
-            if let Some(evicted) = self.entries.remove(&oldest_key) {
-                self.total_lines = self.total_lines.saturating_sub(evicted.len);
+            if let Some((_, front_key)) = self.order.pop_first() {
+                if front_key == key {
+                    self.order.insert(seq, key);
+                    break;
+                }
+                if let Some(evicted) = self.entries.remove(&front_key) {
+                    self.total_lines = self.total_lines.saturating_sub(evicted.len);
+                }
             }
         }
 
@@ -122,7 +199,7 @@ impl LineCache {
         for key in keys_to_remove {
             if let Some(removed) = self.entries.remove(&key) {
                 self.total_lines = self.total_lines.saturating_sub(removed.len);
-                self.order.remove(&removed.stamp);
+                self.order.remove(&removed.seq);
             }
         }
     }

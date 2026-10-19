@@ -1,0 +1,9 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Bash, src)"
+---
+const VERSION 1-1
+fn deploy 3-5
+fn cleanup 7-9
+fn main 11-14
+  fn inner 12-12

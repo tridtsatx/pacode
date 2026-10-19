@@ -6,13 +6,21 @@ pub mod builtin;
 pub mod hashline;
 pub mod host;
 pub mod output;
+pub mod prompts;
 pub mod registry;
 pub mod test_support;
+pub mod threads;
+pub mod walk;
 
-pub use builtin::{builtin_tools, subagent_tool_names};
-pub use host::{AgentSpec, LedgerPass, ToolCtx, ToolHost, WaitOutcome, WriteIntent, WriteLock};
+pub use builtin::{builtin_tools, orchestrator_tools, subagent_tool_names};
+pub use host::{
+    AgentSpec, LedgerPass, ParentReply, PermissionOutcome, SendOutcome, SpawnedTask, ToolCtx,
+    ToolHost, UserStop, WaitOutcome, WriteIntent, WriteLock,
+};
 pub use output::{ToolError, ToolOutput};
 pub use registry::ToolRegistry;
+
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use pacode_types::ToolDefinition;
@@ -33,6 +41,50 @@ pub enum ToolKind {
     Control,
 }
 
+/// Memoised [`ToolDefinition`] owned by the tool that owns the schema.
+///
+/// `ToolRegistry::definitions()` is called on every model step, and building a
+/// definition means assembling a `serde_json::Value` from a `json!` macro and
+/// then running [`ensure_common_properties`] over it — for `symbols` that schema
+/// is the single most expensive thing on the path. The result is a pure function
+/// of `name`/`description`/`schema()`, so it is computed once per tool and
+/// cloned (a `ToolDefinition` clone is a few allocations, far cheaper than the
+/// build).
+///
+/// The cell is a `OnceLock` and there is deliberately no `invalidate`. That is a
+/// conclusion, not an omission: the definition is a pure function of
+/// `name`/`description`/`schema()`, and those come from fields the tool owns for
+/// its whole life. A tool whose schema *can* change does not mutate itself — the
+/// owner of the tool set re-lists and builds a **new** proxy with a **new**
+/// cache (`mcp_tools` after a pool refresh, `plugin_tools` after a host
+/// re-scan), so the old object and its cache go out of scope together. A stale
+/// schema is therefore not reachable, and an invalidation hook would be a
+/// documented way to introduce one.
+///
+/// `OnceLock` over a lock because there is nothing to clear: the read path is a
+/// single atomic load, the write happens once per tool at startup, and
+/// `get_or_init` gives the same "first writer wins, both callers see one value"
+/// guarantee the hand-rolled version had to assemble from two lock scopes.
+#[derive(Debug, Default)]
+pub struct DefinitionCache(OnceLock<ToolDefinition>);
+
+impl DefinitionCache {
+    pub fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    /// Cached definition, building it with `build` on the first call.
+    ///
+    /// The closure is not run while the cell is claimed, so a `build` that
+    /// re-entered this cache would recurse rather than deadlock. Two threads
+    /// racing the very first build may both run it; `get_or_init` keeps the
+    /// first value and hands it to both callers, and both were built from the
+    /// same schema anyway.
+    pub fn get(&self, build: impl FnOnce() -> ToolDefinition) -> ToolDefinition {
+        self.0.get_or_init(build).clone()
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Name sent to the model (snake_case, unique in the registry).
@@ -44,11 +96,45 @@ pub trait Tool: Send + Sync {
     fn kind(&self) -> ToolKind;
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
 
+    /// This tool's definition cache, or `None` to not memoise.
+    ///
+    /// Opt-in rather than required: a tool memoises by holding a
+    /// [`DefinitionCache`] field and returning a reference to it, and a tool
+    /// with no cache simply leaves this alone and rebuilds its definition per
+    /// call. The default is what a test stub or a one-off tool wants; the
+    /// built-ins all cache, because [`ToolRegistry::definitions`] runs on every
+    /// model step.
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        None
+    }
+
+    /// Whether a result can outgrow the output cap, so the schema offers
+    /// `accept_large_output`. A tool whose result is a short confirmation
+    /// (edit, write, plan, …) returns `false`: the flag would do nothing there
+    /// and its schema text costs tokens on every request.
+    fn can_exceed_output_cap(&self) -> bool {
+        true
+    }
+
+    /// Whether this call may run alongside its neighbours of the same model
+    /// step: it changes nothing another call could observe, so their order
+    /// does not matter. The turn joins consecutive calls that say yes and runs
+    /// the rest one at a time, in call order. Default: reads and network calls.
+    fn runs_concurrently(&self, _input: &Value, _cwd: &std::path::Path) -> bool {
+        matches!(self.kind(), ToolKind::ReadOnly | ToolKind::Network)
+    }
+
+    /// The definition advertised to the model, memoised when the tool holds a
+    /// cache (see [`definition_cache`](Self::definition_cache)).
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
+        let build = || ToolDefinition {
             name: self.name().to_string(),
             description: self.description().to_string(),
-            input_schema: ensure_common_properties(self.schema()),
+            input_schema: ensure_common_properties(self.schema(), self.can_exceed_output_cap()),
+        };
+        match self.definition_cache() {
+            Some(cache) => cache.get(build),
+            None => build(),
         }
     }
 }
@@ -56,9 +142,10 @@ pub trait Tool: Send + Sync {
 pub const INTENT_KEY: &str = "intent";
 pub const ACCEPT_LARGE_OUTPUT_KEY: &str = "accept_large_output";
 
-/// Add the shared `intent` (required) and `accept_large_output` (optional) properties
-/// to an object schema. Port of jcode's `ensure_intent_in_schema`.
-pub fn ensure_common_properties(mut schema: Value) -> Value {
+/// Add the shared `intent` (required) property to an object schema, and the
+/// optional `accept_large_output` when `offer_large_output` (see
+/// [`Tool::can_exceed_output_cap`]). Port of jcode's `ensure_intent_in_schema`.
+pub fn ensure_common_properties(mut schema: Value, offer_large_output: bool) -> Value {
     let Some(object) = schema.as_object_mut() else {
         return schema;
     };
@@ -77,17 +164,19 @@ pub fn ensure_common_properties(mut schema: Value) -> Value {
         properties.entry(INTENT_KEY).or_insert_with(|| {
             serde_json::json!({
                 "type": "string",
-                "description": "Required short label shown in the UI: why this call is being made."
+                "description": "Short UI label: why this call is made."
             })
         });
-        properties
-            .entry(ACCEPT_LARGE_OUTPUT_KEY)
-            .or_insert_with(|| {
-                serde_json::json!({
-                    "type": "boolean",
-                    "description": "Re-run accepting the stated token cost of a withheld result."
-                })
-            });
+        if offer_large_output {
+            properties
+                .entry(ACCEPT_LARGE_OUTPUT_KEY)
+                .or_insert_with(|| {
+                    serde_json::json!({
+                        "type": "boolean",
+                        "description": "Skip the head+tail cut of output over the cap; the cut names the full size."
+                    })
+                });
+        }
     } else {
         return schema;
     }
@@ -124,7 +213,7 @@ mod lib_tests {
     #[test]
     fn common_properties_added_once() {
         let schema = serde_json::json!({"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}});
-        let out = ensure_common_properties(schema);
+        let out = ensure_common_properties(schema, true);
         assert!(out["properties"]["intent"].is_object());
         assert!(out["properties"]["accept_large_output"].is_object());
         let required: Vec<&str> = out["required"]
@@ -134,7 +223,40 @@ mod lib_tests {
             .filter_map(Value::as_str)
             .collect();
         assert_eq!(required, vec!["path", "intent"]);
-        let again = ensure_common_properties(out.clone());
+        let again = ensure_common_properties(out.clone(), true);
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn large_output_flag_only_where_output_can_be_cut() {
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let out = ensure_common_properties(schema, false);
+        assert!(out["properties"]["intent"].is_object());
+        assert!(out["properties"].get(ACCEPT_LARGE_OUTPUT_KEY).is_none());
+
+        let tools = builtin_tools(&pacode_types::WebConfig::default());
+        let offers = |name: &str| {
+            tools.get(name).expect(name).definition().input_schema["properties"]
+                .get(ACCEPT_LARGE_OUTPUT_KEY)
+                .is_some()
+        };
+        for name in [
+            "read", "grep", "glob", "ls", "symbols", "bash", "bg", "batch",
+        ] {
+            assert!(
+                offers(name),
+                "{name} caps its output, so it offers the flag"
+            );
+        }
+        for name in [
+            "edit",
+            "multi_edit",
+            "write",
+            "plan",
+            "ask_question",
+            "report_status",
+        ] {
+            assert!(!offers(name), "{name} returns a short confirmation");
+        }
     }
 }

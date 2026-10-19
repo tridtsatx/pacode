@@ -66,6 +66,7 @@ fn session() -> (tempfile::TempDir, Arc<Session>) {
         effort: pacode_types::Effort::Medium,
         mode: pacode_types::Mode::Auto,
         first_prompt: None,
+        zdr: false,
     };
     let tools = pacode_tools::ToolRegistry::new();
     let mut agents = BTreeMap::new();
@@ -104,6 +105,14 @@ fn session() -> (tempfile::TempDir, Arc<Session>) {
         scheduler: crate::schedule::Scheduler::new(),
         ledger: crate::ledger::FileLedger::new(),
         efforts_cache: Default::default(),
+        agent_aliases: std::sync::Mutex::new(Default::default()),
+        accounting: Arc::new(crate::analyze::SessionAccounting::new()),
+        submit_lock: tokio::sync::Mutex::new(()),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        recovery_admissions: std::sync::Mutex::new(Default::default()),
+        model_flags: RwLock::new(Default::default()),
+        global_events: crate::transcript::EventSink::new(),
+        idle_watch: crate::core::IdleWatch::default(),
     });
     (temp, session)
 }
@@ -126,6 +135,7 @@ fn ctx(session: &Arc<Session>, agent: &AgentId, name: &str) -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: pacode_tools::ToolRegistry::default(),
     }
     .with_tool("edit", ToolKind::Edit)
 }

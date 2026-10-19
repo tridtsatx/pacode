@@ -145,22 +145,8 @@ pub fn render_transcript(messages: &[Arc<Message>]) -> String {
                     let _ = writeln!(out, "[{tag}]\n{body}\n");
                 }
                 ContentBlock::Reasoning { .. } => {}
-                ContentBlock::Image {
-                    mime,
-                    width,
-                    height,
-                    source_path,
-                    ..
-                } => {
-                    let dims = match (width, height) {
-                        (Some(w), Some(h)) => format!(" {w}x{h}"),
-                        _ => String::new(),
-                    };
-                    let from = source_path
-                        .as_deref()
-                        .map(|p| format!(" from {p}"))
-                        .unwrap_or_default();
-                    let _ = writeln!(out, "[{label}] [image {mime}{dims}{from}]\n");
+                ContentBlock::Image { source } => {
+                    let _ = writeln!(out, "[{label}] {}\n", source.placeholder());
                 }
             }
         }

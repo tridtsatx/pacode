@@ -3,18 +3,37 @@
 //! One `tokio::select!` over: client events (`ClientEvent`), terminal events
 //! (`crossterm::event::EventStream`), the stream tick (paced by `config.ui.ups`,
 //! only while `state.needs_stream_tick()`), the second tick (1 s, only while
-//! `state.needs_second_tick()`), the animation tick (the pacman interval while
-//! the turn runs; 125 ms for ambient pulses; 70 ms while a transient animation —
-//! toast slide/fade, overlay unfold, welcome cascade — is on screen), and toast
-//! expiry (armed only while toasts exist).
-//! A frame is drawn when `state.dirty` and the frame interval has passed since the
-//! last frame (otherwise a deferred draw is scheduled). Nothing ticks in the idle state.
+//! `state.needs_second_tick()`), the animation tick (a phase-stable
+//! `tokio::time::Interval` clocked by `config.ui.animation`: `tick_ms` while
+//! the turn/spinner runs, `fast_tick_ms` while a transient animation — toast
+//! slide/fade, overlay unfold, welcome cascade — is on screen; armed only
+//! while something animates), and toast expiry (armed only while toasts exist).
 //!
-//! Startup: connect (spawning the daemon), attach, apply the snapshot, send
-//! `initial_prompt` if any, then loop. On `quit`: leave the alt screen and close the
-//! client (the daemon and its sessions keep running).
+//! Two clocks pace two dirty flags: content sets `state.dirty` and is gated by
+//! `frame_interval` (`ui.ups`); the animation tick sets `state.dirty_anim` and
+//! is gated by the current animation period. Either flag with its gate elapsed
+//! draws a frame that clears both (otherwise a deferred draw is scheduled for
+//! the earliest pending gate). Nothing ticks in the idle state.
+//!
+//! Startup: paint the first frame, connect (spawning the daemon), then loop —
+//! the attach runs as a background request so keys work while the daemon is
+//! still opening the session. Its snapshot lands via `BgResponse::AttachFinished`,
+//! which applies it, flushes requests queued meanwhile, and sends
+//! `initial_prompt` plus the post-attach list batch. On `quit`: leave the alt
+//! screen and close the client (the daemon and its sessions keep running).
 
-use std::sync::Arc;
+mod attach;
+mod bg_response;
+mod deferred;
+mod dispatch;
+mod frame;
+mod panel;
+mod prompt;
+mod reply;
+mod resync;
+mod wakeups;
+
+use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream};
@@ -23,42 +42,62 @@ use tokio::sync::mpsc;
 
 use pacode_client::{Client, ClientEvent};
 use pacode_types::state::ToastLevel;
-use pacode_types::time::now_ms;
-use pacode_types::{AgentId, PluginCommandOutcome, Reply, Request, TranscriptKind};
 
-use crate::keys::{Action, handle_key, handle_mouse};
-use crate::layout::ScreenLayout;
-use crate::state::transcript::{Cell, CellKind};
-use crate::state::{AppState, PanelTarget, TOAST_TTL_SECS};
+use self::attach::{
+    AttachRequest, AttachRequestKind, dispatch_pending_attach_retry, snapshot_actions_after_apply,
+    spawn_attach_request,
+};
+use self::bg_response::{BgResponse, handle_bg_response};
+use self::deferred::{background_view_on_screen, dispatch_deferred, files_view_on_screen};
+use self::dispatch::{dispatch_action, dispatch_global_refresh_action};
+use self::frame::{AnimPacer, FrameClock, Painter, spawn_refresh_probe};
+use self::prompt::bound_paste;
+use self::resync::{clear_list_loading, take_global_resync_actions, take_resync_action};
+use crate::keys::{Action, handle_key, handle_mouse, prompt_batch_action};
+use crate::state::AppState;
 use crate::terminal::TerminalGuard;
 use crate::ui;
 use crate::{TuiError, TuiOptions};
 
-enum BgResponse {
-    Reply(Result<Reply, pacode_client::ClientError>),
-    LoadPanelReply {
-        target: PanelTarget,
-        result: Result<Reply, pacode_client::ClientError>,
-    },
-    LoadHistoryReply {
-        result: Result<Reply, pacode_client::ClientError>,
-    },
-    BashCompleted(Result<crate::bash::BashOutput, String>),
-}
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod app_tests;
 
-pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> {
+// `app_tests` reaches the loop's helpers through `use super::*`, as it did
+// before they moved into submodules.
+#[cfg(test)]
+use {
+    self::{bg_response::*, deferred::*, dispatch::*, panel::*, prompt::*, reply::*},
+    crate::state::transcript::CellKind,
+    crate::state::{PanelTarget, PromptBatch, SessionContext},
+    pacode_client::ClientEventContext,
+    pacode_types::{AgentId, Reply, TranscriptKind},
+};
+
+/// `None` when the loop exited before a session attached (the attach is a
+/// background request — quitting during it is allowed).
+pub async fn run(mut opts: TuiOptions) -> Result<Option<pacode_types::SessionId>, TuiError> {
+    let timing = crate::timing::enabled();
+    let t_start = Instant::now();
     log::info!("TUI starting up");
+
+    let t = Instant::now();
     let mut term_guard = TerminalGuard::enter(opts.config.ui.mouse)?;
+    crate::timing::mark(timing, "terminal_enter", t);
 
-    let client_paths = opts.client.paths.clone();
-    // Inline images are read from the daemon's content-addressed store.
-    pacode_image::store::init(client_paths.images_dir());
-    let (client, mut events) = Client::connect(opts.client).await?;
-    let snapshot = client.attach(opts.attach.clone()).await?;
-    let session_id = snapshot.meta.id.clone();
-    log::info!("TUI attached to session {session_id}");
-    let client = Arc::new(client);
+    // Arm the frame metrics before the first frame and hold the gate for the
+    // whole run, so the reading `pacode stats` prints is this client's and not
+    // the previous one's. Off unless `PACODE_FRAME_METRICS` says otherwise —
+    // an unarmed gate writes nothing and does not even remove the last
+    // client's report.
+    let _frame_metrics = crate::render_metrics::MetricsGate::install(&opts.client.paths.state_dir);
 
+    // Progressive paint, now cache-first (§8.2): build the state, run the one
+    // allowed blocking cache read on `spawn_blocking`, apply whatever came
+    // back, then draw the first frame — all before any daemon IO. The socket
+    // connect, a possible daemon spawn and the attach snapshot then resolve
+    // while the user already sees the chrome and a "connecting…" footer.
+    let t = Instant::now();
     let size = term_guard.terminal.size()?;
     let mut state = AppState::new(
         opts.config.clone(),
@@ -66,19 +105,91 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         size.width,
         size.height,
     );
-    state.paths = client_paths;
     state.cwd = opts.cwd.clone();
-    state.slots[0] = Some(crate::state::SessionSlot {
-        id: snapshot.meta.id.clone(),
-        title: snapshot.meta.title(),
-        turns: snapshot.usage.turns,
-        context_tokens: snapshot.usage.context_tokens,
-        agents_count: snapshot.agents.len(),
-        tasks_count: snapshot.tasks.len(),
-    });
-    state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
+    state.analyze_mode = opts.analyze_mode;
+    state.paths = opts.client.paths.clone();
+    state.cache = crate::cache::DiskCache::new(state.paths.cache_dir.clone());
+    state.connection = crate::state::Connection::Connecting;
+    // The `-p` prompt flies once the attach lands — `AttachFinished` sends it.
+    state.initial_prompt = opts.initial_prompt.take();
+    crate::timing::mark(timing, "app_state_new", t);
 
+    let t = Instant::now();
+    let load = {
+        let cache = state.cache.clone();
+        let ctx = crate::cache::LoadCtx {
+            cwd: opts.cwd.clone(),
+            mcp_sig: crate::cache::mcp_sig(&opts.config),
+            marketplace_source: opts.config.plugins.marketplace.clone(),
+        };
+        tokio::task::spawn_blocking(move || crate::cache::startup_load(&cache, &ctx))
+            .await
+            .unwrap_or_default()
+    };
+    if load.caps.evicted > 0 {
+        log::info!(
+            "cache: evicted {} file(s), {} B freed",
+            load.caps.evicted,
+            load.caps.freed_bytes
+        );
+    }
+    let session_start = state.session_start_ms;
+    crate::cache::apply_snapshot(&mut state, load.snapshot, session_start);
+    crate::timing::mark(timing, "cache_load", t);
+
+    term_guard.terminal.draw(|f| {
+        let prepared = ui::prepare_frame(f.area(), &mut state, Instant::now());
+        ui::draw(f, &state, &prepared);
+        crate::font::apply_weight_to_frame(f, &state.config.font);
+    })?;
+    crate::timing::mark(timing, "first_frame", t_start);
+
+    // Inline transcript images are read from the daemon's content-addressed store.
+    pacode_image::store::init(opts.client.paths.images_dir());
+    let t = Instant::now();
+    let (client, mut events) = Client::connect(opts.client).await?;
+    crate::timing::mark(timing, "client_connect", t);
+    let client = Arc::new(client);
+
+    let mut term_events = EventStream::new();
+    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgResponse>();
+
+    // The attach is the slow part of startup — a cold session open may wait
+    // on the daemon's store and MCP work — so it runs as a background
+    // request and the event loop starts now. `AttachFinished` applies the
+    // snapshot, flushes `state.pending_requests`, sends `initial_prompt`,
+    // and fires the §8.2 post-attach list batch. `client.attach` (not a raw
+    // `request`) keeps the remembered session populated for reconnects.
+    let t_attach = Instant::now();
+    let attach_context = state.begin_attach(opts.attach.clone());
+    let attach_client_context = client.event_context();
+    let attach_token = state
+        .set_pending_attach_client_epoch(attach_client_context.session_epoch.wrapping_add(1))
+        .expect("pending attach must exist");
+    let attach_epoch = state
+        .pending_attach_epoch_signal()
+        .expect("pending attach epoch must exist");
+    attach_epoch.store(
+        attach_client_context.session_epoch.wrapping_add(1),
+        Ordering::Release,
+    );
+    spawn_attach_request(
+        &mut state,
+        &client,
+        &bg_tx,
+        AttachRequest {
+            context: attach_context,
+            token: attach_token,
+            request_client_context: attach_client_context,
+            attach: opts.attach.clone(),
+            kind: AttachRequestKind::Attach,
+            timing_started: Some(t_attach),
+        },
+    );
+
+    let t = Instant::now();
     let font_outcome = term_guard.apply_font(&opts.config.font);
+    crate::timing::mark(timing, "apply_font", t);
     if !font_outcome.unsupported.is_empty() {
         let items = font_outcome.unsupported.join(", ");
         state.push_toast(
@@ -92,208 +203,107 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
         state.push_toast(ToastLevel::Warn, warning, None, Instant::now());
     }
 
-    if let Some(prompt) = opts.initial_prompt {
-        let _ = client
-            .ok(Request::UserMessage {
-                text: prompt,
-                attachments: Vec::new(),
-            })
-            .await;
+    // `ui.ups = "auto"` probes external tools (hyprctl/wlr-randr/xrandr —
+    // measured ~37 ms warm, up to 200 ms per miss). Run it off the critical
+    // path and adopt the result when it lands; until then draw uncapped —
+    // nothing animates during attach anyway, so no extra frames are spent.
+    // `_hz_keepalive` keeps one sender alive so `hz_rx.recv()` in the loop
+    // pends forever once the probe result is consumed (a closed channel would
+    // return `None` instantly and spin the select loop).
+    let t_probe = Instant::now();
+    let (hz_tx, mut hz_rx) = mpsc::unbounded_channel::<(u64, Option<u16>)>();
+    let _hz_keepalive = hz_tx.clone();
+    let mut frame_clock = FrameClock::new(state.config.ui.ups);
+    if frame_clock.ups == pacode_types::Ups::Auto {
+        spawn_refresh_probe(hz_tx.clone(), frame_clock.probe_generation);
     }
+    let mut frame_interval = frame_clock.interval;
+    crate::timing::mark(timing, "refresh_hz_spawn", t_probe);
 
-    let mut term_events = EventStream::new();
-    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgResponse>();
+    let mut painter = Painter::new(frame_interval);
+    let mut anim = AnimPacer::new(state.config.ui.animation.tick_ms());
 
-    // Tell the daemon to stream only the main agent (and the panel target later).
-    dispatch_subscribe(&mut state, &client);
-
-    // On start (after attach), send ListPlugins and register commands
-    {
-        let cl = Arc::clone(&client);
-        let tx = bg_tx.clone();
-        tokio::spawn(async move {
-            let res = cl.request(Request::ListPlugins).await;
-            let _ = tx.send(BgResponse::Reply(res));
-        });
-    }
-
-    // The footer and `/effort` need the current model's reasoning levels.
-    {
-        let cl = Arc::clone(&client);
-        let tx = bg_tx.clone();
-        tokio::spawn(async move {
-            let res = cl.request(Request::ListModels).await;
-            let _ = tx.send(BgResponse::Reply(res));
-        });
-    }
-
-    let detected_hz = match opts.config.ui.ups {
-        pacode_types::Ups::Auto => pacode_config::display::detect_refresh_hz(),
-        pacode_types::Ups::Fixed(_) | pacode_types::Ups::Dynamic => None,
-    };
-    let frame_interval = opts.config.ui.ups.frame_interval(detected_hz);
-
-    let mut last_draw = Instant::now() - frame_interval.unwrap_or(Duration::from_millis(33));
-    let mut last_layout = ScreenLayout::default();
-    let mut active_escape: Option<(ratatui::layout::Rect, std::path::PathBuf)> = None;
-
-    loop {
-        let is_files_overlay = matches!(
-            state.focus,
-            crate::state::Focus::Overlay(crate::state::Overlay::Files { .. })
-        );
-        if !is_files_overlay {
+    // Every way out of the loop yields here, so the exit work below runs on
+    // an error too.
+    let loop_result: Result<(), TuiError> = loop {
+        if term_guard.mouse_enabled() != state.config.ui.mouse
+            && let Err(error) = term_guard.set_mouse(state.config.ui.mouse)
+        {
+            log::warn!("failed to update terminal mouse capture: {error}");
+            state.config.ui.mouse = term_guard.mouse_enabled();
+        }
+        if frame_clock.set_ups(state.config.ui.ups) {
+            frame_interval = frame_clock.interval;
+            if frame_clock.ups == pacode_types::Ups::Auto {
+                spawn_refresh_probe(hz_tx.clone(), frame_clock.probe_generation);
+            }
+        }
+        let files_view = files_view_on_screen(&state);
+        if !files_view {
             if state.files.cached_preview.is_some() {
                 state.files.clear_preview();
             }
-            if let Some((area, _path)) = active_escape.take() {
-                let _ = term_guard.clear_image_area(area);
-            }
+            // Reopening rescans: `statused_at` records the rows_version the
+            // labels describe — dropping it re-arms the deferred status job.
+            state.files.statused_at = None;
+        }
+
+        // The Background level's output-tail cache lives only while the
+        // level is on screen — reopening re-arms it from scratch (§5.9).
+        if !background_view_on_screen(&state) {
+            state.rail.clear_task_tail();
         }
 
         // Refresh the activity phase before drawing, so the draw path reads state
         // only and the displayed duration never depends on when a redraw happened.
         state.tick_phase(Instant::now());
 
-        // Redraw if dirty and frame interval elapsed
-        let now = Instant::now();
-        let can_draw = match frame_interval {
-            Some(interval) => now.saturating_duration_since(last_draw) >= interval,
-            None => true,
-        };
-        if state.dirty && can_draw {
-            term_guard.terminal.draw(|f| {
-                last_layout = ui::draw(f, &mut state);
-                crate::font::apply_weight_to_frame(f, &state.config.font);
-            })?;
-            state.dirty = false;
-            last_draw = Instant::now();
+        if let Err(error) = painter.draw_if_due(
+            &mut term_guard,
+            &mut state,
+            frame_interval,
+            &mut anim,
+            frame_clock.detected_hz,
+            timing,
+        ) {
+            break Err(error);
+        }
 
-            if is_files_overlay {
-                if let Some((area, esc, path)) = state.files.pending_escape.take() {
-                    if let Some((old_area, ref old_path)) = active_escape
-                        && (*old_path != path || old_area != area)
-                    {
-                        let _ = term_guard.clear_image_area(old_area);
-                    }
-                    let _ = term_guard.draw_image_escape(area, &esc);
-                    active_escape = Some((area, path));
-                } else if let Some((old_area, _)) = active_escape.take() {
-                    let _ = term_guard.clear_image_area(old_area);
-                }
-            } else if let Some((old_area, _)) = active_escape.take() {
-                let _ = term_guard.clear_image_area(old_area);
-            }
+        // Deferred work recorded before paint: completion scans, image
+        // renders, the stashed clipboard copy — all of it runs on blocking
+        // threads, replies land back through `bg_rx` (§8.1). Daemon-bound
+        // wants come back as actions and go through `dispatch_action`.
+        for act in dispatch_deferred(&mut state, &bg_tx, &client) {
+            dispatch_action(act, &mut state, &client, &bg_tx);
         }
 
         if state.quit {
-            break;
+            break Ok(());
         }
 
         // Compute timers dynamically
         let needs_stream = state.needs_stream_tick();
         let stream_tick_dur = frame_interval.unwrap_or(Duration::from_millis(33));
-        let stream_sleep = async {
-            if needs_stream {
-                tokio::time::sleep(stream_tick_dur).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
+        let stream_sleep = wakeups::stream(needs_stream, stream_tick_dur);
 
-        // The second tick is armed to the next boundary of the displayed clock, not
-        // to a full second from now. Every other timer in this select! cancels and
-        // re-creates this future; measuring from `now` meant a plain 1 s sleep was
-        // restarted by each animation frame and never fired, so the duration only
-        // moved on unrelated redraws and read 0.1 -> 0.3 -> 0.5 instead of ticking.
         let needs_second = state.needs_second_tick() || state.phase.is_some();
-        let next_boundary_ms = crate::state::activity::ms_to_next_second(state.phase_elapsed_ms);
-        let second_sleep = async {
-            if needs_second {
-                tokio::time::sleep(Duration::from_millis(next_boundary_ms)).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
+        let second_sleep = wakeups::second(needs_second, &state);
 
-        let anim_sleep = async {
-            // Every arm of this sleep is a visible animation; while nothing
-            // animates, the future stays pending and no timer runs.
-            let now = Instant::now();
-            let fast = state.fast_anim_active(now);
-            if state.turn_active || state.transcript.has_backlog() {
-                let mut interval_ms = crate::ui::anim::pacman_interval_ms(
-                    state.transcript.stream_backlog_chars(),
-                    state.transcript.has_pending_final(),
-                );
-                if fast {
-                    interval_ms = interval_ms.min(crate::ui::anim::TRANSIENT_TICK_MS);
-                }
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            } else if state.needs_anim_tick(now) || state.toast_needs_anim(now) {
-                let interval_ms = if fast {
-                    crate::ui::anim::TRANSIENT_TICK_MS
-                } else {
-                    125
-                };
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-
-        let ctrl_c_expiry_sleep = async {
-            if let Some(t) = state.ctrl_c_at {
-                let dur = Duration::from_secs(2);
-                let elapsed = Instant::now().saturating_duration_since(t);
-                if elapsed < dur {
-                    tokio::time::sleep(dur - elapsed).await;
-                }
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-
-        let toast_expiry_sleep = async {
-            if let Some(oldest) = state.toasts.front() {
-                let dur = Duration::from_secs(TOAST_TTL_SECS);
-                let elapsed = Instant::now().saturating_duration_since(oldest.shown_at);
-                let remaining = dur.saturating_sub(elapsed);
-                tokio::time::sleep(remaining).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-
-        let deferred_draw_sleep = async {
-            if state.dirty {
-                if let Some(interval) = frame_interval {
-                    let elapsed = Instant::now().saturating_duration_since(last_draw);
-                    let remaining = interval.saturating_sub(elapsed);
-                    tokio::time::sleep(remaining).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
+        anim.rearm(&state);
+        let ctrl_c_expiry_sleep = wakeups::ctrl_c_expiry(&state);
+        let toast_expiry_sleep = wakeups::toast_expiry(&state);
+        let deferred_draw_sleep =
+            wakeups::deferred_draw(painter.next_draw_wait(&state, frame_interval, anim.period()));
+        let menu_remote_sleep = wakeups::menu_remote(&state);
+        let resync_sleep = wakeups::resync(&state);
+        let anim_sleep = anim.tick();
 
         tokio::select! {
             client_ev = events.recv() => {
                 match client_ev {
-                    Some(ev) => {
-                        state.apply_client_event(ev, Instant::now());
-                        if let Some(req) = state.drain_prompt_queue() {
-                            dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
-                        }
-                        if let Some(req) = state.take_resync_request() {
-                            dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
-                        }
-                        dispatch_subscribe(&mut state, &client);
-                    }
+                    Some(ev) => on_client_event(ev, &mut state, &client, &bg_tx),
                     None => {
-                        break;
+                        break Ok(());
                     }
                 }
             }
@@ -301,9 +311,13 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                 if let Some(Ok(ev)) = term_ev {
                     let actions = match ev {
                         Event::Key(key) => handle_key(&mut state, key, Instant::now()),
-                        Event::Mouse(mouse) => handle_mouse(&mut state, mouse, &last_layout),
+                        Event::Mouse(mouse) => {
+                            handle_mouse(&mut state, mouse, &painter.last_layout)
+                        }
                         Event::Paste(text) => {
-                            crate::paste::handle_paste(&mut state, text, Instant::now())
+                            let now = Instant::now();
+                            let text = bound_paste(&mut state, text, now);
+                            crate::paste::handle_paste(&mut state, text, now)
                         }
                         Event::Resize(w, h) => {
                             state.cols = w;
@@ -311,13 +325,15 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                             state.transcript.images.clear();
                             state.panel.agent_transcript.images.clear();
                             state.dirty = true;
+                            // The next frame reallocates ratatui's buffers and
+                            // repaints every cell; marking it here is what lets
+                            // the report separate a window drag from a client
+                            // that is slow at painting.
+                            crate::render_metrics::RenderMetrics::record_resize_frame();
                             vec![]
                         }
                         _ => vec![],
                     };
-                    // Before the actions, so a panel's history load starts after its
-                    // deltas are already subscribed.
-                    dispatch_subscribe(&mut state, &client);
                     for act in actions {
                         dispatch_action(act, &mut state, &client, &bg_tx);
                     }
@@ -325,14 +341,15 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             }
             bg_res = bg_rx.recv() => {
                 if let Some(res) = bg_res {
-                    let actions = handle_bg_response(res, &mut state);
-                    for act in actions {
-                        dispatch_action(act, &mut state, &client, &bg_tx);
-                    }
-                    if let Some(req) = state.take_resync_request() {
-                        dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
-                    }
-                    dispatch_subscribe(&mut state, &client);
+                    on_bg_response(res, &mut state, &client, &bg_tx);
+                }
+            }
+            detected = hz_rx.recv() => {
+                if let Some((generation, hz)) = detected
+                    && frame_clock.accept_probe(generation, hz)
+                {
+                    crate::timing::mark(timing, "refresh_hz_detect", t_probe);
+                    frame_interval = frame_clock.interval;
                 }
             }
             _ = stream_sleep => {
@@ -346,15 +363,15 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                 if state.rail.has_live_agents() || state.rail.has_running_tasks() {
                     state.dirty = true;
                 }
-                if state.rail.update_idle(state.turn_active, now) {
+                let turn_active = state.turn_active;
+                if state.rail.update_idle(turn_active, now) {
                     state.dirty = true;
                 }
                 // Marks the frame dirty itself when the whole-second reading changed.
                 state.tick_phase(now);
             }
             _ = anim_sleep => {
-                state.anim_frame = state.anim_frame.wrapping_add(1);
-                state.dirty = true;
+                anim.on_tick(&mut state);
             }
             _ = ctrl_c_expiry_sleep => {
                 state.ctrl_c_at = None;
@@ -366,408 +383,147 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
             _ = deferred_draw_sleep => {
                 // Loop iteration triggers draw
             }
+            _ = menu_remote_sleep => {
+                let now = Instant::now();
+                let actions = crate::keys_menu::remote_filter_due(&mut state, now);
+                for act in actions {
+                    dispatch_action(act, &mut state, &client, &bg_tx);
+                }
+            }
+            _ = resync_sleep => {
+                // The debounce window closed with a want still armed — the
+                // send gate inside re-checks attachment and connection.
+                if let Some(action) = take_resync_action(&mut state, Instant::now()) {
+                    dispatch_action(action, &mut state, &client, &bg_tx);
+                }
+            }
         }
-    }
+    };
 
-    let attached_session = state
-        .meta
-        .as_ref()
-        .map(|m| m.id.clone())
-        .unwrap_or(session_id);
-    log::info!("TUI loop ended, quitting session {attached_session}");
-    if let Some((area, _)) = active_escape.take() {
-        let _ = term_guard.clear_image_area(area);
+    flush_prefs_on_exit(&mut state);
+    loop_result?;
+    // `None` is a real outcome: quitting while the background attach was
+    // still in flight means no session was ever attached.
+    let attached_session = state.meta.as_ref().map(|m| m.id.clone());
+    match &attached_session {
+        Some(id) => log::info!("TUI loop ended, quitting session {id}"),
+        None => log::info!("TUI loop ended before a session attached"),
     }
+    painter.clear_image_escapes(&mut term_guard);
     drop(events);
     drop(bg_rx);
-    if let Ok(c) = Arc::try_unwrap(client) {
-        c.close().await;
+    match Arc::try_unwrap(client) {
+        Ok(client) => client.close().await,
+        Err(client) => {
+            log::warn!(
+                "client close skipped: {} outstanding Arc clone(s)",
+                Arc::strong_count(&client).saturating_sub(1)
+            );
+            drop(client);
+        }
+    }
+    // A failed startup attach propagated through `state.attach_error` — the
+    // CLI prints it the same way the old synchronous `?` did.
+    if let Some(err) = state.attach_error.take() {
+        return Err(err.into());
+    }
+    if matches!(
+        state.connection,
+        crate::state::Connection::Disconnected { .. }
+    ) {
+        return Err(pacode_client::ClientError::Disconnected.into());
     }
     Ok(attached_session)
 }
 
-/// Send `Subscribe` when the wanted agent set changed. Fire and forget: an older daemon
-/// answers with an error and keeps streaming everything, which is still correct.
-fn dispatch_subscribe(state: &mut AppState, client: &Arc<Client>) {
-    if let Some(req) = state.take_subscribe_request() {
-        let cl = Arc::clone(client);
-        tokio::spawn(async move {
-            if let Err(err) = cl.request(req).await {
-                log::debug!("subscribe request failed: {err}");
-            }
-        });
-    }
-}
-
-fn dispatch_action(
-    act: Action,
+/// A daemon/client event: fold it in, then send whatever it unblocked — an
+/// attach retry, a seq-gap or global resync, the post-snapshot flush, and
+/// queued prompts.
+fn on_client_event(
+    ev: ClientEvent,
     state: &mut AppState,
     client: &Arc<Client>,
     bg_tx: &mpsc::UnboundedSender<BgResponse>,
 ) {
-    match act {
-        Action::Quit => {
-            state.quit = true;
-        }
-        Action::Send(req) => {
-            let cl = Arc::clone(client);
-            let tx = bg_tx.clone();
-            tokio::spawn(async move {
-                let res = cl.request(req).await;
-                let _ = tx.send(BgResponse::Reply(res));
-            });
-        }
-        Action::RunBashInteractive { command } => {
-            log::info!("bash-mode interactive start: {command}");
-            let shell = crate::bash::user_shell();
-            let cwd = state.cwd();
-            let mouse = state.config.ui.mouse;
-            let status = crate::terminal::run_suspended(mouse, || {
-                std::process::Command::new(&shell)
-                    .arg("-c")
-                    .arg(&command)
-                    .current_dir(&cwd)
-                    .status()
-            });
-            let (exit_code, err_msg) = match status {
-                Ok(Ok(s)) => {
-                    log::debug!("bash-mode interactive exited with code {:?}", s.code());
-                    (s.code(), None)
-                }
-                Ok(Err(e)) => {
-                    log::warn!("bash-mode interactive failed to execute: {e}");
-                    (Some(1), Some(e.to_string()))
-                }
-                Err(e) => {
-                    log::warn!("terminal error during interactive bash command: {e}");
-                    (Some(1), Some(e.to_string()))
-                }
-            };
-            let now = now_ms();
-            let output = err_msg.unwrap_or_default();
-            state.transcript.cells.push_back(Cell {
-                id: now,
-                kind: CellKind::Item(TranscriptKind::BashCommand {
-                    command,
-                    output,
-                    exit_code,
-                    truncated: false,
-                }),
-                version: 0,
-                ts_ms: now,
-                stats: None,
-            });
-            state.transcript.scroll_to_bottom();
-            state.dirty = true;
-        }
-        Action::RunBashCaptured { command } => {
-            log::info!("bash-mode captured start: {command}");
-            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-            state.running_bash = Some(cancel_tx);
-            state.dirty = true;
-            let tx = bg_tx.clone();
-            let cwd = state.cwd();
-            tokio::spawn(async move {
-                let res = crate::bash::run_captured(&command, &cwd, cancel_rx).await;
-                let _ = tx.send(BgResponse::BashCompleted(res));
-            });
-        }
-        Action::LoadPanel => {
-            let cl = Arc::clone(client);
-            let tx = bg_tx.clone();
-            if let Some(ref target) = state.panel.target {
-                let target = target.clone();
-                tokio::spawn(async move {
-                    let res = match &target {
-                        PanelTarget::Agent(id) => {
-                            cl.request(Request::GetHistory {
-                                agent: id.clone(),
-                                before_seq: None,
-                                limit: 300,
-                            })
-                            .await
-                        }
-                        PanelTarget::Task(id) => {
-                            cl.request(Request::GetTaskOutput {
-                                task: id.clone(),
-                                tail_lines: 300,
-                            })
-                            .await
-                        }
-                    };
-                    let _ = tx.send(BgResponse::LoadPanelReply {
-                        target,
-                        result: res,
-                    });
-                });
-            }
-        }
-        Action::LoadHistory => {
-            let cl = Arc::clone(client);
-            let tx = bg_tx.clone();
-            let first_cell_id = state.transcript.oldest_seq();
-            let limit = state.config.session.history_page;
-            log::debug!("history page requested: before_seq={first_cell_id:?}, limit={limit}");
-            state.transcript.loading_history = true;
-            tokio::spawn(async move {
-                let res = cl
-                    .request(Request::GetHistory {
-                        agent: AgentId::main(),
-                        before_seq: first_cell_id,
-                        limit,
-                    })
-                    .await;
-                let _ = tx.send(BgResponse::LoadHistoryReply { result: res });
-            });
-        }
+    let global_resync = matches!(&ev, ClientEvent::ResyncNeeded { .. });
+    let snapshot_landed = matches!(&ev, ClientEvent::Snapshot { .. });
+    let reset_deferred = matches!(
+        &ev,
+        ClientEvent::Disconnected { .. } | ClientEvent::Reconnecting { .. }
+    );
+    let pending_attach = state.pending_attach.is_some();
+    let now = Instant::now();
+    let snapshot_applied = state.apply_client_event(ev, now);
+    flush_prefs_write(state);
+    if reset_deferred && snapshot_applied {
+        state.session.cancel_deferred_work();
+        clear_list_loading(state);
+    }
+    dispatch_pending_attach_retry(state, client, bg_tx);
+    let reconnect_boundary =
+        snapshot_landed && snapshot_applied && state.take_reconnect_snapshot_boundary();
+    if let Some(action) = take_resync_action(state, now) {
+        dispatch_action(action, state, client, bg_tx);
+    }
+    for action in take_global_resync_actions(
+        state,
+        (global_resync && snapshot_applied) || reconnect_boundary,
+    ) {
+        dispatch_global_refresh_action(action, state, client, bg_tx);
+    }
+    for action in
+        snapshot_actions_after_apply(state, pending_attach, snapshot_landed, snapshot_applied)
+    {
+        dispatch_action(action, state, client, bg_tx);
+    }
+    if let Some(req) = state.drain_prompt_queue() {
+        dispatch_action(Action::Send(req), state, client, bg_tx);
+    }
+    if let Some(sequence) = state.drain_pending_sequence() {
+        dispatch_action(prompt_batch_action(sequence), state, client, bg_tx);
     }
 }
 
-fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
-    match res {
-        BgResponse::Reply(Ok(Reply::Error { message })) => {
-            state.resync.on_request_failed();
-            let now = now_ms();
-            state.transcript.cells.push_back(Cell {
-                id: now,
-                kind: CellKind::Item(TranscriptKind::Notice {
-                    level: ToastLevel::Error,
-                    text: message,
-                }),
-                version: 0,
-                ts_ms: now,
-                stats: None,
-            });
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::Models { models })) => {
-            state.models = models;
-            state.refresh_model_picker();
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::AuthStatus { providers })) => {
-            state.auth_providers = providers;
-            state.refresh_model_picker();
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::Sessions { sessions })) => {
-            state.sessions = sessions;
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::McpServers { servers })) => {
-            crate::commands::register_mcp_servers(&servers);
-            if let crate::state::Focus::Overlay(crate::state::Overlay::McpPicker {
-                servers: ref mut s,
-                loading: ref mut l,
-                ..
-            }) = state.focus
-            {
-                *s = servers;
-                *l = false;
-                state.dirty = true;
-            }
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::McpPrompt { text })) => {
-            state.input.insert_str(&text);
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::MarketplacePlugins {
-            plugins: listing,
-            stale: is_stale,
-        })) => {
-            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
-                ref mut market,
-                ref mut loading,
-                ref mut stale,
-                ref mut index,
-                ..
-            }) = state.focus
-            {
-                *index = (*index).min(listing.len().saturating_sub(1));
-                *market = listing;
-                *loading = false;
-                *stale = is_stale;
-                state.dirty = true;
-            }
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::Plugins { plugins })) => {
-            crate::commands::register_plugins(&plugins);
-            state.plugins = plugins.clone();
-            if let crate::state::Focus::Overlay(crate::state::Overlay::PluginsPicker {
-                plugins: ref mut p,
-                ..
-            }) = state.focus
-            {
-                *p = plugins;
-                state.dirty = true;
-            }
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::PluginCommand(outcome))) => match outcome {
-            PluginCommandOutcome::InsertText { text } => {
-                state.input.insert_str(&text);
-                state.dirty = true;
-                vec![]
-            }
-            PluginCommandOutcome::SendPrompt { text } => {
-                vec![Action::Send(Request::UserMessage {
-                    text,
-                    attachments: Vec::new(),
-                })]
-            }
-            PluginCommandOutcome::Nothing => vec![],
-        },
-        BgResponse::Reply(Ok(Reply::Attached(snapshot))) => {
-            let slot_idx = state.active_slot;
-            state.record_slot(
-                slot_idx,
-                &snapshot.meta,
-                &snapshot.usage,
-                snapshot.agents.len(),
-                snapshot.tasks.len(),
-            );
-            state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(Reply::Snapshot(snapshot))) => {
-            let slot_idx = state.active_slot;
-            state.record_slot(
-                slot_idx,
-                &snapshot.meta,
-                &snapshot.usage,
-                snapshot.agents.len(),
-                snapshot.tasks.len(),
-            );
-            state.apply_client_event(ClientEvent::Snapshot(snapshot), Instant::now());
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::Reply(Ok(_)) => vec![],
-        BgResponse::Reply(Err(err)) => {
-            // Any failed request may be the resync's GetSnapshot; free the debounce slot.
-            state.resync.on_request_failed();
-            let now = now_ms();
-            state.transcript.cells.push_back(Cell {
-                id: now,
-                kind: CellKind::Item(TranscriptKind::Notice {
-                    level: ToastLevel::Error,
-                    text: err.to_string(),
-                }),
-                version: 0,
-                ts_ms: now,
-                stats: None,
-            });
-            state.dirty = true;
-            vec![]
-        }
-        BgResponse::LoadPanelReply { target, result } => {
-            match result {
-                Ok(Reply::History {
-                    items, has_more, ..
-                }) => {
-                    if state.panel.target == Some(target) {
-                        state.panel.agent_transcript.reset(items, has_more);
-                        state.dirty = true;
-                    }
-                }
-                Ok(Reply::TaskOutput {
-                    lines, total_lines, ..
-                }) => {
-                    if state.panel.target == Some(target) {
-                        state.panel.task_lines = lines;
-                        state.panel.task_total_lines = total_lines;
-                        state.dirty = true;
-                    }
-                }
-                Ok(Reply::Error { message }) => {
-                    state.push_toast(
-                        ToastLevel::Error,
-                        "Panel load error".into(),
-                        Some(message),
-                        Instant::now(),
-                    );
-                }
-                Err(e) => {
-                    state.push_toast(
-                        ToastLevel::Error,
-                        "Panel load error".into(),
-                        Some(e.to_string()),
-                        Instant::now(),
-                    );
-                }
-                _ => {}
-            }
-            vec![]
-        }
-        BgResponse::LoadHistoryReply { result } => {
-            match result {
-                Ok(Reply::History {
-                    items, has_more, ..
-                }) => {
-                    log::debug!(
-                        "history page loaded: {} items, has_more={has_more}",
-                        items.len()
-                    );
-                    state.transcript.prepend(items, has_more);
-                    state.dirty = true;
-                }
-                _ => {
-                    log::warn!("history page request failed or returned non-history reply");
-                    state.transcript.loading_history = false;
-                }
-            }
-            vec![]
-        }
-        BgResponse::BashCompleted(res) => {
-            state.running_bash = None;
-            state.dirty = true;
-            match res {
-                Ok(out) => {
-                    log::debug!(
-                        "bash-mode captured completed: exit_code={:?}, truncated={}",
-                        out.exit_code,
-                        out.truncated
-                    );
-                    let now = now_ms();
-                    state.transcript.cells.push_back(Cell {
-                        id: now,
-                        kind: CellKind::Item(TranscriptKind::BashCommand {
-                            command: out.command,
-                            output: out.output,
-                            exit_code: out.exit_code,
-                            truncated: out.truncated,
-                        }),
-                        version: 0,
-                        ts_ms: now,
-                        stats: None,
-                    });
-                    state.transcript.scroll_to_bottom();
-                }
-                Err(err) => {
-                    log::warn!("bash-mode captured error: {err}");
-                    let now = now_ms();
-                    state.transcript.cells.push_back(Cell {
-                        id: now,
-                        kind: CellKind::Item(TranscriptKind::Notice {
-                            level: ToastLevel::Error,
-                            text: err,
-                        }),
-                        version: 0,
-                        ts_ms: now,
-                        stats: None,
-                    });
-                    state.transcript.scroll_to_bottom();
-                }
-            }
-            vec![]
-        }
+/// Write the default changes a `SessionUpdated` produced, on a blocking
+/// thread: `prefs.toml` is disk IO and the UI thread never waits on it.
+fn flush_prefs_write(state: &mut AppState) {
+    if let Some(delta) = state.take_prefs_write() {
+        state.prefs_outbox.post(delta);
+        let outbox = state.prefs_outbox.clone();
+        let paths = state.paths.clone();
+        tokio::task::spawn_blocking(move || outbox.flush(&paths));
+    }
+}
+
+/// The loop is over: the last change's blocking write may still be queued
+/// when the runtime shuts down and never run, so the outbox is written here,
+/// once, on this thread. `flush` takes the delta, so
+/// a write that did run leaves nothing to repeat.
+fn flush_prefs_on_exit(state: &mut AppState) {
+    if let Some(delta) = state.take_prefs_write() {
+        state.prefs_outbox.post(delta);
+    }
+    state.prefs_outbox.flush(&state.paths);
+}
+
+/// A background result: fold it in, then dispatch what it produced and
+/// whatever it unblocked — an attach retry and queued prompts.
+fn on_bg_response(
+    res: BgResponse,
+    state: &mut AppState,
+    client: &Arc<Client>,
+    bg_tx: &mpsc::UnboundedSender<BgResponse>,
+) {
+    let actions = handle_bg_response(res, state);
+    flush_prefs_write(state);
+    dispatch_pending_attach_retry(state, client, bg_tx);
+    for act in actions {
+        dispatch_action(act, state, client, bg_tx);
+    }
+    if let Some(req) = state.drain_prompt_queue() {
+        dispatch_action(Action::Send(req), state, client, bg_tx);
+    }
+    if let Some(sequence) = state.drain_pending_sequence() {
+        dispatch_action(prompt_batch_action(sequence), state, client, bg_tx);
     }
 }

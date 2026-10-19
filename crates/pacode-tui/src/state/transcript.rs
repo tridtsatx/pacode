@@ -1,76 +1,68 @@
 //! Transcript cells with a bounded render cache and paced streaming.
+//!
+//! This module holds the transcript and how items land in it (`upsert`, the
+//! client's own rows, permission prompts). The rest is split by concern:
+//! `transcript_cell` (the cell types and their byte weight),
+//! `transcript_evict` (cell and byte caps, history pages),
+//! `transcript_stream` (paced reveal, tool output) and `transcript_view`
+//! (scroll, rows under the pointer, expansion and exploration groups).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use pacode_render::{LineCache, StreamBuffer, StreamKind, StreamOp};
-use pacode_types::{TranscriptItem, TranscriptKind};
+use pacode_render::{LineCache, RenderOptions, StreamBuffer, StreamKind};
 
-#[path = "cell_extent.rs"]
-pub mod cell_extent;
+use crate::ui::toolgroup::GroupHead;
+use pacode_types::{PermissionId, PermissionRequest, ToolStatus, TranscriptItem, TranscriptKind};
+
+#[path = "tool_stream.rs"]
+mod tool_stream;
+#[path = "transcript_cell.rs"]
+mod transcript_cell;
+#[path = "transcript_evict.rs"]
+mod transcript_evict;
+#[path = "transcript_stream.rs"]
+mod transcript_stream;
+#[path = "transcript_view.rs"]
+mod transcript_view;
+
+pub use tool_stream::{MAX_TOOL_STREAM_CHARS, MAX_TOOL_STREAMS, ToolStreamView, ToolStreams};
+use transcript_cell::cell_bytes;
+pub use transcript_cell::{
+    BackgroundKind, BackgroundOutcome, BackgroundResult, Cell, CellKind, HeaderInfo, PermExplain,
+    explain_level_name,
+};
 
 #[cfg(test)]
 #[path = "transcript_tests.rs"]
 mod transcript_tests;
 
-/// One transcript row group. `id` is the item seq from the daemon (stable across
-/// updates), `cache_id` keys the render cache.
-#[derive(Clone, Debug)]
-pub struct Cell {
-    pub id: u64,
-    pub kind: CellKind,
-    /// Bumped whenever the content changes (invalidates the cache).
-    pub version: u32,
-    pub ts_ms: u64,
-    pub stats: Option<String>,
+pub(crate) type StableRevision = (u64, usize);
+
+/// Ceiling on the bytes one transcript holds client-side. The cell cap counts
+/// rows, not weight: a hundred tool calls with 2 MiB previews pass any cell cap
+/// and still pin hundreds of megabytes. The daemon's own tail is capped at
+/// 4 MiB per session, so this leaves room for a full session of growth before
+/// the oldest cells start dropping.
+pub const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
+
+/// The high bit of a cell id marks it as the client's own. Daemon item seqs
+/// are a per-session counter starting at zero; client rows (notices, gaps,
+/// finished background jobs) used to be keyed by a wall clock or by an event
+/// seq, and both alias that counter: two notices in the same millisecond
+/// replaced each other, a permission row could land on top of a transcript
+/// item, and one evicted client row pushed the eviction floor past every real
+/// seq so later items were dropped as "already evicted".
+const CLIENT_ID_TAG: u64 = 1 << 63;
+
+fn is_client_id(id: u64) -> bool {
+    id & CLIENT_ID_TAG != 0
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct HeaderInfo {
-    pub version: String,
-    /// Days since the Unix epoch; picks the phrase of the day (stable for the whole day).
-    pub day: u64,
-    pub mascot: crate::ui::mascot::MascotKind,
-    /// Whether the terminal takes RGB, so the mascot can use the arcade palette
-    /// instead of folding it down to the nearest ANSI colour.
-    pub truecolor: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum CellKind {
-    /// Wraps the daemon item; `Assistant`/`Reasoning` text is the *revealed* text.
-    Item(TranscriptKind),
-    /// Divider between turns (drawn as a blank line).
-    Gap,
-    /// A background task or subagent that ended. Client-side only: the daemon
-    /// reports the task, the client decides whether it was long enough to be
-    /// worth a line and renders it like a tool call rather than as prose.
-    BackgroundResult(BackgroundResult),
-}
-
-/// What a finished background job is shown as.
-#[derive(Clone, Debug, PartialEq)]
-pub struct BackgroundResult {
-    /// `task` for a command, `agent` for a subagent.
-    pub kind: BackgroundKind,
-    /// Command line or agent name.
-    pub label: String,
-    pub outcome: BackgroundOutcome,
-    pub exit_code: Option<i32>,
-    pub duration_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackgroundKind {
-    Task,
-    Agent,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackgroundOutcome {
-    Completed,
-    Failed,
-    Killed,
+pub(crate) struct RenderProfile {
+    pub(crate) width: u16,
+    pub(crate) options: RenderOptions,
+    pub(crate) anim_frame: u64,
 }
 
 pub struct Transcript {
@@ -81,6 +73,13 @@ pub struct Transcript {
     /// Bumped on every header change so the render cache can key on it.
     pub header_version: u32,
     pub max_cells: usize,
+    /// Ceiling on the estimated resident bytes of the cells; see
+    /// `MAX_TRANSCRIPT_BYTES`.
+    pub max_bytes: usize,
+    /// Estimated resident bytes per cell id, kept in step with `bytes` by every
+    /// path that adds, replaces or drops a cell.
+    cell_bytes: HashMap<u64, usize>,
+    bytes: usize,
     /// Scroll offset in rendered lines from the bottom; 0 = follow the tail.
     pub scroll_from_bottom: usize,
     /// Total rendered line count recorded by the most recent draw. `None` before first draw.
@@ -92,24 +91,31 @@ pub struct Transcript {
     /// a screen row to the line the reader actually clicked on.
     pub first_visible_line: usize,
     /// Cells whose output is shown in full instead of the first few lines.
-    pub expanded: std::collections::HashSet<u64>,
+    pub expanded: HashSet<u64>,
     /// Which content lines belong to which cell, from the most recent draw:
     /// `(cell id, first line, one past the last)`. This is how a click on a row
     /// finds the cell under it.
     pub cell_lines: Vec<(u64, usize, usize)>,
+    /// The header rows of every exploration group of the most recent draw: a
+    /// click there opens the whole group rather than one call of it.
+    pub(crate) group_heads: Vec<GroupHead>,
     pub cache: LineCache,
-    /// Rendered line count per cell, so a frame renders only the cells in view; see
-    /// `cell_extent` for cap and invalidation.
-    pub extents: cell_extent::CellExtents,
-    /// Cells whose lines the most recent draw rendered or fetched (the viewport's
-    /// cells, plus any cell measured for the first time or whose lines are not
-    /// cacheable). Bounded by the viewport once every cell has been measured.
-    pub cells_laid_out: usize,
+    pub(crate) stable_revisions: HashMap<u64, StableRevision>,
+    pub(crate) cell_line_index: HashMap<u64, usize>,
+    /// Monotonic source of client-allocated cell ids; survives `reset` so an id
+    /// is never handed out twice in one session.
+    next_client_id: u64,
+    evicted_floor: Option<u64>,
+    render_profile: Option<RenderProfile>,
     /// Decoded inline images (32 entries / 4 MB, LRU); see `state::image_cache`.
     pub images: crate::state::image_cache::ImageCellCache,
     /// Streaming reveal buffer for the live assistant cell (`live_cell`).
     pub stream: Option<StreamBuffer>,
     pub live_cell: Option<u64>,
+    /// Output received so far for each running tool call, keyed by cell id.
+    /// The wire item carries no partial output, so the live body of a running
+    /// call lives here until that call's final item replaces it.
+    pub tool_streams: ToolStreams,
     /// Final item received while the paced reveal still has backlog: applied when the
     /// backlog drains so the tail of an answer does not pop in at once.
     pub pending_final: Option<TranscriptItem>,
@@ -126,18 +132,26 @@ impl Transcript {
             header: None,
             header_version: 0,
             max_cells,
+            max_bytes: MAX_TRANSCRIPT_BYTES,
+            cell_bytes: HashMap::new(),
+            bytes: 0,
             scroll_from_bottom: 0,
             rendered_lines: None,
             viewport_height: None,
             first_visible_line: 0,
-            expanded: std::collections::HashSet::new(),
+            expanded: HashSet::new(),
             cell_lines: Vec::new(),
+            group_heads: Vec::new(),
             cache: LineCache::new(20_000),
-            extents: cell_extent::CellExtents::default(),
-            cells_laid_out: 0,
+            stable_revisions: HashMap::new(),
+            cell_line_index: HashMap::new(),
+            next_client_id: 0,
+            evicted_floor: None,
+            render_profile: None,
             images: crate::state::image_cache::ImageCellCache::default(),
             stream: None,
             live_cell: None,
+            tool_streams: ToolStreams::default(),
             pending_final: None,
             has_more_history: false,
             loading_history: false,
@@ -146,59 +160,115 @@ impl Transcript {
 
     /// Set `[ui] images` and the colour depth used for inline images.
     pub fn with_images(mut self, enabled: bool, truecolor: bool) -> Self {
+        self.set_images(enabled, truecolor);
+        self
+    }
+
+    /// In-place form of [`Transcript::with_images`].
+    pub fn set_images(&mut self, enabled: bool, truecolor: bool) {
         self.images.enabled = enabled;
         self.images.truecolor = truecolor;
-        self
     }
 
     /// Replace everything (snapshot).
     pub fn reset(&mut self, items: Vec<TranscriptItem>, has_more: bool) {
         self.cells.clear();
         self.cache.clear();
-        self.extents.clear();
+        self.stable_revisions.clear();
+        self.cell_line_index.clear();
+        self.cell_bytes.clear();
+        self.bytes = 0;
+        self.evicted_floor = None;
+        self.render_profile = None;
         self.images.clear();
         self.stream = None;
         self.live_cell = None;
+        self.tool_streams.clear();
         self.pending_final = None;
+        self.expanded.clear();
+        self.cell_lines.clear();
+        self.group_heads.clear();
         self.scroll_from_bottom = 0;
+        self.first_visible_line = 0;
         self.loading_history = false;
         self.rendered_lines = None;
         self.viewport_height = None;
-
-        // The daemon already bounds what it sends to `session.history_page` items and
-        // reports whether anything older exists, so the client keeps the page whole
-        // instead of capping it a second time with a number of its own.
         self.has_more_history = has_more;
 
-        for item in &items {
-            let cell = Cell {
-                id: item.seq,
-                kind: CellKind::Item(item.kind.clone()),
-                version: 0,
-                ts_ms: item.ts_ms,
-                stats: None,
-            };
-            self.cells.push_back(cell);
-        }
-        self.enforce_cap();
-    }
-
-    /// Prepend older items (history page).
-    pub fn prepend(&mut self, items: Vec<TranscriptItem>, has_more: bool) {
-        self.has_more_history = has_more;
-        self.loading_history = false;
-
-        for item in items.into_iter().rev() {
-            let cell = Cell {
+        for item in items {
+            self.append_indexed(Cell {
                 id: item.seq,
                 kind: CellKind::Item(item.kind),
                 version: 0,
                 ts_ms: item.ts_ms,
                 stats: None,
-            };
-            self.cells.push_front(cell);
+                perm_explain: None,
+            });
         }
-        self.enforce_cap();
+        self.enforce_limits();
+    }
+
+    /// Estimated resident bytes of the cells on screen.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn set_render_profile(
+        &mut self,
+        width: u16,
+        options: &RenderOptions,
+        anim_frame: u64,
+    ) {
+        self.render_profile = Some(RenderProfile {
+            width,
+            options: options.clone(),
+            anim_frame,
+        });
+    }
+
+    /// Where a cell sits in `cells`. A scan rather than an id→position map:
+    /// `cells` is a public deque, and every map that claimed to mirror it went
+    /// stale the moment something else touched it — evicting one row and
+    /// appending another leaves the length identical, and a lookup that trusted
+    /// the stale map appended a second copy of a row already on screen.
+    fn cell_index(&self, cell_id: u64) -> Option<usize> {
+        self.cells.iter().position(|cell| cell.id == cell_id)
+    }
+
+    fn set_cell_bytes(&mut self, id: u64, size: usize) {
+        self.bytes = self
+            .bytes
+            .saturating_sub(self.cell_bytes.remove(&id).unwrap_or(0))
+            .saturating_add(size);
+        self.cell_bytes.insert(id, size);
+    }
+
+    fn forget_bytes(&mut self, id: u64) -> usize {
+        let size = self.cell_bytes.remove(&id).unwrap_or(0);
+        self.bytes = self.bytes.saturating_sub(size);
+        size
+    }
+
+    /// A client id no daemon item could carry: monotonic, and never handed out
+    /// twice in one session.
+    fn allocate_client_id(&mut self) -> u64 {
+        loop {
+            self.next_client_id = self.next_client_id.wrapping_add(1) & !CLIENT_ID_TAG;
+            if self.next_client_id != 0 {
+                return CLIENT_ID_TAG | self.next_client_id;
+            }
+        }
+    }
+
+    fn append_indexed(&mut self, cell: Cell) {
+        let size = cell_bytes(&cell);
+        if let Some(index) = self.cell_index(cell.id) {
+            self.set_cell_bytes(cell.id, size);
+            self.cells[index] = cell;
+            return;
+        }
+        self.set_cell_bytes(cell.id, size);
+        self.cells.push_back(cell);
     }
 
     /// Set or update the non-persisted header banner.
@@ -210,30 +280,13 @@ impl Transcript {
         self.header_version = self.header_version.wrapping_add(1);
     }
 
-    /// Hand the paced stream over to a different cell.
-    ///
-    /// The buffer belongs to whichever cell is live. Carrying it across a switch
-    /// replayed one cell's undrained tail into the next one, which is how the
-    /// first grapheme of an answer ended up alone in the reasoning cell above it
-    /// while the rest of the sentence went to the answer cell. Anything still
-    /// buffered is flushed into the cell that produced it before the new cell
-    /// starts with an empty buffer.
-    fn set_live_cell(&mut self, seq: u64, now: Instant) {
-        if self.live_cell == Some(seq) {
-            self.stream.get_or_insert_with(|| StreamBuffer::new(now));
-            return;
-        }
-        if self.live_cell.is_some() && self.has_backlog() {
-            self.flush_stream();
-        }
-        self.live_cell = Some(seq);
-        self.stream = Some(StreamBuffer::new(now));
-    }
-
     /// `ItemAdded` / `ItemUpdated`: insert or replace by seq. Assistant/Reasoning items
     /// that are not complete become the live cell with an empty revealed text.
     pub fn upsert(&mut self, item: TranscriptItem, now: Instant) {
         let seq = item.seq;
+        if self.is_evicted(seq) {
+            return;
+        }
         match item.kind {
             TranscriptKind::Assistant { text, complete } => {
                 if !complete {
@@ -310,275 +363,160 @@ impl Transcript {
                 }
             }
             other => {
+                // A terminal cell must never land mid-reveal: the live cell can
+                // still hold buffered text that precedes this item on the wire,
+                // and appending first would split the answer around the tool.
+                // Flushing preserves wire order. Updates to an existing cell
+                // replace in place and cannot reorder, so they skip the flush.
+                if self.cell_index(seq).is_none() {
+                    self.flush_stream();
+                }
                 self.insert_or_replace(seq, other, item.ts_ms);
             }
         }
-        self.enforce_cap();
+        self.enforce_limits();
+    }
+
+    /// Append a row the client invented (a notice, a gap, a finished
+    /// background job). Its identity is allocated here rather than taken from
+    /// the caller: callers hand over a wall clock or an event seq, and keying a
+    /// cell by either puts it in the daemon's seq space, where it can overwrite
+    /// a transcript item.
+    pub fn push_cell(&mut self, mut cell: Cell) {
+        if self.has_backlog() || self.has_pending_final() {
+            self.flush_stream();
+        }
+        cell.id = self.allocate_client_id();
+        self.append_indexed(cell);
+        self.enforce_limits();
+    }
+
+    /// Index of the prompt row carrying `permission`, if it is still on screen.
+    fn permission_cell_index(&self, permission: &PermissionId) -> Option<usize> {
+        self.cells.iter().position(|cell| {
+            matches!(
+                &cell.kind,
+                CellKind::Item(TranscriptKind::Permission(existing)) if &existing.id == permission
+            )
+        })
+    }
+
+    fn refresh_permission_cell(&mut self, index: usize, req: PermissionRequest, ts_ms: u64) {
+        let cell = &mut self.cells[index];
+        cell.kind = CellKind::Item(TranscriptKind::Permission(req));
+        cell.version = cell.version.wrapping_add(1);
+        cell.ts_ms = ts_ms;
+    }
+
+    /// Insert or refresh the pending-permission prompt for `req`, keyed on the
+    /// permission id rather than a seq: the daemon emits the same request
+    /// twice (`PermissionRequested`, then an `ItemAdded` transcript item) and
+    /// a snapshot repeats it via `pending_permissions`. The first write keeps
+    /// the slot — later writes refresh the request in place, so the prompt
+    /// never renders twice and any `perm_explain` state survives the
+    /// duplicate. A prompt that arrives as an event has no transcript item seq
+    /// to key on, so it is filed under a client id (see `push_cell`).
+    pub fn upsert_permission(&mut self, req: PermissionRequest, ts_ms: u64, _fallback_id: u64) {
+        if let Some(index) = self.permission_cell_index(&req.id) {
+            self.refresh_permission_cell(index, req, ts_ms);
+            return;
+        }
+        self.push_cell(Cell {
+            id: 0,
+            kind: CellKind::Item(TranscriptKind::Permission(req)),
+            version: 0,
+            ts_ms,
+            stats: None,
+            perm_explain: None,
+        });
+    }
+
+    /// Fold an `e`-key explanation state into every cell still carrying the
+    /// pending request — the `PermissionRequested` row and the transcript
+    /// item share the request's id. Returns true when at least one live
+    /// prompt took it; false means the request already resolved and its
+    /// prompt is gone.
+    pub fn set_perm_explain(&mut self, permission: &PermissionId, explain: &PermExplain) -> bool {
+        let mut landed = false;
+        for cell in &mut self.cells {
+            if matches!(
+                &cell.kind,
+                CellKind::Item(TranscriptKind::Permission(req)) if req.id == *permission
+            ) {
+                cell.perm_explain = Some(explain.clone());
+                cell.version = cell.version.wrapping_add(1);
+                landed = true;
+            }
+        }
+        landed
     }
 
     fn insert_or_replace(&mut self, seq: u64, kind: TranscriptKind, ts_ms: u64) {
-        if let Some(existing) = self.cells.iter_mut().find(|c| c.id == seq) {
-            existing.kind = CellKind::Item(kind);
-            existing.version = existing.version.wrapping_add(1);
-            existing.ts_ms = ts_ms;
-        } else {
-            self.cells.push_back(Cell {
+        // A call that is no longer running owns its body: the daemon's final
+        // preview replaces the live bytes, and keeping them would hold output
+        // that is no longer on screen.
+        if matches!(
+            kind,
+            TranscriptKind::ToolCall {
+                status: ToolStatus::Ok
+                    | ToolStatus::Error
+                    | ToolStatus::Backgrounded
+                    | ToolStatus::Denied,
+                ..
+            }
+        ) {
+            self.tool_streams.remove(seq);
+        }
+
+        // A permission item is the same prompt `PermissionRequested` already
+        // rendered — keyed by request id so the daemon's double emission
+        // lands on one cell instead of prompting twice. When the prompt is not
+        // on screen yet, the item's own seq is the right key: a history page
+        // that repeats this item has to find the cell it already made.
+        if let TranscriptKind::Permission(req) = kind {
+            if let Some(index) = self.permission_cell_index(&req.id) {
+                self.refresh_permission_cell(index, req, ts_ms);
+                return;
+            }
+            if self.is_evicted(seq) {
+                return;
+            }
+            self.append_indexed(Cell {
                 id: seq,
-                kind: CellKind::Item(kind),
+                kind: CellKind::Item(TranscriptKind::Permission(req)),
                 version: 0,
                 ts_ms,
                 stats: None,
+                perm_explain: None,
             });
-        }
-    }
-
-    /// `TextDelta`/`ReasoningDelta` for `item_seq`: queue into the stream buffer.
-    pub fn push_delta(&mut self, item_seq: u64, text: &str, reasoning: bool, now: Instant) {
-        if text.is_empty() {
             return;
         }
-        let kind = if reasoning {
-            StreamKind::Reasoning
-        } else {
-            StreamKind::Text
-        };
-        if self.live_cell == Some(item_seq) {
-            let sb = self.stream.get_or_insert_with(|| StreamBuffer::new(now));
-            sb.push(kind, text);
-        } else if self.cells.iter().any(|c| c.id == item_seq) {
-            self.set_live_cell(item_seq, now);
-            if let Some(sb) = self.stream.as_mut() {
-                sb.push(kind, text);
-            }
-            if let Some(cell) = self.cells.iter_mut().find(|c| c.id == item_seq) {
-                cell.version = cell.version.wrapping_add(1);
-            }
-        }
-    }
-
-    /// Reveal paced text into the live cell. Returns true when something was revealed.
-    pub fn tick_stream(&mut self, now: Instant) -> bool {
-        let Some(live_id) = self.live_cell else {
-            return false;
-        };
-        let Some(ref mut sb) = self.stream else {
-            return false;
-        };
-        let ops = sb.reveal(now);
-        if ops.is_empty() {
-            return false;
-        }
-
-        if let Some(cell) = self.cells.iter_mut().find(|c| c.id == live_id) {
-            for op in ops {
-                match op {
-                    // Text only ever reaches the cell that produced it now that
-                    // the buffer is per-cell; a reasoning cell is never rewritten
-                    // into an answer cell mid-stream.
-                    StreamOp::Text(s) => {
-                        if let CellKind::Item(TranscriptKind::Assistant { text, .. }) =
-                            &mut cell.kind
-                        {
-                            text.push_str(&s);
-                        }
-                    }
-                    StreamOp::Reasoning(s) => {
-                        if let CellKind::Item(TranscriptKind::Reasoning { text, .. }) =
-                            &mut cell.kind
-                        {
-                            text.push_str(&s);
-                        }
-                    }
-                    StreamOp::CloseReasoning => {}
-                }
-            }
-            cell.version = cell.version.wrapping_add(1);
-            self.apply_pending_final();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// When the backlog is drained and a final item is waiting, install it.
-    fn apply_pending_final(&mut self) {
-        if self.has_backlog() {
+        if self.is_evicted(seq) {
             return;
         }
-        if let Some(item) = self.pending_final.take() {
-            self.live_cell = None;
-            self.stream = None;
-            self.insert_or_replace(item.seq, item.kind, item.ts_ms);
-        }
-    }
-
-    /// Flush the stream (item complete or interrupted).
-    pub fn flush_stream(&mut self) {
-        let Some(live_id) = self.live_cell else {
-            return;
-        };
-        let Some(ref mut sb) = self.stream else {
-            return;
-        };
-        let ops = sb.flush();
-        if let Some(cell) = self.cells.iter_mut().find(|c| c.id == live_id) {
-            for op in ops {
-                match op {
-                    // Text only ever reaches the cell that produced it now that
-                    // the buffer is per-cell; a reasoning cell is never rewritten
-                    // into an answer cell mid-stream.
-                    StreamOp::Text(s) => {
-                        if let CellKind::Item(TranscriptKind::Assistant { text, .. }) =
-                            &mut cell.kind
-                        {
-                            text.push_str(&s);
-                        }
-                    }
-                    StreamOp::Reasoning(s) => {
-                        if let CellKind::Item(TranscriptKind::Reasoning { text, .. }) =
-                            &mut cell.kind
-                        {
-                            text.push_str(&s);
-                        }
-                    }
-                    StreamOp::CloseReasoning => {}
-                }
-            }
-            cell.version = cell.version.wrapping_add(1);
-        }
-        if let Some(item) = self.pending_final.take() {
-            self.live_cell = None;
-            self.stream = None;
-            self.insert_or_replace(item.seq, item.kind, item.ts_ms);
-        }
-    }
-
-    pub fn has_backlog(&self) -> bool {
-        self.stream.as_ref().is_some_and(|s| !s.is_empty())
-    }
-
-    pub fn stream_backlog_chars(&self) -> usize {
-        self.stream.as_ref().map(|s| s.backlog_chars()).unwrap_or(0)
-    }
-
-    pub fn has_pending_final(&self) -> bool {
-        self.pending_final.is_some()
-    }
-
-    /// Record the rendered line count and viewport height from the most recent draw,
-    /// clamping `scroll_from_bottom` so the view can never sit past the top.
-    /// The cell drawn at content line `line`, from the most recent draw.
-    pub fn cell_at_line(&self, line: usize) -> Option<u64> {
-        self.cell_lines
-            .iter()
-            .find(|(_, start, end)| line >= *start && line < *end)
-            .map(|(id, _, _)| *id)
-    }
-
-    /// Show or hide a cell's full output. Returns true when something changed.
-    pub fn toggle_expanded(&mut self, cell_id: u64) -> bool {
-        if !self.cells.iter().any(|c| c.id == cell_id) {
-            return false;
-        }
-        if !self.expanded.remove(&cell_id) {
-            self.expanded.insert(cell_id);
-        }
-        // The rendered height changes, so the cached lines for that cell are stale.
-        self.cache.invalidate_cell(cell_id);
-        true
-    }
-
-    pub fn is_expanded(&self, cell_id: u64) -> bool {
-        self.expanded.contains(&cell_id)
-    }
-
-    pub fn record_render(&mut self, total_lines: usize, viewport: usize) {
-        self.rendered_lines = Some(total_lines);
-        self.viewport_height = Some(viewport);
-        let max_scroll = total_lines.saturating_sub(viewport);
-        self.scroll_from_bottom = self.scroll_from_bottom.min(max_scroll);
-        self.first_visible_line = max_scroll.saturating_sub(self.scroll_from_bottom);
-    }
-
-    pub fn scroll_by(&mut self, delta: i32) {
-        let max_scroll = match (self.rendered_lines, self.viewport_height) {
-            (Some(total), Some(vp)) => total.saturating_sub(vp),
-            _ => 0,
-        };
-        let new_scroll =
-            (self.scroll_from_bottom as i64 + delta as i64).clamp(0, max_scroll as i64);
-        self.scroll_from_bottom = new_scroll as usize;
-    }
-
-    pub fn scroll_to_top(&mut self) {
-        let max_scroll = match (self.rendered_lines, self.viewport_height) {
-            (Some(total), Some(vp)) => total.saturating_sub(vp),
-            _ => 0,
-        };
-        self.scroll_from_bottom = max_scroll;
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_from_bottom = 0;
-    }
-
-    pub fn oldest_seq(&self) -> Option<u64> {
-        self.cells.front().map(|c| c.id)
-    }
-
-    pub fn is_at_top(&self) -> bool {
-        match (self.rendered_lines, self.viewport_height) {
-            (Some(total), Some(vp)) => {
-                if total == 0 {
-                    return false;
-                }
-                let max_scroll = total.saturating_sub(vp);
-                self.scroll_from_bottom >= max_scroll
-            }
-            _ => false,
-        }
-    }
-
-    /// Screen position (0-based line offset from the top of the viewport) for a cell.
-    /// Returns `None` if the cell is not currently within the visible viewport.
-    pub fn cell_screen_position(&self, cell_id: u64, viewport: usize) -> Option<usize> {
-        let cell_idx = self.cells.iter().position(|c| c.id == cell_id)?;
-        let total = self.cells.len();
-        if total == 0 || viewport == 0 {
-            return None;
-        }
-        let max_scroll = total.saturating_sub(viewport);
-        let scroll = self.scroll_from_bottom.min(max_scroll);
-        let start = max_scroll.saturating_sub(scroll);
-        if cell_idx >= start && cell_idx < start + viewport {
-            Some(cell_idx - start)
-        } else {
-            None
-        }
-    }
-
-    /// Evict oldest cells past `max_cells` (keeping the live cell and pinned header), dropping their cache.
-    pub fn enforce_cap(&mut self) {
-        let limit = self.max_cells;
-        let evict_idx = 0;
-
-        while self.cells.len() > limit {
-            if let Some(cell) = self.cells.get(evict_idx) {
-                if Some(cell.id) == self.live_cell {
-                    break;
-                }
-                if let Some(evicted) = self.cells.remove(evict_idx) {
-                    // The expansion belongs to the cell; an evicted cell takes it
-                    // with it rather than leaving an id behind forever.
-                    self.expanded.remove(&evicted.id);
-                    self.cache.invalidate_cell(evicted.id);
-                    self.extents.remove(evicted.id);
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+        let (version, stats, perm_explain) = self
+            .cell_index(seq)
+            .map(|index| {
+                let existing = &self.cells[index];
+                (
+                    existing.version.wrapping_add(1),
+                    existing.stats.clone(),
+                    existing.perm_explain.clone(),
+                )
+            })
+            .unwrap_or((0, None, None));
+        self.append_indexed(Cell {
+            id: seq,
+            kind: CellKind::Item(kind),
+            version,
+            ts_ms,
+            stats,
+            perm_explain,
+        });
+        let stable_len = self
+            .cell_index(seq)
+            .and_then(|index| self.cells.get(index))
+            .and_then(Self::stable_prefix_len);
+        self.refresh_stable_revision(seq, stable_len, true);
     }
 }

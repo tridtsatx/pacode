@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use pacode_types::{Config, McpServerInfo, PluginInfo, Request};
 
 use crate::commands;
+use crate::keys::Action;
 use crate::state::AppState;
 use crate::ui::input::command_inline_hint;
 
@@ -125,16 +126,20 @@ fn test_login_command_registration_and_execution() {
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].name, "login");
 
-    // 3. Execution without argument: opens Overlay::LoginPicker and sends ListAuth
+    // 3. Execution without argument: opens the model palette and asks for
+    //    the catalog and the auth status it groups by.
     let actions = commands::execute(&mut state, "/login");
-    assert_eq!(actions, vec![crate::keys::Action::Send(Request::ListAuth)]);
     assert_eq!(
-        state.focus,
-        crate::state::Focus::Overlay(crate::state::Overlay::LoginPicker {
-            query: String::new(),
-            index: 0,
-        })
+        actions,
+        vec![
+            crate::keys::Action::Send(Request::ListModels),
+            crate::keys::Action::Send(Request::ListAuth),
+        ]
     );
+    assert!(matches!(
+        state.focus,
+        crate::state::Focus::Overlay(crate::state::Overlay::ModelPalette { .. })
+    ));
 
     // 4. Execution with argument: sends Request::Login { provider }
     state.focus = crate::state::Focus::Normal;
@@ -156,4 +161,122 @@ fn test_mcp_invalid_format_pushes_notice() {
     let actions = commands::execute(&mut state, "/mcp:malformed");
     assert!(actions.is_empty());
     assert!(state.transcript.cells.len() > initial_cell_count);
+}
+
+fn attached_meta() -> pacode_types::SessionMeta {
+    pacode_types::SessionMeta {
+        id: pacode_types::SessionId::new("ses_old"),
+        name: Some("old".into()),
+        cwd: std::path::PathBuf::from("/work/project"),
+        git_branch: None,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        model: pacode_types::ModelRoute::new("prov", "model-x"),
+        effort: pacode_types::Effort::Max,
+        mode: pacode_types::Mode::Plan,
+        first_prompt: None,
+        zdr: false,
+    }
+}
+
+#[test]
+fn clear_asks_the_daemon_and_leaves_the_view_until_it_answers() {
+    let mut state = make_test_state();
+    state.meta = Some(attached_meta());
+    commands::execute(&mut state, "/mcp:malformed");
+    let cells = state.transcript.cells.len();
+    assert!(cells > 0);
+
+    let actions = commands::execute(&mut state, "/clear");
+
+    assert_eq!(actions, vec![Action::Send(Request::ClearContext)]);
+    assert_eq!(
+        state.transcript.cells.len(),
+        cells,
+        "a refused clear must find the transcript where it was"
+    );
+}
+
+#[test]
+fn new_attaches_a_fresh_session_with_the_current_settings() {
+    let mut state = make_test_state();
+    state.meta = Some(attached_meta());
+
+    let actions = commands::execute(&mut state, "/new");
+
+    let expected = pacode_types::Attach::New {
+        cwd: std::path::PathBuf::from("/work/project"),
+        model: Some(pacode_types::ModelRoute::new("prov", "model-x")),
+        effort: Some(pacode_types::Effort::Max),
+        mode: Some(pacode_types::Mode::Plan),
+    };
+    assert_eq!(
+        actions,
+        vec![Action::SwitchSession {
+            attach: expected.clone()
+        }]
+    );
+    assert_eq!(
+        state.pending_attach.as_ref().map(|p| p.attach.clone()),
+        Some(expected)
+    );
+    assert!(state.meta.is_none(), "the old session is left, not closed");
+    assert!(commands::find_command("new").is_some());
+}
+
+/// The last notice in the transcript: (level, text).
+fn last_notice(state: &AppState) -> (pacode_types::ToastLevel, String) {
+    state
+        .transcript
+        .cells
+        .iter()
+        .rev()
+        .find_map(|c| {
+            if let crate::state::CellKind::Item(pacode_types::TranscriptKind::Notice {
+                level,
+                text,
+            }) = &c.kind
+            {
+                Some((*level, text.clone()))
+            } else {
+                None
+            }
+        })
+        .expect("a notice")
+}
+
+/// B16: a theme name that is neither builtin nor a user theme is refused —
+/// nothing is applied, persisted, or reported as set.
+#[test]
+fn test_theme_typo_is_refused_and_not_persisted() {
+    let root = std::env::temp_dir().join(format!("pacode-b16-{}", std::process::id()));
+    let mut state = make_test_state();
+    state.paths = pacode_config::Paths::under(&root);
+    let before = state.config.theme.name.clone();
+    commands::execute(&mut state, "/theme no-such-theme");
+    assert_eq!(state.config.theme.name, before);
+    assert!(!state.paths.config_file.exists());
+    let (level, text) = last_notice(&state);
+    assert_eq!(level, pacode_types::ToastLevel::Warn);
+    assert!(text.contains("Unknown theme 'no-such-theme'"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B18: the valid list comes from `Effort::ALL`, so `xhigh` is in it.
+#[test]
+fn test_invalid_effort_lists_every_level() {
+    let mut state = make_test_state();
+    commands::execute(&mut state, "/effort bogus");
+    let (_, text) = last_notice(&state);
+    assert!(text.ends_with("low, medium, high, xhigh, max"), "{text}");
+}
+
+/// B20: a command's notice is the answer to what the user just typed; a
+/// reader scrolled up is brought down to it.
+#[test]
+fn test_command_notice_scrolls_into_view() {
+    let mut state = make_test_state();
+    state.transcript.scroll_from_bottom = 7;
+    commands::execute(&mut state, "/no-such-command");
+    assert_eq!(state.transcript.scroll_from_bottom, 0);
 }

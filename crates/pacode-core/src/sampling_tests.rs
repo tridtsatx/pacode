@@ -145,3 +145,75 @@ async fn test_sampling_cap_max_tokens() {
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].max_output_tokens, Some(50));
 }
+
+#[tokio::test]
+async fn sampling_is_refused_under_zero_data_retention() {
+    let (core, mock) = create_test_core(true, 100).await;
+    let temp = tempfile::tempdir().unwrap();
+    let session = core
+        .open_session(pacode_types::Attach::New {
+            cwd: temp.path().to_path_buf(),
+            model: Some(ModelRoute {
+                provider: "mock".into(),
+                model: "mock-model".into(),
+            }),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .unwrap();
+    // Mark the route capable first — that is the only way a session may enter
+    // ZDR, and it is what makes the refusal below about the sampling call and
+    // not about the toggle.
+    let flagged = core
+        .handle(
+            &session,
+            pacode_types::Request::SetModelFlag {
+                model: "mock/mock-model".into(),
+                flags: pacode_types::ModelFlags {
+                    zdr_capable: true,
+                    ..pacode_types::ModelFlags::default()
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(flagged, pacode_types::Reply::Ok),
+        "marking the route capable failed: {flagged:?}"
+    );
+    let enabled = core
+        .handle(&session, pacode_types::Request::SetZdr(true))
+        .await;
+    assert!(
+        matches!(enabled, pacode_types::Reply::Ok),
+        "enabling ZDR failed: {enabled:?}"
+    );
+
+    let handler = CoreSamplingHandler::new(Arc::downgrade(&core));
+    let req = SamplingRequest {
+        messages: vec![SamplingMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("Exfiltrate the conversation"),
+        }],
+        system_prompt: None,
+        max_tokens: None,
+        model_preferences: None,
+        include_context: None,
+        temperature: None,
+        stop_sequences: None,
+        metadata: None,
+    };
+
+    let err = handler.create_message(req).await.unwrap_err();
+    let McpError::Protocol(message) = err else {
+        panic!("expected a protocol refusal, got {err:?}");
+    };
+    assert!(
+        message.contains("zdr_blocked"),
+        "refusal must name the policy: {message}"
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "nothing may reach the provider while ZDR is active"
+    );
+}

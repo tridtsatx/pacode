@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ToolError;
 use crate::host::{
-    AgentKindDef, AgentSpec, LedgerPass, PermissionDraft, ToolCtx, ToolHost, WaitOutcome,
-    WriteIntent, WriteLock,
+    AgentKindDef, AgentSpec, LedgerPass, ParentReply, PermissionDraft, SendOutcome, ToolCtx,
+    ToolHost, WaitOutcome, WriteIntent, WriteLock,
 };
 
 #[derive(Default)]
@@ -156,16 +156,57 @@ fn file_name(path: &Path) -> String {
 /// A host that only has to answer the scheduling calls; everything else a tool
 /// might reach for is refused loudly rather than pretending to work. Ledger calls
 /// are recorded (see [`LedgerStub`]) and allowed unless told otherwise.
-#[derive(Default)]
+///
+/// Permission drafts are recorded in `drafts` and answered with `decision`
+/// (default `AllowOnce`) plus the optional deny `reason`. When `tasks` is set,
+/// task calls delegate to a real `TaskManager`, so tests can run actual
+/// commands. `agent send` and `ask_parent` are recorded in `sent` / `asked`
+/// and answered with `send_outcome` / `parent_reply` (`None` = refused).
 pub struct StubToolHost {
     pub schedule: ScheduleStub,
     pub ledger: LedgerStub,
+    pub drafts: Mutex<Vec<PermissionDraft>>,
+    pub decision: Mutex<PermissionDecision>,
+    pub reason: Mutex<Option<String>>,
+    pub tasks: Option<Arc<pacode_exec::TaskManager>>,
+    pub sent: Mutex<Vec<(AgentId, String)>>,
+    pub send_outcome: Mutex<Option<SendOutcome>>,
+    pub asked: Mutex<Vec<(CallId, String)>>,
+    pub parent_reply: Mutex<Option<ParentReply>>,
+}
+
+impl Default for StubToolHost {
+    fn default() -> Self {
+        Self {
+            schedule: ScheduleStub::default(),
+            ledger: LedgerStub::default(),
+            drafts: Mutex::new(Vec::new()),
+            decision: Mutex::new(PermissionDecision::AllowOnce),
+            reason: Mutex::new(None),
+            tasks: None,
+            sent: Mutex::new(Vec::new()),
+            send_outcome: Mutex::new(None),
+            asked: Mutex::new(Vec::new()),
+            parent_reply: Mutex::new(None),
+        }
+    }
 }
 
 #[async_trait]
 impl ToolHost for StubToolHost {
-    async fn request_permission(&self, _draft: PermissionDraft) -> PermissionDecision {
-        PermissionDecision::AllowOnce
+    async fn request_permission(&self, draft: PermissionDraft) -> crate::host::PermissionOutcome {
+        self.drafts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(draft);
+        crate::host::PermissionOutcome {
+            decision: *self.decision.lock().unwrap_or_else(|p| p.into_inner()),
+            reason: self
+                .reason
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        }
     }
 
     async fn ask_question(
@@ -232,46 +273,95 @@ impl ToolHost for StubToolHost {
 
     async fn spawn_task(
         &self,
-        _spec: pacode_exec::TaskSpec,
-    ) -> Result<pacode_types::TaskId, ToolError> {
-        Err(ToolError::Failed("no tasks in this test".to_string()))
+        spec: pacode_exec::TaskSpec,
+    ) -> Result<crate::host::SpawnedTask, ToolError> {
+        match &self.tasks {
+            Some(tasks) => crate::host::SpawnedTask::start(tasks, spec)
+                .await
+                .map(|(_, spawned)| spawned)
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Err(ToolError::Failed("no tasks in this test".to_string())),
+        }
     }
 
-    fn task_info(&self, _task: &pacode_types::TaskId) -> Option<pacode_types::TaskInfo> {
-        None
+    fn task_info(&self, task: &pacode_types::TaskId) -> Option<pacode_types::TaskInfo> {
+        self.tasks.as_ref().and_then(|t| t.info(task))
     }
 
     fn list_tasks(&self) -> Vec<pacode_types::TaskInfo> {
-        Vec::new()
+        self.tasks
+            .as_ref()
+            .map(|t| t.list(None))
+            .unwrap_or_default()
     }
 
     async fn wait_task(
         &self,
-        _task: &pacode_types::TaskId,
-        _timeout: Duration,
-        _return_on_progress: bool,
+        task: &pacode_types::TaskId,
+        timeout: Duration,
+        return_on_progress: bool,
     ) -> WaitOutcome {
-        WaitOutcome::Timeout
+        match &self.tasks {
+            Some(tasks) => match tasks.wait(task, timeout, return_on_progress).await {
+                pacode_exec::WaitResult::Ended(_) | pacode_exec::WaitResult::NotFound => {
+                    WaitOutcome::Finished
+                }
+                pacode_exec::WaitResult::Progress(_) => WaitOutcome::Progress,
+                pacode_exec::WaitResult::Timeout(_) => WaitOutcome::Timeout,
+            },
+            None => WaitOutcome::Timeout,
+        }
     }
 
-    async fn kill_task(&self, _task: &pacode_types::TaskId) -> Result<(), ToolError> {
-        Err(ToolError::Failed("no tasks in this test".to_string()))
+    async fn kill_task(&self, task: &pacode_types::TaskId) -> Result<(), ToolError> {
+        match &self.tasks {
+            Some(tasks) => tasks
+                .kill(task)
+                .await
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Err(ToolError::Failed("no tasks in this test".to_string())),
+        }
     }
 
     async fn task_tail(
         &self,
-        _task: &pacode_types::TaskId,
-        _lines: usize,
+        task: &pacode_types::TaskId,
+        lines: usize,
     ) -> Result<Vec<String>, ToolError> {
-        Ok(Vec::new())
+        match &self.tasks {
+            Some(tasks) => tasks
+                .tail(task, lines)
+                .await
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn task_output(
+        &self,
+        task: &pacode_types::TaskId,
+        max_chars: usize,
+    ) -> Result<String, ToolError> {
+        match &self.tasks {
+            Some(tasks) => tasks
+                .output(task, max_chars)
+                .await
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Ok(String::new()),
+        }
     }
 
     fn report_task_progress(
         &self,
-        _task: &pacode_types::TaskId,
-        _progress: pacode_types::TaskProgress,
+        task: &pacode_types::TaskId,
+        progress: pacode_types::TaskProgress,
     ) -> Result<(), ToolError> {
-        Ok(())
+        match &self.tasks {
+            Some(tasks) => tasks
+                .report_progress(task, progress)
+                .map_err(|e| ToolError::failed(e.to_string())),
+            None => Ok(()),
+        }
     }
 
     async fn spawn_agent(&self, _spec: AgentSpec) -> Result<AgentId, ToolError> {
@@ -298,12 +388,53 @@ impl ToolHost for StubToolHost {
         Err(ToolError::Failed("no agents in this test".to_string()))
     }
 
+    async fn continue_agent(
+        &self,
+        _agent: &AgentId,
+        _consent: Option<u64>,
+    ) -> Result<(), ToolError> {
+        Err(ToolError::Failed("no agents in this test".to_string()))
+    }
+
     fn request_agent_status(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Err(ToolError::Failed("no agents in this test".to_string()))
     }
 
     fn report_status(&self, _text: String) -> Result<(), ToolError> {
         Ok(())
+    }
+
+    async fn send_to_agent(
+        &self,
+        agent: &AgentId,
+        message: String,
+        _consent: Option<u64>,
+    ) -> Result<SendOutcome, ToolError> {
+        self.sent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((agent.clone(), message));
+        self.send_outcome
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| ToolError::failed("no agents in this test"))
+    }
+
+    async fn ask_parent(
+        &self,
+        call_id: &CallId,
+        question: String,
+    ) -> Result<ParentReply, ToolError> {
+        self.asked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((call_id.clone(), question));
+        self.parent_reply
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| ToolError::invalid("only subagents can ask the orchestrator"))
     }
 
     fn plan(&self) -> pacode_types::Plan {
@@ -376,5 +507,6 @@ pub fn stub_ctx(host: Arc<StubToolHost>) -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: crate::registry::ToolRegistry::new(),
     }
 }

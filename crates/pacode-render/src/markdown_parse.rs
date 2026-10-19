@@ -1,8 +1,9 @@
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::RenderOptions;
+use crate::syntax::Lang;
 
 pub enum Block {
     Paragraph(Line<'static>),
@@ -10,6 +11,9 @@ pub enum Block {
         line: Line<'static>,
     },
     Code {
+        /// Language from the fence info string (```` ```rust ````); `None` for
+        /// indented blocks and unknown languages — those render unhighlighted.
+        lang: Option<Lang>,
         lines: Vec<String>,
     },
     ListItem {
@@ -66,6 +70,7 @@ pub fn parse_to_blocks(source: &str, opts: &RenderOptions) -> Vec<Block> {
 
     let mut in_heading = false;
     let mut in_code_block = false;
+    let mut code_lang = None;
     let mut code_buf = String::new();
 
     let mut list_stack: Vec<ListFrame> = Vec::new();
@@ -220,7 +225,6 @@ pub fn parse_to_blocks(source: &str, opts: &RenderOptions) -> Vec<Block> {
             }
 
             Event::Start(Tag::CodeBlock(kind)) => {
-                let _ = kind;
                 flush_inline(
                     &mut spans,
                     &mut blocks,
@@ -229,6 +233,10 @@ pub fn parse_to_blocks(source: &str, opts: &RenderOptions) -> Vec<Block> {
                     in_blockquote,
                     &mut bq_lines,
                 );
+                code_lang = match kind {
+                    CodeBlockKind::Fenced(info) => crate::syntax::detect_lang(&info),
+                    CodeBlockKind::Indented => None,
+                };
                 in_code_block = true;
                 code_buf.clear();
             }
@@ -236,7 +244,10 @@ pub fn parse_to_blocks(source: &str, opts: &RenderOptions) -> Vec<Block> {
                 in_code_block = false;
                 let trimmed = code_buf.strip_suffix('\n').unwrap_or(&code_buf);
                 let lines = trimmed.split('\n').map(|s| s.to_string()).collect();
-                blocks.push(Block::Code { lines });
+                blocks.push(Block::Code {
+                    lang: code_lang.take(),
+                    lines,
+                });
                 code_buf.clear();
             }
 

@@ -1,6 +1,4 @@
 use super::*;
-use crate::state::AppState;
-use pacode_types::Config;
 
 fn real_png(w: u32, h: u32) -> Vec<u8> {
     let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
@@ -12,10 +10,6 @@ fn real_png(w: u32, h: u32) -> Vec<u8> {
     img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .expect("encode png");
     out
-}
-
-fn state() -> AppState {
-    AppState::new(Config::default(), "1.0.0".to_string(), 80, 24)
 }
 
 #[test]
@@ -91,41 +85,6 @@ fn at_most_eight_pending() {
 }
 
 #[test]
-fn deleted_chips_free_their_slot() {
-    let mut s = state();
-    for _ in 0..MAX_PENDING {
-        let chip = s.attach_bytes(&real_png(4, 4), None).unwrap();
-        s.input.insert_str(&chip);
-    }
-    assert!(s.attach_bytes(&real_png(4, 4), None).is_err());
-    s.input.text.clear();
-    s.input.cursor = 0;
-    assert!(s.attach_bytes(&real_png(4, 4), None).is_ok());
-}
-
-#[test]
-fn build_user_message_carries_attachments() {
-    let mut s = state();
-    let chip = s
-        .attach_bytes(&real_png(8, 8), Some("x.png".into()))
-        .unwrap();
-    let req = s.build_user_message(format!("what is {chip}?"));
-    match req {
-        Request::UserMessage { text, attachments } => {
-            assert_eq!(text, "what is [Image 1]?");
-            assert_eq!(attachments.len(), 1);
-            assert!(!attachments[0].data.is_empty());
-        }
-        other => panic!("unexpected {other:?}"),
-    }
-    // Plain text: no attachments.
-    match s.build_user_message("hi".into()) {
-        Request::UserMessage { attachments, .. } => assert!(attachments.is_empty()),
-        other => panic!("unexpected {other:?}"),
-    }
-}
-
-#[test]
 fn image_extension_detection() {
     assert!(is_image_path("a/b/c.PNG"));
     assert!(is_image_path("x.jpeg"));
@@ -154,26 +113,4 @@ fn drag_and_drop_path_forms() {
     );
     assert_eq!(image_path_from_paste("two\nlines.png"), None);
     assert_eq!(image_path_from_paste("/definitely/missing.png"), None);
-}
-
-#[test]
-fn at_candidate_attaches_instead_of_inserting_text() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("pic.png"), real_png(10, 10)).unwrap();
-    let mut s = state();
-    s.cwd = dir.path().to_path_buf();
-    s.input.text = "look @pi".to_string();
-    s.input.cursor = 8;
-    assert!(s.attach_at_candidate(5, 8, "pic.png"));
-    assert!(
-        s.input.text.starts_with("look [Image 1"),
-        "{}",
-        s.input.text
-    );
-    assert!(s.input.text.ends_with("] "));
-    assert_eq!(s.attachments.len(), 1);
-    // Unreadable file: text stays, caller falls back to `@path`.
-    s.input.text = "x @nope.png".to_string();
-    assert!(!s.attach_at_candidate(2, 11, "nope.png"));
-    assert_eq!(s.input.text, "x @nope.png");
 }

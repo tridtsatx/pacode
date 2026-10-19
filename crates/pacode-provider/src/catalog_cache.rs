@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pacode_types::ModelInfo;
 use serde::{Deserialize, Serialize};
 
-use crate::Provider;
+use crate::{Provider, ProviderError};
 
 #[cfg(test)]
 #[path = "catalog_cache_tests.rs"]
@@ -18,6 +18,10 @@ mod catalog_cache_tests;
 pub const CATALOG_CACHE_VERSION: u32 = 2;
 pub const DEFAULT_MAX_MODELS_PER_PROVIDER: usize = 500;
 pub const DEFAULT_CATALOG_TTL_SECS: u64 = 86400;
+/// Provider HTTP clients bound connect only — without this a server that
+/// accepts the socket but stalls the body would hold the in-flight slot
+/// (and every `ListModels` waiting on it) forever.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CatalogDiskCache {
@@ -165,6 +169,44 @@ impl CatalogCache {
         );
     }
 
+    /// Drop everything cached for one provider: memory, disk, and any refresh
+    /// currently in flight.
+    ///
+    /// Called from registry hot reload. A provider entry that changed (new
+    /// `base_url`, new `path`, new `catalog`) may now answer `/models` with a
+    /// different answer, so serving the pre-reload list would be stale by
+    /// definition. The in-flight entry is cleared too, so a refresh started
+    /// against the old transport cannot re-seed the cache afterwards — that is
+    /// the one race a plain "remove the key" would leave open.
+    ///
+    /// Removing from disk is a read-modify-write under `disk_lock`, so a
+    /// concurrent `persist_provider_record` for a *different* provider is not
+    /// lost.
+    pub fn invalidate(&self, provider_id: &str) {
+        self.memory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+
+        let path = {
+            let guard = self.cache_path.read().unwrap_or_else(|p| p.into_inner());
+            guard.clone()
+        };
+        let Some(path) = path else { return };
+
+        let _lock = self.disk_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(mut disk_cache) = load_disk_cache(&path) else {
+            return;
+        };
+        if disk_cache.providers.remove(provider_id).is_some() {
+            save_disk_cache(&path, &disk_cache);
+        }
+    }
+
     fn read_provider_from_disk(&self, provider_id: &str) -> Option<ProviderCacheRecord> {
         let path = self
             .cache_path
@@ -240,7 +282,14 @@ impl CatalogCache {
             id: provider_id,
         };
 
-        match provider.refresh_models().await {
+        let fetched = match tokio::time::timeout(REFRESH_TIMEOUT, provider.refresh_models()).await {
+            Ok(res) => res,
+            Err(_) => Err(ProviderError::Transport(format!(
+                "model catalog request timed out after {}s",
+                REFRESH_TIMEOUT.as_secs()
+            ))),
+        };
+        match fetched {
             Ok(mut models) => {
                 if models.len() > self.max_models_per_provider {
                     models.truncate(self.max_models_per_provider);
@@ -308,21 +357,26 @@ impl CatalogCache {
             return record.models;
         }
 
-        let notify = {
+        let wait = {
             let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(existing) = in_flight.get(provider_id) {
-                Some(Arc::clone(existing))
-            } else {
-                in_flight.insert(
-                    provider_id.to_string(),
-                    Arc::new(tokio::sync::Notify::new()),
-                );
-                None
+            match in_flight.get(provider_id) {
+                // `notified_owned` snapshots the notify_waiters counter while
+                // the entry is still locked in — before the runner can remove
+                // it and call `notify_waiters` — so the wakeup cannot slip
+                // between the lookup and the `.await`.
+                Some(existing) => Some(Arc::clone(existing).notified_owned()),
+                None => {
+                    in_flight.insert(
+                        provider_id.to_string(),
+                        Arc::new(tokio::sync::Notify::new()),
+                    );
+                    None
+                }
             }
         };
 
-        if let Some(notify) = notify {
-            notify.notified().await;
+        if let Some(notified) = wait {
+            notified.await;
             let mem = self.memory.lock().unwrap_or_else(|p| p.into_inner());
             mem.get(provider_id)
                 .map(|r| r.models.clone())
@@ -330,5 +384,56 @@ impl CatalogCache {
         } else {
             self.perform_refresh(provider_id, provider.as_ref()).await
         }
+    }
+
+    /// Force a synchronous refresh for `provider_id`, bypassing the TTL.
+    ///
+    /// Dedupes against a refresh already running for the provider (a stale-hit
+    /// `trigger_background_refresh` or another `force_refresh`): the caller
+    /// then waits on that refresh's `Notify` and serves what it cached rather
+    /// than starting a second fetch.
+    pub async fn force_refresh(
+        &self,
+        provider_id: &str,
+        provider: &Arc<dyn Provider>,
+    ) -> Vec<ModelInfo> {
+        let wait = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            match in_flight.get(provider_id) {
+                // `notified_owned` snapshots the notify_waiters counter at
+                // creation; creating it while the entry is still locked in —
+                // i.e. before the runner can drop the entry and call
+                // `notify_waiters` — means the wakeup cannot be missed, even
+                // if the refresh finishes before the `.await` is polled.
+                Some(existing) => Some(Arc::clone(existing).notified_owned()),
+                None => {
+                    in_flight.insert(
+                        provider_id.to_string(),
+                        Arc::new(tokio::sync::Notify::new()),
+                    );
+                    None
+                }
+            }
+        };
+
+        // The in_flight lock is dropped before either await, same as in
+        // `get_models_for_provider` — a Mutex is never held across one.
+        if let Some(notified) = wait {
+            notified.await;
+            let mem = self.memory.lock().unwrap_or_else(|p| p.into_inner());
+            mem.get(provider_id)
+                .map(|r| r.models.clone())
+                .unwrap_or_default()
+        } else {
+            self.perform_refresh(provider_id, provider.as_ref()).await
+        }
+    }
+
+    /// The `Notify` a refresh currently running for `provider_id` trips on
+    /// completion. Watchers use it to follow a background refresh without
+    /// starting one; `None` means nothing is in flight.
+    pub fn refresh_in_flight(&self, provider_id: &str) -> Option<Arc<tokio::sync::Notify>> {
+        let in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        in_flight.get(provider_id).cloned()
     }
 }

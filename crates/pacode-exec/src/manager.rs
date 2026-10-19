@@ -2,17 +2,16 @@
 //!
 //! Implementation notes:
 //! - spawn via `sh -c` (or `$SHELL -c`), `process_group(0)` (own group), stdin null,
-//!   stdout+stderr piped; a reader task per pipe appends to the spool file and the
+//!   stdout+stderr piped; the supervisor drains both pipes into the spool file
+//!   `spool_dir/<task_id>.out` (append, 0600, marker at `max_spool_bytes`) and the
 //!   in-RAM [`HeadTailBuffer`], feeds [`ProgressParser`] line by line, and touches the
 //!   stall clock;
-//! - spool file `spool_dir/<task_id>.out` (append, 0600), truncated with a marker at
-//!   `max_spool_bytes`;
-//! - stall watchdog: one `tokio::time::sleep` re-armed on activity, fires at most once
-//!   per silence episode;
-//! - `kill`: SIGTERM to the process group, `kill_grace_secs`, then SIGKILL;
-//! - events on a `tokio::sync::broadcast` channel (capacity 256, lagging receivers just
+//! - `kill`: SIGTERM to the process group, `kill_grace_secs`, then SIGKILL; a natural
+//!   exit, a timeout and a cancel all leave no process of the group behind;
+//! - events on a `tokio::sync::broadcast` channel (capacity 1024, lagging receivers just
 //!   miss events and should re-list);
-//! - `shutdown` kills everything and waits for reader tasks.
+//! - `shutdown` kills, escalates to SIGKILL, waits for the supervisors, and marks
+//!   whatever is left as killed.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,26 +19,47 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pacode_types::{
-    ExecConfig, ProgressSource, ResourcesConfig, SessionId, TaskId, TaskInfo, TaskProgress,
-    TaskStatus,
+    AgentId, ExecConfig, ProgressSource, ResourcesConfig, SessionId, TaskId, TaskInfo,
+    TaskProgress, TaskStatus,
 };
 use tokio::sync::broadcast;
 
+use crate::admission::{Admission, SlotPermit};
 use crate::buffer::HeadTailBuffer;
+use crate::memcap::MemoryPolicy;
+use crate::memlimit::{MemoryLimiter, SpawnSetup};
 use crate::progress::ProgressParser;
-use crate::resources::ResourceNotice;
+use crate::resources::{GuardHost, ResourceGuard, ResourceNotice};
+use crate::retention::Retention;
 use crate::spec::TaskSpec;
-use crate::state::{SharedState, TaskEntry};
+use crate::state::{ManagedSpool, SharedState, TaskEntry};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TaskEvent {
     Started(TaskInfo),
     Progress(TaskInfo),
     Ended(TaskInfo),
+    /// A foreground task ended, but the call waiting on it was dropped before
+    /// its result was delivered (see [`crate::ForegroundGuard`]): nothing told
+    /// the model, so it is announced like a background end. Follows `Ended`.
+    Unreported(TaskInfo),
     /// No output and no progress for `exec.stall_secs`; the task is still running.
     Stalled(TaskInfo),
     /// The resource guard entered a warning/breach level or recovered.
     Resource(ResourceNotice),
+    /// Output the process produced, on whole lines, while it is still running.
+    ///
+    /// One event per batch of completed lines, not per line and not per read:
+    /// a build that flushes 8 KiB at a time would otherwise put a hundred
+    /// events on the wire to say one thing. A partial trailing line waits for
+    /// its newline — a client that drew half a line would repaint it a moment
+    /// later anyway.
+    Output {
+        info: TaskInfo,
+        /// The foreground call the output belongs to ([`TaskSpec::call`]).
+        call: Option<pacode_types::CallId>,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,34 +87,149 @@ pub enum ExecError {
     /// Machine memory or spool disk is low; carries the full user-facing text.
     #[error("{0}")]
     LowResources(String),
+    #[error("tool memory limit: {0}")]
+    MemoryLimit(#[source] std::io::Error),
 }
+
+/// Capacity of the task-event broadcast channel (owner: exec; cap: this constant;
+/// invalidation: none, fixed at construction). Sized for bursts of task events (F6);
+/// a `Lagged` receiver is handled by the router, the capacity keeps that path rare.
+pub(crate) const TASK_EVENT_CAPACITY: usize = 1024;
 
 pub struct TaskManager {
     pub(crate) state: Arc<SharedState>,
+    /// The machine-level memory policy every spawn of this daemon goes
+    /// through. One per daemon, shared with the tools so that a raise is
+    /// visible to every later spawn.
+    memory: MemoryLimiter,
+}
+
+/// `[resources]` with the guard and the niceness off (`new`, `with_memory`).
+fn disabled_resources() -> ResourcesConfig {
+    ResourcesConfig {
+        enabled: false,
+        nice: 0,
+        ..ResourcesConfig::default()
+    }
+}
+
+/// Polls `fut` once and returns its output if it is ready right away. Dropping
+/// a pending admission future leaves the queue as it was.
+fn ready_now<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
+    }
 }
 
 impl TaskManager {
-    /// Without the resource guard (tests); the daemon uses `with_resources`.
+    /// Build a manager with no tool memory cap and no resource guard.
+    ///
+    /// The daemon does not use this; it supplies the user's
+    /// `ui.tool_memory_percent` and `ui.tool_memory_split_sessions` and its
+    /// `[resources]` through [`TaskManager::with_limits`]. A caller that reaches
+    /// for `new` without a policy gets an uncapped manager rather than a guessed
+    /// one — a cap derived from a default nobody chose is a cap nobody can debug.
     pub fn new(spool_dir: PathBuf, config: ExecConfig) -> Arc<Self> {
-        let resources = ResourcesConfig {
-            enabled: false,
-            nice: 0,
-            ..ResourcesConfig::default()
+        Self::with_memory(
+            spool_dir,
+            config,
+            MemoryLimiter::new(MemoryPolicy::disabled()),
+        )
+    }
+
+    /// Build a manager that caps what a spawned process may use (no resource guard).
+    pub fn with_memory(spool_dir: PathBuf, config: ExecConfig, memory: MemoryLimiter) -> Arc<Self> {
+        Self::with_limits(spool_dir, config, disabled_resources(), memory)
+    }
+
+    /// Build a manager with the machine-resource guard (no tool memory cap).
+    pub fn with_resources(
+        spool_dir: PathBuf,
+        config: ExecConfig,
+        resources: ResourcesConfig,
+    ) -> Arc<Self> {
+        Self::with_limits(
+            spool_dir,
+            config,
+            resources,
+            MemoryLimiter::new(MemoryPolicy::disabled()),
+        )
+    }
+
+    /// Build a manager with both the resource guard and the tool memory cap.
+    pub fn with_limits(
+        spool_dir: PathBuf,
+        config: ExecConfig,
+        resources: ResourcesConfig,
+        memory: MemoryLimiter,
+    ) -> Arc<Self> {
+        let (events, _) = broadcast::channel(TASK_EVENT_CAPACITY);
+        let guard = ResourceGuard::new(&resources, spool_dir.clone());
+        let admission = Arc::new(Admission::new(config.max_tasks));
+        let state = Arc::new(SharedState {
+            spool_dir,
+            config,
+            tasks: Mutex::new(HashMap::new()),
+            events,
+            guard,
+            nice: resources.nice,
+            admission,
+            retention: Retention::default(),
+        });
+        let host: Arc<dyn GuardHost> = state.clone();
+        state.guard.bind(Arc::downgrade(&host));
+        // F5: trim spools left by earlier runs.
+        crate::retention::gc_at_start(&state);
+        Arc::new(Self { state, memory })
+    }
+
+    /// The memory policy: ceilings, the live-session division, and raises.
+    pub fn memory(&self) -> &MemoryLimiter {
+        &self.memory
+    }
+
+    /// Refuse a new subagent when machine resources are low.
+    pub fn admit_agent(&self) -> Result<(), ExecError> {
+        self.state.guard.admit_agent()
+    }
+
+    pub fn guard(&self) -> &ResourceGuard {
+        &self.state.guard
+    }
+
+    /// Exempt (or re-include) a task tree from resource-guard kills.
+    pub fn set_protected(&self, id: &TaskId, protected: bool) {
+        let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = tasks.get_mut(id) {
+            entry.protected = protected;
+        }
+    }
+
+    /// One of the `exec.max_tasks` process slots (F4). With `spec.cancel` the
+    /// caller waits for it in FIFO order (cancellable); without, a busy manager
+    /// refuses at once with `TooManyTasks(max_tasks)`.
+    async fn admit(&self, spec: &TaskSpec) -> Result<SlotPermit, ExecError> {
+        let permit = match spec.cancel.as_ref() {
+            Some(cancel) => self.state.admission.acquire(Some(cancel)).await?,
+            None => match ready_now(self.state.admission.acquire(None)) {
+                Some(permit) => permit?,
+                None => return Err(ExecError::TooManyTasks(self.state.config.max_tasks)),
+            },
         };
-        Self::with_resources(spool_dir, config, resources)
+        self.state.guard.admit()?;
+        Ok(permit)
     }
 
     /// Start the process. Returns immediately with the initial `TaskInfo`.
-    pub async fn spawn(&self, spec: TaskSpec) -> Result<TaskInfo, ExecError> {
-        // F4: wait (FIFO, cancellable) for one of `exec.max_tasks` process slots. The
-        // permit moves into the supervisor and frees the slot when the task ends.
-        let permit = self.state.admission.acquire(spec.cancel.as_ref()).await?;
-        self.state.guard.admit()?;
-
+    pub async fn spawn(&self, mut spec: TaskSpec) -> Result<TaskInfo, ExecError> {
         tokio::fs::create_dir_all(&self.state.spool_dir)
             .await
             .map_err(ExecError::Spawn)?;
 
+        let permit = self.admit(&spec).await?;
         let id = TaskId::generate();
         let spool_path = self.state.spool_dir.join(format!("{}.out", id.as_str()));
 
@@ -110,11 +245,21 @@ impl TaskManager {
             tokio::fs::File::from_std(std_file)
         };
 
+        // The tool memory ceiling is decided before the process exists, so the
+        // child is already inside its limit by the time its first instruction
+        // runs. The environment travels with the command, so a script and the
+        // model both see the ceiling they are working under.
+        let plan = self.memory.plan_spawn(&spec.session);
+        let mut env = std::mem::take(&mut spec.env);
+        if let Some(ceiling) = &plan.ceiling {
+            env.extend(ceiling.environment());
+        }
+
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
         let mut cmd = tokio::process::Command::new(shell);
         cmd.arg("-c").arg(&spec.command);
         cmd.current_dir(&spec.cwd);
-        cmd.envs(spec.env.iter().cloned());
+        cmd.envs(env.iter().cloned());
         #[cfg(unix)]
         cmd.process_group(0);
         cmd.stdin(std::process::Stdio::null());
@@ -123,19 +268,32 @@ impl TaskManager {
         cmd.kill_on_drop(false);
         #[cfg(unix)]
         {
-            if self.state.nice > 0 {
-                let nice = self.state.nice.clamp(0, 19);
-                // SAFETY: only async-signal-safe setpriority(2) runs between fork and exec.
+            let nice = self.state.nice.clamp(0, 19);
+            if nice > 0 || plan.setup != SpawnSetup::None {
+                let setup = plan.setup.clone();
+                // SAFETY: only async-signal-safe syscalls run between fork and exec:
+                // setpriority(2), and `SpawnSetup::install`, which is documented and
+                // implemented as bare syscalls on memory allocated before the fork —
+                // no allocator, no locks, no Rust runtime state.
                 unsafe {
                     cmd.pre_exec(move || {
-                        libc::setpriority(libc::PRIO_PROCESS, 0, nice);
-                        Ok(())
+                        if nice > 0 {
+                            libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                        }
+                        setup.install()
                     });
                 }
             }
         }
 
-        let child = cmd.spawn().map_err(ExecError::Spawn)?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                drop(spool_file);
+                let _ = std::fs::remove_file(&spool_path);
+                return Err(ExecError::Spawn(error));
+            }
+        };
         let child_pid = child.id();
 
         let label = spec
@@ -164,11 +322,15 @@ impl TaskManager {
         };
 
         let (version_tx, _) = tokio::sync::watch::channel(0u64);
+        let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let head_tail_buf = HeadTailBuffer::new(16 * 1024, self.state.config.tail_bytes);
         let parser = ProgressParser::new();
 
-        let entry = TaskEntry {
+        let mut entry = TaskEntry {
             info: info.clone(),
+            call: spec.call.clone(),
+            spool: Arc::new(ManagedSpool::new(spool_path, true)),
             buffer: head_tail_buf,
             parser,
             version_tx,
@@ -176,36 +338,45 @@ impl TaskManager {
             stalled: false,
             kill_requested: false,
             child_pid,
+            kill_tx,
             supervisor: None,
             started: std::time::Instant::now(),
             protected: false,
             guard_reason: None,
         };
 
+        let supervisor_state = Arc::clone(&self.state);
+        let timeout = spec.timeout;
+        let supervisor = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
+            crate::supervisor::run_supervisor(
+                id,
+                child,
+                spool_file,
+                timeout,
+                kill_rx,
+                supervisor_state,
+                permit,
+            )
+            .await;
+        });
+        entry.supervisor = Some(supervisor);
+
         {
-            let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks.insert(id.clone(), entry);
+            let mut tasks = self
+                .state
+                .tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            tasks.insert(entry.info.id.clone(), entry);
         }
 
         let _ = self.state.events.send(TaskEvent::Started(info.clone()));
         // Before the supervisor can finish: starts sampling on 0 -> 1.
         self.state.guard.process_started();
-
-        let supervisor = tokio::spawn(crate::supervisor::run_supervisor(
-            id.clone(),
-            child,
-            spool_file,
-            spec.timeout,
-            Arc::clone(&self.state),
-            permit,
-        ));
-
-        {
-            let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = tasks.get_mut(&id) {
-                entry.supervisor = Some(supervisor);
-            }
-        }
+        let _ = start_tx.send(());
 
         Ok(info)
     }
@@ -217,6 +388,103 @@ impl TaskManager {
             // Evicted terminal task (F1): the stub is inserted before the entry leaves.
             None => self.state.retention.get(id),
         }
+    }
+
+    fn managed_spool_path(&self, id: &TaskId) -> Option<PathBuf> {
+        let raw = id.as_str();
+        let suffix = raw.strip_prefix("tsk_")?;
+        if suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return None;
+        }
+        Some(self.state.spool_dir.join(format!("{raw}.out")))
+    }
+
+    pub fn hydrate(&self, infos: Vec<TaskInfo>) {
+        let evicted = {
+            let mut tasks = self
+                .state
+                .tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for info in infos {
+                if info.status == TaskStatus::Running {
+                    continue;
+                }
+                let remove_on_cleanup = self.managed_spool_path(&info.id).as_deref()
+                    == Some(info.output_path.as_path());
+                let spool = Arc::new(ManagedSpool::new(
+                    info.output_path.clone(),
+                    remove_on_cleanup,
+                ));
+                if let Some(entry) = tasks.get_mut(&info.id) {
+                    if entry.info.status == TaskStatus::Running {
+                        continue;
+                    }
+                    if entry.spool.path() != spool.path() {
+                        let previous = std::mem::replace(&mut entry.spool, spool);
+                        previous.request_cleanup();
+                    }
+                    entry.info = info;
+                    entry.buffer = HeadTailBuffer::new(16 * 1024, self.state.config.tail_bytes);
+                    entry.parser = ProgressParser::new();
+                    entry.last_activity = std::time::Instant::now();
+                    entry.stalled = false;
+                    entry.kill_requested = false;
+                    entry.child_pid = None;
+                    entry.kill_tx.send_modify(|requested| *requested = false);
+                    entry.supervisor = None;
+                    entry.version_tx.send_modify(|version| *version += 1);
+                    continue;
+                }
+
+                let (version_tx, _) = tokio::sync::watch::channel(0u64);
+                let (kill_tx, _) = tokio::sync::watch::channel(false);
+                tasks.insert(
+                    info.id.clone(),
+                    TaskEntry {
+                        spool,
+                        info,
+                        call: None,
+                        buffer: HeadTailBuffer::new(16 * 1024, self.state.config.tail_bytes),
+                        parser: ProgressParser::new(),
+                        version_tx,
+                        last_activity: std::time::Instant::now(),
+                        stalled: false,
+                        kill_requested: false,
+                        child_pid: None,
+                        kill_tx,
+                        supervisor: None,
+                        started: std::time::Instant::now(),
+                        protected: false,
+                        guard_reason: None,
+                    },
+                );
+            }
+            self.state.prune_terminal_overflow(&mut tasks)
+        };
+        drop(evicted);
+    }
+
+    pub fn reassign_owner(
+        &self,
+        session: &SessionId,
+        from: &AgentId,
+        to: &AgentId,
+    ) -> Vec<TaskInfo> {
+        let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks
+            .values_mut()
+            .filter(|entry| entry.info.session == *session && entry.info.owner == *from)
+            .map(|entry| {
+                entry.info.owner = to.clone();
+                entry.version_tx.send_modify(|version| *version += 1);
+                entry.info.clone()
+            })
+            .collect()
     }
 
     /// Running tasks, the newest 256 finished ones, and the stubs of older finished
@@ -309,71 +577,6 @@ impl TaskManager {
         }
     }
 
-    pub async fn kill(&self, id: &TaskId) -> Result<(), ExecError> {
-        let (pid, mut rx) = {
-            let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = tasks
-                .get_mut(id)
-                .ok_or_else(|| ExecError::NotFound(id.clone()))?;
-            if entry.info.status.is_terminal() {
-                return Ok(());
-            }
-            entry.kill_requested = true;
-            (entry.child_pid, entry.version_tx.subscribe())
-        };
-
-        if let Some(pid) = pid {
-            #[cfg(unix)]
-            unsafe {
-                libc::killpg(pid as i32, libc::SIGTERM);
-            }
-
-            let grace_secs = self.state.config.kill_grace_secs;
-            if grace_secs > 0 {
-                wait_terminal(
-                    id,
-                    &self.state.tasks,
-                    &mut rx,
-                    Duration::from_secs(grace_secs),
-                )
-                .await;
-            }
-
-            let still_running = {
-                let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-                tasks
-                    .get(id)
-                    .map(|e| e.info.status == TaskStatus::Running)
-                    .unwrap_or(false)
-            };
-
-            if still_running {
-                #[cfg(unix)]
-                unsafe {
-                    libc::killpg(pid as i32, libc::SIGKILL);
-                }
-                wait_terminal(id, &self.state.tasks, &mut rx, Duration::from_secs(2)).await;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Kill every running task of a session (session close).
-    pub async fn kill_session(&self, session: &SessionId) {
-        let to_kill: Vec<TaskId> = {
-            let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks
-                .values()
-                .filter(|e| e.info.session == *session && e.info.status == TaskStatus::Running)
-                .map(|e| e.info.id.clone())
-                .collect()
-        };
-        for id in to_kill {
-            let _ = self.kill(&id).await;
-        }
-    }
-
     /// Agent-reported progress (`bg progress`). Wins over parsed progress.
     pub fn report_progress(&self, id: &TaskId, progress: TaskProgress) -> Result<(), ExecError> {
         let info = {
@@ -392,14 +595,6 @@ impl TaskManager {
         Ok(())
     }
 
-    /// The foreground wait gave up: the task now shows in the BACKGROUND rail.
-    pub fn mark_backgrounded(&self, id: &TaskId) {
-        let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = tasks.get_mut(id) {
-            entry.info.backgrounded = true;
-        }
-    }
-
     /// Clear the failed-unacked flag.
     pub fn ack(&self, id: &TaskId) {
         let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -411,65 +606,43 @@ impl TaskManager {
         }
     }
 
-    /// Drop a finished task from the list (its spool file stays until the spool GC).
+    /// Drop a finished task from the list; its spool file is removed with it.
     pub fn forget(&self, id: &TaskId) {
-        let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks.remove(id);
+        let removed = {
+            let mut tasks = self
+                .state
+                .tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if tasks
+                .get(id)
+                .is_some_and(|entry| entry.info.status.is_terminal())
+            {
+                tasks.remove(id)
+            } else {
+                None
+            }
+        };
         self.state.retention.forget(id);
+        if let Some(entry) = removed {
+            entry.spool.request_cleanup();
+            drop(entry);
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {
         self.state.events.subscribe()
     }
-
-    /// Kill all tasks and stop reader tasks.
-    pub async fn shutdown(&self) {
-        let to_kill: Vec<TaskId> = {
-            let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks
-                .values()
-                .filter(|e| e.info.status == TaskStatus::Running)
-                .map(|e| e.info.id.clone())
-                .collect()
-        };
-        for id in to_kill {
-            let _ = self.kill(&id).await;
-        }
-
-        let handles: Vec<tokio::task::JoinHandle<()>> = {
-            let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks
-                .values_mut()
-                .filter_map(|e| e.supervisor.take())
-                .collect()
-        };
-        for handle in handles {
-            let _ = handle.await;
-        }
-    }
 }
 
-async fn wait_terminal(
-    id: &TaskId,
-    tasks: &Mutex<HashMap<TaskId, TaskEntry>>,
-    rx: &mut tokio::sync::watch::Receiver<u64>,
-    timeout: Duration,
-) {
-    let _ = tokio::time::timeout(timeout, async {
-        loop {
-            {
-                let t = tasks.lock().unwrap_or_else(|e| e.into_inner());
-                if t.get(id).is_none_or(|e| e.info.status.is_terminal()) {
-                    break;
-                }
-            }
-            if rx.changed().await.is_err() {
-                break;
-            }
-        }
-    })
-    .await;
-}
+#[path = "output.rs"]
+mod output;
+#[path = "stop.rs"]
+mod stop;
+
+#[path = "foreground.rs"]
+mod foreground;
+pub use foreground::ForegroundGuard;
 
 #[cfg(test)]
 #[path = "manager_tests.rs"]

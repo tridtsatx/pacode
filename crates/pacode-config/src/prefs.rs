@@ -1,11 +1,12 @@
 //! User preferences persisted to `<paths.state_dir>/prefs.toml`.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use pacode_types::{Effort, Mode};
+use pacode_types::{Effort, Mode, ModelFlags};
 
 use crate::paths::Paths;
 
@@ -20,9 +21,14 @@ pub struct Prefs {
     /// Marketplace last pointed at with `/plugins <source>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marketplace: Option<String>,
-    /// Models picked in `/model`, newest first (capped by the picker).
+    /// Recently used routes (`provider/model`), most recent first; the model
+    /// palette's `RECENT` group. The client caps it.
+    /// Kept above `model_flags`: TOML values must precede tables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_models: Vec<String>,
+    /// Per-route flags (`zdr_capable`, `favorite`) keyed by `provider/model`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_flags: HashMap<String, ModelFlags>,
 }
 
 pub fn prefs_file(paths: &Paths) -> PathBuf {

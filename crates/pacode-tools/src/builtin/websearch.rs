@@ -22,11 +22,14 @@ use pacode_types::WebConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
+use super::helpers::{cap_output, parse_input, preview_body};
 use super::webfetch::shared_web_client;
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "websearch";
+
+/// Model-facing description; see `prompts/websearch.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/websearch.md");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchResult {
@@ -192,6 +195,7 @@ struct WebSearchInput {
 pub struct WebSearchTool {
     backend: Arc<dyn SearchBackend>,
     config: WebConfig,
+    definition: DefinitionCache,
 }
 
 impl WebSearchTool {
@@ -208,7 +212,11 @@ impl WebSearchTool {
     }
 
     pub fn with_backend_and_config(backend: Arc<dyn SearchBackend>, config: WebConfig) -> Self {
-        Self { backend, config }
+        Self {
+            backend,
+            config,
+            definition: DefinitionCache::new(),
+        }
     }
 }
 
@@ -225,7 +233,10 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web using DuckDuckGo. Returns a numbered list of results with title, URL, and snippet."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
@@ -295,10 +306,14 @@ impl Tool for WebSearchTool {
         let cap = ctx.output_cap_chars;
         let content = cap_output(&formatted, accept_large_output, cap);
         let count = results.len();
-        let preview = if count == 0 && note.is_some() {
-            "0 results (markup may have changed)".to_string()
+        let preview = if count == 0 {
+            if note.is_some() {
+                "0 results (markup may have changed)".to_string()
+            } else {
+                "0 results".to_string()
+            }
         } else {
-            format!("{count} results")
+            preview_body(&formatted)
         };
         let title = format!("Search \"{query}\"");
 

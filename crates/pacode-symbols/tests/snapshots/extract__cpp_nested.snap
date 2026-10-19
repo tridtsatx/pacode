@@ -1,0 +1,17 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Cpp, src)"
+---
+module ns 1-20
+  class Widget 3-11
+    method Widget 5-5
+    method ~Widget 6-6
+    method draw 7-7
+    method get 8-8
+  struct S 13-13
+  enum Color 15-15
+  fn identity 18-18
+fn free_fn 22-22
+method ns::Widget::get 24-24
+type Alias 26-26
+type myint 27-27

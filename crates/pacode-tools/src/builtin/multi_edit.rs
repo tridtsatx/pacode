@@ -9,14 +9,18 @@ use serde_json::{Value, json};
 
 use super::edit;
 use super::helpers::{
-    first_changed_line, hashline_report, is_outside_workspace, parse_input, permission_title,
-    read_text_file, reject_nul_in_ops, rel_path, write_atomic,
+    FileChange, diff_off_runtime, hashline_report, is_outside_workspace, parse_input,
+    permission_title, preview_body, read_text_file, reject_nul_in_ops, rel_path, write_atomic,
 };
 use crate::hashline::{Applied, Op, apply_ops};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput, WriteIntent};
 
 pub const NAME: &str = "multi_edit";
 
+/// A unit struct (also constructible with `default()`): tests use the plain
+/// value, so it carries no `DefinitionCache`; the registry's own definitions
+/// cache covers the per-step cost.
+#[derive(Default)]
 pub struct MultiEditTool;
 
 #[derive(Deserialize, Default)]
@@ -60,19 +64,7 @@ impl Tool for MultiEditTool {
     }
 
     fn description(&self) -> &str {
-        // Formatted once from constant text (not a cache: nothing to invalidate).
-        static DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-            format!(
-                "Apply hashline edits to several files at once, atomically: `files` = \
-                 [{{path, ops}}] with the same `ops` and `LINE#HASH` anchors as `edit`. Every \
-                 anchor in every file is verified first; if any is stale nothing is written and \
-                 the current anchored lines are returned. Fallback form (avoid): `path` + \
-                 `edits` [{{old_string, new_string, replace_all}}] applied in order to one file. \
-                 {}",
-                edit::CONCURRENCY_NOTE
-            )
-        });
-        DESCRIPTION.as_str()
+        include_str!("../prompts/multi_edit.md").trim()
     }
 
     fn schema(&self) -> Value {
@@ -126,12 +118,17 @@ impl Tool for MultiEditTool {
         })
     }
 
+    fn can_exceed_output_cap(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Edit
     }
 
-    /// Applies `edit::apply_replacement` sequentially in memory; one permission request
-    /// with the combined diff; atomic write; output lists replacements per edit.
+    /// Applies `edit::apply_replacement` sequentially in memory under the path's
+    /// write lock; one permission request with the combined diff; the write lands
+    /// atomically; output lists replacements per edit.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _accept_large_output) = parse_input::<MultiEditInput>(input)?;
         if !args.files.is_empty() {
@@ -149,8 +146,10 @@ impl Tool for MultiEditTool {
             return Err(ToolError::invalid("edits cannot be empty"));
         }
         let full_path = ctx.resolve(Path::new(&args.path));
-        // Read, ledger check and write all happen under the path's write lock.
+        // Read, ledger check and write all happen under the ledger lock and the
+        // path's write lock (always taken in that order).
         let _lock = ctx.host.ledger_lock(std::slice::from_ref(&full_path)).await;
+        let _write_lock = crate::registry::acquire_path_write_lock(&full_path, &ctx.cancel).await?;
         let original = read_text_file(&full_path, &args.path).await?;
 
         let mut current = original.clone();
@@ -204,30 +203,28 @@ impl Tool for MultiEditTool {
 
         let rel_path = rel_path(&full_path, &ctx.cwd);
 
-        // Diff and stat in one `spawn_blocking`; `current` moves in and back out.
-        let (diff, stat, current) = {
-            let rel = rel_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let diff = pacode_render::unified_diff(&original, &current, &rel, 3);
-                let stat = pacode_render::diff_stat(&original, &current);
-                (diff, stat, current)
-            })
-            .await
-            .map_err(|e| ToolError::failed(e.to_string()))?
-        };
+        let FileChange {
+            new: current,
+            diff,
+            stat,
+        } = diff_off_runtime(original, current, rel_path.clone()).await?;
 
         let outside = is_outside_workspace(&full_path, &ctx.cwd);
         let perm_title = permission_title("Edit", &rel_path, outside);
 
-        ctx.require_permission(perm_title, diff.clone(), None)
-            .await?;
+        let detail = crate::registry::cap_output_bytes(
+            diff.as_str(),
+            crate::registry::MAX_PERMISSION_DETAIL_BYTES,
+        )
+        .into_owned();
+        ctx.require_permission(perm_title, detail, None).await?;
 
         write_atomic(&full_path, &current).await?;
         ctx.host
             .ledger_record_write(&ctx.agent, &full_path, &current)
             .await;
 
-        let preview = first_changed_line(&diff);
+        let preview = preview_body(&diff);
         let title = format!("Multi-edit {rel_path}");
 
         let mut lines = Vec::new();
@@ -278,6 +275,18 @@ async fn call_hashline(files: Vec<FileOps>, ctx: &ToolCtx) -> Result<ToolOutput,
     // Every file is read, checked and written under its write lock (taken together,
     // in the host's fixed order, so two multi-file edits cannot deadlock).
     let _lock = ctx.host.ledger_lock(&seen).await;
+    // Then each path's write lock, in canonical-path order so two multi-file edits
+    // cannot deadlock on them either.
+    let mut lock_order: Vec<std::path::PathBuf> = seen
+        .iter()
+        .map(|p| super::helpers::canonicalize_best_effort(p))
+        .collect();
+    lock_order.sort();
+    lock_order.dedup();
+    let mut _write_locks = Vec::with_capacity(lock_order.len());
+    for path in &lock_order {
+        _write_locks.push(crate::registry::acquire_path_write_lock(path, &ctx.cancel).await?);
+    }
 
     let mut planned: Vec<Planned> = Vec::with_capacity(files.len());
     let mut problems: Vec<String> = Vec::new();
@@ -336,13 +345,9 @@ async fn call_hashline(files: Vec<FileOps>, ctx: &ToolCtx) -> Result<ToolOutput,
         let mut detail = String::new();
         let (mut added, mut removed) = (0u32, 0u32);
         for p in &planned {
-            detail.push_str(&pacode_render::unified_diff(
-                &p.original,
-                &p.applied.content,
-                &p.rel,
-                3,
-            ));
-            let stat = pacode_render::diff_stat(&p.original, &p.applied.content);
+            let (diff, stat) =
+                pacode_render::unified_diff(&p.original, &p.applied.content, &p.rel, 3);
+            detail.push_str(&diff);
             added = added.saturating_add(stat.added);
             removed = removed.saturating_add(stat.removed);
         }
@@ -358,7 +363,11 @@ async fn call_hashline(files: Vec<FileOps>, ctx: &ToolCtx) -> Result<ToolOutput,
     };
     ctx.require_permission(
         permission_title("Edit", &subject, any_outside),
-        detail.clone(),
+        crate::registry::cap_output_bytes(
+            detail.as_str(),
+            crate::registry::MAX_PERMISSION_DETAIL_BYTES,
+        )
+        .into_owned(),
         None,
     )
     .await?;
@@ -386,7 +395,7 @@ async fn call_hashline(files: Vec<FileOps>, ctx: &ToolCtx) -> Result<ToolOutput,
     sections.extend(notes);
     Ok(ToolOutput::text(sections.join("\n\n"))
         .with_title(format!("Multi-edit {subject}"))
-        .with_preview(first_changed_line(&detail))
+        .with_preview(preview_body(&detail))
         .with_diff(pacode_types::DiffStat { added, removed }))
 }
 

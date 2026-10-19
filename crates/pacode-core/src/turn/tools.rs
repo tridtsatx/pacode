@@ -1,423 +1,118 @@
 //! Tool execution for the turn loop: concurrent/sequential grouping, permissions, cancellation.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use pacode_tools::ToolKind;
 use pacode_types::{
-    AgentStatus, CallId, Event, Message, ToolStatus, TranscriptItem, TranscriptKind,
+    CallId, ContentBlock, Event, Message, Role, ToolStatus, TranscriptItem, TranscriptKind,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
 use crate::session::Session;
+use crate::turn::stream::PendingToolCall;
 
-mod cancel;
-use cancel::{CancelledCall, record_cancelled};
+mod budget;
+mod call;
 
-struct ToolCallInfo {
-    call_id: CallId,
-    name: String,
-    input: serde_json::Value,
-    parse_err: Option<String>,
-    item_seq: u64,
-    title: String,
-    intent: Option<String>,
+#[cfg(test)]
+use budget::{BudgetLimits, TurnBudget};
+use budget::{turn_budget, turn_budget_limits};
+pub(crate) use call::call_bounded;
+#[cfg(test)]
+use call::split_result_for_consumers;
+use call::{Precheck, ToolCallInfo, ToolOutcome, precheck, run_single_tool};
+
+async fn commit_tool_outcome(session: &Arc<Session>, agent: &Arc<Agent>, outcome: ToolOutcome) {
+    agent.commit_pending_user_messages();
+    let (seq, message) = agent
+        .history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(outcome.result);
+    let _ = session
+        .append_agent_message(agent.as_ref(), seq, &message)
+        .await;
 }
 
-enum ToolExecutionStatus {
-    Ok,
-    Cancelled,
-}
-
-impl ToolExecutionStatus {
-    fn is_cancelled(&self) -> bool {
-        matches!(self, ToolExecutionStatus::Cancelled)
-    }
-}
-
-enum ToolChunk {
-    Concurrent(Vec<ToolCallInfo>),
-    Sequential(ToolCallInfo),
-}
+/// Input keys that name what the tool acts on, in priority order — `path`
+/// beats `content` for `write`, `pattern` beats `path` for `grep`.
+pub(crate) const TITLE_KEYS: &[&str] = &[
+    "command",
+    "pattern",
+    "query",
+    "path",
+    "file_path",
+    "file",
+    "url",
+    "uri",
+];
 
 fn tool_title(name: &str, input: &serde_json::Value) -> String {
-    if let Some(obj) = input.as_object() {
-        for (k, v) in obj {
-            if k != "intent"
-                && k != "accept_large_output"
-                && let Some(s) = v.as_str()
-            {
-                let arg = s.trim();
-                let truncated: String = arg.chars().take(60).collect();
-                return format!("{name} {truncated}");
-            }
-        }
-    }
-    name.to_string()
+    crate::transcript::tool_title(name, input, TITLE_KEYS)
 }
 
-async fn run_single_tool(
-    session: Arc<Session>,
-    agent: Arc<Agent>,
-    cancel: CancellationToken,
-    mut call: ToolCallInfo,
-) -> ToolExecutionStatus {
-    log::debug!(
-        "tool call start: session={} agent={} tool={} call_id={}",
-        session.id,
-        agent.id(),
-        call.name,
-        call.call_id
-    );
-    agent.set_status(AgentStatus::RunningTool, Some(call.title.clone()));
-    session.events.emit(Event::AgentUpdated(agent.info()));
-
-    if cancel.is_cancelled() {
-        record_cancelled(
-            &session,
-            &agent,
-            CancelledCall {
-                call_id: call.call_id,
-                name: call.name,
-                title: call.title,
-                intent: call.intent,
-                item_seq: call.item_seq,
-            },
-        )
-        .await;
-        return ToolExecutionStatus::Cancelled;
-    }
-
-    let mut hook_denied = None;
-    if call.parse_err.is_none() {
-        match session
-            .plugins
-            .run_hooks(&pacode_plugin::HookEvent::PreToolCall {
-                name: call.name.clone(),
-                input: call.input.clone(),
-            })
-            .await
-        {
-            Ok(pacode_plugin::HookResult::Deny { reason }) => {
-                hook_denied = Some(reason);
-            }
-            Ok(pacode_plugin::HookResult::ModifyInput(new_input)) => {
-                call.input = new_input;
-            }
-            Ok(pacode_plugin::HookResult::Continue) => {}
-            Err(e) => {
-                hook_denied = Some(format!("plugin hook error: {e}"));
-            }
-        }
-    }
-
-    // `[hooks].pre_tool_use` runs after plugin hooks so it sees the final
-    // input; skipped when the call is already dead. Exit code 2 blocks the
-    // call and the hook's stderr goes back to the model as the tool error.
-    let mut user_hook_block = None;
-    if hook_denied.is_none() && call.parse_err.is_none() {
-        match crate::hooks::pre_tool_use(&session, &agent, &call.name, &call.input).await {
-            crate::hooks::PreToolDecision::Allow => {}
-            crate::hooks::PreToolDecision::Block(reason) => user_hook_block = Some(reason),
-        }
-    }
-
-    let tool_opt = agent
-        .tools
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&call.name);
-
-    let host = Arc::new(crate::host::SessionHost {
-        session: session.clone(),
-        agent: agent.id(),
-    });
-    let ctx = pacode_tools::ToolCtx {
-        session: session.id.clone(),
-        agent: agent.id(),
-        agent_name: agent.info().name,
-        call_id: call.call_id.clone(),
-        cwd: session.meta().cwd.clone(),
-        mode: session.meta().mode,
-        host,
-        cancel: cancel.clone(),
-        output_cap_chars: session.config.context.tool_output_cap_chars,
-        exec_yield_after: Duration::from_secs(session.config.exec.yield_after_secs),
-        exec_default_timeout: Duration::from_secs(session.config.exec.default_timeout_secs),
-        tool_name: Some(call.name.clone()),
-        tool_kind: tool_opt.as_ref().map(|t| t.kind()),
-    };
-
-    // Style guard: remember the file as it was, so the lines this call adds can be
-    // checked once it succeeded (see `crate::style_guard`).
-    let guard_snapshot =
-        if hook_denied.is_none() && user_hook_block.is_none() && call.parse_err.is_none() {
-            crate::style_guard::snapshot(&session, &call.name, &call.input).await
-        } else {
-            None
-        };
-
-    let start = Instant::now();
-    // Images the tool returned (e.g. `read` on a picture); shown in the transcript and
-    // sent to the model only when it accepts images.
-    let mut tool_images: Vec<pacode_types::ImageRef> = Vec::new();
-    let (mut content, mut is_error, preview, diff, task, mut status) =
-        if let Some(reason) = hook_denied {
-            (
-                format!("Permission denied: {reason}"),
-                true,
-                "Denied".to_string(),
-                None,
-                None,
-                ToolStatus::Denied,
-            )
-        } else if let Some(reason) = user_hook_block {
-            (
-                reason,
-                true,
-                "Blocked by hook".to_string(),
-                None,
-                None,
-                ToolStatus::Denied,
-            )
-        } else if let Some(err) = call.parse_err {
-            if err.starts_with(pacode_rules::STREAM_STOP_PREFIX) {
-                // The stream was cut short by a style-guard rule: the text is already
-                // the model-facing explanation.
-                (
-                    err,
-                    true,
-                    "Stopped by style guard".to_string(),
-                    None,
-                    None,
-                    ToolStatus::Error,
-                )
-            } else {
-                (
-                    format!("Invalid JSON arguments: {err}"),
-                    true,
-                    "Invalid JSON".to_string(),
-                    None,
-                    None,
-                    ToolStatus::Error,
-                )
-            }
-        } else {
-            match tool_opt {
-                Some(tool) => {
-                    let call_fut = tool.call(call.input.clone(), &ctx);
-                    let tool_res = tokio::select! {
-                        _ = cancel.cancelled() => Err(pacode_tools::ToolError::Cancelled),
-                        res = call_fut => res,
-                    };
-                    match tool_res {
-                        Ok(output) => {
-                            tool_images = output.images.clone();
-                            let status = if let Some(task_id) = output.task.as_ref() {
-                                session.tasks.mark_backgrounded(task_id);
-                                if let Some(tinfo) = session.tasks.info(task_id) {
-                                    session.events.emit(Event::TaskUpdated(tinfo));
-                                }
-                                ToolStatus::Backgrounded
-                            } else if output.is_error {
-                                ToolStatus::Error
-                            } else {
-                                ToolStatus::Ok
-                            };
-                            (
-                                output.content,
-                                output.is_error,
-                                output.preview,
-                                output.diff,
-                                output.task,
-                                status,
-                            )
-                        }
-                        Err(pacode_tools::ToolError::Cancelled) => {
-                            record_cancelled(
-                                &session,
-                                &agent,
-                                CancelledCall {
-                                    call_id: call.call_id,
-                                    name: call.name,
-                                    title: call.title,
-                                    intent: call.intent,
-                                    item_seq: call.item_seq,
-                                },
-                            )
-                            .await;
-                            return ToolExecutionStatus::Cancelled;
-                        }
-                        Err(pacode_tools::ToolError::Denied(reason)) => (
-                            format!("Permission denied: {reason}"),
-                            true,
-                            "Denied".to_string(),
-                            None,
-                            None,
-                            ToolStatus::Denied,
-                        ),
-                        Err(err) => (
-                            err.to_string(),
-                            true,
-                            err.to_string(),
-                            None,
-                            None,
-                            ToolStatus::Error,
-                        ),
-                    }
-                }
-                None => (
-                    format!("unknown tool: {}", call.name),
-                    true,
-                    "unknown tool".to_string(),
-                    None,
-                    None,
-                    ToolStatus::Error,
-                ),
-            }
-        };
-
-    if !is_error
-        && let Some(snap) = guard_snapshot
-        && let Some(found) = crate::style_guard::check_after_write(&session, &agent, snap).await
-    {
-        content.push_str(&found.block);
-        if found.is_error {
-            is_error = true;
-            status = ToolStatus::Error;
-        }
-    }
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    log::debug!(
-        "tool call result: session={} agent={} tool={} call_id={} status={:?} duration={}ms is_error={is_error}",
-        session.id,
-        agent.id(),
-        call.name,
-        call.call_id,
-        status,
-        duration_ms
-    );
-
-    let output_val = serde_json::json!({
-        "content": content,
-        "is_error": is_error,
-    });
-    let _ = session
-        .plugins
-        .run_hooks(&pacode_plugin::HookEvent::PostToolCall {
-            name: call.name.clone(),
-            input: call.input.clone(),
-            output: output_val.clone(),
-        })
-        .await;
-
-    // `[hooks].post_tool_use` observes the outcome (denied and errored calls
-    // included); it never blocks and hook stdout is ignored.
-    crate::hooks::post_tool_use(&session, &agent, &call.name, &call.input, &output_val).await;
-
-    let item = TranscriptItem {
-        seq: call.item_seq,
-        agent: agent.id(),
-        ts_ms: pacode_types::now_ms(),
-        kind: TranscriptKind::ToolCall {
-            call_id: call.call_id.clone(),
-            name: call.name,
-            title: call.title,
-            intent: call.intent,
-            status,
-            preview,
-            diff,
-            duration_ms: Some(duration_ms),
-            task,
-        },
-    };
+/// The preview the streamed cell already shows (raw args so far), kept across
+/// the dispatch refresh so the row does not blink empty before the tool lands.
+/// Empty when the cell is missing or belongs to a different seq.
+fn streamed_args_preview(agent: &Agent, call_id: &CallId, seq: u64) -> String {
     agent
         .transcript
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .upsert(item.clone());
-    session.events.emit(Event::ItemUpdated(item));
-
-    if !tool_images.is_empty() {
-        let route = agent.info().model;
-        let accepts = match session.providers.resolve(&route).await {
-            Ok(provider) => provider.model_info(&route.model).vision,
-            Err(_) => false,
-        };
-        if !accepts {
-            content.push_str(&format!(
-                "\n[{} image(s) not shown: model {} does not accept images]",
-                tool_images.len(),
-                route.model
-            ));
-            tool_images.clear();
-        }
-    }
-
-    let res_msg = Message::tool_result_with_images(call.call_id, content, is_error, &tool_images);
-    let (seq, arc_msg) = agent
-        .history
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push(res_msg);
-    let _ = session
-        .store
-        .append_message(&session.id, &agent.id(), seq, &arc_msg)
-        .await;
-
-    if !tool_images.is_empty() {
-        let images_seq = agent
-            .transcript
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .next_seq();
-        let images_item = TranscriptItem {
-            seq: images_seq,
-            agent: agent.id(),
-            ts_ms: pacode_types::now_ms(),
-            kind: TranscriptKind::Images {
-                images: tool_images,
-            },
-        };
-        agent
-            .transcript
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .upsert(images_item.clone());
-        session.events.emit(Event::ItemAdded(images_item));
-    }
-
-    ToolExecutionStatus::Ok
+        .tool_item(call_id)
+        .and_then(|item| match &item.kind {
+            TranscriptKind::ToolCall { preview, .. } if item.seq == seq => Some(preview.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 pub async fn execute_tool_calls(
     session: &Arc<Session>,
     agent: &Arc<Agent>,
     cancel: &CancellationToken,
-    tool_calls: Vec<(CallId, String, serde_json::Value, Option<String>)>,
+    tool_calls: Vec<PendingToolCall>,
 ) -> bool {
+    let registry_snapshot = agent
+        .tools
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot();
+    let budget = turn_budget(session, agent);
+    let limits = turn_budget_limits(session);
     let mut prepared_calls = Vec::new();
-    for (call_id, name, input, parse_err) in tool_calls {
-        let title = tool_title(&name, &input);
-        let intent = pacode_tools::intent_of(&input);
-        let item_seq = agent
-            .transcript
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .next_seq();
+    for call in tool_calls {
+        let title = tool_title(&call.name, &call.input);
+        let intent = pacode_tools::intent_of(&call.input);
+        // Calls the stream announced at `ToolCallStart` already have a cell
+        // (its preview shows the raw args): refresh it in place — real
+        // title/intent now, the args preview stays until the tool output
+        // replaces it. A call that arrived without a start event gets a fresh
+        // cell. On a JSON parse error the existing cell is updated to
+        // "Invalid JSON" by `run_single_tool` — no second cell appears.
+        let (item_seq, preview, streamed) = match call.item_seq {
+            Some(seq) => (seq, streamed_args_preview(agent, &call.call_id, seq), true),
+            None => (
+                agent
+                    .transcript
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .next_seq(),
+                String::new(),
+                false,
+            ),
+        };
         let item = TranscriptItem {
             seq: item_seq,
             agent: agent.id(),
             ts_ms: pacode_types::now_ms(),
             kind: TranscriptKind::ToolCall {
-                call_id: call_id.clone(),
-                name: name.clone(),
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
                 title: title.clone(),
                 intent: intent.clone(),
                 status: ToolStatus::Running,
-                preview: String::new(),
+                preview,
                 diff: None,
                 duration_ms: None,
                 task: None,
@@ -428,93 +123,220 @@ pub async fn execute_tool_calls(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .upsert(item.clone());
-        session.events.emit(Event::ItemAdded(item));
+        if streamed {
+            session.events.emit(Event::ItemUpdated(item));
+        } else {
+            session.events.emit(Event::ItemAdded(item));
+        }
 
         prepared_calls.push(ToolCallInfo {
-            call_id,
-            name,
-            input,
-            parse_err,
+            call_id: call.call_id,
+            name: call.name,
+            input: call.input,
+            parse_err: call.parse_err,
             item_seq,
             title,
             intent,
         });
     }
 
-    let mut chunks: Vec<ToolChunk> = Vec::new();
-    for call in prepared_calls {
-        let is_concurrent = agent
-            .tools
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
+    // Consecutive calls that may run side by side form a group; any other
+    // call runs alone, in call order. Each call's pre-dispatch checks
+    // (budget, plugin and user hooks) run before it joins: a plugin hook may
+    // rewrite the input, so whether it runs alongside its neighbours is
+    // decided on the input it will actually run. A call that runs alone
+    // first lets the reads queued before it finish, so its hooks still run
+    // right before it.
+    let cwd = session.meta().cwd;
+    let runs_concurrently = |call: &ToolCallInfo| {
+        registry_snapshot
             .get(&call.name)
-            .map(|t| matches!(t.kind(), ToolKind::ReadOnly | ToolKind::Network))
-            .unwrap_or(false);
-
-        if is_concurrent {
-            match chunks.last_mut() {
-                Some(ToolChunk::Concurrent(list)) => list.push(call),
-                _ => chunks.push(ToolChunk::Concurrent(vec![call])),
-            }
-        } else {
-            chunks.push(ToolChunk::Sequential(call));
-        }
-    }
-
+            .is_some_and(|tool| tool.runs_concurrently(&call.input, &cwd))
+    };
+    let run = Run {
+        session,
+        agent,
+        cancel,
+        registry: &registry_snapshot,
+    };
     let mut interrupted = false;
-    let mut remaining_calls_to_cancel = Vec::new();
-
-    for chunk in chunks {
-        if cancel.is_cancelled() {
-            interrupted = true;
-            match chunk {
-                ToolChunk::Concurrent(list) => remaining_calls_to_cancel.extend(list),
-                ToolChunk::Sequential(call) => remaining_calls_to_cancel.push(call),
-            }
-            continue;
+    let mut group: Vec<(ToolCallInfo, Precheck)> = Vec::new();
+    for mut call in prepared_calls {
+        if !runs_concurrently(&call) {
+            interrupted |= run.group(std::mem::take(&mut group)).await;
         }
-
-        match chunk {
-            ToolChunk::Concurrent(list) => {
-                let futures = list.into_iter().map(|call| {
-                    let session = session.clone();
-                    let agent = agent.clone();
-                    let cancel = cancel.clone();
-                    async move { run_single_tool(session, agent, cancel, call).await }
-                });
-                let results = futures::future::join_all(futures).await;
-                for res in results {
-                    if res.is_cancelled() {
-                        interrupted = true;
-                    }
-                }
-            }
-            ToolChunk::Sequential(call) => {
-                let res =
-                    run_single_tool(session.clone(), agent.clone(), cancel.clone(), call).await;
-                if res.is_cancelled() {
-                    interrupted = true;
-                }
-            }
+        let checks = precheck(
+            session,
+            agent,
+            cancel,
+            &registry_snapshot,
+            &budget,
+            limits,
+            &mut call,
+        )
+        .await;
+        if runs_concurrently(&call) {
+            group.push((call, checks));
+        } else {
+            interrupted |= run.group(std::mem::take(&mut group)).await;
+            interrupted |= run.one(call, checks).await;
         }
     }
-
-    if interrupted {
-        for call in remaining_calls_to_cancel {
-            record_cancelled(
-                session,
-                agent,
-                CancelledCall {
-                    call_id: call.call_id,
-                    name: call.name,
-                    title: call.title,
-                    intent: call.intent,
-                    item_seq: call.item_seq,
-                },
-            )
-            .await;
-        }
-    }
-
+    interrupted |= run.group(group).await;
     interrupted
 }
+
+/// What every call of one step is dispatched with.
+struct Run<'a> {
+    session: &'a Arc<Session>,
+    agent: &'a Arc<Agent>,
+    cancel: &'a CancellationToken,
+    registry: &'a pacode_tools::ToolRegistry,
+}
+
+impl Run<'_> {
+    /// Run one call and commit its result; whether it was interrupted.
+    async fn one(&self, call: ToolCallInfo, checks: Precheck) -> bool {
+        let outcome = run_single_tool(
+            self.session.clone(),
+            self.agent.clone(),
+            self.cancel.clone(),
+            self.registry.clone(),
+            call,
+            checks,
+        )
+        .await;
+        let interrupted = outcome.interrupted;
+        commit_tool_outcome(self.session, self.agent, outcome).await;
+        interrupted
+    }
+
+    /// Run a group side by side and commit the results in call order.
+    async fn group(&self, group: Vec<(ToolCallInfo, Precheck)>) -> bool {
+        let futures = group.into_iter().map(|(call, checks)| {
+            run_single_tool(
+                self.session.clone(),
+                self.agent.clone(),
+                self.cancel.clone(),
+                self.registry.clone(),
+                call,
+                checks,
+            )
+        });
+        let mut interrupted = false;
+        for outcome in futures::future::join_all(futures).await {
+            interrupted |= outcome.interrupted;
+            commit_tool_outcome(self.session, self.agent, outcome).await;
+        }
+        interrupted
+    }
+}
+
+/// Append+persist a synthetic error `tool_result` for every `tool_use` in the
+/// trailing assistant message that never got one.
+///
+/// `run_single_tool` and the interrupted-chunk loop stub the calls they can
+/// reach; what they cannot cover is the turn task dying mid-dispatch — a tool
+/// panic unwinds `execute_tool_calls` before results land, and an abort drops
+/// it outright — leaving persisted `tool_use`s unanswered so every later
+/// request 400s (`tool_use ids found without tool_result`). Runs once per turn
+/// end from the spawn supervisor; an intact tail makes it a no-op.
+///
+/// Only the tail is repaired: a `tool_use` stranded deeper in history (e.g.
+/// behind a later user message, or loaded corrupted) is healed wire-side by
+/// `History::for_model`'s pairing pass instead — history is append-only and
+/// the store is too.
+pub(crate) async fn stub_dangling_tool_calls(session: &Arc<Session>, agent: &Arc<Agent>) {
+    // (call_id, name) of the trailing assistant's still-unanswered calls.
+    let missing: Vec<(CallId, String)> = {
+        let hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
+        let mut idx = hist.messages.len();
+        let mut answered: Vec<CallId> = Vec::new();
+        while idx > 0 && hist.messages[idx - 1].role == Role::Tool {
+            for block in &hist.messages[idx - 1].content {
+                if let ContentBlock::ToolResult { call_id, .. } = block {
+                    answered.push(call_id.clone());
+                }
+            }
+            idx -= 1;
+        }
+        let Some(last) = idx.checked_sub(1).map(|i| &hist.messages[i]) else {
+            return;
+        };
+        if last.role != Role::Assistant {
+            return;
+        }
+        last.tool_uses()
+            .filter(|(id, _, _)| !answered.contains(id))
+            .map(|(id, name, _)| (id.clone(), name.to_string()))
+            .collect()
+    };
+    if missing.is_empty() {
+        return;
+    }
+    log::warn!(
+        "turn ended with {} unanswered tool call(s), writing stubs: session={} agent={}",
+        missing.len(),
+        session.id,
+        agent.id()
+    );
+    for (call_id, name) in missing {
+        let stub =
+            Message::tool_result(call_id.clone(), crate::agent::INTERRUPTED_TOOL_RESULT, true);
+        let (seq, arc_stub) = agent
+            .history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(stub);
+        let _ = session
+            .append_agent_message(agent.as_ref(), seq, &arc_stub)
+            .await;
+        // The cell allocated at `ToolCallStart` must not stay `Running`.
+        let prev = agent
+            .transcript
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .tool_item(&call_id)
+            .cloned();
+        if let Some(prev) = prev
+            && let TranscriptKind::ToolCall {
+                title,
+                intent,
+                duration_ms,
+                task,
+                ..
+            } = &prev.kind
+        {
+            let item = TranscriptItem {
+                seq: prev.seq,
+                agent: agent.id(),
+                ts_ms: pacode_types::now_ms(),
+                kind: TranscriptKind::ToolCall {
+                    call_id: call_id.clone(),
+                    name,
+                    title: title.clone(),
+                    intent: intent.clone(),
+                    status: ToolStatus::Error,
+                    preview: crate::agent::INTERRUPTED_TOOL_RESULT.to_string(),
+                    diff: None,
+                    duration_ms: *duration_ms,
+                    task: task.clone(),
+                },
+            };
+            agent
+                .transcript
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .upsert(item.clone());
+            session.events.emit(Event::ItemUpdated(item));
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "tools_tests.rs"]
+mod tools_tests;
+
+#[cfg(test)]
+#[path = "tools_bash_tests.rs"]
+mod tools_bash_tests;

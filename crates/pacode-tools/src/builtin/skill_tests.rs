@@ -102,10 +102,10 @@ impl ToolHost for DummyHost {
         self.schedule.stop_monitor(id)
     }
 
-    async fn request_permission(&self, _draft: PermissionDraft) -> PermissionDecision {
-        PermissionDecision::AllowOnce
+    async fn request_permission(&self, _draft: PermissionDraft) -> crate::PermissionOutcome {
+        PermissionDecision::AllowOnce.into()
     }
-    async fn spawn_task(&self, _spec: TaskSpec) -> Result<TaskId, ToolError> {
+    async fn spawn_task(&self, _spec: TaskSpec) -> Result<crate::SpawnedTask, ToolError> {
         Err(ToolError::failed("unused"))
     }
     fn task_info(&self, _task: &TaskId) -> Option<TaskInfo> {
@@ -127,6 +127,9 @@ impl ToolHost for DummyHost {
     }
     async fn task_tail(&self, _task: &TaskId, _lines: usize) -> Result<Vec<String>, ToolError> {
         Ok(Vec::new())
+    }
+    async fn task_output(&self, _task: &TaskId, _max_chars: usize) -> Result<String, ToolError> {
+        Ok(String::new())
     }
     fn report_task_progress(
         &self,
@@ -153,11 +156,35 @@ impl ToolHost for DummyHost {
     async fn stop_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Ok(())
     }
+    async fn continue_agent(
+        &self,
+        _agent: &AgentId,
+        _consent: Option<u64>,
+    ) -> Result<(), ToolError> {
+        Ok(())
+    }
     fn request_agent_status(&self, _agent: &AgentId) -> Result<(), ToolError> {
         Ok(())
     }
     fn report_status(&self, _text: String) -> Result<(), ToolError> {
         Ok(())
+    }
+
+    async fn send_to_agent(
+        &self,
+        _agent: &pacode_types::AgentId,
+        _message: String,
+        _consent: Option<u64>,
+    ) -> Result<crate::host::SendOutcome, ToolError> {
+        Err(ToolError::Failed("no agents in this test".to_string()))
+    }
+
+    async fn ask_parent(
+        &self,
+        _call_id: &pacode_types::CallId,
+        _question: String,
+    ) -> Result<crate::host::ParentReply, ToolError> {
+        Err(ToolError::Failed("no parent in this test".to_string()))
     }
     fn plan(&self) -> Plan {
         Plan::default()
@@ -182,6 +209,7 @@ fn make_ctx(cwd: PathBuf) -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: crate::registry::ToolRegistry::new(),
     }
 }
 

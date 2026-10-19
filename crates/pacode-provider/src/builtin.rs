@@ -58,6 +58,7 @@ impl BuiltinProvider {
                     display_name: Some(m.name.to_string()),
                     context_window: m.context_window,
                     reasoning: None,
+                    ..ModelConfig::default()
                 })
                 .collect(),
             ..ProviderConfig::default()

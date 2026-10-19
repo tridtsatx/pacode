@@ -286,7 +286,9 @@ impl Provider for MockProvider {
             display_name: model.to_string(),
             context_window: Some(32_000),
             supports_reasoning: true,
-            vision: true,
+            // Scripted, so it "sees" anything: image paths are exercised end to end.
+            supports_vision: true,
+            supported_efforts: None,
             pricing: None,
             ..Default::default()
         }

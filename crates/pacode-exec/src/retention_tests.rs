@@ -1,10 +1,9 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use pacode_types::{AgentId, ExecConfig, SessionId, TaskId, TaskStatus};
 
 use super::{MAX_STUBS, MAX_TERMINAL, Retention};
-use crate::manager::{TaskManager, WaitResult};
+use crate::manager::TaskManager;
 use crate::spec::TaskSpec;
 
 fn spec(session: &SessionId, cmd: &str) -> TaskSpec {
@@ -14,63 +13,6 @@ fn spec(session: &SessionId, cmd: &str) -> TaskSpec {
         cmd.to_string(),
         std::env::current_dir().unwrap(),
     )
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn finished_tasks_are_evicted_to_stubs_and_tail_reads_the_spool() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mgr = TaskManager::new(tmp.path().to_path_buf(), ExecConfig::default());
-    let session = SessionId::generate();
-    let total = MAX_TERMINAL + 44;
-
-    let mut ids: Vec<TaskId> = Vec::new();
-    for batch in 0..(total / 20 + 1) {
-        let mut handles = Vec::new();
-        for n in 0..20 {
-            let idx = batch * 20 + n;
-            if idx >= total {
-                break;
-            }
-            let mgr = Arc::clone(&mgr);
-            let spec = spec(&session, &format!("echo line-{idx}"));
-            handles.push(tokio::spawn(async move {
-                let info = mgr.spawn(spec).await.unwrap();
-                mgr.wait(&info.id, Duration::from_secs(10), false).await;
-                info.id
-            }));
-        }
-        for h in handles {
-            ids.push(h.await.unwrap());
-        }
-    }
-
-    // Eviction runs just after `Ended`; let the last supervisors finish.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let live = mgr.state.tasks.lock().unwrap().len();
-    assert!(live <= MAX_TERMINAL, "{live} entries kept");
-    assert_eq!(mgr.list(Some(&session)).len(), total);
-
-    let evicted = ids
-        .iter()
-        .find(|id| !mgr.state.tasks.lock().unwrap().contains_key(*id))
-        .expect("some task was evicted")
-        .clone();
-    let info = mgr.info(&evicted).expect("stub keeps info");
-    assert_eq!(info.status, TaskStatus::Completed);
-    let tail = mgr.tail(&evicted, 5).await.unwrap();
-    assert_eq!(tail.len(), 1);
-    assert!(tail[0].starts_with("line-"));
-    assert!(matches!(
-        mgr.wait(&evicted, Duration::from_secs(1), false).await,
-        WaitResult::Ended(_)
-    ));
-    assert!(mgr.output(&evicted, 1000).await.unwrap().contains("line-"));
-
-    mgr.ack(&evicted);
-    assert!(mgr.info(&evicted).unwrap().acked);
-    mgr.forget(&evicted);
-    assert!(mgr.info(&evicted).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

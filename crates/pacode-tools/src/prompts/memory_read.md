@@ -1,0 +1,1 @@
+Alias of memory_recall: search saved memories, or list pinned + recent ones when no query is given. Optional scope 'global' | 'project' | 'both'.

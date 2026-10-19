@@ -1,0 +1,1 @@
+Search saved memories (BM25 full-text, boosted by recency, pinned and past use). Empty query lists pinned + most recent entries. Searches both scopes unless 'scope' is given. Returns id, kind, title and text for up to 'limit' (default 5, max 20).

@@ -1,0 +1,19 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Scala, src)"
+---
+module com.x 1-1
+module App 3-9
+  const Version 4-4
+  method main 5-8
+    fn local 6-6
+trait Repo 11-13
+  method save 12-12
+class Service 15-18
+  method save 16-16
+  method helper 17-17
+enum Color 20-20
+class User 22-22
+impl extension 24-26
+  method shout 25-25
+type Alias 27-27

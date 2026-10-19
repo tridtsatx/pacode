@@ -2,6 +2,7 @@
 //!
 //! Enables pacode to act as an external ACP agent for editors such as Zed.
 
+pub mod config_options;
 pub mod error;
 pub mod mapping;
 pub mod server;

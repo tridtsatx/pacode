@@ -1,15 +1,15 @@
 //! Request body construction for the OpenAI Responses API.
 //!
 //! Images: user messages carry `input_image` parts (`image_url` = `data:` URL, bytes
-//! loaded lazily from the image store) next to the `input_text` parts. Images returned
-//! by tools go into one user follow-up message after the whole run of
-//! `function_call_output` items (a plain-string `output` cannot hold pixels).
+//! loaded lazily from the image store) after the `input_text` part; models without
+//! vision get text placeholders. Images returned by tools go into one user follow-up
+//! message after the whole run of `function_call_output` items (a plain-string `output`
+//! cannot hold pixels).
 
-use pacode_types::{ContentBlock, Effort, ProviderConfig, ProviderDefaults, Role};
+use pacode_types::{ContentBlock, Effort, ImageSource, ProviderConfig, ProviderDefaults, Role};
 use serde_json::Value;
 
 use crate::CompletionRequest;
-use crate::vision;
 
 pub const REASONING_KEYWORDS: &[&str] = &[
     "codex",
@@ -57,6 +57,8 @@ pub fn build_responses_body(
         }
     }
 
+    let vision = model_supports_vision(&req.model);
+
     let mut input = Vec::new();
     let mut pending_tool_images: Vec<Value> = Vec::new();
     for msg in &req.messages {
@@ -65,14 +67,54 @@ pub fn build_responses_body(
         }
         match msg.role {
             Role::User => {
+                let has_images = msg
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }));
+                if !vision || !has_images {
+                    input.push(serde_json::json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": crate::image::text_with_image_fallbacks(msg),
+                        }]
+                    }));
+                    continue;
+                }
+                let mut text = msg.text();
+                let mut content: Vec<Value> = Vec::new();
+                for block in &msg.content {
+                    if let ContentBlock::Image { source } = block {
+                        match crate::openai_compat::load_image_payload(source) {
+                            Some((mime, b64)) => content.push(serde_json::json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{mime};base64,{b64}"),
+                            })),
+                            None => {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(&crate::image::image_fallback_text(source));
+                            }
+                        }
+                    }
+                }
+                let mut parts = Vec::with_capacity(content.len() + 1);
+                parts.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": text,
+                }));
+                parts.extend(content);
                 input.push(serde_json::json!({
                     "type": "message",
                     "role": "user",
-                    "content": user_parts(msg),
+                    "content": parts,
                 }));
             }
             Role::Assistant => {
-                let text = msg.text();
+                // `input_image` is only valid on user input; degrade to text.
+                let text = crate::image::text_with_image_fallbacks(msg);
                 if !text.is_empty() {
                     input.push(serde_json::json!({
                         "type": "message",
@@ -123,7 +165,14 @@ pub fn build_responses_body(
                                 "output": output,
                             }));
                         }
-                        ContentBlock::Image { .. } => pending_tool_images.push(image_part(block)),
+                        ContentBlock::Image { source } => pending_tool_images.push(if vision {
+                            image_part(source)
+                        } else {
+                            serde_json::json!({
+                                "type": "input_text",
+                                "text": crate::image::image_fallback_text(source),
+                            })
+                        }),
                         ContentBlock::Text { .. }
                         | ContentBlock::Reasoning { .. }
                         | ContentBlock::ToolUse { .. } => {}
@@ -214,6 +263,19 @@ pub fn model_heuristic_reasoning(model: &str) -> bool {
     REASONING_KEYWORDS.iter().any(|&k| lower.contains(k))
 }
 
+/// Whether the model accepts `input_image` parts. The Responses API serves the
+/// gpt-5/codex/o-series families, all of which take image input; `o1-mini` and
+/// `o1-preview` are the exceptions.
+pub fn model_supports_vision(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("o1-mini") || lower.contains("o1-preview") {
+        return false;
+    }
+    ["codex", "gpt-5", "gpt-4o", "gpt-4.1", "o1", "o3", "o4"]
+        .iter()
+        .any(|&k| lower.contains(k))
+}
+
 pub fn deep_merge(target: &mut Value, source: &Value) {
     match (target, source) {
         (Value::Object(target_map), Value::Object(source_map)) => {
@@ -232,48 +294,17 @@ pub fn deep_merge(target: &mut Value, source: &Value) {
     }
 }
 
-/// Content parts of a user message: text and `input_image` parts in block order.
-fn user_parts(msg: &pacode_types::Message) -> Vec<Value> {
-    if !msg.has_images() {
-        return vec![serde_json::json!({ "type": "input_text", "text": msg.text() })];
-    }
-    let mut parts = Vec::new();
-    for block in &msg.content {
-        match block {
-            ContentBlock::Text { text } => {
-                if !text.is_empty() {
-                    parts.push(serde_json::json!({ "type": "input_text", "text": text }));
-                }
-            }
-            ContentBlock::Image { .. } => parts.push(image_part(block)),
-            ContentBlock::Reasoning { .. }
-            | ContentBlock::ToolUse { .. }
-            | ContentBlock::ToolResult { .. } => {}
-        }
-    }
-    parts
-}
-
 /// `input_image` part, or an `input_text` note when the bytes are gone.
-fn image_part(block: &ContentBlock) -> Value {
-    let ContentBlock::Image {
-        mime,
-        hash,
-        source_path,
-        ..
-    } = block
-    else {
-        return serde_json::json!({ "type": "input_text", "text": "[image omitted]" });
-    };
-    match vision::data_url(mime, hash) {
-        Ok(url) => serde_json::json!({ "type": "input_image", "image_url": url }),
-        Err(err) => {
-            log::warn!("image {hash} left out of the request: {err}");
-            serde_json::json!({
-                "type": "input_text",
-                "text": vision::omitted_note(source_path.as_deref()),
-            })
-        }
+fn image_part(source: &ImageSource) -> Value {
+    match crate::openai_compat::load_image_payload(source) {
+        Some((mime, b64)) => serde_json::json!({
+            "type": "input_image",
+            "image_url": format!("data:{mime};base64,{b64}"),
+        }),
+        None => serde_json::json!({
+            "type": "input_text",
+            "text": crate::image::image_fallback_text(source),
+        }),
     }
 }
 

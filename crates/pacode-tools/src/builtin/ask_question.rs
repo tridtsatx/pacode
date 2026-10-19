@@ -5,8 +5,8 @@ use pacode_types::QuestionOption;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::parse_input;
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use super::helpers::{parse_input, preview_body};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 #[cfg(test)]
 #[path = "ask_question_tests.rs"]
@@ -14,7 +14,13 @@ mod ask_question_tests;
 
 pub const NAME: &str = "ask_question";
 
-pub struct AskQuestionTool;
+/// Model-facing description; see `prompts/ask_question.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/ask_question.md");
+
+#[derive(Default)]
+pub struct AskQuestionTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -40,12 +46,10 @@ impl Tool for AskQuestionTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user to choose between options and wait for the answer. Use it for \
-         a decision that is genuinely theirs — an architectural trade-off, an \
-         ambiguity you cannot resolve from the code — not for something you can \
-         decide yourself. Give each option a description covering its upside, its \
-         downside and its pitfall, and mark exactly one as recommended. The user can \
-         also type an answer of their own or dismiss the question."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
@@ -74,12 +78,26 @@ impl Tool for AskQuestionTool {
         })
     }
 
+    fn can_exceed_output_cap(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Control
     }
 
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, _): (AskInput, bool) = parse_input(input)?;
+
+        // Refused here, before the question reaches the host: the picker can only
+        // highlight one recommendation, and a correctable input error is cheaper
+        // than a question that fails downstream.
+        let recommended = args.options.iter().filter(|o| o.recommended).count();
+        if recommended > 1 {
+            return Err(ToolError::invalid(format!(
+                "at most one option may be marked as recommended, {recommended} were"
+            )));
+        }
 
         let options: Vec<QuestionOption> = args
             .options
@@ -110,7 +128,7 @@ impl Tool for AskQuestionTool {
             .await?;
 
         let content = answer_text(&answer, &labels, &question_text);
-        let preview = content.lines().next().unwrap_or_default().to_string();
+        let preview = preview_body(&content);
         Ok(ToolOutput::text(content)
             .with_title(format!("ask {}", short(&question_text)))
             .with_preview(preview))

@@ -27,6 +27,7 @@ fn test_registry_from_config_empty_base_url() {
             extra_body: None,
             headers: BTreeMap::new(),
             proxy: None,
+            ..Default::default()
         },
     );
 
@@ -68,6 +69,7 @@ fn test_registry_from_config_and_routes() {
             extra_body: None,
             headers: BTreeMap::new(),
             proxy: None,
+            ..Default::default()
         },
     );
 
@@ -86,7 +88,7 @@ fn test_registry_from_config_and_routes() {
     let reg = ProviderRegistry::from_config(&cfg, &api_keys).expect("valid registry");
     assert_eq!(
         reg.default_route(),
-        Some(&ModelRoute::new("openrouter", "openai/gpt-5.5"))
+        Some(ModelRoute::new("openrouter", "openai/gpt-5.5"))
     );
 
     let prov = reg.get("openrouter");
@@ -242,6 +244,28 @@ fn test_transport_selection_per_kind() {
         devin_reg.get("my-devin").is_some(),
         "devin transport is wired"
     );
+
+    // OpenCode builds OpenCodeProvider transport
+    let mut opencode_providers = BTreeMap::new();
+    opencode_providers.insert(
+        "my-opencode".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::OpenCode,
+            base_url: "https://opencode.ai/zen/v1".to_string(),
+            ..ProviderConfig::default()
+        },
+    );
+    let opencode_cfg = Config {
+        providers: opencode_providers,
+        ..Config::default()
+    };
+    let opencode_reg =
+        ProviderRegistry::from_config_with_store(&opencode_cfg, &BTreeMap::new(), None)
+            .expect("opencode registry builds");
+    assert!(
+        opencode_reg.get("my-opencode").is_some(),
+        "opencode transport is wired"
+    );
 }
 
 #[test]
@@ -317,6 +341,21 @@ fn test_synthesized_builtin_providers() {
     assert_eq!(devin_cfg.kind, ProviderKind::Devin);
     assert_eq!(devin_cfg.base_url, "https://api.devin.ai/rpc");
 
+    // opencode synthesized (unconditionally, even without store entry)
+    assert!(providers.contains_key("opencode"));
+    let opencode_cfg = &providers["opencode"];
+    assert_eq!(opencode_cfg.kind, ProviderKind::OpenCode);
+    assert_eq!(opencode_cfg.base_url, "https://opencode.ai/zen/v1");
+    assert_eq!(opencode_cfg.api_key.as_deref(), Some("public"));
+    assert!(opencode_cfg.headers.contains_key("User-Agent"));
+    assert_eq!(
+        opencode_cfg
+            .headers
+            .get("x-opencode-client")
+            .map(String::as_str),
+        Some("cli")
+    );
+
     // from_config_with_store with empty config builds synthesized providers
     let empty_cfg = Config::default();
     let reg = ProviderRegistry::from_config_with_store(&empty_cfg, &BTreeMap::new(), Some(&store))
@@ -324,6 +363,7 @@ fn test_synthesized_builtin_providers() {
 
     assert!(reg.get("openrouter").is_some());
     assert!(reg.get("openai").is_some());
+    assert!(reg.get("opencode").is_some());
 }
 
 #[test]
@@ -423,7 +463,8 @@ impl Provider for FailingProvider {
             display_name: model.to_string(),
             context_window: None,
             supports_reasoning: false,
-            vision: false,
+            supports_vision: false,
+            supported_efforts: None,
             pricing: None,
             ..Default::default()
         }
@@ -449,7 +490,8 @@ impl Provider for SuccessProvider {
             display_name: "Good Model".to_string(),
             context_window: Some(64_000),
             supports_reasoning: true,
-            vision: false,
+            supports_vision: false,
+            supported_efforts: None,
             pricing: None,
             ..Default::default()
         }

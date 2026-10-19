@@ -36,6 +36,9 @@ struct StubHost {
     agents: Mutex<Vec<AgentInfo>>,
     agent_kinds: Mutex<Vec<AgentKindDef>>,
     spawned_specs: Mutex<Vec<AgentSpec>>,
+    /// How long a permission prompt stays open; widens the window between a
+    /// tool's read of a file and its write for the concurrency tests.
+    permission_delay: Duration,
 }
 
 impl StubHost {
@@ -51,6 +54,14 @@ impl StubHost {
             agents: Mutex::new(Vec::new()),
             agent_kinds: Mutex::new(Vec::new()),
             spawned_specs: Mutex::new(Vec::new()),
+            permission_delay: Duration::ZERO,
+        }
+    }
+
+    fn slow_permissions(self, delay: Duration) -> Self {
+        Self {
+            permission_delay: delay,
+            ..self
         }
     }
 }
@@ -105,22 +116,29 @@ impl ToolHost for StubHost {
         self.schedule.stop_monitor(id)
     }
 
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
+    async fn request_permission(&self, draft: PermissionDraft) -> pacode_tools::PermissionOutcome {
         let dec = *self.decision.lock().unwrap();
         self.drafts.lock().unwrap().push(draft.clone());
-        if draft.risk == Some(RiskLevel::Catastrophic) {
-            return PermissionDecision::Deny;
+        if !self.permission_delay.is_zero() {
+            tokio::time::sleep(self.permission_delay).await;
         }
-        dec
+        if draft.risk == Some(RiskLevel::Catastrophic) {
+            return pacode_tools::PermissionOutcome {
+                decision: PermissionDecision::Deny,
+                reason: Some("catastrophic operations are denied by policy.".to_string()),
+            };
+        }
+        pacode_tools::PermissionOutcome {
+            decision: dec,
+            reason: None,
+        }
     }
 
-    async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError> {
-        let info = self
-            .tasks
-            .spawn(spec)
+    async fn spawn_task(&self, spec: TaskSpec) -> Result<pacode_tools::SpawnedTask, ToolError> {
+        pacode_tools::SpawnedTask::start(&self.tasks, spec)
             .await
-            .map_err(|e| ToolError::failed(e.to_string()))?;
-        Ok(info.id)
+            .map(|(_, spawned)| spawned)
+            .map_err(|e| ToolError::failed(e.to_string()))
     }
 
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {
@@ -156,6 +174,13 @@ impl ToolHost for StubHost {
     async fn task_tail(&self, task: &TaskId, lines: usize) -> Result<Vec<String>, ToolError> {
         self.tasks
             .tail(task, lines)
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))
+    }
+
+    async fn task_output(&self, task: &TaskId, max_chars: usize) -> Result<String, ToolError> {
+        self.tasks
+            .output(task, max_chars)
             .await
             .map_err(|e| ToolError::failed(e.to_string()))
     }
@@ -222,6 +247,23 @@ impl ToolHost for StubHost {
         Ok(())
     }
 
+    async fn send_to_agent(
+        &self,
+        _agent: &pacode_types::AgentId,
+        _message: String,
+        _consent: Option<u64>,
+    ) -> Result<pacode_tools::host::SendOutcome, ToolError> {
+        Err(ToolError::Failed("no agents in this test".to_string()))
+    }
+
+    async fn ask_parent(
+        &self,
+        _call_id: &pacode_types::CallId,
+        _question: String,
+    ) -> Result<pacode_tools::host::ParentReply, ToolError> {
+        Err(ToolError::Failed("no parent in this test".to_string()))
+    }
+
     async fn stop_agent(&self, agent: &AgentId) -> Result<(), ToolError> {
         if let Some(a) = self
             .agents
@@ -231,6 +273,23 @@ impl ToolHost for StubHost {
             .find(|a| a.id == *agent)
         {
             a.status = AgentStatus::Stopped;
+        }
+        Ok(())
+    }
+
+    async fn continue_agent(
+        &self,
+        agent: &AgentId,
+        _consent: Option<u64>,
+    ) -> Result<(), ToolError> {
+        if let Some(a) = self
+            .agents
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|a| a.id == *agent)
+        {
+            a.status = AgentStatus::Thinking;
         }
         Ok(())
     }
@@ -263,6 +322,7 @@ fn make_ctx(cwd: PathBuf, host: Arc<dyn ToolHost>) -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: pacode_tools::ToolRegistry::new(),
     }
 }
 
@@ -292,7 +352,9 @@ async fn test_read_offset_limit_and_binary() {
     assert!(out.content.contains("     6\tline 6"));
     assert!(!out.content.contains("line 2"));
     assert!(!out.content.contains("line 7"));
-    assert_eq!(out.preview, "4 lines");
+    // The cell body is the numbered output itself, expandable via ctrl+o.
+    assert!(out.preview.contains("     3\tline 3"));
+    assert!(out.preview.contains("     6\tline 6"));
 
     let bin_file = tmp.path().join("test.bin");
     tokio::fs::write(&bin_file, b"abc\0def").await.unwrap();
@@ -392,7 +454,13 @@ async fn test_edit_unique_ambiguous_replace_all_atomic() {
     assert_eq!(out.content, "Edited file.txt: 1 replacement(s)");
     let content = tokio::fs::read_to_string(&file_path).await.unwrap();
     assert_eq!(content, "hi world\nhello zed\n");
-    assert!(!tmp.path().join("file.txt.pacode-tmp").exists());
+    let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains("pacode-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
 
     // Replace all
     let out_all = tool
@@ -461,7 +529,7 @@ async fn test_bash_foreground_exit_code_and_output() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host);
 
-    let tool = BashTool;
+    let tool = BashTool::default();
 
     let out_ok = tool
         .call(
@@ -486,6 +554,43 @@ async fn test_bash_foreground_exit_code_and_output() {
     assert!(out_fail.is_error);
 }
 
+/// Output past the cap keeps its head as well as its tail: the first error of
+/// a long build is the one that matters, and a tail-only cut lost it.
+#[tokio::test]
+async fn test_bash_long_output_keeps_head_and_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+    let tool = BashTool::default();
+
+    // Under the cap but over the old 400-line window: every line arrives.
+    let out = tool
+        .call(json!({"command": "seq 1 3000"}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out.content.starts_with("1\n2\n3\n"),
+        "{}",
+        &out.content[..40]
+    );
+    assert!(out.content.contains("\n1500\n"));
+    assert!(out.content.ends_with("\n3000\n[exit code 0]"));
+
+    // Over the cap: head and tail around a truncation marker, within the cap.
+    let out = tool
+        .call(json!({"command": "seq 1 100000"}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.starts_with("1\n2\n3\n"));
+    assert!(out.content.contains("truncated"));
+    // The real size is named: the exec buffer's own marker fell inside the cut.
+    assert!(
+        out.content
+            .ends_with("\n100000\n[exit code 0, 588895 bytes total]")
+    );
+    assert!(out.content.chars().count() <= ctx.output_cap_chars + 200);
+}
+
 #[tokio::test]
 async fn test_bash_auto_yield() {
     let tmp = tempfile::tempdir().unwrap();
@@ -493,7 +598,7 @@ async fn test_bash_auto_yield() {
     let mut ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
     ctx.exec_yield_after = Duration::from_millis(200);
 
-    let tool = BashTool;
+    let tool = BashTool::default();
     let out = tool
         .call(json!({"command": "sleep 3"}), &ctx)
         .await
@@ -509,7 +614,7 @@ async fn test_bash_background_immediate() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host);
 
-    let tool = BashTool;
+    let tool = BashTool::default();
     let start = std::time::Instant::now();
     let out = tool
         .call(json!({"command": "sleep 5", "background": true}), &ctx)
@@ -527,7 +632,7 @@ async fn test_bash_plan_mode_denies_touch_allows_ls() {
     let mut ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
     ctx.mode = Mode::Plan;
 
-    let tool = BashTool;
+    let tool = BashTool::default();
 
     let err = tool.call(json!({"command": "touch x"}), &ctx).await;
     assert!(matches!(err, Err(ToolError::Denied(_))));
@@ -544,7 +649,7 @@ async fn test_bash_catastrophic_denial() {
     let mut ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
     ctx.mode = Mode::Bypass;
 
-    let tool = BashTool;
+    let tool = BashTool::default();
     let err = tool.call(json!({"command": "rm -rf ~"}), &ctx).await;
     assert!(matches!(err, Err(ToolError::Denied(_))));
 
@@ -583,7 +688,7 @@ async fn test_grep_glob_ls_with_gitignore() {
         .unwrap();
 
     // Grep
-    let grep = GrepTool;
+    let grep = GrepTool::default();
     let out_grep = grep.call(json!({"pattern": "hello"}), &ctx).await.unwrap();
     assert!(out_grep.content.contains("file1.rs"));
     assert!(!out_grep.content.contains("test.ignored"));
@@ -591,14 +696,14 @@ async fn test_grep_glob_ls_with_gitignore() {
     assert!(!out_grep.content.contains(".hidden_file"));
 
     // Glob
-    let glob = GlobTool;
+    let glob = GlobTool::default();
     let out_glob = glob.call(json!({"pattern": "*.rs"}), &ctx).await.unwrap();
     assert!(out_glob.content.contains("file1.rs"));
     assert!(out_glob.content.contains("file2.rs"));
     assert!(!out_glob.content.contains("ignored_dir"));
 
     // Ls
-    let ls = LsTool;
+    let ls = LsTool::default();
     let out_ls = ls.call(json!({}), &ctx).await.unwrap();
     assert!(out_ls.content.contains("file1.rs"));
     assert!(out_ls.content.contains("file2.rs"));
@@ -613,7 +718,7 @@ async fn test_plan_set_and_update() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let tool = PlanTool;
+    let tool = PlanTool::default();
     let set_out = tool
         .call(
             json!({
@@ -693,7 +798,6 @@ fn test_agent_schema_hides_model_and_effort() {
     assert!(props.contains_key("kind"));
     assert!(props.contains_key("context"));
     let desc = AgentTool.description();
-    assert!(!desc.contains("model"), "description leaks model: {desc}");
     assert!(!desc.contains("effort"), "description leaks effort: {desc}");
 }
 
@@ -789,8 +893,14 @@ async fn test_agent_spawn_with_named_kind() {
     assert_eq!(spec.tools, Some(vec!["ls".to_string()]));
 }
 
+/// An unknown `kind` must not cost the spawn. pacode ships no built-in kinds,
+/// so a model naming a plausible one is ordinary, not a mistake — and when it
+/// *was* an error the model retried the same name for several turns, which read
+/// as "subagents are slow to start". The contract here is: the agent exists,
+/// it got the default tool set, and the model is told what was ignored and
+/// what does exist so it can correct itself in one step.
 #[tokio::test]
-async fn test_agent_spawn_unknown_kind_lists_available() {
+async fn test_agent_spawn_unknown_kind_warns_instead_of_refusing() {
     let tmp = tempfile::tempdir().unwrap();
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     host.agent_kinds
@@ -800,20 +910,38 @@ async fn test_agent_spawn_unknown_kind_lists_available() {
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
     let tool = AgentTool;
-    let err = tool
+    let out = tool
         .call(
-            json!({"action": "spawn", "kind": "nope", "prompt": "do work"}),
+            json!({"action": "spawn", "kind": "explore", "prompt": "do work"}),
             &ctx,
         )
-        .await;
-    match err {
-        Err(ToolError::InvalidInput(msg)) => {
-            assert!(msg.contains("unknown agent kind 'nope'"), "got: {msg}");
-            assert!(msg.contains("reviewer"), "should list available: {msg}");
-        }
-        other => panic!("expected InvalidInput, got {other:?}"),
-    }
-    assert!(host.spawned_specs.lock().unwrap().is_empty());
+        .await
+        .expect("an unknown kind must not fail the spawn");
+
+    let text = out.content.clone();
+    assert!(
+        text.contains("Spawned agent"),
+        "the spawn must still happen: {text}"
+    );
+    assert!(
+        text.contains("'explore'") && text.contains("reviewer"),
+        "the note must name what was ignored and what exists: {text}"
+    );
+    assert!(
+        !out.is_error,
+        "this is a note, not a failed call the model has to recover from"
+    );
+
+    let specs = host.spawned_specs.lock().unwrap();
+    assert_eq!(
+        specs.len(),
+        1,
+        "exactly one subagent was spawned: {specs:?}"
+    );
+    assert_eq!(
+        specs[0].tools, None,
+        "with no matching kind there is no kind file to restrict tools"
+    );
 }
 
 #[tokio::test]
@@ -861,6 +989,29 @@ async fn test_agent_list_shows_kinds_without_agents() {
     assert!(out.content.contains("reviewer"));
 }
 
+/// With no kinds defined, `list` has to say so. The old output listed agents
+/// and stopped, leaving the model to guess whether `kind` was usable at all —
+/// which is how it ended up inventing names and burning turns on rejected
+/// spawns. The sentence has to tell it to omit the field.
+#[tokio::test]
+async fn test_agent_list_says_to_omit_kind_when_none_are_defined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    assert!(
+        host.agent_kinds.lock().unwrap().is_empty(),
+        "this test is about the empty case"
+    );
+
+    let tool = AgentTool;
+    let out = tool.call(json!({"action": "list"}), &ctx).await.unwrap();
+    assert!(
+        out.content.contains("omit `kind`"),
+        "the empty case must tell the model what to do instead: {}",
+        out.content
+    );
+}
+
 #[test]
 fn test_definition_ensures_common_properties() {
     let read = ReadTool;
@@ -879,7 +1030,7 @@ async fn test_bg_lifecycle() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let bash = BashTool;
+    let bash = BashTool::default();
     let spawn_res = bash
         .call(
             json!({"command": "echo 'bg line 1' && sleep 10", "background": true}),
@@ -889,7 +1040,7 @@ async fn test_bg_lifecycle() {
         .unwrap();
     let task_id = spawn_res.task.unwrap();
 
-    let bg = BgTool;
+    let bg = BgTool::default();
     let list_out = bg.call(json!({"action": "list"}), &ctx).await.unwrap();
     assert!(list_out.content.contains(task_id.as_str()));
     assert!(list_out.content.contains("running"));
@@ -1010,7 +1161,7 @@ async fn test_webfetch_url_validation() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host);
 
-    let tool = pacode_tools::builtin::webfetch::WebFetchTool;
+    let tool = pacode_tools::builtin::webfetch::WebFetchTool::default();
 
     let err_scheme = tool
         .call(json!({"url": "ftp://example.com/file"}), &ctx)
@@ -1159,4 +1310,306 @@ async fn test_mcp_resource_proxy() {
     assert!(out_blob.content.contains("[blob: image/png]"));
 
     pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_edits_of_one_file_both_land() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(
+        StubHost::new(tmp.path().join("spool")).slow_permissions(Duration::from_millis(40)),
+    );
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+    let file = tmp.path().join("shared.txt");
+    tokio::fs::write(&file, "aaa\nbbb\n").await.unwrap();
+
+    // Both callers read the same starting content; without the per-path lock one
+    // of the two writes would be computed from a file the other had already
+    // replaced, and the first change would vanish.
+    // Two separate tools, as two concurrent `edit` calls would be.
+    let one = EditTool;
+    let two = EditTool;
+    let (first, second) = tokio::join!(
+        one.call(
+            json!({"path": "shared.txt", "old_string": "aaa", "new_string": "AAA"}),
+            &ctx
+        ),
+        two.call(
+            json!({"path": "./shared.txt", "old_string": "bbb", "new_string": "BBB"}),
+            &ctx
+        )
+    );
+    first.expect("first edit");
+    second.expect("second edit");
+
+    assert_eq!(
+        tokio::fs::read_to_string(&file).await.unwrap(),
+        "AAA\nBBB\n"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains("pacode-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}
+
+#[tokio::test]
+async fn write_keeps_the_mode_and_caps_a_huge_permission_detail() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    let file = tmp.path().join("run.sh");
+    tokio::fs::write(&file, "old\n").await.unwrap();
+    tokio::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+        .await
+        .unwrap();
+
+    WriteTool
+        .call(json!({"path": "run.sh", "content": "new\n"}), &ctx)
+        .await
+        .unwrap();
+
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o755,
+        "an overwrite must not strip the exec bit"
+    );
+
+    let filler = "z".repeat(200_000);
+    WriteTool
+        .call(json!({"path": "run.sh", "content": filler}), &ctx)
+        .await
+        .unwrap();
+    let drafts = host.drafts.lock().unwrap().clone();
+    let last = drafts.last().expect("a draft");
+    assert!(
+        last.detail.len() <= pacode_tools::registry::MAX_PERMISSION_DETAIL_BYTES,
+        "permission detail of {} bytes escaped the cap",
+        last.detail.len()
+    );
+    assert!(
+        last.detail.contains("output truncated"),
+        "{}",
+        &last.detail[..80]
+    );
+    assert_eq!(tokio::fs::read_to_string(&file).await.unwrap(), filler);
+}
+
+#[tokio::test]
+async fn a_file_too_large_to_diff_is_refused_instead_of_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    let file = tmp.path().join("huge.txt");
+    let handle = std::fs::File::create(&file).unwrap();
+    handle
+        .set_len(pacode_tools::registry::MAX_SOURCE_FILE_BYTES + 1)
+        .unwrap();
+    drop(handle);
+
+    let err = EditTool
+        .call(
+            json!({"path": "huge.txt", "old_string": "a", "new_string": "b"}),
+            &ctx,
+        )
+        .await
+        .expect_err("too large to load whole");
+    assert!(format!("{err}").contains("byte limit"), "{err}");
+
+    let err = WriteTool
+        .call(json!({"path": "huge.txt", "content": "b"}), &ctx)
+        .await
+        .expect_err("too large to load whole");
+    assert!(format!("{err}").contains("byte limit"), "{err}");
+
+    // Nothing was written, and nothing was asked.
+    assert!(host.drafts.lock().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Input caps: `plan set` and `memory_write` must bound what they store and say
+// so out loud. A silent cut looks exactly like a successful write, and the model
+// goes on believing in content that was never stored.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_plan_set_caps_item_length_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = PlanTool::default();
+    let long = "x".repeat(pacode_tools::builtin::plan::MAX_ITEM_CHARS + 500);
+    let out = tool
+        .call(json!({"action": "set", "items": [{"content": long}]}), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains("plan input truncated"),
+        "a capped set must say so: {}",
+        out.content
+    );
+
+    // And what was actually stored is the bounded text, not the input.
+    let plan = ctx.host.plan();
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(
+        plan.items[0].content.chars().count(),
+        pacode_tools::builtin::plan::MAX_ITEM_CHARS
+    );
+}
+
+#[tokio::test]
+async fn test_plan_set_caps_item_count_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = PlanTool::default();
+    let items: Vec<serde_json::Value> = (0..30)
+        .map(|i| json!({"content": format!("step {i}")}))
+        .collect();
+    let out = tool
+        .call(json!({"action": "set", "items": items}), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains("plan input truncated"),
+        "a capped set must say so: {}",
+        out.content
+    );
+    assert!(out.content.contains("10 item(s) past the 20-item limit"));
+
+    let plan = ctx.host.plan();
+    assert_eq!(plan.items.len(), pacode_tools::builtin::plan::MAX_ITEMS);
+}
+
+#[tokio::test]
+async fn test_plan_set_within_limits_has_no_truncation_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = PlanTool::default();
+    let out = tool
+        .call(
+            json!({"action": "set", "items": [{"content": "a short step"}]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !out.content.contains("truncated"),
+        "an uncapped set must not claim it truncated anything: {}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn test_plan_get_after_a_capped_set_shows_the_bounded_plan() {
+    // The cap has to be below the hard output byte cap, or the model would get
+    // a plan back that is itself cut with a marker it cannot act on.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = PlanTool::default();
+    let long = "y".repeat(pacode_tools::builtin::plan::MAX_ITEM_CHARS + 500);
+    tool.call(json!({"action": "set", "items": [{"content": long}]}), &ctx)
+        .await
+        .unwrap();
+
+    let got = tool.call(json!({"action": "get"}), &ctx).await.unwrap();
+    assert!(
+        !got.content.contains("output truncated"),
+        "a plan that fits the input cap must survive `get` intact: {}",
+        got.content
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `agent`: the kind list is read at call time, because the tool description is
+// served from a cache and cannot see the host.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_agent_kinds_lists_what_the_session_actually_has() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    host.agent_kinds
+        .lock()
+        .unwrap()
+        .push(reviewer_kind(tmp.path()));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = AgentTool;
+    let out = tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    assert!(out.content.contains("reviewer"), "{}", out.content);
+    assert!(out.content.contains("Reviews code changes"));
+}
+
+#[tokio::test]
+async fn test_agent_kinds_names_the_empty_case() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host);
+
+    let tool = AgentTool;
+    let out = tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    // Silence here is what had the model inventing `explore`/`reviewer`.
+    assert!(
+        out.content.contains("No agent kinds are defined"),
+        "the empty case must be named: {}",
+        out.content
+    );
+    assert!(out.content.contains("omit `kind`"));
+}
+
+#[tokio::test]
+async fn test_agent_kinds_reflects_a_kind_added_after_the_definition_was_cached() {
+    // The point of the call-time read: `Tool::description` is memoised per tool
+    // and has no ToolCtx, so a kind appearing later cannot reach it. Reading at
+    // call time can.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+    let tool = AgentTool;
+
+    let before = tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    assert!(before.content.contains("No agent kinds are defined"));
+
+    // Touch the definition cache the way the turn loop does on every step.
+    let _ = tool.definition();
+
+    host.agent_kinds
+        .lock()
+        .unwrap()
+        .push(reviewer_kind(tmp.path()));
+
+    let after = tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    assert!(
+        after.content.contains("reviewer"),
+        "a kind added after the definition was cached must still be visible: {}",
+        after.content
+    );
+}
+
+#[tokio::test]
+async fn test_agent_kinds_is_side_effect_free() {
+    // `kinds` exists so the model can look without acting; it must not spawn.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Arc::new(StubHost::new(tmp.path().join("spool")));
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+
+    let tool = AgentTool;
+    tool.call(json!({"action": "kinds"}), &ctx).await.unwrap();
+    assert!(host.spawned_specs.lock().unwrap().is_empty());
+    assert!(host.list_agents().is_empty());
 }

@@ -10,7 +10,7 @@ use crate::test_support::{StubToolHost, stub_ctx};
 async fn the_answer_comes_back_as_the_label_the_user_saw() {
     let ctx = stub_ctx(std::sync::Arc::new(StubToolHost::default()));
 
-    let out = AskQuestionTool
+    let out = AskQuestionTool::default()
         .call(
             json!({
                 "question": "Where should the cache live?",
@@ -34,7 +34,7 @@ async fn the_answer_comes_back_as_the_label_the_user_saw() {
 async fn a_question_the_picker_could_not_present_is_refused() {
     let ctx = stub_ctx(std::sync::Arc::new(StubToolHost::default()));
 
-    let err = AskQuestionTool
+    let err = AskQuestionTool::default()
         .call(
             json!({
                 "question": "Only one way?",
@@ -47,7 +47,7 @@ async fn a_question_the_picker_could_not_present_is_refused() {
         .expect_err("one option is not a choice");
     assert!(format!("{err}").contains("at least"), "{err}");
 
-    let err = AskQuestionTool
+    let err = AskQuestionTool::default()
         .call(
             json!({
                 "question": "  ",
@@ -62,6 +62,30 @@ async fn a_question_the_picker_could_not_present_is_refused() {
         .await
         .expect_err("an empty question is not a question");
     assert!(format!("{err}").contains("empty"), "{err}");
+}
+
+#[tokio::test]
+async fn several_recommended_options_are_refused_before_asking() {
+    let ctx = stub_ctx(std::sync::Arc::new(StubToolHost::default()));
+
+    let err = AskQuestionTool::default()
+        .call(
+            json!({
+                "question": "Which storage?",
+                "options": [
+                    {"label": "a", "description": "x", "recommended": true},
+                    {"label": "b", "description": "y", "recommended": true}
+                ],
+                "intent": "ask"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("two recommendations are not a recommendation");
+    assert!(
+        format!("{err}").contains("at most one option may be marked as recommended"),
+        "{err}"
+    );
 }
 
 #[tokio::test]

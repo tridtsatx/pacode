@@ -1,17 +1,20 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use futures::StreamExt;
 use pacode_types::{
-    Effort, Message, ModelConfig, ProviderConfig, ProviderDefaults, StopReason, StreamEvent, Usage,
+    ContentBlock, Effort, ImageSource, Message, ModelConfig, ProviderConfig, ProviderDefaults,
+    Role, StopReason, StreamEvent, Usage,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::devin::Devin;
 use crate::devin::connect::{CONNECT_FLAG_END_STREAM, ConnectFrameDecoder, encode_connect_frame};
 use crate::devin::proto::{self, WireType, Writer};
-use crate::devin::wire::encode_get_chat_message_request;
-use crate::{CompletionRequest, Provider, ProviderError};
+use crate::devin::wire::{encode_get_chat_message_request, encode_messages};
+use crate::{CompletionRequest, Provider, ProviderError, shared};
 
 /// Provider whose fixture server answers `GetCliModelConfigs`, so the catalog —
 /// and with it the model families — is available.
@@ -41,6 +44,7 @@ fn make_test_provider(base_url: &str, api_key: Option<&str>, session_token: Opti
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let defaults = ProviderDefaults {
@@ -210,7 +214,7 @@ fn test_exact_byte_layout_of_get_chat_message_request() {
         model: "swe-1-6-fast".to_string(),
         system_static: "You are an assistant.".to_string(),
         system_dynamic: "Current date: 2026-09-11".to_string(),
-        messages: vec![Message::user("Hello Devin")],
+        messages: shared(vec![Message::user("Hello Devin")]),
         tools: vec![],
         effort: Some(Effort::Medium),
         max_output_tokens: Some(4096),
@@ -229,6 +233,7 @@ fn test_exact_byte_layout_of_get_chat_message_request() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let session_token = "sess-tok-xyz-987";
@@ -542,7 +547,7 @@ async fn test_full_streamed_turn_text_thinking_usage_stop() {
         model: "swe-1-6-fast".to_string(),
         system_static: "system".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("hi")],
+        messages: shared(vec![Message::user("hi")]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),
@@ -659,7 +664,7 @@ async fn test_streamed_tool_call_split_across_three_frames_mid_json() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("run ls")],
+        messages: shared(vec![Message::user("run ls")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -772,7 +777,7 @@ async fn test_text_containing_word_functions_not_mistaken_for_tool_call() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("tell me about functions")],
+        messages: shared(vec![Message::user("tell me about functions")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -869,6 +874,8 @@ async fn test_list_models_mapping_and_merge() {
             display_name: Some("Devin Custom Name".to_string()),
             context_window: Some(64_000),
             reasoning: Some(true),
+            efforts: None,
+            ..Default::default()
         }],
         catalog: true,
         context_window: Some(128_000),
@@ -877,6 +884,7 @@ async fn test_list_models_mapping_and_merge() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let provider = Devin::new(
@@ -992,12 +1000,21 @@ async fn test_catalog_efforts_fold_into_one_family_and_effort_picks_the_id() {
         models[0].display_name, "SWE-2",
         "effort dropped from the name"
     );
+    assert_eq!(
+        models[0].supported_efforts,
+        Some(vec![Effort::Medium, Effort::High, Effort::Max]),
+        "member ranks fold into supported_efforts"
+    );
+    assert!(
+        models[0].supports_vision,
+        "all devin catalog models are multimodal"
+    );
 
     let req = CompletionRequest {
         model: "swe-2".to_string(),
         system_static: "system".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("hi")],
+        messages: shared(vec![Message::user("hi")]),
         tools: vec![],
         effort: Some(Effort::High),
         max_output_tokens: Some(1024),
@@ -1093,7 +1110,7 @@ async fn test_error_mapping_streaming_trailer_error() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Hello")],
+        messages: shared(vec![Message::user("Hello")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1159,6 +1176,7 @@ async fn test_idle_timeout_surfaces_error() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let defaults = ProviderDefaults {
@@ -1182,7 +1200,7 @@ async fn test_idle_timeout_surfaces_error() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Hello")],
+        messages: shared(vec![Message::user("Hello")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1254,7 +1272,7 @@ async fn test_structured_tool_call_field_and_stop_reason_ten() {
         model: "swe-1-6-fast".to_string(),
         system_static: "system".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("find beta")],
+        messages: shared(vec![Message::user("find beta")]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),
@@ -1366,7 +1384,7 @@ async fn test_structured_tool_call_arguments_streamed_across_frames() {
         model: "swe-2-max".to_string(),
         system_static: "system".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("list files")],
+        messages: shared(vec![Message::user("list files")]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),
@@ -1578,7 +1596,7 @@ async fn test_adaptive_route_issues_exactly_one_assign_model_and_carries_jwt_and
         model: "adaptive".to_string(),
         system_static: "system".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("solve problem")],
+        messages: shared(vec![Message::user("solve problem")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1697,7 +1715,7 @@ async fn test_non_adaptive_route_issues_no_assign_model() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("hi")],
+        messages: shared(vec![Message::user("hi")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1779,7 +1797,7 @@ async fn test_response_carrying_fields_10_and_21_produces_reasoning_signature_ev
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("do something")],
+        messages: shared(vec![Message::user("do something")]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1829,7 +1847,7 @@ fn test_assistant_message_with_signature_re_encoded_as_11_12_18() {
         model: "swe-1-6-fast".to_string(),
         system_static: "".to_string(),
         system_dynamic: "".to_string(),
-        messages: vec![Message::user("Question"), assistant_msg],
+        messages: shared(vec![Message::user("Question"), assistant_msg]),
         tools: vec![],
         effort: None,
         max_output_tokens: None,
@@ -1848,6 +1866,7 @@ fn test_assistant_message_with_signature_re_encoded_as_11_12_18() {
         extra_body: None,
         headers: BTreeMap::new(),
         proxy: None,
+        ..Default::default()
     };
 
     let encoded = encode_get_chat_message_request("session-token", &req, &cfg, None);
@@ -1918,14 +1937,18 @@ fn test_conversation_id_is_stable_across_turns_of_one_conversation() {
         model: "adaptive".to_string(),
         system_static: "system".to_string(),
         system_dynamic: String::new(),
-        messages: vec![Message::user("find gamma")],
+        messages: shared(vec![Message::user("find gamma")]),
         tools: vec![],
         effort: None,
         max_output_tokens: Some(1024),
     };
     let mut later = first.clone();
-    later.messages.push(Message::assistant_text("looking"));
-    later.messages.push(Message::user("and now delta"));
+    later
+        .messages
+        .push(Arc::new(Message::assistant_text("looking")));
+    later
+        .messages
+        .push(Arc::new(Message::user("and now delta")));
     later.system_dynamic = "changed between turns".to_string();
 
     assert_eq!(
@@ -1935,7 +1958,7 @@ fn test_conversation_id_is_stable_across_turns_of_one_conversation() {
     );
 
     let other = CompletionRequest {
-        messages: vec![Message::user("a different conversation")],
+        messages: shared(vec![Message::user("a different conversation")]),
         ..first.clone()
     };
     assert_ne!(
@@ -1976,4 +1999,179 @@ fn test_devin_malformed_proxy_names_provider_and_offending_value() {
         msg.contains("bad-proxy-url"),
         "error must name offending value: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// N. Image wire payloads (field 10) + effort metadata
+// ---------------------------------------------------------------------------
+
+/// Decode the message proto produced by `encode_messages` into
+/// `(field_no, WireValue)` pairs for assertion.
+fn decode_fields(bytes: &[u8]) -> Vec<(u32, proto::WireValue<'_>)> {
+    let reader = proto::Reader::new(bytes);
+    let mut out = Vec::new();
+    for res in reader {
+        let (field_no, _wt, val) = res.expect("valid field");
+        out.push((field_no, val));
+    }
+    out
+}
+
+fn ld_string(val: &proto::WireValue<'_>) -> String {
+    match val {
+        proto::WireValue::LengthDelimited(b) => String::from_utf8_lossy(b).to_string(),
+        other => panic!("expected length-delimited, got {other:?}"),
+    }
+}
+
+fn devin_msg(role: Role, content: Vec<ContentBlock>) -> Arc<Message> {
+    Arc::new(Message {
+        role,
+        content,
+        meta: pacode_types::MessageMeta::default(),
+    })
+}
+
+#[test]
+fn test_encode_messages_image_field10_vision() {
+    let msgs = vec![devin_msg(
+        Role::User,
+        vec![
+            ContentBlock::Text {
+                text: "look".to_string(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    mime: "image/png".to_string(),
+                    data: vec![0xAB, 0xCD],
+                },
+            },
+        ],
+    )];
+    let writers = encode_messages(&msgs, true);
+    assert_eq!(writers.len(), 1);
+    let fields = decode_fields(writers[0].as_bytes());
+
+    let text = fields
+        .iter()
+        .find(|(n, _)| *n == 3)
+        .map(|(_, v)| ld_string(v))
+        .expect("field 3 text");
+    assert_eq!(text, "look");
+
+    let img = fields
+        .iter()
+        .find(|(n, _)| *n == 10)
+        .map(|(_, v)| v)
+        .expect("field 10 image attachment");
+    let img_bytes = match img {
+        proto::WireValue::LengthDelimited(b) => *b,
+        other => panic!("field 10 must be a message: {other:?}"),
+    };
+    let sub = decode_fields(img_bytes);
+    let expect_b64 = base64::engine::general_purpose::STANDARD.encode([0xABu8, 0xCD]);
+    assert_eq!(
+        ld_string(&sub.iter().find(|(n, _)| *n == 1).expect("f1").1),
+        expect_b64,
+        "field 10.1 = base64 payload"
+    );
+    assert_eq!(
+        ld_string(&sub.iter().find(|(n, _)| *n == 2).expect("f2").1),
+        "image/png",
+        "field 10.2 = mime"
+    );
+}
+
+#[test]
+fn test_encode_messages_image_degrades() {
+    let img = ContentBlock::Image {
+        source: ImageSource::Bytes {
+            mime: "image/png".to_string(),
+            data: vec![1, 2],
+        },
+    };
+
+    // supports_vision=false -> placeholder text, no field 10.
+    let msgs = vec![devin_msg(
+        Role::User,
+        vec![
+            ContentBlock::Text {
+                text: "t".to_string(),
+            },
+            img.clone(),
+        ],
+    )];
+    let writers = encode_messages(&msgs, false);
+    let fields = decode_fields(writers[0].as_bytes());
+    assert!(
+        fields.iter().all(|(n, _)| *n != 10),
+        "no image attachment without vision"
+    );
+    let text = ld_string(&fields.iter().find(|(n, _)| *n == 3).expect("f3").1);
+    assert_eq!(text, "t\n[image: image/png, 2 bytes]");
+
+    // Assistant image degrades even with vision (field 10 is user-side).
+    let msgs2 = vec![devin_msg(Role::Assistant, vec![img])];
+    let writers2 = encode_messages(&msgs2, true);
+    let fields2 = decode_fields(writers2[0].as_bytes());
+    assert!(fields2.iter().all(|(n, _)| *n != 10));
+    let text2 = ld_string(&fields2.iter().find(|(n, _)| *n == 3).expect("f3").1);
+    assert_eq!(text2, "[image: image/png, 2 bytes]");
+}
+
+#[test]
+fn test_rank_to_effort_mapping() {
+    assert_eq!(super::rank_to_effort(2), Some(Effort::Low));
+    assert_eq!(super::rank_to_effort(3), Some(Effort::Medium));
+    assert_eq!(super::rank_to_effort(4), Some(Effort::High));
+    assert_eq!(super::rank_to_effort(5), Some(Effort::XHigh));
+    assert_eq!(super::rank_to_effort(6), Some(Effort::Max));
+    // `none`/`minimal` ranks and unknown values map to no effort tier.
+    assert_eq!(super::rank_to_effort(0), None);
+    assert_eq!(super::rank_to_effort(1), None);
+    assert_eq!(super::rank_to_effort(7), None);
+}
+
+#[test]
+fn test_devin_model_info_vision_and_config_efforts() {
+    let cfg = ProviderConfig {
+        kind: Default::default(),
+        base_url: "https://example.invalid".to_string(),
+        api_key: None,
+        api_key_env: None,
+        models: vec![ModelConfig {
+            id: "swe-cfg".to_string(),
+            display_name: None,
+            context_window: None,
+            reasoning: None,
+            efforts: Some(vec![Effort::Medium, Effort::High]),
+            ..Default::default()
+        }],
+        catalog: false,
+        context_window: Some(128_000),
+        reasoning: None,
+        effort_map: BTreeMap::new(),
+        extra_body: None,
+        headers: BTreeMap::new(),
+        proxy: None,
+        ..Default::default()
+    };
+    let provider = Devin::new(
+        "devin-test",
+        cfg,
+        ProviderDefaults::default(),
+        "k",
+        "s",
+        Option::<String>::None,
+        BTreeMap::new(),
+    )
+    .expect("valid");
+
+    assert!(provider.model_info("swe-1-5").supports_vision);
+    assert_eq!(
+        provider.model_info("swe-cfg").supported_efforts,
+        Some(vec![Effort::Medium, Effort::High]),
+        "config efforts win over family metadata"
+    );
+    assert_eq!(provider.model_info("swe-1-5").supported_efforts, None);
 }

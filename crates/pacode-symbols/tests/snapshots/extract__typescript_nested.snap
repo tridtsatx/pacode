@@ -1,0 +1,20 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::TypeScript, src)"
+---
+interface Shape 1-4
+  method area 2-2
+class Base 6-11
+  method constructor 8-8
+  method draw 9-9
+  method helper 10-10
+const top 13-13
+export ratio 14-14
+fn calc 15-15
+enum Color 17-17
+type Alias 19-19
+module NS 21-23
+  fn inner 22-22
+fn free 25-25
+module 'fs' 27-29
+  fn read 28-28

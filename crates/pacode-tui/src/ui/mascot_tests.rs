@@ -92,3 +92,20 @@ fn the_ascii_fallback_animates_at_a_fixed_size() {
         .collect();
     assert_ne!(f0, f1);
 }
+
+/// Under ANSI-16 every sprite keeps its colour by hue — Pinky is pink, not
+/// the white it collapses to by saturation — and the eyes stay white on a
+/// blue pupil.
+#[test]
+fn ansi_sprite_colours_keep_their_hue() {
+    use ratatui::style::Color;
+    let body = |rgb: (u8, u8, u8)| color(rgb, false);
+    assert_eq!(body(PACMAN_YELLOW), Color::LightYellow);
+    assert_eq!(body(BLINKY_RED), Color::LightRed);
+    assert_eq!(body(INKY_CYAN), Color::LightCyan);
+    assert_eq!(body(CLYDE_ORANGE), Color::LightYellow);
+    assert_eq!(body(PINKY_PINK), Color::Magenta);
+    assert_eq!(body(EYE_WHITE), Color::White);
+    assert_eq!(body(PUPIL_BLUE), Color::LightBlue);
+    assert_eq!(body(PUPIL_BLACK), Color::Black);
+}

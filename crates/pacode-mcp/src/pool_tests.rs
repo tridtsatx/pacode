@@ -110,6 +110,96 @@ async fn test_call_in_flight_never_reaped() {
     assert!(!pool.is_running_async("test-srv").await);
 }
 
+/// The `*_cached` listers answer from the disk schema cache without ever
+/// spawning a server: every config names a command that cannot start, so any
+/// live call would fail loudly — the cached reads still succeed. A lazy
+/// server's cache hit also marks the status `Ready` (mirroring the lazy
+/// branch of `list_all_tools`); a non-lazy one does not.
+#[test]
+fn test_cached_listers_serve_disk_schema_without_spawning() {
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let cache_dir = temp_dir.path().to_path_buf();
+
+    let bogus = McpServerConfig {
+        command: "bogus_command_that_does_not_exist_xyz_12345".to_string(),
+        args: vec![],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+        enabled: true,
+        lazy: false,
+        timeout_secs: 5,
+    };
+
+    let tools = vec![McpToolInfo {
+        name: "echo".to_string(),
+        description: "echoes".to_string(),
+        input_schema: serde_json::json!({"type": "object"}),
+    }];
+    let resources = vec![McpResource {
+        uri: "fake://r1".to_string(),
+        name: "r1".to_string(),
+        description: None,
+        mime_type: None,
+    }];
+    let prompts = vec![McpPrompt {
+        name: "p1".to_string(),
+        description: None,
+        arguments: vec![],
+    }];
+
+    let mut servers = BTreeMap::new();
+    // Non-lazy, cached: serves the schema, does not mark Ready.
+    crate::cache::save_disk_cache(&cache_dir, "eager", &bogus, &tools, &resources, &prompts);
+    servers.insert("eager".to_string(), bogus.clone());
+    // Lazy, cached: serves the schema and marks Ready with the counts.
+    let lazy_cfg = McpServerConfig {
+        lazy: true,
+        ..bogus.clone()
+    };
+    crate::cache::save_disk_cache(&cache_dir, "lazy", &lazy_cfg, &tools, &resources, &prompts);
+    servers.insert("lazy".to_string(), lazy_cfg);
+    // Disabled, cached: skipped entirely — the fingerprint covers `enabled`.
+    let off_cfg = McpServerConfig {
+        enabled: false,
+        ..bogus.clone()
+    };
+    crate::cache::save_disk_cache(&cache_dir, "off", &off_cfg, &tools, &resources, &prompts);
+    servers.insert("off".to_string(), off_cfg);
+    // Enabled, uncached: contributes nothing.
+    servers.insert("uncached".to_string(), bogus.clone());
+
+    let pool = McpPool::new(servers, Some(cache_dir), None);
+
+    let all_tools = pool.list_all_tools_cached();
+    assert_eq!(all_tools.len(), 2);
+    assert_eq!(all_tools[0].0, "eager");
+    assert_eq!(all_tools[1].0, "lazy");
+    assert_eq!(pool.list_all_resources_cached().len(), 2);
+    assert_eq!(pool.list_all_prompts_cached().len(), 2);
+
+    // Nothing spawned: the bogus command would have failed any live call.
+    for name in ["eager", "lazy", "off", "uncached"] {
+        assert!(!pool.is_running(name), "{name} must not be running");
+    }
+
+    let statuses = pool.statuses();
+    let ready: Vec<_> = statuses
+        .iter()
+        .filter(|(_, s)| matches!(s, ServerStatus::Ready { .. }))
+        .collect();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].0, "lazy");
+    assert_eq!(
+        ready[0].1,
+        ServerStatus::Ready {
+            tools: 1,
+            resources: 1,
+            prompts: 1,
+        }
+    );
+}
+
 #[tokio::test]
 async fn test_zero_threshold_disables_reaping() {
     let mut servers = BTreeMap::new();

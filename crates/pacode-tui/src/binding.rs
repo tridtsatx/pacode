@@ -58,6 +58,102 @@ pub enum Action {
     PasteClipboard,
     /// Open the plan/agents overlay, which is where the rail lives below 80 columns.
     RailOverlay,
+    /// Toggle zero-data-retention for the session (only `zdr = "session"`).
+    ToggleZdr,
+    /// Hold the notifications bound for the orchestrator, then release them
+    /// paced instead of in one burst.
+    ToggleLock,
+    /// Open the menu hub — the `ctrl+,` half of the entry (§4.2); double-Shift
+    /// is the other.
+    Menu,
+    /// Open the help menu — the `?` key on an empty prompt.
+    Help,
+    /// Toggle `favorite` on the model picker's selected row (§9.1).
+    ModelPickerFavorite,
+    /// Toggle `zdr_capable` on the model picker's selected row (§9.1).
+    ModelPickerZdr,
+    /// Force-refresh the model catalog, bypassing the stale cache (§9.1).
+    ModelPickerRefresh,
+    /// Step the model palette's capability filter (all / reasoning / vision).
+    ModelPickerKind,
+    /// Switch the highlighted provider to its next stored account.
+    ModelPickerAccount,
+    /// Sign the highlighted provider's active account out.
+    ModelPickerLogout,
+    /// Expand or collapse the newest tool-call cell with hidden output (§6);
+    /// a click on a cell does the same for that specific cell.
+    ExpandOutput,
+    /// Move the prompt cursor one word left (readline `backward-word`).
+    MoveWordLeft,
+    /// Move the prompt cursor one word right (readline `forward-word`).
+    MoveWordRight,
+    /// Move the prompt cursor to the very start of the input.
+    MoveStart,
+    /// Move the prompt cursor to the very end of the input.
+    MoveEnd,
+    /// Delete the current logical (`\n`-delimited) line of the prompt.
+    DeleteLine,
+}
+
+/// The part of the UI a rebindable action applies to — the Keys menu groups
+/// its rows by it (§5.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Works anywhere in the app.
+    Global,
+    /// The prompt input — including the keys gated on an empty prompt.
+    Prompt,
+    /// Inside the centred menus. The base's own keys (§3.4) are not
+    /// rebindable, so no `Action` carries this scope yet.
+    Menu,
+    /// The agents/sessions rail.
+    Rail,
+    /// The bottom panel — agent transcript and task output.
+    Panel,
+    /// The pickers (the model palette, theme…): their keys resolve only
+    /// while the picker overlay owns the keyboard, so a chord spelled like
+    /// a global one (`alt+f`) is not a conflict (§9.1).
+    Picker,
+}
+
+impl Scope {
+    /// Display order for the Keys menu's section headers.
+    pub const ALL: [Scope; 6] = [
+        Self::Global,
+        Self::Prompt,
+        Self::Menu,
+        Self::Rail,
+        Self::Panel,
+        Self::Picker,
+    ];
+
+    /// The section label — rendered `[global]`-style by the menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Prompt => "prompt",
+            Self::Menu => "menu",
+            Self::Rail => "rail",
+            Self::Panel => "panel",
+            Self::Picker => "picker",
+        }
+    }
+
+    /// Keys for this scope resolve through the shared `action_for` ladder in
+    /// `handle_key` (Normal/Panel focus) — everything but the overlay-local
+    /// scopes, whose keys live behind the overlay routing and never reach it.
+    fn on_global_ladder(self) -> bool {
+        matches!(self, Self::Global | Self::Prompt | Self::Rail | Self::Panel)
+    }
+
+    /// Whether two actions can compete for the same chord: identical scopes
+    /// always race, and any two scopes on the shared ladder shadow each
+    /// other regardless of their post-resolution gating. A picker chord and
+    /// a global chord spelled alike never meet — exactly one context is
+    /// live at a time.
+    pub fn overlaps(self, other: Scope) -> bool {
+        self == other || (self.on_global_ladder() && other.on_global_ladder())
+    }
 }
 
 impl Action {
@@ -108,6 +204,22 @@ impl Action {
             Self::PasteImage => "paste_image",
             Self::PasteClipboard => "paste_clipboard",
             Self::RailOverlay => "rail_overlay",
+            Self::ToggleZdr => "toggle_zdr",
+            Self::ToggleLock => "toggle_lock",
+            Self::Menu => "menu",
+            Self::Help => "help",
+            Self::ModelPickerFavorite => "model_picker_favorite",
+            Self::ModelPickerZdr => "model_picker_zdr",
+            Self::ModelPickerRefresh => "model_picker_refresh",
+            Self::ModelPickerKind => "model_picker_kind",
+            Self::ModelPickerAccount => "model_picker_account",
+            Self::ModelPickerLogout => "model_picker_logout",
+            Self::ExpandOutput => "expand_output",
+            Self::MoveWordLeft => "move_word_left",
+            Self::MoveWordRight => "move_word_right",
+            Self::MoveStart => "move_start",
+            Self::MoveEnd => "move_end",
+            Self::DeleteLine => "delete_line",
         }
     }
 
@@ -158,7 +270,98 @@ impl Action {
             Self::PasteImage => "Paste image from clipboard",
             Self::PasteClipboard => "Paste from clipboard (image or text)",
             Self::RailOverlay => "Show plan and agents",
+            Self::ToggleZdr => "Toggle ZDR mode",
+            Self::ToggleLock => "Toggle the notice lock (hold notifications)",
+            Self::Menu => "Open the menu hub",
+            Self::Help => "Open help menu",
+            Self::ModelPickerFavorite => "Model picker: mark model as favorite",
+            Self::ModelPickerZdr => "Model picker: mark model ZDR-capable",
+            Self::ModelPickerRefresh => "Model picker: force-refresh the catalog",
+            Self::ModelPickerKind => "Model picker: cycle the capability filter",
+            Self::ModelPickerAccount => "Model picker: switch the provider's account",
+            Self::ModelPickerLogout => "Model picker: sign the provider out",
+            Self::ExpandOutput => "Expand/collapse the latest tool output",
+            Self::MoveWordLeft => "Move cursor one word left",
+            Self::MoveWordRight => "Move cursor one word right",
+            Self::MoveStart => "Move cursor to input start",
+            Self::MoveEnd => "Move cursor to input end",
+            Self::DeleteLine => "Delete current input line",
         }
+    }
+
+    /// Where the action applies — the section the Keys menu files it under
+    /// (§5.4). Keys gated on an empty prompt (`?`, `.`) count as `Prompt`;
+    /// `s`/`k` act only on an open panel, so they are `Panel`.
+    pub fn scope(self) -> Scope {
+        match self {
+            Self::Menu
+            | Self::Cancel
+            | Self::SessionPicker
+            | Self::FilesOverlay
+            | Self::RailOverlay
+            | Self::ToggleZdr
+            | Self::CycleMode
+            | Self::ToggleLock
+            | Self::ScrollUp
+            | Self::ScrollDown
+            | Self::ScrollTop
+            | Self::ScrollBottom
+            | Self::CopySelection
+            | Self::ExpandOutput => Scope::Global,
+            Self::Submit
+            | Self::Newline
+            | Self::SubmitNow
+            | Self::ClearInput
+            | Self::DeleteWordForward
+            | Self::DeleteWordBack
+            | Self::MoveWordLeft
+            | Self::MoveWordRight
+            | Self::MoveStart
+            | Self::MoveEnd
+            | Self::DeleteLine
+            | Self::RemoveQueued
+            | Self::ClearQueue
+            | Self::PasteImage
+            | Self::PasteClipboard
+            | Self::Help
+            | Self::BgList => Scope::Prompt,
+            Self::FollowAgent
+            | Self::NextAgent
+            | Self::PrevAgent
+            | Self::SelectAgent1
+            | Self::SelectAgent2
+            | Self::SelectAgent3
+            | Self::SelectAgent4
+            | Self::SelectAgent5
+            | Self::SelectAgent6
+            | Self::SelectAgent7
+            | Self::SelectAgent8
+            | Self::SelectAgent9
+            | Self::SelectSession1
+            | Self::SelectSession2
+            | Self::SelectSession3
+            | Self::SelectSession4
+            | Self::SelectSession5
+            | Self::SelectSession6
+            | Self::SelectSession7
+            | Self::SelectSession8
+            | Self::SelectSession9 => Scope::Rail,
+            Self::StopAgent | Self::KillTask => Scope::Panel,
+            Self::ModelPickerFavorite
+            | Self::ModelPickerZdr
+            | Self::ModelPickerRefresh
+            | Self::ModelPickerKind
+            | Self::ModelPickerAccount
+            | Self::ModelPickerLogout => Scope::Picker,
+        }
+    }
+
+    /// The factory bindings — what [`Keymap::defaults`] installs, what
+    /// `ctrl+r` restores and what the Keys menu's `default` line shows. The
+    /// default keymap is built once; this borrows from it.
+    pub fn default(self) -> &'static [Binding] {
+        static DEFAULTS: std::sync::OnceLock<Keymap> = std::sync::OnceLock::new();
+        DEFAULTS.get_or_init(Keymap::defaults).bindings_for(self)
     }
 }
 
@@ -391,6 +594,25 @@ pub const ACTION_NAMES: &[(&str, Action)] = &[
     ("paste_image", Action::PasteImage),
     ("paste_clipboard", Action::PasteClipboard),
     ("rail_overlay", Action::RailOverlay),
+    ("toggle_zdr", Action::ToggleZdr),
+    ("toggle_lock", Action::ToggleLock),
+    ("menu", Action::Menu),
+    ("help", Action::Help),
+    ("expand_output", Action::ExpandOutput),
+    ("move_word_left", Action::MoveWordLeft),
+    ("move_word_right", Action::MoveWordRight),
+    ("move_start", Action::MoveStart),
+    ("move_end", Action::MoveEnd),
+    ("delete_line", Action::DeleteLine),
+    // Overlay-scoped actions sit last: `action_for` returns the first match,
+    // and a chord spelled like a global one (`alt+f`, `alt+z`) must keep
+    // resolving to its global owner in Normal focus (§9.1).
+    ("model_picker_favorite", Action::ModelPickerFavorite),
+    ("model_picker_zdr", Action::ModelPickerZdr),
+    ("model_picker_refresh", Action::ModelPickerRefresh),
+    ("model_picker_kind", Action::ModelPickerKind),
+    ("model_picker_account", Action::ModelPickerAccount),
+    ("model_picker_logout", Action::ModelPickerLogout),
 ];
 
 /// The active keymap mapping `Action` to a list of `Binding`s.
@@ -526,14 +748,62 @@ impl Keymap {
             Action::DeleteWordForward,
             vec![Binding {
                 code: KeyCode::Delete,
-                mods: KeyModifiers::ALT,
+                mods: KeyModifiers::CONTROL,
             }],
         );
         bindings.insert(
             Action::DeleteWordBack,
+            vec![
+                Binding {
+                    code: KeyCode::Char('w'),
+                    mods: KeyModifiers::CONTROL,
+                },
+                Binding {
+                    code: KeyCode::Backspace,
+                    mods: KeyModifiers::CONTROL,
+                },
+                Binding {
+                    code: KeyCode::Backspace,
+                    mods: KeyModifiers::ALT,
+                },
+            ],
+        );
+        // Readline-style prompt editing (§6): word jumps on ctrl+left/right,
+        // whole-input boundaries on ctrl+up/down, logical-line delete on
+        // alt+delete (its previous owner moved to ctrl+delete).
+        bindings.insert(
+            Action::MoveWordLeft,
             vec![Binding {
-                code: KeyCode::Char('w'),
+                code: KeyCode::Left,
                 mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::MoveWordRight,
+            vec![Binding {
+                code: KeyCode::Right,
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::MoveStart,
+            vec![Binding {
+                code: KeyCode::Up,
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::MoveEnd,
+            vec![Binding {
+                code: KeyCode::Down,
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        bindings.insert(
+            Action::DeleteLine,
+            vec![Binding {
+                code: KeyCode::Delete,
+                mods: KeyModifiers::ALT,
             }],
         );
         bindings.insert(
@@ -574,6 +844,14 @@ impl Keymap {
             vec![Binding {
                 code: KeyCode::Char('c'),
                 mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            }],
+        );
+        // §6: the fold marker advertises this chord.
+        bindings.insert(
+            Action::ExpandOutput,
+            vec![Binding {
+                code: KeyCode::Char('o'),
+                mods: KeyModifiers::CONTROL,
             }],
         );
         let digits = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
@@ -653,6 +931,46 @@ impl Keymap {
                 mods: KeyModifiers::ALT,
             }],
         );
+        bindings.insert(
+            Action::ToggleZdr,
+            vec![Binding {
+                code: KeyCode::Char('z'),
+                mods: KeyModifiers::ALT,
+            }],
+        );
+        // alt+l — the notice lock. Global scope: the lock is worth flipping
+        // from anywhere, and no other `alt+<letter>` chord claims the `l`.
+        bindings.insert(
+            Action::ToggleLock,
+            vec![Binding {
+                code: KeyCode::Char('l'),
+                mods: KeyModifiers::ALT,
+            }],
+        );
+        // ctrl+, — the keymap half of the menu-hub entry (§4.2); the other
+        // half is the double-Shift detector, which is not a binding.
+        bindings.insert(
+            Action::Menu,
+            vec![Binding {
+                code: KeyCode::Char(','),
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        // `?` on an empty prompt — Help. Both spellings: terminals disagree on
+        // whether SHIFT rides along.
+        bindings.insert(
+            Action::Help,
+            vec![
+                Binding {
+                    code: KeyCode::Char('?'),
+                    mods: KeyModifiers::NONE,
+                },
+                Binding {
+                    code: KeyCode::Char('?'),
+                    mods: KeyModifiers::SHIFT,
+                },
+            ],
+        );
         // ctrl+v and, where the terminal forwards it, ctrl+shift+v: image first, text otherwise.
         bindings.insert(
             Action::PasteClipboard,
@@ -668,6 +986,85 @@ impl Keymap {
                 Binding {
                     code: KeyCode::Char('V'),
                     mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                },
+            ],
+        );
+        // §9.1: the model picker's per-model marks live on modifier chords so
+        // letters always reach the query. alt is the primary spelling; the
+        // ctrl chords are the fallback for terminals that eat alt.
+        bindings.insert(
+            Action::ModelPickerFavorite,
+            vec![
+                Binding {
+                    code: KeyCode::Char('f'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('g'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        bindings.insert(
+            Action::ModelPickerZdr,
+            vec![
+                Binding {
+                    code: KeyCode::Char('z'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('y'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        bindings.insert(
+            Action::ModelPickerRefresh,
+            vec![Binding {
+                code: KeyCode::Char('r'),
+                mods: KeyModifiers::CONTROL,
+            }],
+        );
+        // Letters in the palette are search text, so its account and filter
+        // keys are chords too (alt first, ctrl for terminals that eat alt).
+        // Logout is never `ctrl+d` — that chord quits everywhere else — and
+        // the palette asks for a second press before it signs anyone out.
+        bindings.insert(
+            Action::ModelPickerKind,
+            vec![
+                Binding {
+                    code: KeyCode::Char('k'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('k'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        bindings.insert(
+            Action::ModelPickerAccount,
+            vec![
+                Binding {
+                    code: KeyCode::Char('a'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('a'),
+                    mods: KeyModifiers::CONTROL,
+                },
+            ],
+        );
+        bindings.insert(
+            Action::ModelPickerLogout,
+            vec![
+                Binding {
+                    code: KeyCode::Char('x'),
+                    mods: KeyModifiers::ALT,
+                },
+                Binding {
+                    code: KeyCode::Char('x'),
+                    mods: KeyModifiers::CONTROL,
                 },
             ],
         );
@@ -690,19 +1087,36 @@ impl Keymap {
                 .map(|(_, action)| *action);
 
             match matched_action {
-                Some(action) => match parse_binding(spec) {
-                    Ok(binding) => {
-                        keymap.set_binding(action, binding);
+                Some(action) => {
+                    // `keys.<action> = ""` is an explicit unbind — the only
+                    // spelling that keeps an action keyless across restarts
+                    // (the capture takeover writes it, §5.4).
+                    if spec.trim().is_empty() {
+                        keymap.set_bindings(action, Vec::new());
+                        continue;
                     }
-                    Err(err) => {
-                        log::warn!(
-                            "rejected invalid key binding from config for '{action_name}': '{spec}' ({err})"
-                        );
-                        warnings.push(format!(
-                            "invalid binding for '{action_name}': '{spec}' ({err})"
-                        ));
+                    // A spec may carry several chords: "alt+up,ctrl+k".
+                    let mut parsed = Vec::new();
+                    let mut rejected = Vec::new();
+                    for part in spec.split(',') {
+                        match parse_binding(part) {
+                            Ok(binding) => parsed.push(binding),
+                            Err(err) => {
+                                let msg = format!(
+                                    "invalid binding for '{action_name}': '{part}' ({err})"
+                                );
+                                log::warn!("rejected {msg}");
+                                rejected.push(msg);
+                            }
+                        }
                     }
-                },
+                    warnings.extend(rejected);
+                    if parsed.is_empty() {
+                        // Nothing usable — keep the factory binding.
+                        continue;
+                    }
+                    keymap.set_bindings(action, parsed);
+                }
                 None => {
                     log::warn!("rejected unknown key action from config: '{action_name}'");
                     warnings.push(format!("unknown key action: '{action_name}'"));
@@ -732,6 +1146,13 @@ impl Keymap {
         self.bindings.get(&action).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// The key a hint should name for `action` — its first binding, spelled
+    /// the way `/keys` spells it. `None` when the action is unbound, so a hint
+    /// drops the item instead of naming a key that does nothing.
+    pub fn hint(&self, action: Action) -> Option<String> {
+        self.bindings_for(action).first().map(format_binding)
+    }
+
     /// Stable list of action names and action variants.
     pub fn action_names() -> &'static [(&'static str, Action)] {
         ACTION_NAMES
@@ -739,8 +1160,31 @@ impl Keymap {
 
     /// Override the binding for an action.
     pub fn set_binding(&mut self, action: Action, binding: Binding) {
-        self.bindings.insert(action, vec![binding]);
+        self.set_bindings(action, vec![binding]);
+    }
+
+    /// Replace the action's whole binding list — the multi-chord form of
+    /// [`set_binding`]; an empty list unbinds the action.
+    pub fn set_bindings(&mut self, action: Action, bindings: Vec<Binding>) {
+        self.bindings.insert(action, bindings);
         self.overrides.insert(action);
+    }
+
+    /// Drop `binding` from the action's list — the in-memory half of a
+    /// capture takeover (§5.4). `true` when a binding was actually removed.
+    /// What remains differs from the factory set, so the action is marked
+    /// overridden — the caller persists exactly this remainder.
+    pub fn remove_binding(&mut self, action: Action, binding: &Binding) -> bool {
+        let Some(list) = self.bindings.get_mut(&action) else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|b| b != binding);
+        if list.len() == before {
+            return false;
+        }
+        self.overrides.insert(action);
+        true
     }
 
     /// Reset an action to its default bindings.
@@ -757,13 +1201,16 @@ impl Keymap {
     }
 
     /// Check if a proposed binding conflicts with another action's binding.
+    /// Only scopes that can resolve the same key event compete (§5.4): a
+    /// picker-local chord never races a global one, so `alt+f` on
+    /// `model_picker_favorite` does not collide with `files_overlay`.
     pub fn find_conflict(
         &self,
         candidate: &Binding,
         for_action: Action,
     ) -> Option<(&'static str, Action)> {
         for &(name, act) in Self::action_names() {
-            if act == for_action {
+            if act == for_action || !act.scope().overlaps(for_action.scope()) {
                 continue;
             }
             if let Some(bindings) = self.bindings.get(&act) {

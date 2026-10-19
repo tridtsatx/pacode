@@ -14,8 +14,10 @@ mod monitor;
 #[path = "schedule_tests.rs"]
 mod schedule_tests;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use pacode_types::time::now_ms;
 use pacode_types::{
     CronJob, CronJobId, CronSchedule, Event, MonitorCondition, MonitorId, MonitorInfo,
@@ -23,6 +25,7 @@ use pacode_types::{
 };
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::session::Session;
 
@@ -36,6 +39,8 @@ pub const MAX_MONITORS: usize = 32;
 pub const MIN_POLL_SECS: u64 = 1;
 /// A condition check that has not answered by then counts as "not yet".
 pub const CHECK_TIMEOUT_SECS: u64 = 20;
+
+const TERMINAL_MONITOR_RETENTION: usize = MAX_MONITORS;
 
 /// Why a scheduling request was refused.
 #[derive(Debug, thiserror::Error)]
@@ -58,9 +63,14 @@ pub enum ScheduleError {
 pub struct Scheduler {
     jobs: Mutex<Vec<CronJob>>,
     monitors: Mutex<Vec<MonitorInfo>>,
-    /// Woken whenever the set of deadlines changes.
-    changed: Notify,
+    monitor_cancels: Mutex<HashMap<MonitorId, CancellationToken>>,
+    changed: Arc<Notify>,
     task: Mutex<Option<JoinHandle<()>>>,
+}
+
+enum DueWork {
+    Job(CronJob),
+    Monitor(monitor::MonitorCheck),
 }
 
 impl Drop for Scheduler {
@@ -79,7 +89,8 @@ impl Scheduler {
         Arc::new(Self {
             jobs: Mutex::new(Vec::new()),
             monitors: Mutex::new(Vec::new()),
-            changed: Notify::new(),
+            monitor_cancels: Mutex::new(HashMap::new()),
+            changed: Arc::new(Notify::new()),
             task: Mutex::new(None),
         })
     }
@@ -224,7 +235,12 @@ impl Scheduler {
             last_check_ms: None,
             fired_at_ms: None,
         };
+        self.monitor_cancels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(info.id.clone(), CancellationToken::new());
         monitors.push(info.clone());
+        monitor::retain_terminal(&mut monitors, None);
         drop(monitors);
         self.changed.notify_one();
         Ok(info)
@@ -238,7 +254,9 @@ impl Scheduler {
             .ok_or_else(|| ScheduleError::UnknownMonitor(id.clone()))?;
         monitor.status = MonitorStatus::Stopped;
         let updated = monitor.clone();
+        monitor::retain_terminal(&mut monitors, Some(id));
         drop(monitors);
+        monitor::cancel(self, id);
         self.changed.notify_one();
         Ok(updated)
     }
@@ -299,36 +317,20 @@ impl Scheduler {
     }
 
     /// Monitors due for a check.
-    fn due_monitors(&self, now: u64) -> Vec<MonitorInfo> {
-        self.monitors
-            .lock()
-            .map(|m| {
-                m.iter()
-                    .filter(|m| m.status.is_live())
-                    .filter(|m| m.next_check_at_ms().is_none_or(|next| next <= now))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn due_monitors(&self, now: u64) -> Vec<monitor::MonitorCheck> {
+        self.due_monitor_checks(now)
+    }
+
+    fn due_monitor_checks(&self, now: u64) -> Vec<monitor::MonitorCheck> {
+        monitor::due_checks(self, now)
     }
 
     fn record_check(&self, id: &MonitorId, now: u64, fired: bool) -> Option<MonitorInfo> {
-        let mut monitors = self.monitors.lock().unwrap_or_else(|p| p.into_inner());
-        let monitor = monitors.iter_mut().find(|m| &m.id == id)?;
-        monitor.last_check_ms = Some(now);
-        if fired {
-            monitor.status = MonitorStatus::Fired;
-            monitor.fired_at_ms = Some(now);
-        }
-        Some(monitor.clone())
+        monitor::record_check(self, id, now, fired)
     }
 
     fn record_failure(&self, id: &MonitorId, now: u64) -> Option<MonitorInfo> {
-        let mut monitors = self.monitors.lock().unwrap_or_else(|p| p.into_inner());
-        let monitor = monitors.iter_mut().find(|m| &m.id == id)?;
-        monitor.last_check_ms = Some(now);
-        monitor.status = MonitorStatus::Failed;
-        Some(monitor.clone())
+        monitor::record_failure(self, id, now)
     }
 }
 
@@ -340,26 +342,23 @@ async fn run(scheduler: Weak<Scheduler>, session: Weak<Session>) {
         };
         let now = now_ms();
         let deadline = sched.next_deadline_ms(now);
+        let changed = sched.changed.clone();
+        drop(sched);
 
         match deadline {
             None => {
-                // Nothing scheduled: park. No timer, no wakeups, no cost.
-                sched.changed.notified().await;
+                changed.notified().await;
             }
             Some(at) => {
                 let wait = at.saturating_sub(now);
                 if wait > 0 {
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
-                        _ = sched.changed.notified() => {
-                            drop(sched);
-                            continue;
-                        }
+                        _ = changed.notified() => continue,
                     }
                 }
             }
         }
-        drop(sched);
 
         let (Some(sched), Some(session)) = (scheduler.upgrade(), session.upgrade()) else {
             return;
@@ -368,41 +367,60 @@ async fn run(scheduler: Weak<Scheduler>, session: Weak<Session>) {
     }
 }
 
-async fn fire_due(scheduler: &Arc<Scheduler>, session: &Arc<Session>) {
+fn cron_fire_id(job: &CronJob, occurrence_ms: u64) -> String {
+    format!("cron-{}-{occurrence_ms}", job.id)
+}
+
+async fn fire_due(scheduler: &Scheduler, session: &Arc<Session>) {
     let now = now_ms();
+    let mut due = FuturesUnordered::new();
 
     for job in scheduler.take_due_jobs(now) {
-        let status = match session.submit_user_message(job.prompt.clone()).await {
-            Ok(()) => "sent".to_string(),
-            Err(e) => format!("failed: {e}"),
-        };
-        let updated = scheduler
-            .record_job_status(&job.id, status)
-            .unwrap_or(job.clone());
-        if let Err(e) = session.store.upsert_cron_job(&session.id, &updated).await {
-            log::warn!("failed to persist cron job {}: {e}", updated.id);
-        }
-        session.events.emit(Event::CronUpdated(updated));
+        due.push(fire_work(scheduler, session, DueWork::Job(job)));
+    }
+    for check in scheduler.due_monitors(now) {
+        due.push(fire_work(scheduler, session, DueWork::Monitor(check)));
     }
 
-    for monitor in scheduler.due_monitors(now) {
-        let outcome = monitor::check_condition(&monitor.condition, &session.meta().cwd).await;
-        let updated = match outcome {
-            Ok(true) => {
-                let info = scheduler.record_check(&monitor.id, now, true);
-                if let Some(info) = &info {
-                    session.inject_monitor_fired(info);
-                }
-                info
-            }
-            Ok(false) => scheduler.record_check(&monitor.id, now, false),
-            Err(e) => {
-                log::warn!("monitor {} check failed: {e}", monitor.id);
-                scheduler.record_failure(&monitor.id, now)
-            }
-        };
-        if let Some(info) = updated {
-            session.events.emit(Event::MonitorUpdated(info));
-        }
+    while let Some(()) = due.next().await {}
+}
+
+async fn fire_work(scheduler: &Scheduler, session: &Arc<Session>, work: DueWork) {
+    match work {
+        DueWork::Job(job) => fire_job(scheduler, session, job).await,
+        DueWork::Monitor(check) => monitor::fire(scheduler, session, check).await,
     }
+}
+
+async fn fire_job(scheduler: &Scheduler, session: &Arc<Session>, job: CronJob) {
+    let mut admitted = job.clone();
+    admitted.last_status = Some("queued".to_string());
+    if let Err(error) = session.store.upsert_cron_job(&session.id, &admitted).await {
+        let status = format!("failed to admit: {error}");
+        if let Some(updated) = scheduler.record_job_status(&job.id, status) {
+            session.events.emit(Event::CronUpdated(updated));
+        }
+        return;
+    }
+
+    let occurrence_ms = job.last_run_ms.unwrap_or_else(now_ms);
+    let message_id = cron_fire_id(&job, occurrence_ms);
+    let fingerprint = crate::core::user_message_fingerprint(&job.prompt, &[]);
+    let status = match session
+        .submit_user_message_with_images_idempotent(
+            job.prompt.clone(),
+            Vec::new(),
+            message_id,
+            fingerprint,
+        )
+        .await
+    {
+        Ok(()) => "sent".to_string(),
+        Err(error) => format!("failed: {error}"),
+    };
+    let updated = scheduler.record_job_status(&job.id, status).unwrap_or(job);
+    if let Err(error) = session.store.upsert_cron_job(&session.id, &updated).await {
+        log::warn!("failed to persist cron job {}: {error}", updated.id);
+    }
+    session.events.emit(Event::CronUpdated(updated));
 }

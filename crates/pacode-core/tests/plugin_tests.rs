@@ -142,6 +142,8 @@ async fn test_lua_plugin_full_flow() {
         Request::UserMessage {
             text: "call tool".into(),
             attachments: Vec::new(),
+            images: Vec::new(),
+            message_id: None,
         },
     )
     .await;

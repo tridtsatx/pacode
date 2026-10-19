@@ -25,7 +25,46 @@ fn is_overlay_down(key: &KeyEvent) -> bool {
     is_next(key) || key.code == KeyCode::Char('j')
 }
 
-pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
+/// The next rung the cursor may land on, skipping levels the current model does
+/// not accept.
+///
+/// `None` from [`AppState::supported_efforts`] means "nothing is known", and
+/// every level is then allowed — the cursor moves exactly as it did before.
+/// The walk is bounded by the length of the ladder, so a model that accepts
+/// nothing leaves the cursor where it is instead of spinning.
+pub(crate) fn next_allowed_index(
+    supported: Option<&[pacode_types::Effort]>,
+    from: usize,
+    forward: bool,
+) -> usize {
+    let ladder = pacode_types::Effort::ALL;
+    let last = ladder.len().saturating_sub(1);
+    if ladder.is_empty() {
+        return from;
+    }
+    // `None` means nothing is known about this model, so every rung is allowed.
+    let allowed = |index: usize| {
+        ladder
+            .get(index)
+            .is_some_and(|effort| supported.is_none_or(|levels| levels.contains(effort)))
+    };
+    let mut index = from;
+    for _ in 0..=last {
+        index = if forward {
+            if index >= last { 0 } else { index + 1 }
+        } else if index == 0 {
+            last
+        } else {
+            index - 1
+        };
+        if allowed(index) {
+            return index;
+        }
+    }
+    from
+}
+
+pub(crate) fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     let prev_overlay = match &state.focus {
         Focus::Overlay(o) => Some(crate::nav::overlay_name(o)),
         _ => None,
@@ -39,43 +78,127 @@ pub fn handle_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
     actions
 }
 
-fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
-    // The effort picker offers only what the model supports.
-    let effort_levels = if matches!(state.focus, Focus::Overlay(Overlay::EffortPicker { .. })) {
-        state.effort_levels()
-    } else {
-        Vec::new()
+/// Send `answer` for the question the queue is focused on NOW. The id is
+/// read off the queue at send time — never from a key handler's earlier
+/// view of it — so a resolve or a new ask that shifted the focus between
+/// keypresses can never stamp the stale question. The copy is dropped
+/// optimistically: the `QuestionResolved` echo just finds it already gone.
+fn submit_answer(state: &mut AppState, answer: pacode_types::QuestionAnswer) -> Vec<Action> {
+    let Some(id) = state.questions.current().map(|q| q.id.clone()) else {
+        state.focus = Focus::Normal;
+        return vec![];
     };
-    match &mut state.focus {
-        Focus::Overlay(Overlay::QuestionPicker {
-            question,
-            index,
-            selected,
-            typed,
-            typing,
-        }) => {
-            let count = question.options.len();
-            let multi = question.multi_select;
-            let id = question.id.clone();
+    state.questions.resolve(&id);
+    if state.questions.is_empty() {
+        state.focus = Focus::Normal;
+    }
+    state.dirty = true;
+    vec![Action::Send(pacode_types::Request::AnswerQuestion {
+        question: id,
+        answer,
+    })]
+}
 
-            if *typing {
+fn handle_rail_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
+    let Focus::Overlay(Overlay::RailOverlay { selected }) = &state.focus else {
+        return vec![];
+    };
+    let selected = selected.clone();
+    let agents = crate::nav::selectable_agents(state);
+    if agents.is_empty() {
+        if key.code == KeyCode::Esc {
+            state.focus = Focus::Normal;
+        }
+        return vec![];
+    }
+    let current = agents
+        .iter()
+        .position(|agent| agent == &selected)
+        .unwrap_or(0);
+    if is_overlay_up(&key) {
+        state.focus = Focus::Overlay(Overlay::RailOverlay {
+            selected: agents[(current + agents.len() - 1) % agents.len()].clone(),
+        });
+        return vec![];
+    }
+    if is_overlay_down(&key) {
+        state.focus = Focus::Overlay(Overlay::RailOverlay {
+            selected: agents[(current + 1) % agents.len()].clone(),
+        });
+        return vec![];
+    }
+    match key.code {
+        KeyCode::Esc => state.focus = Focus::Normal,
+        KeyCode::Enter => {
+            if !agents.contains(&selected) {
+                return vec![];
+            }
+            state.focus = Focus::Normal;
+            return crate::nav::select_agent_by_id(state, &selected);
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
+    // The effort ladder needs the model's supported set, and the focus match
+    // below holds `state` mutably. Copied out first, so the two never overlap.
+    let supported_efforts = state
+        .supported_efforts()
+        .map(<[pacode_types::Effort]>::to_vec);
+    if matches!(state.focus, Focus::Overlay(Overlay::RailOverlay { .. })) {
+        return handle_rail_overlay_key(state, key);
+    }
+    match &mut state.session.focus {
+        Focus::Overlay(Overlay::QuestionPicker) => {
+            let Some((count, multi)) = state
+                .questions
+                .current()
+                .map(|q| (q.options.len(), q.multi_select))
+            else {
+                // The queue ran dry without the picker noticing — a resolve
+                // folded while the layer was up. Drop the layer.
+                state.focus = Focus::Normal;
+                return vec![];
+            };
+
+            if state.questions.focus().is_some_and(|f| f.typing) {
                 match key.code {
                     KeyCode::Esc => {
-                        *typing = false;
-                        typed.clear();
+                        let f = state.questions.focus_mut().expect("current exists");
+                        f.typing = false;
+                        f.typed.clear();
                     }
                     KeyCode::Enter => {
-                        let answer = pacode_types::QuestionAnswer::typed(typed.clone());
-                        state.focus = Focus::Normal;
-                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                            question: id,
-                            answer,
-                        })];
+                        let typed = state
+                            .questions
+                            .focus()
+                            .map(|f| f.typed.clone())
+                            .unwrap_or_default();
+                        return submit_answer(state, pacode_types::QuestionAnswer::typed(typed));
                     }
+                    // Arrows still walk the queue while typing: `typed` and
+                    // `typing` are stored per question, so a half-written
+                    // answer is right there when the cursor comes back.
+                    KeyCode::Left => state.questions.move_cursor(-1),
+                    KeyCode::Right => state.questions.move_cursor(1),
                     KeyCode::Backspace => {
-                        typed.pop();
+                        state
+                            .questions
+                            .focus_mut()
+                            .expect("current exists")
+                            .typed
+                            .pop();
                     }
-                    KeyCode::Char(c) => typed.push(c),
+                    KeyCode::Char(c) => {
+                        state
+                            .questions
+                            .focus_mut()
+                            .expect("current exists")
+                            .typed
+                            .push(c);
+                    }
                     _ => {}
                 }
                 state.dirty = true;
@@ -84,52 +207,100 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
 
             match key.code {
                 // Dismissing answers the question as dismissed: the turn is
-                // waiting on it, so leaving it unanswered would hang the model.
+                // waiting on it, so leaving it unanswered would hang the
+                // model. More questions may still wait behind it.
                 KeyCode::Esc => {
-                    state.focus = Focus::Normal;
-                    return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                        question: id,
-                        answer: pacode_types::QuestionAnswer::cancelled(),
-                    })];
+                    return submit_answer(state, pacode_types::QuestionAnswer::cancelled());
                 }
-                KeyCode::Up | KeyCode::Char('k') => *index = index.saturating_sub(1),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(f) = state.questions.focus_mut() {
+                        f.index = f.index.saturating_sub(1);
+                    }
+                }
+                // The free-text plaque sits at `index == count` — one row past
+                // the last option.
                 KeyCode::Down | KeyCode::Char('j') => {
-                    *index = (*index + 1).min(count.saturating_sub(1));
+                    if let Some(f) = state.questions.focus_mut() {
+                        f.index = (f.index + 1).min(count);
+                    }
                 }
-                KeyCode::Char('t') => *typing = true,
-                KeyCode::Char(' ') if multi => {
-                    if let Some(pos) = selected.iter().position(|i| i == index) {
-                        selected.remove(pos);
-                    } else {
-                        selected.push(*index);
+                // Several questions can wait at once: walk the queue.
+                // Per-question state is keyed by id, so a half-typed answer
+                // survives the round trip.
+                KeyCode::Left | KeyCode::Char('h') => state.questions.move_cursor(-1),
+                KeyCode::Right | KeyCode::Char('l') => state.questions.move_cursor(1),
+                KeyCode::Char('t') => {
+                    if let Some(f) = state.questions.focus_mut() {
+                        f.typing = true;
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(f) = state.questions.focus_mut() {
+                        if f.index == count {
+                            // Space on the plaque means "type here" (in typing
+                            // mode the Char arm above appends it to `typed`).
+                            f.typing = true;
+                        } else if multi {
+                            if let Some(pos) = f.selected.iter().position(|i| *i == f.index) {
+                                f.selected.remove(pos);
+                            } else {
+                                f.selected.push(f.index);
+                            }
+                        }
                     }
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                     let picked = (c as usize) - ('0' as usize) - 1;
-                    if picked < count {
-                        state.focus = Focus::Normal;
-                        return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                            question: id,
-                            answer: pacode_types::QuestionAnswer::choice(picked),
-                        })];
+                    if picked == count {
+                        // `N+1` jumps to the free-text plaque rather than
+                        // answering — typing there starts with enter.
+                        if let Some(f) = state.questions.focus_mut() {
+                            f.index = count;
+                        }
+                    } else if picked < count {
+                        return submit_answer(state, pacode_types::QuestionAnswer::choice(picked));
+                    }
+                }
+                // On the plaque any other printable key starts typing
+                // immediately — the "Type something" row IS the input, so a
+                // letter there should not fall dead.
+                KeyCode::Char(c)
+                    if state.questions.focus().is_some_and(|f| f.index == count)
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(f) = state.questions.focus_mut() {
+                        f.typing = true;
+                        f.typed.push(c);
                     }
                 }
                 KeyCode::Enter => {
-                    let answer = if multi && !selected.is_empty() {
-                        pacode_types::QuestionAnswer {
-                            selected: selected.clone(),
-                            free_text: None,
-                            cancelled: false,
+                    let index = state.questions.focus().map(|f| f.index).unwrap_or(0);
+                    if index == count {
+                        if let Some(f) = state.questions.focus_mut() {
+                            f.typing = true;
                         }
                     } else {
-                        pacode_types::QuestionAnswer::choice(*index)
-                    };
-                    state.focus = Focus::Normal;
-                    return vec![Action::Send(pacode_types::Request::AnswerQuestion {
-                        question: id,
-                        answer,
-                    })];
+                        let selected = state
+                            .questions
+                            .focus()
+                            .map(|f| f.selected.clone())
+                            .unwrap_or_default();
+                        let answer = if multi && !selected.is_empty() {
+                            pacode_types::QuestionAnswer {
+                                selected,
+                                free_text: None,
+                                cancelled: false,
+                            }
+                        } else {
+                            pacode_types::QuestionAnswer::choice(index)
+                        };
+                        return submit_answer(state, answer);
+                    }
                 }
+                // Any other printable key is ignored: the question is a closed
+                // list — free text lives only on the plaque.
                 _ => {}
             }
             state.dirty = true;
@@ -138,18 +309,30 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
         Focus::Overlay(Overlay::EffortPicker { index }) => {
             match key.code {
                 KeyCode::Esc => state.focus = Focus::Normal,
+                // The cursor skips levels this model does not accept and lands
+                // on the next one that does, wrapping to the first *available*
+                // rather than to the bottom of the ladder. Stepping onto a greyed
+                // level is not a greyed level: the user pressed "faster" and
+                // nothing happened, which reads as a dead key.
                 KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
-                    *index = index.saturating_sub(1);
+                    *index = next_allowed_index(supported_efforts.as_deref(), *index, false);
                 }
                 KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
-                    *index = (*index + 1).min(effort_levels.len().saturating_sub(1));
+                    *index = next_allowed_index(supported_efforts.as_deref(), *index, true);
                 }
                 KeyCode::Enter => {
-                    let picked = effort_levels.get(*index).copied();
-                    state.focus = Focus::Normal;
-                    if let Some(effort) = picked {
-                        return crate::ui::model_picker_keys::set_effort(state, effort);
+                    let effort = pacode_types::Effort::ALL[*index];
+                    // Greyed levels are unselectable: refuse and keep the
+                    // picker open (spec §6).
+                    if !state.effort_supported(effort) {
+                        state.push_notice_with_level(
+                            pacode_types::ToastLevel::Warn,
+                            format!("effort {effort} is not supported by the current model"),
+                        );
+                        return vec![];
                     }
+                    state.focus = Focus::Normal;
+                    return vec![Action::Send(Request::SetEffort(effort))];
                 }
                 _ => {}
             }
@@ -167,469 +350,74 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
                 KeyCode::Enter => {
                     let mode = pacode_types::Mode::CYCLE[*index];
                     state.focus = Focus::Normal;
-                    state.save_pref_mode(mode);
                     return vec![Action::Send(Request::SetMode(mode))];
                 }
                 _ => {}
             }
             vec![]
         }
-        Focus::Overlay(Overlay::ModelPicker { .. }) => {
-            crate::ui::model_picker_keys::handle_key(state, key)
-        }
-        Focus::Overlay(Overlay::LoginPicker { query, index }) => {
-            let q_lower = query.to_lowercase();
-            let filtered_count = state
-                .auth_providers
-                .iter()
-                .filter(|p| {
-                    q_lower.is_empty()
-                        || p.id.to_lowercase().contains(&q_lower)
-                        || p.display_name.to_lowercase().contains(&q_lower)
-                        || p.auth_kind.to_lowercase().contains(&q_lower)
-                        || p.detail.to_lowercase().contains(&q_lower)
-                })
-                .count();
-
-            if is_prev(&key) && *index > 0 {
-                *index -= 1;
-                state.dirty = true;
-                return vec![];
-            }
-            if is_next(&key) && filtered_count > 0 && *index + 1 < filtered_count {
-                *index += 1;
-                state.dirty = true;
-                return vec![];
-            }
-
-            match key.code {
-                KeyCode::Esc => {
-                    state.focus = Focus::Normal;
+        // The page owns only its scroll: every other key is the app's, so a
+        // reader can copy from it and the usual chords keep working.
+        Focus::Overlay(Overlay::Analyze { .. }) => {
+            let (rows, visible) = state.analyze_geometry();
+            let delta = match key.code {
+                KeyCode::PageDown => i32::try_from(visible).unwrap_or(1),
+                KeyCode::PageUp => -(i32::try_from(visible).unwrap_or(1)),
+                KeyCode::Down | KeyCode::Char('j') => 1,
+                KeyCode::Up | KeyCode::Char('k') => -1,
+                KeyCode::Home => {
+                    if let Focus::Overlay(Overlay::Analyze { view }) = &mut state.focus {
+                        view.scroll_to_top();
+                    }
                     state.dirty = true;
+                    return vec![];
                 }
-                KeyCode::Enter => {
-                    let filtered: Vec<_> = state
-                        .auth_providers
-                        .iter()
-                        .filter(|p| {
-                            q_lower.is_empty()
-                                || p.id.to_lowercase().contains(&q_lower)
-                                || p.display_name.to_lowercase().contains(&q_lower)
-                                || p.auth_kind.to_lowercase().contains(&q_lower)
-                                || p.detail.to_lowercase().contains(&q_lower)
-                        })
-                        .collect();
-                    if let Some(p) = filtered.get(*index) {
-                        let provider = p.id.clone();
-                        return vec![Action::Send(Request::Login { provider })];
-                    }
-                }
-                KeyCode::Char('a')
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    let filtered: Vec<_> = state
-                        .auth_providers
-                        .iter()
-                        .filter(|p| {
-                            q_lower.is_empty()
-                                || p.id.to_lowercase().contains(&q_lower)
-                                || p.display_name.to_lowercase().contains(&q_lower)
-                                || p.auth_kind.to_lowercase().contains(&q_lower)
-                                || p.detail.to_lowercase().contains(&q_lower)
-                        })
-                        .collect();
-                    if let Some(p) = filtered.get(*index)
-                        && p.accounts.len() > 1
-                    {
-                        let cur = p
-                            .active
-                            .as_ref()
-                            .and_then(|act| p.accounts.iter().position(|acc| acc == act))
-                            .unwrap_or(0);
-                        let next = (cur + 1) % p.accounts.len();
-                        let label = p.accounts[next].clone();
-                        return vec![Action::Send(Request::SetAuthAccount {
-                            provider: p.id.clone(),
-                            label,
-                        })];
-                    }
-                    query.push('a');
-                    *index = 0;
-                    state.dirty = true;
-                }
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let filtered: Vec<_> = state
-                        .auth_providers
-                        .iter()
-                        .filter(|p| {
-                            q_lower.is_empty()
-                                || p.id.to_lowercase().contains(&q_lower)
-                                || p.display_name.to_lowercase().contains(&q_lower)
-                                || p.auth_kind.to_lowercase().contains(&q_lower)
-                                || p.detail.to_lowercase().contains(&q_lower)
-                        })
-                        .collect();
-                    if let Some(p) = filtered.get(*index) {
-                        return vec![Action::Send(Request::Logout {
-                            provider: p.id.clone(),
-                            label: p.active.clone(),
-                        })];
-                    }
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                    *index = 0;
-                    state.dirty = true;
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    query.push(c);
-                    *index = 0;
-                    state.dirty = true;
-                }
-                _ => {}
-            }
-            vec![]
-        }
-        Focus::Overlay(Overlay::SessionPicker { query, index }) => {
-            let q_lower = query.to_lowercase();
-            let filtered_count = state
-                .sessions
-                .iter()
-                .filter(|s| {
-                    q_lower.is_empty()
-                        || s.title().to_lowercase().contains(&q_lower)
-                        || s.id.as_str().to_lowercase().contains(&q_lower)
-                })
-                .count();
-
-            if is_prev(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
-            }
-            if is_next(&key) && filtered_count > 0 && *index + 1 < filtered_count {
-                *index += 1;
-                return vec![];
-            }
-
-            match key.code {
-                KeyCode::Esc => state.focus = Focus::Normal,
-                KeyCode::Enter => {
-                    let filtered: Vec<_> = state
-                        .sessions
-                        .iter()
-                        .filter(|s| {
-                            q_lower.is_empty()
-                                || s.title().to_lowercase().contains(&q_lower)
-                                || s.id.as_str().to_lowercase().contains(&q_lower)
-                        })
-                        .collect();
-                    if let Some(session) = filtered.get(*index) {
-                        let id = session.id.clone();
-                        state.focus = Focus::Normal;
-                        return vec![Action::Send(Request::Attach(
-                            pacode_types::Attach::Resume { session: id },
-                        ))];
-                    }
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                    *index = 0;
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    query.push(c);
-                    *index = 0;
-                }
-                _ => {}
-            }
-            vec![]
-        }
-        Focus::Overlay(Overlay::Files { index }) => {
-            let count = state.files.len();
-            if is_overlay_up(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
-            }
-            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
-                *index += 1;
-                return vec![];
-            }
-            match key.code {
-                KeyCode::Esc => state.focus = Focus::Normal,
-                KeyCode::Enter => {
-                    let sorted = state.files.sorted_rows();
-                    if let Some(row) = sorted.get(*index) {
-                        state.input.insert_str(&row.path);
-                    }
-                    state.focus = Focus::Normal;
-                }
-                _ => {}
-            }
-            vec![]
-        }
-        Focus::Overlay(Overlay::RailOverlay) | Focus::Overlay(Overlay::Help) => {
-            if key.code == KeyCode::Esc {
-                state.focus = Focus::Normal;
-            }
-            vec![]
-        }
-        Focus::Overlay(Overlay::Import(_)) => vec![],
-        Focus::Overlay(Overlay::McpPicker {
-            index,
-            servers,
-            loading,
-        }) => {
-            let count = servers.len();
-            if is_overlay_up(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
-            }
-            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
-                *index += 1;
-                return vec![];
-            }
-            match key.code {
-                KeyCode::Esc => state.focus = Focus::Normal,
-                KeyCode::Char('r') => {
-                    if let Some(s) = servers.get(*index) {
-                        let server_name = s.name.clone();
-                        *loading = true;
-                        return vec![
-                            Action::Send(Request::RestartMcpServer {
-                                server: server_name,
-                            }),
-                            Action::Send(Request::ListMcpServers),
-                        ];
-                    }
-                }
-                KeyCode::Enter => {
-                    if let Some(s) = servers.get(*index) {
-                        let server_name = s.name.clone();
-                        let enabled = s.status == "disabled";
-                        *loading = true;
-                        return vec![
-                            Action::Send(Request::SetMcpServerEnabled {
-                                server: server_name,
-                                enabled,
-                            }),
-                            Action::Send(Request::ListMcpServers),
-                        ];
-                    }
-                }
-                _ => {}
-            }
-            vec![]
-        }
-        Focus::Overlay(Overlay::PluginsPicker {
-            index,
-            plugins,
-            tab,
-            market,
-            query,
-            loading,
-            stale,
-        }) => {
-            use crate::state::PluginsTab;
-
-            let count = match tab {
-                PluginsTab::Installed => plugins.len(),
-                PluginsTab::Discover => market.len(),
+                _ => return vec![],
             };
-            let source = state.config.plugins.marketplace.clone();
-
-            if is_overlay_up(&key) && *index > 0 {
-                *index -= 1;
-                return vec![];
+            if let Focus::Overlay(Overlay::Analyze { view }) = &mut state.focus {
+                view.scroll_by(delta, rows, visible);
             }
-            if is_overlay_down(&key) && count > 0 && *index + 1 < count {
-                *index += 1;
+            state.dirty = true;
+            vec![]
+        }
+        // The settings page owns every key it recognises and reports the rest
+        // as unhandled, so a chord that belongs to the app still works with the
+        // page open.
+        Focus::Overlay(Overlay::Settings { ui: _ }) => {
+            // The area is read before the mutable borrow of the focus the match
+            // is holding: the view lives inside it.
+            let area = crate::ui::popup::resolve_current(state)
+                .map_or_else(ratatui::layout::Rect::default, |popup| popup.area());
+            // Taken out and put back: the view is part of the state the commit
+            // needs mutably, and holding both borrows at once is not allowed.
+            let Focus::Overlay(Overlay::Settings { ui }) = &mut state.session.focus else {
                 return vec![];
+            };
+            let mut view = std::mem::take(ui);
+            #[allow(clippy::mem_replace_with_default)]
+            let result = crate::ui::settings_ui::commit(state, &mut view, key, area);
+            if let Focus::Overlay(Overlay::Settings { ui }) = &mut state.session.focus {
+                *ui = view;
             }
-
-            match key.code {
-                KeyCode::Esc => {
+            match result {
+                crate::ui::settings_ui::SettingsResult::Stay(actions) => {
+                    state.dirty = true;
+                    actions
+                }
+                crate::ui::settings_ui::SettingsResult::Close => {
                     state.focus = Focus::Normal;
                     state.dirty = true;
-                    return vec![];
-                }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    *tab = tab.next();
-                    *index = 0;
-                    state.dirty = true;
-                    // The Discover tab is empty until the marketplace answers.
-                    if *tab == PluginsTab::Discover && market.is_empty() && !source.is_empty() {
-                        *loading = true;
-                        let query = query.clone();
-                        return vec![Action::Send(Request::BrowseMarketplace { source, query })];
-                    }
-                }
-                // Typing filters Discover; the request goes out on every keystroke
-                // but the index is served from cache, so it costs no network.
-                KeyCode::Char(c) if *tab == PluginsTab::Discover && !source.is_empty() => match c {
-                    'i' if !market.is_empty() => {
-                        let name = market[(*index).min(market.len() - 1)].name.clone();
-                        *loading = true;
-                        state.dirty = true;
-                        // The install reply refreshes Discover; ListPlugins
-                        // makes the new plugin show up under Installed.
-                        return vec![
-                            Action::Send(Request::InstallPlugin { source, name }),
-                            Action::Send(Request::ListPlugins),
-                        ];
-                    }
-                    _ => {
-                        query.push(c);
-                        *index = 0;
-                        *loading = true;
-                        state.dirty = true;
-                        let query = query.clone();
-                        return vec![Action::Send(Request::BrowseMarketplace { source, query })];
-                    }
-                },
-                KeyCode::Backspace if *tab == PluginsTab::Discover && !source.is_empty() => {
-                    query.pop();
-                    *index = 0;
-                    *loading = true;
-                    state.dirty = true;
-                    let query = query.clone();
-                    return vec![Action::Send(Request::BrowseMarketplace { source, query })];
-                }
-                KeyCode::Char('x') if *tab == PluginsTab::Installed && !plugins.is_empty() => {
-                    let p = &plugins[(*index).min(plugins.len() - 1)];
-                    // Uninstall removes exactly what an install record tracks, so
-                    // only marketplace-installed plugins are removable here.
-                    if p.is_installed() {
-                        let name = p.name.clone();
-                        state.dirty = true;
-                        // ListPlugins refreshes the Installed tab; the uninstall
-                        // reply itself refreshes the Discover tab.
-                        return vec![
-                            Action::Send(Request::UninstallPlugin { name }),
-                            Action::Send(Request::ListPlugins),
-                        ];
-                    }
-                }
-                _ => {}
-            }
-            let _ = stale;
-            vec![]
-        }
-        Focus::Overlay(Overlay::KeysPicker { index, capturing }) => {
-            let count = crate::binding::Keymap::action_names().len();
-            if *capturing {
-                if key.code == KeyCode::Esc {
-                    *capturing = false;
-                    return vec![];
-                }
-
-                let mut mods = key.modifiers
-                    & (KeyModifiers::CONTROL
-                        | KeyModifiers::ALT
-                        | KeyModifiers::SHIFT
-                        | KeyModifiers::SUPER);
-                let code = match key.code {
-                    KeyCode::Char(c) if c.is_ascii_uppercase() => {
-                        mods.insert(KeyModifiers::SHIFT);
-                        KeyCode::Char(c.to_ascii_lowercase())
-                    }
-                    KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
-                    other => other,
-                };
-                let binding = crate::binding::Binding { code, mods };
-                let formatted = crate::binding::format_binding(&binding);
-                if formatted.ends_with("unknown") {
-                    *capturing = false;
-                    state.push_toast(
-                        pacode_types::ToastLevel::Warn,
-                        "Cannot bind key".to_string(),
-                        Some("Key cannot be represented".to_string()),
-                        std::time::Instant::now(),
-                    );
-                    return vec![];
-                }
-
-                let Some(&(_, action)) = crate::binding::Keymap::action_names().get(*index) else {
-                    *capturing = false;
-                    return vec![];
-                };
-
-                if let Some((_, conflict_action)) = state.keymap.find_conflict(&binding, action) {
-                    *capturing = false;
-                    state.push_toast(
-                        pacode_types::ToastLevel::Warn,
-                        "Keybinding conflict".to_string(),
-                        Some(conflict_action.description().to_string()),
-                        std::time::Instant::now(),
-                    );
-                    return vec![];
-                }
-
-                state.keymap.set_binding(action, binding);
-                *capturing = false;
-
-                let act_name = action.name();
-                let dotted = format!("keys.{act_name}");
-                if let Err(err) = pacode_config::update_config_value(
-                    &state.paths,
-                    &dotted,
-                    pacode_config::toml::Value::String(formatted),
-                ) {
-                    log::warn!("failed to update config value '{dotted}': {err}");
-                    state.push_toast(
-                        pacode_types::ToastLevel::Error,
-                        "Failed to update config".to_string(),
-                        Some(err.to_string()),
-                        std::time::Instant::now(),
-                    );
-                }
-            } else {
-                if is_overlay_up(&key) && *index > 0 {
-                    *index -= 1;
-                    return vec![];
-                }
-                if is_overlay_down(&key) && count > 0 && *index + 1 < count {
-                    *index += 1;
-                    return vec![];
-                }
-                match key.code {
-                    KeyCode::Esc => state.focus = Focus::Normal,
-                    KeyCode::Enter => {
-                        *capturing = true;
-                    }
-                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(&(_, action)) =
-                            crate::binding::Keymap::action_names().get(*index)
-                        {
-                            state.keymap.reset_default(action);
-                            let act_name = action.name();
-                            let dotted = format!("keys.{act_name}");
-                            if let Err(err) =
-                                pacode_config::remove_config_value(&state.paths, &dotted)
-                            {
-                                log::warn!("failed to remove config value '{dotted}': {err}");
-                                state.push_toast(
-                                    pacode_types::ToastLevel::Error,
-                                    "Failed to update config".to_string(),
-                                    Some(err.to_string()),
-                                    std::time::Instant::now(),
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
+                    vec![]
                 }
             }
-            vec![]
         }
+        // The model palette owns its keys: search, navigation, the effort
+        // ladder, sign-in and the commit all live in `keys_palette`.
+        Focus::Overlay(Overlay::ModelPalette { .. }) => crate::keys_palette::handle_key(state, key),
+        Focus::Overlay(Overlay::RailOverlay { .. }) => vec![],
+        // Unreachable — `keys::handle_key` routes a menu to `keys_menu` before
+        // the overlay dispatch — but the match stays exhaustive.
+        Focus::Overlay(Overlay::Menu { .. }) => vec![],
         Focus::Overlay(Overlay::ThemePicker {
             index,
             original_theme,
@@ -637,11 +425,7 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             step,
             user_themes,
         }) => {
-            let truecolor = match state.config.ui.color.as_str() {
-                "ansi" => false,
-                "truecolor" | "24bit" => true,
-                _ => pacode_render::detect_truecolor(),
-            };
+            let truecolor = state.truecolor;
             let builtins = pacode_render::builtin_palettes();
 
             match step {
@@ -793,9 +577,6 @@ fn handle_picker_key_inner(state: &mut AppState, key: KeyEvent) -> Vec<Action> {
             }
             vec![]
         }
-        Focus::Overlay(Overlay::ConfigPicker) => crate::ui::config_view::handle_key(state, key),
-        Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } | Focus::BgList { .. } => {
-            vec![]
-        }
+        Focus::Normal | Focus::SelectAgent { .. } | Focus::Panel { .. } => vec![],
     }
 }

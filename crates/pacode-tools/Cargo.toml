@@ -22,6 +22,7 @@ pacode-plugin = { workspace = true }
 pacode-coreutils = { workspace = true }
 pacode-outline = { workspace = true }
 pacode-memory = { workspace = true }
+pacode-symbols = { workspace = true }
 tokio = { workspace = true, features = ["rt", "fs", "io-util", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
@@ -41,6 +42,7 @@ url = { workspace = true }
 dom_smoothie = { workspace = true }
 htmd = { workspace = true }
 regex = { workspace = true }
+libc = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]

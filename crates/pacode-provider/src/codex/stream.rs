@@ -1,13 +1,18 @@
 //! Event stream construction and retry policy for OpenAI Responses API.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use pacode_types::{Effort, StopReason, StreamEvent};
 use serde_json::Value;
 
 use super::events::{ResponsesChunkState, responses_chunk_to_events};
+use crate::governor::{ProviderGovernor, governor_for, hold_permit};
+use crate::post::HttpPost;
+use crate::retry::{OpenedStream, RetryAfterSignal, RetryBudget, StreamTransport};
 use crate::sse::SseParser;
 use crate::{EventStream, ProviderError};
 
@@ -17,6 +22,22 @@ pub fn create_responses_event_stream(
     req_model: String,
     stream_idle_secs: u64,
     effort: Effort,
+) -> EventStream {
+    create_responses_event_stream_with_retry_after(
+        response,
+        req_model,
+        stream_idle_secs,
+        effort,
+        RetryAfterSignal::default(),
+    )
+}
+
+pub(crate) fn create_responses_event_stream_with_retry_after(
+    response: reqwest::Response,
+    req_model: String,
+    stream_idle_secs: u64,
+    effort: Effort,
+    retry_after: RetryAfterSignal,
 ) -> EventStream {
     let timeout_secs = stream_idle_secs * effort.idle_timeout_factor();
     let idle_duration = Duration::from_secs(timeout_secs.max(1));
@@ -32,6 +53,7 @@ pub fn create_responses_event_stream(
         stream_ended: bool,
         idle_duration: Duration,
         timeout_secs: u64,
+        retry_after: RetryAfterSignal,
     }
 
     let initial_state = StreamState {
@@ -45,6 +67,7 @@ pub fn create_responses_event_stream(
         stream_ended: false,
         idle_duration,
         timeout_secs,
+        retry_after,
     };
 
     let stream = futures::stream::unfold(initial_state, |mut state| async move {
@@ -71,6 +94,8 @@ pub fn create_responses_event_stream(
                     return Some((Err(ProviderError::IdleTimeout(state.timeout_secs)), state));
                 }
                 Ok(Some(Ok(bytes))) => {
+                    // The lossy copy + redact scan run per network chunk — only
+                    // when `trace` is actually on (off in release builds).
                     if log::log_enabled!(log::Level::Trace) {
                         let chunk_str = String::from_utf8_lossy(&bytes);
                         let chunk_redacted = crate::redact(&chunk_str);
@@ -98,7 +123,8 @@ pub fn create_responses_event_stream(
                             Err(e) => {
                                 state.stream_ended = true;
                                 state.pending_error = Some(ProviderError::Malformed(format!(
-                                    "invalid SSE JSON: {e}"
+                                    "invalid SSE JSON: {e}: {}",
+                                    crate::error_body_message(&payload)
                                 )));
                                 break;
                             }
@@ -113,6 +139,13 @@ pub fn create_responses_event_stream(
 
                                 match responses_chunk_to_events(&json, &mut state.chunk_state) {
                                     Err(err) => {
+                                        if matches!(&err, ProviderError::RateLimited(_))
+                                            && let Some(delay) = json
+                                                .get("error")
+                                                .and_then(crate::sse::retry_after_from_error)
+                                        {
+                                            state.retry_after.set(delay);
+                                        }
                                         state.stream_ended = true;
                                         state.pending_error = Some(err);
                                         break;
@@ -169,194 +202,88 @@ pub fn create_responses_event_stream(
 }
 
 /// Owned configuration for opening (and reopening) a Responses API stream.
+#[derive(Clone)]
 pub struct CodexStreamOpener {
     pub client: reqwest::Client,
     pub url: String,
     pub headers: Vec<(String, String)>,
-    /// Serialised once (see `request_body`); released after the first committing event.
-    pub body: bytes::Bytes,
+    /// Serialised once (see `request_body`): each retry is a refcount bump instead of
+    /// a DOM re-serialization; released after the first committing event.
+    pub body: Bytes,
     pub model: String,
     pub stream_idle_secs: u64,
     pub effort: Effort,
-    pub max_retries: u32,
     pub backoff_base: Duration,
-    /// Provider-wide concurrency permits and cooldown, shared with every other request.
-    pub gate: std::sync::Arc<crate::gate::ProviderGate>,
+    /// Provider-wide adaptive concurrency limit and cooldown, shared with every other
+    /// request of this provider entry.
+    pub gate: Arc<crate::gate::ProviderGate>,
 }
 
 impl CodexStreamOpener {
     /// POST the request, retrying the connection itself with backoff; returns the parsed event stream.
-    pub async fn open(&self) -> Result<EventStream, ProviderError> {
-        let (response, permit) = self.post().await?;
-        let stream = create_responses_event_stream(
+    pub async fn open(&self, mut budget: RetryBudget) -> Result<EventStream, ProviderError> {
+        let governor = self.governor();
+        let opened = self.open_once(&governor, &mut budget).await?;
+        Ok(crate::retry::retrying_transport_stream(
+            self.clone(),
+            governor,
+            opened,
+            budget,
+        ))
+    }
+}
+
+impl StreamTransport for CodexStreamOpener {
+    fn governor(&self) -> Arc<ProviderGovernor> {
+        governor_for(&self.url, None, &self.headers)
+    }
+
+    fn backoff_base(&self) -> Duration {
+        self.backoff_base
+    }
+
+    async fn open_once(
+        &self,
+        governor: &Arc<ProviderGovernor>,
+        budget: &mut RetryBudget,
+    ) -> Result<OpenedStream, ProviderError> {
+        let post = HttpPost {
+            label: "codex",
+            client: &self.client,
+            url: &self.url,
+            api_key: None,
+            headers: &self.headers,
+            body: &self.body,
+            stream_idle_secs: self.stream_idle_secs,
+            effort: self.effort,
+            backoff_base: self.backoff_base,
+        };
+        let (response, permit, gate_permit) =
+            crate::retry::post_gated(&post, &self.gate, governor, budget).await?;
+        let retry_after = RetryAfterSignal::default();
+        let inner = create_responses_event_stream_with_retry_after(
             response,
             self.model.clone(),
             self.stream_idle_secs,
             self.effort,
+            retry_after.clone(),
         );
-        // The permit lives exactly as long as the stream (freed on end, error or drop).
-        Ok(crate::gate::GatedStream::wrap(stream, permit))
+        // Both permits live exactly as long as the stream (freed on end, error or drop);
+        // the gate permit also credits the AIMD increase on the first event.
+        Ok(OpenedStream {
+            stream: crate::gate::GatedStream::wrap(hold_permit(inner, permit), gate_permit),
+            retry_after,
+        })
     }
 
-    async fn post(&self) -> Result<(reqwest::Response, crate::gate::GatePermit), ProviderError> {
-        let mut attempt = 0;
-        let started = tokio::time::Instant::now();
-        loop {
-            // Waits out any provider-wide cooldown and for a free slot (cancel-safe).
-            let permit = self.gate.acquire().await;
-            let mut req_builder = self.client.post(&self.url).body(self.body.clone());
+    fn note_stream_rate_limit(&self) {
+        self.gate
+            .note_response(429, &reqwest::header::HeaderMap::new());
+    }
 
-            for (k, v) in &self.headers {
-                req_builder = req_builder.header(k, v);
-            }
-
-            match req_builder.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        return Ok((resp, permit));
-                    }
-
-                    let status_u16 = status.as_u16();
-                    let headers = resp.headers().clone();
-                    drop(permit);
-                    let text = resp.text().await.unwrap_or_default();
-                    let redacted_body = crate::redact(&text);
-                    log::trace!("responses error body: {redacted_body}");
-                    log::warn!("codex request failed ({status_u16}): {redacted_body}");
-
-                    if status_u16 == 401 || status_u16 == 403 {
-                        return Err(ProviderError::Auth(format!("{status_u16}: {text}")));
-                    }
-
-                    let is_retryable = status_u16 == 429 || status_u16 >= 500;
-                    // Server-provided delay -> shared cooldown, not counted as a retry.
-                    let hinted = self.gate.note_response(status_u16, &headers).is_some();
-                    if is_retryable && hinted && started.elapsed() < crate::gate::MAX_QUEUE_WAIT {
-                        continue;
-                    }
-                    if is_retryable && attempt < self.max_retries {
-                        crate::retry::sleep_backoff(attempt, self.backoff_base).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    if status_u16 == 429 {
-                        return Err(ProviderError::RateLimited(text));
-                    }
-                    return Err(ProviderError::Http {
-                        status: status_u16,
-                        message: text,
-                    });
-                }
-                Err(err) => {
-                    let err_str = err.to_string();
-                    let redacted_err = crate::redact(&err_str);
-                    log::warn!("codex request transport error: {redacted_err}");
-                    drop(permit);
-                    if attempt < self.max_retries {
-                        crate::retry::sleep_backoff(attempt, self.backoff_base).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(ProviderError::Transport(err.to_string()));
-                }
-            }
+    fn release_body(&mut self) {
+        if !self.body.is_empty() {
+            self.body = Bytes::new();
         }
     }
-}
-
-fn is_committing(event: &StreamEvent) -> bool {
-    matches!(
-        event,
-        StreamEvent::TextDelta { .. }
-            | StreamEvent::ReasoningDelta { .. }
-            | StreamEvent::ReasoningSignature { .. }
-            | StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolCallArgsDelta { .. }
-            | StreamEvent::Usage(_)
-            | StreamEvent::MessageEnd { .. }
-    )
-}
-
-struct RetryState {
-    opener: CodexStreamOpener,
-    inner: Option<EventStream>,
-    attempt: u32,
-    max_retries: u32,
-    committed: bool,
-    done: bool,
-}
-
-/// Wrap `initial` so that a retryable failure before any output reopens the request.
-pub fn retrying_responses_stream(opener: CodexStreamOpener, initial: EventStream) -> EventStream {
-    let max_retries = opener.max_retries;
-    let state = RetryState {
-        opener,
-        inner: Some(initial),
-        attempt: 0,
-        max_retries,
-        committed: false,
-        done: false,
-    };
-
-    let stream = futures::stream::unfold(state, |mut state| async move {
-        loop {
-            if state.done {
-                return None;
-            }
-
-            if state.inner.is_none() {
-                match state.opener.open().await {
-                    Ok(inner) => state.inner = Some(inner),
-                    Err(err) => {
-                        if err.is_retryable() && state.attempt < state.max_retries {
-                            crate::retry::sleep_backoff(state.attempt, state.opener.backoff_base)
-                                .await;
-                            state.attempt += 1;
-                            continue;
-                        }
-                        state.done = true;
-                        return Some((Err(err), state));
-                    }
-                }
-            }
-
-            let next = match state.inner.as_mut() {
-                Some(inner) => inner.next().await,
-                None => return None,
-            };
-
-            match next {
-                Some(Ok(event)) => {
-                    if is_committing(&event) {
-                        state.committed = true;
-                        // No reopen is possible any more: free the request payload.
-                        if !state.opener.body.is_empty() {
-                            state.opener.body = bytes::Bytes::new();
-                        }
-                    }
-                    return Some((Ok(event), state));
-                }
-                Some(Err(err)) => {
-                    if !state.committed && err.is_retryable() && state.attempt < state.max_retries {
-                        let redacted = crate::redact(&err.to_string());
-                        let attempt = state.attempt;
-                        log::warn!(
-                            "codex stream failed before output (attempt {attempt}), reopening: {redacted}"
-                        );
-                        crate::retry::sleep_backoff(state.attempt, state.opener.backoff_base).await;
-                        state.attempt += 1;
-                        state.inner = None;
-                        continue;
-                    }
-                    state.done = true;
-                    return Some((Err(err), state));
-                }
-                None => return None,
-            }
-        }
-    });
-
-    Box::pin(stream)
 }

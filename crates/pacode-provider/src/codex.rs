@@ -31,9 +31,9 @@ pub use request::{
     REASONING_KEYWORDS, build_responses_body, deep_merge, model_heuristic_reasoning,
     reasoning_enabled_for,
 };
-pub use stream::{CodexStreamOpener, create_responses_event_stream, retrying_responses_stream};
+pub use stream::{CodexStreamOpener, create_responses_event_stream};
 
-use crate::{CompletionRequest, EventStream, Provider, ProviderError, redact};
+use crate::{CompletionRequest, EventStream, Provider, ProviderError, RetryBudget, redact};
 
 #[cfg(test)]
 #[path = "codex_tests.rs"]
@@ -56,7 +56,8 @@ pub struct Codex {
     /// Single-flight for `list_models`: concurrent misses share one catalogue GET.
     catalog_fetch: tokio::sync::Mutex<()>,
     backoff_base: Duration,
-    /// Concurrency permits and cooldown; the registry swaps in the shared per-provider gate.
+    /// Adaptive concurrency limit and cooldown, shared by every instance of this provider
+    /// entry (see [`crate::provider_gate`]).
     gate: Arc<crate::gate::ProviderGate>,
 }
 
@@ -83,7 +84,7 @@ impl Codex {
             .build()
             .map_err(|e| ProviderError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        let gate = Arc::new(crate::gate::ProviderGate::new(defaults.max_concurrent));
+        let gate = crate::provider_gate(&id, &cfg.base_url, defaults.max_concurrent);
 
         Ok(Self {
             id,
@@ -97,12 +98,6 @@ impl Codex {
             backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
             gate,
         })
-    }
-
-    /// Share the registry's per-provider gate (see `OpenAiCompat::with_gate`).
-    pub(crate) fn with_gate(mut self, gate: Arc<crate::gate::ProviderGate>) -> Self {
-        self.gate = gate;
-        self
     }
 
     /// Convenience constructor from an optional API key string.
@@ -233,7 +228,7 @@ impl Codex {
             req_builder = req_builder.header(k, v);
         }
 
-        let response = match req_builder.send().await {
+        let mut response = match req_builder.send().await {
             Ok(resp) => resp,
             Err(err) => {
                 if !configured_models.is_empty() {
@@ -250,7 +245,7 @@ impl Codex {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            let text = crate::error_body::read_error_body(&mut response).await;
             let redacted_text = redact(&text);
             log::trace!("models response body: {redacted_text}");
             if !configured_models.is_empty() {
@@ -266,7 +261,7 @@ impl Codex {
             log::warn!("request failed ({status}): {redacted_text}");
             return Err(ProviderError::Http {
                 status,
-                message: text,
+                message: crate::error_body_message(&text),
             });
         }
 
@@ -282,7 +277,10 @@ impl Codex {
                     }
                     return Ok(configured_models);
                 }
-                return Err(ProviderError::Malformed(err.to_string()));
+                return Err(ProviderError::Malformed(format!(
+                    "{err}: {}",
+                    crate::error_body_message(&json_text)
+                )));
             }
         };
 
@@ -301,7 +299,15 @@ impl Codex {
                 if let Some(id) = id_opt
                     && seen.insert(id.to_string())
                 {
-                    all_models.push(self.model_info(id));
+                    let mut info = self.model_info(id);
+                    if info.supported_efforts.is_none() {
+                        // This backend's catalog enumerates the levels each
+                        // model accepts (`supported_reasoning_levels`); a
+                        // providers.toml `efforts` list still wins. A catalog
+                        // that names none leaves the ladder unrestricted.
+                        info.supported_efforts = crate::catalog_efforts::efforts(item);
+                    }
+                    all_models.push(info);
                 }
             }
         }
@@ -322,8 +328,7 @@ impl Provider for Codex {
     async fn complete(&self, req: CompletionRequest) -> Result<EventStream, ProviderError> {
         let url = self.endpoint();
         let headers = self.build_headers();
-        let info = self.model_info(&req.model);
-        let mut req = gate_images(req, &info)?;
+        let mut req = req;
         let body = self.build_body(&req);
         let max_retries = self.defaults.max_retries;
 
@@ -332,27 +337,27 @@ impl Provider for Codex {
         let model = &req.model;
         log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
 
-        // Serialise once; the Value tree and the history copy are dropped right away.
-        let body = crate::request_body::encode(body)?;
+        // Serialise once: the opener resends these bytes on every retry; the `Value`
+        // tree and the history copy are dropped right away, and the (image- and
+        // secret-redacted) trace dump only runs while `trace` is enabled.
+        let body_bytes = crate::request_body::encode(body)?;
         req.messages = Vec::new();
-        crate::request_body::trace_body(&body);
+        crate::request_body::trace_body(&body_bytes);
 
         let effort = req.effort.unwrap_or(self.defaults.effort);
         let opener = CodexStreamOpener {
             client: self.client.clone(),
             url,
             headers,
-            body,
+            body: body_bytes,
             model: req.model,
             stream_idle_secs: self.defaults.stream_idle_secs,
             effort,
-            max_retries,
             backoff_base: self.backoff_base,
             gate: Arc::clone(&self.gate),
         };
 
-        let inner = opener.open().await?;
-        Ok(retrying_responses_stream(opener, inner))
+        opener.open(RetryBudget::new(max_retries)).await
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -403,7 +408,8 @@ impl Provider for Codex {
             display_name,
             context_window,
             supports_reasoning,
-            vision: crate::vision::heuristic_vision(model),
+            supports_vision: request::model_supports_vision(model),
+            supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
             pricing,
             kind: crate::model_meta::kind_from_id(model),
             ..ModelInfo::default()
@@ -412,16 +418,4 @@ impl Provider for Codex {
         crate::model_meta::finish(&mut info, crate::ReasoningWire::ReasoningEffort);
         info
     }
-}
-
-/// Reject images for text-only models; strip stale ones from old history.
-fn gate_images(
-    mut req: CompletionRequest,
-    info: &ModelInfo,
-) -> Result<CompletionRequest, ProviderError> {
-    if !req.messages.iter().any(pacode_types::Message::has_images) {
-        return Ok(req);
-    }
-    req.messages = crate::vision::gate_images(&req.messages, &req.model, info.vision)?.into_owned();
-    Ok(req)
 }

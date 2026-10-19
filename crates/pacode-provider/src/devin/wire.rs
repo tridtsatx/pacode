@@ -2,7 +2,9 @@
 //!
 //! Protocol specifications captured from live Devin CLI traffic.
 
-use pacode_types::{ContentBlock, Message, ProviderConfig, Role, ToolDefinition};
+use std::sync::Arc;
+
+use pacode_types::{ContentBlock, ImageSource, Message, ProviderConfig, Role, ToolDefinition};
 
 use super::proto::{self, ProtoError, WireType};
 use crate::CompletionRequest;
@@ -129,38 +131,53 @@ pub fn encode_pending() -> proto::Writer {
     w
 }
 
+/// Whether the model takes the field-10 image payload. Every model Devin
+/// serves — the `swe-*` family and the relayed Claude/GPT/Gemini entries — is
+/// a multimodal frontier model, so this is unconditional.
+pub fn model_supports_vision(_model: &str) -> bool {
+    true
+}
+
 /// Encode messages from the conversation history into protobuf messages.
 ///
 /// Images (observed in live traffic of the official CLI): a user message carries one
 /// nested field `10 { 1 base64_data, 2 mime_type }` per image and keeps a text
-/// placeholder `[Image N: <path>]` for each. Tool messages cannot carry images, so
-/// images returned by tools go into one user message after the run of tool messages.
-pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
+/// placeholder `[Image N: <path>]` for each image that has a path. Without vision, or
+/// when the bytes cannot be loaded, an image degrades to its fallback text instead.
+/// Tool messages cannot carry images, so images returned by tools go into one user
+/// message after the run of tool messages.
+pub fn encode_messages(messages: &[Arc<Message>], supports_vision: bool) -> Vec<proto::Writer> {
     let mut encoded = Vec::new();
-    let mut pending_tool_images: Vec<&ContentBlock> = Vec::new();
+    let mut pending_tool_images: Vec<&ImageSource> = Vec::new();
 
     for msg in messages {
         if msg.role != Role::Tool && !pending_tool_images.is_empty() {
             let images = std::mem::take(&mut pending_tool_images);
             encoded.push(user_message(
-                "Images returned by the tool call(s) above:",
+                TOOL_IMAGES_TEXT.to_string(),
                 &images,
+                supports_vision,
             ));
         }
         match msg.role {
             Role::User | Role::System => {
-                let images: Vec<&ContentBlock> = msg
+                let images: Vec<&ImageSource> = msg
                     .content
                     .iter()
-                    .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                    .filter_map(|b| match b {
+                        ContentBlock::Image { source } => Some(source),
+                        _ => None,
+                    })
                     .collect();
-                encoded.push(user_message(&msg.text(), &images));
+                encoded.push(user_message(msg.text(), &images, supports_vision));
             }
             Role::Assistant => {
                 let mut w = proto::Writer::new();
                 w.write_string(1, &random_uuid());
                 w.write_varint(2, 2);
-                let text = msg.text();
+                // Field 10 image attachments are user-side; images in
+                // assistant history degrade into the text field.
+                let text = crate::image::text_with_image_fallbacks(msg);
                 if !text.is_empty() {
                     w.write_string(3, &text);
                 }
@@ -195,11 +212,15 @@ pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
                             let mut w = proto::Writer::new();
                             w.write_string(1, &random_uuid());
                             w.write_varint(2, 4);
-                            w.write_string(3, content);
+                            // Empty tool output must not emit the field — see the
+                            // note in `user_message`.
+                            if !content.is_empty() {
+                                w.write_string(3, content);
+                            }
                             w.write_string(7, call_id.as_str());
                             encoded.push(w);
                         }
-                        ContentBlock::Image { .. } => pending_tool_images.push(block),
+                        ContentBlock::Image { source } => pending_tool_images.push(source),
                         ContentBlock::Text { .. }
                         | ContentBlock::Reasoning { .. }
                         | ContentBlock::ToolUse { .. } => {}
@@ -210,50 +231,74 @@ pub fn encode_messages(messages: &[Message]) -> Vec<proto::Writer> {
     }
     if !pending_tool_images.is_empty() {
         encoded.push(user_message(
-            "Images returned by the tool call(s) above:",
+            TOOL_IMAGES_TEXT.to_string(),
             &pending_tool_images,
+            supports_vision,
         ));
     }
 
     encoded
 }
 
-/// A user message: `text`, then a `[Image N: path]` placeholder per image, with the
-/// pixels in nested field 10. An image whose bytes are gone keeps only its placeholder.
-fn user_message(text: &str, images: &[&ContentBlock]) -> proto::Writer {
-    let mut full = text.to_string();
-    for (i, block) in images.iter().enumerate() {
-        if let ContentBlock::Image {
-            hash, source_path, ..
-        } = block
-        {
-            if !full.is_empty() {
-                full.push('\n');
+/// Text of the user message that carries images returned by tools.
+const TOOL_IMAGES_TEXT: &str = "Images returned by the tool call(s) above:";
+
+/// A user message: `text`, then per image either a `[Image N: path]` placeholder with
+/// the pixels in nested field 10 (vision, bytes available) or its fallback text.
+fn user_message(mut text: String, images: &[&ImageSource], supports_vision: bool) -> proto::Writer {
+    let mut attachments = Vec::new();
+    for (i, source) in images.iter().enumerate() {
+        let loaded = if supports_vision {
+            crate::openai_compat::load_image_payload(source)
+        } else {
+            None
+        };
+        let line = match loaded {
+            Some(payload) => {
+                attachments.push(payload);
+                image_placeholder(i + 1, source)
             }
-            let path = source_path
-                .clone()
-                .unwrap_or_else(|| format!("image-{}", hash.chars().take(12).collect::<String>()));
-            full.push_str(&format!("[Image {}: {path}]", i + 1));
+            None => Some(crate::image::image_fallback_text(source)),
+        };
+        if let Some(line) = line {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&line);
         }
     }
     let mut w = proto::Writer::new();
     w.write_string(1, &random_uuid());
     w.write_varint(2, 1);
-    w.write_string(3, &full);
-    for block in images {
-        if let ContentBlock::Image { mime, hash, .. } = block {
-            match crate::vision::base64_payload(hash) {
-                Ok(data) => {
-                    let mut img = proto::Writer::new();
-                    img.write_string(1, &data);
-                    img.write_string(2, mime);
-                    w.write_message(10, &img);
-                }
-                Err(err) => log::warn!("image {hash} left out of the request: {err}"),
-            }
-        }
+    // An empty text field serializes to `{}` after the gateway's proto3 JSON pass,
+    // and the upstream rejects `text.text` as a missing required field — omit it like
+    // the assistant arm.
+    if !text.is_empty() {
+        w.write_string(3, &text);
+    }
+    for (mime, b64) in attachments {
+        let mut img = proto::Writer::new();
+        img.write_string(1, &b64);
+        img.write_string(2, &mime);
+        w.write_message(10, &img);
     }
     w
+}
+
+/// `[Image N: <path>]`, as the official CLI writes it, for an image that has a path.
+fn image_placeholder(n: usize, source: &ImageSource) -> Option<String> {
+    match source {
+        ImageSource::Stored {
+            hash, source_path, ..
+        } => {
+            let path = source_path
+                .clone()
+                .unwrap_or_else(|| format!("image-{}", hash.chars().take(12).collect::<String>()));
+            Some(format!("[Image {n}: {path}]"))
+        }
+        ImageSource::Path(path) => Some(format!("[Image {n}: {}]", path.display())),
+        ImageSource::Bytes { .. } => None,
+    }
 }
 
 /// Encode `GetChatMessageRequest` into protobuf bytes.
@@ -282,7 +327,7 @@ pub fn encode_get_chat_message_request(
     }
 
     // 3: repeated message
-    for msg in encode_messages(&req.messages) {
+    for msg in encode_messages(&req.messages, model_supports_vision(&req.model)) {
         w.write_message(3, &msg);
     }
 

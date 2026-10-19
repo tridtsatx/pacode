@@ -495,7 +495,7 @@ fn test_keymap_find_conflict() {
 
     // Unbound key has no conflict
     let unbound = Binding {
-        code: KeyCode::Char('z'),
+        code: KeyCode::Char('y'),
         mods: KeyModifiers::ALT,
     };
     assert_eq!(keymap.find_conflict(&unbound, Action::FollowAgent), None);
@@ -520,6 +520,10 @@ fn test_keymap_action_for() {
     );
     assert_eq!(
         keymap.action_for(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT)),
+        Some(Action::DeleteLine)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL)),
         Some(Action::DeleteWordForward)
     );
     assert_eq!(
@@ -551,6 +555,85 @@ fn test_rebind_select_agent_2_takes_effect() {
     // Old default binding (alt+2) no longer resolves to SelectAgent2
     let old_key = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT);
     assert_ne!(keymap.action_for(old_key), Some(Action::SelectAgent2));
+}
+
+#[test]
+fn test_picker_mark_actions_defaults_and_scope() {
+    // §9.1: alt is the primary spelling, ctrl the fallback for terminals
+    // that eat alt; both live in the registry, changeable from Keys.
+    let keymap = Keymap::defaults();
+    assert_eq!(
+        keymap.bindings_for(Action::ModelPickerFavorite),
+        &[
+            Binding {
+                code: KeyCode::Char('f'),
+                mods: KeyModifiers::ALT,
+            },
+            Binding {
+                code: KeyCode::Char('g'),
+                mods: KeyModifiers::CONTROL,
+            },
+        ]
+    );
+    assert_eq!(
+        keymap.bindings_for(Action::ModelPickerZdr),
+        &[
+            Binding {
+                code: KeyCode::Char('z'),
+                mods: KeyModifiers::ALT,
+            },
+            Binding {
+                code: KeyCode::Char('y'),
+                mods: KeyModifiers::CONTROL,
+            },
+        ]
+    );
+    assert_eq!(Action::ModelPickerFavorite.scope(), Scope::Picker);
+    assert_eq!(Action::ModelPickerZdr.scope(), Scope::Picker);
+    assert_eq!(Action::ModelPickerFavorite.name(), "model_picker_favorite");
+    assert_eq!(Action::ModelPickerZdr.name(), "model_picker_zdr");
+}
+
+#[test]
+fn test_shared_chords_resolve_to_their_global_owner() {
+    // The picker duplicates alt+f/alt+z under its own scope — in Normal
+    // focus the global actions must still win the shared ladder.
+    let keymap = Keymap::defaults();
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)),
+        Some(Action::FilesOverlay)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+        Some(Action::ToggleZdr)
+    );
+}
+
+#[test]
+fn test_find_conflict_is_scope_aware() {
+    let keymap = Keymap::defaults();
+    let alt_f = Binding {
+        code: KeyCode::Char('f'),
+        mods: KeyModifiers::ALT,
+    };
+
+    // alt+f is held by files_overlay — but the picker scope never meets the
+    // global ladder, so binding it on a picker action is not a conflict.
+    assert_eq!(
+        keymap.find_conflict(&alt_f, Action::ModelPickerFavorite),
+        None
+    );
+
+    // Inside the picker scope the same chord does collide: alt+z is
+    // model_picker_zdr's chord, so favorite cannot also claim it.
+    let alt_z = Binding {
+        code: KeyCode::Char('z'),
+        mods: KeyModifiers::ALT,
+    };
+    assert_eq!(
+        keymap.find_conflict(&alt_z, Action::ModelPickerFavorite),
+        Some(("model_picker_zdr", Action::ModelPickerZdr))
+    );
 }
 
 #[test]
@@ -591,4 +674,77 @@ fn test_queue_actions_present_in_defaults() {
             mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
         }]
     );
+}
+
+#[test]
+fn test_editing_actions_defaults_scope_and_resolution() {
+    let keymap = Keymap::defaults();
+
+    // ctrl+arrows: word jumps and whole-input boundaries.
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)),
+        Some(Action::MoveWordLeft)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)),
+        Some(Action::MoveWordRight)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+        Some(Action::MoveStart)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)),
+        Some(Action::MoveEnd)
+    );
+
+    // Delete chords: alt+delete kills the line, ctrl+delete the next word,
+    // ctrl/alt+backspace the previous word (ctrl+w stays).
+    assert_eq!(
+        keymap.bindings_for(Action::DeleteWordBack),
+        &[
+            Binding {
+                code: KeyCode::Char('w'),
+                mods: KeyModifiers::CONTROL,
+            },
+            Binding {
+                code: KeyCode::Backspace,
+                mods: KeyModifiers::CONTROL,
+            },
+            Binding {
+                code: KeyCode::Backspace,
+                mods: KeyModifiers::ALT,
+            },
+        ]
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        Some(Action::DeleteWordBack)
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+        Some(Action::DeleteWordBack)
+    );
+
+    // Plain arrows/backspace stay unbound — the code path owns them.
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        None
+    );
+    assert_eq!(
+        keymap.action_for(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        None
+    );
+
+    // All five are prompt-scoped and serialize to snake_case names.
+    for (act, name) in [
+        (Action::MoveWordLeft, "move_word_left"),
+        (Action::MoveWordRight, "move_word_right"),
+        (Action::MoveStart, "move_start"),
+        (Action::MoveEnd, "move_end"),
+        (Action::DeleteLine, "delete_line"),
+    ] {
+        assert_eq!(act.scope(), Scope::Prompt);
+        assert_eq!(act.name(), name);
+    }
 }

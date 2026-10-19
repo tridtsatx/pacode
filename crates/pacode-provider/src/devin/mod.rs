@@ -31,11 +31,11 @@ pub use connect::{
     CONNECT_FLAG_END_STREAM, ConnectClient, ConnectFrameDecoder, DecodedFrame, encode_connect_frame,
 };
 pub use proto::{ProtoError, Reader, WireType, WireValue, Writer, decode_varint, encode_varint};
-pub use stream::{DevinStreamOpener, create_devin_event_stream, devin_retrying_stream};
+pub use stream::{DevinStreamOpener, create_devin_event_stream};
 pub use tool_parser::{InlineToolCallParser, find_json_object_end};
 pub use wire::*;
 
-use crate::{CompletionRequest, EventStream, Provider, ProviderError, redact};
+use crate::{CompletionRequest, EventStream, Provider, ProviderError, RetryBudget, redact};
 
 #[cfg(test)]
 #[path = "../devin_tests.rs"]
@@ -316,6 +316,19 @@ impl Devin {
             if let Some(cw) = context_windows.get(representative) {
                 info.context_window = Some(*cw);
             }
+            if info.supported_efforts.is_none() {
+                // The catalog is per-model effort metadata already: each member
+                // id encodes one effort tier (ranks `none`/`minimal`/absent have
+                // no `Effort` counterpart and are skipped).
+                let efforts: Vec<Effort> = family
+                    .members
+                    .iter()
+                    .filter_map(|(rank, _)| rank.and_then(rank_to_effort))
+                    .collect();
+                if !efforts.is_empty() {
+                    info.supported_efforts = Some(efforts);
+                }
+            }
             all_models.push(info);
         }
 
@@ -355,17 +368,16 @@ impl Provider for Devin {
             req.model = resolved;
         }
 
-        if req.messages.iter().any(pacode_types::Message::has_images) {
-            let vision = self.model_info(&req.model).vision;
-            req.messages =
-                crate::vision::gate_images(&req.messages, &req.model, vision)?.into_owned();
-        }
-
         let assignment_jwt = if req.model.eq_ignore_ascii_case("adaptive") {
             // Must be the same id the chat request sends in field 16: the assignment
             // token is bound to the conversation.
             let conversation_id = crate::devin::wire::conversation_id(&req);
-            let latest_user_msg = req.messages.iter().rev().find(|m| m.role == Role::User);
+            let latest_user_msg = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .map(|m| &**m);
             let req_bytes = encode_assign_model_request(
                 &self.session_token,
                 "adaptive",
@@ -401,13 +413,13 @@ impl Provider for Devin {
             cfg: self.cfg.clone(),
             stream_idle_secs: self.defaults.stream_idle_secs,
             effort,
-            max_retries: self.defaults.max_retries,
             backoff_base: self.backoff_base,
             assignment_jwt,
         };
 
-        let inner = opener.open().await?;
-        Ok(devin_retrying_stream(opener, inner))
+        opener
+            .open(RetryBudget::new(self.defaults.max_retries))
+            .await
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -448,12 +460,24 @@ impl Provider for Devin {
             display_name,
             context_window,
             supports_reasoning,
-            // `adaptive` routes to a vision-capable model server side.
-            vision: model.eq_ignore_ascii_case("adaptive")
-                || crate::vision::heuristic_vision(model),
+            supports_vision: wire::model_supports_vision(model),
+            supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
             pricing,
             efforts: self.family_efforts(model),
             ..ModelInfo::default()
         }
+    }
+}
+
+/// Map a family-member effort rank (see `catalog::EFFORT_TIERS`) back to an
+/// [`Effort`]; `none`/`minimal` have no counterpart.
+fn rank_to_effort(rank: u8) -> Option<Effort> {
+    match rank {
+        2 => Some(Effort::Low),
+        3 => Some(Effort::Medium),
+        4 => Some(Effort::High),
+        5 => Some(Effort::XHigh),
+        6 => Some(Effort::Max),
+        _ => None,
     }
 }

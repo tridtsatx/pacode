@@ -122,14 +122,7 @@ impl Tool for UtilTool {
     }
 
     fn description(&self) -> &str {
-        "Run common text utilities in-process: wc head tail sort(-n -r -u -k -t) uniq(-c -d) \
-         cut tr nl tac rev paste join sed(s///, Np, N,Mp, Nd) jq diff(unified) tree basename \
-         dirname realpath stat du sha256sum md5sum base64 xxd. Prefer this over writing \
-         throw-away shell or python scripts for counting, filtering, slicing, sorting, JSON \
-         extraction, diffing and directory listings. `cmd` is a simple pipeline with `|`, e.g. \
-         `wc -l src/*.rs | sort -n` or `jq -r '.items[].name' data.json | sort -u`. Quotes and \
-         globs work; redirection, `;`, `&&`, subshells and $variables are not supported (use \
-         `bash`). Read-only, no process is spawned; unsupported flags fail with exit code 2."
+        include_str!("../prompts/util.md").trim()
     }
 
     fn schema(&self) -> Value {

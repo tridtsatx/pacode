@@ -6,6 +6,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{CronJobId, MonitorId};
+use crate::state::{
+    ID_MAX_CHARS, LimitError, LimitUnit, NAME_MAX_CHARS, TEXT_MAX_CHARS, check_bytes, check_chars,
+    limit_error,
+};
 
 /// Hard cap of cron jobs per session (`CoreError::TooManyCronJobs` above it).
 pub const MAX_CRON_JOBS: usize = 64;
@@ -15,6 +19,29 @@ pub const MAX_MONITORS: usize = 32;
 pub const MIN_MONITOR_POLL_SECS: u64 = 1;
 /// Poll interval used when the caller does not name one.
 pub const DEFAULT_MONITOR_POLL_SECS: u64 = 5;
+/// And no slower than this: a monitor nobody checks is a monitor that never fires.
+pub const MAX_MONITOR_POLL_SECS: u64 = 86_400;
+/// The latest instant a schedule is ever asked to work from, `9999-12-31T23:59:59.999Z`.
+/// Times come off the wire and out of the store, so the search the cron evaluator
+/// does from them is bounded here rather than allowed to run past the end of the
+/// millisecond range and wrap.
+pub const MAX_TIMESTAMP_MS: u64 = 253_402_300_799_999;
+/// Caps on the fields of a scheduled job and a monitor. Both are written by a
+/// model or a client, persisted, and shown in a list, so each is held to what
+/// that can survive.
+pub const CRON_EXPR_MAX_CHARS: usize = 200;
+pub const CRON_STATUS_MAX_CHARS: usize = 200;
+pub const MONITOR_LABEL_MAX_CHARS: usize = 120;
+pub const MONITOR_COMMAND_MAX_CHARS: usize = 4_000;
+pub const MONITOR_PATTERN_MAX_CHARS: usize = 1_000;
+pub const MONITOR_PATH_MAX_CHARS: usize = 4_000;
+
+/// Milliseconds in a seconds count, saturating: an interval that large is a
+/// mistyped number, and a run time in the far future is a better answer than a
+/// wrapped one that fires immediately.
+fn ms_from_secs(secs: u64) -> u64 {
+    secs.saturating_mul(1_000)
+}
 
 /// When a cron job runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,10 +64,12 @@ impl CronSchedule {
 
     /// Parse the model/user form: `every 90s`, `every 5m`, `every 2h`, `every 1d`,
     /// `every 30` (seconds), `@every 5m`, or a cron expression with five or six fields.
-    /// Returns `None` for an empty string or an interval without a number.
+    /// Returns `None` for an empty string, an interval without a number, or a
+    /// candidate longer than [`CRON_EXPR_MAX_CHARS`] — the parser has no use for
+    /// more text than a real expression takes.
     pub fn parse(raw: &str) -> Option<Self> {
         let text = raw.trim();
-        if text.is_empty() {
+        if text.is_empty() || text.chars().count() > CRON_EXPR_MAX_CHARS {
             return None;
         }
         let lower = text.to_ascii_lowercase();
@@ -73,11 +102,14 @@ impl CronSchedule {
     /// An interval counts from `after_ms` (which the caller sets to the previous
     /// run, or to now for a job that has never fired); an expression is evaluated
     /// in UTC. An expression that cannot be parsed or can never match is an error,
-    /// never a panic and never an unbounded search.
+    /// never a panic and never an unbounded search. `after_ms` is clamped to
+    /// [`MAX_TIMESTAMP_MS`] and every step saturates, so no value off the wire can
+    /// push the search or the addition past the end of the millisecond range.
     pub fn next_run_ms(&self, after_ms: u64) -> Result<u64, crate::cron_expr::CronError> {
+        let from = after_ms.min(MAX_TIMESTAMP_MS);
         match self {
-            Self::Every { secs } => Ok(after_ms.saturating_add(secs.max(&1) * 1000)),
-            Self::Cron { expr } => crate::cron_expr::CronExpr::parse(expr)?.next_after_ms(after_ms),
+            Self::Every { secs } => Ok(from.saturating_add(ms_from_secs((*secs).max(1)))),
+            Self::Cron { expr } => crate::cron_expr::CronExpr::parse(expr)?.next_after_ms(from),
         }
     }
 
@@ -86,6 +118,15 @@ impl CronSchedule {
         match self {
             Self::Every { .. } => Ok(()),
             Self::Cron { expr } => crate::cron_expr::CronExpr::parse(expr).map(|_| ()),
+        }
+    }
+
+    /// Whether the schedule text fits the caps of the scheduled-job DTOs, for a
+    /// request or a persisted job that has not been parsed yet.
+    pub fn check_size(&self) -> Result<(), LimitError> {
+        match self {
+            Self::Every { .. } => Ok(()),
+            Self::Cron { expr } => check_chars("cron expression", expr, CRON_EXPR_MAX_CHARS),
         }
     }
 
@@ -212,6 +253,20 @@ impl CronJob {
         let last = self.last_status.as_deref().unwrap_or("never run");
         format!("{} [{state}] {name} next in {next} last: {last}", self.id)
     }
+
+    /// Whether the job fits the caps of the scheduled-job DTOs, for a request or
+    /// a record that came back out of the store.
+    pub fn validate(&self) -> Result<(), LimitError> {
+        check_chars("cron id", self.id.as_str(), ID_MAX_CHARS)?;
+        check_chars("cron name", &self.name, NAME_MAX_CHARS)?;
+        check_bytes("cron prompt", &self.prompt, TEXT_MAX_CHARS)?;
+        check_chars(
+            "cron last status",
+            self.last_status.as_deref().unwrap_or(""),
+            CRON_STATUS_MAX_CHARS,
+        )?;
+        self.schedule.check_size()
+    }
 }
 
 /// What a monitor waits for.
@@ -280,6 +335,23 @@ impl MonitorCondition {
             Self::FileExists { .. } | Self::FileMatches { .. } => false,
         }
     }
+
+    /// Whether the condition fits the caps of the monitor DTOs.
+    pub fn check_size(&self) -> Result<(), LimitError> {
+        match self {
+            Self::CommandSucceeds { command } => {
+                check_chars("monitor command", command, MONITOR_COMMAND_MAX_CHARS)
+            }
+            Self::ProcessGone { pattern } => {
+                check_chars("monitor pattern", pattern, MONITOR_PATTERN_MAX_CHARS)
+            }
+            Self::FileExists { path } => check_chars("monitor path", path, MONITOR_PATH_MAX_CHARS),
+            Self::FileMatches { path, pattern } => {
+                check_chars("monitor path", path, MONITOR_PATH_MAX_CHARS)?;
+                check_chars("monitor pattern", pattern, MONITOR_PATTERN_MAX_CHARS)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,7 +415,7 @@ impl MonitorInfo {
         // interval before the first look would miss a condition that already holds.
         match self.last_check_ms {
             None => Some(self.started_at_ms),
-            Some(last) => Some(last.saturating_add(self.poll_interval_secs.saturating_mul(1_000))),
+            Some(last) => Some(last.saturating_add(ms_from_secs(self.poll_interval_secs))),
         }
     }
 
@@ -352,12 +424,29 @@ impl MonitorInfo {
         Some(self.next_check_at_ms()?.saturating_sub(now_ms))
     }
 
-    /// Clamp a requested interval to the floor and the default.
+    /// Clamp a requested interval to the floor and the default. An interval past
+    /// [`MAX_MONITOR_POLL_SECS`] is a mistyped number: it would mean a monitor
+    /// nobody expects to fire for a day, so it comes back as the ceiling.
     pub fn normalize_poll_interval(requested: Option<u64>) -> u64 {
         requested
             .filter(|secs| *secs > 0)
             .unwrap_or(DEFAULT_MONITOR_POLL_SECS)
-            .max(MIN_MONITOR_POLL_SECS)
+            .clamp(MIN_MONITOR_POLL_SECS, MAX_MONITOR_POLL_SECS)
+    }
+
+    /// Whether the monitor fits the caps of the monitor DTOs.
+    pub fn validate(&self) -> Result<(), LimitError> {
+        check_chars("monitor id", self.id.as_str(), ID_MAX_CHARS)?;
+        check_chars("monitor label", &self.label, MONITOR_LABEL_MAX_CHARS)?;
+        if self.status.is_live() && self.poll_interval_secs > MAX_MONITOR_POLL_SECS {
+            return Err(limit_error(
+                "monitor poll interval",
+                usize::try_from(self.poll_interval_secs).unwrap_or(usize::MAX),
+                MAX_MONITOR_POLL_SECS as usize,
+                LimitUnit::Seconds,
+            ));
+        }
+        self.condition.check_size()
     }
 
     pub fn summary_line(&self) -> String {

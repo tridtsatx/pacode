@@ -5,14 +5,18 @@ use pacode_skills::SkillRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use super::helpers::{cap_output, parse_input, preview_body};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "skill";
+
+/// Model-facing description; see `prompts/skill.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/skill.md");
 
 pub struct SkillTool {
     registry: Arc<SkillRegistry>,
     max_body_bytes: usize,
+    definition: DefinitionCache,
 }
 
 impl SkillTool {
@@ -20,16 +24,14 @@ impl SkillTool {
         Self {
             registry,
             max_body_bytes,
+            definition: DefinitionCache::new(),
         }
     }
 }
 
 impl Default for SkillTool {
     fn default() -> Self {
-        Self {
-            registry: Arc::new(SkillRegistry::default()),
-            max_body_bytes: 16384,
-        }
+        Self::new(Arc::new(SkillRegistry::default()), 16384)
     }
 }
 
@@ -46,7 +48,10 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        "Load the full instructions and content for a skill by name."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
@@ -80,7 +85,7 @@ impl Tool for SkillTool {
 
         let content = cap_output(&body, accept_large_output, ctx.output_cap_chars);
         let title = format!("Skill {name}");
-        let preview = format!("{} bytes", body.len());
+        let preview = preview_body(&content);
 
         Ok(ToolOutput::text(content)
             .with_title(title)

@@ -68,6 +68,30 @@ impl ImportSource {
             Self::VsCode => "VS Code",
         }
     }
+
+    /// The files and directories [`discover`] consults for this source, the
+    /// primary config first. A UI uses this to tell "the agent is not
+    /// installed / nothing is configured" (no watched path exists) apart from
+    /// "config present but empty", and to label a source section with the
+    /// path that was actually read. Keep in sync with `mcp::discover_mcp`
+    /// and `skills::discover_skills`.
+    pub fn watch_paths(&self, home: &Path, cwd: &Path) -> Vec<PathBuf> {
+        match self {
+            Self::ClaudeCode => vec![
+                home.join(".claude.json"),
+                cwd.join(".mcp.json"),
+                home.join(".claude"),
+            ],
+            Self::Codex => vec![home.join(".codex").join("config.toml")],
+            Self::OpenCode => vec![
+                home.join(".config").join("opencode").join("opencode.json"),
+                home.join(".config").join("opencode"),
+            ],
+            Self::Cursor => vec![home.join(".cursor").join("mcp.json")],
+            Self::GeminiCli => vec![home.join(".gemini").join("settings.json")],
+            Self::VsCode => vec![cwd.join(".vscode").join("mcp.json")],
+        }
+    }
 }
 
 impl std::fmt::Display for ImportSource {

@@ -1,5 +1,5 @@
 use super::*;
-use pacode_types::AgentId;
+use pacode_types::{AgentId, ExplainLevel};
 use std::time::Duration;
 
 #[test]
@@ -130,6 +130,238 @@ fn test_enforce_cap_retains_live_cell() {
     assert_eq!(t.cells[0].id, 2);
     assert_eq!(t.cells[1].id, 3);
     assert_eq!(t.live_cell, Some(3));
+}
+
+#[test]
+fn cap_does_not_evict_the_new_tail_to_make_room_for_a_pinned_live_cell() {
+    let mut t = Transcript::new(1);
+    let now = Instant::now();
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: AgentId::main(),
+            ts_ms: 1,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.upsert(
+        TranscriptItem {
+            seq: 2,
+            agent: AgentId::main(),
+            ts_ms: 2,
+            kind: TranscriptKind::User {
+                text: "tail".into(),
+            },
+        },
+        now,
+    );
+
+    assert_eq!(
+        t.cells.iter().map(|cell| cell.id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(t.live_cell, Some(1));
+}
+
+#[test]
+fn prepend_over_cap_advances_history_and_keeps_the_live_tail() {
+    let mut t = Transcript::new(3);
+    let now = Instant::now();
+    for seq in 10..=11 {
+        t.upsert(
+            TranscriptItem {
+                seq,
+                agent: AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::User {
+                    text: seq.to_string(),
+                },
+            },
+            now,
+        );
+    }
+    t.upsert(
+        TranscriptItem {
+            seq: 12,
+            agent: AgentId::main(),
+            ts_ms: 12,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+
+    let shift = t.prepend(
+        (7..=9)
+            .map(|seq| TranscriptItem {
+                seq,
+                agent: AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::User {
+                    text: seq.to_string(),
+                },
+            })
+            .collect(),
+        false,
+    );
+
+    assert_eq!(shift, 0);
+    assert_eq!(
+        t.cells.iter().map(|cell| cell.id).collect::<Vec<_>>(),
+        vec![7, 8, 9, 12]
+    );
+    assert_eq!(t.oldest_seq(), Some(7));
+    assert_eq!(t.live_cell, Some(12));
+}
+
+#[test]
+fn a_late_update_cannot_resurrect_an_evicted_cell() {
+    let mut t = Transcript::new(2);
+    let now = Instant::now();
+    for seq in 1..=3 {
+        t.upsert(
+            TranscriptItem {
+                seq,
+                agent: AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::User {
+                    text: seq.to_string(),
+                },
+            },
+            now,
+        );
+    }
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: AgentId::main(),
+            ts_ms: 4,
+            kind: TranscriptKind::Notice {
+                level: pacode_types::ToastLevel::Info,
+                text: "late".into(),
+            },
+        },
+        now,
+    );
+
+    assert_eq!(
+        t.cells.iter().map(|cell| cell.id).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+}
+
+#[test]
+fn a_late_update_cannot_resurrect_a_tail_evicted_by_pagination() {
+    let mut t = Transcript::new(3);
+    let now = Instant::now();
+    for seq in 10..=12 {
+        t.upsert(
+            TranscriptItem {
+                seq,
+                agent: AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::User {
+                    text: seq.to_string(),
+                },
+            },
+            now,
+        );
+    }
+    t.prepend(
+        (7..=9)
+            .map(|seq| TranscriptItem {
+                seq,
+                agent: AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::User {
+                    text: seq.to_string(),
+                },
+            })
+            .collect(),
+        false,
+    );
+    t.upsert(
+        TranscriptItem {
+            seq: 11,
+            agent: AgentId::main(),
+            ts_ms: 11,
+            kind: TranscriptKind::Notice {
+                level: pacode_types::ToastLevel::Info,
+                text: "late".into(),
+            },
+        },
+        now,
+    );
+
+    assert_eq!(
+        t.cells.iter().map(|cell| cell.id).collect::<Vec<_>>(),
+        vec![7, 8, 9]
+    );
+}
+
+#[test]
+fn prepend_keeps_a_multiline_anchor_at_the_same_viewport_position() {
+    let page: Vec<_> = (7..9)
+        .map(|seq| TranscriptItem {
+            seq,
+            agent: AgentId::main(),
+            ts_ms: seq,
+            kind: TranscriptKind::User {
+                text: format!("{seq} first\n{seq} second"),
+            },
+        })
+        .collect();
+    let opts = pacode_render::RenderOptions::new(30, false);
+    let mut expected = Transcript::new(16);
+    expected.reset(page.clone(), false);
+    let expected_shift = crate::ui::dialog::plain_lines(
+        &mut expected,
+        30,
+        &opts,
+        0,
+        0,
+        crate::ui::dialog::PlainWindow {
+            lines: None,
+            max_bytes: crate::state::selection::MAX_SELECTION_BYTES,
+        },
+    )
+    .lines
+    .len();
+
+    let mut t = Transcript::new(16);
+    t.reset(
+        (10..13)
+            .map(|seq| TranscriptItem {
+                seq,
+                agent: AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::User {
+                    text: format!("{seq} first\n{seq} second"),
+                },
+            })
+            .collect(),
+        true,
+    );
+    let area = ratatui::layout::Rect::new(0, 0, 30, 2);
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    t.scroll_to_top();
+    let before = t.cell_screen_position(10, 2);
+    assert_eq!(before, Some(0));
+
+    let page_len = page.len();
+    let shift = t.prepend(page, false);
+    assert_eq!(shift, expected_shift);
+    assert!(shift > page_len);
+
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    assert_eq!(t.cell_screen_position(10, 2), before);
 }
 
 #[test]
@@ -328,6 +560,29 @@ fn test_reset_keeps_the_daemon_page_whole() {
 }
 
 #[test]
+fn reset_clears_render_and_expansion_metadata() {
+    let mut t = Transcript::new(8);
+    t.cells.push_back(tool_cell(1, "a\nb"));
+    t.toggle_expanded(1);
+    t.cell_lines = vec![(1, 0, 2)];
+    t.record_render(20, 5);
+    t.scroll_by(10);
+    t.first_visible_line = 7;
+
+    t.reset(Vec::new(), false);
+
+    assert!(t.expanded.is_empty());
+    assert!(t.cell_lines.is_empty());
+    assert!(t.cell_line_index.is_empty());
+    assert!(t.cells.is_empty());
+    assert_eq!(t.bytes(), 0);
+    assert_eq!(t.scroll_from_bottom, 0);
+    assert_eq!(t.first_visible_line, 0);
+    assert_eq!(t.rendered_lines, None);
+    assert_eq!(t.viewport_height, None);
+}
+
+#[test]
 fn test_lazy_loader_prepend_keeps_anchored_cell_position() {
     let mut t = Transcript::new(500);
     let initial_items: Vec<TranscriptItem> = (10..30)
@@ -335,50 +590,49 @@ fn test_lazy_loader_prepend_keeps_anchored_cell_position() {
             seq: i,
             agent: AgentId::main(),
             ts_ms: i * 10,
-            kind: TranscriptKind::User {
-                text: format!("msg {i}"),
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: true,
             },
         })
         .collect();
 
     t.reset(initial_items, true);
-    let viewport = 10;
-    // Scroll to the top (max_scroll = 20 - 10 = 10)
-    t.record_render(20, viewport);
-    t.scroll_by(100);
-    assert_eq!(t.scroll_from_bottom, 10);
+    let opts = pacode_render::RenderOptions::new(80, false);
+    let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    t.scroll_to_top();
 
-    // Anchor cell is cell id 10 at the top of the viewport
     let anchor_id = 10;
-    let pos_before = t.cell_screen_position(anchor_id, viewport);
+    let pos_before = t.cell_screen_position(anchor_id, area.height as usize);
     assert_eq!(pos_before, Some(0));
 
-    // Also check another cell in the viewport (cell 15 at screen line 5)
     let mid_id = 15;
-    let pos_mid_before = t.cell_screen_position(mid_id, viewport);
+    let pos_mid_before = t.cell_screen_position(mid_id, area.height as usize);
     assert_eq!(pos_mid_before, Some(5));
 
-    // Prepend 10 older items (ids 0..10)
     let older: Vec<TranscriptItem> = (0..10)
         .map(|i| TranscriptItem {
             seq: i,
             agent: AgentId::main(),
             ts_ms: i * 10,
-            kind: TranscriptKind::User {
-                text: format!("msg {i}"),
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: true,
             },
         })
         .collect();
     t.prepend(older, false);
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
 
-    // The anchored cells must remain at the exact same screen position
-    let pos_after = t.cell_screen_position(anchor_id, viewport);
-    assert_eq!(pos_after, pos_before);
-    assert_eq!(pos_after, Some(0));
-
-    let pos_mid_after = t.cell_screen_position(mid_id, viewport);
-    assert_eq!(pos_mid_after, pos_mid_before);
-    assert_eq!(pos_mid_after, Some(5));
+    assert_eq!(
+        t.cell_screen_position(anchor_id, area.height as usize),
+        pos_before
+    );
+    assert_eq!(
+        t.cell_screen_position(mid_id, area.height as usize),
+        pos_mid_before
+    );
 }
 
 #[test]
@@ -587,6 +841,223 @@ fn a_delta_for_an_unknown_cell_is_ignored_and_leaves_the_live_cell_alone() {
     }
 }
 
+fn tool_item(seq: u64, agent: &AgentId) -> TranscriptItem {
+    TranscriptItem {
+        seq,
+        agent: agent.clone(),
+        ts_ms: seq,
+        kind: TranscriptKind::ToolCall {
+            call_id: pacode_types::CallId::new(format!("call_{seq}")),
+            name: "bash".into(),
+            title: "bash echo".into(),
+            intent: None,
+            status: pacode_types::ToolStatus::Running,
+            preview: String::new(),
+            diff: None,
+            duration_ms: None,
+            task: None,
+        },
+    }
+}
+
+/// A tool item arriving while the paced reveal still holds buffered text used
+/// to be appended below the unrevealed backlog, which split the answer around
+/// the tool. A terminal cell now flushes the backlog first, so the on-screen
+/// order matches the wire order.
+#[test]
+fn a_tool_cell_lands_after_the_answer_text_it_follows_on_the_wire() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    // Buffered into the paced stream but not yet revealed into the cell.
+    t.push_delta(1, "part one", false, now);
+    assert!(t.has_backlog());
+
+    t.upsert(tool_item(2, &agent), now);
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 1);
+    assert_eq!(t.cells[1].id, 2);
+    // The backlog was flushed into the answer cell, not dropped.
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+            assert_eq!(text, "part one");
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
+
+/// Deltas that arrive after the tool cell still belong to the answer cell
+/// above it — the tool keeps its position and the answer keeps growing.
+#[test]
+fn deltas_after_a_tool_cell_still_reach_the_answer_above_it() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(1, "part one", false, now);
+    t.upsert(tool_item(2, &agent), now);
+
+    t.push_delta(1, " and part two", false, now);
+    t.flush_stream();
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 1);
+    assert_eq!(t.cells[1].id, 2);
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+            assert_eq!(text, "part one and part two");
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
+
+/// A completed answer waiting behind a drained-looking backlog (`pending_final`)
+/// is flushed by a terminal cell too, not just raw stream text.
+#[test]
+fn a_terminal_cell_flushes_a_pending_final() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(1, "part one", false, now);
+    // The finished item waits for the backlog instead of cutting in.
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 1,
+            kind: TranscriptKind::Assistant {
+                text: "part one".into(),
+                complete: true,
+            },
+        },
+        now,
+    );
+    assert!(t.has_pending_final());
+
+    t.push_cell(tool_cell(2, "done"));
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 1);
+    assert!(
+        is_client_id(t.cells[1].id),
+        "a client row carries a client id, never a daemon seq"
+    );
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, complete }) => {
+            assert_eq!(text, "part one");
+            assert!(complete);
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
+
+/// Updating a cell that already exists replaces it in place: it cannot jump
+/// the queue, so it must not flush the backlog either.
+#[test]
+fn updating_an_existing_cell_does_not_flush_or_reorder() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    let agent = AgentId::main();
+
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: agent.clone(),
+            ts_ms: 0,
+            kind: TranscriptKind::Assistant {
+                text: String::new(),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.push_delta(1, "part one", false, now);
+    t.upsert(tool_item(2, &agent), now);
+    assert_eq!(t.cells.len(), 2);
+
+    // More text streams in after the tool landed — backlog again.
+    t.push_delta(1, " more", false, now);
+    assert!(t.has_backlog());
+
+    // An `ItemUpdated` for the existing tool cell replaces it in place and
+    // leaves the pending backlog alone.
+    let mut updated = tool_item(2, &agent);
+    updated.kind = TranscriptKind::ToolCall {
+        call_id: pacode_types::CallId::new("call_2"),
+        name: "bash".into(),
+        title: "bash echo".into(),
+        intent: None,
+        status: pacode_types::ToolStatus::Ok,
+        preview: "done".into(),
+        diff: None,
+        duration_ms: Some(10),
+        task: None,
+    };
+    t.upsert(updated, now);
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 1);
+    assert_eq!(t.cells[1].id, 2);
+    assert!(
+        t.has_backlog(),
+        "an in-place update must not drain the stream"
+    );
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::Assistant { text, .. }) => {
+            assert_eq!(text, "part one");
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+    match &t.cells[1].kind {
+        CellKind::Item(TranscriptKind::ToolCall {
+            preview, status, ..
+        }) => {
+            assert_eq!(preview, "done");
+            assert_eq!(*status, pacode_types::ToolStatus::Ok);
+        }
+        other => panic!("unexpected cell {other:?}"),
+    }
+}
+
 fn tool_cell(id: u64, preview: &str) -> Cell {
     Cell {
         id,
@@ -604,6 +1075,7 @@ fn tool_cell(id: u64, preview: &str) -> Cell {
         version: 0,
         ts_ms: id,
         stats: None,
+        perm_explain: None,
     }
 }
 
@@ -624,6 +1096,103 @@ fn clicking_a_cell_toggles_its_expansion_and_an_unknown_cell_is_ignored() {
 }
 
 #[test]
+fn ctrl_o_expands_the_newest_tool_cell_and_collapses_it_back() {
+    let mut t = Transcript::new(8);
+    let long: String = (1..=12)
+        .map(|i| format!("row {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    t.cells.push_back(tool_cell(1, "short"));
+    t.cells.push_back(tool_cell(2, &long));
+    t.cells.push_back(tool_cell(3, "tiny"));
+
+    // The newest tool cell is always the target — expansion also reveals the
+    // call's full argument, so a short preview is still worth expanding.
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(3));
+    assert!(!t.is_expanded(1));
+    assert!(!t.is_expanded(2));
+
+    // Second press toggles the same cell back.
+    assert!(t.toggle_last_expandable());
+    assert!(!t.is_expanded(3));
+}
+
+/// B24: a `!cmd` result folds like a bash call, so `ctrl+o` must reach it.
+#[test]
+fn ctrl_o_expands_a_bang_command_result() {
+    let mut t = Transcript::new(8);
+    t.cells.push_back(tool_cell(1, "older tool call"));
+    t.cells.push_back(Cell {
+        id: 2,
+        kind: CellKind::Item(pacode_types::TranscriptKind::BashCommand {
+            command: "seq 40".into(),
+            output: "1\n2".into(),
+            exit_code: Some(0),
+            truncated: false,
+        }),
+        version: 0,
+        ts_ms: 2,
+        stats: None,
+        perm_explain: None,
+    });
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(2));
+    assert!(!t.is_expanded(1));
+}
+
+/// The orchestrator <-> subagent exchange folds to its first line, so
+/// `ctrl+o` must reach it like a tool call.
+#[test]
+fn ctrl_o_expands_an_agent_exchange_cell() {
+    let mut t = Transcript::new(8);
+    t.cells.push_back(tool_cell(1, "older tool call"));
+    t.cells.push_back(Cell {
+        id: 2,
+        kind: CellKind::Item(pacode_types::TranscriptKind::AgentMessage {
+            subagent: pacode_types::AgentId::new("agt_1"),
+            subagent_name: "tests".into(),
+            direction: pacode_types::AgentMessageDirection::Question,
+            text: "which db?\nwith details".into(),
+            reply: None,
+        }),
+        version: 0,
+        ts_ms: 2,
+        stats: None,
+        perm_explain: None,
+    });
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(2));
+    assert!(!t.is_expanded(1));
+}
+
+#[test]
+fn ctrl_o_expands_short_and_denied_cells_too() {
+    // A single-line output still expands — the expanded cell also spells out
+    // the call's full argument.
+    let mut t = Transcript::new(8);
+    t.cells.push_back(tool_cell(1, "only one line"));
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(1));
+
+    // A denied call expands too: its one-line "Denied" preview used to make
+    // the cell look unexpandable, but the refused command is exactly what the
+    // reader wants to see.
+    let mut denied_cell = tool_cell(1, "Denied");
+    if let CellKind::Item(TranscriptKind::ToolCall { ref mut status, .. }) = denied_cell.kind {
+        *status = pacode_types::ToolStatus::Denied;
+    }
+    let mut t = Transcript::new(8);
+    t.cells.push_back(denied_cell);
+    assert!(t.toggle_last_expandable());
+    assert!(t.is_expanded(1));
+
+    // With no tool cell at all there is nothing to toggle.
+    let mut t = Transcript::new(8);
+    assert!(!t.toggle_last_expandable());
+}
+
+#[test]
 fn an_evicted_cell_takes_its_expansion_with_it() {
     let mut t = Transcript::new(2);
     t.cells.push_back(tool_cell(1, "a"));
@@ -632,7 +1201,7 @@ fn an_evicted_cell_takes_its_expansion_with_it() {
     assert!(t.is_expanded(1));
 
     t.cells.push_back(tool_cell(3, "c"));
-    t.enforce_cap();
+    t.set_max_cells(2);
 
     assert_eq!(t.cells.len(), 2);
     assert!(
@@ -652,4 +1221,411 @@ fn a_content_line_maps_back_to_the_cell_drawn_there() {
     assert_eq!(t.cell_at_line(8), Some(11));
     assert_eq!(t.cell_at_line(9), Some(12));
     assert_eq!(t.cell_at_line(10), None);
+}
+
+fn perm_request(id: &str, title: &str) -> PermissionRequest {
+    PermissionRequest {
+        id: PermissionId::new(id),
+        agent: AgentId::main(),
+        agent_name: "main".into(),
+        call_id: pacode_types::CallId::new("call_1"),
+        tool: "bash".into(),
+        title: title.into(),
+        detail: String::new(),
+        risk: Some(pacode_types::RiskLevel::Confirm),
+        created_at_ms: 1,
+    }
+}
+
+/// The daemon emits the same request as an event AND as a transcript item
+/// (and again in a snapshot's `pending_permissions`) — all three writes must
+/// land on one prompt cell.
+#[test]
+fn a_permission_request_lands_once_no_matter_how_often_it_arrives() {
+    let mut t = Transcript::new(16);
+    t.upsert_permission(perm_request("perm_1", "Bash: rm -rf /tmp/x"), 1, 10);
+    // The ItemAdded echo — a different seq, the same request id.
+    t.upsert(
+        TranscriptItem {
+            seq: 42,
+            agent: AgentId::main(),
+            ts_ms: 2,
+            kind: TranscriptKind::Permission(perm_request("perm_1", "Bash: rm -rf /tmp/x")),
+        },
+        Instant::now(),
+    );
+    // …and the snapshot's pending_permissions repeat.
+    t.upsert_permission(perm_request("perm_1", "Bash: rm -rf /tmp/x"), 3, 99);
+
+    let prompts: Vec<&Cell> = t
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Item(TranscriptKind::Permission(_))))
+        .collect();
+    assert_eq!(prompts.len(), 1, "one request must render one prompt");
+    // The first write keeps the slot; the echoes refresh it in place. The slot
+    // is filed under a client id: the seqs handed to `upsert_permission` come
+    // from the event counter, not from the transcript.
+    assert!(is_client_id(prompts[0].id));
+    assert_eq!(prompts[0].ts_ms, 3);
+
+    // A different request is a different prompt.
+    t.upsert_permission(perm_request("perm_2", "Bash: ls"), 4, 12);
+    assert_eq!(t.cells.len(), 2);
+}
+
+#[test]
+fn set_perm_explain_marks_the_prompt_and_reports_a_miss() {
+    let mut t = Transcript::new(16);
+    t.upsert_permission(perm_request("perm_1", "Bash: rm -rf /tmp/x"), 1, 10);
+
+    assert!(t.set_perm_explain(&PermissionId::new("perm_1"), &PermExplain::Requested));
+    assert_eq!(t.cells[0].perm_explain, Some(PermExplain::Requested));
+
+    // A landing answer replaces the mark rather than stacking.
+    let done = PermExplain::Done {
+        text: "deletes the dir".into(),
+        level: Some(ExplainLevel::High),
+    };
+    assert!(t.set_perm_explain(&PermissionId::new("perm_1"), &done));
+    assert_eq!(t.cells[0].perm_explain, Some(done));
+
+    // An unknown id lands nowhere.
+    assert!(!t.set_perm_explain(&PermissionId::new("perm_zzz"), &PermExplain::Requested));
+
+    // Once the verdict swapped the prompt for a notice, a late answer has no
+    // target — the caller falls back to a notice of its own.
+    t.cells[0].kind = CellKind::Item(TranscriptKind::Notice {
+        level: pacode_types::ToastLevel::Warn,
+        text: "Denied".into(),
+    });
+    assert!(!t.set_perm_explain(&PermissionId::new("perm_1"), &PermExplain::Requested));
+}
+
+fn user_item(seq: u64, text: &str) -> TranscriptItem {
+    TranscriptItem {
+        seq,
+        agent: AgentId::main(),
+        ts_ms: seq,
+        kind: TranscriptKind::User {
+            text: text.to_string(),
+        },
+    }
+}
+
+fn notice(ts_ms: u64, text: &str) -> Cell {
+    Cell {
+        id: ts_ms,
+        kind: CellKind::Item(TranscriptKind::Notice {
+            level: pacode_types::ToastLevel::Info,
+            text: text.to_string(),
+        }),
+        version: 0,
+        ts_ms,
+        stats: None,
+        perm_explain: None,
+    }
+}
+
+#[test]
+fn two_client_rows_in_the_same_millisecond_are_two_rows() {
+    let mut t = Transcript::new(16);
+    t.upsert(user_item(1, "hello"), Instant::now());
+    t.push_cell(notice(1_700_000_000_000, "first"));
+    t.push_cell(notice(1_700_000_000_000, "second"));
+
+    assert_eq!(t.cells.len(), 3, "a shared clock must not merge two rows");
+    let ids: Vec<u64> = t.cells.iter().map(|cell| cell.id).collect();
+    assert_eq!(ids[0], 1);
+    assert!(is_client_id(ids[1]) && is_client_id(ids[2]));
+    assert_ne!(ids[1], ids[2]);
+}
+
+#[test]
+fn a_client_row_never_lands_on_a_transcript_item() {
+    let mut t = Transcript::new(16);
+    t.upsert(user_item(7, "kept"), Instant::now());
+    // The event counter hands the client the same number the item counter uses.
+    t.push_cell(notice(7, "event 7"));
+
+    assert_eq!(t.cells.len(), 2);
+    assert_eq!(t.cells[0].id, 7);
+    match &t.cells[0].kind {
+        CellKind::Item(TranscriptKind::User { text }) => assert_eq!(text, "kept"),
+        other => panic!("the item was replaced: {other:?}"),
+    }
+}
+
+#[test]
+fn a_client_row_never_moves_the_eviction_floor_over_a_real_seq() {
+    let mut t = Transcript::new(3);
+    let now = Instant::now();
+    for seq in 10..=12 {
+        t.upsert(user_item(seq, &seq.to_string()), now);
+    }
+    // A notice whose id is a wall clock: eviction must not read it as a seq.
+    t.push_cell(notice(1_700_000_000_000, "paged"));
+    t.prepend(
+        (7..=9)
+            .map(|seq| user_item(seq, &seq.to_string()))
+            .collect(),
+        false,
+    );
+
+    t.upsert(user_item(13, "late"), now);
+    t.upsert(notice_item(14, "late notice"), now);
+
+    let ids: Vec<u64> = t.cells.iter().map(|cell| cell.id).collect();
+    assert!(
+        ids.contains(&13) && ids.contains(&14),
+        "a client row must not push the floor past a real seq: {ids:?}"
+    );
+}
+
+fn notice_item(seq: u64, text: &str) -> TranscriptItem {
+    TranscriptItem {
+        seq,
+        agent: AgentId::main(),
+        ts_ms: seq,
+        kind: TranscriptKind::Notice {
+            level: pacode_types::ToastLevel::Info,
+            text: text.to_string(),
+        },
+    }
+}
+
+#[test]
+fn a_history_cursor_never_points_at_a_client_row() {
+    let mut t = Transcript::new(16);
+    t.upsert(user_item(4, "oldest daemon row"), Instant::now());
+    t.push_cell(notice(1_700_000_000_000, "notice"));
+    assert_eq!(
+        t.oldest_seq(),
+        Some(4),
+        "GetHistory must be asked for the oldest item seq, not a clock"
+    );
+}
+
+#[test]
+fn the_byte_cap_drops_the_oldest_rows_but_keeps_the_stream_and_the_prompt() {
+    let mut t = Transcript::new(64);
+    let now = Instant::now();
+    t.set_max_bytes(4_000);
+    t.upsert(
+        TranscriptItem {
+            seq: 1,
+            agent: AgentId::main(),
+            ts_ms: 1,
+            kind: TranscriptKind::Assistant {
+                text: "x".repeat(1_000),
+                complete: false,
+            },
+        },
+        now,
+    );
+    t.upsert_permission(perm_request("perm_1", "Bash: ls"), 2, 1_700_000_000_000);
+    for seq in 2..8 {
+        t.upsert(
+            TranscriptItem {
+                seq,
+                agent: AgentId::main(),
+                ts_ms: seq,
+                kind: TranscriptKind::ToolCall {
+                    call_id: pacode_types::CallId::new(format!("call_{seq}")),
+                    name: "bash".into(),
+                    title: "bash".into(),
+                    intent: None,
+                    status: pacode_types::ToolStatus::Ok,
+                    preview: "y".repeat(1_000),
+                    diff: None,
+                    duration_ms: None,
+                    task: None,
+                },
+            },
+            now,
+        );
+    }
+
+    assert!(t.bytes() > 4_000 || t.cells.len() < 8, "the cap must bite");
+    assert_eq!(t.live_cell, Some(1), "the streaming row is pinned");
+    assert!(
+        t.cells
+            .iter()
+            .any(|cell| matches!(&cell.kind, CellKind::Item(TranscriptKind::Permission(_)))),
+        "a prompt waiting for a verdict is pinned"
+    );
+    assert_eq!(
+        t.oldest_seq(),
+        Some(1),
+        "the oldest row is the one that goes"
+    );
+}
+
+#[test]
+fn an_update_after_an_eviction_replaces_the_row_instead_of_copying_it() {
+    let mut t = Transcript::new(2);
+    let now = Instant::now();
+    t.upsert(user_item(1, "one"), now);
+    t.upsert(user_item(2, "two"), now);
+    t.upsert(user_item(3, "three"), now);
+    assert_eq!(
+        t.cells.iter().map(|cell| cell.id).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+
+    t.upsert(user_item(2, "two again"), now);
+    t.upsert(user_item(3, "three again"), now);
+    assert_eq!(
+        t.cells.iter().map(|cell| cell.id).collect::<Vec<_>>(),
+        vec![2, 3],
+        "an eviction that left the length unchanged must not stale the lookup"
+    );
+    assert_eq!(t.cells.len(), 2);
+}
+
+#[test]
+fn a_repeated_permission_in_a_history_page_does_not_prompt_twice() {
+    let mut t = Transcript::new(16);
+    t.upsert_permission(perm_request("perm_1", "Bash: ls"), 1, 1_700_000_000_000);
+    t.prepend(
+        vec![TranscriptItem {
+            seq: 3,
+            agent: AgentId::main(),
+            ts_ms: 3,
+            kind: TranscriptKind::Permission(perm_request("perm_1", "Bash: ls")),
+        }],
+        false,
+    );
+
+    let prompts = t
+        .cells
+        .iter()
+        .filter(|cell| matches!(cell.kind, CellKind::Item(TranscriptKind::Permission(_))))
+        .count();
+    assert_eq!(prompts, 1);
+}
+
+/// The same tool item once its call is over: the daemon's preview is the body.
+fn finished_tool_item(seq: u64, preview: &str) -> TranscriptItem {
+    let mut item = tool_item(seq, &AgentId::main());
+    if let TranscriptKind::ToolCall {
+        status,
+        preview: body,
+        ..
+    } = &mut item.kind
+    {
+        *status = pacode_types::ToolStatus::Ok;
+        *body = preview.to_string();
+    }
+    item
+}
+
+/// A live body belongs to the cell that is running. When the call finishes
+/// the daemon's preview is the body, and a chunk that lands afterwards must
+/// not resurrect the old one.
+#[test]
+fn a_tool_output_chunk_after_the_call_finished_is_dropped() {
+    let mut t = Transcript::new(8);
+    let now = Instant::now();
+    t.upsert(tool_item(1, &AgentId::main()), now);
+    t.push_tool_output(1, "Compiling\n");
+    assert_eq!(t.tool_streams.get(1).map(|s| s.text), Some("Compiling\n"));
+
+    t.upsert(finished_tool_item(1, "Compiled"), now);
+    assert_eq!(t.tool_streams.get(1), None);
+
+    t.push_tool_output(1, "late chunk\n");
+    assert_eq!(
+        t.tool_streams.get(1),
+        None,
+        "a finished cell keeps no live body"
+    );
+}
+
+/// An evicted cell's live body goes with it: the buffer is capped, but a
+/// session that runs and scrolls thousands of calls must not sit on the
+/// bodies of calls that left the screen.
+#[test]
+fn evicting_a_running_tool_cell_frees_its_live_body() {
+    let mut t = Transcript::new(1);
+    let now = Instant::now();
+    t.upsert(tool_item(1, &AgentId::main()), now);
+    t.push_tool_output(1, "one\n");
+    t.upsert(tool_item(2, &AgentId::main()), now);
+    t.push_tool_output(2, "two\n");
+
+    assert_eq!(
+        t.tool_streams.get(1),
+        None,
+        "the evicted call's body is gone"
+    );
+    assert_eq!(t.tool_streams.get(2).map(|s| s.text), Some("two\n"));
+}
+
+/// A delta for a cell that is not on screen at all (evicted, or a different
+/// agent's transcript) is refused rather than buffered.
+#[test]
+fn a_tool_output_chunk_for_an_unknown_cell_is_refused() {
+    let mut t = Transcript::new(8);
+    t.push_tool_output(99, "orphan\n");
+    assert_eq!(t.tool_streams.get(99), None);
+}
+
+fn three_line_item(seq: u64) -> TranscriptItem {
+    user_item(seq, &format!("{seq} first\n{seq} second\n{seq} third"))
+}
+
+/// The cell and the line within it at the top of the last frame.
+fn top_of_view(t: &Transcript) -> Option<(u64, usize)> {
+    let line = t.first_visible_line;
+    let id = t.cell_at_line(line)?;
+    let (_, start, _) = t.cell_lines.iter().find(|(cell, _, _)| *cell == id)?;
+    Some((id, line - start))
+}
+
+/// B08: scrolled up, the reader's text stays put while new content lands
+/// below it; the view no longer drifts up one row per streamed line.
+#[test]
+fn a_scrolled_up_view_stays_on_its_text_while_content_arrives() {
+    let opts = pacode_render::RenderOptions::new(30, false);
+    let area = ratatui::layout::Rect::new(0, 0, 30, 4);
+    let mut t = Transcript::new(64);
+    t.reset((1..=10).map(three_line_item).collect(), false);
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    t.scroll_by(5);
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    let before = top_of_view(&t);
+    let scroll_before = t.scroll_from_bottom;
+    assert!(before.is_some());
+
+    t.upsert(three_line_item(11), Instant::now());
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+
+    assert_eq!(top_of_view(&t), before);
+    assert!(t.scroll_from_bottom > scroll_before);
+}
+
+/// B08: scrolled to the very top, the reader is on the welcome header — not
+/// a cell — and the view stays there while content arrives below.
+#[test]
+fn a_view_scrolled_to_the_header_stays_at_the_top_while_content_arrives() {
+    let opts = pacode_render::RenderOptions::new(30, false);
+    let area = ratatui::layout::Rect::new(0, 0, 30, 4);
+    let mut t = Transcript::new(64);
+    t.reset((1..=10).map(three_line_item).collect(), false);
+    t.set_header(HeaderInfo {
+        version: "0.1.0".into(),
+        day: 0,
+        mascot: crate::ui::mascot::MascotKind::Pacman,
+        truecolor: true,
+    });
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    t.scroll_to_top();
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    assert_eq!(t.first_visible_line, 0);
+    assert!(t.cell_lines.first().is_some_and(|(_, start, _)| *start > 0));
+
+    t.upsert(three_line_item(11), Instant::now());
+    crate::ui::dialog::prepare(area, &mut t, &opts, 0, 0);
+    assert_eq!(t.first_visible_line, 0);
 }

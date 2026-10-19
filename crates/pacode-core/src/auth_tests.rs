@@ -187,13 +187,16 @@ impl AuthDriver for FakeAuthDriver {
 }
 
 async fn build_test_core(paths: Paths) -> Arc<Core> {
+    build_test_core_with(paths, pacode_provider::MockProvider::new("mock")).await
+}
+
+async fn build_test_core_with(paths: Paths, mock: pacode_provider::MockProvider) -> Arc<Core> {
     paths.ensure_dirs().unwrap();
     let config = Arc::new(Config {
         provider: ProviderDefaults::default(),
         ..Config::default()
     });
     let mut reg = ProviderRegistry::empty();
-    let mock = pacode_provider::MockProvider::new("mock");
     reg.insert(Arc::new(mock));
     reg.set_default_route(Some(pacode_types::ModelRoute::new("mock", "mock-model")));
     let providers = Arc::new(reg);
@@ -462,4 +465,97 @@ async fn test_logout_and_set_auth_account() {
         }
         other => panic!("expected AuthStatus, got {other:?}"),
     }
+}
+
+/// A logout (like a login or an account switch) changes which providers serve
+/// models, so attached clients get the new catalog without asking again —
+/// that is what unlocks or locks a group in an open model palette.
+#[tokio::test]
+async fn test_auth_change_pushes_the_catalog_to_attached_sessions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let core = build_test_core(Paths::under(temp_dir.path())).await;
+    let session_id = core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(pacode_types::ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .expect("open session");
+    let mut events = core.subscribe(&session_id).expect("session events");
+
+    let _ = core.handle_logout("claude".to_string(), None);
+
+    let models_updated = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Ok((_, Event::ModelsUpdated { .. })) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(models_updated, "a logout must push ModelsUpdated");
+}
+
+/// The rebuild after a sign-in swaps the credential, not the cached catalog:
+/// the announcement fetches that provider's catalog again, so a fresh TTL on
+/// the old account's list cannot ship it to the clients.
+#[tokio::test]
+async fn test_the_announced_catalog_is_fetched_again_not_served_from_cache() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let fresh = pacode_types::ModelInfo {
+        route: pacode_types::ModelRoute::new("mock", "new-account-model"),
+        display_name: "New".to_string(),
+        context_window: None,
+        supports_reasoning: false,
+        supports_vision: false,
+        supported_efforts: None,
+        pricing: None,
+        ..pacode_types::ModelInfo::default()
+    };
+    let mock = pacode_provider::MockProvider::new("mock");
+    mock.set_models(vec![fresh.clone()]);
+    let core = build_test_core_with(Paths::under(temp_dir.path()), mock).await;
+    let stale = pacode_types::ModelInfo {
+        route: pacode_types::ModelRoute::new("mock", "old-account-model"),
+        ..fresh.clone()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    core.providers()
+        .catalog_cache()
+        .seed_memory_cache("mock", now, vec![stale]);
+    let session_id = core
+        .open_session(Attach::New {
+            cwd: temp_dir.path().to_path_buf(),
+            model: Some(pacode_types::ModelRoute::new("mock", "mock-model")),
+            effort: None,
+            mode: None,
+        })
+        .await
+        .expect("open session");
+    let mut events = core.subscribe(&session_id).expect("session events");
+
+    core.announce_catalog("mock");
+
+    let models = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Ok((_, Event::ModelsUpdated { models })) => return Some(models),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+    .expect("ModelsUpdated");
+    assert_eq!(models, vec![fresh]);
 }

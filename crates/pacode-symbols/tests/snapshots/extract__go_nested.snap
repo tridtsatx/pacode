@@ -1,0 +1,14 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Go, src)"
+---
+const Version 3-3
+const counter 4-4
+struct Server 6-8
+interface Handler 10-12
+type Alias 14-14
+fn NewServer 16-18
+method Server.Start 20-24
+method Server.Stop 26-26
+struct A 29-29
+type B 30-30

@@ -66,13 +66,13 @@ impl ToolHost for DummyHost {
         self.schedule.stop_monitor(id)
     }
 
-    async fn request_permission(&self, _draft: PermissionDraft) -> PermissionDecision {
-        PermissionDecision::AllowOnce
+    async fn request_permission(&self, _draft: PermissionDraft) -> crate::PermissionOutcome {
+        PermissionDecision::AllowOnce.into()
     }
     async fn spawn_task(
         &self,
         _spec: pacode_exec::TaskSpec,
-    ) -> Result<pacode_types::TaskId, ToolError> {
+    ) -> Result<crate::SpawnedTask, ToolError> {
         Err(ToolError::failed("not implemented"))
     }
     fn task_info(&self, _task: &pacode_types::TaskId) -> Option<pacode_types::TaskInfo> {
@@ -98,6 +98,13 @@ impl ToolHost for DummyHost {
         _lines: usize,
     ) -> Result<Vec<String>, ToolError> {
         Ok(Vec::new())
+    }
+    async fn task_output(
+        &self,
+        _task: &pacode_types::TaskId,
+        _max_chars: usize,
+    ) -> Result<String, ToolError> {
+        Ok(String::new())
     }
     fn report_task_progress(
         &self,
@@ -127,7 +134,31 @@ impl ToolHost for DummyHost {
     fn report_status(&self, _text: String) -> Result<(), ToolError> {
         Ok(())
     }
+
+    async fn send_to_agent(
+        &self,
+        _agent: &pacode_types::AgentId,
+        _message: String,
+        _consent: Option<u64>,
+    ) -> Result<crate::host::SendOutcome, ToolError> {
+        Err(ToolError::Failed("no agents in this test".to_string()))
+    }
+
+    async fn ask_parent(
+        &self,
+        _call_id: &pacode_types::CallId,
+        _question: String,
+    ) -> Result<crate::host::ParentReply, ToolError> {
+        Err(ToolError::Failed("no parent in this test".to_string()))
+    }
     async fn stop_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
+        Ok(())
+    }
+    async fn continue_agent(
+        &self,
+        _agent: &AgentId,
+        _consent: Option<u64>,
+    ) -> Result<(), ToolError> {
         Ok(())
     }
     fn plan(&self) -> pacode_types::Plan {
@@ -153,6 +184,7 @@ fn dummy_ctx() -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: crate::registry::ToolRegistry::new(),
     }
 }
 
@@ -539,7 +571,8 @@ async fn test_websearch_tool_success_and_formatting() {
         .expect("tool call succeeds");
 
     assert_eq!(out.title, "Search \"rust programming\"");
-    assert_eq!(out.preview, "2 results");
+    assert!(out.preview.contains("Search results for: rust programming"));
+    assert!(out.preview.contains("Rust Official"));
     assert!(out.content.contains("Search results for: rust programming"));
     assert!(out.content.contains("1. **Rust Official**"));
     assert!(out.content.contains("https://www.rust-lang.org/"));

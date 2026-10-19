@@ -1,409 +1,310 @@
-//! The prompt (spec §3): thin line above, `❯` dim + text + block cursor, thin line
-//! below; no background, no border. Multi-line up to 6 rows. Slash popup above the
-//! input (max 6 rows) listing matching commands with usage and help.
+//! The prompt (spec §3): two full-width horizontal rules in the neutral
+//! border grey — independent of the permission mode and of bash mode — with
+//! `❯` + text + block cursor between them. No side borders, no padding, no
+//! title. Multi-line up to 6 rows. ASCII `-` rules under `ascii_only`.
+//!
+//! Bash mode draws the same wrapped rows as a plain prompt — the `!` is part
+//! of the text — so the cursor, the scroll and the layout height share one
+//! wrap; only the colours differ, mapped from one tokenization of the whole
+//! command onto the rows.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
-use pacode_render::RenderOptions;
+use pacode_render::{BashRole, RenderOptions};
 
-use crate::commands;
+use crate::commands::{self, SlashCommand};
 use crate::layout::ScreenLayout;
 use crate::state::AppState;
+use crate::state::input::InputState;
 
-pub fn draw(frame: &mut Frame, layout: &ScreenLayout, state: &mut AppState, opts: &RenderOptions) {
-    if layout.input_top.height > 0 {
-        let hline = opts.glyphs.hline.repeat(layout.input_top.width as usize);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(hline, opts.theme.faint))),
-            layout.input_top,
-        );
+#[cfg(test)]
+#[path = "input_tests.rs"]
+mod input_tests;
+
+pub(crate) struct PreparedInput {
+    lines: Vec<String>,
+    /// Byte offset in the input text where each of `lines` starts.
+    offsets: Vec<usize>,
+    cursor: (u16, u16),
+    scroll: usize,
+}
+
+struct WrapMemo {
+    text: String,
+    cursor: usize,
+    scroll: usize,
+    width: u16,
+    height: u16,
+    prepared: Rc<PreparedInput>,
+}
+
+thread_local! {
+    static WRAP_MEMO: RefCell<Option<WrapMemo>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn prepare(input: &mut InputState, width: u16, height: u16) -> Rc<PreparedInput> {
+    if let Some(memo) = WRAP_MEMO.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|memo| wrap_matches(memo, input, width, height))
+            .map(|memo| Rc::clone(&memo.prepared))
+    }) {
+        return memo;
     }
+    input.reconcile_scroll(width, height);
+    let prepared = Rc::new(measure(input, width));
+    WRAP_MEMO.with(|cell| {
+        *cell.borrow_mut() = Some(WrapMemo {
+            text: input.text.clone(),
+            cursor: input.cursor,
+            scroll: input.input_scroll,
+            width,
+            height,
+            prepared: Rc::clone(&prepared),
+        });
+    });
+    prepared
+}
 
-    if layout.input.height > 0 {
-        let lines = state.input.wrap_lines(layout.input.width);
-        let total_lines = lines.len();
-        let height = layout.input.height as usize;
-        let (cur_line, cur_col) = state.input.cursor_position(layout.input.width);
+fn wrap_matches(memo: &WrapMemo, input: &InputState, width: u16, height: u16) -> bool {
+    memo.width == width
+        && memo.height == height
+        && memo.cursor == input.cursor
+        && memo.scroll == input.input_scroll
+        && memo.text == input.text
+}
 
-        let max_scroll = total_lines.saturating_sub(height);
-        state.input.input_scroll = state.input.input_scroll.min(max_scroll);
+fn measure(input: &InputState, width: u16) -> PreparedInput {
+    let lines = input.wrap_lines(width);
+    PreparedInput {
+        offsets: line_offsets(&input.text, &lines),
+        lines,
+        cursor: input.cursor_position(width),
+        scroll: input.input_scroll,
+    }
+}
 
-        let cur_line_idx = cur_line as usize;
-        if cur_line_idx < state.input.input_scroll {
-            state.input.input_scroll = cur_line_idx;
-        } else if cur_line_idx >= state.input.input_scroll + height {
-            state.input.input_scroll = cur_line_idx.saturating_sub(height.saturating_sub(1));
-        }
-
-        let matching_cmd_token = if state.input.text.starts_with('/') {
-            let token = state
-                .input
-                .text
-                .split_whitespace()
-                .next()
-                .unwrap_or(&state.input.text);
-            let name = token.strip_prefix('/').unwrap_or("");
-            if commands::all_commands().iter().any(|c| c.name == name) {
-                Some(token.to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let inline_hint = command_inline_hint(&state.input.text);
-        let is_bash = state.input.text.starts_with('!');
-
-        let mut rendered = Vec::new();
-        if is_bash {
-            let prefix = if state.is_running_bash() {
-                Span::styled(
-                    format!("{} (busy) ", opts.glyphs.running),
-                    opts.theme.yellow,
-                )
-            } else {
-                Span::styled(
-                    "! ",
-                    opts.theme
-                        .accent
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                )
+/// Where each wrapped row starts in `text`. The wrap splits on `\n`, drops
+/// one trailing `\r`, and cuts each logical line into pieces that partition
+/// it in order — so the offsets replay that walk.
+fn line_offsets(text: &str, lines: &[String]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(lines.len());
+    let mut rows = lines.iter();
+    let mut pos = 0usize;
+    for raw in text.split('\n') {
+        let logical = raw.strip_suffix('\r').unwrap_or(raw).len();
+        let mut taken = 0usize;
+        loop {
+            let Some(row) = rows.next() else {
+                return offsets;
             };
-            let mut line_spans = vec![prefix];
-            let cmd_text = &state.input.text[1..];
-            let bash_spans = crate::bash::highlight::tokenize(cmd_text);
-            for span in bash_spans {
-                line_spans.push(Span::styled(
-                    span.text.to_string(),
-                    opts.theme.bash_style(span.role),
+            offsets.push(pos + taken);
+            taken += row.len();
+            if taken >= logical {
+                break;
+            }
+        }
+        pos += raw.len() + 1;
+    }
+    offsets
+}
+
+pub(crate) fn draw(
+    frame: &mut Frame,
+    layout: &ScreenLayout,
+    state: &AppState,
+    opts: &RenderOptions,
+    view: &Rc<PreparedInput>,
+) {
+    let text = &state.input.text;
+    let is_bash = text.starts_with('!');
+    draw_rules(frame, layout, opts);
+
+    if layout.input.height == 0 || layout.input.width == 0 {
+        return;
+    }
+    let height = layout.input.height as usize;
+    let rendered: Vec<Line<'static>> = if is_bash {
+        bash_rows(text, view, height, state.is_running_bash(), opts)
+    } else {
+        prompt_rows(text, view, height, opts)
+    };
+    frame.render_widget(Paragraph::new(rendered), layout.input);
+
+    let cur_line = view.cursor.0;
+    let cur_screen_line = cur_line.saturating_sub(view.scroll as u16);
+    if cur_line >= view.scroll as u16 && (cur_screen_line as usize) < height {
+        frame.set_cursor_position((
+            layout.input.x + view.cursor.1,
+            layout.input.y + cur_screen_line,
+        ));
+    }
+}
+
+/// The rules above and below the prompt text, always in the border grey.
+fn draw_rules(frame: &mut Frame, layout: &ScreenLayout, opts: &RenderOptions) {
+    for row in [layout.input_top, layout.input_bottom] {
+        if row.height > 0 {
+            let rule = opts.glyphs.hline.repeat(row.width as usize);
+            let line = Line::from(Span::styled(rule, opts.theme.border));
+            frame.render_widget(Paragraph::new(line), row);
+        }
+    }
+}
+
+/// The plain prompt: `❯` on the first row, the slash command in cyan with its
+/// argument hint, the rest as typed.
+fn prompt_rows(
+    text: &str,
+    view: &PreparedInput,
+    height: usize,
+    opts: &RenderOptions,
+) -> Vec<Line<'static>> {
+    let named = named_command(text);
+    let matching_cmd_token = named.as_ref().map(|(token, _)| (*token).to_string());
+    let inline_hint = match &named {
+        Some((_, command)) if takes_arg_hint(text) => arg_hint(text, command),
+        _ => None,
+    };
+    let mut rendered = Vec::with_capacity(height);
+    for (i, wl) in view.lines.iter().enumerate().skip(view.scroll).take(height) {
+        let mut line_spans = vec![row_prefix(i, opts.theme.dim, opts)];
+        if i == 0 {
+            if let Some(ref token) = matching_cmd_token
+                && wl.starts_with(token.as_str())
+            {
+                line_spans.push(Span::styled(token.clone(), opts.theme.cyan));
+                line_spans.push(Span::styled(wl[token.len()..].to_string(), opts.theme.fg));
+            } else {
+                line_spans.extend(crate::ui::images::style_chips(
+                    wl,
+                    opts.theme.fg,
+                    opts.theme.accent,
                 ));
             }
-            rendered.push(Line::from(line_spans));
+            if let Some(ref hint) = inline_hint {
+                line_spans.push(Span::styled(hint.clone(), opts.theme.dim));
+            }
         } else {
-            for (i, wl) in lines
-                .iter()
-                .enumerate()
-                .skip(state.input.input_scroll)
-                .take(height)
-            {
-                let prefix = if i == 0 {
-                    Span::styled(format!("{} ", opts.glyphs.prompt), opts.theme.dim)
-                } else {
-                    Span::raw("  ")
-                };
-
-                let mut line_spans = vec![prefix];
-                if i == 0 {
-                    if let Some(ref token) = matching_cmd_token
-                        && wl.starts_with(token.as_str())
-                    {
-                        line_spans.push(Span::styled(token.clone(), opts.theme.cyan));
-                        line_spans.push(Span::styled(wl[token.len()..].to_string(), opts.theme.fg));
-                    } else {
-                        line_spans.extend(crate::ui::images::style_chips(
-                            wl,
-                            opts.theme.fg,
-                            opts.theme.accent,
-                        ));
-                    }
-                    if let Some(ref hint) = inline_hint {
-                        line_spans.push(Span::styled(hint.clone(), opts.theme.dim));
-                    }
-                } else {
-                    line_spans.extend(crate::ui::images::style_chips(
-                        wl,
-                        opts.theme.fg,
-                        opts.theme.accent,
-                    ));
-                }
-
-                rendered.push(Line::from(line_spans));
-            }
+            line_spans.extend(crate::ui::images::style_chips(
+                wl,
+                opts.theme.fg,
+                opts.theme.accent,
+            ));
         }
-
-        frame.render_widget(Paragraph::new(rendered), layout.input);
-
-        let cur_screen_line = cur_line.saturating_sub(state.input.input_scroll as u16);
-        if cur_line >= state.input.input_scroll as u16 && (cur_screen_line as usize) < height {
-            frame.set_cursor_position((layout.input.x + cur_col, layout.input.y + cur_screen_line));
-        }
+        rendered.push(Line::from(line_spans));
     }
+    rendered
+}
 
-    if layout.input_bottom.height > 0 {
-        let hline = opts.glyphs.hline.repeat(layout.input_bottom.width as usize);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(hline, opts.theme.faint))),
-            layout.input_bottom,
-        );
-    }
-
-    if state.input.text.starts_with('/') && !state.input.text.contains(' ') {
-        let query = &state.input.text[1..];
-        let matches = commands::matching(query);
-        if !matches.is_empty() {
-            let max_visible = 6;
-            let count = matches.len().min(max_visible);
-            let popup_h = count as u16;
-            let popup_y = layout.input_top.y.saturating_sub(popup_h);
-            let popup_w = layout.input.width.min(50);
-            let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
-
-            frame.render_widget(Clear, popup_area);
-
-            let selected = state.input.slash_index % matches.len();
-            let start = if selected >= max_visible {
-                selected + 1 - max_visible
-            } else {
-                0
-            };
-
-            let mut popup_lines = Vec::new();
-            for (i, cmd) in matches.iter().enumerate().skip(start).take(count) {
-                let is_sel = i == selected;
-                let usage_style = if is_sel {
-                    opts.theme
-                        .selected_bg
-                        .patch(opts.theme.cyan)
-                        .patch(opts.theme.bold)
-                } else {
-                    opts.theme.accent
-                };
-                let help_style = if is_sel {
-                    opts.theme.selected_bg.patch(opts.theme.fg)
-                } else {
-                    opts.theme.dim
-                };
-
-                let usage = format!("{:<12}", cmd.usage);
-                let line = if is_sel {
-                    let text = format!("{usage} {}", cmd.help);
-                    let padded = format!("{:<width$}", text, width = popup_w as usize);
-                    Line::from(Span::styled(
-                        padded,
-                        opts.theme
-                            .selected_bg
-                            .patch(opts.theme.cyan)
-                            .patch(opts.theme.bold),
-                    ))
-                } else {
-                    Line::from(vec![
-                        Span::styled(usage, usage_style),
-                        Span::raw(" "),
-                        Span::styled(cmd.help.to_string(), help_style),
-                    ])
-                };
-                popup_lines.push(line);
-            }
-
-            frame.render_widget(Paragraph::new(popup_lines), popup_area);
-        }
-    }
-
-    // @ file reference popup (drawn ABOVE the input box)
-    let byte_cursor =
-        crate::state::input::char_to_byte_index(&state.input.text, state.input.cursor);
-    let at_query = if !state.input.at_closed {
-        pacode_types::at_ref::find_active_query(&state.input.text, byte_cursor)
+/// `❯` on the first row, two cells of indent on the rest.
+fn row_prefix(row: usize, style: Style, opts: &RenderOptions) -> Span<'static> {
+    if row == 0 {
+        Span::styled(format!("{} ", opts.glyphs.prompt), style)
     } else {
-        None
+        Span::raw("  ")
+    }
+}
+
+/// Bash mode: the same wrapped rows, each cut along the token spans of one
+/// tokenization of the whole command, so a token that wraps keeps its colour
+/// and the cursor lands where the text is (B09). A running captured command
+/// turns the prompt glyph into the running glyph.
+fn bash_rows(
+    text: &str,
+    view: &PreparedInput,
+    height: usize,
+    running: bool,
+    opts: &RenderOptions,
+) -> Vec<Line<'static>> {
+    let bang = opts.theme.accent.add_modifier(Modifier::BOLD);
+    // (start, end, role) over `text`; the `!` itself is byte 0.
+    let command = &text[1..];
+    let tokens: Vec<(usize, usize, BashRole)> = crate::bash::highlight::tokenize(command)
+        .into_iter()
+        .map(|span| {
+            let start = 1 + (span.text.as_ptr() as usize - command.as_ptr() as usize);
+            (start, start + span.text.len(), span.role)
+        })
+        .collect();
+    // Tokens come out in text order, so the one covering a byte is found by
+    // bisection — a long pasted script costs a log per drawn character.
+    let style_at = |byte: usize| -> Style {
+        if byte == 0 {
+            return bang;
+        }
+        let next = tokens.partition_point(|(start, _, _)| *start <= byte);
+        next.checked_sub(1)
+            .and_then(|i| tokens.get(i))
+            .filter(|(_, end, _)| byte < *end)
+            .map_or(opts.theme.fg, |(_, _, role)| opts.theme.bash_style(*role))
     };
-    if let Some(ref q) = at_query {
-        let cwd = state.cwd();
-        let candidates = crate::at_complete::complete_at_path(&q.query, &cwd);
-        if !candidates.is_empty() {
-            let max_visible = 6;
-            let count = candidates.len().min(max_visible);
-            let popup_h = count as u16;
-            let popup_y = layout.input_top.y.saturating_sub(popup_h);
-            let popup_w = layout.input.width.min(50);
-            let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
 
-            frame.render_widget(Clear, popup_area);
-
-            let selected = state.input.at_index % candidates.len();
-            let start = if selected >= max_visible {
-                selected + 1 - max_visible
-            } else {
-                0
-            };
-
-            let mut popup_lines = Vec::new();
-            for (i, cand) in candidates.iter().enumerate().skip(start).take(count) {
-                let is_sel = i == selected;
-                let padded = format!("{:<width$}", cand.path, width = popup_w as usize);
-                let style = if is_sel {
-                    opts.theme
-                        .selected_bg
-                        .patch(opts.theme.cyan)
-                        .patch(opts.theme.bold)
-                } else if cand.is_dir {
-                    opts.theme.cyan
-                } else {
-                    opts.theme.fg
-                };
-                popup_lines.push(Line::from(Span::styled(padded, style)));
+    let mut rendered = Vec::with_capacity(height);
+    for (i, wl) in view.lines.iter().enumerate().skip(view.scroll).take(height) {
+        let prefix = if i == 0 && running {
+            Span::styled(format!("{} ", opts.glyphs.running), opts.theme.yellow)
+        } else {
+            row_prefix(i, bang, opts)
+        };
+        let mut spans = vec![prefix];
+        let base = view.offsets.get(i).copied().unwrap_or(0);
+        let mut run_start = 0usize;
+        let mut run_style: Option<Style> = None;
+        for (at, _) in wl.char_indices() {
+            let style = style_at(base + at);
+            if run_style != Some(style) {
+                if let Some(prev) = run_style {
+                    spans.push(Span::styled(wl[run_start..at].to_string(), prev));
+                }
+                run_start = at;
+                run_style = Some(style);
             }
-
-            frame.render_widget(Paragraph::new(popup_lines), popup_area);
         }
-    }
-
-    // Bash completion popup (drawn ABOVE the input box)
-    if state.input.text.starts_with('!') && !state.input.bash_complete_closed {
-        let cwd = state.cwd();
-        let char_cursor = state.input.cursor.saturating_sub(1);
-        let candidates = crate::bash::complete::complete(
-            &state.input.text[1..],
-            char_cursor,
-            &state.input.bash_history,
-            &cwd,
-        );
-        if !candidates.is_empty() {
-            let max_visible = 6;
-            let count = candidates.len().min(max_visible);
-            let popup_h = count as u16;
-            let popup_y = layout.input_top.y.saturating_sub(popup_h);
-            let popup_w = layout.input.width.min(50);
-            let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
-
-            frame.render_widget(Clear, popup_area);
-
-            let selected = state.input.bash_complete_index % candidates.len();
-            let start = if selected >= max_visible {
-                selected + 1 - max_visible
-            } else {
-                0
-            };
-
-            let mut popup_lines = Vec::new();
-            for (i, cand) in candidates.iter().enumerate().skip(start).take(count) {
-                let is_sel = i == selected;
-                let padded = format!("{:<width$}", cand.display, width = popup_w as usize);
-                let style = if is_sel {
-                    opts.theme
-                        .selected_bg
-                        .patch(opts.theme.cyan)
-                        .patch(opts.theme.bold)
-                } else {
-                    opts.theme.fg
-                };
-                popup_lines.push(Line::from(Span::styled(padded, style)));
-            }
-
-            frame.render_widget(Paragraph::new(popup_lines), popup_area);
+        if let Some(prev) = run_style {
+            spans.push(Span::styled(wl[run_start..].to_string(), prev));
         }
+        rendered.push(Line::from(spans));
     }
+    rendered
+}
 
-    // Prompt queue popup (drawn ABOVE the input box when no other popup is active)
-    let slash_popup_active = state.input.text.starts_with('/') && !state.input.text.contains(' ');
-    let bash_popup_active = state.input.text.starts_with('!') && !state.input.bash_complete_closed;
-    let at_popup_active = at_query.is_some();
+fn named_command(text: &str) -> Option<(&str, SlashCommand)> {
+    let token = text.strip_prefix('/')?.split_whitespace().next()?;
+    Some((token, commands::find_command(token)?))
+}
 
-    if !slash_popup_active
-        && !bash_popup_active
-        && !at_popup_active
-        && !state.input.prompt_queue.is_empty()
-    {
-        let max_visible = 6;
-        let queue_len = state.input.prompt_queue.len();
-        let count = queue_len.min(max_visible);
-        let popup_h = count as u16;
-        let popup_y = layout.input_top.y.saturating_sub(popup_h);
-        let popup_w = layout.input.width.min(60);
-        let popup_area = Rect::new(layout.input.x, popup_y, popup_w, popup_h);
+fn takes_arg_hint(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('/') else {
+        return false;
+    };
+    let Some(name) = rest.split_whitespace().next() else {
+        return false;
+    };
+    rest[name.len()..].trim().is_empty()
+}
 
-        frame.render_widget(Clear, popup_area);
-
-        let mut popup_lines = Vec::new();
-        for (i, prompt) in state
-            .input
-            .prompt_queue
-            .iter()
-            .enumerate()
-            .take(max_visible)
-        {
-            let prefix = format!(" queued #{}: ", i + 1);
-            let avail = (popup_w as usize).saturating_sub(prefix.len()).max(1);
-            let single_line = prompt.lines().next().unwrap_or("");
-            let truncated = pacode_render::truncate_to_width(single_line, avail, true);
-            let line = Line::from(vec![
-                Span::styled(prefix, opts.theme.accent),
-                Span::styled(truncated, opts.theme.fg),
-            ]);
-            popup_lines.push(line);
-        }
-
-        frame.render_widget(Paragraph::new(popup_lines), popup_area);
+fn arg_hint(text: &str, command: &SlashCommand) -> Option<String> {
+    if command.arg_hint.is_empty() {
+        return None;
     }
+    Some(if text.ends_with(' ') {
+        command.arg_hint.to_string()
+    } else {
+        format!(" {}", command.arg_hint)
+    })
 }
 
 pub fn command_inline_hint(text: &str) -> Option<String> {
-    if let Some(rest) = text.strip_prefix('/') {
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() == 1 {
-            let cmd_name = parts[0];
-            if let Some(cmd) = commands::find_command(cmd_name)
-                && !cmd.arg_hint.is_empty()
-            {
-                if text.ends_with(' ') {
-                    return Some(cmd.arg_hint.to_string());
-                } else {
-                    return Some(format!(" {}", cmd.arg_hint));
-                }
-            }
-        }
+    if !takes_arg_hint(text) {
+        return None;
     }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_command_inline_hints() {
-        assert_eq!(
-            command_inline_hint("/effort"),
-            Some(" [low|medium|high|xhigh|max]".into())
-        );
-        assert_eq!(
-            command_inline_hint("/effort "),
-            Some("[low|medium|high|xhigh|max]".into())
-        );
-        assert_eq!(
-            command_inline_hint("/mode"),
-            Some(" [build|auto|plan|bypass]".into())
-        );
-        assert_eq!(
-            command_inline_hint("/mode "),
-            Some("[build|auto|plan|bypass]".into())
-        );
-        assert_eq!(
-            command_inline_hint("/model"),
-            Some(" [provider/model]".into())
-        );
-        assert_eq!(
-            command_inline_hint("/model "),
-            Some("[provider/model]".into())
-        );
-        assert_eq!(command_inline_hint("/export"), Some(" [path]".into()));
-        assert_eq!(command_inline_hint("/export "), Some("[path]".into()));
-
-        // Commands with no argument hint
-        assert_eq!(command_inline_hint("/config"), None);
-        assert_eq!(command_inline_hint("/config "), None);
-
-        // Commands with arguments already typed
-        assert_eq!(command_inline_hint("/effort hi"), None);
-        assert_eq!(command_inline_hint("/mode plan"), None);
-
-        // Unknown or non-slash inputs
-        assert_eq!(command_inline_hint("/unknown"), None);
-        assert_eq!(command_inline_hint("hello"), None);
-        assert_eq!(command_inline_hint(""), None);
-    }
+    let (_, command) = named_command(text)?;
+    arg_hint(text, &command)
 }

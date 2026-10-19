@@ -1,0 +1,14 @@
+---
+source: crates/pacode-symbols/tests/extract.rs
+expression: "render(Language::Python, src)"
+---
+const TOP 1-1
+fn outer 3-6
+  fn inner 4-5
+fn decorated 8-10
+class Foo 12-20
+  const X 13-13
+  method __init__ 15-16
+  method prop 18-20
+class Bar 22-24
+  const y 24-24

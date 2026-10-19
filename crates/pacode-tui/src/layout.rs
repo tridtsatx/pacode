@@ -3,15 +3,24 @@
 //! ```text
 //! ┌──────────────────────────────┬────────────┐
 //! │ dialog  /  agent panel       │ rail       │
-//! ├──────────────────────────────┤            │
+//! │ toast strip · image strip    │            │
+//! │ ──────────────────────────── │            │
 //! │ ❯ input                      │            │
-//! ├──────────────────────────────┤            │
+//! │ ──────────────────────────── │            │
 //! │ footer row 1                 │            │
 //! │ footer row 2                 │ anchor     │
 //! └──────────────────────────────┴────────────┘
 //! ```
+//!
+//! The prompt is two plain full-width rules — the `input_top` and
+//! `input_bottom` rows — with the text rows between them. No side borders:
+//! the text gets the whole left column.
+
+use std::time::Instant;
 
 use ratatui::layout::Rect;
+
+use crate::state::AppState;
 
 /// Width tiers from spec §8.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,9 +69,13 @@ impl WidthTier {
 pub const INPUT_MIN_LINES: u16 = 1;
 pub const INPUT_MAX_LINES: u16 = 6;
 pub const FOOTER_LINES: u16 = 2;
+/// Toast strip capacity: up to this many plain text lines directly above the
+/// input separator (spec §7).
+pub const TOAST_STRIP_MAX: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScreenLayout {
+    pub screen: Rect,
     pub tier: WidthTier,
     /// Dialog transcript area (left column, above the input).
     pub dialog: Rect,
@@ -70,23 +83,60 @@ pub struct ScreenLayout {
     pub panel: Option<Rect>,
     /// The vertical separator between dialog and panel (1 col), if a panel is open.
     pub panel_separator: Option<Rect>,
-    /// Separator line above the input.
+    /// The rule row above the prompt text (full left-column width).
     pub input_top: Rect,
+    /// Pasted-image preview strip directly above the prompt's top rule;
+    /// zero-height when no `[Image N]` tokens are live (spec §1).
+    pub preview: Rect,
+    /// The prompt's text rows between the rules: prompt glyph + text, full
+    /// left-column width.
     pub input: Rect,
-    /// Separator line below the input.
+    /// The rule row below the prompt text.
     pub input_bottom: Rect,
     pub footer: Rect,
     /// Rail column (right), full height; zero-sized on `Tiny`.
     pub rail: Rect,
     /// Vertical line between dialog column and rail.
     pub rail_separator: Rect,
-    /// Toast area: 4 lines above `input_top`, right-aligned inside the dialog column.
+    /// Toast strip: up to `TOAST_STRIP_MAX` plain lines above the preview
+    /// strip and the prompt's top rule, borrowing rows from the dialog like the
+    /// preview strip. Zero-height when no toast is live.
     pub toast: Rect,
 }
 
-/// Compute the layout for a terminal of `area` with `input_lines` lines of input and
-/// `panel_open`.
-pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
+pub fn current(state: &AppState) -> ScreenLayout {
+    compute_for_state(
+        Rect::new(0, 0, state.cols, state.rows),
+        state,
+        Instant::now(),
+    )
+}
+
+pub fn compute_for_state(area: Rect, state: &AppState, now: Instant) -> ScreenLayout {
+    let panel_open = (state.panel.target.is_some()
+        || matches!(state.focus, crate::state::Focus::Panel { .. }))
+        && !state.agent_replaces_dialog();
+    let temporary = compute(area, 1, panel_open, 0, 0);
+    let input_lines = state.input.wrapped_lines(temporary.input.width);
+    let preview_lines = if state.is_bottom_picker() {
+        0
+    } else {
+        state.image_strip_rows()
+    };
+    let toast_lines = crate::ui::toast::live_toasts(state, now).len() as u16;
+    compute(area, input_lines, panel_open, preview_lines, toast_lines)
+}
+
+/// Compute the layout for a terminal of `area` with `input_lines` lines of input,
+/// `panel_open`, `preview_lines` rows of image preview strip (0 = none), and
+/// `toast_lines` rows of toast strip (0 = none).
+pub fn compute(
+    area: Rect,
+    input_lines: u16,
+    panel_open: bool,
+    preview_lines: u16,
+    toast_lines: u16,
+) -> ScreenLayout {
     let tier = WidthTier::for_width(area.width);
     let rail_w = tier.rail_width();
 
@@ -120,14 +170,29 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
     let clamped_input = input_lines.clamp(INPUT_MIN_LINES, INPUT_MAX_LINES);
     let input_h = clamped_input.min(rem_for_input);
     let input_y = input_bottom_y.saturating_sub(input_h);
+    // Above the input: the top rule, then the preview strip above it. The
+    // strip takes space from the dialog (which can scroll), never from the
+    // input.
+    let input_top_h = if input_y > left_area.y { 1 } else { 0 };
     let input = Rect::new(left_area.x, input_y, left_area.width, input_h);
 
-    let input_top_h = if input_y > left_area.y { 1 } else { 0 };
     let input_top_y = input_y.saturating_sub(input_top_h);
     let input_top = Rect::new(left_area.x, input_top_y, left_area.width, input_top_h);
+    let preview_h = preview_lines.min(input_top_y.saturating_sub(left_area.y));
+    let preview_y = input_top_y.saturating_sub(preview_h);
+    let preview = Rect::new(left_area.x, preview_y, left_area.width, preview_h);
 
-    let dialog_h = input_top_y.saturating_sub(left_area.y);
+    // The toast strip borrows rows from the bottom of the dialog, directly
+    // above the preview strip and the top rule — the same mechanism as the
+    // preview strip, so the strip's lines never overdraw transcript text.
     let dialog_y = left_area.y;
+    let toast_h = toast_lines
+        .min(TOAST_STRIP_MAX)
+        .min(preview_y.saturating_sub(dialog_y));
+    let toast_y = preview_y.saturating_sub(toast_h);
+    let toast = Rect::new(left_area.x, toast_y, left_area.width, toast_h);
+
+    let dialog_h = toast_y.saturating_sub(dialog_y);
 
     let (dialog, panel, panel_separator) = if panel_open {
         let share = tier.dialog_share_with_panel();
@@ -161,18 +226,14 @@ pub fn compute(area: Rect, input_lines: u16, panel_open: bool) -> ScreenLayout {
         )
     };
 
-    let toast_w = (dialog.width.saturating_sub(2)).min(62);
-    let toast_h = if toast_w > 0 { 4.min(dialog.height) } else { 0 };
-    let toast_y = input_top_y.saturating_sub(toast_h);
-    let toast_x = dialog.x + dialog.width.saturating_sub(1).saturating_sub(toast_w);
-    let toast = Rect::new(toast_x, toast_y, toast_w, toast_h);
-
     ScreenLayout {
+        screen: area,
         tier,
         dialog,
         panel,
         panel_separator,
         input_top,
+        preview,
         input,
         input_bottom,
         footer,

@@ -28,6 +28,9 @@ struct StubHost {
     tasks: Arc<TaskManager>,
     plan: Mutex<Plan>,
     agents: Mutex<Vec<AgentInfo>>,
+    /// How long a permission prompt stays open; widens the window between a
+    /// tool's read of a file and its write for the concurrency tests.
+    permission_delay: Duration,
 }
 
 impl StubHost {
@@ -41,6 +44,14 @@ impl StubHost {
             tasks,
             plan: Mutex::new(Plan::default()),
             agents: Mutex::new(Vec::new()),
+            permission_delay: Duration::ZERO,
+        }
+    }
+
+    fn slow_permissions(self, delay: Duration) -> Self {
+        Self {
+            permission_delay: delay,
+            ..self
         }
     }
 }
@@ -95,19 +106,23 @@ impl ToolHost for StubHost {
         self.schedule.stop_monitor(id)
     }
 
-    async fn request_permission(&self, draft: PermissionDraft) -> PermissionDecision {
+    async fn request_permission(&self, draft: PermissionDraft) -> pacode_tools::PermissionOutcome {
         let dec = *self.decision.lock().unwrap();
         self.drafts.lock().unwrap().push(draft);
-        dec
+        if !self.permission_delay.is_zero() {
+            tokio::time::sleep(self.permission_delay).await;
+        }
+        pacode_tools::PermissionOutcome {
+            decision: dec,
+            reason: None,
+        }
     }
 
-    async fn spawn_task(&self, spec: TaskSpec) -> Result<TaskId, ToolError> {
-        let info = self
-            .tasks
-            .spawn(spec)
+    async fn spawn_task(&self, spec: TaskSpec) -> Result<pacode_tools::SpawnedTask, ToolError> {
+        pacode_tools::SpawnedTask::start(&self.tasks, spec)
             .await
-            .map_err(|e| ToolError::failed(e.to_string()))?;
-        Ok(info.id)
+            .map(|(_, spawned)| spawned)
+            .map_err(|e| ToolError::failed(e.to_string()))
     }
 
     fn task_info(&self, task: &TaskId) -> Option<TaskInfo> {
@@ -143,6 +158,13 @@ impl ToolHost for StubHost {
     async fn task_tail(&self, task: &TaskId, lines: usize) -> Result<Vec<String>, ToolError> {
         self.tasks
             .tail(task, lines)
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))
+    }
+
+    async fn task_output(&self, task: &TaskId, max_chars: usize) -> Result<String, ToolError> {
+        self.tasks
+            .output(task, max_chars)
             .await
             .map_err(|e| ToolError::failed(e.to_string()))
     }
@@ -186,7 +208,32 @@ impl ToolHost for StubHost {
         Ok(())
     }
 
+    async fn send_to_agent(
+        &self,
+        _agent: &pacode_types::AgentId,
+        _message: String,
+        _consent: Option<u64>,
+    ) -> Result<pacode_tools::host::SendOutcome, ToolError> {
+        Err(ToolError::Failed("no agents in this test".to_string()))
+    }
+
+    async fn ask_parent(
+        &self,
+        _call_id: &pacode_types::CallId,
+        _question: String,
+    ) -> Result<pacode_tools::host::ParentReply, ToolError> {
+        Err(ToolError::Failed("no parent in this test".to_string()))
+    }
+
     async fn stop_agent(&self, _agent: &AgentId) -> Result<(), ToolError> {
+        Ok(())
+    }
+
+    async fn continue_agent(
+        &self,
+        _agent: &AgentId,
+        _consent: Option<u64>,
+    ) -> Result<(), ToolError> {
         Ok(())
     }
 
@@ -218,6 +265,7 @@ fn make_ctx(cwd: PathBuf, host: Arc<dyn ToolHost>) -> ToolCtx {
         exec_default_timeout: Duration::from_secs(30),
         tool_name: None,
         tool_kind: None,
+        tools: pacode_tools::ToolRegistry::new(),
     }
 }
 
@@ -249,7 +297,7 @@ async fn test_memory_write_and_read_project_scope() {
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
     // Old call shape: scope + text only.
-    let out = MemoryWriteTool
+    let out = MemoryWriteTool::default()
         .call(
             json!({"scope": "project", "text": "use rust edition 2024"}),
             &ctx,
@@ -267,7 +315,7 @@ async fn test_memory_write_and_read_project_scope() {
     assert!(drafts[0].detail.contains("use rust edition 2024"));
 
     // Old alias reads it back.
-    let read_out = MemoryReadTool
+    let read_out = MemoryReadTool::default()
         .call(json!({"scope": "project"}), &ctx)
         .await
         .unwrap();
@@ -284,7 +332,7 @@ async fn test_memory_global_scope_no_permission_prompt_and_recall() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let out = MemoryWriteTool
+    let out = MemoryWriteTool::default()
         .call(
             json!({"scope": "global", "kind": "preference", "title": "Code style",
                    "text": "prefer concise code", "tags": ["style"]}),
@@ -300,7 +348,7 @@ async fn test_memory_global_scope_no_permission_prompt_and_recall() {
         "global writes never prompt"
     );
 
-    let found = MemoryRecallTool
+    let found = MemoryRecallTool::default()
         .call(json!({"query": "concise", "scope": "global"}), &ctx)
         .await
         .unwrap();
@@ -317,7 +365,7 @@ async fn test_memory_dedupe_update_and_forget() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let first = MemoryWriteTool
+    let first = MemoryWriteTool::default()
         .call(
             json!({"scope": "global", "title": "Unique", "text": "unique note"}),
             &ctx,
@@ -325,7 +373,7 @@ async fn test_memory_dedupe_update_and_forget() {
         .await
         .unwrap();
     assert!(first.content.starts_with("stored "));
-    let second = MemoryWriteTool
+    let second = MemoryWriteTool::default()
         .call(
             json!({"scope": "global", "title": "unique", "text": "unique note v2"}),
             &ctx,
@@ -335,22 +383,25 @@ async fn test_memory_dedupe_update_and_forget() {
     assert!(second.content.starts_with("updated "));
     assert_eq!(id_of(&first.content), id_of(&second.content));
 
-    let listed = MemoryListTool.call(json!({}), &ctx).await.unwrap();
+    let listed = MemoryListTool::default()
+        .call(json!({}), &ctx)
+        .await
+        .unwrap();
     assert!(listed.content.starts_with("1 memories"));
 
     let id = id_of(&first.content);
-    let f = MemoryForgetTool
+    let f = MemoryForgetTool::default()
         .call(json!({"id": id}), &ctx)
         .await
         .unwrap();
     assert!(f.content.starts_with("forgot "));
-    let gone = MemoryRecallTool
+    let gone = MemoryRecallTool::default()
         .call(json!({"query": "unique"}), &ctx)
         .await
         .unwrap();
     assert_eq!(gone.content, "no memories found");
     assert!(
-        MemoryForgetTool
+        MemoryForgetTool::default()
             .call(json!({"id": id}), &ctx)
             .await
             .is_err()
@@ -366,11 +417,11 @@ async fn test_memory_recall_merges_both_scopes() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    MemoryWriteTool
+    MemoryWriteTool::default()
         .call(json!({"scope": "global", "text": "global knowledge"}), &ctx)
         .await
         .unwrap();
-    MemoryWriteTool
+    MemoryWriteTool::default()
         .call(
             json!({"scope": "project", "text": "project knowledge"}),
             &ctx,
@@ -378,7 +429,7 @@ async fn test_memory_recall_merges_both_scopes() {
         .await
         .unwrap();
 
-    let both = MemoryRecallTool
+    let both = MemoryRecallTool::default()
         .call(json!({"query": "knowledge"}), &ctx)
         .await
         .unwrap();
@@ -402,7 +453,7 @@ async fn test_memory_legacy_markdown_is_migrated() {
     let host = Arc::new(StubHost::new(tmp.path().join("spool")));
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let out = MemoryRecallTool
+    let out = MemoryRecallTool::default()
         .call(json!({"query": "legacy", "scope": "global"}), &ctx)
         .await
         .unwrap();
@@ -422,7 +473,7 @@ async fn test_memory_write_permission_denied() {
     *host.decision.lock().unwrap() = PermissionDecision::Deny;
     let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
 
-    let err = MemoryWriteTool
+    let err = MemoryWriteTool::default()
         .call(
             json!({"scope": "project", "text": "should be rejected"}),
             &ctx,
@@ -431,5 +482,84 @@ async fn test_memory_write_permission_denied() {
 
     assert!(matches!(err, Err(ToolError::Denied(_))));
     assert!(!ctx.cwd.join(".pacode").join("memory.db").exists());
+    clear_global();
+}
+
+#[tokio::test]
+async fn concurrent_notes_all_survive() {
+    let _lock = ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    set_global(&tmp.path().join("global"));
+    let host = Arc::new(
+        StubHost::new(tmp.path().join("spool")).slow_permissions(Duration::from_millis(40)),
+    );
+    let ctx = make_ctx(tmp.path().to_path_buf(), host.clone());
+
+    // Writes that overlap (the permission prompt widens the window) must not lose
+    // one another's notes.
+    let notes = [
+        (
+            "Rust edition",
+            "the workspace builds with rust edition 2024",
+        ),
+        ("Test runner", "integration tests run with cargo nextest"),
+        ("Lint gate", "clippy warnings fail continuous integration"),
+    ];
+    for (title, text) in notes {
+        MemoryWriteTool::default()
+            .call(
+                json!({"scope": "project", "title": title, "text": text}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+    }
+    // Three separate tools, as three concurrent `memory_write` calls would be.
+    let w1 = MemoryWriteTool::default();
+    let w2 = MemoryWriteTool::default();
+    let w3 = MemoryWriteTool::default();
+    let (alpha, beta, gamma) = tokio::join!(
+        w1.call(
+            json!({"scope": "project", "title": "Alpha", "text": "alpha centauri is a star system"}),
+            &ctx
+        ),
+        w2.call(
+            json!({"scope": "project", "title": "Beta", "text": "beta releases ship on fridays"}),
+            &ctx
+        ),
+        w3.call(
+            json!({"scope": "project", "title": "Gamma", "text": "gamma correction applies to images"}),
+            &ctx
+        ),
+    );
+    alpha.expect("store alpha");
+    beta.expect("store beta");
+    gamma.expect("store gamma");
+
+    let listed = MemoryListTool::default()
+        .call(json!({}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        listed.content.starts_with("6 memories"),
+        "a note was lost: {}",
+        listed.content
+    );
+    for expected in [
+        "alpha centauri",
+        "beta releases",
+        "gamma correction",
+        "nextest",
+    ] {
+        let found = MemoryRecallTool::default()
+            .call(json!({"query": expected}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            found.content.contains(expected),
+            "{expected} missing: {}",
+            found.content
+        );
+    }
     clear_global();
 }

@@ -1,10 +1,12 @@
-//! Per-turn system prompt assembly (perf C3/C4).
+//! Per-turn system prompt inputs (perf C3): the shared prompt cache. The dynamic
+//! part is rendered per request in `run_turn` (it names the request's tools as its
+//! provider sends them).
 
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent::Agent;
-use crate::prompt::{DynamicContext, PromptOpts, TurnPromptCache};
+use crate::prompt::{PromptOpts, TurnPromptCache};
 use crate::session::Session;
 
 /// Shared prompt cache for `cwd` (see `prompt/shared.rs`): a main turn start invalidates it.
@@ -28,41 +30,4 @@ pub(super) async fn turn_prompt_cache(
         discover_foreign: session.config.context.discover_foreign_instructions,
     };
     crate::prompt::shared(cwd, opts, agent.id().is_main()).await
-}
-
-/// The dynamic system text of one turn: `(plan.version, text)`, local to `run_turn`.
-/// Rebuilt only when the plan version changes; subagent prompts do not contain the plan,
-/// so theirs is built once per turn (key `0`).
-pub(super) type SystemSlot = Option<(u64, Arc<str>)>;
-
-pub(super) fn dynamic(
-    slot: &mut SystemSlot,
-    session: &Session,
-    agent: &Agent,
-    meta: &pacode_types::SessionMeta,
-    cache: &TurnPromptCache,
-) -> Arc<str> {
-    let is_subagent = !agent.id().is_main();
-    let plan_guard = session.plan.read().unwrap_or_else(|p| p.into_inner());
-    let key = if is_subagent { 0 } else { plan_guard.version };
-    if let Some((k, text)) = slot.as_ref()
-        && *k == key
-    {
-        return text.clone();
-    }
-    let dyn_ctx = DynamicContext {
-        cwd: &meta.cwd,
-        git_branch: cache.git_branch.as_deref(),
-        date: &cache.date,
-        mode: meta.mode,
-        plan: &plan_guard,
-        instructions: cache.instructions.as_deref(),
-        is_subagent,
-        skills: session.skills.skills(),
-        skills_enabled: session.config.skills.enabled,
-        max_listed_skills: session.config.skills.max_listed,
-    };
-    let text: Arc<str> = Arc::from(crate::prompt::system_dynamic(&dyn_ctx));
-    *slot = Some((key, text.clone()));
-    text
 }

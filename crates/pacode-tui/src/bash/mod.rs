@@ -14,6 +14,7 @@ pub mod highlight;
 mod mod_tests;
 
 use std::path::Path;
+use tokio::io::AsyncReadExt;
 
 pub use complete::{BASH_HISTORY_CAP, Candidate, complete, record_history};
 pub use highlight::{BashSpan, tokenize};
@@ -86,7 +87,54 @@ pub fn user_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
-/// Run a command captured asynchronously (used by background task in `app.rs`).
+async fn read_capped_tail<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = Vec::with_capacity(cap);
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if output.len().saturating_add(read) > cap {
+            let remove = output.len().saturating_add(read) - cap;
+            output.drain(..remove.min(output.len()));
+            truncated = true;
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+    (output, truncated)
+}
+
+type CapturedStream = (Vec<u8>, bool);
+
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn killpg(pgrp: i32, sig: i32) -> i32;
+}
+
+async fn abort_reader(handle: &mut tokio::task::JoinHandle<CapturedStream>) {
+    handle.abort();
+    let _ = handle.await;
+}
+
+async fn terminate_child(child: &mut tokio::process::Child, _pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = _pid {
+        unsafe {
+            let _ = killpg(pid as i32, SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 pub async fn run_captured(
     cmd: &str,
     cwd: &Path,
@@ -94,65 +142,91 @@ pub async fn run_captured(
 ) -> Result<BashOutput, String> {
     let shell = user_shell();
     let mut command = tokio::process::Command::new(&shell);
-    command.arg("-c").arg(cmd).current_dir(cwd);
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
+    command
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
 
     let mut child = command
         .spawn()
         .map_err(|e| format!("failed to spawn {shell}: {e}"))?;
-
+    let child_pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let stdout_handle = tokio::spawn(async move {
-        if let Some(mut r) = stdout {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            let _ = r.read_to_end(&mut buf).await;
-            buf
+    let mut stdout_handle = tokio::spawn(async move {
+        if let Some(r) = stdout {
+            read_capped_tail(r, BASH_OUTPUT_CAP_BYTES).await
         } else {
-            Vec::new()
+            (Vec::new(), false)
+        }
+    });
+    let mut stderr_handle = tokio::spawn(async move {
+        if let Some(r) = stderr {
+            read_capped_tail(r, BASH_OUTPUT_CAP_BYTES).await
+        } else {
+            (Vec::new(), false)
         }
     });
 
-    let stderr_handle = tokio::spawn(async move {
-        if let Some(mut r) = stderr {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            let _ = r.read_to_end(&mut buf).await;
-            buf
-        } else {
-            Vec::new()
-        }
-    });
+    let wait_result = tokio::select! {
+        result = child.wait() => result.map(Some),
+        _ = &mut cancel_rx => Ok(None),
+    };
 
-    tokio::select! {
-        res = child.wait() => {
-            let status = res.map_err(|e| format!("child wait failed: {e}"))?;
-            let stdout_bytes = stdout_handle.await.unwrap_or_default();
-            let stderr_bytes = stderr_handle.await.unwrap_or_default();
+    match wait_result {
+        Ok(Some(status)) => {
+            let stdout_result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), &mut stdout_handle).await;
+            let stderr_result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), &mut stderr_handle).await;
+            let (stdout_bytes, stdout_truncated) = match stdout_result {
+                Ok(result) => result.unwrap_or_default(),
+                Err(_) => {
+                    abort_reader(&mut stdout_handle).await;
+                    (Vec::new(), true)
+                }
+            };
+            let (stderr_bytes, stderr_truncated) = match stderr_result {
+                Ok(result) => result.unwrap_or_default(),
+                Err(_) => {
+                    abort_reader(&mut stderr_handle).await;
+                    (Vec::new(), true)
+                }
+            };
 
             let mut combined = stdout_bytes;
             combined.extend_from_slice(&stderr_bytes);
-
             let (output, truncated) = truncate_output(&combined, BASH_OUTPUT_CAP_BYTES);
             Ok(BashOutput {
                 command: cmd.to_string(),
                 output,
                 exit_code: status.code(),
-                truncated,
+                truncated: truncated || stdout_truncated || stderr_truncated,
             })
         }
-        _ = &mut cancel_rx => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        Ok(None) => {
+            terminate_child(&mut child, child_pid).await;
+            abort_reader(&mut stdout_handle).await;
+            abort_reader(&mut stderr_handle).await;
             Ok(BashOutput {
                 command: cmd.to_string(),
                 output: "[cancelled by user]\n".to_string(),
-                exit_code: Some(130), // standard 128 + SIGINT
+                exit_code: Some(130),
                 truncated: false,
             })
+        }
+        Err(error) => {
+            terminate_child(&mut child, child_pid).await;
+            abort_reader(&mut stdout_handle).await;
+            abort_reader(&mut stderr_handle).await;
+            Err(format!("child wait failed: {error}"))
         }
     }
 }

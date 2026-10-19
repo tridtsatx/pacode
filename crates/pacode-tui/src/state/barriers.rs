@@ -1,0 +1,172 @@
+//! Requests the prompt path waits behind, from send to reply. A prompt sent
+//! after a settings change (route, effort, mode, ZDR) must not reach the daemon
+//! ahead of it and run on the old settings; a prompt queued before a `/clear`
+//! belongs to the conversation being cleared and must not drain into the gap,
+//! where the clear would sweep it or it would open the cleared context.
+//!
+//! A barrier drops on its own reply (`BgResponse::BarrierReply`, whenever the
+//! reply still belongs to this session generation, deferred epoch and slot,
+//! even while a snapshot is awaited), on `ContextCleared` for a clear, and
+//! whenever the deferred epoch advances (connection change, disconnect, seq-gap
+//! resync) or the link starts reconnecting, after which its reply is stale
+//! and never folds. A clear dropped that way leaves its outcome to the next
+//! snapshot (`settle_lost_clear`). A session switch resets the session
+//! state, barriers included.
+
+use std::time::Instant;
+
+use pacode_types::Request;
+use pacode_types::state::ToastLevel;
+
+use super::{AppState, SessionUiState};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestBarrier {
+    Clear,
+    Settings,
+}
+
+impl RequestBarrier {
+    pub fn for_request(request: &Request) -> Option<Self> {
+        match request {
+            Request::ClearContext => Some(Self::Clear),
+            Request::SetModel(_)
+            | Request::SetEffort(_)
+            | Request::SetMode(_)
+            | Request::SetZdr(_) => Some(Self::Settings),
+            Request::Hello(_)
+            | Request::Attach(_)
+            | Request::Detach
+            | Request::Shutdown { .. }
+            | Request::Ping
+            | Request::ListSessions { .. }
+            | Request::RuntimeStats
+            | Request::DebugStats
+            | Request::Subscribe { .. }
+            | Request::ListModels
+            | Request::RefreshModels
+            | Request::ListMcpServers
+            | Request::RestartMcpServer { .. }
+            | Request::SetMcpServerEnabled { .. }
+            | Request::GetMcpPrompt { .. }
+            | Request::ListPlugins
+            | Request::RunPluginCommand { .. }
+            | Request::BrowseMarketplace { .. }
+            | Request::InstallPlugin { .. }
+            | Request::UninstallPlugin { .. }
+            | Request::ListAuth
+            | Request::Login { .. }
+            | Request::Logout { .. }
+            | Request::SetAuthAccount { .. }
+            | Request::Analyze
+            | Request::UserMessage { .. }
+            | Request::Interrupt
+            | Request::InterruptAll
+            | Request::CloseSession
+            | Request::PermissionReply { .. }
+            | Request::ExplainPermission { .. }
+            | Request::SetNoticeLock(_)
+            | Request::SetModelFlag { .. }
+            | Request::StopAgent(_)
+            | Request::KillTask(_)
+            | Request::AckTask(_)
+            | Request::GetSnapshot
+            | Request::GetHistory { .. }
+            | Request::GetTaskOutput { .. }
+            | Request::Compact
+            | Request::DetachTurn
+            | Request::AnswerQuestion { .. }
+            | Request::ListCronJobs
+            | Request::AddCronJob { .. }
+            | Request::RemoveCronJob(_)
+            | Request::SetCronEnabled { .. }
+            | Request::RunCronJobNow(_)
+            | Request::ListMonitors
+            | Request::StopMonitor(_)
+            | Request::GitLog { .. }
+            | Request::GitShow { .. }
+            | Request::GitDiff { .. } => None,
+        }
+    }
+}
+
+impl SessionUiState {
+    /// Whether queued prompts, retries and pending sequences must wait.
+    pub fn prompt_path_held(&self) -> bool {
+        self.clear_in_flight || self.settings_in_flight > 0
+    }
+
+    pub fn raise_barrier(&mut self, barrier: RequestBarrier) {
+        match barrier {
+            RequestBarrier::Clear => self.clear_in_flight = true,
+            RequestBarrier::Settings => self.settings_in_flight += 1,
+        }
+    }
+
+    pub fn lower_barrier(&mut self, barrier: RequestBarrier) {
+        match barrier {
+            RequestBarrier::Clear => self.clear_in_flight = false,
+            RequestBarrier::Settings => {
+                self.settings_in_flight = self.settings_in_flight.saturating_sub(1);
+            }
+        }
+    }
+
+    /// No reply in flight will fold any more. A clear whose reply is lost
+    /// may or may not have happened; the next snapshot tells.
+    pub fn drop_request_barriers(&mut self) {
+        self.clear_outcome_unknown |= self.clear_in_flight;
+        self.clear_in_flight = false;
+        self.settings_in_flight = 0;
+    }
+}
+
+impl AppState {
+    /// Whether a reply scoped to `(generation, deferred_epoch, slot)` is the
+    /// reply of a barrier raised in this state: barriers drop whenever any of
+    /// the three moves (a slot switch resets the session), so a reply from
+    /// before cannot lower a newer barrier.
+    pub fn owns_barrier_reply(&self, generation: u64, deferred_epoch: u64, slot: usize) -> bool {
+        generation == self.session.generation
+            && deferred_epoch == self.session.deferred_epoch
+            && slot == self.active_slot
+    }
+
+    /// A snapshot landed after a clear lost its reply: an empty transcript
+    /// means the clear went through, and the queued prompts belonged to what
+    /// it cleared; otherwise they stay.
+    pub fn settle_lost_clear(&mut self, transcript_empty: bool, now: Instant) {
+        if std::mem::take(&mut self.session.clear_outcome_unknown) && transcript_empty {
+            self.drop_prompts_of_cleared_context(now);
+        }
+    }
+
+    /// The conversation was cleared (our `/clear` answered `Ok`, or any
+    /// client's `ContextCleared` arrived): the prompts waiting to go out were
+    /// typed for it, so they go too, and a toast says how many.
+    pub fn drop_prompts_of_cleared_context(&mut self, now: Instant) {
+        self.clear_in_flight = false;
+        self.clear_outcome_unknown = false;
+        let mut dropped = self.input.prompt_queue.len();
+        self.input.queue_clear();
+        self.session.pending_sequences.retain(|sequence| {
+            let prompt = sequence
+                .requests
+                .iter()
+                .any(|request| matches!(request, Request::UserMessage { .. }));
+            dropped += usize::from(prompt);
+            !prompt
+        });
+        if dropped == 0 {
+            return;
+        }
+        let s = if dropped == 1 { "" } else { "s" };
+        self.push_toast(
+            ToastLevel::Warn,
+            format!("{dropped} queued prompt{s} dropped"),
+            Some("they belonged to the cleared conversation".to_string()),
+            now,
+        );
+        self.dirty = true;
+    }
+}

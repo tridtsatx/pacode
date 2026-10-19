@@ -196,6 +196,8 @@ fn test_prompt_prefix_byte_identical_across_steps_of_turn() {
         skills: &[],
         skills_enabled: false,
         max_listed_skills: 10,
+        tools: &[],
+        provider: native_provider(),
     };
     let step1_prompt = system_dynamic(&dyn_ctx_step1);
     assert!(step1_prompt.contains("Git branch: main"));
@@ -217,6 +219,8 @@ fn test_prompt_prefix_byte_identical_across_steps_of_turn() {
         skills: &[],
         skills_enabled: false,
         max_listed_skills: 10,
+        tools: &[],
+        provider: native_provider(),
     };
     let step2_prompt = system_dynamic(&dyn_ctx_step2);
 
@@ -240,6 +244,8 @@ fn test_prompt_prefix_byte_identical_across_steps_of_turn() {
         skills: &[],
         skills_enabled: false,
         max_listed_skills: 10,
+        tools: &[],
+        provider: native_provider(),
     };
     let next_turn_prompt = system_dynamic(&dyn_ctx_next_turn);
     assert!(next_turn_prompt.contains("Git branch: feature-branch"));
@@ -286,6 +292,8 @@ fn test_system_dynamic_skills_section() {
         skills: &skills,
         skills_enabled: true,
         max_listed_skills: 2,
+        tools: &[],
+        provider: native_provider(),
     };
     let out = system_dynamic(&ctx);
     assert!(out.contains("## Skills\n"));
@@ -308,6 +316,8 @@ fn test_system_dynamic_skills_section() {
         skills: &skills,
         skills_enabled: false,
         max_listed_skills: 10,
+        tools: &[],
+        provider: native_provider(),
     };
     let out_disabled = system_dynamic(&ctx_disabled);
     assert!(!out_disabled.contains("## Skills"));
@@ -325,6 +335,8 @@ fn test_system_dynamic_skills_section() {
         skills: &[],
         skills_enabled: true,
         max_listed_skills: 10,
+        tools: &[],
+        provider: native_provider(),
     };
     let out_empty = system_dynamic(&ctx_empty);
     assert!(!out_empty.contains("## Skills"));
@@ -420,6 +432,8 @@ fn subagent_dynamic_prompt_ignores_plan_and_mode() {
             skills: &[],
             skills_enabled: false,
             max_listed_skills: 0,
+            tools: &[],
+            provider: native_provider(),
         })
     };
     assert_eq!(
@@ -427,4 +441,235 @@ fn subagent_dynamic_prompt_ignores_plan_and_mode() {
         build(&planned, Mode::Plan, true)
     );
     assert!(build(&planned, Mode::Build, false).contains("do the thing"));
+}
+
+fn tools_ctx<'a>(
+    cwd: &'a std::path::Path,
+    plan: &'a pacode_types::Plan,
+    tools: &'a [ToolDefinition],
+    is_subagent: bool,
+) -> DynamicContext<'a> {
+    DynamicContext {
+        cwd,
+        git_branch: Some("main"),
+        date: "2026-10-13",
+        mode: Mode::Build,
+        plan,
+        instructions: None,
+        is_subagent,
+        skills: &[],
+        skills_enabled: false,
+        max_listed_skills: 10,
+        tools,
+        provider: native_provider(),
+    }
+}
+
+/// A provider that sends native tool names on the wire.
+fn native_provider() -> &'static pacode_provider::mock::MockProvider {
+    static NATIVE: std::sync::LazyLock<pacode_provider::mock::MockProvider> =
+        std::sync::LazyLock::new(|| pacode_provider::mock::MockProvider::new("mock"));
+    &NATIVE
+}
+
+fn tool(name: &str, description: &str) -> ToolDefinition {
+    ToolDefinition {
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: serde_json::json!({"type": "object"}),
+    }
+}
+
+fn builtin_definitions() -> Vec<ToolDefinition> {
+    pacode_tools::builtin::builtin_tools(&pacode_types::WebConfig::default()).definitions()
+}
+
+fn tools_section_of(out: &str) -> &str {
+    out.split("## Tools\n").nth(1).expect("tools section")
+}
+
+#[test]
+fn tools_section_lists_every_builtin_with_a_one_line_summary() {
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let defs = builtin_definitions();
+    assert!(
+        defs.iter().any(|d| d.name == "agent"),
+        "builtins carry `agent`"
+    );
+    let out = system_dynamic(&tools_ctx(&cwd, &plan, &defs, false));
+    let section = tools_section_of(&out);
+    for def in &defs {
+        let line = section
+            .lines()
+            .find(|l| l.starts_with(&format!("- {}: ", def.name)))
+            .unwrap_or_else(|| panic!("{} listed", def.name));
+        assert!(
+            line.chars().count() <= def.name.chars().count() + 4 + 120,
+            "{line}"
+        );
+    }
+    assert_eq!(section.lines().count(), defs.len());
+    assert!(!section.contains("more not listed"));
+}
+
+#[test]
+fn subagent_tools_section_matches_its_reduced_set() {
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let defs: Vec<_> = builtin_definitions()
+        .into_iter()
+        .filter(|d| d.name != "agent")
+        .collect();
+    let out = system_dynamic(&tools_ctx(&cwd, &plan, &defs, true));
+    let section = tools_section_of(&out);
+    assert!(!section.contains("- agent: "));
+    assert!(section.contains("- read: "));
+}
+
+/// The role text names the channel tools only when the subagent has them: a
+/// narrowed tool set must not be told to call a tool it was not given.
+#[test]
+fn subagent_role_mentions_only_the_channel_tools_it_has() {
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let role_of = |out: &str| -> String {
+        out.split("## Subagent Role\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .expect("a role section")
+            .to_string()
+    };
+
+    let full = vec![tool("ask_parent", "Ask."), tool("report_status", "Report.")];
+    let role = role_of(&system_dynamic(&tools_ctx(&cwd, &plan, &full, true)));
+    assert!(role.contains("`ask_parent`"), "{role}");
+    assert!(role.contains("`report_status`"), "{role}");
+    assert!(role.contains("<orchestrator_message>"), "{role}");
+
+    let narrow = vec![tool("read", "Read.")];
+    let role = role_of(&system_dynamic(&tools_ctx(&cwd, &plan, &narrow, true)));
+    assert!(!role.contains("ask_parent"), "{role}");
+    assert!(!role.contains("report_status"), "{role}");
+    assert!(role.contains("<orchestrator_message>"), "{role}");
+}
+
+#[test]
+fn tools_section_lists_mcp_and_summarises_the_first_sentence() {
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let mut defs = builtin_definitions();
+    defs.push(tool(
+        "github__search_issues",
+        "Search issues in a repository. Supports qualifiers.\nSecond line.",
+    ));
+    defs.push(tool("long", &"y".repeat(300)));
+    defs.push(tool(
+        "wrapped",
+        "List files (e.g. `*.rs`) matching\n    a pattern. More.\n\nNext paragraph.",
+    ));
+    let out = system_dynamic(&tools_ctx(&cwd, &plan, &defs, false));
+    assert!(out.contains("- wrapped: List files (e.g. `*.rs`) matching a pattern.\n"));
+    assert!(out.contains("- github__search_issues: Search issues in a repository.\n"));
+    assert!(out.contains(&format!("- long: {}...\n", "y".repeat(117))));
+}
+
+#[test]
+fn a_long_summary_is_cut_at_a_word_boundary() {
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let defs = vec![tool("words", &"word, ".repeat(40))];
+    let out = system_dynamic(&tools_ctx(&cwd, &plan, &defs, false));
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("- words: "))
+        .expect("words line");
+    let summary = &line["- words: ".len()..];
+    assert!(summary.ends_with("word..."), "{summary}");
+    assert!(summary.chars().count() <= 120, "{summary}");
+}
+
+#[test]
+fn tools_section_is_capped_with_a_marker() {
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let many: Vec<_> = (0..MAX_LISTED_TOOLS + 5)
+        .map(|i| tool(&format!("t{i:03}"), "Short."))
+        .collect();
+    let out = system_dynamic(&tools_ctx(&cwd, &plan, &many, false));
+    assert!(out.contains(&format!("- t{:03}: ", MAX_LISTED_TOOLS - 1)));
+    assert!(!out.contains(&format!("- t{MAX_LISTED_TOOLS:03}: ")));
+    assert!(out.contains("- ... and 5 more not listed here"));
+
+    let wide: Vec<_> = (0..60)
+        .map(|i| tool(&format!("w{i:02}"), &"z".repeat(300)))
+        .collect();
+    let out = system_dynamic(&tools_ctx(&cwd, &plan, &wide, false));
+    let section = tools_section_of(&out);
+    let listed = section.lines().filter(|l| l.starts_with("- w")).count();
+    assert!(listed < 60);
+    assert!(section.contains(&format!("- ... and {} more not listed here", 60 - listed)));
+    assert!(section.chars().count() <= MAX_TOOLS_SECTION_CHARS + 200);
+}
+
+#[test]
+fn prompt_is_byte_stable_while_the_tool_set_is_unchanged() {
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let first = builtin_definitions();
+    let second = builtin_definitions();
+    let a = system_dynamic(&tools_ctx(&cwd, &plan, &first, false));
+    let b = system_dynamic(&tools_ctx(&cwd, &plan, &second, false));
+    assert_eq!(a.as_bytes(), b.as_bytes());
+    // The rule lives in the static part, which never sees the tool list.
+    assert!(!system_static().contains("- read: "));
+}
+
+#[test]
+fn static_prompt_has_the_self_knowledge_rule() {
+    let s = system_static();
+    assert!(s.contains("## Self-Knowledge"));
+    assert!(s.contains("never read files, search the repository, or inspect pacode's source"));
+    assert!(s.contains("A tool that is not listed is one you do not have"));
+}
+
+#[test]
+fn tools_section_uses_the_names_the_provider_sends_on_the_wire() {
+    use pacode_provider::Provider;
+
+    let cwd = std::path::PathBuf::from("/test/cwd");
+    let plan = pacode_types::Plan::default();
+    let defs = builtin_definitions();
+
+    let native = system_dynamic(&tools_ctx(&cwd, &plan, &defs, false));
+    let native = tools_section_of(&native);
+    assert!(native.contains("- bash: "), "{native}");
+    assert!(native.contains("- read: "), "{native}");
+    assert!(!native.contains("- Bash: "), "{native}");
+
+    let oauth = pacode_provider::anthropic::Anthropic::from_oauth(
+        "anthropic",
+        pacode_types::ProviderConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            ..Default::default()
+        },
+        pacode_types::ProviderDefaults::default(),
+        "sk-ant-oat-test".to_string(),
+        Default::default(),
+    )
+    .expect("oauth provider");
+    let mut ctx = tools_ctx(&cwd, &plan, &defs, false);
+    ctx.provider = &oauth;
+    let out = system_dynamic(&ctx);
+    let section = tools_section_of(&out);
+    for def in &defs {
+        let wire = oauth.wire_tool_name(&def.name);
+        assert!(
+            section.contains(&format!("- {wire}: ")),
+            "{wire} listed:\n{section}"
+        );
+    }
+    assert!(section.contains("- Bash: "), "{section}");
+    assert!(section.contains("- Read: "), "{section}");
+    assert!(!section.contains("- bash: "), "{section}");
 }

@@ -8,31 +8,45 @@
 //! - `agent`: [`Agent`] — history, status, transcript bookkeeping
 //! - `turn`: the turn loop (§6.2) with injection points B/C/D
 //! - `inject`: [`InjectionQueue`] and rendering of injections into user messages
+//! - `notice_lock`: the switch, the backlog it parks, and the paced release at
+//!   the two drain sites
 //! - `permissions`: the mode × kind × risk matrix and the AllowSession cache
 //! - `prompt`: system prompt (static + dynamic), AGENTS.md/CLAUDE.md discovery
+//! - `clear`: `/clear` — the conversation reset in place
 //! - `compaction`: threshold check and summary turn
 //! - `transcript`: history → `TranscriptItem`, event sink with seq, delta coalescing
 //! - `host`: `ToolHost` implementation handed to tools
 //! - `hooks`: user `[hooks]` shell commands on tool/lifecycle events
 //! - `naming`: session title generation after the first reply
 //! - `ledger`: file ownership between agents sharing one working tree
+//! - `analyze`: `/analyze` accounting — per-category attribution and the
+//!   session ledger, under explicit caps
+//! - `fusion`: the two-model turn pipeline — a read-only planner, then an
+//!   implementer that works from the plan left in the transcript
+//! - `plan_reminder`: a main agent that stops with open plan items is
+//!   reminded and its turn goes on, under a per-user-message budget
 
 pub mod agent;
-pub mod agent_comm;
-mod agent_comm_flow;
+pub mod analyze;
 mod attach;
 pub mod auth;
+pub mod clear;
 pub mod compaction;
 pub mod core;
 pub mod expand;
+pub mod explain;
+pub mod fusion;
 pub mod hooks;
 pub mod host;
 pub mod inject;
 pub mod ledger;
 pub mod naming;
+pub mod notice_lock;
 pub mod permissions;
+pub mod plan_reminder;
 pub mod prompt;
 pub mod questions;
+pub(crate) mod rpc;
 pub mod sampling;
 pub mod schedule;
 pub mod session;

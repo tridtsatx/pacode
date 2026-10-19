@@ -1,18 +1,20 @@
-//! `ask_parent`: subagent → orchestrator question. Subagent-only: the core
-//! removes it from the main agent's tool set, and the host refuses it there too.
+//! `ask_parent`: subagent → orchestrator question. The call blocks until the
+//! orchestrator answers with `agent send` or completes a turn without one.
+//! Subagent-only: the core removes it from the main agent's tool set, and the
+//! host refuses it there too.
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::parse_input;
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
-
-#[cfg(test)]
-#[path = "ask_parent_tests.rs"]
-mod ask_parent_tests;
+use crate::host::ParentReply;
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "ask_parent";
+
+/// Model-facing description; see `prompts/ask_parent.md`.
+const DESCRIPTION: &str = include_str!("../prompts/ask_parent.md");
 
 /// Longest question, in characters.
 pub const MAX_QUESTION_CHARS: usize = 2000;
@@ -21,57 +23,30 @@ pub const MAX_OPTIONS: usize = 6;
 /// Longest suggested answer, in characters.
 pub const MAX_OPTION_CHARS: usize = 200;
 
-pub struct AskParentTool;
+/// The result when the orchestrator completed a turn without answering.
+pub const UNANSWERED: &str = "The orchestrator ended its turn without answering. Proceed with \
+     your best judgment and state the assumption in your final report.";
 
-#[derive(Deserialize)]
+/// The result when the orchestrator's turn failed with the question in it.
+pub const PARENT_FAILED: &str = "The orchestrator's turn failed before it answered. Proceed with \
+     your best judgment and state the assumption in your final report.";
+
+/// The result when earlier questions kept going unanswered: this one was not
+/// sent, so the orchestrator is not woken for a question it will not take.
+pub const NOT_ANSWERING: &str = "The orchestrator is not answering your questions, so this one \
+     was not sent. Proceed on your own judgment and state your assumptions in your final \
+     report.";
+
+#[derive(Default)]
+pub struct AskParentTool {
+    definition: DefinitionCache,
+}
+
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct AskParentInput {
     question: String,
     options: Vec<String>,
-    wait: bool,
-}
-
-impl Default for AskParentInput {
-    fn default() -> Self {
-        Self {
-            question: String::new(),
-            options: Vec::new(),
-            wait: true,
-        }
-    }
-}
-
-/// What the host reports back for one `ask_parent` call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ParentReply {
-    /// The orchestrator answered while the call was waiting.
-    Answered { question_id: String, text: String },
-    /// Nobody answered within `agents.ask_parent_timeout_secs`.
-    TimedOut { question_id: String },
-    /// The agent was stopped or interrupted while waiting.
-    Cancelled { question_id: String },
-    /// `wait = false`: the question is queued, the answer arrives later.
-    Pending { question_id: String },
-}
-
-/// The model-visible result text for a reply.
-pub fn reply_text(reply: &ParentReply) -> String {
-    match reply {
-        ParentReply::Answered { question_id, text } => {
-            format!("The orchestrator answered {question_id}: {text}")
-        }
-        ParentReply::TimedOut { .. } => {
-            "no answer from orchestrator; make a reasonable assumption and state it".to_string()
-        }
-        ParentReply::Cancelled { question_id } => format!(
-            "Question {question_id} was withdrawn before it was answered; make a reasonable assumption and state it"
-        ),
-        ParentReply::Pending { question_id } => format!(
-            "Question {question_id} sent to the orchestrator. Keep working; the answer arrives \
-             later as <answer_from_orchestrator question=\"{question_id}\"> (or as a plain \
-             <message_from_orchestrator>)."
-        ),
-    }
 }
 
 /// Trim and validate a question; `Err` is the message for the model.
@@ -99,6 +74,19 @@ pub fn clean_options(options: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// The question as the orchestrator sees it: the text, then the suggested
+/// answers (if any) as a numbered list.
+pub fn compose_question(question: &str, options: &[String]) -> String {
+    if options.is_empty() {
+        return question.to_string();
+    }
+    let mut text = format!("{question}\n\nOptions:");
+    for (i, option) in options.iter().enumerate() {
+        text.push_str(&format!("\n{}. {option}", i + 1));
+    }
+    text
+}
+
 #[async_trait]
 impl Tool for AskParentTool {
     fn name(&self) -> &str {
@@ -106,13 +94,11 @@ impl Tool for AskParentTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the orchestrator (the agent that spawned you) a question. Ask only when you \
-         are blocked and cannot make a reasonable assumption yourself; keep it short and \
-         offer `options` when the choice is closed. With `wait` (default true) the call \
-         blocks until the orchestrator answers, or until a timeout, after which you must \
-         assume and state the assumption. With `wait: false` it returns at once and the \
-         answer arrives later as `<answer_from_orchestrator>`. The number of questions \
-         per agent is limited."
+        DESCRIPTION.trim()
+    }
+
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
@@ -120,16 +106,19 @@ impl Tool for AskParentTool {
             "type": "object",
             "required": ["question"],
             "properties": {
-                "question": {"type": "string", "description": "Short question, max 2000 chars."},
+                "question": {"type": "string", "description": "Self-contained question, max 2000 chars."},
                 "options": {
                     "type": "array",
                     "maxItems": MAX_OPTIONS,
                     "items": {"type": "string"},
-                    "description": "Suggested answers, if the choice is closed."
-                },
-                "wait": {"type": "boolean", "default": true, "description": "Block until answered (default) or return immediately."}
+                    "description": "The answers you see, if the choice is closed."
+                }
             }
         })
+    }
+
+    fn can_exceed_output_cap(&self) -> bool {
+        false
     }
 
     fn kind(&self) -> ToolKind {
@@ -140,16 +129,25 @@ impl Tool for AskParentTool {
         let (args, _) = parse_input::<AskParentInput>(input)?;
         let question = check_question(&args.question)?;
         let options = clean_options(args.options);
-        let short: String = question.chars().take(48).collect();
-        let reply = ctx.host.ask_parent(question, options, args.wait).await?;
-        let preview = match &reply {
-            ParentReply::Answered { .. } => "answered",
-            ParentReply::TimedOut { .. } => "no answer",
-            ParentReply::Cancelled { .. } => "withdrawn",
-            ParentReply::Pending { .. } => "sent",
+        let reply = ctx
+            .host
+            .ask_parent(&ctx.call_id, compose_question(&question, &options))
+            .await?;
+        let (content, preview) = match reply {
+            ParentReply::Answered(answer) => (
+                format!("The orchestrator answered:\n\n{answer}"),
+                "answered",
+            ),
+            ParentReply::Unanswered => (UNANSWERED.to_string(), "no answer"),
+            ParentReply::ParentFailed => (PARENT_FAILED.to_string(), "no answer"),
+            ParentReply::NotAnswering => (NOT_ANSWERING.to_string(), "not sent"),
         };
-        Ok(ToolOutput::text(reply_text(&reply))
-            .with_title(format!("ask parent: {short}"))
+        Ok(ToolOutput::text(content)
+            .with_title("Ask orchestrator")
             .with_preview(preview))
     }
 }
+
+#[cfg(test)]
+#[path = "ask_parent_tests.rs"]
+mod ask_parent_tests;

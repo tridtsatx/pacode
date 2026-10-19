@@ -117,7 +117,7 @@ pub fn run(
                         bail!("Login to {provider_id} failed: {message}");
                     }
                 },
-                ClientEvent::Disconnected { reason } => {
+                ClientEvent::Disconnected { reason, .. } => {
                     bail!("Disconnected from daemon: {reason}");
                 }
                 _ => {}

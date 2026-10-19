@@ -9,12 +9,18 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{cap_output, parse_input};
-use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
+use super::helpers::{cap_output, parse_input, preview_body};
+use crate::{DefinitionCache, Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "glob";
 
-pub struct GlobTool;
+/// Model-facing description; see `prompts/glob.md` for the convention.
+const DESCRIPTION: &str = include_str!("../prompts/glob.md");
+
+#[derive(Default)]
+pub struct GlobTool {
+    definition: DefinitionCache,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -31,8 +37,10 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "List files matching a glob pattern (e.g. `src/**/*.rs`), most recently \
-         modified first, respecting .gitignore."
+        DESCRIPTION.trim()
+    }
+    fn definition_cache(&self) -> Option<&DefinitionCache> {
+        Some(&self.definition)
     }
 
     fn schema(&self) -> Value {
@@ -53,7 +61,8 @@ impl Tool for GlobTool {
 
     /// `globset::Glob` matched against paths relative to the root while walking with
     /// `ignore::WalkBuilder`; collect (mtime, path); sort desc by mtime; cap; output one
-    /// relative path per line; `spawn_blocking`.
+    /// relative path per line, plus a footer naming how many matches the cap hid;
+    /// `spawn_blocking`.
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (args, accept_large_output) = parse_input::<GlobInput>(input)?;
         if args.pattern.is_empty() {
@@ -70,50 +79,41 @@ impl Tool for GlobTool {
         let cancel = ctx.cancel.clone();
         let pattern = args.pattern.clone();
 
-        let matched_paths =
-            tokio::task::spawn_blocking(move || -> Result<Vec<String>, ToolError> {
+        let (matched_paths, total) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<String>, usize), ToolError> {
                 let glob = globset::GlobBuilder::new(&pattern)
                     .literal_separator(false)
                     .build()
                     .map_err(|e| ToolError::invalid(format!("invalid glob pattern: {e}")))?
                     .compile_matcher();
 
-                let walker = ignore::WalkBuilder::new(&root)
-                    .hidden(true)
-                    .git_ignore(true)
-                    .require_git(false)
-                    .build();
+                let entries = crate::walk::shared().collect(
+                    &root,
+                    crate::walk::WalkOptions {
+                        include_hidden: false,
+                        max_depth: None,
+                    },
+                    &cancel,
+                )?;
 
                 // Bounded top-N by mtime (cap: `max_results` entries; owner: this call). Ties keep
-                // walk order via `seq`, as the previous stable sort did.
+                // walk order via `seq`, as a stable sort would; `total` counts every match so
+                // the footer can name what the cap hid.
                 let mut heap: BinaryHeap<Reverse<(SystemTime, Reverse<usize>, PathBuf)>> =
                     BinaryHeap::with_capacity(max_results.min(4096) + 1);
-                let mut seq = 0usize;
+                let mut total = 0usize;
 
-                for entry in walker {
-                    if cancel.is_cancelled() {
-                        return Err(ToolError::Cancelled);
-                    }
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                for entry in entries.iter().filter(|entry| entry.is_file) {
+                    if !(glob.is_match(&entry.rel)
+                        || glob.is_match(entry.rel.file_name().unwrap_or_default()))
+                    {
                         continue;
                     }
-                    let path = entry.path();
-                    let rel = path.strip_prefix(&root).unwrap_or(path);
-                    if glob.is_match(rel) || glob.is_match(path.file_name().unwrap_or_default()) {
-                        let mtime = entry
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        heap.push(Reverse((mtime, Reverse(seq), rel.to_path_buf())));
-                        seq += 1;
-                        if heap.len() > max_results {
-                            heap.pop();
-                        }
+                    let mtime = entry.mtime.unwrap_or(SystemTime::UNIX_EPOCH);
+                    heap.push(Reverse((mtime, Reverse(total), entry.rel.clone())));
+                    total += 1;
+                    if heap.len() > max_results {
+                        heap.pop();
                     }
                 }
 
@@ -123,15 +123,26 @@ impl Tool for GlobTool {
                     .into_iter()
                     .map(|Reverse((_, _, p))| p.to_string_lossy().to_string())
                     .collect();
-                Ok(lines)
+                Ok((lines, total))
             })
             .await
             .map_err(|e| ToolError::failed(e.to_string()))??;
 
         let count = matched_paths.len();
-        let joined = matched_paths.join("\n");
+        let mut joined = matched_paths.join("\n");
+        if total > count {
+            let more = total - count;
+            joined.push_str(&format!(
+                "\n— {more} more matching files not shown (newest {count} listed); narrow the \
+                 pattern or raise `max_results`"
+            ));
+        }
         let content = cap_output(&joined, accept_large_output, ctx.output_cap_chars);
-        let preview = format!("{count} files");
+        let preview = if count == 0 {
+            "no files".to_string()
+        } else {
+            preview_body(&joined)
+        };
         let title = format!("Glob \"{}\"", args.pattern);
 
         Ok(ToolOutput::text(content)

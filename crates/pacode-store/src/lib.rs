@@ -7,11 +7,19 @@
 //!
 //! Submodules (to implement): `schema`, `worker`, `queries`, plus the `Store` facade here.
 
+pub mod capabilities;
 pub mod queries;
 pub mod schema;
 pub mod worker;
 
-pub use queries::{CompactionRecord, MessageRow, SearchHit, SessionFilter};
+mod batch;
+mod txn;
+
+pub use queries::{
+    AdmissionCursor, AgentRestore, CompactionRecord, MessageAdmission, MessageAdmissionPage,
+    MessageAdmissionResult, MessageAdmissionState, MessagePage, MessageRow, SearchHit,
+    SessionCursor, SessionFilter, SessionPage, TaskAdmission, TaskAdmissionResult,
+};
 pub use worker::Store;
 
 #[derive(Debug, thiserror::Error)]
@@ -26,4 +34,6 @@ pub enum StoreError {
     Closed,
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("invalid store data: {0}")]
+    Invalid(String),
 }

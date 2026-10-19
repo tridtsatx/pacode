@@ -42,7 +42,11 @@ pub fn render(
     frame: u64,
     welcome_ms: u64,
 ) -> Vec<Line<'static>> {
-    let title = format!("pacode v{}", info.version);
+    let title = title_spans(info, opts);
+    let title_w: usize = title
+        .iter()
+        .map(|s| pacode_render::display_width(&s.content))
+        .sum();
 
     let stage = if welcome_ms < crate::state::WELCOME_ANIM_MS {
         welcome_ms / CASCADE_ROW_MS
@@ -53,7 +57,7 @@ pub fn render(
     if width < 40 {
         return vec![
             if stage > 0 {
-                Line::from(Span::styled(title, opts.theme.bold))
+                Line::from(title.clone())
             } else {
                 Line::default()
             },
@@ -81,7 +85,7 @@ pub fn render(
     };
 
     let phrase = phrases::phrase_of_the_day(info.day);
-    let title_end = mascot_width + GAP + pacode_render::display_width(&title);
+    let title_end = mascot_width + GAP + title_w;
     let phrase_w = pacode_render::display_width(phrase);
     // Right-aligned on the title row, only when it fits without crowding the title.
     let phrase_pad = (width as usize)
@@ -103,7 +107,7 @@ pub fn render(
         if row == title_row && title_due {
             let pad = mascot_width.saturating_sub(drawn) + GAP;
             spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(title.clone(), opts.theme.bold));
+            spans.extend(title.iter().cloned());
             if let Some(pad) = phrase_pad {
                 spans.push(Span::raw(" ".repeat(pad)));
                 spans.push(Span::styled(phrase, opts.theme.faint));
@@ -129,6 +133,14 @@ pub fn render(
     lines.push(Line::default());
 
     lines
+}
+
+/// ` pacode ` as an accent plaque, then the version, quiet.
+fn title_spans(info: &HeaderInfo, opts: &RenderOptions) -> Vec<Span<'static>> {
+    vec![
+        crate::ui::chrome::badge("pacode", opts.theme.accent, opts),
+        Span::styled(format!(" v{}", info.version), opts.theme.dim),
+    ]
 }
 
 fn line_width(line: &Line<'_>) -> usize {

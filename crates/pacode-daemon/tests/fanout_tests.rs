@@ -45,6 +45,7 @@ async fn slow_reader_sees_resync_before_newer_events() {
             }
             ServerMessage::Event { .. } => events_before += 1,
             ServerMessage::Reply { .. } => panic!("unexpected reply"),
+            ServerMessage::Resync { .. } => panic!("unexpected resync"),
         }
     }
     assert!(events_before >= 8, "queued backlog precedes the Resync");

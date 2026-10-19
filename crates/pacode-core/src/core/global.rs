@@ -1,6 +1,6 @@
 //! Global request handlers: MCP servers, plugins, models, sessions.
 
-use pacode_types::{Reply, Request};
+use pacode_types::{Event, Reply, Request};
 
 use super::Core;
 
@@ -9,6 +9,14 @@ impl Core {
     /// Used by the daemon for unattached connections too.
     pub async fn handle_global(&self, req: &Request) -> Option<Reply> {
         match req {
+            // A daemon-level reading, so it answers on an unattached connection
+            // too: the point is to inspect a busy daemon from outside it.
+            Request::RuntimeStats => {
+                let (core, providers) = self.stats();
+                Some(Reply::RuntimeStats {
+                    stats: Box::new(pacode_types::RuntimeStatsReply { core, providers }),
+                })
+            }
             Request::ListSessions { limit } => Some(
                 match self
                     .deps
@@ -25,9 +33,54 @@ impl Core {
                     },
                 },
             ),
-            Request::ListModels => Some(Reply::Models {
-                models: self.providers().list_all_models().await,
-            }),
+            Request::ListModels => {
+                let providers = self.providers();
+                let models = providers.list_all_models().await;
+                // A stale cache hit kicks off a background refresh in
+                // `CatalogCache`: when one is running, follow it once and push
+                // the fresh list to every attached client instead of letting
+                // the picker sit on the stale answer. One task per request —
+                // overlapping `ListModels` calls may broadcast a duplicate,
+                // which clients fold idempotently.
+                let cache = providers.catalog_cache();
+                let waiters: Vec<tokio::sync::futures::OwnedNotified> = providers
+                    .ids()
+                    .into_iter()
+                    .filter_map(|id| cache.refresh_in_flight(&id).map(|n| n.notified_owned()))
+                    .collect();
+                if !waiters.is_empty() {
+                    let core = self.self_weak.get().cloned().unwrap_or_default();
+                    tokio::spawn(async move {
+                        for w in waiters {
+                            w.await;
+                        }
+                        let Some(core) = core.upgrade() else {
+                            return;
+                        };
+                        let models = core.providers().list_all_models().await;
+                        core.broadcast_event(Event::ModelsUpdated { models });
+                    });
+                }
+                Some(Reply::Models { models })
+            }
+            Request::RefreshModels => {
+                let providers = self.providers();
+                let cache = providers.catalog_cache();
+                let mut models = Vec::new();
+                // Sequential per provider — there are few, and each
+                // `force_refresh` dedupes against a refresh already in flight.
+                for id in providers.ids() {
+                    if let Some(provider) = providers.get(&id) {
+                        models.extend(cache.force_refresh(&id, &provider).await);
+                    }
+                }
+                // Attached clients that did not ask keep their cached copy
+                // otherwise — push the fresh catalog to them too.
+                self.broadcast_event(Event::ModelsUpdated {
+                    models: models.clone(),
+                });
+                Some(Reply::Models { models })
+            }
             Request::ListMcpServers => {
                 let statuses = self.deps.mcp.statuses();
                 let mut servers = Vec::new();
@@ -106,7 +159,7 @@ impl Core {
                                 if let Some(main) = session.main_agent()
                                     && let Ok(mut g) = main.tools.write()
                                 {
-                                    *g = new_tools.without(pacode_tools::builtin::ask_parent::NAME);
+                                    *g = pacode_tools::orchestrator_tools(&new_tools);
                                 }
                             }
                         }

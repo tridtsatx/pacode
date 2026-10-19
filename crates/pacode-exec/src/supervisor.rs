@@ -1,3 +1,4 @@
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -76,17 +77,56 @@ fn emit_progress_snapshot(id: &TaskId, state: &Arc<SharedState>) {
     }
 }
 
+pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(3);
+
+pub(crate) enum Signal {
+    Terminate,
+    Kill,
+}
+
+pub(crate) fn terminate(child_pid: Option<u32>) {
+    signal(child_pid, Signal::Terminate);
+}
+
+pub(crate) fn force_kill(child_pid: Option<u32>) {
+    signal(child_pid, Signal::Kill);
+}
+
+pub(crate) fn terminal_status(
+    kill_requested: bool,
+    wait_failed: bool,
+    exit_code: Option<i32>,
+) -> TaskStatus {
+    if kill_requested {
+        return TaskStatus::Killed;
+    }
+    if wait_failed {
+        return TaskStatus::Failed;
+    }
+    match exit_code {
+        Some(0) => TaskStatus::Completed,
+        Some(_) | None => TaskStatus::Failed,
+    }
+}
+
 pub(crate) async fn run_supervisor(
     id: TaskId,
     mut child: tokio::process::Child,
     mut spool_file: tokio::fs::File,
     timeout: Option<Duration>,
+    mut kill_rx: tokio::sync::watch::Receiver<bool>,
     state: Arc<SharedState>,
     permit: SlotPermit,
 ) {
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let child_pid = child.id();
+    let kill_grace = Duration::from_secs(state.config.kill_grace_secs);
+    let mut kill_requested = *kill_rx.borrow_and_update();
+    let mut kill_deadline: Option<tokio::time::Instant> = None;
+    if kill_requested {
+        arm_kill(child_pid, kill_grace, &mut kill_deadline);
+    }
 
     let mut stdout_buf = [0u8; 8192];
     let mut stderr_buf = [0u8; 8192];
@@ -111,7 +151,8 @@ pub(crate) async fn run_supervisor(
     let mut timeout_active = timeout.is_some();
 
     let mut child_waited = false;
-    let mut child_status: Option<std::process::ExitStatus> = None;
+    let mut child_status: Option<ExitStatus> = None;
+    let mut wait_failed = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     let mut progress_throttle = ProgressThrottle::new(PROGRESS_EMIT_INTERVAL);
 
@@ -120,16 +161,9 @@ pub(crate) async fn run_supervisor(
             break;
         }
 
-        if let Some(deadline) = drain_deadline
-            && tokio::time::Instant::now() >= deadline
-        {
-            break;
-        }
-
         let flush_at = progress_throttle
             .flush_deadline()
             .map(tokio::time::Instant::from_std);
-
         tokio::select! {
             _ = async {
                 match flush_at {
@@ -196,6 +230,20 @@ pub(crate) async fn run_supervisor(
                 }
             }
 
+            _ = kill_rx.changed(), if !kill_requested => {
+                kill_requested = true;
+                arm_kill(child_pid, kill_grace, &mut kill_deadline);
+            }
+
+            _ = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
+                force_kill(child_pid);
+                kill_deadline = None;
+            }
+
+            _ = wait_for_deadline(drain_deadline) => {
+                break;
+            }
+
             _ = stall_interval.tick() => {
                 let stalled_info = {
                     let mut tasks = state.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -220,25 +268,29 @@ pub(crate) async fn run_supervisor(
 
             _ = &mut timeout_sleep, if timeout_active => {
                 timeout_active = false;
-                if let Some(pid) = child_pid {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::killpg(pid as i32, libc::SIGKILL);
-                    }
-                }
+                kill_deadline = None;
+                force_kill(child_pid);
             }
 
             wait_res = child.wait(), if !child_waited => {
                 child_waited = true;
-                child_status = wait_res.ok();
-                drain_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(3));
+                match wait_res {
+                    Ok(status) => child_status = Some(status),
+                    Err(_) => wait_failed = true,
+                }
+                drain_deadline = Some(tokio::time::Instant::now() + DRAIN_GRACE);
+                force_kill(child_pid);
             }
         }
     }
 
     if !child_waited {
-        child_status = child.wait().await.ok();
+        match child.wait().await {
+            Ok(status) => child_status = Some(status),
+            Err(_) => wait_failed = true,
+        }
     }
+    force_kill(child_pid);
 
     let guard_reason = {
         let tasks = state.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -254,6 +306,7 @@ pub(crate) async fn run_supervisor(
     }
 
     let _ = spool_file.flush().await;
+    drop(spool_file);
 
     let remaining_lines: Vec<String> = {
         let mut lines = Vec::new();
@@ -275,12 +328,21 @@ pub(crate) async fn run_supervisor(
     let exit_code = child_status.and_then(|s| s.code());
     let now_timestamp = now_ms();
 
-    let ended_info = {
-        let mut tasks = state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = tasks.get_mut(&id) {
+    state.guard.process_ended();
+    // Free the process slot (F4) before the task turns terminal, so a spawn that
+    // sees it ended (and a queued spawn) finds the slot free.
+    drop(permit);
+
+    let mut ended = false;
+    let evicted = {
+        let mut tasks = state
+            .tasks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let ended_info = if let Some(entry) = tasks.get_mut(&id) {
             for line in remaining_lines {
                 if let Some(p) = entry.parser.feed_line(&line, now_timestamp)
-                    && entry.info.progress.as_ref().map(|pr| pr.source)
+                    && entry.info.progress.as_ref().map(|progress| progress.source)
                         != Some(ProgressSource::Reported)
                 {
                     entry.info.progress = Some(p);
@@ -288,32 +350,34 @@ pub(crate) async fn run_supervisor(
             }
             entry.info.warnings = entry.parser.warnings();
             entry.info.errors = entry.parser.errors();
+            if wait_failed {
+                entry.info.errors = entry.info.errors.saturating_add(1);
+            }
 
-            let status = if entry.kill_requested {
-                TaskStatus::Killed
-            } else {
-                match exit_code {
-                    Some(0) => TaskStatus::Completed,
-                    Some(_) | None => TaskStatus::Failed,
-                }
-            };
+            let status = terminal_status(entry.kill_requested, wait_failed, exit_code);
             entry.info.status = status;
             entry.info.exit_code = exit_code;
             entry.info.ended_at_ms = Some(now_timestamp);
             entry.info.output_bytes = entry.buffer.total_bytes();
-            entry.version_tx.send_modify(|v| *v += 1);
+            entry.child_pid = None;
+            entry.version_tx.send_modify(|version| *version += 1);
             Some(entry.info.clone())
         } else {
             None
+        };
+        // Sent under the lock (a broadcast send never blocks): whoever sees
+        // the task terminal under this lock afterwards — a dropped
+        // `ForegroundGuard` sending `Unreported` — is ordered after `Ended`.
+        if let Some(info) = ended_info {
+            ended = true;
+            let _ = state.events.send(TaskEvent::Ended(info));
         }
+        state.prune_terminal_overflow(&mut tasks)
     };
-
-    state.guard.process_ended();
-    // Free the process slot (F4) before announcing the end, so a queued spawn can start.
-    drop(permit);
-    if let Some(info) = ended_info {
-        let _ = state.events.send(TaskEvent::Ended(info));
-        // F1: forget the oldest finished tasks; F5: occasional spool GC.
+    drop(evicted);
+    // F1: forget the oldest finished tasks beyond the stub retention; F5: occasional
+    // spool GC.
+    if ended {
         crate::retention::on_ended(&state, &id);
     }
 }
@@ -369,6 +433,16 @@ async fn handle_chunk(
         complete_lines.push(String::from_utf8_lossy(&dropped).into_owned());
     }
 
+    // The live tail, before the parser sees the lines: this is the output the
+    // client draws, and the parser's job is to summarise progress out of it.
+    let live_text = if complete_lines.is_empty() {
+        String::new()
+    } else {
+        let mut text = complete_lines.join("\n");
+        text.push('\n');
+        text
+    };
+
     let now_timestamp = now_ms();
     let mut progress_to_emit = None;
 
@@ -404,6 +478,62 @@ async fn handle_chunk(
 
     if let Some(info) = progress_to_emit {
         let _ = state.events.send(TaskEvent::Progress(info));
+    }
+    if !live_text.is_empty() {
+        let entry = state
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|entry| (entry.info.clone(), entry.call.clone()));
+        if let Some((info, call)) = entry {
+            let _ = state.events.send(TaskEvent::Output {
+                info,
+                call,
+                text: live_text,
+            });
+        }
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn arm_kill(pid: Option<u32>, grace: Duration, deadline: &mut Option<tokio::time::Instant>) {
+    terminate(pid);
+    if grace.is_zero() {
+        force_kill(pid);
+    } else {
+        *deadline = Some(tokio::time::Instant::now() + grace);
+    }
+}
+
+fn signal(child_pid: Option<u32>, request: Signal) {
+    let Some(child_pid) = child_pid else {
+        return;
+    };
+    let Ok(raw) = i32::try_from(child_pid) else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        let number = match request {
+            Signal::Terminate => libc::SIGTERM,
+            Signal::Kill => libc::SIGKILL,
+        };
+        unsafe {
+            if libc::killpg(raw, number) != 0 {
+                libc::kill(raw, number);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (raw, request);
     }
 }
 

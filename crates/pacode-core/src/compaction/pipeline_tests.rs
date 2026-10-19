@@ -126,9 +126,10 @@ async fn summary_stage_folds_older_part_and_attaches_pinned() {
     assert_eq!(out.method, Some(CompactionMethod::Summary));
     assert_eq!(s.calls(), 1);
     assert!(!out.summary_failed);
-    // keep_recent_messages = 4 lands on a tool result -> cut moves back to its tool call.
-    assert_eq!(out.folded, 31);
-    assert_eq!(out.messages.len(), 5);
+    // The cut stops at the oldest recent mutating result inside the lookback
+    // (every `bash` call counts) and moves back to its tool call.
+    assert_eq!(out.folded, 19);
+    assert_eq!(out.messages.len(), 17);
     assert_eq!(out.messages[0].role, Role::Assistant);
     assert!(out.messages[0].has_tool_uses());
     assert_eq!(out.messages[1].role, Role::Tool);

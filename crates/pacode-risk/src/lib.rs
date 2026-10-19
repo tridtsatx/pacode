@@ -5,17 +5,32 @@
 //! Tiers (`pacode_types::RiskLevel`):
 //! - `Safe`: no destructive potential detected;
 //! - `Low`: destructive but bounded (inside cwd, git-recoverable, temp dirs);
-//! - `Confirm`: destructive target cannot be determined statically;
+//! - `Confirm`: destructive target cannot be determined statically, or the
+//!   line cannot be read statically at all;
 //! - `Catastrophic`: would destroy home, root, credentials; never runs.
+//!
+//! Layers: [`tokenize`] lexes, [`shell`] finds every simple command the line
+//! runs, `wrappers` finds the command behind `sudo`/`env`/`xargs`/`sh -c`; the
+//! gate ([`classify`]), the Plan-mode check ([`is_read_only`]) and the
+//! concurrency check ([`is_side_effect_free`]) all judge that one list.
 
+mod assess;
 pub mod gate;
+mod git;
 pub mod paths;
+mod pure;
 pub mod readonly;
+pub mod shell;
+mod sinks;
 pub mod tokenize;
+mod wrappers;
+mod writers;
 
 use std::path::Path;
 
 pub use pacode_types::RiskLevel;
+pub use pure::is_side_effect_free;
+pub use readonly::is_protected_read;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RiskFinding {
@@ -92,8 +107,9 @@ pub fn classify_with_home(command: &str, cwd: &Path, home: &Path) -> RiskAssessm
     gate::classify_with_home(command, cwd, home)
 }
 
-/// True when every simple command in the pipeline is on the read-only allowlist and
-/// there are no redirections to files. Used by Plan mode.
+/// True when every command the line runs is on the read-only allowlist, with
+/// no writing redirection, substitution, or unreadable grammar. Used by Plan
+/// mode.
 pub fn is_read_only(command: &str) -> bool {
     readonly::is_read_only(command)
 }

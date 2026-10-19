@@ -31,6 +31,38 @@ pub fn cap_output(text: &str, accept_large: bool, cap: usize) -> String {
     }
 }
 
+/// The transcript-cell body: real output, head+tail-capped at
+/// `PREVIEW_CAP_CHARS` — enough for the cell's collapsed view and for
+/// `ctrl+o` expansion, bounded so the transcript stays light.
+pub fn preview_body(text: &str) -> String {
+    pacode_types::truncate_head_tail(text, pacode_types::PREVIEW_CAP_CHARS)
+}
+
+/// The new text of a whole-file change with its unified diff (context 3)
+/// and line counts.
+pub(crate) struct FileChange {
+    pub new: String,
+    pub diff: String,
+    pub stat: pacode_types::DiffStat,
+}
+
+/// Diff `old` → `new` on the blocking pool. A large rewrite is real CPU work
+/// (bounded by `pacode_render::DIFF_TIMEOUT`, plus tokenising up to the
+/// whole-file limit) that must not stall a runtime worker the daemon's event
+/// loop shares; the new text moves in and comes back so nothing is copied.
+pub(crate) async fn diff_off_runtime(
+    old: String,
+    new: String,
+    rel_path: String,
+) -> Result<FileChange, ToolError> {
+    tokio::task::spawn_blocking(move || {
+        let (diff, stat) = pacode_render::unified_diff(&old, &new, &rel_path, 3);
+        FileChange { new, diff, stat }
+    })
+    .await
+    .map_err(|err| ToolError::failed(format!("diff task failed: {err}")))
+}
+
 /// Check if a path is outside the workspace directory `cwd`.
 pub fn is_outside_workspace(path: &Path, cwd: &Path) -> bool {
     let canonical_cwd = match cwd.canonicalize() {
@@ -41,7 +73,9 @@ pub fn is_outside_workspace(path: &Path, cwd: &Path) -> bool {
     !canonical_path.starts_with(&canonical_cwd)
 }
 
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
+/// Canonical path when it exists; otherwise canonicalizes the deepest existing
+/// ancestor and re-appends the missing tail.
+pub(crate) fn canonicalize_best_effort(path: &Path) -> PathBuf {
     if let Ok(c) = path.canonicalize() {
         return c;
     }
@@ -64,18 +98,6 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     base
 }
 
-/// Extract the first changed line from a unified diff for transcript preview.
-pub fn first_changed_line(diff: &str) -> String {
-    for line in diff.lines() {
-        if (line.starts_with('+') && !line.starts_with("+++"))
-            || (line.starts_with('-') && !line.starts_with("---"))
-        {
-            return line.to_string();
-        }
-    }
-    String::new()
-}
-
 /// Cap on lines of fresh anchored context appended to a successful hashline edit.
 const REPORT_CONTEXT_LINES: usize = 40;
 
@@ -87,16 +109,16 @@ pub fn rel_path(full: &Path, cwd: &Path) -> String {
         .to_string()
 }
 
-/// Read a text file for editing: refuses binary (NUL in the first 8 KiB) and non-UTF-8.
+/// Read a text file for editing: refuses non-regular, too-large (over
+/// [`crate::registry::MAX_SOURCE_FILE_BYTES`]), binary (NUL in the first 8 KiB) and
+/// non-UTF-8 files. `shown` is the path as the model wrote it.
 pub async fn read_text_file(full: &Path, shown: &str) -> Result<String, ToolError> {
-    let bytes = tokio::fs::read(full).await?;
-    let check_len = bytes.len().min(8192);
-    if bytes[..check_len].contains(&0) {
-        return Err(ToolError::failed(format!(
-            "cannot edit binary file: {shown}"
-        )));
-    }
-    String::from_utf8(bytes).map_err(|e| ToolError::failed(format!("file is not valid UTF-8: {e}")))
+    crate::registry::read_source_file(full, crate::registry::MAX_SOURCE_FILE_BYTES)
+        .await
+        .map_err(|err| match err {
+            crate::registry::SourceReadError::Io(io) => ToolError::Io(io),
+            other => ToolError::failed(other.message("edit", shown)),
+        })
 }
 
 /// Permission title `<verb> <path>` with the standard outside-workspace suffix.
@@ -108,35 +130,16 @@ pub fn permission_title(verb: &str, rel: &str, outside: bool) -> String {
     }
 }
 
-async fn write_then_rename(
-    tmp: &str,
-    dest: &Path,
-    content: &str,
-    perms: Option<std::fs::Permissions>,
-) -> std::io::Result<()> {
-    tokio::fs::write(tmp, content.as_bytes()).await?;
-    if let Some(p) = perms {
-        tokio::fs::set_permissions(tmp, p).await?;
-    }
-    tokio::fs::rename(tmp, dest).await
-}
-
-/// Atomic write: temp file beside the destination, original permissions copied, then
-/// rename. Writes through a symlink to its target. The temp file is removed on failure.
+/// Atomic write ([`crate::registry::write_atomic`]: hidden temp file beside the
+/// destination, original mode carried over, then rename). Writes through a symlink to
+/// its target instead of replacing the link, and invalidates the walk cache.
 pub async fn write_atomic(full: &Path, content: &str) -> Result<(), ToolError> {
     let dest = tokio::fs::canonicalize(full)
         .await
         .unwrap_or_else(|_| full.to_path_buf());
-    let perms = tokio::fs::metadata(&dest)
-        .await
-        .ok()
-        .map(|m| m.permissions());
-    let tmp = format!("{}.pacode-tmp", dest.to_string_lossy());
-    let result = write_then_rename(&tmp, &dest, content, perms).await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-    result.map_err(ToolError::Io)
+    crate::registry::write_atomic(&dest, content.as_bytes()).await?;
+    crate::walk::invalidate_path(&dest);
+    Ok(())
 }
 
 /// Model-visible summary of one applied hashline edit: counts, relocation notes, and the

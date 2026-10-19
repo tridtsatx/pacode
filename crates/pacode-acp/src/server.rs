@@ -4,14 +4,16 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, Implementation, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    ResumeSessionRequest, SessionCapabilities, SessionCloseCapabilities, SessionListCapabilities,
-    SessionResumeCapabilities, SetSessionModeRequest,
+    InitializeResponse, ListSessionsRequest, LoadSessionRequest, NewSessionRequest,
+    PromptCapabilities, PromptRequest, ResumeSessionRequest, SessionCapabilities,
+    SessionCloseCapabilities, SessionListCapabilities, SessionResumeCapabilities,
+    SetSessionConfigOptionRequest, SetSessionModeRequest,
 };
 use agent_client_protocol::{Agent, Stdio};
 use pacode_client::ClientOptions;
 use pacode_types::Config;
 
+use crate::config_options::config_options_caps;
 use crate::error::AcpError;
 use crate::session::SessionManager;
 
@@ -21,11 +23,13 @@ pub async fn run_server(client_opts: ClientOptions, _config: Config) -> Result<(
     pacode_image::store::init(client_opts.paths.images_dir());
     let session_mgr = Arc::new(SessionManager::new(client_opts));
 
+    let mgr_init = Arc::clone(&session_mgr);
     let mgr_new = Arc::clone(&session_mgr);
     let mgr_load = Arc::clone(&session_mgr);
     let mgr_resume = Arc::clone(&session_mgr);
     let mgr_prompt = Arc::clone(&session_mgr);
     let mgr_set_mode = Arc::clone(&session_mgr);
+    let mgr_set_config = Arc::clone(&session_mgr);
     let mgr_list = Arc::clone(&session_mgr);
     let mgr_close = Arc::clone(&session_mgr);
     let mgr_cancel = Arc::clone(&session_mgr);
@@ -35,10 +39,14 @@ pub async fn run_server(client_opts: ClientOptions, _config: Config) -> Result<(
         .name("pacode")
         .on_receive_request(
             async move |init: InitializeRequest, responder, _cx| {
+                mgr_init.set_config_caps(config_options_caps(&init.client_capabilities));
                 let response = InitializeResponse::new(init.protocol_version)
                     .agent_capabilities(
                         AgentCapabilities::new()
                             .load_session(true)
+                            .prompt_capabilities(
+                                PromptCapabilities::new().image(true).embedded_context(true),
+                            )
                             .session_capabilities(
                                 SessionCapabilities::new()
                                     .resume(SessionResumeCapabilities::new())
@@ -95,6 +103,16 @@ pub async fn run_server(client_opts: ClientOptions, _config: Config) -> Result<(
         .on_receive_request(
             async move |req: SetSessionModeRequest, responder, _cx| match mgr_set_mode
                 .set_mode(req)
+                .await
+            {
+                Ok(resp) => responder.respond(resp),
+                Err(e) => responder.respond_with_internal_error(e.to_string()),
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: SetSessionConfigOptionRequest, responder, _cx| match mgr_set_config
+                .set_config_option(req)
                 .await
             {
                 Ok(resp) => responder.respond(resp),

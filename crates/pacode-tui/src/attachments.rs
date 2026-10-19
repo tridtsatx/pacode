@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use pacode_image::prepare::{MAX_INPUT_BYTES, Prepared, prepare};
-use pacode_types::{Attachment, MAX_IMAGES_PER_MESSAGE, Request, format_bytes};
+use pacode_types::{Attachment, MAX_IMAGES_PER_MESSAGE, format_bytes};
 
 #[cfg(test)]
 #[path = "attachments_tests.rs"]
@@ -293,66 +293,4 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-impl crate::state::AppState {
-    /// The user message request for prompt `text`, with the images its chips refer to.
-    pub fn build_user_message(&mut self, text: String) -> Request {
-        let (text, attachments) = self.attachments.take_for_text(&text);
-        Request::UserMessage { text, attachments }
-    }
-
-    /// Forget pending images whose chips are in neither the prompt nor a queued prompt.
-    pub(crate) fn prune_attachments(&mut self) {
-        let mut used: Vec<u32> = find_chips(&self.input.text).iter().map(|c| c.n).collect();
-        for queued in &self.input.prompt_queue {
-            used.extend(find_chips(queued).iter().map(|c| c.n));
-        }
-        self.attachments.retain_numbers(&used);
-    }
-
-    /// Prepare and keep `bytes`; returns the chip text to insert into the prompt.
-    pub fn attach_bytes(
-        &mut self,
-        bytes: &[u8],
-        name: Option<String>,
-    ) -> Result<String, AttachError> {
-        self.prune_attachments();
-        self.attachments.add(bytes, name)
-    }
-
-    /// Replace the `@query` at `[at_byte, cursor_byte)` by an image chip for `rel_path`
-    /// (relative to the session cwd). Returns false, leaving the text alone, when the
-    /// file cannot be attached; the caller then inserts the plain `@path`.
-    pub fn attach_at_candidate(
-        &mut self,
-        at_byte: usize,
-        cursor_byte: usize,
-        rel_path: &str,
-    ) -> bool {
-        let full = self.cwd().join(rel_path);
-        self.prune_attachments();
-        match self.attachments.add_file(&full) {
-            Ok(chip) => {
-                let prefix = self.input.text[..at_byte].to_string();
-                let suffix = self.input.text[cursor_byte..].to_string();
-                let insert = format!("{chip} ");
-                self.input.cursor = prefix.chars().count() + insert.chars().count();
-                self.input.text = format!("{prefix}{insert}{suffix}");
-                self.input.at_closed = true;
-                self.dirty = true;
-                true
-            }
-            Err(err) => {
-                log::warn!("cannot attach {rel_path}: {err}");
-                self.push_toast(
-                    pacode_types::ToastLevel::Warn,
-                    format!("Cannot attach {rel_path}"),
-                    Some(err.to_string()),
-                    std::time::Instant::now(),
-                );
-                false
-            }
-        }
-    }
 }

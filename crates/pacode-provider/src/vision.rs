@@ -8,12 +8,7 @@
 //! Images are never stored in messages; transports load the bytes lazily from the
 //! content-addressed store (`pacode_image::store`) when they build a request.
 
-use std::borrow::Cow;
-
-use pacode_types::{ContentBlock, Message, Role};
 use serde_json::Value;
-
-use crate::ProviderError;
 
 #[cfg(test)]
 #[path = "vision_tests.rs"]
@@ -77,72 +72,6 @@ pub fn catalog_vision(item: &Value) -> Option<bool> {
     let modality = arch.get("modality").and_then(Value::as_str)?;
     let input = modality.split("->").next().unwrap_or(modality);
     Some(input.contains("image"))
-}
-
-/// `data:<mime>;base64,<payload>` for a stored image (payload cached, see `image_cache`).
-pub(crate) fn data_url(mime: &str, hash: &str) -> Result<String, ProviderError> {
-    let payload = crate::image_cache::payload(hash)?;
-    Ok(format!("data:{mime};base64,{payload}"))
-}
-
-/// Base64 payload (no prefix) for a stored image (cached, see `image_cache`).
-pub(crate) fn base64_payload(hash: &str) -> Result<String, ProviderError> {
-    Ok(crate::image_cache::payload(hash)?.to_string())
-}
-
-/// Text standing in for an image the model cannot see.
-pub(crate) fn omitted_note(source_path: Option<&str>) -> String {
-    match source_path {
-        Some(p) => format!("[image omitted: {p}]"),
-        None => "[image omitted]".to_string(),
-    }
-}
-
-/// Gate images for a model.
-///
-/// * vision model: messages pass through untouched;
-/// * text-only model: images in the **last user message** (the one being sent now)
-///   are a clear error `model <id> does not accept images`; older images (left over
-///   from a model switch) become a one-line text note so history stays usable.
-pub(crate) fn gate_images<'a>(
-    messages: &'a [Message],
-    model: &str,
-    vision: bool,
-) -> Result<Cow<'a, [Message]>, ProviderError> {
-    if vision || !messages.iter().any(Message::has_images) {
-        return Ok(Cow::Borrowed(messages));
-    }
-    let last_user = messages.iter().rposition(|m| m.role == Role::User);
-    let tail_has_images = last_user.is_some_and(|i| messages[i..].iter().any(Message::has_images));
-    if tail_has_images {
-        return Err(ProviderError::Config(format!(
-            "model {model} does not accept images"
-        )));
-    }
-    let stripped: Vec<Message> = messages
-        .iter()
-        .map(|m| {
-            if !m.has_images() {
-                return m.clone();
-            }
-            let mut out = m.clone();
-            out.content = m
-                .content
-                .iter()
-                .map(|b| match b {
-                    ContentBlock::Image { source_path, .. } => ContentBlock::Text {
-                        text: omitted_note(source_path.as_deref()),
-                    },
-                    ContentBlock::Text { .. }
-                    | ContentBlock::Reasoning { .. }
-                    | ContentBlock::ToolUse { .. }
-                    | ContentBlock::ToolResult { .. } => b.clone(),
-                })
-                .collect();
-            out
-        })
-        .collect();
-    Ok(Cow::Owned(stripped))
 }
 
 /// Replace the payload of `data:<mime>;base64,<payload>` URLs by a size marker so

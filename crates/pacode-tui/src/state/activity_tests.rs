@@ -6,35 +6,75 @@ fn glyphs() -> Glyphs {
 
 #[test]
 fn thinking_wording_escalates_at_10_20_and_30_seconds() {
-    // Frame 2 is the "…" step of the dots cycle, matching the old static text.
-    assert_eq!(thinking_label(0, 2, &glyphs()), "thinking…");
-    assert_eq!(thinking_label(9_900, 2, &glyphs()), "thinking…");
-    assert_eq!(thinking_label(10_000, 2, &glyphs()), "thinking a bit more…");
-    assert_eq!(thinking_label(19_900, 2, &glyphs()), "thinking a bit more…");
-    assert_eq!(thinking_label(20_000, 2, &glyphs()), "thinking a lot…");
-    assert_eq!(thinking_label(29_900, 2, &glyphs()), "thinking a lot…");
+    // The "..." step of the dots cycle sits at frame `2 * DOT_DIVIDER`,
+    // matching the old static text.
+    let f = 2 * DOT_DIVIDER;
+    assert_eq!(thinking_label(0, f, &glyphs()), "thinking...");
+    assert_eq!(thinking_label(9_900, f, &glyphs()), "thinking...");
     assert_eq!(
-        thinking_label(30_000, 2, &glyphs()),
-        "almost done thinking…"
+        thinking_label(10_000, f, &glyphs()),
+        "thinking a bit more..."
     );
     assert_eq!(
-        thinking_label(120_000, 2, &glyphs()),
-        "almost done thinking…"
+        thinking_label(19_900, f, &glyphs()),
+        "thinking a bit more..."
+    );
+    assert_eq!(thinking_label(20_000, f, &glyphs()), "thinking a lot...");
+    assert_eq!(thinking_label(29_900, f, &glyphs()), "thinking a lot...");
+    assert_eq!(
+        thinking_label(30_000, f, &glyphs()),
+        "almost done thinking..."
+    );
+    assert_eq!(
+        thinking_label(120_000, f, &glyphs()),
+        "almost done thinking..."
     );
 }
 
 #[test]
 fn thinking_dots_cycle_with_the_frame() {
-    assert_eq!(thinking_label(0, 0, &glyphs()), "thinking.");
-    assert_eq!(thinking_label(0, 1, &glyphs()), "thinking..");
-    assert_eq!(thinking_label(0, 2, &glyphs()), "thinking…");
-    assert_eq!(thinking_label(0, 3, &glyphs()), "thinking.");
+    // One dot step every DOT_DIVIDER frames; the suffix holds still between
+    // steps so the ~15 fps tick does not strobe it.
+    assert_eq!(thinking_label(0, 0, &glyphs()), "thinking.  ");
+    assert_eq!(thinking_label(0, DOT_DIVIDER - 1, &glyphs()), "thinking.  ");
+    assert_eq!(thinking_label(0, DOT_DIVIDER, &glyphs()), "thinking.. ");
+    assert_eq!(thinking_label(0, 2 * DOT_DIVIDER, &glyphs()), "thinking...");
+    assert_eq!(thinking_label(0, 3 * DOT_DIVIDER, &glyphs()), "thinking.  ");
 
+    // §9.2: the suffix is 3 cells wide in both glyph sets — `…` never
+    // appears in the animation.
     let ascii = Glyphs::new(true);
-    assert_eq!(trailing_dots(0, &ascii), ".");
-    assert_eq!(trailing_dots(1, &ascii), "..");
-    assert_eq!(trailing_dots(2, &ascii), "...");
-    assert_eq!(trailing_dots(2, &glyphs()), "…");
+    for frame in 0..9 * DOT_DIVIDER {
+        assert_eq!(
+            pacode_render::display_width(trailing_dots(frame, &ascii)),
+            3,
+            "ascii frame {frame}"
+        );
+        assert_eq!(
+            pacode_render::display_width(trailing_dots(frame, &glyphs())),
+            3,
+            "unicode frame {frame}"
+        );
+        assert!(!trailing_dots(frame, &glyphs()).contains('…'));
+    }
+    assert_eq!(trailing_dots(0, &ascii), ".  ");
+    assert_eq!(trailing_dots(DOT_DIVIDER, &ascii), ".. ");
+    assert_eq!(trailing_dots(2 * DOT_DIVIDER, &ascii), "...");
+}
+
+#[test]
+fn thinking_label_keeps_the_same_display_width_on_every_frame() {
+    // §9.2: whatever to the right of the label must not move between frames.
+    for elapsed in [0_u64, 9_900, 15_000, 25_000, 45_000, 120_000] {
+        let width = pacode_render::display_width(&thinking_label(elapsed, 0, &glyphs()));
+        for frame in 1..12 {
+            assert_eq!(
+                pacode_render::display_width(&thinking_label(elapsed, frame, &glyphs())),
+                width,
+                "elapsed {elapsed} frame {frame}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -65,35 +105,19 @@ fn thinking_colour_without_rgb_flips_at_the_last_threshold() {
 }
 
 #[test]
-fn the_pacman_bar_is_dropped_while_waiting_on_someone_else() {
-    assert!(Phase::Thinking.shows_pacman());
-    assert!(Phase::Responding.shows_pacman());
-    assert!(Phase::Tool("bash cargo test".to_string()).shows_pacman());
-    assert!(!Phase::WaitingAgent("review".to_string()).shows_pacman());
-    assert!(!Phase::WaitingTask(2).shows_pacman());
-}
-
-#[test]
 fn each_phase_words_itself() {
     let g = glyphs();
-    assert_eq!(Phase::Thinking.label(0, 2, &g), "thinking…");
-    assert_eq!(Phase::Thinking.label(25_000, 2, &g), "thinking a lot…");
+    let f = 2 * DOT_DIVIDER;
+    assert_eq!(Phase::Thinking.label(0, f, &g), "thinking...");
+    assert_eq!(Phase::Thinking.label(25_000, f, &g), "thinking a lot...");
     assert_eq!(Phase::Responding.label(99_000, 0, &g), "responding…");
+    assert_eq!(
+        Phase::Responding.label(99_000, 0, &Glyphs::new(true)),
+        "responding..."
+    );
     assert_eq!(
         Phase::Tool("write src/foo.rs".to_string()).label(0, 0, &g),
         "write src/foo.rs"
-    );
-    assert_eq!(
-        Phase::WaitingAgent("review".to_string()).label(0, 0, &g),
-        "waiting for agent review"
-    );
-    assert_eq!(
-        Phase::WaitingTask(1).label(0, 0, &g),
-        "waiting for a background task"
-    );
-    assert_eq!(
-        Phase::WaitingTask(3).label(0, 0, &g),
-        "waiting for 3 background tasks"
     );
 }
 

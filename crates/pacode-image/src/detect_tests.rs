@@ -41,28 +41,28 @@ fn test_detect_iterm2() {
 }
 
 #[test]
-fn test_detect_sixel_foot_falls_back_to_halfblocks() {
+fn test_detect_sixel_foot() {
     let env = make_env(&[("TERM", "foot")]);
     assert!(is_sixel_env(&env));
-    assert_eq!(detect_from(&env), GraphicsProtocol::HalfBlocks);
+    assert_eq!(detect_from(&env), GraphicsProtocol::Sixel);
 
     let env_extra = make_env(&[("TERM", "foot-extra")]);
     assert!(is_sixel_env(&env_extra));
-    assert_eq!(detect_from(&env_extra), GraphicsProtocol::HalfBlocks);
+    assert_eq!(detect_from(&env_extra), GraphicsProtocol::Sixel);
 }
 
 #[test]
-fn test_detect_sixel_mlterm_falls_back_to_halfblocks() {
+fn test_detect_sixel_mlterm() {
     let env = make_env(&[("TERM", "mlterm")]);
     assert!(is_sixel_env(&env));
-    assert_eq!(detect_from(&env), GraphicsProtocol::HalfBlocks);
+    assert_eq!(detect_from(&env), GraphicsProtocol::Sixel);
 }
 
 #[test]
 fn test_detect_sixel_xterm_colorterm_sixel() {
     let env = make_env(&[("TERM", "xterm-256color"), ("COLORTERM", "sixel")]);
     assert!(is_sixel_env(&env));
-    assert_eq!(detect_from(&env), GraphicsProtocol::HalfBlocks);
+    assert_eq!(detect_from(&env), GraphicsProtocol::Sixel);
 
     // xterm without COLORTERM=sixel is not sixel
     let env_no_sixel = make_env(&[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]);

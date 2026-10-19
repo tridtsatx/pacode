@@ -16,8 +16,8 @@
 //! parts (bytes are loaded lazily from the image store). Chat completions cannot carry
 //! images inside `tool` messages, so images returned by tools are sent as one `user`
 //! follow-up message placed right after the whole run of `tool` messages (never between
-//! them: every `tool_call_id` must be answered contiguously). Models without vision
-//! fail before the request with `model <id> does not accept images`.
+//! them: every `tool_call_id` must be answered contiguously). Models without vision (or a
+//! provider set to `image_transport = "text_only"`) get text placeholders instead.
 //!
 //! SSE parsing is tolerant: `delta.content`, `delta.reasoning_content` or
 //! `delta.reasoning` or `delta.thinking` (string), `delta.tool_calls[i]` with `index`
@@ -39,19 +39,55 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pacode_types::{
-    ContentBlock, ModelInfo, ModelRoute, Pricing, ProviderConfig, ProviderDefaults, Role,
-    prettify_model_name,
+    ContentBlock, ImageSource, ImageTransport, ModelInfo, ModelRoute, Pricing, ProviderConfig,
+    ProviderDefaults, Role, ThinkingMode, ToolResultMode, prettify_model_name,
 };
 use serde_json::Value;
 
 use crate::compat::{Compat, PLACEHOLDER, ReasoningWire};
+
+/// Connect timeout when neither the provider entry nor `[provider]` names one.
+const DEFAULT_CONNECT_SECS: u64 = 30;
+
 pub use crate::sse::{ChunkState, SseParser, chunk_to_events};
 use crate::vision;
-use crate::{CompletionRequest, EventStream, Provider, ProviderError};
+use crate::{CompletionRequest, EventStream, Provider, ProviderError, RetryBudget};
 
 #[cfg(test)]
 #[path = "openai_compat_tests.rs"]
 mod openai_compat_tests;
+
+/// Model ids suggesting image input: OpenAI vision families, the VLM naming
+/// conventions (`*-vl`, `*4v`, llava/pixtral/…), and the multimodal frontier
+/// models gateways like OpenRouter relay verbatim.
+const VISION_KEYWORDS: &[&str] = &[
+    "vision",
+    "-vl",
+    "4v",
+    "llava",
+    "pixtral",
+    "moondream",
+    "internvl",
+    "minicpm-v",
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-5",
+    "o1",
+    "o3",
+    "o4",
+    "chatgpt",
+    "claude",
+    "gemini",
+    "llama-4",
+    "mistral-small-3",
+    "mistral-medium",
+    "grok-4",
+    "grok-2-vision",
+];
+
+/// Keyword hits that are known to lack image input; checked first so a false
+/// positive degrades to text instead of failing the request.
+const VISION_EXCLUDE: &[&str] = &["o1-mini", "o1-preview", "o3-mini", "claude-2", "instant"];
 
 pub struct OpenAiCompat {
     id: String,
@@ -67,7 +103,8 @@ pub struct OpenAiCompat {
     catalog_fetch: tokio::sync::Mutex<()>,
     /// First retry backoff step; only tuned down by tests.
     backoff_base: Duration,
-    /// Concurrency permits and cooldown; the registry swaps in the per-provider shared gate.
+    /// Adaptive concurrency limit and cooldown, shared by every instance of this provider
+    /// entry (see [`crate::provider_gate`]).
     gate: Arc<crate::gate::ProviderGate>,
 }
 
@@ -93,15 +130,19 @@ impl OpenAiCompat {
                     ProviderError::Config(format!("provider '{id}' has invalid proxy: {e}"))
                 })?;
 
+        // Per-provider timeouts win over the global `[provider]` defaults; an
+        // entry that sets none is bounded exactly as before.
         let client = pacode_net::client_builder(&proxy_setting)
             .map_err(|e| ProviderError::Config(format!("provider '{id}' proxy error: {e}")))?
-            .connect_timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(
+                cfg.timeouts.connect_secs_or(DEFAULT_CONNECT_SECS),
+            ))
             .user_agent(format!("pacode/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| ProviderError::Config(format!("failed to build HTTP client: {e}")))?;
 
         let compat = Compat::for_base_url(&cfg.base_url);
-        let gate = Arc::new(crate::gate::ProviderGate::new(defaults.max_concurrent));
+        let gate = crate::provider_gate(&id, &cfg.base_url, defaults.max_concurrent);
 
         Ok(Self {
             id,
@@ -116,13 +157,6 @@ impl OpenAiCompat {
             backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
             gate,
         })
-    }
-
-    /// Share the registry's per-provider gate so all clones and rebuilds of this provider
-    /// draw from one permit pool and one cooldown.
-    pub(crate) fn with_gate(mut self, gate: Arc<crate::gate::ProviderGate>) -> Self {
-        self.gate = gate;
-        self
     }
 
     /// Shorten the retry backoff schedule (tests drive real retries without real waits).
@@ -150,7 +184,16 @@ impl OpenAiCompat {
             "content": system_content,
         }));
 
+        // A provider set to `text_only` never sees an image part, even for a
+        // model that can read them: some gateways mis-render the unexpected
+        // content type instead of erroring, and a wrong image is worse than a
+        // clear placeholder.
+        let vision = self.vision_for(&req.model)
+            && self.cfg.compat.image_transport == ImageTransport::DataUrl;
+        // Images returned by tools: chat completions cannot carry them in `tool`
+        // messages, so they follow the whole run of tool results as one user message.
         let mut pending_tool_images: Vec<Value> = Vec::new();
+
         for msg in &req.messages {
             if msg.role != Role::Tool && !pending_tool_images.is_empty() {
                 messages.push(tool_images_message(std::mem::take(
@@ -159,19 +202,57 @@ impl OpenAiCompat {
             }
             match msg.role {
                 Role::User => {
+                    let has_images = msg
+                        .content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Image { .. }));
+                    if !vision || !has_images {
+                        // No vision (or no images): a plain string keeps the
+                        // wire shape unchanged; images degrade to placeholders.
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": crate::image::text_with_image_fallbacks(msg),
+                        }));
+                        continue;
+                    }
+                    let mut text = msg.text();
+                    let mut parts: Vec<Value> = Vec::new();
+                    for block in &msg.content {
+                        if let ContentBlock::Image { source } = block {
+                            match load_image_payload(source) {
+                                Some((mime, b64)) => parts.push(serde_json::json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{mime};base64,{b64}"),
+                                    },
+                                })),
+                                None => {
+                                    if !text.is_empty() {
+                                        text.push('\n');
+                                    }
+                                    text.push_str(&crate::image::image_fallback_text(source));
+                                }
+                            }
+                        }
+                    }
+                    let mut content = Vec::with_capacity(parts.len() + 1);
+                    content.push(serde_json::json!({ "type": "text", "text": text }));
+                    content.extend(parts);
                     messages.push(serde_json::json!({
                         "role": "user",
-                        "content": user_content(msg),
+                        "content": content,
                     }));
                 }
                 Role::System => {
                     messages.push(serde_json::json!({
                         "role": "system",
-                        "content": msg.text(),
+                        "content": crate::image::text_with_image_fallbacks(msg),
                     }));
                 }
                 Role::Assistant => {
-                    let mut text = msg.text();
+                    // Images are only valid on user turns; degrade any that
+                    // ended up in assistant history.
+                    let mut text = crate::image::text_with_image_fallbacks(msg);
                     let mut tool_calls = Vec::new();
                     for block in &msg.content {
                         if let ContentBlock::ToolUse { id, name, input } = block {
@@ -219,11 +300,18 @@ impl OpenAiCompat {
                                 messages.push(serde_json::json!({
                                     "role": "tool",
                                     "tool_call_id": self.compat.tool_id(call_id.as_str()),
-                                    "content": content,
+                                    "content": self.render_tool_result(content),
                                 }));
                             }
-                            ContentBlock::Image { .. } => {
-                                pending_tool_images.extend(image_parts(block));
+                            ContentBlock::Image { source } => {
+                                pending_tool_images.push(if vision {
+                                    image_part(source)
+                                } else {
+                                    serde_json::json!({
+                                        "type": "text",
+                                        "text": crate::image::image_fallback_text(source),
+                                    })
+                                });
                             }
                             ContentBlock::Text { .. }
                             | ContentBlock::Reasoning { .. }
@@ -246,17 +334,25 @@ impl OpenAiCompat {
             serde_json::json!({ "include_usage": true }),
         );
 
-        if !req.tools.is_empty() {
-            let tools_val: Vec<Value> = req
-                .tools
+        // A model whose entry says `supports_tools = false` is chat-only: it
+        // gets no tools at all, even when the turn assembled some.
+        let model_cfg = self.cfg.models.iter().find(|m| m.id == req.model);
+        let tools_allowed = model_cfg.is_none_or(|m| m.tools_or(true));
+        let wire_tools = if tools_allowed {
+            self.cfg.compat.wire_tools(&req.tools)
+        } else {
+            Vec::new()
+        };
+        if !wire_tools.is_empty() {
+            let tools_val: Vec<Value> = wire_tools
                 .iter()
-                .map(|t| {
+                .map(|def| {
                     serde_json::json!({
                         "type": "function",
                         "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": self.compat.clean_schema(&t.input_schema),
+                            "name": def.name,
+                            "description": def.description,
+                            "parameters": self.compat.clean_schema(&def.input_schema),
                         }
                     })
                 })
@@ -266,15 +362,26 @@ impl OpenAiCompat {
         }
 
         let max_tokens = req.max_output_tokens.or(self.compat.default_max_tokens);
-        if let Some(max_tokens) = max_tokens {
+        if let Some(max_tokens) = max_tokens
+            && self.cfg.compat.sends_max_output_tokens()
+        {
             body.insert(
                 self.compat.max_tokens_field.key().to_string(),
                 serde_json::json!(max_tokens),
             );
         }
 
-        if reasoning_on {
-            let wire = self.compat.reasoning_wire(&req.model);
+        if self.cfg.compat.sends_thinking_for(reasoning_on) {
+            let wire = match self.compat.reasoning_wire(&req.model) {
+                // `thinking_mode = "always"` asks for the field even where the
+                // endpoint's quirks say nothing: fall back to the plain OpenAI one.
+                ReasoningWire::Unsupported
+                    if self.cfg.compat.thinking_mode == ThinkingMode::Always =>
+                {
+                    ReasoningWire::ReasoningEffort
+                }
+                wire => wire,
+            };
             let effort = req.effort.unwrap_or(self.defaults.effort);
             let effort_str = match self.cfg.effort_map.get(effort.as_str()) {
                 Some(override_val) => override_val.clone(),
@@ -312,30 +419,6 @@ impl OpenAiCompat {
         body_val
     }
 
-    /// Vision flag of `model`: the live catalogue when it declared one, else the id
-    /// heuristic.
-    fn vision_for(&self, model: &str) -> bool {
-        if let Ok(guard) = self.catalog_cache.lock()
-            && let Some(found) = guard
-                .as_ref()
-                .and_then(|list| list.iter().find(|m| m.route.model == model))
-        {
-            return found.vision;
-        }
-        vision::heuristic_vision(model)
-    }
-
-    /// Reject images for text-only models; strip stale ones from old history.
-    fn gate_images(&self, mut req: CompletionRequest) -> Result<CompletionRequest, ProviderError> {
-        if !req.messages.iter().any(pacode_types::Message::has_images) {
-            return Ok(req);
-        }
-        let vision = self.vision_for(&req.model);
-        let gated = vision::gate_images(&req.messages, &req.model, vision)?.into_owned();
-        req.messages = gated;
-        Ok(req)
-    }
-
     fn reasoning_enabled_for(&self, model: &str) -> bool {
         let model_cfg = self.cfg.models.iter().find(|m| m.id == model);
         if let Some(cfg) = model_cfg
@@ -347,6 +430,56 @@ impl OpenAiCompat {
             return r;
         }
         self.compat.heuristic_reasoning(model)
+    }
+
+    /// Whether images go out as inline base64 parts or degrade to text
+    /// placeholders. A model entry that names `vision` wins; otherwise the live
+    /// catalogue when it declared input modalities, else the id heuristic, so a
+    /// multimodal model on an unusual id still gets images.
+    fn vision_for(&self, model: &str) -> bool {
+        if let Some(pinned) = self
+            .cfg
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.vision)
+        {
+            return pinned;
+        }
+        if let Ok(guard) = self.catalog_cache.lock()
+            && let Some(found) = guard
+                .as_ref()
+                .and_then(|list| list.iter().find(|m| m.route.model == model))
+        {
+            return found.supports_vision;
+        }
+        model_supports_vision(model)
+    }
+
+    /// A model entry that names `vision` explicitly; the catalogue must not override it.
+    fn vision_pinned(&self, model: &str) -> bool {
+        self.cfg
+            .models
+            .iter()
+            .any(|m| m.id == model && m.vision.is_some())
+    }
+
+    /// The text a tool result contributes to the conversation. `Text` is the
+    /// historical shape; `TextWithJson` keeps the rendered text and appends the
+    /// structured payload, for a gateway that wants to parse the result itself
+    /// without pacode dropping the human-readable half.
+    fn render_tool_result(&self, content: &str) -> Value {
+        match self.cfg.compat.tool_result_mode {
+            ToolResultMode::Text => Value::String(content.to_string()),
+            ToolResultMode::TextWithJson => match serde_json::from_str::<Value>(content) {
+                Ok(parsed) if parsed.is_object() || parsed.is_array() => {
+                    serde_json::json!([content, parsed])
+                }
+                // Not JSON, or a bare scalar: there is no structured half to add,
+                // so the text stands alone rather than being mangled.
+                _ => Value::String(content.to_string()),
+            },
+        }
     }
 
     pub fn clear_catalog_cache(&self) {
@@ -371,7 +504,7 @@ impl OpenAiCompat {
             return Ok(configured_models);
         }
 
-        let url = format!("{}/models", self.cfg.base_url.trim_end_matches('/'));
+        let url = self.cfg.models_url();
         let mut req_builder = self.client.get(&url);
         if let Some(key) = &self.api_key
             && !key.is_empty()
@@ -382,7 +515,7 @@ impl OpenAiCompat {
             req_builder = req_builder.header(k, v);
         }
 
-        let response = match req_builder.send().await {
+        let mut response = match req_builder.send().await {
             Ok(resp) => resp,
             Err(err) => {
                 if !configured_models.is_empty() {
@@ -399,7 +532,7 @@ impl OpenAiCompat {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            let text = crate::error_body::read_error_body(&mut response).await;
             let redacted_text = redact(&text);
             log::trace!("models response body: {redacted_text}");
             if !configured_models.is_empty() {
@@ -415,13 +548,15 @@ impl OpenAiCompat {
             log::warn!("request failed ({status}): {redacted_text}");
             return Err(ProviderError::Http {
                 status,
-                message: text,
+                message: crate::error_body_message(&text),
             });
         }
 
         let json_text = response.text().await.unwrap_or_default();
-        let redacted_json = redact(&json_text);
-        log::trace!("models response body: {redacted_json}");
+        if log::log_enabled!(log::Level::Trace) {
+            let redacted_json = redact(&json_text);
+            log::trace!("models response body: {redacted_json}");
+        }
         let json_val = match serde_json::from_str::<Value>(&json_text) {
             Ok(j) => j,
             Err(err) => {
@@ -433,7 +568,10 @@ impl OpenAiCompat {
                     }
                     return Ok(configured_models);
                 }
-                return Err(ProviderError::Malformed(err.to_string()));
+                return Err(ProviderError::Malformed(format!(
+                    "{err}: {}",
+                    crate::error_body_message(&json_text)
+                )));
             }
         };
 
@@ -447,8 +585,20 @@ impl OpenAiCompat {
                     && seen.insert(id.to_string())
                 {
                     let mut info = self.model_info(id);
-                    if let Some(declared) = vision::catalog_vision(item) {
-                        info.vision = declared;
+                    if let Some(declared) = vision::catalog_vision(item)
+                        && !self.vision_pinned(id)
+                    {
+                        info.supports_vision = declared;
+                    }
+                    if info.supported_efforts.is_none() {
+                        // Most OpenAI-compatible `/models` payloads name no
+                        // levels at all — not even OpenRouter's
+                        // `supported_parameters`, which names the parameter and
+                        // not its values. The few that do enumerate them
+                        // (GitHub Copilot, gateways fronting the ChatGPT
+                        // catalog) are the only honest source of an
+                        // unsupported list; everything else stays `None`.
+                        info.supported_efforts = crate::catalog_efforts::efforts(item);
                     }
                     let pinned = self.cfg.reasoning.is_some();
                     crate::model_meta::apply_catalog_item(
@@ -469,51 +619,36 @@ impl OpenAiCompat {
     }
 }
 
-/// `content` of a user message: a plain string, or a parts array when it has images.
-fn user_content(msg: &pacode_types::Message) -> Value {
-    if !msg.has_images() {
-        return Value::String(msg.text());
-    }
-    let mut parts = Vec::new();
-    for block in &msg.content {
-        match block {
-            ContentBlock::Text { text } => {
-                if !text.is_empty() {
-                    parts.push(serde_json::json!({ "type": "text", "text": text }));
-                }
+/// Wire-ready `(mime, base64)` of an image block: stored images come from the
+/// content-addressed store through the shared base64 cache (see `image_cache`), files
+/// and inline bytes through [`crate::image::load_image_data`]. `None` when the bytes are
+/// gone or over the cap; the caller degrades to [`crate::image::image_fallback_text`].
+pub(crate) fn load_image_payload(source: &ImageSource) -> Option<(String, String)> {
+    match source {
+        ImageSource::Stored { mime, hash, .. } => match crate::image_cache::payload(hash) {
+            Ok(payload) => Some((mime.clone(), payload.to_string())),
+            Err(err) => {
+                log::warn!("image {hash} left out of the request: {err}");
+                None
             }
-            ContentBlock::Image { .. } => parts.extend(image_parts(block)),
-            ContentBlock::Reasoning { .. }
-            | ContentBlock::ToolUse { .. }
-            | ContentBlock::ToolResult { .. } => {}
+        },
+        ImageSource::Path(_) | ImageSource::Bytes { .. } => {
+            crate::image::load_image_data(source, crate::image::MAX_IMAGE_BYTES)
         }
     }
-    Value::Array(parts)
 }
 
-/// One `image_url` part for an image block, or a text note when the bytes are gone.
-fn image_parts(block: &ContentBlock) -> Vec<Value> {
-    let ContentBlock::Image {
-        mime,
-        hash,
-        source_path,
-        ..
-    } = block
-    else {
-        return Vec::new();
-    };
-    match vision::data_url(mime, hash) {
-        Ok(url) => vec![serde_json::json!({
+/// One `image_url` part for an image, or a text part when its bytes are gone.
+fn image_part(source: &ImageSource) -> Value {
+    match load_image_payload(source) {
+        Some((mime, b64)) => serde_json::json!({
             "type": "image_url",
-            "image_url": { "url": url },
-        })],
-        Err(err) => {
-            log::warn!("image {hash} left out of the request: {err}");
-            vec![serde_json::json!({
-                "type": "text",
-                "text": vision::omitted_note(source_path.as_deref()),
-            })]
-        }
+            "image_url": { "url": format!("data:{mime};base64,{b64}") },
+        }),
+        None => serde_json::json!({
+            "type": "text",
+            "text": crate::image::image_fallback_text(source),
+        }),
     }
 }
 
@@ -525,6 +660,16 @@ fn tool_images_message(parts: Vec<Value>) -> Value {
     })];
     content.extend(parts);
     serde_json::json!({ "role": "user", "content": content })
+}
+
+/// Whether the model accepts `image_url` parts. Substring heuristic — a miss
+/// degrades images to text, so the list errs toward the well-known families.
+pub fn model_supports_vision(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    if VISION_EXCLUDE.iter().any(|&k| lower.contains(k)) {
+        return false;
+    }
+    VISION_KEYWORDS.iter().any(|&k| lower.contains(k))
 }
 
 fn deep_merge(target: &mut Value, source: &Value) {
@@ -811,23 +956,27 @@ impl Provider for OpenAiCompat {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<EventStream, ProviderError> {
-        let url = format!(
-            "{}/chat/completions",
-            self.cfg.base_url.trim_end_matches('/')
-        );
-        let mut req = self.gate_images(req)?;
+        // `path` is the deployment half of the endpoint: a fixed suffix, or a
+        // template whose `{model}` placeholder routes per model. Absent, the
+        // dialect's own default applies.
+        let url = self
+            .cfg
+            .completion_url(self.cfg.effective_dialect(), &req.model);
+        let mut req = req;
         let body = self.build_body(&req);
-        let max_retries = self.defaults.max_retries;
+        let max_retries = self.cfg.timeouts.max_retries_or(self.defaults.max_retries);
 
         let body_keys = crate::request_body::body_keys(&body);
         let url_redacted = redact(&url);
         let model = &req.model;
         log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
 
-        // Serialise once; the Value tree and the history copy are dropped right away.
-        let body = crate::request_body::encode(body)?;
+        // Serialise once: the opener resends these bytes on every retry; the `Value`
+        // tree and the history copy are dropped right away, and the (image- and
+        // secret-redacted) trace dump only runs while `trace` is enabled.
+        let body_bytes = crate::request_body::encode(body)?;
         req.messages = Vec::new();
-        crate::request_body::trace_body(&body);
+        crate::request_body::trace_body(&body_bytes);
 
         let effort = req.effort.unwrap_or(self.defaults.effort);
         let opener = crate::retry::StreamOpener {
@@ -840,19 +989,18 @@ impl Provider for OpenAiCompat {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            body,
+            body: body_bytes,
             model: req.model,
-            stream_idle_secs: self.defaults.stream_idle_secs,
+            stream_idle_secs: self
+                .cfg
+                .timeouts
+                .stream_idle_secs_or(self.defaults.stream_idle_secs),
             effort,
-            max_retries,
             backoff_base: self.backoff_base,
             gate: Arc::clone(&self.gate),
         };
 
-        // The first open is eager: a hard failure (auth, 4xx) is reported by `complete`
-        // itself rather than as the first item of an otherwise valid stream.
-        let inner = opener.open().await?;
-        Ok(crate::retry::retrying_stream(opener, inner))
+        opener.open(RetryBudget::new(max_retries)).await
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -903,7 +1051,13 @@ impl Provider for OpenAiCompat {
             display_name,
             context_window,
             supports_reasoning,
-            vision: self.vision_for(model),
+            supports_vision: self.vision_for(model),
+            // providers.toml `efforts` wins. A `/models` entry that names its
+            // own levels overrides nothing and fills the gap in `fetch_models`;
+            // one that names none leaves the ladder unrestricted, because
+            // OpenRouter's `supported_parameters` says which parameter exists,
+            // not which values it takes.
+            supported_efforts: model_cfg.and_then(|m| m.efforts.clone()),
             pricing,
             kind: crate::model_meta::kind_from_id(model),
             ..ModelInfo::default()
