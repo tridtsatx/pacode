@@ -30,9 +30,10 @@ the default:
 | Daemon at rest | **17 MB RSS, 0.0% CPU** | hundreds of MB, always warm |
 | Daemon + 3 clients | **25.9 MB PSS** (+4.9 MB per client) | one process per window |
 | First TUI frame | **6.5 ms** | seconds |
-| Binary | one 43 MB static-ish executable | a runtime plus a node_modules tree |
+| Binary | one ~60 MB executable (release build, 2026-10-19; it was 43 MB before the latest features) | a runtime plus a node_modules tree |
 
-Those are measured, not aspirational. "Economy" is a rule in this repository, not
+Those are measured, not aspirational; the daemon, PSS and first-frame figures date
+from before the binary grew and have not been re-measured since. "Economy" is a rule in this repository, not
 a nice-to-have: every cache states its cap, its invalidation and its owner, and
 **nothing is allowed to tick while the session is idle.** A scheduled job a day
 away costs one wakeup a minute to redraw its countdown, not sixty.
@@ -53,6 +54,12 @@ install -m755 target/release/pacode ~/.local/bin/pacode
 ```
 
 Rust stable, edition 2024. No containers, no runtime, nothing else to install.
+
+To build only the binary, name the package: `cargo build --release -p pacode`.
+Building the whole workspace unifies Cargo features across crates and can enable
+more than the binary asks for. By default `read` can outline Rust, TypeScript,
+JavaScript, Python, Go, Java, C, Bash, JSON, TOML, YAML and Markdown; for C++, C#,
+Kotlin, Ruby, PHP and Swift add `--features outline-extra` (a larger binary).
 
 ## Use it
 
@@ -99,7 +106,10 @@ catalog = true                       # list models from GET /models
 Endpoint differences (`max_completion_tokens` on OpenAI, `reasoning` object on
 OpenRouter, binary `thinking` on Z.AI and Kimi K2, tool-id limits, Gemini schema
 limits) are applied by host, so a custom entry pointing at one of these hosts gets
-them too. Devin keeps its own login.
+them too. Devin keeps its own login (`/login devin`).
+
+Anthropic is not a provider: the `anthropic` kind was removed, and a config entry
+with `kind = "anthropic"` fails with an explicit error instead of being guessed at.
 
 A provider can be sent through a proxy:
 
@@ -128,7 +138,95 @@ and cost about 64 bytes each.
 
 **Subagents.** Spawn them, watch them in the rail, select one and its conversation
 takes over the column (`ui.agent_view = "panel"` splits instead). They report back
-as an injection between steps, never mid-stream.
+as an injection between steps, never mid-stream. The orchestrator talks to a
+running one through the `agent` tool: `message` sends an instruction or
+correction, `answer` replies to a question, `result` fetches the final answer if
+the delivered report was cut short. A subagent that is blocked can put a question
+to its orchestrator with `ask_parent`; `agents.ask_parent_timeout_secs` and
+`agents.ask_parent_max` bound the wait and the number of questions. Named subagent
+kinds come from `agents/*.md` files.
+
+**Agents do not clobber each other.** Main agent and subagents write one working
+tree, with no worktrees. A file ownership ledger (in memory, per session) tracks
+who last wrote each path and what each agent has read. Writing an existing file you
+never read is rejected (`read X first`). Writing over lines another agent changed
+since your read is rejected with who changed which lines and the fresh anchored
+text, which counts as read, so one retry is enough; changes elsewhere in the file
+only produce a note. Writers of one path take a per-path lock. The ledger is lost
+on daemon restart, so read-first applies again.
+
+**Hashline edits.** `read` returns rows as `LINE#HASH| text`. `edit` takes ops that
+name those anchors instead of retyping unchanged text, and applies all of them or
+none: a stale anchor rejects the edit with fresh anchored context, and an anchor
+whose line drifted is relocated when exactly one line nearby carries its hash. The
+old `old_string` / `new_string` form is still accepted.
+
+**Smart read.** A source file longer than `read.outline_threshold` lines (default
+400, `0` turns it off) comes back as a tree-sitter outline, signatures kept and
+bodies elided, when that is clearly shorter. `mode` is `auto`, `full` or
+`outline`; `symbol` returns one declaration in full (`"bar"`, `"Foo::bar"`);
+`expand` returns line ranges from the outline's markers. `offset` / `limit` always
+read plainly.
+
+**Style guard.** Rules are markdown files with a small frontmatter (`name`,
+`languages`, `match` regex run on each *added* line, optional `unless`, `scope`,
+`severity` = `warn` / `block`, `mode` = `after_write` / `stream`, `max_per_turn`,
+`exclude`) in `<project>/.pacode/rules/*.md` or `<config dir>/rules/*.md`. A hit is
+appended to the tool result with the rule's text; a `stream` rule can cut a
+write/edit call short while its arguments are still streaming. Built-in packs
+cover Rust (no `unwrap`/`expect`, `dbg!`, `println!`, lossy casts, `unsafe` without
+a `SAFETY` comment, and a few more) and TypeScript (no `any`, `var`,
+`@ts-ignore`, `console.log`, `==`, enums). Later layers override earlier ones by
+name: built-in, then global, then project.
+
+```toml
+[rules]
+enabled = true
+builtin = true               # the Rust and TypeScript packs
+disable = ["rust-no-println"]  # rule names removed from every layer
+stream = true                # allow stream rules to cut a call short
+```
+
+**Memory.** A global store (`<config dir>/memory.db`) and a per-project one
+(`<project>/.pacode/memory.db`; add it to `.gitignore`), both SQLite with FTS5.
+`memory_write` (near-duplicates update the old entry), `memory_recall` (ranked by
+text match, recency, pinning and recall count), `memory_list` and `memory_forget`
+(soft delete, purged after 90 days) are tools; pinned entries and a short index go
+into the system prompt, capped by `context.memory_cap_chars`. `[memory]` has
+`enabled` (default on) and `embeddings`, which does nothing yet: no embedder ships.
+
+**Built-in coreutils.** The `util` tool runs common text utilities in-process, with
+no shell and no fork: `wc head tail sort uniq cut tr nl tac rev paste join basename
+dirname realpath stat du tree diff jq sha256sum md5sum base64 xxd sed`. They are
+read-only and a flag a utility does not implement is an error, never ignored. A
+`bash` command that is a plain pipeline of these (no redirection, globs or
+expansion) takes the same fast path and falls back to the real shell on any
+failure, so error text comes from the real tools.
+
+**Images.** `ctrl+v` pastes an image as a chip in the prompt; it is removed whole.
+Images in the transcript are drawn inline as half-block cells, so they scroll and
+redraw like text (`ui.images = "off"` shows a one-line stub instead). Sending an
+image to a model that does not report vision support is refused with a message
+rather than silently dropped.
+
+**Todo guard.** If the model ends its turn while the plan still has open items, a
+reminder is injected and it continues. `agents.todo_guard` (default on) and
+`agents.todo_guard_max_reminders` bound it per user turn; only the main agent is
+guarded.
+
+**Compaction.** Triggered at `context.compaction_threshold` of the window, aimed at
+`context.compaction_target_ratio`. First a mechanical shake replaces old large tool
+results with short stubs (the last `context.keep_recent_turns` turns and the newest
+result per file are untouched). Then a structured summary of the older part (goal,
+decisions, files touched, commands, open problems, facts), written by
+`context.compaction_model` when set. Then pinned blocks (plan, tasks, a file-ledger
+digest) are re-injected verbatim. If the summary call fails it degrades to the shake
+plus a deterministic digest instead of an error.
+
+**Instruction files.** `AGENTS.md`, `PACODE.md` and `CLAUDE.md` are read from the
+project and its ancestors, and `AGENTS.md` / `PACODE.md` from the config dir. With `context.discover_foreign_instructions` (default on) the files
+written for other agents are picked up too: `.cursor/rules`, `.clinerules`,
+Copilot, Windsurf, Gemini and Codex files in the project and its ancestors.
 
 **Background commands.** A foreground command that outlives five seconds moves to
 the background on its own and keeps going; the rail tracks it, and the model is
@@ -175,13 +273,22 @@ editors that speak it.
 | `.` | background tasks |
 | `ctrl+v` | paste — an image when the clipboard holds one, text otherwise |
 | click a tool call | expand its whole output; click again to fold |
-| `shift+tab` | cycle permission mode |
+| `shift+tab` / `alt+m` | cycle permission mode (`alt+m` for terminals that swallow `shift+tab`) |
 | `ctrl+c` twice | quit |
 
 `/model`, `/effort`, `/mode`, `/theme`, `/config`, `/sessions`, `/mcp`,
-`/plugins`, `/keys`, `/editor`, `/import`, `/compact`, `/export`, `/help`.
+`/plugins`, `/keys`, `/editor`, `/import`, `/compact`, `/export`, `/login`,
+`/clear`, `/help`, `/quit`.
 
 Every binding is rebindable from `/keys`.
+
+**Model picker.** `/model` lists providers on the left and their models on the
+right, with context window, a detail line for the highlighted model and a search
+box. `alt+←` / `alt+→` filters by kind (chat, image, embedding, other). `r` picks
+which role the next choice applies to: `default` (the session's model), `agents`
+(`agents.default_model` and `agents.default_effort`) or `compaction`
+(`context.compaction_model`). Effort is limited to the levels the chosen model
+actually supports.
 
 ## Resource limits
 
@@ -210,21 +317,60 @@ sample_ms_idle_headroom = 1000
 sample_ms_pressure = 200
 ```
 
+## Many agents at once
+
+Subagents multiply load, so the daemon limits it in four places:
+
+- **Provider gate.** `provider.max_concurrent` (default 64, `0` = unlimited) is a
+  ceiling on in-flight requests per provider across all agents. The effective limit
+  adapts: halved on each 429/503 episode, raised by one after a run of successes,
+  and a `Retry-After` pauses every request to that provider instead of each agent
+  retrying alone.
+- **Exec admission queue.** When `exec.max_tasks` processes are already running,
+  a new command waits in FIFO order for a slot instead of failing.
+- **Interest subscriptions.** A client says which agents' high-volume events
+  (text and reasoning deltas, transcript items) it wants; the daemon drops or
+  coalesces the rest, so a TUI drawing one agent does not receive 256.
+- **Idle session eviction.** A session with no running turn, agent, task, monitor,
+  subscriber or imminent cron job, untouched for ten minutes, is unloaded; resuming
+  rebuilds it from the store. Only in-memory state is lost (ledger, live monitors).
+
+`Request::DebugStats` returns the daemon's counters as JSON for diagnostics.
+
+Measured with a load bench: 256 simulated streaming subagents against a local mock
+provider on a 4-core machine. Text latency p99 was 28 to 36 ms, the daemon used
+roughly 0.03 to 0.1 core, RSS peaked at about 120 to 240 MB and was 47 to 84 MB at
+the end of the run, no events were lost, no turns failed, and spawning 256 agents
+took about 0.5 s. This is a mock provider, not real model latency. Two of the bench's
+own checks still fail: memory retained per finished agent (about 100 KB each, so RSS
+grows from 47 to 67 MB over four waves of 64 agents) and its idle "wakeups per minute"
+limit, which counts context switches rather than timers (the daemon's only idle timer
+is a 30 s poll, and idle CPU is zero ticks).
+
 ## Layout
 
-Nineteen crates, each with one job:
+Twenty-five crates, each with one job:
 
 | | |
 |---|---|
+| `pacode` | the binary: CLI, daemon launcher, `acp`, `import`, `login` |
 | `pacode-types` | wire types and pure logic — no IO, no tokio, few dependencies |
-| `pacode-core` | the turn loop, sessions, agents, permissions, scheduling |
-| `pacode-daemon` | the server: sockets, connections, lifecycle |
+| `pacode-config` | XDG paths, TOML loading, env overrides, the settings registry behind `/config` |
+| `pacode-core` | the turn loop, sessions, agents, permissions, compaction, scheduling, the file ledger |
+| `pacode-daemon` | the server: sockets, connections, event fan-out, lifecycle |
 | `pacode-tui` / `pacode-render` / `pacode-client` | the terminal client |
-| `pacode-provider` | model providers and the catalog |
-| `pacode-tools` | the built-in tool set |
-| `pacode-exec` | supervised processes, output spooling, progress parsing |
+| `pacode-image` | image decoding, protocol detection and half-block rendering |
+| `pacode-provider` | model providers, the catalog, the provider gate |
+| `pacode-auth` / `pacode-net` | OAuth and the credential store; proxy configuration |
+| `pacode-tools` | the built-in tool set, including hashline edits |
+| `pacode-coreutils` | in-process `wc`, `sort`, `sed`, `jq`, `tree`, `diff` and friends |
+| `pacode-outline` | tree-sitter outlines for smart `read`, one feature per grammar |
+| `pacode-rules` | style-guard rule files, the built-in Rust and TypeScript packs, the scanner |
+| `pacode-memory` | global and per-project agent memory, SQLite with FTS5 recall |
+| `pacode-risk` | deterministic shell-command risk classification |
+| `pacode-exec` | supervised processes, output spooling, progress parsing, admission queue |
 | `pacode-store` | SQLite on a worker thread, with FTS5 search |
-| `pacode-mcp` / `pacode-plugin` / `pacode-skills` / `pacode-acp` | the edges |
+| `pacode-mcp` / `pacode-plugin` / `pacode-skills` / `pacode-acp` / `pacode-import` | the edges |
 
 House rules: modules under 500 lines, exhaustive matches, no `unwrap()` outside
 tests, `thiserror` in public APIs, and a clean `cargo clippy --workspace
@@ -234,13 +380,18 @@ tests, `thiserror` in public APIs, and a clean `cargo clippy --workspace
 
 Work in progress, and honest about it:
 
-- **Works today:** sessions, subagents, permissions, background commands, cron
-  jobs and monitors, questions, MCP, plugins and the marketplace, skills, ACP,
-  import from other agents.
+- **Works today:** sessions, subagents and their messaging, permissions, background
+  commands, cron jobs and monitors, questions, hashline edits, the file ledger,
+  smart read, style-guard rules, memory, built-in coreutils, images, the model
+  picker, compaction, MCP, plugins and the marketplace (skills and MCP servers),
+  skills, ACP, import from other agents. Linux is the supported platform; macOS is
+  best effort.
 - **Coming shortly:** proper documentation, a contributing guide, and the
   remaining tabs of the plugin screen.
-- **Not there yet:** Windows (Unix sockets and process groups are assumed), and
-  running Claude Code hooks or markdown slash commands from a plugin.
+- **Not there yet:** Windows (Unix sockets and process groups are assumed), running
+  Claude Code plugin hooks or markdown slash commands from a plugin, and semantic
+  (embedding) memory recall. Shell hooks you write yourself in `[hooks]` in
+  `config.toml` are a separate feature and do work.
 
 Issues and pull requests are welcome meanwhile; the checks below are what CI will
 run.
@@ -271,6 +422,10 @@ built while reading, and borrowing ideas from:
   to, and sessions that outlive the terminal.
 - [Codex](https://github.com/openai/codex) — supervised process execution and
   output handling; the head/tail output buffer here is a port of its idea.
+- [oh-my-pi](https://github.com/can1357/oh-my-pi) — hashline edits (anchored
+  `LINE#HASH` lines instead of retyped text), the smart-read ideas (outlines,
+  reading a symbol or a range), style-guard rules that act when a model writes
+  code (their TTSR), the todo guard and the shape of the model picker.
 - [jcode](https://github.com/1jehuang/jcode) — the most RAM-efficient harness,
   and the reason this one measures itself at all; the rail layout and much of the
   TUI vocabulary came from reading it.
