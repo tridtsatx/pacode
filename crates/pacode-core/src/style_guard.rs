@@ -10,8 +10,10 @@
 //! State (all in one process-wide registry, see [`with_session`]):
 //! - rule set cache, one per session. Cap: 1 set. Invalidation: the rule files'
 //!   (path, mtime, size) fingerprint or the `[rules]` config changed. Owner: registry.
-//! - per-agent [`TurnLimiter`]. Cap: [`MAX_AGENTS_PER_SESSION`]. Invalidation: reset
-//!   when the agent's latest real user message changes (a new turn). Owner: registry.
+//! - per-agent [`TurnLimiter`]. Cap: [`MAX_AGENTS_PER_SESSION`]; past the cap only the
+//!   least recently used agent is evicted (G3a), so active agents keep their budget.
+//!   Invalidation: reset when the agent's latest real user message changes (a new
+//!   turn). Owner: registry.
 //! - pinned reminders, one line per rule that fired. Cap: [`MAX_PINNED`] (oldest
 //!   dropped). Read by [`pinned_reminders`] for the compaction pinned-blocks hook.
 //! - the registry itself. Cap: [`MAX_SESSIONS`], least recently used evicted;
@@ -38,14 +40,17 @@ pub(crate) use stream::StreamGuard;
 pub const MAX_PINNED: usize = 32;
 /// Sessions tracked at once.
 pub const MAX_SESSIONS: usize = 64;
-/// Agents (main + subagents) tracked per session.
-pub const MAX_AGENTS_PER_SESSION: usize = 32;
+/// Agents (main + subagents) tracked per session. Past this, the least recently used
+/// agent's limiter is evicted; the others keep their budgets.
+pub const MAX_AGENTS_PER_SESSION: usize = 512;
 
 #[derive(Default)]
 struct AgentTurn {
     /// Identity of the user message that started the current turn.
     marker: usize,
     limiter: TurnLimiter,
+    /// [`SessionGuard::agent_tick`] value at this agent's last lookup.
+    last_used: u64,
 }
 
 #[derive(Default)]
@@ -53,21 +58,38 @@ pub(crate) struct SessionGuard {
     ruleset: Option<(Fingerprint, Arc<RuleSet>)>,
     pinned: Vec<String>,
     agents: BTreeMap<String, AgentTurn>,
+    /// Monotonic counter stamped into `AgentTurn::last_used` (LRU order).
+    agent_tick: u64,
     last_used: u64,
 }
 
 impl SessionGuard {
     /// The limiter of `agent_key`, reset when `marker` shows a new turn started.
     fn limiter_for(&mut self, agent_key: &str, marker: usize) -> &mut TurnLimiter {
+        self.agent_tick += 1;
+        let tick = self.agent_tick;
         if self.agents.len() >= MAX_AGENTS_PER_SESSION && !self.agents.contains_key(agent_key) {
-            self.agents.clear();
+            self.evict_least_recent_agent();
         }
         let turn = self.agents.entry(agent_key.to_string()).or_default();
+        turn.last_used = tick;
         if turn.marker != marker {
             turn.marker = marker;
             turn.limiter.reset();
         }
         &mut turn.limiter
+    }
+
+    /// Drop the single agent whose limiter was used least recently.
+    fn evict_least_recent_agent(&mut self) {
+        let oldest = self
+            .agents
+            .iter()
+            .min_by_key(|(_, t)| t.last_used)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = oldest {
+            self.agents.remove(&key);
+        }
     }
 
     /// Pin one line per rule (first message wins), dropping the oldest past the cap.

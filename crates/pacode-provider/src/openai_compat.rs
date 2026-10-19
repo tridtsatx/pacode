@@ -531,8 +531,16 @@ fn deep_merge(target: &mut Value, source: &Value) {
     }
 }
 
+// Test-only per-thread count of `redact` calls, used to prove trace work is skipped.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REDACT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Redact sensitive information (`api_key`, `authorization`, `Bearer ...`) from log messages.
 pub fn redact(input: &str) -> String {
+    #[cfg(test)]
+    REDACT_CALLS.with(|c| c.set(c.get() + 1));
     let mut result = redact_bearer(input);
     result = redact_keys(&result, &["api_key", "api-key", "apikey", "authorization"]);
     result
@@ -805,9 +813,11 @@ impl Provider for OpenAiCompat {
         let model = &req.model;
         log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
 
-        let serialized_body = serde_json::to_string(&body).unwrap_or_default();
-        let body_redacted = redact(&vision::redact_data_urls(&serialized_body));
-        log::trace!("request body: {body_redacted}");
+        if log::log_enabled!(log::Level::Trace) {
+            let serialized_body = serde_json::to_string(&body).unwrap_or_default();
+            let body_redacted = redact(&vision::redact_data_urls(&serialized_body));
+            log::trace!("request body: {body_redacted}");
+        }
 
         let effort = req.effort.unwrap_or(self.defaults.effort);
         let opener = crate::retry::StreamOpener {

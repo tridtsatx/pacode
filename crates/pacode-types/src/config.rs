@@ -63,6 +63,8 @@ pub struct ProviderDefaults {
     /// Base idle timeout of a streaming response, scaled by effort.
     pub stream_idle_secs: u64,
     pub max_retries: u32,
+    /// Max in-flight requests per provider across all agents (0 = unlimited).
+    pub max_concurrent: u32,
     /// Time-to-live in seconds for cached model catalog (background refresh).
     pub catalog_ttl_secs: u64,
     pub proxy: Option<String>,
@@ -75,6 +77,7 @@ impl Default for ProviderDefaults {
             effort: Effort::Medium,
             stream_idle_secs: 180,
             max_retries: 5,
+            max_concurrent: 16,
             catalog_ttl_secs: 86400,
             proxy: None,
         }
@@ -87,6 +90,8 @@ pub enum ProviderKind {
     #[default]
     #[serde(alias = "openai")]
     OpenAi,
+    /// Removed provider kind. Kept only so an old config still parses; building it
+    /// fails with a clear error (see `pacode-provider` registry).
     Anthropic,
     Codex,
     Devin,
@@ -402,7 +407,7 @@ pub struct AgentsConfig {
 impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
-            max_live: 8,
+            max_live: 16,
             default_model: None,
             default_effort: None,
             max_turns: 200,
@@ -437,9 +442,14 @@ pub struct ContextConfig {
     pub compaction_threshold: f32,
     pub tool_output_cap_chars: usize,
     pub injection_cap_chars: usize,
+    /// Total character budget for one batch of injected reports (sum over items).
+    pub injection_budget_chars: usize,
     /// Cap for AGENTS.md / CLAUDE.md content in the system prompt.
     pub instructions_cap_chars: usize,
     pub memory_cap_chars: usize,
+    /// Also read instruction files written for other agents (`.cursor/rules`,
+    /// `.clinerules`, Copilot, Windsurf, Gemini, Codex) from the project tree.
+    pub discover_foreign_instructions: bool,
     pub compaction_model: Option<String>,
     /// Recent messages kept verbatim after a summary compaction.
     pub keep_recent_messages: usize,
@@ -458,8 +468,10 @@ impl Default for ContextConfig {
             compaction_threshold: 0.85,
             tool_output_cap_chars: 16_000,
             injection_cap_chars: 4_000,
+            injection_budget_chars: 24_000,
             instructions_cap_chars: 32_000,
             memory_cap_chars: 8_000,
+            discover_foreign_instructions: true,
             compaction_model: None,
             keep_recent_messages: 6,
             compaction_target_ratio: 0.40,

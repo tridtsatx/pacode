@@ -176,7 +176,7 @@ pub enum Command {
 
     /// Sign in to a model provider.
     Login {
-        /// Provider identifier to sign in to (e.g. devin, anthropic, openai).
+        /// Provider identifier to sign in to (e.g. devin, openai).
         #[arg(long, value_name = "ID")]
         provider: Option<String>,
 

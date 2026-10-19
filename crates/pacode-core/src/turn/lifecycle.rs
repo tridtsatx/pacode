@@ -1,6 +1,8 @@
 //! Turn spawning and error notification lifecycle helpers.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use pacode_types::{AgentStatus, Event, Role, TurnId, TurnStop, Usage};
 use tokio_util::sync::CancellationToken;
@@ -68,13 +70,78 @@ pub(crate) fn emit_failure_notice(session: &Session, agent: &Agent, message: &st
     session.events.emit(Event::ItemAdded(item));
 }
 
+/// Source of per-turn ids. A turn id only has to differ from every other live turn's.
+static NEXT_TURN_NO: AtomicU64 = AtomicU64::new(1);
+
+/// Which turn currently owns each agent's `cancel` token. `CancellationToken` has no
+/// identity, so the owner is recorded here as `Arc::as_ptr(agent)` -> turn number.
+///
+/// Cap: one entry per agent with a running turn (bounded by `agents.max_live` plus
+/// main). Invalidation: the entry is removed when its turn releases the token (epilogue
+/// or `TurnGuard::drop`, even on panic). Owner: `start_turn` inserts, `TurnGuard`
+/// removes. Lock order is always `agent.cancel` first, then this map.
+static TURN_OWNERS: LazyLock<Mutex<HashMap<usize, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn owner_key(agent: &Arc<Agent>) -> usize {
+    Arc::as_ptr(agent) as usize
+}
+
+/// Releases the agent's cancel token when dropped, but only if this turn still owns it.
+struct TurnGuard {
+    agent: Arc<Agent>,
+    turn_no: u64,
+    released: bool,
+}
+
+impl TurnGuard {
+    /// Clear `agent.cancel` if it still holds this turn's token. Returns whether it did.
+    fn release(&mut self) -> bool {
+        if self.released {
+            return false;
+        }
+        self.released = true;
+        let mut cancel = self.agent.cancel.lock().unwrap_or_else(|p| p.into_inner());
+        let mut owners = TURN_OWNERS.lock().unwrap_or_else(|p| p.into_inner());
+        let key = owner_key(&self.agent);
+        if owners.get(&key) == Some(&self.turn_no) {
+            owners.remove(&key);
+            *cancel = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Spawn `run_turn` as a tokio task, storing the cancel token on the agent. Returns
-/// immediately. When the turn ends, the token is cleared and, for subagents, the
-/// parent gets an `Injection::AgentFinished` and the agent's history is persisted
-/// and dropped from memory (info + summary stay).
-pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
+/// immediately. When the turn ends, the token is cleared (only if this turn still owns
+/// it) and, for subagents, the parent gets an `Injection::AgentFinished` and the
+/// agent's history is persisted and dropped from memory (info + summary stay).
+///
+/// Atomic and idempotent: under the `cancel` lock, if a turn is already running this
+/// returns `false` and starts nothing (whatever the caller queued is drained by the
+/// running turn, or by its epilogue restart). Returns `true` when a turn was spawned.
+pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) -> bool {
     let cancel = CancellationToken::new();
-    *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
+    let turn_no = NEXT_TURN_NO.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut slot = agent.cancel.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(cancel.clone());
+        TURN_OWNERS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(owner_key(&agent), turn_no);
+    }
 
     if agent.id().is_main() {
         let mut hbt = agent
@@ -93,18 +160,24 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
     }
 
     tokio::spawn(async move {
+        let mut guard = TurnGuard {
+            agent: agent.clone(),
+            turn_no,
+            released: false,
+        };
         let stop = super::run_turn(session.clone(), agent.clone(), cancel).await;
-        *agent.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        *agent
-            .history_before_turn
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
+        if guard.release() {
+            *agent
+                .history_before_turn
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
 
         // An injection that landed between the last drain and the end of the turn
         // would otherwise wait for the next user message: run another turn for it.
         // A subagent is covered too, so a late orchestrator message is not lost.
         if matches!(stop, TurnStop::Completed) && !agent.injections.is_empty() {
-            start_turn(session.clone(), agent.clone());
+            let _ = start_turn(session.clone(), agent.clone());
             return;
         }
 
@@ -154,7 +227,7 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
                         answer: capped_answer,
                     });
                 if parent.id().is_main() && !parent.is_running() {
-                    start_turn(session.clone(), parent);
+                    let _ = start_turn(session.clone(), parent);
                 }
             }
 
@@ -164,4 +237,9 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) {
             }
         }
     });
+    true
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod tests;

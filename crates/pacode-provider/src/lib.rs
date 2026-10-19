@@ -21,6 +21,7 @@ pub mod mock;
 pub mod model_meta;
 pub mod openai_compat;
 pub mod registry;
+mod registry_cache;
 mod retry;
 pub mod sse;
 pub mod vision;

@@ -12,13 +12,19 @@ use crate::manager::{ExecError, TaskManager};
 use crate::resources::{GuardHost, ResourceGuard};
 use crate::state::SharedState;
 
+/// Capacity of the task-event broadcast channel (owner: exec; cap: this constant;
+/// invalidation: none, fixed at construction).
+pub(crate) const TASK_EVENT_CAPACITY: usize = 1024;
+
 impl TaskManager {
     pub fn with_resources(
         spool_dir: PathBuf,
         config: ExecConfig,
         resources: ResourcesConfig,
     ) -> Arc<Self> {
-        let (events, _) = broadcast::channel(256);
+        // Sized for bursts of task events (F6). A `Lagged` receiver is handled by the
+        // router (P0-4); the capacity keeps that path rare.
+        let (events, _) = broadcast::channel(TASK_EVENT_CAPACITY);
         let guard = ResourceGuard::new(&resources, spool_dir.clone());
         let state = Arc::new(SharedState {
             spool_dir,

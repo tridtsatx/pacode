@@ -41,6 +41,11 @@ pub fn run(
         std::process::id()
     );
 
+    // Before the runtime and any fd-holding state exist: 256 agents need far more fds
+    // than a typical default soft limit allows.
+    let (nofile_old, nofile_new) = crate::limits::raise_nofile();
+    log::info!("nofile soft {nofile_old} -> {nofile_new}");
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

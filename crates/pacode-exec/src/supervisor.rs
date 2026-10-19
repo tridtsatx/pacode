@@ -1,11 +1,79 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pacode_types::{ProgressSource, TaskId, TaskStatus, now_ms};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::manager::TaskEvent;
 use crate::state::SharedState;
+
+/// Minimum spacing between two `Progress` broadcasts for one task (F6). The stored
+/// progress is always current; only the broadcast is thinned. A trailing emit fires
+/// when output stops inside the window, and `Ended` carries the final state anyway.
+pub(crate) const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Per-task gate for `TaskEvent::Progress` broadcasts.
+#[derive(Debug)]
+pub(crate) struct ProgressThrottle {
+    interval: Duration,
+    last_emit: Option<Instant>,
+    pending: bool,
+}
+
+impl ProgressThrottle {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_emit: None,
+            pending: false,
+        }
+    }
+
+    /// Called on each new progress value. Returns true when it should be broadcast now.
+    pub(crate) fn on_progress(&mut self, now: Instant) -> bool {
+        match self.last_emit {
+            Some(prev) if now.saturating_duration_since(prev) < self.interval => {
+                self.pending = true;
+                false
+            }
+            _ => {
+                self.last_emit = Some(now);
+                self.pending = false;
+                true
+            }
+        }
+    }
+
+    /// When a trailing emit is owed, the instant it becomes due.
+    pub(crate) fn flush_deadline(&self) -> Option<Instant> {
+        if self.pending {
+            self.last_emit.map(|t| t + self.interval)
+        } else {
+            None
+        }
+    }
+
+    /// Called when the trailing deadline fires. Returns true when an emit is owed.
+    pub(crate) fn on_flush(&mut self, now: Instant) -> bool {
+        if !self.pending {
+            return false;
+        }
+        self.pending = false;
+        self.last_emit = Some(now);
+        true
+    }
+}
+
+/// Broadcast the current progress snapshot of a task, if it still exists.
+fn emit_progress_snapshot(id: &TaskId, state: &Arc<SharedState>) {
+    let info = {
+        let tasks = state.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get(id).map(|e| e.info.clone())
+    };
+    if let Some(info) = info {
+        let _ = state.events.send(TaskEvent::Progress(info));
+    }
+}
 
 pub(crate) async fn run_supervisor(
     id: TaskId,
@@ -43,6 +111,7 @@ pub(crate) async fn run_supervisor(
     let mut child_waited = false;
     let mut child_status: Option<std::process::ExitStatus> = None;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
+    let mut progress_throttle = ProgressThrottle::new(PROGRESS_EMIT_INTERVAL);
 
     loop {
         if stdout_done && stderr_done && child_waited {
@@ -55,7 +124,22 @@ pub(crate) async fn run_supervisor(
             break;
         }
 
+        let flush_at = progress_throttle
+            .flush_deadline()
+            .map(tokio::time::Instant::from_std);
+
         tokio::select! {
+            _ = async {
+                match flush_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            }, if flush_at.is_some() => {
+                if progress_throttle.on_flush(Instant::now()) {
+                    emit_progress_snapshot(&id, &state);
+                }
+            }
+
             res = async {
                 match stdout.as_mut() {
                     Some(r) => r.read(&mut stdout_buf).await,
@@ -77,6 +161,7 @@ pub(crate) async fn run_supervisor(
                             max_spool_bytes,
                             &mut stdout_line_acc,
                             &state,
+                            &mut progress_throttle,
                         ).await;
                     }
                 }
@@ -103,6 +188,7 @@ pub(crate) async fn run_supervisor(
                             max_spool_bytes,
                             &mut stderr_line_acc,
                             &state,
+                            &mut progress_throttle,
                         ).await;
                     }
                 }
@@ -236,6 +322,7 @@ async fn handle_chunk(
     max_spool_bytes: u64,
     line_acc: &mut Vec<u8>,
     state: &Arc<SharedState>,
+    progress_throttle: &mut ProgressThrottle,
 ) {
     if !*spool_truncated && !state.guard.spool_allowed() {
         let _ = spool_file
@@ -302,7 +389,9 @@ async fn handle_chunk(
 
             if any_progress {
                 entry.version_tx.send_modify(|v| *v += 1);
-                progress_to_emit = Some(entry.info.clone());
+                if progress_throttle.on_progress(Instant::now()) {
+                    progress_to_emit = Some(entry.info.clone());
+                }
             }
         }
     }
@@ -311,3 +400,7 @@ async fn handle_chunk(
         let _ = state.events.send(TaskEvent::Progress(info));
     }
 }
+
+#[cfg(test)]
+#[path = "supervisor_tests.rs"]
+mod supervisor_tests;

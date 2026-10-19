@@ -132,6 +132,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "provider.effort", label: "Reasoning Effort", description: "Base reasoning effort level", section: "provider", default_value: "medium", kind: SettingKind::Enum { options: EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.stream_idle_secs", label: "Stream Idle Timeout", description: "Base idle timeout in seconds for streaming responses", section: "provider", default_value: "180", kind: SettingKind::Integer { min: 1, max: 3600 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.max_retries", label: "Max Retries", description: "Maximum retries for failed provider requests", section: "provider", default_value: "5", kind: SettingKind::Integer { min: 0, max: 100 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "provider.max_concurrent", label: "Max Concurrent Requests", description: "Maximum in-flight requests per provider across all agents (0 = unlimited)", section: "provider", default_value: "16", kind: SettingKind::Integer { min: 0, max: 4096 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "provider.catalog_ttl_secs", label: "Catalog TTL Seconds", description: "Seconds before cached model catalog is considered stale", section: "provider", default_value: "86400", kind: SettingKind::Integer { min: 1, max: 2592000 }, apply: ApplyMode::NextTurn },
 
     // ui
@@ -171,7 +172,7 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "resources.sample_ms_pressure", label: "Sample Interval (pressure) ms", description: "Sampling interval in ms near or below the reserve", section: "resources", default_value: "200", kind: SettingKind::Integer { min: 50, max: 10000 }, apply: ApplyMode::Restart },
 
     // agents
-    SettingEntry { dotted_key: "agents.max_live", label: "Max Live Agents", description: "Maximum concurrent live subagents", section: "agents", default_value: "8", kind: SettingKind::Integer { min: 1, max: 64 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "agents.max_live", label: "Max Live Agents", description: "Maximum concurrent live subagents", section: "agents", default_value: "16", kind: SettingKind::Integer { min: 1, max: 512 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "agents.default_model", label: "Subagent Model", description: "provider/model for subagents when unspecified", section: "agents", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "agents.default_effort", label: "Subagent Effort", description: "Reasoning effort for subagents: low, medium, high, xhigh, max", section: "agents", default_value: "", kind: SettingKind::Enum { options: SUBAGENT_EFFORT_OPTIONS }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "agents.max_turns", label: "Max Turns", description: "Maximum tool-calling turns for a subagent before stopping", section: "agents", default_value: "200", kind: SettingKind::Integer { min: 1, max: 10000 }, apply: ApplyMode::NextTurn },
@@ -188,7 +189,9 @@ pub static SETTINGS: &[SettingEntry] = &[
     SettingEntry { dotted_key: "context.compaction_threshold", label: "Compaction Threshold", description: "Fraction of context window that triggers compaction", section: "context", default_value: "0.85", kind: SettingKind::Float { min: 0.1, max: 1.0 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.tool_output_cap_chars", label: "Tool Output Cap Chars", description: "Maximum characters preserved from single tool output", section: "context", default_value: "16000", kind: SettingKind::Integer { min: 100, max: 10000000 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.injection_cap_chars", label: "Injection Cap Chars", description: "Maximum characters for system prompt injection files", section: "context", default_value: "4000", kind: SettingKind::Integer { min: 100, max: 10000000 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "context.injection_budget_chars", label: "Injection Budget Chars", description: "Total characters for one batch of injected agent reports", section: "context", default_value: "24000", kind: SettingKind::Integer { min: 100, max: 10000000 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.instructions_cap_chars", label: "Instructions Cap Chars", description: "Cap for AGENTS.md / CLAUDE.md in system prompt", section: "context", default_value: "32000", kind: SettingKind::Integer { min: 100, max: 10000000 }, apply: ApplyMode::NextTurn },
+    SettingEntry { dotted_key: "context.discover_foreign_instructions", label: "Foreign Instructions", description: "Also read instruction files written for other agents (.cursor/rules, .clinerules, Copilot, Windsurf, Gemini, Codex)", section: "context", default_value: "true", kind: SettingKind::Bool, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.memory_cap_chars", label: "Memory Cap Chars", description: "Maximum characters for session memory", section: "context", default_value: "8000", kind: SettingKind::Integer { min: 100, max: 10000000 }, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.compaction_model", label: "Compaction Model", description: "Model to perform context compaction (default: session model)", section: "context", default_value: "", kind: SettingKind::String, apply: ApplyMode::NextTurn },
     SettingEntry { dotted_key: "context.keep_recent_messages", label: "Keep Recent Messages", description: "Recent messages kept verbatim after compaction", section: "context", default_value: "6", kind: SettingKind::Integer { min: 1, max: 100 }, apply: ApplyMode::NextTurn },
@@ -259,6 +262,7 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         "provider.effort" => Some(config.provider.effort.as_str().to_string()),
         "provider.stream_idle_secs" => Some(config.provider.stream_idle_secs.to_string()),
         "provider.max_retries" => Some(config.provider.max_retries.to_string()),
+        "provider.max_concurrent" => Some(config.provider.max_concurrent.to_string()),
         "provider.catalog_ttl_secs" => Some(config.provider.catalog_ttl_secs.to_string()),
         "ui.hints.model" => Some(config.ui.hints.model.to_string()),
         "ui.hints.effort" => Some(config.ui.hints.effort.to_string()),
@@ -326,7 +330,11 @@ pub fn read_value(config: &Config, dotted_key: &str) -> Option<String> {
         }
         "context.tool_output_cap_chars" => Some(config.context.tool_output_cap_chars.to_string()),
         "context.injection_cap_chars" => Some(config.context.injection_cap_chars.to_string()),
+        "context.injection_budget_chars" => Some(config.context.injection_budget_chars.to_string()),
         "context.instructions_cap_chars" => Some(config.context.instructions_cap_chars.to_string()),
+        "context.discover_foreign_instructions" => {
+            Some(config.context.discover_foreign_instructions.to_string())
+        }
         "context.memory_cap_chars" => Some(config.context.memory_cap_chars.to_string()),
         "context.compaction_model" => {
             Some(config.context.compaction_model.clone().unwrap_or_default())
@@ -501,6 +509,11 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
         "provider.max_retries" => {
             if let toml::Value::Integer(n) = value {
                 config.provider.max_retries = *n as u32;
+            }
+        }
+        "provider.max_concurrent" => {
+            if let toml::Value::Integer(n) = value {
+                config.provider.max_concurrent = *n as u32;
             }
         }
         "provider.catalog_ttl_secs" => {
@@ -730,9 +743,19 @@ pub fn apply_to_config(config: &mut Config, dotted_key: &str, value: &toml::Valu
                 config.context.injection_cap_chars = *n as usize;
             }
         }
+        "context.injection_budget_chars" => {
+            if let toml::Value::Integer(n) = value {
+                config.context.injection_budget_chars = *n as usize;
+            }
+        }
         "context.instructions_cap_chars" => {
             if let toml::Value::Integer(n) = value {
                 config.context.instructions_cap_chars = *n as usize;
+            }
+        }
+        "context.discover_foreign_instructions" => {
+            if let toml::Value::Boolean(b) = value {
+                config.context.discover_foreign_instructions = *b;
             }
         }
         "context.memory_cap_chars" => {

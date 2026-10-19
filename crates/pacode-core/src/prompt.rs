@@ -304,12 +304,30 @@ impl TurnPromptCache {
         instructions_cap_chars: usize,
         memory_cap_chars: usize,
     ) -> Self {
-        let git_branch = git_branch(cwd);
-        let instructions = load_instructions_with_memory(
+        Self::with_options(
             cwd,
             home_config,
             instructions_cap_chars,
             memory_cap_chars,
+            true,
+        )
+    }
+
+    /// `new` with the foreign-instruction switch (`[context] discover_foreign_instructions`).
+    pub fn with_options(
+        cwd: &Path,
+        home_config: Option<&Path>,
+        instructions_cap_chars: usize,
+        memory_cap_chars: usize,
+        discover_foreign: bool,
+    ) -> Self {
+        let git_branch = git_branch(cwd);
+        let instructions = load_instructions_with_options(
+            cwd,
+            home_config,
+            instructions_cap_chars,
+            memory_cap_chars,
+            discover_foreign,
         );
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         Self {

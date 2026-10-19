@@ -59,6 +59,46 @@ fn agent_table_is_capped() {
 }
 
 #[test]
+fn interleaved_agents_keep_their_own_retries() {
+    let mut guard = SessionGuard::default();
+    // 64 agents, two rounds each: every agent spends its two stream retries.
+    for _round in 0..2 {
+        for i in 0..64 {
+            guard
+                .limiter_for(&format!("agent-{i}"), 1)
+                .admit_stream(vec![finding("a", 9)]);
+        }
+    }
+    for i in 0..64 {
+        assert_eq!(
+            guard.limiter_for(&format!("agent-{i}"), 1).retries(),
+            2,
+            "agent-{i} lost its retry budget"
+        );
+    }
+}
+
+#[test]
+fn eviction_drops_only_the_least_recent_agent() {
+    let mut guard = SessionGuard::default();
+    guard
+        .limiter_for("hot", 1)
+        .admit_stream(vec![finding("a", 9)]);
+    for i in 0..(MAX_AGENTS_PER_SESSION * 2) {
+        guard.limiter_for(&format!("agent-{i}"), 1);
+        // "hot" keeps being used, so it stays the most recent agent.
+        guard.limiter_for("hot", 1);
+        assert!(guard.agents.len() <= MAX_AGENTS_PER_SESSION);
+    }
+    assert!(guard.agents.contains_key("hot"));
+    assert_eq!(guard.limiter_for("hot", 1).retries(), 1);
+    // The newest cold agents are still tracked; the oldest were evicted one by one.
+    let newest = format!("agent-{}", MAX_AGENTS_PER_SESSION * 2 - 1);
+    assert!(guard.agents.contains_key(&newest));
+    assert!(!guard.agents.contains_key("agent-0"));
+}
+
+#[test]
 fn pins_one_line_per_rule_and_caps_the_list() {
     let mut guard = SessionGuard::default();
     guard.pin(&[finding("a", 3), finding("a", 3), finding("b", 3)]);

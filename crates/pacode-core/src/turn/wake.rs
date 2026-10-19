@@ -32,8 +32,11 @@ pub(crate) async fn absorb_pending(session: &Arc<Session>, agent: &Arc<Agent>) {
     if drained.is_empty() {
         return;
     }
-    let message =
-        crate::inject::render_injections(&drained, session.config.context.injection_cap_chars);
+    let message = crate::inject::render_injections(
+        &drained,
+        session.config.context.injection_cap_chars,
+        session.config.context.injection_budget_chars,
+    );
     let (seq, arc) = agent
         .history
         .lock()

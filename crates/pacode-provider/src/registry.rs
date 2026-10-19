@@ -15,6 +15,7 @@ use crate::catalog_cache::{
     CatalogCache, DEFAULT_CATALOG_TTL_SECS, DEFAULT_MAX_MODELS_PER_PROVIDER,
 };
 use crate::openai_compat::OpenAiCompat;
+use crate::registry_cache::{TokenCache, legacy_resolve};
 use crate::{Provider, ProviderError};
 
 #[cfg(test)]
@@ -244,6 +245,9 @@ pub struct ProviderRegistry {
     /// the same file the registry was built from rather than a global default.
     auth_path: Option<std::path::PathBuf>,
     token_refresher: Option<TokenRefresher>,
+    /// Resolved store credentials with their expiry; see `registry_cache` for the cap,
+    /// invalidation and ownership rules. Seeded when providers are built from a store.
+    token_cache: Arc<TokenCache>,
 }
 
 impl ProviderRegistry {
@@ -262,6 +266,7 @@ impl ProviderRegistry {
             store_providers: Arc::new(RwLock::new(BTreeMap::new())),
             auth_path: None,
             token_refresher: None,
+            token_cache: Arc::new(TokenCache::default()),
         }
     }
 
@@ -317,6 +322,7 @@ impl ProviderRegistry {
 
             if let ResolvedCredential::StoreOAuth(acc) = &credential {
                 store_providers.insert(id.clone(), acc.access.clone());
+                registry.token_cache.put(&id, &acc.access, acc.expires_at);
             }
 
             configs.insert(id.clone(), pcfg.clone());
@@ -411,11 +417,28 @@ impl ProviderRegistry {
                     Ok(token) => Some(token),
                     Err(e) => return Err(e),
                 }
+            } else if legacy_resolve() {
+                // Escape hatch: the pre-cache behaviour (read and rewrite per step).
+                match self.refresh_from_store_legacy(&route.provider).await {
+                    Ok(token) => Some(token),
+                    Err(e) => {
+                        return Err(ProviderError::Config(format!(
+                            "credentials for '{}' are unusable: {e}",
+                            route.provider
+                        )));
+                    }
+                }
             } else {
-                // No seam installed: go through the auth crate so an expired OAuth
-                // token is refreshed before the turn uses it. A credential that needs
-                // no refresh (api key, devin) comes back unchanged.
-                match self.refresh_from_store(&route.provider).await {
+                // No seam installed: answer from the in-memory cache while the token is
+                // outside the refresh window; otherwise one single-flight refresh through
+                // the auth crate. A credential that needs no refresh (api key, devin)
+                // comes back unchanged and is cached without an expiry.
+                let provider_id = route.provider.as_str();
+                match self
+                    .token_cache
+                    .ensure_fresh(provider_id, move || self.refresh_from_store(provider_id))
+                    .await
+                {
                     Ok(token) => Some(token),
                     Err(e) => {
                         return Err(ProviderError::Config(format!(
@@ -436,7 +459,10 @@ impl ProviderRegistry {
                 };
 
                 if current_token.as_deref() != Some(&token) {
+                    let expiry = self.token_cache.expiry(&route.provider);
                     self.rebuild_provider_with_token(&route.provider, &token)?;
+                    // The rebuild invalidated the entry; re-store the refreshed one.
+                    self.token_cache.put(&route.provider, &token, expiry);
                 }
             }
         }
@@ -447,8 +473,46 @@ impl ProviderRegistry {
     }
 
     /// Refresh the stored credential of `provider` against the credential file this
-    /// registry was built from. A refreshed token is persisted back to that file.
-    async fn refresh_from_store(&self, provider: &str) -> Result<String, String> {
+    /// registry was built from. Returns the token and its expiry. The file is loaded in
+    /// `spawn_blocking`; it is saved (also in `spawn_blocking`) only when the refresh
+    /// changed the account, after re-reading it so other providers' or processes' newer
+    /// entries are merged rather than overwritten.
+    async fn refresh_from_store(&self, provider: &str) -> Result<(String, Option<i64>), String> {
+        let Some(path) = self.auth_path.clone() else {
+            let token = pacode_auth::flows::access_token(provider)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Unknown expiry: never treat as fresh.
+            return Ok((token, Some(0)));
+        };
+        let load_path = path.clone();
+        let mut store = tokio::task::spawn_blocking(move || AuthStore::load_from(load_path))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let before = store.get(provider).cloned();
+        let token = pacode_auth::flows::access_token_in(&mut store, provider)
+            .await
+            .map_err(|e| e.to_string())?;
+        let after = store.get(provider).cloned();
+        let expires_at = after.as_ref().and_then(|a| a.expires_at);
+        if after != before
+            && let Some(account) = after
+        {
+            let provider = provider.to_string();
+            tokio::task::spawn_blocking(move || {
+                let mut latest = AuthStore::load_from(&path).unwrap_or(store);
+                latest.upsert(&provider, account);
+                latest.save().map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+        }
+        Ok((token, expires_at))
+    }
+
+    /// Pre-cache behaviour, kept behind `PACODE_AUTH_LEGACY_RESOLVE=1` for one release.
+    async fn refresh_from_store_legacy(&self, provider: &str) -> Result<String, String> {
         match &self.auth_path {
             Some(path) => {
                 let mut store = AuthStore::load_from(path).map_err(|e| e.to_string())?;
@@ -496,6 +560,7 @@ impl ProviderRegistry {
             extra: serde_json::Map::new(),
         };
         let credential = ResolvedCredential::StoreOAuth(account);
+        self.token_cache.remove(id);
 
         let provider = build_transport(id, &pcfg, &defaults, &pricing, &credential)?;
         self.providers
@@ -528,6 +593,7 @@ impl ProviderRegistry {
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(id);
+            self.token_cache.remove(id);
             return Ok(());
         };
 
@@ -554,11 +620,13 @@ impl ProviderRegistry {
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(id.to_string(), acc.access.clone());
+            self.token_cache.put(id, &acc.access, acc.expires_at);
         } else {
             self.store_providers
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(id);
+            self.token_cache.remove(id);
             // A synthesized builtin whose login is gone (and with no env key) disappears;
             // a config-defined entry stays even if it is merely unauthenticated.
             let synthesized = id == "devin"

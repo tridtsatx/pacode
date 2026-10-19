@@ -19,6 +19,7 @@
 //! - `sessions`, `daemon`: thin wrappers over the client.
 
 mod cli;
+mod limits;
 
 fn main() {
     // Let `pacode sessions list | head` end quietly instead of panicking on EPIPE.

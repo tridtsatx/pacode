@@ -533,3 +533,78 @@ fn test_config_entry_overrides_builtin_and_api_key_login_synthesizes() {
     );
     assert!(providers.contains_key("gemini"));
 }
+
+#[tokio::test]
+async fn test_resolve_does_not_touch_auth_file_when_token_is_fresh() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let path = temp_dir.path().join("auth.json");
+    let mut store = AuthStore::new_empty(&path);
+    store.upsert(
+        "moonshot",
+        Account {
+            label: "moonshot-1".to_string(),
+            kind: "oauth".to_string(),
+            access: "tok".to_string(),
+            refresh: Some("r".to_string()),
+            expires_at: Some(i64::MAX / 4),
+            email: None,
+            extra: serde_json::Map::new(),
+        },
+    );
+    store.save().expect("save");
+
+    let reg = ProviderRegistry::from_config_with_store(
+        &Config::default(),
+        &BTreeMap::new(),
+        Some(&store),
+    )
+    .expect("registry");
+    let route = ModelRoute::new("moonshot", "kimi-k3");
+    // Remove the file: a fresh cached token must not need it at all.
+    let content = std::fs::read_to_string(&path).expect("read");
+    std::fs::remove_file(&path).expect("rm");
+    for _ in 0..1000 {
+        reg.resolve(&route).await.expect("resolve");
+    }
+    assert!(!path.exists(), "resolve must not rewrite auth.json");
+    std::fs::write(&path, content).expect("restore");
+}
+
+#[tokio::test]
+async fn test_login_rebuild_invalidates_cached_token() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let path = temp_dir.path().join("auth.json");
+    let mut store = AuthStore::new_empty(&path);
+    let account = |access: &str| Account {
+        label: "moonshot-1".to_string(),
+        kind: "oauth".to_string(),
+        access: access.to_string(),
+        refresh: None,
+        expires_at: None,
+        email: None,
+        extra: serde_json::Map::new(),
+    };
+    store.upsert("moonshot", account("old"));
+    store.save().expect("save");
+    let reg = ProviderRegistry::from_config_with_store(
+        &Config::default(),
+        &BTreeMap::new(),
+        Some(&store),
+    )
+    .expect("registry");
+    let route = ModelRoute::new("moonshot", "kimi-k3");
+    reg.resolve(&route).await.expect("resolve");
+
+    store.upsert("moonshot", account("new"));
+    store.save().expect("save");
+    reg.rebuild_provider_from_store("moonshot", &store)
+        .expect("rebuild");
+    reg.resolve(&route).await.expect("resolve");
+    let current = reg
+        .store_providers
+        .read()
+        .expect("lock")
+        .get("moonshot")
+        .cloned();
+    assert_eq!(current.as_deref(), Some("new"));
+}

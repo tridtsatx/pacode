@@ -452,3 +452,48 @@ fn test_chunk_to_events_error_raw_equal_to_message_not_duplicated() {
         other => panic!("expected Malformed error, got {other:?}"),
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_chunks_skip_redact_when_trace_disabled() {
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // No logger is installed in tests, so the trace level is disabled.
+    assert!(!log::log_enabled!(log::Level::Trace));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await;
+        let mut body = String::new();
+        for _ in 0..100 {
+            body.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(resp.as_bytes()).await;
+    });
+
+    let response = reqwest::get(format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect("response");
+    let before = crate::openai_compat::REDACT_CALLS.with(|c| c.get());
+    let mut stream = crate::sse::create_event_stream(
+        response,
+        "m".to_string(),
+        30,
+        pacode_types::Effort::default(),
+    );
+    while stream.next().await.is_some() {}
+    let after = crate::openai_compat::REDACT_CALLS.with(|c| c.get());
+    assert_eq!(after, before, "redact must not run per chunk at Info level");
+    let _ = server.await;
+}

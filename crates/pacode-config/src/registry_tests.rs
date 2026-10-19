@@ -444,3 +444,36 @@ fn test_read_outline_threshold_setting() {
     reset_in_config(&mut cfg, "read.outline_threshold");
     assert_eq!(cfg.read.outline_threshold, 400);
 }
+
+#[test]
+fn test_agents_max_live_bounds() {
+    let entry = find_entry("agents.max_live").unwrap();
+    assert_eq!(entry.default_value, "16");
+    assert!(validate_candidate(entry, "256").is_ok());
+    assert!(validate_candidate(entry, "512").is_ok());
+    assert!(validate_candidate(entry, "513").is_err());
+}
+
+#[test]
+fn test_capacity_settings_apply_and_read_back() {
+    let mut cfg = Config::default();
+
+    let v = validate("provider.max_concurrent", "0").expect("0 means unlimited");
+    apply_to_config(&mut cfg, "provider.max_concurrent", &v);
+    assert_eq!(cfg.provider.max_concurrent, 0);
+    assert_eq!(
+        read_value(&cfg, "provider.max_concurrent"),
+        Some("0".to_string())
+    );
+
+    let v = validate("context.injection_budget_chars", "5000").expect("valid budget");
+    apply_to_config(&mut cfg, "context.injection_budget_chars", &v);
+    assert_eq!(cfg.context.injection_budget_chars, 5000);
+    assert_eq!(
+        read_value(&cfg, "context.injection_budget_chars"),
+        Some("5000".to_string())
+    );
+
+    reset_in_config(&mut cfg, "context.injection_budget_chars");
+    assert_eq!(cfg.context.injection_budget_chars, 24_000);
+}

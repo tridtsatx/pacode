@@ -415,9 +415,11 @@ pub(crate) fn create_event_stream(
                     return Some((Err(ProviderError::IdleTimeout(state.timeout_secs)), state));
                 }
                 Ok(Some(Ok(bytes))) => {
-                    let chunk_str = String::from_utf8_lossy(&bytes);
-                    let chunk_redacted = crate::redact(&chunk_str);
-                    log::trace!("response body chunk: {chunk_redacted}");
+                    if log::log_enabled!(log::Level::Trace) {
+                        let chunk_str = String::from_utf8_lossy(&bytes);
+                        let chunk_redacted = crate::redact(&chunk_str);
+                        log::trace!("response body chunk: {chunk_redacted}");
+                    }
                     let payloads = state.parser.feed(bytes.as_ref());
                     for payload in payloads {
                         if payload.trim() == "[DONE]" {

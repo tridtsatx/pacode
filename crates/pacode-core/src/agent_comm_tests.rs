@@ -258,6 +258,7 @@ fn parent_message_is_wrapped_with_an_instruction() {
             text: "also cover the CLI".into(),
         }],
         1000,
+        crate::inject::DEFAULT_INJECTION_BUDGET,
     );
     let text = msg.text();
     assert!(
@@ -278,6 +279,7 @@ fn agent_question_names_the_agent_options_and_the_reply_route() {
             options: vec!["nextest".into(), "cargo test".into()],
         }],
         1000,
+        crate::inject::DEFAULT_INJECTION_BUDGET,
     );
     let text = msg.text();
     assert!(text.contains("<question_from_agent id=\"q3\" agent=\"tests\">"));
@@ -299,6 +301,7 @@ fn agent_question_without_options_has_no_options_block() {
             options: Vec::new(),
         }],
         1000,
+        crate::inject::DEFAULT_INJECTION_BUDGET,
     )
     .text();
     assert!(!text.contains("Options:"));
@@ -312,6 +315,7 @@ fn late_answer_is_tagged_with_its_question() {
             text: "nextest".into(),
         }],
         1000,
+        crate::inject::DEFAULT_INJECTION_BUDGET,
     )
     .text();
     assert!(text.contains(
@@ -323,4 +327,49 @@ fn late_answer_is_tagged_with_its_question() {
 fn comm_errors_become_tool_failures_with_the_same_text() {
     let err: ToolError = CommError::NotRunning(AgentId::new("agt_x")).into();
     assert!(err.to_string().contains("spawn a new agent"), "{err}");
+}
+
+fn finished(i: usize, answer_len: usize) -> Injection {
+    let mut agent = info(&format!("worker-{i}"));
+    agent.id = AgentId::new(format!("agt_{i:04}"));
+    agent.status = AgentStatus::Finished;
+    Injection::AgentFinished {
+        agent,
+        answer: "x".repeat(answer_len),
+    }
+}
+
+#[test]
+fn injection_budget_stubs_the_tail_but_keeps_every_id_in_order() {
+    let items: Vec<Injection> = (0..256).map(|i| finished(i, 4000)).collect();
+    let budget = 24_000;
+    let text = render_injections(&items, 4000, budget).text();
+    assert!(text.len() <= budget + 300 + 256 * 120, "len {}", text.len());
+    let mut last = 0;
+    for i in 0..256 {
+        let pos = text
+            .find(&format!("id=\"agt_{i:04}\""))
+            .expect("every agent id appears");
+        assert!(pos >= last, "ordering preserved");
+        last = pos;
+    }
+    assert!(text.contains("truncated=\"true\"/>"));
+    assert!(text.contains("reports truncated; use `agent list`"));
+}
+
+#[test]
+fn injection_under_budget_has_no_stub_or_notice() {
+    let items: Vec<Injection> = (0..3).map(|i| finished(i, 100)).collect();
+    let text = render_injections(&items, 4000, 24_000).text();
+    assert!(!text.contains("truncated=\"true\""));
+    assert!(!text.contains("reports truncated"));
+}
+
+#[test]
+fn single_item_over_budget_is_head_tail_truncated_not_dropped() {
+    let text = render_injections(&[finished(1, 50_000)], 100_000, 2_000).text();
+    assert!(text.contains("id=\"agt_0001\""));
+    assert!(text.contains("characters truncated"));
+    assert!(!text.contains("truncated=\"true\""));
+    assert!(text.len() < 3_000, "len {}", text.len());
 }

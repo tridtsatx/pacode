@@ -113,8 +113,13 @@ impl InjectionQueue {
     }
 }
 
+/// Default total character budget for one rendered batch of injections. The caller
+/// takes the budget from `[context] injection_budget_chars` (this is its default).
+pub const DEFAULT_INJECTION_BUDGET: usize = 24_000;
+
 /// Render a batch of injections into ONE user message of kind `Injected`, each item
-/// wrapped in a marker tag and capped to `cap_chars` (spec §6.4):
+/// wrapped in a marker tag and capped to `cap_chars` (spec §6.4), the whole batch
+/// held to roughly `budget_chars`:
 ///
 /// ```text
 /// <task_finished id="tsk_…" label="cargo build" exit="0" duration="3m02s">
@@ -126,109 +131,158 @@ impl InjectionQueue {
 /// <user_message>…</user_message>
 /// <notice>…</notice>
 /// ```
-pub fn render_injections(items: &[Injection], cap_chars: usize) -> Message {
+///
+/// Items render in order. Once the next full report would cross the budget, the
+/// remaining reports (finished/stalled tasks, finished/status agents) become one-line
+/// stubs and a single notice counts them. The first item is never dropped: if it alone
+/// exceeds the budget it is head/tail truncated to the budget. Steers, notices and
+/// questions are small and always rendered in full (per-item cap only).
+pub fn render_injections(items: &[Injection], cap_chars: usize, budget_chars: usize) -> Message {
     let now = pacode_types::now_ms();
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::with_capacity(items.len() + 1);
+    let mut used = 0usize;
+    let mut truncated = 0usize;
 
     for item in items {
-        match item {
-            Injection::UserSteer(text) => {
-                let capped = pacode_types::truncate_head_tail(text, cap_chars);
-                parts.push(format!("<user_message>{capped}</user_message>"));
-            }
-            Injection::TaskFinished { task, tail } => {
-                let exit_str = task
-                    .exit_code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "0".to_string());
-                let duration_str = pacode_types::time::format_duration_ms(task.duration_ms(now));
-                let capped = pacode_types::truncate_head_tail(tail, cap_chars);
-                if capped.trim().is_empty() {
-                    parts.push(format!(
-                        "<task_finished id=\"{}\" label=\"{}\" exit=\"{exit_str}\" duration=\"{duration_str}\">\n</task_finished>",
-                        task.id, task.label
-                    ));
-                } else {
-                    parts.push(format!(
-                        "<task_finished id=\"{}\" label=\"{}\" exit=\"{exit_str}\" duration=\"{duration_str}\">\n{capped}\n</task_finished>",
-                        task.id, task.label
-                    ));
-                }
-            }
-            Injection::TaskStalled { task, tail } => {
-                let capped = pacode_types::truncate_head_tail(tail, cap_chars);
-                if capped.trim().is_empty() {
-                    parts.push(format!(
-                        "<task_stalled id=\"{}\" label=\"{}\">\n</task_stalled>",
-                        task.id, task.label
-                    ));
-                } else {
-                    parts.push(format!(
-                        "<task_stalled id=\"{}\" label=\"{}\">\n{capped}\n</task_stalled>",
-                        task.id, task.label
-                    ));
-                }
-            }
-            Injection::AgentFinished { agent, answer } => {
-                let capped = pacode_types::truncate_head_tail(answer, cap_chars);
-                if capped.trim().is_empty() {
-                    parts.push(format!(
-                        "<agent_finished id=\"{}\" name=\"{}\">\n</agent_finished>",
-                        agent.id, agent.name
-                    ));
-                } else {
-                    parts.push(format!(
-                        "<agent_finished id=\"{}\" name=\"{}\">\n{capped}\n</agent_finished>",
-                        agent.id, agent.name
-                    ));
-                }
-            }
-            Injection::StatusRequest => {
-                parts.push(
-                    "<status_request>Report your current status briefly with the `report_status` tool (done / in progress / blockers), then continue.</status_request>"
-                        .to_string(),
-                );
-            }
-            Injection::AgentStatus { agent, text } => {
-                let capped = pacode_types::truncate_head_tail(text, cap_chars);
-                parts.push(format!(
-                    "<agent_status id=\"{}\" name=\"{}\">\n{capped}\n</agent_status>",
-                    agent.id, agent.name
-                ));
-            }
-            Injection::ParentMessage { from: _, text } => {
-                parts.push(crate::agent_comm::render_parent_message(text, cap_chars));
-            }
-            Injection::AgentQuestion {
-                agent,
-                question_id,
-                question,
-                options,
-            } => {
-                parts.push(crate::agent_comm::render_agent_question(
-                    agent,
-                    question_id,
-                    question,
-                    options,
-                    cap_chars,
-                ));
-            }
-            Injection::ParentAnswer { question_id, text } => {
-                parts.push(crate::agent_comm::render_parent_answer(
-                    question_id,
-                    text,
-                    cap_chars,
-                ));
-            }
-            Injection::SystemNotice(text) => {
-                let capped = pacode_types::truncate_head_tail(text, cap_chars);
-                parts.push(format!("<notice>{capped}</notice>"));
+        let mut text = render_item(item, cap_chars, now);
+        if used + text.len() > budget_chars
+            && let Some(stub) = report_stub(item)
+        {
+            if parts.is_empty() {
+                // A lone oversized report is shrunk, never dropped.
+                text = render_item(item, cap_chars.min(budget_chars), now);
+            } else {
+                text = stub;
+                truncated += 1;
             }
         }
+        used += text.len() + 2;
+        parts.push(text);
+    }
+    if truncated > 0 {
+        parts.push(format!(
+            "<notice>{truncated} reports truncated; use `agent list` to see each agent's status</notice>"
+        ));
     }
 
     let body = parts.join("\n\n");
     Message::user(body).with_kind(MessageKind::Injected)
+}
+
+/// One-line stub for a bulky report item; `None` for items that are always rendered.
+fn report_stub(item: &Injection) -> Option<String> {
+    match item {
+        Injection::AgentFinished { agent, .. } => Some(format!(
+            "<agent_finished id=\"{}\" name=\"{}\" status=\"{}\" truncated=\"true\"/>",
+            agent.id,
+            agent.name,
+            format!("{:?}", agent.status).to_lowercase()
+        )),
+        Injection::AgentStatus { agent, .. } => Some(format!(
+            "<agent_status id=\"{}\" name=\"{}\" truncated=\"true\"/>",
+            agent.id, agent.name
+        )),
+        Injection::TaskFinished { task, .. } => Some(format!(
+            "<task_finished id=\"{}\" label=\"{}\" truncated=\"true\"/>",
+            task.id, task.label
+        )),
+        Injection::TaskStalled { task, .. } => Some(format!(
+            "<task_stalled id=\"{}\" label=\"{}\" truncated=\"true\"/>",
+            task.id, task.label
+        )),
+        Injection::UserSteer(_)
+        | Injection::SystemNotice(_)
+        | Injection::StatusRequest
+        | Injection::ParentMessage { .. }
+        | Injection::AgentQuestion { .. }
+        | Injection::ParentAnswer { .. } => None,
+    }
+}
+
+fn render_item(item: &Injection, cap_chars: usize, now: u64) -> String {
+    match item {
+        Injection::UserSteer(text) => {
+            let capped = pacode_types::truncate_head_tail(text, cap_chars);
+            format!("<user_message>{capped}</user_message>")
+        }
+        Injection::TaskFinished { task, tail } => {
+            let exit_str = task
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "0".to_string());
+            let duration_str = pacode_types::time::format_duration_ms(task.duration_ms(now));
+            let capped = pacode_types::truncate_head_tail(tail, cap_chars);
+            if capped.trim().is_empty() {
+                format!(
+                    "<task_finished id=\"{}\" label=\"{}\" exit=\"{exit_str}\" duration=\"{duration_str}\">\n</task_finished>",
+                    task.id, task.label
+                )
+            } else {
+                format!(
+                    "<task_finished id=\"{}\" label=\"{}\" exit=\"{exit_str}\" duration=\"{duration_str}\">\n{capped}\n</task_finished>",
+                    task.id, task.label
+                )
+            }
+        }
+        Injection::TaskStalled { task, tail } => {
+            let capped = pacode_types::truncate_head_tail(tail, cap_chars);
+            if capped.trim().is_empty() {
+                format!(
+                    "<task_stalled id=\"{}\" label=\"{}\">\n</task_stalled>",
+                    task.id, task.label
+                )
+            } else {
+                format!(
+                    "<task_stalled id=\"{}\" label=\"{}\">\n{capped}\n</task_stalled>",
+                    task.id, task.label
+                )
+            }
+        }
+        Injection::AgentFinished { agent, answer } => {
+            let capped = pacode_types::truncate_head_tail(answer, cap_chars);
+            if capped.trim().is_empty() {
+                format!(
+                    "<agent_finished id=\"{}\" name=\"{}\">\n</agent_finished>",
+                    agent.id, agent.name
+                )
+            } else {
+                format!(
+                    "<agent_finished id=\"{}\" name=\"{}\">\n{capped}\n</agent_finished>",
+                    agent.id, agent.name
+                )
+            }
+        }
+        Injection::StatusRequest => "<status_request>Report your current status briefly with the `report_status` tool (done / in progress / blockers), then continue.</status_request>".to_string(),
+        Injection::AgentStatus { agent, text } => {
+            let capped = pacode_types::truncate_head_tail(text, cap_chars);
+            format!(
+                "<agent_status id=\"{}\" name=\"{}\">\n{capped}\n</agent_status>",
+                agent.id, agent.name
+            )
+        }
+        Injection::ParentMessage { from: _, text } => {
+            crate::agent_comm::render_parent_message(text, cap_chars)
+        }
+        Injection::AgentQuestion {
+            agent,
+            question_id,
+            question,
+            options,
+        } => crate::agent_comm::render_agent_question(
+            agent,
+            question_id,
+            question,
+            options,
+            cap_chars,
+        ),
+        Injection::ParentAnswer { question_id, text } => {
+            crate::agent_comm::render_parent_answer(question_id, text, cap_chars)
+        }
+        Injection::SystemNotice(text) => {
+            let capped = pacode_types::truncate_head_tail(text, cap_chars);
+            format!("<notice>{capped}</notice>")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +345,7 @@ mod tests {
             Injection::SystemNotice("system warning".into()),
         ];
 
-        let msg = render_injections(&items, 1000);
+        let msg = render_injections(&items, 1000, DEFAULT_INJECTION_BUDGET);
         assert_eq!(msg.meta.kind, MessageKind::Injected);
         let text = msg.text();
         assert!(text.contains("<user_message>please do this first</user_message>"));
@@ -305,7 +359,11 @@ mod tests {
 
         // Test capping
         let overlong = "A".repeat(500);
-        let capped_msg = render_injections(&[Injection::UserSteer(overlong)], 100);
+        let capped_msg = render_injections(
+            &[Injection::UserSteer(overlong)],
+            100,
+            DEFAULT_INJECTION_BUDGET,
+        );
         let capped_text = capped_msg.text();
         assert!(capped_text.contains("characters truncated"));
     }

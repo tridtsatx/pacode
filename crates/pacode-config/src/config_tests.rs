@@ -140,7 +140,7 @@ fn defaults_from_empty_text() {
     assert_eq!(cfg.exec.max_tasks, 64);
     assert_eq!(cfg.exec.default_timeout_secs, 3600);
 
-    assert_eq!(cfg.agents.max_live, 8);
+    assert_eq!(cfg.agents.max_live, 16);
     assert_eq!(cfg.agents.max_turns, 200);
 
     assert_eq!(cfg.daemon.idle_timeout_secs, 600);
@@ -756,4 +756,24 @@ fn a_quiet_setting_also_silences_dependencies() {
         !log::Log::enabled(&logger, &dep),
         "PACODE_LOG=error must not be raised back to warn for dependencies"
     );
+}
+
+#[test]
+fn capacity_keys_default_and_round_trip() {
+    let defaults = parse("").expect("empty toml should parse");
+    assert_eq!(defaults.agents.max_live, 16);
+    assert_eq!(defaults.provider.max_concurrent, 16);
+    assert_eq!(defaults.context.injection_budget_chars, 24_000);
+
+    let explicit = parse(
+        "[provider]\nmax_concurrent = 0\n\n[agents]\nmax_live = 256\n\n[context]\ninjection_budget_chars = 1000\n",
+    )
+    .expect("explicit capacity keys should parse");
+    assert_eq!(explicit.provider.max_concurrent, 0);
+    assert_eq!(explicit.agents.max_live, 256);
+    assert_eq!(explicit.context.injection_budget_chars, 1000);
+
+    let text = toml::to_string(&explicit).expect("config should serialize");
+    let back = parse(&text).expect("serialized config should re-parse");
+    assert_eq!(back, explicit);
 }

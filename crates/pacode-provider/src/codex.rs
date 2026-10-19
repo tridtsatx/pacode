@@ -321,9 +321,11 @@ impl Provider for Codex {
         let model = &req.model;
         log::debug!("POST {url_redacted} model={model} keys={body_keys:?}");
 
-        let serialized_body = serde_json::to_string(&body).unwrap_or_default();
-        let body_redacted = redact(&crate::vision::redact_data_urls(&serialized_body));
-        log::trace!("request body: {body_redacted}");
+        if log::log_enabled!(log::Level::Trace) {
+            let serialized_body = serde_json::to_string(&body).unwrap_or_default();
+            let body_redacted = redact(&crate::vision::redact_data_urls(&serialized_body));
+            log::trace!("request body: {body_redacted}");
+        }
 
         let effort = req.effort.unwrap_or(self.defaults.effort);
         let opener = CodexStreamOpener {

@@ -92,11 +92,17 @@ pub async fn run_turn(
         .config_file
         .parent()
         .map(|d| d.to_path_buf());
-    let prompt_cache = crate::prompt::TurnPromptCache::new(
+    let memory_cap_chars = if session.config.memory.enabled {
+        session.config.context.memory_cap_chars
+    } else {
+        0
+    };
+    let prompt_cache = crate::prompt::TurnPromptCache::with_options(
         &meta.cwd,
         home_config.as_deref(),
         session.config.context.instructions_cap_chars,
-        session.config.context.memory_cap_chars,
+        memory_cap_chars,
+        session.config.context.discover_foreign_instructions,
     );
     *agent.prompt_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(prompt_cache.clone());
 
@@ -354,6 +360,7 @@ pub async fn run_turn(
                 let injection_msg = crate::inject::render_injections(
                     &drained,
                     session.config.context.injection_cap_chars,
+                    session.config.context.injection_budget_chars,
                 );
                 let (inj_seq, arc_inj) = agent
                     .history
@@ -388,6 +395,7 @@ pub async fn run_turn(
             let injection_msg = crate::inject::render_injections(
                 &drained,
                 session.config.context.injection_cap_chars,
+                session.config.context.injection_budget_chars,
             );
             let (inj_seq, arc_inj) = agent
                 .history
