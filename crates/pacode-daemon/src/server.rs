@@ -52,6 +52,8 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
     };
 
     let mut idle_since: Option<std::time::Instant> = Some(std::time::Instant::now());
+    // Whether freed heap pages were already returned to the OS since the last activity.
+    let mut trimmed = false;
 
     let core_for_watcher = Arc::clone(&core);
     let _watcher = pacode_config::ConfigWatcher::watch(
@@ -150,6 +152,11 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
                     log::info!("evicted {evicted} idle session(s) from memory");
                 }
                 if current_conns == 0 && core.is_idle() {
+                    // Once per busy period: a second trim with nothing new freed is wasted work.
+                    if !trimmed {
+                        release_freed_memory();
+                        trimmed = true;
+                    }
                     let idle_start = idle_since.get_or_insert_with(std::time::Instant::now);
                     if opts.config.daemon.idle_timeout_secs > 0
                         && idle_start.elapsed() >= std::time::Duration::from_secs(opts.config.daemon.idle_timeout_secs)
@@ -162,6 +169,7 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
                     }
                 } else {
                     idle_since = None;
+                    trimmed = false;
                 }
             }
             accept_res = listener.accept() => {
@@ -171,6 +179,7 @@ pub async fn run(opts: DaemonOptions, core: Arc<Core>) -> Result<(), DaemonError
                 match accept_res {
                     Ok((stream, _addr)) => {
                         idle_since = None;
+                        trimmed = false;
                         let core_clone = Arc::clone(&core);
                         let control_clone = control.clone();
                         tokio::spawn(async move {
@@ -227,4 +236,16 @@ pub async fn bind_socket(path: &std::path::Path) -> Result<tokio::net::UnixListe
     }
 
     Ok(listener)
+}
+
+/// Hand freed heap pages back to the OS. glibc keeps the arenas of a busy period
+/// (hundreds of agents streaming) resident long after the work is gone; this runs on the
+/// existing idle poll only, never on a timer of its own, and only while nothing is
+/// attached and the core is idle. A no-op on other allocators and platforms.
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` is thread-safe and only releases unused pages.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }

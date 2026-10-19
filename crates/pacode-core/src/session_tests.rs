@@ -271,14 +271,15 @@ async fn test_fresh_main_history_equals_conversation_as_it_stood_before_detached
     let (core, mock, _tmp, session_id) = setup_test_session().await;
     let session = core.session(&session_id).unwrap();
 
-    // Turn 1 completes normally on main
+    // Turn 1 completes normally on main. Subscribe first: the turn may end before a
+    // late subscriber would see `TurnEnded`.
+    let mut rx = core.subscribe(&session_id).unwrap();
     mock.push(MockResponse::Text("Response 1".into()));
     session
         .submit_user_message("Message 1".into())
         .await
         .unwrap();
 
-    let mut rx = core.subscribe(&session_id).unwrap();
     let timeout = tokio::time::sleep(Duration::from_secs(3));
     tokio::pin!(timeout);
 
@@ -296,14 +297,24 @@ async fn test_fresh_main_history_equals_conversation_as_it_stood_before_detached
     }
 
     let main_before = session.main_agent().unwrap();
+    // `TurnEnded` is emitted just before the turn releases its token: let it finish, or
+    // the next message lands in that window and is delivered as a steer instead.
+    for _ in 0..200 {
+        if !main_before.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let hist_before = main_before.history.lock().unwrap().messages.clone();
     assert_eq!(hist_before.len(), 2);
     assert_eq!(hist_before[0].text(), "Message 1");
     assert_eq!(hist_before[1].text(), "Response 1");
 
     // Turn 2 begins on main and is detached
+    // Long enough that the detached turn is still running while the assertions below
+    // run, even on a loaded machine (when it ends it wakes main, as it should).
     mock.push(MockResponse::Slow {
-        delay: Duration::from_millis(50),
+        delay: Duration::from_millis(1500),
         text: "Long response to message 2".into(),
     });
     session
@@ -926,6 +937,13 @@ async fn test_slow_catalog_never_blocks_spawn() {
         "took {:?}",
         started.elapsed()
     );
+    // The fetch runs on its own task: give it a moment to start, then it must be one.
+    for _ in 0..100 {
+        if mock.list_models_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         mock.list_models_count(),
         1,

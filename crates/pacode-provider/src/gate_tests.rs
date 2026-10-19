@@ -179,6 +179,240 @@ fn gate_map_shares_and_replaces_on_limit_change() {
     assert_eq!(c.limit(), 8);
 }
 
+fn hint_headers(reset: &'static str) -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        "x-ratelimit-reset-requests",
+        reqwest::header::HeaderValue::from_static(reset),
+    );
+    h
+}
+
+async fn hold_n(gate: &Arc<ProviderGate>, n: usize) -> Vec<super::GatePermit> {
+    let mut v = Vec::new();
+    for _ in 0..n {
+        v.push(gate.acquire().await);
+    }
+    v
+}
+
+#[tokio::test]
+async fn halves_once_per_episode() {
+    let gate = ProviderGate::new(64);
+    let h = hint_headers("150ms");
+    for _ in 0..64 {
+        gate.note_response(429, &h);
+    }
+    assert_eq!(
+        gate.effective_limit(),
+        Some(32),
+        "64 simultaneous 429s halve once"
+    );
+    assert_eq!(gate.ceiling(), Some(64));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    gate.note_response(503, &h);
+    assert_eq!(
+        gate.effective_limit(),
+        Some(16),
+        "a new episode halves again"
+    );
+}
+
+#[tokio::test]
+async fn hintless_429_shrinks_once_and_floors_at_min() {
+    let gate = ProviderGate::new(64);
+    let none = reqwest::header::HeaderMap::new();
+    for _ in 0..10 {
+        assert_eq!(gate.note_response(429, &none), None);
+    }
+    assert_eq!(gate.effective_limit(), Some(32));
+    for _ in 0..5 {
+        tokio::time::sleep(super::aimd::NO_HINT_EPISODE + Duration::from_millis(20)).await;
+        gate.note_response(429, &none);
+    }
+    assert_eq!(gate.effective_limit(), Some(super::MIN_LIMIT));
+    let tiny = ProviderGate::new(1);
+    tiny.note_response(429, &none);
+    assert_eq!(tiny.effective_limit(), Some(1), "never above the ceiling");
+}
+
+#[tokio::test]
+async fn additive_increase_stops_at_ceiling() {
+    let gate = Arc::new(ProviderGate::new(8));
+    assert_eq!((gate.effective_limit(), gate.ceiling()), (Some(8), Some(8)));
+    // Streams that started before the decrease and finish inside the episode: no credit.
+    // (`acquire` itself waits out a cooldown, so they must be taken first.)
+    let early = hold_n(&gate, 4).await;
+    gate.note_response(429, &hint_headers("30ms"));
+    assert_eq!(gate.effective_limit(), Some(4));
+    for permit in &early {
+        permit.record_success();
+    }
+    assert_eq!(gate.effective_limit(), Some(4));
+    drop(early);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    for _ in 0..3 {
+        gate.acquire().await.record_success();
+    }
+    assert_eq!(gate.effective_limit(), Some(4));
+    gate.acquire().await.record_success();
+    assert_eq!(gate.effective_limit(), Some(5), "+1 after L successes");
+    assert_eq!(gate.available(), Some(5));
+
+    for _ in 0..200 {
+        gate.acquire().await.record_success();
+    }
+    assert_eq!(gate.effective_limit(), Some(8), "never above the ceiling");
+    assert_eq!(gate.available(), Some(8));
+    assert_eq!(gate.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn debt_is_paid_as_permits_return() {
+    let gate = Arc::new(ProviderGate::new(8));
+    let permits = hold_n(&gate, 8).await;
+    let h = hint_headers("20ms");
+    gate.note_response(429, &h);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    gate.note_response(429, &h);
+    assert_eq!(gate.effective_limit(), Some(2));
+    assert_eq!(gate.in_flight(), 8);
+    assert_eq!(gate.available(), Some(0));
+
+    drop(permits);
+    assert_eq!(gate.available(), Some(2), "only 2 permits come back");
+    assert_eq!(gate.in_flight(), 0);
+    let _a = gate.acquire().await;
+    let _b = gate.acquire().await;
+    let third = tokio::time::timeout(SHORT, gate.acquire()).await;
+    assert!(third.is_err(), "limit is 2");
+}
+
+#[tokio::test]
+async fn decrease_forgets_available_permits_first() {
+    let gate = Arc::new(ProviderGate::new(8));
+    let permits = hold_n(&gate, 3).await;
+    gate.note_response(429, &hint_headers("20ms"));
+    assert_eq!(gate.effective_limit(), Some(4));
+    assert_eq!(gate.available(), Some(1), "5 free, 4 forgotten");
+    drop(permits);
+    assert_eq!(gate.available(), Some(4), "no debt was recorded");
+}
+
+#[tokio::test]
+async fn increase_pays_debt_before_adding_permits() {
+    let gate = Arc::new(ProviderGate::new(8));
+    let permits = hold_n(&gate, 8).await;
+    gate.note_response(429, &hint_headers("20ms"));
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(gate.effective_limit(), Some(4));
+    for p in permits.iter().take(4) {
+        p.record_success();
+    }
+    drop(permits);
+    assert_eq!(gate.effective_limit(), Some(5));
+    assert_eq!(
+        gate.available(),
+        Some(5),
+        "4 debt - 1 paid, 3 forgotten, 5 kept"
+    );
+}
+
+#[tokio::test]
+async fn unlimited_stays_unlimited_until_first_429() {
+    let gate = Arc::new(ProviderGate::new(0));
+    let permits = hold_n(&gate, 300).await;
+    assert_eq!(gate.effective_limit(), None);
+    assert_eq!(gate.ceiling(), None);
+    assert_eq!(gate.available(), None);
+    assert_eq!(gate.note_response(200, &hint_headers("1s")), None);
+    assert_eq!(gate.effective_limit(), None);
+    for p in &permits {
+        p.record_success();
+    }
+    assert_eq!(gate.effective_limit(), None);
+
+    gate.note_response(429, &reqwest::header::HeaderMap::new());
+    assert_eq!(gate.effective_limit(), Some(super::IMPLICIT_CEILING / 2));
+    assert_eq!(gate.ceiling(), Some(super::IMPLICIT_CEILING));
+    assert_eq!(gate.in_flight(), 300);
+    drop(permits);
+    assert_eq!(gate.available(), Some(super::IMPLICIT_CEILING / 2));
+    assert_eq!(gate.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn cancelled_waiters_during_decrease_corrupt_nothing() {
+    let gate = Arc::new(ProviderGate::new(8));
+    let permits = hold_n(&gate, 8).await;
+    let mut waiters = Vec::new();
+    for _ in 0..3 {
+        let gate = Arc::clone(&gate);
+        waiters.push(tokio::spawn(async move { gate.acquire().await }));
+    }
+    tokio::time::sleep(SHORT).await;
+    assert_eq!(gate.queued(), 3);
+    gate.note_response(429, &hint_headers("20ms"));
+    for w in waiters {
+        w.abort();
+        let _ = w.await;
+    }
+    assert_eq!(gate.queued(), 0);
+    assert_eq!(gate.in_flight(), 8);
+    drop(permits);
+    assert_eq!(gate.in_flight(), 0);
+    assert_eq!(gate.available(), Some(4));
+}
+
+/// 64 agents x 4 requests against a provider that serves 32 concurrent streams and answers
+/// 429 above that: the shared limit converges instead of herding.
+#[tokio::test]
+async fn converges_to_provider_capacity_without_herd() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const CAPACITY: usize = 32;
+    let gate = Arc::new(ProviderGate::new(64));
+    let live = Arc::new(AtomicUsize::new(0));
+    let rejects = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..64 {
+        let (gate, live, rejects) = (Arc::clone(&gate), Arc::clone(&live), Arc::clone(&rejects));
+        tasks.push(tokio::spawn(async move {
+            let h = hint_headers("30ms");
+            for _ in 0..4 {
+                loop {
+                    let permit = gate.acquire().await;
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    if now > CAPACITY {
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        rejects.fetch_add(1, Ordering::SeqCst);
+                        gate.note_response(429, &h);
+                        drop(permit);
+                        continue;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    permit.record_success();
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
+                    break;
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.expect("agent joins");
+    }
+    let total_429 = rejects.load(Ordering::SeqCst);
+    assert!(total_429 <= 2 * 256, "{total_429} 429s for 256 requests");
+    let limit = gate.effective_limit().expect("limited");
+    assert!(
+        (8..=40).contains(&limit),
+        "limit {limit} should hover near {CAPACITY}"
+    );
+    assert_eq!(gate.in_flight(), 0);
+    assert_eq!(gate.queued(), 0);
+}
+
 async fn read_request(socket: &mut TcpStream) {
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];

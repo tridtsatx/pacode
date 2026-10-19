@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use pacode_types::AgentId;
 
+use super::refresh::RefreshGate;
 use super::state::DigestRow;
 use super::*;
 
@@ -120,8 +121,8 @@ async fn concurrent_refreshes_of_one_agent_coalesce() {
     let calls = (0..20).map(|_| ledger.refresh_after_exec(&main, "main"));
     futures::future::join_all(calls).await;
 
-    // The first sweep may predate some requests; one more covers all the rest.
-    assert!(ledger.refresh.sweeps() <= 2, "{}", ledger.refresh.sweeps());
+    // How many sweeps the scheduler produced is timing-dependent (see the gate test
+    // below); what must hold is that nothing was rehashed and nothing hung.
     assert_eq!(ledger.refresh.rehashes(), 0);
 }
 
@@ -132,4 +133,24 @@ fn digest_rows(ledger: &FileLedger, agent: &AgentId) -> Vec<DigestRow> {
         .into_iter()
         .map(|input| input.resolve(&ledger.memo))
         .collect()
+}
+
+#[tokio::test]
+async fn one_sweep_covers_every_request_registered_before_it_started() {
+    let gate = RefreshGate::default();
+    let agent = main_id();
+    let wants: Vec<u64> = (0..20).map(|_| gate.request()).collect();
+    let mut entered = 0;
+    for want in wants {
+        if gate.enter(&agent, want).await.is_some() {
+            entered += 1;
+        }
+    }
+    assert_eq!(entered, 1, "the first sweep started after all 20 requests");
+    assert_eq!(gate.sweeps(), 1);
+
+    // A request made after that sweep started needs a new one.
+    let later = gate.request();
+    assert!(gate.enter(&agent, later).await.is_some());
+    assert_eq!(gate.sweeps(), 2);
 }

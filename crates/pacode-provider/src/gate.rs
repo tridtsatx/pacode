@@ -1,8 +1,10 @@
 //! Per-provider admission control shared by every agent that talks to the provider.
 //!
 //! A [`ProviderGate`] bundles two things:
-//! - a [`tokio::sync::Semaphore`] sized from `provider.max_concurrent` (0 = unlimited)
-//!   whose permit is held for the whole streaming response (see [`GatedStream`]);
+//! - a [`tokio::sync::Semaphore`] whose permit is held for the whole streaming response
+//!   (see [`GatedStream`]). `provider.max_concurrent` (0 = unlimited) is only the CEILING:
+//!   the effective limit adapts AIMD-style (see [`aimd`]): halved once per 429/503
+//!   episode, +1 after every `L` successful streams, never above the ceiling;
 //! - a provider-wide cooldown (`Retry-After` / `x-ratelimit-reset-*`): while it is in the
 //!   future every request waits instead of retrying on its own schedule.
 //!
@@ -26,10 +28,14 @@ use std::time::{Duration, SystemTime};
 use futures::Stream;
 use pacode_types::StreamEvent;
 use reqwest::header::HeaderMap;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 
 use crate::{EventStream, ProviderError};
+
+mod aimd;
+pub use aimd::{IMPLICIT_CEILING, MIN_LIMIT};
+use aimd::{Limiter, NO_HINT_EPISODE};
 
 #[cfg(test)]
 #[path = "gate_tests.rs"]
@@ -44,7 +50,8 @@ pub const MAX_QUEUE_WAIT: Duration = Duration::from_secs(600);
 /// Admission gate for one provider id.
 #[derive(Debug)]
 pub struct ProviderGate {
-    permits: Option<Arc<Semaphore>>,
+    limiter: Arc<Limiter>,
+    /// Configured ceiling (0 = unlimited); the key `GateMap` compares.
     limit: u32,
     cooldown_until: Mutex<Option<Instant>>,
     queued: AtomicUsize,
@@ -54,7 +61,25 @@ pub struct ProviderGate {
 /// permits that hold nothing.
 #[derive(Debug)]
 pub struct GatePermit {
-    _permit: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
+    limiter: Arc<Limiter>,
+}
+
+impl GatePermit {
+    /// The request this permit admitted produced its first event: credit one success
+    /// toward the AIMD increase. [`GatedStream`] calls it once per stream.
+    pub fn record_success(&self) {
+        self.limiter.on_success(Instant::now());
+    }
+}
+
+impl Drop for GatePermit {
+    /// Returns the slot, or swallows it when the limit shrank below the permits in use.
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.limiter.release(permit);
+        }
+    }
 }
 
 /// Decrements the queue counter even when the waiting future is dropped.
@@ -74,19 +99,18 @@ impl Drop for QueueGuard<'_> {
 }
 
 impl ProviderGate {
-    /// `max_concurrent == 0` means unlimited (the cooldown still applies).
+    /// `max_concurrent` is the ceiling of the adaptive limit; 0 means unlimited until the
+    /// first 429/503 (the cooldown always applies).
     pub fn new(max_concurrent: u32) -> Self {
-        let permits =
-            (max_concurrent > 0).then(|| Arc::new(Semaphore::new(max_concurrent as usize)));
         Self {
-            permits,
+            limiter: Arc::new(Limiter::new(max_concurrent as usize)),
             limit: max_concurrent,
             cooldown_until: Mutex::new(None),
             queued: AtomicUsize::new(0),
         }
     }
 
-    /// Configured permit count (0 = unlimited).
+    /// Configured ceiling (0 = unlimited).
     pub fn limit(&self) -> u32 {
         self.limit
     }
@@ -96,9 +120,25 @@ impl ProviderGate {
         self.queued.load(Ordering::Relaxed)
     }
 
-    /// Permits not currently held (`None` when unlimited).
+    /// Current adaptive limit; `None` while an unlimited gate has not met a 429/503.
+    pub fn effective_limit(&self) -> Option<usize> {
+        self.limiter.effective_limit()
+    }
+
+    /// Ceiling the limit may grow back to: the configured one, [`IMPLICIT_CEILING`] for a
+    /// gate that was unlimited and met a 429/503, `None` while still unlimited.
+    pub fn ceiling(&self) -> Option<usize> {
+        self.limiter.ceiling()
+    }
+
+    /// Permits currently held by in-flight requests.
+    pub fn in_flight(&self) -> usize {
+        self.limiter.in_flight()
+    }
+
+    /// Permits not currently held (`None` while unlimited).
     pub fn available(&self) -> Option<usize> {
-        self.permits.as_ref().map(|s| s.available_permits())
+        (!self.limiter.is_unlimited()).then(|| self.limiter.semaphore().available_permits())
     }
 
     /// Time left on the provider-wide cooldown, if any.
@@ -122,16 +162,21 @@ impl ProviderGate {
         *slot = Some(current.map_or(until, |cur| cur.max(until)));
     }
 
-    /// Record a failed response. For 429/503 carrying a usable hint the shared cooldown is
-    /// started and the hint returned: the caller should retry without its own backoff
-    /// (the next `acquire` waits). Anything else returns `None`.
+    /// Record a failed response. Every 429/503 shrinks the adaptive limit (once per
+    /// cooldown episode). When it carries a usable hint the shared cooldown is started and
+    /// the hint returned: the caller should retry without its own backoff (the next
+    /// `acquire` waits). Anything else returns `None`.
     pub fn note_response(&self, status: u16, headers: &HeaderMap) -> Option<Duration> {
         if status != 429 && status != 503 {
             return None;
         }
-        let delay = crate::retry_after::delay_from_headers(headers, SystemTime::now())?;
-        self.start_cooldown(delay);
-        Some(delay)
+        let hint = crate::retry_after::delay_from_headers(headers, SystemTime::now());
+        if let Some(delay) = hint {
+            self.start_cooldown(delay);
+        }
+        let window = hint.map_or(NO_HINT_EPISODE, |d| d.min(MAX_COOLDOWN));
+        self.limiter.on_rate_limited(Instant::now(), window);
+        hint
     }
 
     /// Wait for the cooldown to elapse and for a free slot. Cancel-safe.
@@ -141,16 +186,19 @@ impl ProviderGate {
             while let Some(left) = self.cooldown_remaining() {
                 tokio::time::sleep(left).await;
             }
-            let permit = match &self.permits {
-                Some(sem) => sem.clone().acquire_owned().await.ok(),
-                None => None,
+            let permit = self.limiter.semaphore().acquire_owned().await.ok();
+            // Wrapped before any further check so every exit returns through
+            // `Limiter::release` (debt is paid, nothing is leaked).
+            let guard = GatePermit {
+                permit,
+                limiter: Arc::clone(&self.limiter),
             };
             // A 429 may have landed while we queued: do not fire into it.
             if self.cooldown_remaining().is_some() {
-                drop(permit);
+                drop(guard);
                 continue;
             }
-            return GatePermit { _permit: permit };
+            return guard;
         }
     }
 }
@@ -181,6 +229,7 @@ impl GateMap {
 pub(crate) struct GatedStream {
     inner: EventStream,
     permit: Option<GatePermit>,
+    credited: bool,
 }
 
 impl GatedStream {
@@ -188,6 +237,7 @@ impl GatedStream {
         Box::pin(Self {
             inner,
             permit: Some(permit),
+            credited: false,
         })
     }
 }
@@ -198,6 +248,14 @@ impl Stream for GatedStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let poll = this.inner.as_mut().poll_next(cx);
+        if matches!(&poll, Poll::Ready(Some(Ok(_))))
+            && !this.credited
+            && let Some(permit) = &this.permit
+        {
+            // First event: the provider accepted the request (AIMD additive increase).
+            permit.record_success();
+            this.credited = true;
+        }
         if matches!(
             &poll,
             Poll::Ready(None | Some(Err(_)) | Some(Ok(StreamEvent::MessageEnd { .. })))

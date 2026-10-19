@@ -178,11 +178,15 @@ impl Session {
         };
 
         let previous = agent.info();
-        agent.set_status(
+        // Conditional: a stop that landed since the question was registered must keep
+        // its terminal status, not be overwritten by "waiting".
+        if agent.restore_status(
+            previous.status,
             AgentStatus::WaitingOrchestrator,
             Some("waiting for orchestrator".to_string()),
-        );
-        self.events.emit(Event::AgentUpdated(agent.info()));
+        ) {
+            self.events.emit(Event::AgentUpdated(agent.info()));
+        }
 
         let cancel = agent
             .cancel

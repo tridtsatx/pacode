@@ -21,6 +21,10 @@
 mod cli;
 mod limits;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // Let `pacode sessions list | head` end quietly instead of panicking on EPIPE.
     #[cfg(unix)]
