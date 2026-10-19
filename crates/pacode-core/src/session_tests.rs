@@ -799,6 +799,9 @@ async fn test_set_effort_clamps_to_supported_levels() {
         "mock-model",
         &[Effort::Low, Effort::High, Effort::Max],
     )]);
+    session
+        .warm_efforts(&ModelRoute::new("mock", "mock-model"))
+        .await;
     session.set_effort(Effort::Medium).await;
     assert_eq!(session.meta().effort, Effort::Low);
     session.set_effort(Effort::XHigh).await;
@@ -822,13 +825,22 @@ async fn test_set_model_clamps_effort() {
         model_with_efforts("small", &[Effort::Low, Effort::Medium, Effort::High]),
         model_with_efforts("plain", &[]),
     ]);
+    // Switching invalidates the route's cache and never waits on the catalog,
+    // so the switch itself clamps nothing; the catalog arrives afterwards.
     session
         .set_model(ModelRoute::new("mock", "small"))
         .await
         .unwrap();
+    session
+        .warm_efforts(&ModelRoute::new("mock", "small"))
+        .await;
+    session.set_effort(session.meta().effort).await;
     assert_eq!(session.meta().effort, Effort::High);
     assert_eq!(session.main_agent().unwrap().info().effort, Effort::High);
 
+    session
+        .warm_efforts(&ModelRoute::new("mock", "plain"))
+        .await;
     session
         .set_model(ModelRoute::new("mock", "plain"))
         .await
@@ -854,6 +866,9 @@ async fn test_spawn_agent_clamps_inherited_effort() {
         ),
         model_with_efforts("narrow", &[Effort::Low, Effort::High]),
     ]);
+    session
+        .warm_efforts(&ModelRoute::new("mock", "narrow"))
+        .await;
     mock.push(MockResponse::Slow {
         delay: Duration::from_millis(300),
         text: "working".into(),
@@ -870,4 +885,78 @@ async fn test_spawn_agent_clamps_inherited_effort() {
         .await
         .unwrap();
     assert_eq!(session.agent(&id).unwrap().info().effort, Effort::High);
+}
+
+/// A slow catalog never delays clamping or spawning: the static answer is used
+/// at once and only one background fetch runs per route.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_slow_catalog_never_blocks_spawn() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.set_list_models_delay(Duration::from_secs(5));
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "working".into(),
+    });
+    mock.push(MockResponse::Slow {
+        delay: Duration::from_millis(300),
+        text: "working".into(),
+    });
+
+    let started = std::time::Instant::now();
+    let route = ModelRoute::new("mock", "mock-model");
+    for _ in 0..50 {
+        session.clamp_effort_for(&route, Effort::High).await;
+    }
+    for _ in 0..2 {
+        session
+            .spawn_agent(pacode_tools::AgentSpec {
+                name: None,
+                prompt: "work".into(),
+                tools: None,
+                fork: false,
+                model: None,
+                effort: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        mock.list_models_count(),
+        1,
+        "one background fetch per route"
+    );
+}
+
+/// Once the background fetch lands, clamping uses the catalog efforts.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_background_fetch_fills_effort_cache() {
+    let (core, mock, _tmp, session_id) = setup_test_session().await;
+    let session = core.session(&session_id).unwrap();
+    mock.set_list_models_delay(Duration::from_millis(100));
+    mock.set_models(vec![model_with_efforts(
+        "mock-model",
+        &[Effort::Low, Effort::High],
+    )]);
+    let route = ModelRoute::new("mock", "mock-model");
+
+    assert_eq!(
+        session.clamp_effort_for(&route, Effort::Medium).await,
+        Effort::Medium,
+        "first call uses the static (empty) answer"
+    );
+    let mut clamped = Effort::Medium;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        clamped = session.clamp_effort_for(&route, Effort::Medium).await;
+        if clamped != Effort::Medium {
+            break;
+        }
+    }
+    assert_eq!(clamped, Effort::Low);
 }

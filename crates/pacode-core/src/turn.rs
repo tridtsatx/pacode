@@ -314,6 +314,7 @@ pub async fn run_turn(
             && session.meta().name.is_none()
             && !outcome.text.is_empty()
             && let Some(first_prompt) = session.meta().first_prompt.clone()
+            && let Some(title_guard) = crate::naming::begin_title(&session.id)
         {
             let session_clone = session.clone();
             let provider_clone = provider.clone();
@@ -325,6 +326,7 @@ pub async fn run_turn(
                 .unwrap_or_else(|| agent_info.model.model.clone());
             let first_ans = outcome.text.clone();
             tokio::spawn(async move {
+                let _title_guard = title_guard;
                 if let Some(title) = crate::naming::generate_title(
                     provider_clone,
                     &model_name,

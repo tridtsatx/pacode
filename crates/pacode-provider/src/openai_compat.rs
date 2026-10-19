@@ -34,7 +34,7 @@
 //! `stream_idle_secs × effort factor` ends with `ProviderError::IdleTimeout`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -65,6 +65,8 @@ pub struct OpenAiCompat {
     catalog_cache: Mutex<Option<Vec<ModelInfo>>>,
     /// First retry backoff step; only tuned down by tests.
     backoff_base: Duration,
+    /// Concurrency permits and cooldown; the registry swaps in the per-provider shared gate.
+    gate: Arc<crate::gate::ProviderGate>,
 }
 
 impl OpenAiCompat {
@@ -97,6 +99,7 @@ impl OpenAiCompat {
             .map_err(|e| ProviderError::Config(format!("failed to build HTTP client: {e}")))?;
 
         let compat = Compat::for_base_url(&cfg.base_url);
+        let gate = Arc::new(crate::gate::ProviderGate::new(defaults.max_concurrent));
 
         Ok(Self {
             id,
@@ -108,7 +111,15 @@ impl OpenAiCompat {
             client,
             catalog_cache: Mutex::new(None),
             backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
+            gate,
         })
+    }
+
+    /// Share the registry's per-provider gate so all clones and rebuilds of this provider
+    /// draw from one permit pool and one cooldown.
+    pub(crate) fn with_gate(mut self, gate: Arc<crate::gate::ProviderGate>) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Shorten the retry backoff schedule (tests drive real retries without real waits).
@@ -836,6 +847,7 @@ impl Provider for OpenAiCompat {
             effort,
             max_retries,
             backoff_base: self.backoff_base,
+            gate: Arc::clone(&self.gate),
         };
 
         // The first open is eager: a hard failure (auth, 4xx) is reported by `complete`
@@ -856,6 +868,10 @@ impl Provider for OpenAiCompat {
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         self.fetch_models().await
+    }
+
+    fn queue_depth(&self) -> usize {
+        self.gate.queued()
     }
 
     fn model_info(&self, model: &str) -> ModelInfo {

@@ -2921,6 +2921,7 @@ dependencies = [
  "pacode-memory",
  "pacode-plugin",
  "pacode-provider",
+ "pacode-risk",
  "pacode-rules",
  "pacode-skills",
  "pacode-store",

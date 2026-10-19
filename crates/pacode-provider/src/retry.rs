@@ -8,6 +8,7 @@
 //!   in an HTTP 200 body) reopens the request — but only while the turn has not emitted
 //!   any output yet, otherwise a restart would duplicate text or tool calls.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -15,6 +16,7 @@ use pacode_types::{Effort, StreamEvent};
 use rand::Rng;
 use serde_json::Value;
 
+use crate::gate::{GatePermit, GatedStream, MAX_QUEUE_WAIT, ProviderGate};
 use crate::{EventStream, ProviderError};
 
 #[cfg(test)]
@@ -57,23 +59,31 @@ pub(crate) struct StreamOpener {
     pub(crate) effort: Effort,
     pub(crate) max_retries: u32,
     pub(crate) backoff_base: Duration,
+    /// Provider-wide concurrency permits and cooldown; shared with every other request.
+    pub(crate) gate: Arc<ProviderGate>,
 }
 
 impl StreamOpener {
     /// POST the request, retrying the connection itself; returns the parsed event stream.
     pub(crate) async fn open(&self) -> Result<EventStream, ProviderError> {
-        let response = self.post().await?;
-        Ok(crate::sse::create_event_stream(
+        let (response, permit) = self.post().await?;
+        let stream = crate::sse::create_event_stream(
             response,
             self.model.clone(),
             self.stream_idle_secs,
             self.effort,
-        ))
+        );
+        // The permit lives exactly as long as the stream (freed on end, error or drop).
+        Ok(GatedStream::wrap(stream, permit))
     }
 
-    async fn post(&self) -> Result<reqwest::Response, ProviderError> {
+    async fn post(&self) -> Result<(reqwest::Response, GatePermit), ProviderError> {
         let mut attempt = 0;
+        let started = tokio::time::Instant::now();
         loop {
+            // Waits out any provider-wide cooldown and for a free slot; dropping this
+            // future (cancellation) leaves nothing behind.
+            let permit = self.gate.acquire().await;
             let mut req_builder = self
                 .client
                 .post(&self.url)
@@ -94,10 +104,12 @@ impl StreamOpener {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return Ok(resp);
+                        return Ok((resp, permit));
                     }
 
                     let status_u16 = status.as_u16();
+                    let headers = resp.headers().clone();
+                    drop(permit);
                     let text = resp.text().await.unwrap_or_default();
                     let redacted_body = crate::redact(&text);
                     log::trace!("response body: {redacted_body}");
@@ -108,6 +120,13 @@ impl StreamOpener {
                     }
 
                     let is_retryable = status_u16 == 429 || status_u16 >= 500;
+                    // A server-provided delay becomes a shared cooldown: every queued
+                    // request sleeps it out in `acquire` instead of retrying on its own,
+                    // and such waits do not use up the retry budget (bounded in time).
+                    let hinted = self.gate.note_response(status_u16, &headers).is_some();
+                    if is_retryable && hinted && started.elapsed() < MAX_QUEUE_WAIT {
+                        continue;
+                    }
                     if is_retryable && attempt < self.max_retries {
                         sleep_backoff(attempt, self.backoff_base).await;
                         attempt += 1;
@@ -126,6 +145,7 @@ impl StreamOpener {
                     let err_str = err.to_string();
                     let redacted_err = crate::redact(&err_str);
                     log::warn!("request transport error: {redacted_err}");
+                    drop(permit);
                     if attempt < self.max_retries {
                         sleep_backoff(attempt, self.backoff_base).await;
                         attempt += 1;

@@ -54,8 +54,12 @@ pub enum WaitResult {
 pub enum ExecError {
     #[error("task not found: {0}")]
     NotFound(TaskId),
+    /// The admission queue itself is full (carries the queue cap).
     #[error("too many tasks ({0})")]
     TooManyTasks(usize),
+    /// The wait for a free process slot was cancelled; nothing was started.
+    #[error("cancelled while waiting for a process slot")]
+    Cancelled,
     #[error("spawn failed: {0}")]
     Spawn(std::io::Error),
     #[error("io: {0}")]
@@ -82,17 +86,10 @@ impl TaskManager {
 
     /// Start the process. Returns immediately with the initial `TaskInfo`.
     pub async fn spawn(&self, spec: TaskSpec) -> Result<TaskInfo, ExecError> {
+        // F4: wait (FIFO, cancellable) for one of `exec.max_tasks` process slots. The
+        // permit moves into the supervisor and frees the slot when the task ends.
+        let permit = self.state.admission.acquire(spec.cancel.as_ref()).await?;
         self.state.guard.admit()?;
-        {
-            let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            let running = tasks
-                .values()
-                .filter(|e| e.info.status == TaskStatus::Running)
-                .count();
-            if running >= self.state.config.max_tasks {
-                return Err(ExecError::TooManyTasks(self.state.config.max_tasks));
-            }
-        }
 
         tokio::fs::create_dir_all(&self.state.spool_dir)
             .await
@@ -200,6 +197,7 @@ impl TaskManager {
             spool_file,
             spec.timeout,
             Arc::clone(&self.state),
+            permit,
         ));
 
         {
@@ -214,11 +212,15 @@ impl TaskManager {
 
     pub fn info(&self, id: &TaskId) -> Option<TaskInfo> {
         let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks.get(id).map(|e| e.info.clone())
+        match tasks.get(id) {
+            Some(e) => Some(e.info.clone()),
+            // Evicted terminal task (F1): the stub is inserted before the entry leaves.
+            None => self.state.retention.get(id),
+        }
     }
 
-    /// All tasks (running and finished, until `forget`), optionally for one session,
-    /// ordered by start time.
+    /// Running tasks, the newest 256 finished ones, and the stubs of older finished
+    /// ones (see `retention.rs`), optionally for one session, ordered by start time.
     pub fn list(&self, session: Option<&SessionId>) -> Vec<TaskInfo> {
         let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let mut result: Vec<TaskInfo> = tasks
@@ -229,6 +231,7 @@ impl TaskManager {
             })
             .map(|e| e.info.clone())
             .collect();
+        result.extend(self.state.retention.stubs(session));
         result.sort_by_key(|e| e.started_at_ms);
         result
     }
@@ -254,7 +257,12 @@ impl TaskManager {
                         entry.info.progress.clone(),
                     )
                 }
-                None => return WaitResult::NotFound,
+                None => {
+                    return match self.state.retention.get(id) {
+                        Some(stub) => WaitResult::Ended(stub),
+                        None => WaitResult::NotFound,
+                    };
+                }
             }
         };
 
@@ -366,42 +374,6 @@ impl TaskManager {
         }
     }
 
-    /// Last `lines` lines (from RAM tail; falls back to the spool file).
-    pub async fn tail(&self, id: &TaskId, lines: usize) -> Result<Vec<String>, ExecError> {
-        let (buffer_lines, spool_path) = {
-            let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = tasks
-                .get(id)
-                .ok_or_else(|| ExecError::NotFound(id.clone()))?;
-            (
-                entry.buffer.tail_lines(lines),
-                entry.info.output_path.clone(),
-            )
-        };
-
-        if !buffer_lines.is_empty() {
-            return Ok(buffer_lines);
-        }
-
-        match tokio::fs::read_to_string(&spool_path).await {
-            Ok(content) => {
-                let all_lines: Vec<&str> = content.lines().collect();
-                let start = all_lines.len().saturating_sub(lines);
-                Ok(all_lines[start..].iter().map(|s| s.to_string()).collect())
-            }
-            Err(_) => Ok(Vec::new()),
-        }
-    }
-
-    /// Head+tail rendering capped to `max_chars` (for tool results).
-    pub async fn output(&self, id: &TaskId, max_chars: usize) -> Result<String, ExecError> {
-        let tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = tasks
-            .get(id)
-            .ok_or_else(|| ExecError::NotFound(id.clone()))?;
-        Ok(entry.buffer.render(max_chars))
-    }
-
     /// Agent-reported progress (`bg progress`). Wins over parsed progress.
     pub fn report_progress(&self, id: &TaskId, progress: TaskProgress) -> Result<(), ExecError> {
         let info = {
@@ -431,15 +403,19 @@ impl TaskManager {
     /// Clear the failed-unacked flag.
     pub fn ack(&self, id: &TaskId) {
         let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = tasks.get_mut(id) {
-            entry.info.acked = true;
+        match tasks.get_mut(id) {
+            Some(entry) => entry.info.acked = true,
+            None => {
+                self.state.retention.ack(id);
+            }
         }
     }
 
-    /// Drop a finished task from the list (its spool file stays).
+    /// Drop a finished task from the list (its spool file stays until the spool GC).
     pub fn forget(&self, id: &TaskId) {
         let mut tasks = self.state.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.remove(id);
+        self.state.retention.forget(id);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {

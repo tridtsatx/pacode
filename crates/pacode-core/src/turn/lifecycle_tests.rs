@@ -173,3 +173,61 @@ async fn start_turn_is_noop_while_running_and_works_again_after() {
     session.interrupt();
     wait_not_running(&main).await;
 }
+
+#[test]
+fn retire_agent_caps_tail_and_frees_tools_and_prompt() {
+    use pacode_types::{AgentInfo, AgentKind, Effort, ModelRoute, TranscriptItem, TranscriptKind};
+
+    let id = AgentId::new("sub-retire");
+    let info = AgentInfo {
+        id: id.clone(),
+        name: "retire".to_string(),
+        kind: AgentKind::Sub,
+        status: pacode_types::AgentStatus::Finished,
+        activity: None,
+        started_at_ms: 0,
+        finished_at_ms: Some(1),
+        tokens_in: 0,
+        tokens_out: 0,
+        model: ModelRoute::new("mock", "mock-model"),
+        effort: Effort::Low,
+        parent: Some(AgentId::main()),
+        summary: Some("done".into()),
+        error: None,
+    };
+    let agent = crate::agent::Agent::new(
+        id.clone(),
+        info,
+        crate::agent::History::default(),
+        pacode_tools::ToolRegistry::new(),
+        100,
+        Some("prompt".to_string()),
+    );
+    {
+        let mut t = agent.transcript.lock().unwrap();
+        for seq in 0..40u64 {
+            t.upsert(TranscriptItem {
+                seq,
+                agent: id.clone(),
+                ts_ms: 0,
+                kind: TranscriptKind::Notice {
+                    level: pacode_types::ToastLevel::Info,
+                    text: format!("n{seq}"),
+                },
+            });
+        }
+        assert_eq!(t.tail.len(), 40);
+    }
+    let before = agent.info();
+
+    super::retire_agent(&agent);
+
+    let t = agent.transcript.lock().unwrap();
+    assert_eq!(t.tail.len(), 16);
+    assert_eq!(t.tail.front().map(|i| i.seq), Some(24), "newest items kept");
+    assert!(t.tool_items.is_empty());
+    drop(t);
+    assert!(agent.tools.read().unwrap().is_empty());
+    assert!(agent.prompt().is_none());
+    assert_eq!(agent.info(), before, "info and summary are untouched");
+}

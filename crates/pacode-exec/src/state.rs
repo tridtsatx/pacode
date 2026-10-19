@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pacode_types::{ExecConfig, TaskId, TaskInfo, TaskStatus};
 use tokio::sync::broadcast;
 
+use crate::admission::Admission;
 use crate::buffer::HeadTailBuffer;
 use crate::manager::TaskEvent;
 use crate::progress::ProgressParser;
 use crate::resources::{GuardHost, KillSignal, ResourceGuard, ResourceNotice, TreeRoot};
+use crate::retention::Retention;
 
 pub(crate) struct TaskEntry {
     pub(crate) info: TaskInfo,
@@ -36,6 +38,10 @@ pub(crate) struct SharedState {
     pub(crate) guard: ResourceGuard,
     /// Niceness applied to spawned processes (0 = off).
     pub(crate) nice: i32,
+    /// Admission queue for `exec.max_tasks` process slots (F4).
+    pub(crate) admission: Arc<Admission>,
+    /// Stubs of evicted terminal tasks (F1).
+    pub(crate) retention: Retention,
 }
 
 impl GuardHost for SharedState {

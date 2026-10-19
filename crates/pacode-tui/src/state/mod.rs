@@ -8,6 +8,7 @@ pub mod image_cache;
 pub mod input;
 pub mod model_picker;
 pub mod rail;
+pub mod resync;
 pub mod selection;
 pub mod slots;
 pub mod stats;
@@ -220,6 +221,8 @@ pub struct AppState {
     pub app_version: String,
     pub meta: Option<SessionMeta>,
     pub connection: Connection,
+    /// Event-stream continuity (gap detection, snapshot debounce); see [`resync`].
+    pub resync: resync::ResyncState,
     pub turn_active: bool,
     /// Main agent transcript.
     pub transcript: Transcript,
@@ -344,6 +347,7 @@ impl AppState {
             app_version,
             meta: None,
             connection: Connection::Connected,
+            resync: resync::ResyncState::default(),
             turn_active: false,
             transcript: Transcript::new(cells).with_images(images_on, truecolor),
             panel: PanelState {
@@ -498,17 +502,20 @@ impl AppState {
                 true
             }
             ClientEvent::Disconnected { reason } => {
+                self.resync.reset();
                 self.connection = Connection::Disconnected { reason };
                 self.dirty = true;
                 true
             }
             ClientEvent::Reconnecting { attempt } => {
+                self.resync.reset();
                 self.connection = Connection::Reconnecting { attempt };
                 self.dirty = true;
                 true
             }
             ClientEvent::Snapshot(snapshot) => {
                 self.connection = Connection::Connected;
+                self.resync.on_snapshot(snapshot.seq);
                 // The header banner is (re)installed below, so the welcome
                 // cascade re-arms here: a re-attach replays it.
                 self.started_at = now;
@@ -575,10 +582,17 @@ impl AppState {
                 true
             }
             ClientEvent::Event { seq, event } => {
+                if self.resync.classify(seq, &event) != resync::Verdict::Apply {
+                    return false;
+                }
                 self.observe_background_completion(&event);
                 self.apply_event(seq, event, now);
                 self.dirty = true;
                 true
+            }
+            ClientEvent::Desynced => {
+                self.resync.note_desynced();
+                false
             }
         }
     }
@@ -702,6 +716,11 @@ impl AppState {
     }
 
     /// Drain the first prompt from the queue if the main agent is idle.
+    /// A `GetSnapshot` to send when events were lost; at most one is in flight.
+    pub fn take_resync_request(&mut self) -> Option<pacode_types::Request> {
+        self.resync.take_request()
+    }
+
     pub fn drain_prompt_queue(&mut self) -> Option<pacode_types::Request> {
         if !self.turn_active && !self.input.prompt_queue.is_empty() {
             let text = self.input.prompt_queue.pop_front()?;

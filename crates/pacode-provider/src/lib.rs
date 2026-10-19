@@ -17,12 +17,14 @@ pub mod catalog_cache;
 pub mod codex;
 pub mod compat;
 pub mod devin;
+pub mod gate;
 pub mod mock;
 pub mod model_meta;
 pub mod openai_compat;
 pub mod registry;
 mod registry_cache;
 mod retry;
+mod retry_after;
 pub mod sse;
 pub mod vision;
 
@@ -37,6 +39,7 @@ pub use catalog_cache::{
     CATALOG_CACHE_VERSION, CatalogCache, DEFAULT_CATALOG_TTL_SECS, DEFAULT_MAX_MODELS_PER_PROVIDER,
 };
 pub use compat::{Compat, MaxTokensField, ReasoningWire, ToolIdRule};
+pub use gate::ProviderGate;
 pub use mock::MockProvider;
 pub use openai_compat::{OpenAiCompat, redact};
 pub use registry::ProviderRegistry;
@@ -106,4 +109,8 @@ pub trait Provider: Send + Sync {
     }
     /// Static knowledge about a model (context window, reasoning) without a network call.
     fn model_info(&self, model: &str) -> ModelInfo;
+    /// Requests currently queued behind this provider's concurrency gate or cooldown.
+    fn queue_depth(&self) -> usize {
+        0
+    }
 }

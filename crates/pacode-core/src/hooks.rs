@@ -263,6 +263,17 @@ pub async fn pre_tool_use(
     decision
 }
 
+/// Does a finished `bash` call need a ledger refresh? Not when its command is on the
+/// read-only allowlist (`pacode_risk::is_read_only`): that covers the in-process
+/// utility pipelines (`[in-process]` results), which only read. A call without a
+/// readable `command` refreshes.
+fn refresh_needed(input: &serde_json::Value) -> bool {
+    match input.get("command").and_then(serde_json::Value::as_str) {
+        Some(command) => !pacode_risk::is_read_only(command),
+        None => true,
+    }
+}
+
 /// `post_tool_use` hooks for one finished tool call; warnings become notices.
 pub async fn post_tool_use(
     session: &Arc<Session>,
@@ -273,7 +284,7 @@ pub async fn post_tool_use(
 ) {
     // A command may have changed files the ledger tracks: stat those (no tree walk)
     // and attribute what moved to the agent that ran it.
-    if tool == "bash" {
+    if tool == "bash" && refresh_needed(input) {
         let info = agent.info();
         session
             .ledger

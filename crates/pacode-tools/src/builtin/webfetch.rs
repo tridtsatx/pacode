@@ -1,5 +1,10 @@
 //! `webfetch`: fetch a URL as text.
 
+#[cfg(test)]
+#[path = "webfetch_tests.rs"]
+mod webfetch_tests;
+
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,6 +16,29 @@ use super::helpers::{cap_output, parse_input};
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "webfetch";
+
+/// Process-wide HTTP client shared by `webfetch` and `websearch`.
+///
+/// Owner: the tools crate. Cap: one client, hence one connection pool, for the whole
+/// process; it is built once and never rebuilt or invalidated, because the proxy is read
+/// from the environment only. Timeouts: the client-level timeout is 20 s; `websearch`
+/// overrides it per request with `RequestBuilder::timeout`. Redirects: at most 5.
+/// A build failure is cached too, so every caller sees the same outcome.
+static WEB_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+/// Returns the shared web client, building it on first use.
+pub(crate) fn shared_web_client() -> Result<&'static reqwest::Client, String> {
+    WEB_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 pub struct WebFetchTool;
 
@@ -70,10 +98,7 @@ impl Tool for WebFetchTool {
         let host = parsed_url.host_str().unwrap_or("unknown").to_string();
         let title = format!("Fetch {host}");
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
+        let client = shared_web_client()
             .map_err(|e| ToolError::failed(format!("failed to build HTTP client: {e}")))?;
 
         let resp = client

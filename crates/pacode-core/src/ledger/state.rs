@@ -434,12 +434,20 @@ impl LedgerState {
         true
     }
 
-    /// Every tracked path with its last known stat (bash refresh pre-check).
-    pub fn tracked(&self) -> Vec<(PathBuf, Stat)> {
-        self.entries
+    /// Paths a command run by `agent` may have changed, with their last known stat:
+    /// those `agent` has seen plus those any agent wrote through pacode, most recently
+    /// used first, at most `limit`. Paths only other agents read are left out (a
+    /// change there surfaces as external at their next check).
+    pub fn refresh_candidates(&self, agent: &AgentId, limit: usize) -> Vec<(PathBuf, Stat)> {
+        let mut rows: Vec<(u64, &PathBuf, Stat)> = self
+            .entries
             .iter()
-            .map(|(p, e)| (p.clone(), e.stat))
-            .collect()
+            .filter(|(_, e)| e.seen.contains_key(agent) || e.last_writer.is_some())
+            .map(|(p, e)| (e.last_used, p, e.stat))
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+        rows.truncate(limit);
+        rows.into_iter().map(|(_, p, s)| (p.clone(), s)).collect()
     }
 
     /// Give `to` the same seen state as `from` (an agent changing identity).

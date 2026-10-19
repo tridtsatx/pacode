@@ -118,6 +118,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 skills: core.deps.skills.clone(),
                 scheduler: crate::schedule::Scheduler::new(),
                 ledger: crate::ledger::FileLedger::new(),
+                efforts_cache: Default::default(),
             });
 
             start_scheduler(&session).await;
@@ -323,6 +324,7 @@ pub(crate) async fn open_session(core: &Core, attach: Attach) -> Result<SessionI
                 skills: core.deps.skills.clone(),
                 scheduler: crate::schedule::Scheduler::new(),
                 ledger: crate::ledger::FileLedger::new(),
+                efforts_cache: Default::default(),
             });
 
             start_scheduler(&session).await;

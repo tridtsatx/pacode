@@ -520,6 +520,13 @@ pub enum Event {
     },
     /// Credentials of a provider changed (login, logout, account switch).
     AuthUpdated(ProviderAuthInfo),
+    /// Connection-level, never stored and sent with `seq` 0: the daemon dropped events
+    /// for this client (broadcast lag or a full writer queue). The client must call
+    /// `GetSnapshot` and ignore later events with `seq <= snapshot.seq`.
+    Resync {
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

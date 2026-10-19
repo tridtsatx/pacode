@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex};
 use pacode_types::{ExecConfig, ResourcesConfig, TaskId};
 use tokio::sync::broadcast;
 
+use crate::admission::Admission;
 use crate::manager::{ExecError, TaskManager};
 use crate::resources::{GuardHost, ResourceGuard};
+use crate::retention::Retention;
 use crate::state::SharedState;
 
 /// Capacity of the task-event broadcast channel (owner: exec; cap: this constant;
@@ -26,6 +28,7 @@ impl TaskManager {
         // router (P0-4); the capacity keeps that path rare.
         let (events, _) = broadcast::channel(TASK_EVENT_CAPACITY);
         let guard = ResourceGuard::new(&resources, spool_dir.clone());
+        let admission = Arc::new(Admission::new(config.max_tasks));
         let state = Arc::new(SharedState {
             spool_dir,
             config,
@@ -33,9 +36,13 @@ impl TaskManager {
             events,
             guard,
             nice: resources.nice,
+            admission,
+            retention: Retention::default(),
         });
         let host: Arc<dyn GuardHost> = state.clone();
         state.guard.bind(Arc::downgrade(&host));
+        // F5: trim spools left by earlier runs.
+        crate::retention::gc_at_start(&state);
         Arc::new(Self { state })
     }
 

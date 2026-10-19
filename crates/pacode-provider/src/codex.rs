@@ -16,7 +16,7 @@ mod request;
 mod stream;
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -54,6 +54,8 @@ pub struct Codex {
     client: reqwest::Client,
     catalog_cache: Mutex<Option<Vec<ModelInfo>>>,
     backoff_base: Duration,
+    /// Concurrency permits and cooldown; the registry swaps in the shared per-provider gate.
+    gate: Arc<crate::gate::ProviderGate>,
 }
 
 impl Codex {
@@ -79,6 +81,8 @@ impl Codex {
             .build()
             .map_err(|e| ProviderError::Config(format!("failed to build HTTP client: {e}")))?;
 
+        let gate = Arc::new(crate::gate::ProviderGate::new(defaults.max_concurrent));
+
         Ok(Self {
             id,
             cfg,
@@ -88,7 +92,14 @@ impl Codex {
             client,
             catalog_cache: Mutex::new(None),
             backoff_base: crate::retry::DEFAULT_BACKOFF_BASE,
+            gate,
         })
+    }
+
+    /// Share the registry's per-provider gate (see `OpenAiCompat::with_gate`).
+    pub(crate) fn with_gate(mut self, gate: Arc<crate::gate::ProviderGate>) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Convenience constructor from an optional API key string.
@@ -338,6 +349,7 @@ impl Provider for Codex {
             effort,
             max_retries,
             backoff_base: self.backoff_base,
+            gate: Arc::clone(&self.gate),
         };
 
         let inner = opener.open().await?;
@@ -356,6 +368,10 @@ impl Provider for Codex {
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         self.fetch_models().await
+    }
+
+    fn queue_depth(&self) -> usize {
+        self.gate.queued()
     }
 
     fn model_info(&self, model: &str) -> ModelInfo {

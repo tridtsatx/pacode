@@ -235,9 +235,32 @@ pub fn start_turn(session: Arc<Session>, agent: Arc<Agent>) -> bool {
                 let mut hist = agent.history.lock().unwrap_or_else(|p| p.into_inner());
                 hist.messages.clear();
             }
+            retire_agent(&agent);
         }
     });
     true
+}
+
+/// Items a retired (finished) subagent keeps in its in-memory transcript tail.
+const RETIRED_TAIL: usize = 16;
+
+/// Free what a finished subagent no longer needs. Retired agent: tail capped at
+/// `RETIRED_TAIL` (16) items, `tool_items` emptied, tool registry and prompt dropped.
+/// Invalidation: none, a finished agent is not reused. Owner: `Session.agents`; older
+/// items are served from the store by `GetHistory`, and `AgentInfo` plus its summary
+/// are untouched.
+pub(crate) fn retire_agent(agent: &Agent) {
+    {
+        let mut transcript = agent.transcript.lock().unwrap_or_else(|p| p.into_inner());
+        while transcript.tail.len() > RETIRED_TAIL {
+            transcript.tail.pop_front();
+        }
+        transcript.tail_cap = transcript.tail_cap.min(RETIRED_TAIL);
+        transcript.tool_items.clear();
+        transcript.tool_items.shrink_to_fit();
+    }
+    *agent.tools.write().unwrap_or_else(|p| p.into_inner()) = pacode_tools::ToolRegistry::new();
+    agent.set_prompt(None);
 }
 
 #[cfg(test)]

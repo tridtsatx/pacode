@@ -179,23 +179,30 @@ pub struct CodexStreamOpener {
     pub effort: Effort,
     pub max_retries: u32,
     pub backoff_base: Duration,
+    /// Provider-wide concurrency permits and cooldown, shared with every other request.
+    pub gate: std::sync::Arc<crate::gate::ProviderGate>,
 }
 
 impl CodexStreamOpener {
     /// POST the request, retrying the connection itself with backoff; returns the parsed event stream.
     pub async fn open(&self) -> Result<EventStream, ProviderError> {
-        let response = self.post().await?;
-        Ok(create_responses_event_stream(
+        let (response, permit) = self.post().await?;
+        let stream = create_responses_event_stream(
             response,
             self.model.clone(),
             self.stream_idle_secs,
             self.effort,
-        ))
+        );
+        // The permit lives exactly as long as the stream (freed on end, error or drop).
+        Ok(crate::gate::GatedStream::wrap(stream, permit))
     }
 
-    async fn post(&self) -> Result<reqwest::Response, ProviderError> {
+    async fn post(&self) -> Result<(reqwest::Response, crate::gate::GatePermit), ProviderError> {
         let mut attempt = 0;
+        let started = tokio::time::Instant::now();
         loop {
+            // Waits out any provider-wide cooldown and for a free slot (cancel-safe).
+            let permit = self.gate.acquire().await;
             let mut req_builder = self.client.post(&self.url).json(&self.body);
 
             for (k, v) in &self.headers {
@@ -206,10 +213,12 @@ impl CodexStreamOpener {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return Ok(resp);
+                        return Ok((resp, permit));
                     }
 
                     let status_u16 = status.as_u16();
+                    let headers = resp.headers().clone();
+                    drop(permit);
                     let text = resp.text().await.unwrap_or_default();
                     let redacted_body = crate::redact(&text);
                     log::trace!("responses error body: {redacted_body}");
@@ -220,6 +229,11 @@ impl CodexStreamOpener {
                     }
 
                     let is_retryable = status_u16 == 429 || status_u16 >= 500;
+                    // Server-provided delay -> shared cooldown, not counted as a retry.
+                    let hinted = self.gate.note_response(status_u16, &headers).is_some();
+                    if is_retryable && hinted && started.elapsed() < crate::gate::MAX_QUEUE_WAIT {
+                        continue;
+                    }
                     if is_retryable && attempt < self.max_retries {
                         crate::retry::sleep_backoff(attempt, self.backoff_base).await;
                         attempt += 1;
@@ -238,6 +252,7 @@ impl CodexStreamOpener {
                     let err_str = err.to_string();
                     let redacted_err = crate::redact(&err_str);
                     log::warn!("codex request transport error: {redacted_err}");
+                    drop(permit);
                     if attempt < self.max_retries {
                         crate::retry::sleep_backoff(attempt, self.backoff_base).await;
                         attempt += 1;

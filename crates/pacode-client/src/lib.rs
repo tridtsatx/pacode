@@ -77,6 +77,8 @@ pub enum ClientEvent {
         seq: u64,
         event: Event,
     },
+    /// Events were dropped because this consumer fell behind; fetch a snapshot.
+    Desynced,
 }
 
 #[derive(Debug, thiserror::Error)]

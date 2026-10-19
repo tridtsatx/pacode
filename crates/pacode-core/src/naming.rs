@@ -1,8 +1,37 @@
 //! Session title generation (spec §18.4): one short request after the first reply.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use pacode_provider::Provider;
+use pacode_types::SessionId;
+
+/// Sessions with a title request in flight. Cap: one entry per session with a pending
+/// title. Invalidation: the entry is removed when its `TitleGuard` drops (title applied,
+/// request failed, or task aborted). Owner: this module.
+static TITLE_PENDING: LazyLock<Mutex<HashSet<SessionId>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Proof that this caller is the only title request for its session.
+pub struct TitleGuard(SessionId);
+
+impl Drop for TitleGuard {
+    fn drop(&mut self) {
+        TITLE_PENDING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Claim the right to request a title for `session`; `None` when one is already in flight.
+pub fn begin_title(session: &SessionId) -> Option<TitleGuard> {
+    let inserted = TITLE_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(session.clone());
+    inserted.then(|| TitleGuard(session.clone()))
+}
 
 /// Ask the model for a 3–6 word title in the language of the prompt. Returns `None`
 /// on any error or an empty/overlong answer (title capped at 48 chars).
@@ -75,3 +104,7 @@ pub fn clean_title(raw: &str) -> Option<String> {
     }
     Some(cleaned)
 }
+
+#[cfg(test)]
+#[path = "naming_tests.rs"]
+mod tests;

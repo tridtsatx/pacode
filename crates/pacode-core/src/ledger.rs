@@ -26,6 +26,7 @@
 
 mod locks;
 mod ranges;
+mod refresh;
 mod render;
 mod snapshot;
 mod state;
@@ -40,6 +41,7 @@ use pacode_types::AgentId;
 
 pub use locks::{LOCK_MAP_CAP, PathGuard};
 pub use ranges::{LineRanges, MAX_INTERVALS};
+pub use refresh::REFRESH_MAX_PATHS;
 pub use snapshot::{Snapshot, Stat};
 pub use state::{Drift, LedgerState, MAX_PATHS, Verdict, Writer};
 
@@ -48,6 +50,7 @@ pub use state::{Drift, LedgerState, MAX_PATHS, Verdict, Writer};
 pub struct FileLedger {
     state: Mutex<LedgerState>,
     locks: locks::PathLocks,
+    refresh: refresh::RefreshGate,
 }
 
 impl FileLedger {
@@ -60,6 +63,7 @@ impl FileLedger {
         Self {
             state: Mutex::new(LedgerState::with_cap(cap)),
             locks: locks::PathLocks::default(),
+            refresh: refresh::RefreshGate::default(),
         }
     }
 
@@ -156,28 +160,33 @@ impl FileLedger {
         self.state().record_write(agent, name, &key, snap, stat);
     }
 
-    /// After a command run by `agent` finished: stat every tracked path and rehash
-    /// those whose len/mtime moved. No tree walk; a path another writer holds right
-    /// now is skipped (its writer records it, or the next check sees it as external).
+    /// After a command run by `agent` finished: stat the paths it may have changed
+    /// (those `agent` has seen plus pacode-written ones, at most
+    /// [`REFRESH_MAX_PATHS`], most recently used first) in ONE `spawn_blocking`, and
+    /// rehash only those whose len/mtime moved, attributing them to `agent`. No tree
+    /// walk; a path another writer holds right now is skipped (its writer records
+    /// it, or the next check sees it as external). A call already covered by a
+    /// sweep of the same agent that began after the call returns at once.
     pub async fn refresh_after_exec(&self, agent: &AgentId, name: &str) {
-        let tracked = self.state().tracked();
-        for (key, known) in tracked {
-            let Ok(meta) = tokio::fs::metadata(&key).await else {
-                continue;
-            };
-            let stat = Stat {
-                len: meta.len(),
-                mtime: meta.modified().ok(),
-            };
-            if stat == known {
-                continue;
-            }
+        let want = self.refresh.request();
+        let Some(_sweep) = self.refresh.enter(agent, want).await else {
+            return;
+        };
+        let candidates = self.state().refresh_candidates(agent, REFRESH_MAX_PATHS);
+        if candidates.is_empty() {
+            return;
+        }
+        let changed = tokio::task::spawn_blocking(move || refresh::changed_paths(candidates))
+            .await
+            .unwrap_or_default();
+        for key in changed {
             let Some(_guard) = self.locks.try_lock(key.clone()) else {
                 continue;
             };
             let Ok(bytes) = tokio::fs::read(&key).await else {
                 continue;
             };
+            self.refresh.count_rehash();
             let snap = Snapshot::of(&String::from_utf8_lossy(&bytes));
             let stat = stat_of(&key, bytes.len()).await;
             self.state().refresh(agent, name, &key, snap, stat);
@@ -251,6 +260,9 @@ async fn stat_of(key: &Path, fallback_len: usize) -> Stat {
 #[cfg(test)]
 #[path = "ledger_tests.rs"]
 mod ledger_tests;
+#[cfg(test)]
+#[path = "ledger/refresh_tests.rs"]
+mod refresh_tests;
 #[cfg(test)]
 #[path = "ledger/tools_tests.rs"]
 mod tools_tests;

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use pacode_types::{ProgressSource, TaskId, TaskStatus, now_ms};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::admission::SlotPermit;
 use crate::manager::TaskEvent;
 use crate::state::SharedState;
 
@@ -81,6 +82,7 @@ pub(crate) async fn run_supervisor(
     mut spool_file: tokio::fs::File,
     timeout: Option<Duration>,
     state: Arc<SharedState>,
+    permit: SlotPermit,
 ) {
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -307,8 +309,12 @@ pub(crate) async fn run_supervisor(
     };
 
     state.guard.process_ended();
+    // Free the process slot (F4) before announcing the end, so a queued spawn can start.
+    drop(permit);
     if let Some(info) = ended_info {
         let _ = state.events.send(TaskEvent::Ended(info));
+        // F1: forget the oldest finished tasks; F5: occasional spool GC.
+        crate::retention::on_ended(&state, &id);
     }
 }
 

@@ -173,7 +173,10 @@ impl Agent {
     }
 
     pub fn status(&self) -> AgentStatus {
-        self.info().status
+        self.info
+            .read()
+            .map(|i| i.status)
+            .unwrap_or_else(|poisoned| poisoned.into_inner().status)
     }
 
     pub fn is_running(&self) -> bool {

@@ -18,6 +18,7 @@ pacode-skills = { workspace = true }
 pacode-provider = { workspace = true }
 pacode-image = { workspace = true }
 pacode-tools = { workspace = true }
+pacode-risk = { workspace = true }
 pacode-exec = { workspace = true }
 pacode-mcp = { workspace = true }
 pacode-plugin = { workspace = true }

@@ -308,6 +308,9 @@ fn test_unmapped_events_dropped_cleanly() {
             text: "ready".to_string(),
         },
         Event::DaemonShuttingDown,
+        Event::Resync {
+            reason: "lag".to_string(),
+        },
         Event::TurnStarted {
             agent: AgentId::new("a"),
             turn: TurnId::new("t"),

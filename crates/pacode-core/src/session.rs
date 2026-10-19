@@ -43,9 +43,23 @@ pub struct Session {
     pub scheduler: Arc<crate::schedule::Scheduler>,
     /// Who read and wrote which file version (in memory; see `crate::ledger`).
     pub ledger: crate::ledger::FileLedger,
+    /// Catalog efforts per model route (cap 32; see `session_efforts`).
+    pub(crate) efforts_cache: crate::session_efforts::EffortsCache,
 }
 
 impl Session {
+    /// Live subagents (non-main), counted under one read lock without cloning.
+    pub fn live_subagents(&self) -> usize {
+        self.agents
+            .read()
+            .map(|a| {
+                a.iter()
+                    .filter(|(id, agent)| !id.is_main() && agent.status().is_live())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Record the answer on the question's transcript item, so the conversation
     /// shows what was asked and what was chosen rather than only the tool result.
     pub fn record_question_answer(
@@ -311,6 +325,9 @@ impl Session {
             let mut meta = self.meta.write().unwrap_or_else(|p| p.into_inner());
             std::mem::replace(&mut meta.model, route.clone())
         };
+        if old_model != route {
+            self.invalidate_efforts(&route);
+        }
 
         self.update_agent_infos(|info| {
             if info.id.is_main() || (info.status.is_live() && info.model == old_model) {
@@ -403,16 +420,7 @@ impl Session {
     /// Spawn a subagent (depth 1, `agents.max_live` cap) and start its turn.
     pub async fn spawn_agent(self: &Arc<Self>, spec: AgentSpec) -> Result<AgentId, CoreError> {
         self.tasks.admit_agent()?;
-        let live_count = self
-            .agents
-            .read()
-            .map(|a| {
-                a.values()
-                    .filter(|agent| agent.status().is_live() && !agent.id().is_main())
-                    .count()
-            })
-            .unwrap_or(0);
-        if live_count >= self.config.agents.max_live {
+        if self.live_subagents() >= self.config.agents.max_live {
             return Err(CoreError::Invalid(format!(
                 "maximum live subagents ({}) reached",
                 self.config.agents.max_live
@@ -540,16 +548,7 @@ impl Session {
             "detaching running turn on main agent in session {}",
             self.id
         );
-        let live_count = self
-            .agents
-            .read()
-            .map(|a| {
-                a.values()
-                    .filter(|agent| agent.status().is_live() && !agent.id().is_main())
-                    .count()
-            })
-            .unwrap_or(0);
-        if live_count >= self.config.agents.max_live {
+        if self.live_subagents() >= self.config.agents.max_live {
             log::warn!(
                 "failed to detach main turn: maximum live subagents ({}) reached",
                 self.config.agents.max_live

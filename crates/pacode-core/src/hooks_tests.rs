@@ -99,6 +99,7 @@ fn test_session(config: Config) -> (tempfile::TempDir, Arc<Session>, Arc<Agent>)
         skills: Arc::new(pacode_skills::SkillRegistry::default()),
         scheduler: crate::schedule::Scheduler::new(),
         ledger: crate::ledger::FileLedger::new(),
+        efforts_cache: Default::default(),
     });
     (temp, session, agent)
 }
@@ -332,4 +333,14 @@ async fn session_end_and_notification_fire_detached() {
     assert_eq!(wait_for_file(&cwd.join("ended")).await, "bye\n");
     assert_eq!(wait_for_file(&cwd.join("noted")).await, "note\n");
     assert!(!cwd.join("skipped").exists());
+}
+
+#[test]
+fn read_only_bash_commands_skip_the_ledger_refresh() {
+    use serde_json::json;
+    assert!(!refresh_needed(&json!({"command": "ls -la | wc -l"})));
+    assert!(!refresh_needed(&json!({"command": "git status"})));
+    assert!(refresh_needed(&json!({"command": "sed -i s/a/b/ f.txt"})));
+    assert!(refresh_needed(&json!({"command": "echo x > f.txt"})));
+    assert!(refresh_needed(&json!({})));
 }

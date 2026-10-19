@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::helpers::{cap_output, parse_input};
+use super::webfetch::shared_web_client;
 use crate::{Tool, ToolCtx, ToolError, ToolKind, ToolOutput};
 
 pub const NAME: &str = "websearch";
@@ -94,11 +95,13 @@ pub struct DuckDuckGoBackend {
 }
 
 impl DuckDuckGoBackend {
+    /// Uses the process-wide client shared with `webfetch` (one connection pool). The
+    /// per-request timeout comes from `search`, so the shared client's default is not used.
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = match shared_web_client() {
+            Ok(shared) => shared.clone(),
+            Err(_) => reqwest::Client::new(),
+        };
         Self::with_client(client)
     }
 

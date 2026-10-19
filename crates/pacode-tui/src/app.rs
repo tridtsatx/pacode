@@ -284,6 +284,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                         if let Some(req) = state.drain_prompt_queue() {
                             dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
                         }
+                        if let Some(req) = state.take_resync_request() {
+                            dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
+                        }
                     }
                     None => {
                         break;
@@ -318,6 +321,9 @@ pub async fn run(opts: TuiOptions) -> Result<pacode_types::SessionId, TuiError> 
                     let actions = handle_bg_response(res, &mut state);
                     for act in actions {
                         dispatch_action(act, &mut state, &client, &bg_tx);
+                    }
+                    if let Some(req) = state.take_resync_request() {
+                        dispatch_action(Action::Send(req), &mut state, &client, &bg_tx);
                     }
                 }
             }
@@ -499,6 +505,7 @@ fn dispatch_action(
 fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
     match res {
         BgResponse::Reply(Ok(Reply::Error { message })) => {
+            state.resync.on_request_failed();
             let now = now_ms();
             state.transcript.cells.push_back(Cell {
                 id: now,
@@ -624,6 +631,8 @@ fn handle_bg_response(res: BgResponse, state: &mut AppState) -> Vec<Action> {
         }
         BgResponse::Reply(Ok(_)) => vec![],
         BgResponse::Reply(Err(err)) => {
+            // Any failed request may be the resync's GetSnapshot; free the debounce slot.
+            state.resync.on_request_failed();
             let now = now_ms();
             state.transcript.cells.push_back(Cell {
                 id: now,

@@ -386,6 +386,9 @@ pub fn apply_event(state: &mut AppState, seq: u64, event: Event, now: Instant) {
             }
             state.dirty = true;
         }
+        // Handled in `AppState::apply_client_event` (it asks for a snapshot) and never
+        // forwarded here; the arm keeps the match exhaustive.
+        Event::Resync { .. } => {}
     }
     state.rail.update_idle(state.turn_active, now);
 }

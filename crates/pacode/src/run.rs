@@ -101,6 +101,8 @@ async fn run_headless(opts: RunOptions) {
                 std::process::exit(2);
             }
             ClientEvent::Reconnecting { .. } => {}
+            // One-shot runs have no state to repair; the final turn event still ends the run.
+            ClientEvent::Desynced => {}
             ClientEvent::Event { seq, event } => {
                 if opts.json {
                     let line = match serde_json::to_string(&serde_json::json!({

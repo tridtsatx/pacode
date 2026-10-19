@@ -385,7 +385,9 @@ pub fn event_to_session_updates(event: &Event, state: &mut MappingState) -> Vec<
         // Logging in is a pacode-side concern: an ACP client authenticates the agent
         // through its own `authenticate` call, not through session updates.
         | Event::LoginProgress { .. }
-        | Event::AuthUpdated(_) => vec![],
+        | Event::AuthUpdated(_)
+        // Connection-level repair signal for stateful clients; ACP keeps no mirror.
+        | Event::Resync { .. } => vec![],
     }
 }
 

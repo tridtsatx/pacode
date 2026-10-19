@@ -199,12 +199,69 @@ async fn test_max_tasks_enforcement() {
     let spec1 = test_spec("sleep 10");
     let info1 = mgr.spawn(spec1).await.unwrap();
 
-    let spec2 = test_spec("sleep 10");
-    let err = mgr.spawn(spec2).await.unwrap_err();
-    match err {
-        ExecError::TooManyTasks(max) => assert_eq!(max, 1),
-        other => panic!("expected TooManyTasks, got {other:?}"),
+    // F4: the second spawn waits for the slot instead of failing.
+    let spec2 = test_spec("true");
+    let queued = tokio::time::timeout(Duration::from_millis(300), mgr.spawn(spec2)).await;
+    assert!(queued.is_err(), "second spawn should still be waiting");
+
+    mgr.kill(&info1.id).await.unwrap();
+    let info2 = tokio::time::timeout(Duration::from_secs(5), mgr.spawn(test_spec("true")))
+        .await
+        .expect("slot should be free after kill")
+        .unwrap();
+    let res = mgr.wait(&info2.id, Duration::from_secs(5), false).await;
+    assert!(matches!(res, WaitResult::Ended(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_admission_queue_runs_all_with_bounded_concurrency() {
+    let config = ExecConfig {
+        max_tasks: 2,
+        ..Default::default()
+    };
+    let (mgr, _tmp) = test_manager(config);
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let mgr = Arc::clone(&mgr);
+        handles.push(tokio::spawn(async move {
+            let info = mgr.spawn(test_spec("sleep 0.2")).await.unwrap();
+            let running = mgr
+                .list(None)
+                .iter()
+                .filter(|t| t.status == TaskStatus::Running)
+                .count();
+            assert!(running <= 2, "{running} tasks running at once");
+            mgr.wait(&info.id, Duration::from_secs(10), false).await
+        }));
     }
+    for h in handles {
+        let res = h.await.unwrap();
+        assert!(matches!(res, WaitResult::Ended(i) if i.status == TaskStatus::Completed));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cancelled_queued_spawn_starts_nothing() {
+    let config = ExecConfig {
+        max_tasks: 1,
+        ..Default::default()
+    };
+    let (mgr, tmp) = test_manager(config);
+    let info1 = mgr.spawn(test_spec("sleep 10")).await.unwrap();
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut spec = test_spec("touch should_not_exist");
+    spec.cancel = Some(token.clone());
+    let mgr2 = Arc::clone(&mgr);
+    let waiter = tokio::spawn(async move { mgr2.spawn(spec).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    token.cancel();
+    let err = waiter.await.unwrap().unwrap_err();
+    assert!(matches!(err, ExecError::Cancelled), "got {err:?}");
+    assert_eq!(mgr.list(None).len(), 1);
+    // Only the first task's spool exists.
+    let spools = std::fs::read_dir(tmp.path()).unwrap().count();
+    assert_eq!(spools, 1);
 
     mgr.kill(&info1.id).await.unwrap();
 }

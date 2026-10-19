@@ -131,6 +131,9 @@ impl SessionState {
                     }
                 }
                 ClientEvent::Snapshot(_) => {}
+                ClientEvent::Desynced => {
+                    log::warn!("event stream lost events; updates may be incomplete");
+                }
                 ClientEvent::Connected { .. } => {}
                 ClientEvent::Disconnected { reason } => {
                     log::warn!("daemon disconnected: {reason}");

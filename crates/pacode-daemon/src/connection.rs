@@ -170,28 +170,11 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
 
     // Daemon-wide events (login progress, credential changes) reach this client whether
     // or not it ever attaches to a session, so `pacode login` sees its own flow.
-    let global_handle = {
-        let mut global_rx = core.subscribe_global();
-        let event_tx = tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match global_rx.recv().await {
-                    Ok((seq, event)) => {
-                        let msg = ServerMessage::Event { seq, event };
-                        if let Ok(mut s) = serde_json::to_string(&msg) {
-                            s.push('\n');
-                            let _ = event_tx.try_send(s);
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("global event receiver lagged by {n} events");
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        })
-    };
+    let global_handle = tokio::spawn(crate::fanout::run_forwarder(
+        core.subscribe_global(),
+        tx.clone(),
+        "global",
+    ));
 
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
@@ -254,32 +237,12 @@ pub async fn serve_connection(stream: UnixStream, core: Arc<Core>, control: Serv
                             hello.client_id
                         );
                         attached_session = Some(session_id.clone());
-                        if let Some(mut broadcast_rx) = core.subscribe(&session_id) {
-                            let event_tx = tx.clone();
-                            let handle = tokio::spawn(async move {
-                                loop {
-                                    match broadcast_rx.recv().await {
-                                        Ok((seq, event)) => {
-                                            let msg = ServerMessage::Event { seq, event };
-                                            if let Ok(mut s) = serde_json::to_string(&msg) {
-                                                s.push('\n');
-                                                let _ = event_tx.try_send(s);
-                                            }
-                                        }
-                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
-                                            n,
-                                        )) => {
-                                            log::warn!(
-                                                "session event receiver lagged by {n} events"
-                                            );
-                                            continue;
-                                        }
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
+                        if let Some(broadcast_rx) = core.subscribe(&session_id) {
+                            let handle = tokio::spawn(crate::fanout::run_forwarder(
+                                broadcast_rx,
+                                tx.clone(),
+                                "session",
+                            ));
                             forwarder_handle = Some(handle);
                         }
                         match core.snapshot(&session_id) {

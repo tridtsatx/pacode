@@ -42,16 +42,40 @@ pub(crate) fn spawn_writer(
     })
 }
 
+/// Queue `event` for the consumer without blocking the reader.
+///
+/// `dropped_events` counts events lost to a full queue since the consumer last heard of
+/// it (cap: one usize, owner: the connection). Once the queue has room again the next
+/// successful send is preceded by one [`ClientEvent::Desynced`], so the consumer can
+/// re-fetch a snapshot. Dropped events are never Debug-formatted, only counted.
 pub(crate) fn emit_event(
     events_tx: &mpsc::Sender<ClientEvent>,
     dropped_events: &AtomicUsize,
     event: ClientEvent,
 ) {
+    let pending_drops = dropped_events.load(Ordering::Relaxed);
+    if pending_drops > 0 {
+        match events_tx.try_send(ClientEvent::Desynced) {
+            Ok(()) => {
+                log::warn!("event queue recovered after {pending_drops} dropped events");
+                dropped_events.fetch_sub(pending_drops, Ordering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let count = dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
+                log::warn!("event queue full (capacity 1024), dropped events={count}");
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                log::debug!("event receiver closed");
+                return;
+            }
+        }
+    }
     match events_tx.try_send(event) {
         Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(ev)) => {
+        Err(mpsc::error::TrySendError::Full(_)) => {
             let count = dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
-            log::warn!("event queue full (capacity 1024), dropped event count={count}: {ev:?}");
+            log::warn!("event queue full (capacity 1024), dropped events={count}");
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             log::debug!("event receiver closed");
@@ -401,3 +425,7 @@ pub(crate) async fn run_supervisor(mut ctx: SupervisorCtx) {
         ctx.reader = next_reader;
     }
 }
+
+#[cfg(test)]
+#[path = "reconnect_tests.rs"]
+mod reconnect_tests;

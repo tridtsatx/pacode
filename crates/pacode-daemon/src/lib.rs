@@ -12,10 +12,11 @@
 //!   channel; an `Attach` to another session replaces the subscription), `Detach`,
 //!   `Ping`, `Shutdown`; everything else → `core.handle(session, req)`.
 //!   Replies and events share one ordered writer channel (capacity 1024; a client
-//!   that lags gets `Event` drops and must `GetSnapshot`).
+//!   that lags gets `Event::Resync` and must `GetSnapshot`, see [`fanout`]).
 //! - Text deltas are already coalesced by the core.
 
 pub mod connection;
+pub mod fanout;
 pub mod server;
 pub mod wiring;
 

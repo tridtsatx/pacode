@@ -14,6 +14,7 @@ use pacode_types::{
 use crate::catalog_cache::{
     CatalogCache, DEFAULT_CATALOG_TTL_SECS, DEFAULT_MAX_MODELS_PER_PROVIDER,
 };
+use crate::gate::GateMap;
 use crate::openai_compat::OpenAiCompat;
 use crate::registry_cache::{TokenCache, legacy_resolve};
 use crate::{Provider, ProviderError};
@@ -148,7 +149,10 @@ fn build_transport(
     defaults: &ProviderDefaults,
     pricing: &BTreeMap<String, Pricing>,
     credential: &ResolvedCredential,
+    gates: &GateMap,
 ) -> Result<Arc<dyn Provider>, ProviderError> {
+    // One gate per provider id, kept across rebuilds (token refresh) and registry clones.
+    let gate = gates.gate_for(id, defaults.max_concurrent);
     match pcfg.kind {
         ProviderKind::OpenAi => {
             let api_key = credential.api_key().map(String::from);
@@ -158,7 +162,8 @@ fn build_transport(
                 defaults.clone(),
                 api_key,
                 pricing.clone(),
-            )?;
+            )?
+            .with_gate(gate);
             Ok(Arc::new(provider))
         }
         ProviderKind::Anthropic => Err(ProviderError::Config(format!(
@@ -187,7 +192,8 @@ fn build_transport(
                     defaults.clone(),
                     Some(auth),
                     pricing.clone(),
-                )?;
+                )?
+                .with_gate(gate);
                 Ok(Arc::new(provider))
             }
             _ => {
@@ -198,7 +204,8 @@ fn build_transport(
                     defaults.clone(),
                     api_key,
                     pricing.clone(),
-                )?;
+                )?
+                .with_gate(gate);
                 Ok(Arc::new(provider))
             }
         },
@@ -248,6 +255,8 @@ pub struct ProviderRegistry {
     /// Resolved store credentials with their expiry; see `registry_cache` for the cap,
     /// invalidation and ownership rules. Seeded when providers are built from a store.
     token_cache: Arc<TokenCache>,
+    /// Per-provider concurrency gates and cooldowns; see `gate` for cap and invalidation.
+    gates: Arc<GateMap>,
 }
 
 impl ProviderRegistry {
@@ -267,6 +276,7 @@ impl ProviderRegistry {
             auth_path: None,
             token_refresher: None,
             token_cache: Arc::new(TokenCache::default()),
+            gates: Arc::new(GateMap::default()),
         }
     }
 
@@ -327,7 +337,14 @@ impl ProviderRegistry {
 
             configs.insert(id.clone(), pcfg.clone());
 
-            match build_transport(&id, &pcfg, &cfg.provider, &cfg.pricing, &credential) {
+            match build_transport(
+                &id,
+                &pcfg,
+                &cfg.provider,
+                &cfg.pricing,
+                &credential,
+                &registry.gates,
+            ) {
                 Ok(provider) => {
                     registry.insert(provider);
                 }
@@ -562,7 +579,7 @@ impl ProviderRegistry {
         let credential = ResolvedCredential::StoreOAuth(account);
         self.token_cache.remove(id);
 
-        let provider = build_transport(id, &pcfg, &defaults, &pricing, &credential)?;
+        let provider = build_transport(id, &pcfg, &defaults, &pricing, &credential, &self.gates)?;
         self.providers
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -644,7 +661,7 @@ impl ProviderRegistry {
             }
         }
 
-        match build_transport(id, &pcfg, &defaults, &pricing, &credential) {
+        match build_transport(id, &pcfg, &defaults, &pricing, &credential, &self.gates) {
             Ok(provider) => {
                 self.providers
                     .write()

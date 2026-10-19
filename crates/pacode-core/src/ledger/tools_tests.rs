@@ -103,6 +103,7 @@ fn session() -> (tempfile::TempDir, Arc<Session>) {
         skills: Arc::new(pacode_skills::SkillRegistry::default()),
         scheduler: crate::schedule::Scheduler::new(),
         ledger: crate::ledger::FileLedger::new(),
+        efforts_cache: Default::default(),
     });
     (temp, session)
 }

@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use pacode_types::{AgentId, SessionId};
+use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct TaskSpec {
     pub session: SessionId,
     pub owner: AgentId,
@@ -19,6 +20,9 @@ pub struct TaskSpec {
     pub background: bool,
     /// Hard timeout; the task is killed and marked failed when it elapses.
     pub timeout: Option<Duration>,
+    /// Cancels the wait for a free process slot (admission queue); `None` waits as long
+    /// as it takes. Only the wait is cancelled: a started task is stopped with `kill`.
+    pub cancel: Option<CancellationToken>,
 }
 
 impl TaskSpec {
@@ -37,6 +41,7 @@ impl TaskSpec {
             label: None,
             background: false,
             timeout: None,
+            cancel: None,
         }
     }
 }
